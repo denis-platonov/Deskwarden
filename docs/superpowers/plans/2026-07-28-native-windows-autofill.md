@@ -1641,14 +1641,16 @@ fn main() {
         .to_path_buf();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
 
-    let nodewarden_url = std::env::var("NODEWARDEN_SERVER_URL").unwrap_or_else(|_| {
-        eprint!("Nodewarden server URL (e.g. https://vault.example.com): ");
+    let server_url = std::env::var("BW_SERVER_URL").unwrap_or_else(|_| {
+        eprint!("Self-hosted server URL (blank to use the official Bitwarden servers): ");
         std::io::stdout().flush().ok();
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).expect("failed to read server URL");
         input.trim().to_string()
     });
-    configure_bw_server(&nodewarden_url);
+    if !server_url.is_empty() {
+        configure_bw_server(&server_url);
+    }
 
     let session_path = config_dir.join("session.bin");
     let store = session_store::SessionStore::new(session_path);
@@ -1785,8 +1787,8 @@ Expected: builds with no errors (after resolving `credentials_for`'s TODO per th
 
 - [ ] **Step 5: Manually verify end-to-end**
 
-With the Bitwarden CLI installed, `NODEWARDEN_SERVER_URL` set to your nodewarden instance's URL (or ready to type it in when prompted), and at least one vault item that has an `nodewarden:app-match` field pointing at a real running app's process name (set via `run_picker` from Task 11, or manually via `bw` CLI), run: `cargo run`. Expected:
-1. Configures the CLI's server via `bw config server <url>`, prompts for the master password once, then starts `bw serve`.
+With the Bitwarden CLI installed, `BW_SERVER_URL` set to your nodewarden instance's URL (or ready to type it in when prompted — leave blank to use the official Bitwarden servers instead), and at least one vault item that has an `nodewarden:app-match` field pointing at a real running app's process name (set via `run_picker` from Task 11, or manually via `bw` CLI), run: `cargo run`. Expected:
+1. If a server URL was given, configures the CLI's server via `bw config server <url>`; then prompts for the master password once and starts `bw serve`.
 2. Bring the matched application's window to the foreground.
 3. For `prompt` trigger: the overlay appears; clicking Fill types credentials into the window (verify against both an app where UI Automation succeeds and one where it falls back to SendInput, per the spec's testing approach — e.g. Mabl desktop app and Rockstar Games Launcher).
 4. For `auto` trigger: credentials are typed immediately with no overlay.
