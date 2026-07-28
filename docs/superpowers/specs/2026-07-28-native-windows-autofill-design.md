@@ -9,6 +9,35 @@ Bitwarden's autofill only works inside browsers (DOM-based, via the browser exte
 
 Why Bitwarden doesn't already have this: its autofill is architecturally scoped to the browser extension (DOM content scripts). Native-window autofill requires OS-level integration — foreground-window hooks, window/process matching, and keystroke or UI Automation injection — a different engineering domain (Win32 systems programming) than the extension's DOM-based approach. Nothing about it is architecturally impossible; it's simply out of scope for the existing codebase.
 
+## Context: nodewarden
+
+The vault backend in play is **nodewarden**, an already-running, self-hosted, Bitwarden-API-compatible server (in the spirit of Vaultwarden) — not bitwarden.com. The official Bitwarden desktop app is already configured to point at it via the standard self-hosted server URL setting. There is no Bitwarden Inc. cloud service anywhere in this picture; nodewarden is fully owned/operated by the user.
+
+## Distribution intent
+
+This project is intended to be published open source, free for anyone to use. That intent shapes two decisions below: the integration approach (must not depend on code that legally can't be redistributed) and branding (must not create trademark/trade-dress risk by mimicking Bitwarden's official look).
+
+## Integration approach: bw serve, not the Bitwarden Rust SDK
+
+Two alternatives were evaluated for talking to nodewarden and rejected:
+
+- **Bitwarden's internal Rust SDK crates** (`bitwarden-core`, `bitwarden-vault`, `bitwarden-crypto`, published on crates.io but marked "internal... do not use" in their own descriptions) would let `nodewarden-native` connect directly to nodewarden's REST API the way the official desktop client does, with no CLI dependency. Rejected for two independent, each-sufficient reasons, confirmed by reading `LICENSE_SDK.txt` in `bitwarden/sdk-internal` directly:
+  - §3.1 of the SDK's license explicitly prohibits redistributing an application built on it to third parties — incompatible with open-sourcing this project.
+  - §3.3 restricts the SDK to applications connecting to official "Bitwarden server products distributed by the Company" — nodewarden, as an independent server implementation, doesn't qualify, independent of the distribution question.
+  - The crates are dual-licensed (`GPL-3.0-only OR LicenseRef-Bitwarden-SDK`); choosing the GPL option avoids those two clauses but statically linking GPL-3.0 code would require `nodewarden-native` itself to be GPL-3.0-licensed as a combined work — a real constraint, and moot anyway given the next point.
+  - Separately: the new Rust-based CLI these crates are built for (`bw` crate in `sdk-internal`, v0.0.2) has `List`, `Status`, and `Unlock` commands still stubbed as `todo!()` in Bitwarden's own reference implementation — not production-ready regardless of licensing.
+- **Hand-rolled vault crypto** (reimplementing KDF + AES/HMAC decryption from scratch) was rejected earlier in this design process as unnecessary security risk when an audited implementation already exists.
+
+**Decision: use `bw serve`** — the mature, GA, published Bitwarden CLI's local REST API — exactly as originally designed. Running it as a subprocess and talking to its local HTTP API is not "linking" under any license's terms, so neither the SDK EULA's restrictions nor GPL copyleft apply to `nodewarden-native`. The CLI must be pointed at nodewarden via `bw config server <nodewarden-url>` before login/unlock, the standard mechanism for any self-hosted Bitwarden-compatible server (the same one the official desktop app itself uses). The one real cost — requiring users to have the `bw` CLI installed (~50-100MB standalone download) — is accepted as a reasonable ask for an open-source tool's users, given the alternative is legally blocked and/or unstable.
+
+## Branding
+
+This tool must not visually mimic the official Bitwarden desktop app (logo, icon, color scheme, layout) to "look authentic." For a publicly-distributed, unofficial tool that handles vault credentials, that combination is a real trademark/trade-dress risk and a user-trust risk (a lookalike security tool is adjacent to the pattern used in credential-phishing, regardless of intent). `nodewarden-native` gets its own distinct name/logo/color palette, with a clear "unofficial, unaffiliated with Bitwarden" statement in its README.
+
+## License
+
+Since `nodewarden-native` only talks to `bw serve` as a separate OS process (no linking against Bitwarden's code, no dependency on the restricted SDK), it carries no inherited licensing obligations. It can be published under a permissive license (MIT or Apache-2.0) of the user's choice.
+
 ## Goals (v1)
 
 - Detect when a known native Windows application's window comes to the foreground.
