@@ -15,6 +15,9 @@
 - The target vault backend is nodewarden, a self-hosted Bitwarden-API-compatible server the user already runs (not bitwarden.com). The `bw` CLI must be pointed at it via `bw config server <nodewarden-url>` before login — see Task 12.
 - Do not depend on Bitwarden's `bitwarden-core`/`bitwarden-vault`/`bitwarden-crypto` crates or the in-progress Rust `bw` CLI in `bitwarden/sdk-internal` — their license (`LICENSE_SDK.txt`) prohibits redistribution to third parties and restricts use to official Bitwarden server products, and the CLI itself is pre-release (v0.0.2, core commands unimplemented). `bw serve` (the mature, GA, published CLI) is the only sanctioned integration surface.
 - `nodewarden-native` is intended for open-source publication under a permissive license (MIT or Apache-2.0) with its own distinct branding — no visual mimicry of Bitwarden's official app.
+- Login/unlock is a GUI flow (Task 12), not a terminal prompt: the user picks official-vs-self-hosted, enters a server URL if self-hosted, and enters credentials, which then drive `bw config server` / `bw login` / `bw unlock` under the hood.
+- Passwords are passed to the `bw` CLI via `--passwordenv` (an environment variable read once by the child process), never as a bare CLI argument — bare-argument passwords are visible to other processes/users via the OS process list.
+- Release binaries are code-signed via a free open-source code-signing provider (e.g. SignPath's OSS program) rather than a paid certificate, to reduce SmartScreen/AV false-positive friction for users without ongoing cost. This is a release/CI concern, not an implementation task — tracked as a follow-up once the binary is ready to ship, not part of the tasks below.
 - Vault match metadata is stored in the existing custom-field mechanism under the exact field name `nodewarden:app-match`, value a JSON object `{"process": "<exe-name>", "trigger": "prompt" | "hotkey" | "auto"}`.
 - Decrypted secrets are never written to disk; only the CLI session token is persisted, and only DPAPI-encrypted.
 - v1 matches on process name only (no path/signature verification) — see spec's accepted-risk note.
@@ -41,6 +44,7 @@ nodewarden-native/
       send_input.rs          # SendInput-based field fill
     picker_ui.rs              # process picker window (capture flow)
     overlay_ui.rs              # prompt-trigger overlay window
+    login_ui.rs                 # server/credentials login screen
     tray.rs                    # system tray icon + menu
     hotkey.rs                   # global hotkey registration
   examples/
@@ -515,6 +519,7 @@ struct ItemList {
     data: Vec<VaultItem>,
 }
 
+#[derive(Clone)]
 pub struct VaultBridge {
     base_url: String,
     agent: ureq::Agent,
@@ -1387,32 +1392,25 @@ This is GUI code, verified manually.
 
 - [ ] **Step 1: Write the implementation**
 
+Both windows below need to hand a result back to their caller once the user clicks a button, but `eframe::run_simple_native`'s closure is `FnMut` + `'static` and runs on every repaint — it must own (`move`) its state, so a plain local variable moved into it can't be read afterward by the calling function. The fix used throughout this task is: put the result in `Rc<RefCell<T>>`, move a clone into the closure, read the original after `run_simple_native` returns (safe here because eframe runs the closure on the same thread that's blocked inside the call — no cross-thread sharing is happening).
+
 ```rust
 // nodewarden-native/src/picker_ui.rs
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::process_list::{list_processes, ProcessInfo};
 use crate::vault_bridge::{VaultBridge, VaultItem};
 use eframe::egui;
+use std::cell::RefCell;
+use std::rc::Rc;
 
-struct PickerApp {
-    processes: Vec<ProcessInfo>,
-    filter: String,
-    selected_pid: Option<u32>,
-    trigger: TriggerMode,
-    result: Option<AppMatch>,
-    done: bool,
-}
-
-pub fn run_picker(vault: &VaultBridge, target_item: &VaultItem) -> Option<AppMatch> {
+pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch> {
     let processes = list_processes().unwrap_or_default();
-    let mut app = PickerApp {
-        processes,
-        filter: String::new(),
-        selected_pid: None,
-        trigger: TriggerMode::Prompt,
-        result: None,
-        done: false,
-    };
+    let result: Rc<RefCell<Option<AppMatch>>> = Rc::new(RefCell::new(None));
+    let result_for_closure = result.clone();
+
+    let mut filter = String::new();
+    let mut selected_pid: Option<u32> = None;
+    let mut trigger = TriggerMode::Prompt;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 480.0]),
@@ -1421,65 +1419,69 @@ pub fn run_picker(vault: &VaultBridge, target_item: &VaultItem) -> Option<AppMat
 
     let _ = eframe::run_simple_native("Add app to nodewarden", options, move |ctx, frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut done = false;
+
             ui.heading(format!("Match a process to \"{}\"", target_item.name));
-            ui.text_edit_singleline(&mut app.filter);
+            ui.text_edit_singleline(&mut filter);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
-                for p in app
-                    .processes
+                for p in processes
                     .iter()
-                    .filter(|p| p.exe_name.to_lowercase().contains(&app.filter.to_lowercase()))
+                    .filter(|p| p.exe_name.to_lowercase().contains(&filter.to_lowercase()))
                 {
-                    let selected = app.selected_pid == Some(p.pid);
+                    let selected = selected_pid == Some(p.pid);
                     if ui.selectable_label(selected, format!("{} (pid {})", p.exe_name, p.pid)).clicked() {
-                        app.selected_pid = Some(p.pid);
+                        selected_pid = Some(p.pid);
                     }
                 }
             });
 
             ui.separator();
             egui::ComboBox::from_label("Trigger")
-                .selected_text(format!("{:?}", app.trigger))
+                .selected_text(format!("{trigger:?}"))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut app.trigger, TriggerMode::Prompt, "Prompt");
-                    ui.selectable_value(&mut app.trigger, TriggerMode::Hotkey, "Hotkey");
-                    ui.selectable_value(&mut app.trigger, TriggerMode::Auto, "Auto");
+                    ui.selectable_value(&mut trigger, TriggerMode::Prompt, "Prompt");
+                    ui.selectable_value(&mut trigger, TriggerMode::Hotkey, "Hotkey");
+                    ui.selectable_value(&mut trigger, TriggerMode::Auto, "Auto");
                 });
 
             ui.horizontal(|ui| {
                 if ui.button("Save").clicked() {
-                    if let Some(pid) = app.selected_pid {
-                        if let Some(p) = app.processes.iter().find(|p| p.pid == pid) {
-                            let m = AppMatch { process: p.exe_name.clone(), trigger: app.trigger };
-                            if vault.set_app_match(target_item, &m).is_ok() {
-                                app.result = Some(m);
+                    if let Some(pid) = selected_pid {
+                        if let Some(p) = processes.iter().find(|p| p.pid == pid) {
+                            let m = AppMatch { process: p.exe_name.clone(), trigger };
+                            if vault.set_app_match(&target_item, &m).is_ok() {
+                                *result_for_closure.borrow_mut() = Some(m);
                             }
                         }
                     }
-                    app.done = true;
+                    done = true;
                 }
                 if ui.button("Cancel").clicked() {
-                    app.done = true;
+                    done = true;
                 }
             });
 
-            if app.done {
+            if done {
                 frame.close();
             }
         });
     });
 
-    app.result
+    result.borrow_mut().take()
 }
 ```
 
 ```rust
 // nodewarden-native/src/overlay_ui.rs
 use eframe::egui;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub fn show_prompt_overlay(app_name: &str) -> bool {
-    let mut fill_clicked = false;
-    let mut done = false;
+    let app_name = app_name.to_string();
+    let fill_clicked = Rc::new(RefCell::new(false));
+    let fill_clicked_for_closure = fill_clicked.clone();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1490,10 +1492,12 @@ pub fn show_prompt_overlay(app_name: &str) -> bool {
 
     let _ = eframe::run_simple_native("nodewarden", options, move |ctx, frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut done = false;
+
             ui.label(format!("Fill saved credentials into {app_name}?"));
             ui.horizontal(|ui| {
                 if ui.button("Fill").clicked() {
-                    fill_clicked = true;
+                    *fill_clicked_for_closure.borrow_mut() = true;
                     done = true;
                 }
                 if ui.button("Dismiss").clicked() {
@@ -1506,7 +1510,8 @@ pub fn show_prompt_overlay(app_name: &str) -> bool {
         });
     });
 
-    fill_clicked
+    let clicked = *fill_clicked.borrow();
+    clicked
 }
 ```
 
@@ -1516,6 +1521,8 @@ Add to `src/lib.rs`:
 pub mod picker_ui;
 pub mod overlay_ui;
 ```
+
+Note for the implementer: `run_picker`'s signature changed from borrowing (`&VaultBridge`, `&VaultItem`) to owning (`VaultBridge`, `VaultItem`) because the closure must own everything it captures. Callers (Task 13) clone a `VaultBridge` (now `Clone`, see Task 4) and a `VaultItem` before calling it.
 
 - [ ] **Step 2: Verify it builds**
 
@@ -1535,7 +1542,173 @@ git commit -m "feat: add process picker and prompt overlay UI"
 
 ---
 
-### Task 12: Tray app wiring and end-to-end integration
+### Task 12: Login and unlock UI
+
+**Files:**
+- Create: `nodewarden-native/src/login_ui.rs`
+- Modify: `nodewarden-native/src/lib.rs` (add `pub mod login_ui;`)
+
+**Interfaces:**
+- Produces:
+  - `pub enum BwStatus { Unauthenticated, Locked, Unlocked }` (`Clone, Copy, PartialEq, Eq`)
+  - `pub fn check_bw_status() -> BwStatus` — runs `bw status` and parses the result.
+  - `pub fn configure_server(url: &str)` — runs `bw config server <url>`.
+  - `pub fn run_login_flow() -> String` — blocking GUI flow; shows a server-choice + email field when `check_bw_status()` is `Unauthenticated`, or just a password field when `Locked`/`Unlocked`; runs `bw login`/`bw unlock` accordingly and returns the resulting session token.
+
+This is GUI code, verified manually, same reasoning as Task 11. It replaces the terminal-based password prompt from earlier drafts of this plan with the actual required UX: a login screen offering official-vs-self-hosted server choice plus credentials.
+
+- [ ] **Step 1: Write the implementation**
+
+```rust
+// nodewarden-native/src/login_ui.rs
+use eframe::egui;
+use std::cell::RefCell;
+use std::process::Command;
+use std::rc::Rc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BwStatus {
+    Unauthenticated,
+    Locked,
+    Unlocked,
+}
+
+pub fn check_bw_status() -> BwStatus {
+    let output = Command::new("bw")
+        .args(["status"])
+        .output()
+        .expect("failed to run `bw status` (is the Bitwarden CLI installed and on PATH?)");
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.contains("\"status\":\"unlocked\"") {
+        BwStatus::Unlocked
+    } else if text.contains("\"status\":\"locked\"") {
+        BwStatus::Locked
+    } else {
+        BwStatus::Unauthenticated
+    }
+}
+
+pub fn configure_server(url: &str) {
+    let status = Command::new("bw")
+        .args(["config", "server", url])
+        .status()
+        .expect("failed to run `bw config server` (is the Bitwarden CLI installed and on PATH?)");
+    if !status.success() {
+        panic!("`bw config server {url}` failed");
+    }
+}
+
+/// Runs `bw` with the given args plus a password supplied via an
+/// environment variable (`--passwordenv`), never as a bare CLI argument —
+/// a bare-argument password would be visible to other processes/users
+/// via the OS process list.
+fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String> {
+    let mut cmd = Command::new("bw");
+    cmd.args(args);
+    cmd.args(["--passwordenv", "NODEWARDEN_BW_PASSWORD"]);
+    cmd.env("NODEWARDEN_BW_PASSWORD", password);
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn run_login_flow() -> String {
+    let status = check_bw_status();
+    let token: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let token_for_closure = token.clone();
+
+    let mut self_hosted = false;
+    let mut server_url = String::new();
+    let mut email = String::new();
+    let mut password = String::new();
+    let mut error: Option<String> = None;
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 320.0]),
+        ..Default::default()
+    };
+
+    let _ = eframe::run_simple_native("Log in to nodewarden", options, move |ctx, frame| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("nodewarden-native");
+
+            if status == BwStatus::Unauthenticated {
+                ui.checkbox(&mut self_hosted, "Self-hosted server");
+                if self_hosted {
+                    ui.label("Server URL");
+                    ui.text_edit_singleline(&mut server_url);
+                }
+                ui.label("Email");
+                ui.text_edit_singleline(&mut email);
+            }
+
+            ui.label("Master password");
+            ui.add(egui::TextEdit::singleline(&mut password).password(true));
+
+            if let Some(err) = &error {
+                ui.colored_label(egui::Color32::RED, err);
+            }
+
+            if ui.button("Continue").clicked() {
+                if status == BwStatus::Unauthenticated && self_hosted && !server_url.is_empty() {
+                    configure_server(&server_url);
+                }
+
+                let result = match status {
+                    BwStatus::Unauthenticated => {
+                        run_bw_with_password(&["login", &email, "--raw"], &password)
+                    }
+                    BwStatus::Locked | BwStatus::Unlocked => {
+                        run_bw_with_password(&["unlock", "--raw"], &password)
+                    }
+                };
+
+                match result {
+                    Ok(session_token) => *token_for_closure.borrow_mut() = Some(session_token),
+                    Err(e) => error = Some(e),
+                }
+            }
+
+            if token_for_closure.borrow().is_some() {
+                frame.close();
+            }
+        });
+    });
+
+    token
+        .borrow_mut()
+        .take()
+        .expect("login flow closed without producing a session token")
+}
+```
+
+Add to `src/lib.rs`:
+
+```rust
+pub mod login_ui;
+```
+
+- [ ] **Step 2: Verify it builds**
+
+Run: `cargo build`
+Expected: builds with no errors.
+
+- [ ] **Step 3: Manually verify**
+
+With the Bitwarden CLI installed and *not* currently logged in (`bw logout` first if needed), run a small scratch call to `login_ui::run_login_flow()` (e.g. temporarily from `main.rs`, removed once Task 13 wires it in properly). Expected: the "Self-hosted server" checkbox and email field appear; checking it reveals a URL field; entering your nodewarden URL, email, and master password and clicking Continue configures the server, logs in, and returns a non-empty session token with no error shown. Re-run after `bw lock` (without logging out) and confirm only the password field appears this time, and Continue unlocks successfully.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add nodewarden-native/src/login_ui.rs nodewarden-native/src/lib.rs
+git commit -m "feat: add login/unlock UI for official and self-hosted servers"
+```
+
+---
+
+### Task 13: Tray app wiring and end-to-end integration
 
 **Files:**
 - Create: `nodewarden-native/src/tray.rs`
@@ -1543,7 +1716,7 @@ git commit -m "feat: add process picker and prompt overlay UI"
 - Modify: `nodewarden-native/src/main.rs` (full rewrite of wiring)
 
 **Interfaces:**
-- Consumes everything from Tasks 2-11: `app_match`, `session_store::SessionStore`, `vault_bridge::{VaultBridge, extract_app_match}`, `match_engine::MatchEngine`, `window_watch::watch_foreground_windows`, `injector::{Injector, RealUiAutomation, RealSendInput}`, `picker_ui::run_picker`, `overlay_ui::show_prompt_overlay`.
+- Consumes everything from Tasks 2-12: `app_match`, `session_store::SessionStore`, `vault_bridge::{VaultBridge, extract_app_match}`, `match_engine::MatchEngine`, `window_watch::watch_foreground_windows`, `injector::{Injector, RealUiAutomation, RealSendInput}`, `picker_ui::run_picker`, `overlay_ui::show_prompt_overlay`, `login_ui::run_login_flow`.
 - Produces: the running application — no further consumers.
 
 - [ ] **Step 1: Write the tray module**
@@ -1615,6 +1788,7 @@ pub fn fill_hotkey_pressed(fh: &FillHotkey) -> bool {
 mod app_match;
 mod hotkey;
 mod injector;
+mod login_ui;
 mod match_engine;
 mod overlay_ui;
 mod picker_ui;
@@ -1627,7 +1801,6 @@ mod window_watch;
 use app_match::AppMatch;
 use injector::{Injector, RealSendInput, RealUiAutomation};
 use match_engine::MatchEngine;
-use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use vault_bridge::VaultBridge;
@@ -1641,24 +1814,13 @@ fn main() {
         .to_path_buf();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
 
-    let server_url = std::env::var("BW_SERVER_URL").unwrap_or_else(|_| {
-        eprint!("Self-hosted server URL (blank to use the official Bitwarden servers): ");
-        std::io::stdout().flush().ok();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("failed to read server URL");
-        input.trim().to_string()
-    });
-    if !server_url.is_empty() {
-        configure_bw_server(&server_url);
-    }
-
     let session_path = config_dir.join("session.bin");
     let store = session_store::SessionStore::new(session_path);
 
     let session_token = match store.load() {
         Some(token) => token,
         None => {
-            let token = unlock_interactively();
+            let token = login_ui::run_login_flow();
             store.save(&token).expect("failed to persist session token");
             token
         }
@@ -1734,16 +1896,6 @@ fn refresh_match_engine(vault: &VaultBridge, engine: &mut MatchEngine) {
     engine.rebuild(&entries);
 }
 
-fn configure_bw_server(url: &str) {
-    let status = Command::new("bw")
-        .args(["config", "server", url])
-        .status()
-        .expect("failed to run `bw config server` (is the Bitwarden CLI installed and on PATH?)");
-    if !status.success() {
-        panic!("`bw config server {url}` failed");
-    }
-}
-
 fn spawn_bw_serve(session_token: &str) -> Child {
     Command::new("bw")
         .args(["serve", "--port", "8087"])
@@ -1753,29 +1905,6 @@ fn spawn_bw_serve(session_token: &str) -> Child {
         .spawn()
         .expect("failed to spawn `bw serve` (is the Bitwarden CLI installed and on PATH?)")
 }
-
-fn unlock_interactively() -> String {
-    print!("Enter Bitwarden master password: ");
-    std::io::stdout().flush().ok();
-    let password = rpassword::read_password().expect("failed to read password");
-
-    let output = Command::new("bw")
-        .args(["unlock", &password, "--raw"])
-        .output()
-        .expect("failed to run `bw unlock`");
-
-    if !output.status.success() {
-        panic!("bw unlock failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
-
-    String::from_utf8(output.stdout).expect("bw unlock returned non-UTF8 output").trim().to_string()
-}
-```
-
-Add `rpassword` to `Cargo.toml` dependencies (needed for masked password input in `unlock_interactively`):
-
-```toml
-rpassword = "7"
 ```
 
 Note for the implementer: `credentials_for` is intentionally left reading empty strings — `vault_bridge::VaultItem`/`VaultField` (Task 4) only modeled `id`/`name`/`fields` because that's all the match-extraction logic needed. Before this task is considered functionally complete, extend `VaultItem` with the `login: Option<LoginData>` shape `bw serve` actually returns (`{"login": {"username": "...", "password": "..."}}`) and implement `credentials_for` to read it — write this as a small follow-up TDD task (parse a sample `bw serve` item JSON with a `login` block, assert extracted username/password) before wiring real fills end-to-end.
@@ -1787,8 +1916,8 @@ Expected: builds with no errors (after resolving `credentials_for`'s TODO per th
 
 - [ ] **Step 5: Manually verify end-to-end**
 
-With the Bitwarden CLI installed, `BW_SERVER_URL` set to your nodewarden instance's URL (or ready to type it in when prompted — leave blank to use the official Bitwarden servers instead), and at least one vault item that has an `nodewarden:app-match` field pointing at a real running app's process name (set via `run_picker` from Task 11, or manually via `bw` CLI), run: `cargo run`. Expected:
-1. If a server URL was given, configures the CLI's server via `bw config server <url>`; then prompts for the master password once and starts `bw serve`.
+With the Bitwarden CLI installed and at least one vault item that has an `nodewarden:app-match` field pointing at a real running app's process name (set via `run_picker` from Task 11, or manually via `bw` CLI), run: `cargo run`. Expected:
+1. The login screen from Task 12 appears once; completing it (self-hosted URL + email + password, or just password if already logged in) configures the server if needed, logs in/unlocks, and starts `bw serve`.
 2. Bring the matched application's window to the foreground.
 3. For `prompt` trigger: the overlay appears; clicking Fill types credentials into the window (verify against both an app where UI Automation succeeds and one where it falls back to SendInput, per the spec's testing approach — e.g. Mabl desktop app and Rockstar Games Launcher).
 4. For `auto` trigger: credentials are typed immediately with no overlay.
@@ -1805,6 +1934,7 @@ git commit -m "feat: wire tray, hotkey, bw serve lifecycle, and match dispatch i
 
 ## Plan Self-Review Notes
 
-- **Spec coverage:** window watcher (Task 7), process picker via running-process list (Tasks 5, 11), three configurable trigger modes (Tasks 2, 12), UI Automation + SendInput fallback (Tasks 8-10), `bw serve` as the vault source with DPAPI-protected session (Tasks 3-4, 12), no backend/schema changes (custom field only, Task 2/4), security notes (transient in-memory secrets, Task 12's `credentials_for`) are all covered.
-- **Known gap surfaced explicitly, not hidden:** `credentials_for` in Task 12 is a real placeholder for the `login.username`/`login.password` extraction, called out inline as a required follow-up TDD task rather than silently glossed over — the surrounding pipeline (matching, triggering, injecting) is fully implemented and testable independently of it.
-- **Type consistency check:** `AppMatch`, `TriggerMode`, `VaultItem`, `VaultField`, `MatchEngine::lookup` return type `Option<(&str, &AppMatch)>`, and `Injector::fill` signature are used identically across every task that references them.
+- **Spec coverage:** window watcher (Task 7), process picker via running-process list (Tasks 5, 11), three configurable trigger modes (Tasks 2, 13), UI Automation + SendInput fallback (Tasks 8-10), `bw serve` as the vault source with DPAPI-protected session (Tasks 3-4, 13), GUI login/unlock covering both official and self-hosted servers (Task 12, added after design review), no backend/schema changes (custom field only, Task 2/4), security notes (transient in-memory secrets, password never passed as a bare CLI argument — Task 12) are all covered.
+- **Known gap surfaced explicitly, not hidden:** `credentials_for` in Task 13 is a real placeholder for the `login.username`/`login.password` extraction, called out inline as a required follow-up TDD task rather than silently glossed over — the surrounding pipeline (matching, triggering, injecting) is fully implemented and testable independently of it.
+- **Closure-capture bug caught and fixed:** the original Task 11 draft captured picker/overlay results in a `move` closure and then read them from the enclosing function afterward, which doesn't compile. Fixed with the `Rc<RefCell<T>>` pattern, applied consistently in Task 11 and the new Task 12.
+- **Type consistency check:** `AppMatch`, `TriggerMode`, `VaultItem` (now `Clone`), `VaultBridge` (now `Clone`), `VaultField`, `MatchEngine::lookup` return type `Option<(&str, &AppMatch)>`, `Injector::fill` signature, and `login_ui::BwStatus`/`run_login_flow` are used identically across every task that references them.
