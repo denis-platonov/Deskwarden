@@ -13,6 +13,30 @@ pub struct VaultItem {
     pub name: String,
     #[serde(default)]
     pub fields: Vec<VaultField>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Pure helper: returns a copy of `item` with its `nodewarden:app-match`
+/// custom field replaced (or added) to encode `m`. All other fields —
+/// including anything not modeled by `VaultItem` and captured in `other` —
+/// are preserved unchanged, since `bw serve`'s edit endpoint expects the
+/// full item as the new state rather than a server-merged patch.
+pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
+    let mut fields: Vec<VaultField> = item
+        .fields
+        .iter()
+        .filter(|f| f.name.as_deref() != Some(APP_MATCH_FIELD_NAME))
+        .cloned()
+        .collect();
+    fields.push(VaultField {
+        name: Some(APP_MATCH_FIELD_NAME.to_string()),
+        value: Some(m.to_field_value()),
+    });
+
+    let mut updated = item.clone();
+    updated.fields = fields;
+    updated
 }
 
 pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
@@ -68,19 +92,7 @@ impl VaultBridge {
     }
 
     pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
-        let mut fields: Vec<VaultField> = item
-            .fields
-            .iter()
-            .filter(|f| f.name.as_deref() != Some(APP_MATCH_FIELD_NAME))
-            .cloned()
-            .collect();
-        fields.push(VaultField {
-            name: Some(APP_MATCH_FIELD_NAME.to_string()),
-            value: Some(m.to_field_value()),
-        });
-
-        let mut updated = item.clone();
-        updated.fields = fields;
+        let updated = with_app_match(item, m);
 
         let url = format!("{}/object/item/{}", self.base_url, item.id);
         self.agent
@@ -105,6 +117,7 @@ mod tests {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
             }],
+            other: serde_json::Map::new(),
         };
         let m = extract_app_match(&item).unwrap();
         assert_eq!(m.process, "RockstarGamesLauncher.exe");
@@ -113,7 +126,12 @@ mod tests {
 
     #[test]
     fn extract_app_match_returns_none_without_field() {
-        let item = VaultItem { id: "1".into(), name: "Other".into(), fields: vec![] };
+        let item = VaultItem {
+            id: "1".into(),
+            name: "Other".into(),
+            fields: vec![],
+            other: serde_json::Map::new(),
+        };
         assert!(extract_app_match(&item).is_none());
     }
 
@@ -126,8 +144,43 @@ mod tests {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some("not json".into()),
             }],
+            other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
+    }
+
+    #[test]
+    fn with_app_match_preserves_unknown_fields() {
+        let json = r#"{
+            "id": "1",
+            "name": "Rockstar",
+            "type": 1,
+            "fields": [],
+            "login": {"username": "a", "password": "b"},
+            "notes": "secret",
+            "folderId": null,
+            "favorite": true
+        }"#;
+        let item: VaultItem = serde_json::from_str(json).unwrap();
+
+        let m = AppMatch {
+            process: "RockstarGamesLauncher.exe".into(),
+            trigger: TriggerMode::Prompt,
+        };
+        let updated = with_app_match(&item, &m);
+
+        let value = serde_json::to_value(&updated).unwrap();
+        assert_eq!(value["type"], serde_json::json!(1));
+        assert_eq!(
+            value["login"],
+            serde_json::json!({"username": "a", "password": "b"})
+        );
+        assert_eq!(value["notes"], serde_json::json!("secret"));
+        assert_eq!(value["favorite"], serde_json::json!(true));
+
+        let m_back = extract_app_match(&updated).unwrap();
+        assert_eq!(m_back.process, "RockstarGamesLauncher.exe");
+        assert_eq!(m_back.trigger, TriggerMode::Prompt);
     }
 
     #[test]
