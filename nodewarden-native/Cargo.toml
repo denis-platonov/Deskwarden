@@ -3,6 +3,10 @@ name = "nodewarden-native"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "nodewarden_native"
+path = "src/lib.rs"
+
 [dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
