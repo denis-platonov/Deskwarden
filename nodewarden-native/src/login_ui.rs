@@ -10,28 +10,74 @@ pub enum BwStatus {
     Unlocked,
 }
 
-pub fn check_bw_status() -> BwStatus {
-    let output = Command::new("bw")
-        .args(["status"])
-        .output()
-        .expect("failed to run `bw status` (is the Bitwarden CLI installed and on PATH?)");
-    let text = String::from_utf8_lossy(&output.stdout);
-    if text.contains("\"status\":\"unlocked\"") {
+/// Parses `bw status` JSON output into a [`BwStatus`].
+///
+/// Split out from the process spawn so the (only interesting) part is
+/// testable without a Bitwarden CLI on PATH.
+pub fn parse_bw_status(stdout: &str) -> BwStatus {
+    if stdout.contains("\"status\":\"unlocked\"") {
         BwStatus::Unlocked
-    } else if text.contains("\"status\":\"locked\"") {
+    } else if stdout.contains("\"status\":\"locked\"") {
         BwStatus::Locked
     } else {
         BwStatus::Unauthenticated
     }
 }
 
-pub fn configure_server(url: &str) {
-    let status = Command::new("bw")
+pub fn check_bw_status() -> BwStatus {
+    check_bw_status_with_session(None)
+}
+
+/// Runs `bw status`, optionally with a `BW_SESSION` so the CLI can report
+/// `unlocked` for a *specific* session token rather than only for whatever is
+/// in the ambient environment.
+///
+/// A cached session token is worthless if it has since been invalidated (a
+/// manual `bw lock`, a password change, a reboot), so this is how startup
+/// checks a cached token before trusting it. Spawn failure -- typically the
+/// CLI not being on PATH -- is logged and reported as `Unauthenticated`
+/// rather than panicking the whole app.
+pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
+    let mut cmd = Command::new("bw");
+    cmd.arg("status");
+    if let Some(token) = session_token {
+        cmd.env("BW_SESSION", token);
+    }
+
+    match cmd.output() {
+        Ok(output) => parse_bw_status(&String::from_utf8_lossy(&output.stdout)),
+        Err(e) => {
+            log::error!(
+                "failed to run `bw status` (is the Bitwarden CLI installed and on PATH?): {e}"
+            );
+            BwStatus::Unauthenticated
+        }
+    }
+}
+
+/// Points the Bitwarden CLI at a self-hosted server.
+///
+/// Returns `Err` rather than panicking: a typo in a self-hosted URL is
+/// ordinary user error and belongs inline in the login window (the same way
+/// `run_bw_with_password` failures already are), not as a process-killing
+/// panic with a Rust backtrace.
+pub fn configure_server(url: &str) -> Result<(), String> {
+    let output = Command::new("bw")
         .args(["config", "server", url])
-        .status()
-        .expect("failed to run `bw config server` (is the Bitwarden CLI installed and on PATH?)");
-    if !status.success() {
-        panic!("`bw config server {url}` failed");
+        .output()
+        .map_err(|e| {
+            format!("failed to run `bw config server` (is the Bitwarden CLI on PATH?): {e}")
+        })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if stderr.is_empty() {
+            format!("`bw config server {url}` failed")
+        } else {
+            stderr
+        })
     }
 }
 
@@ -105,25 +151,44 @@ pub fn run_login_flow() -> String {
             let mut done = false;
 
             if ui.button("Continue").clicked() {
-                if status == BwStatus::Unauthenticated && self_hosted && !server_url.is_empty() {
-                    configure_server(&server_url);
-                }
+                // A bad self-hosted URL is inline UI error, not a panic: bail
+                // out of this Continue click and let the user correct it.
+                let server_configured =
+                    if status == BwStatus::Unauthenticated && self_hosted && !server_url.is_empty()
+                    {
+                        match configure_server(&server_url) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                log::warn!("bw config server failed: {e}");
+                                error = Some(e);
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
 
-                let result = match status {
-                    BwStatus::Unauthenticated => {
-                        run_bw_with_password(&["login", &email, "--raw"], &password)
-                    }
-                    BwStatus::Locked | BwStatus::Unlocked => {
-                        run_bw_with_password(&["unlock", "--raw"], &password)
-                    }
-                };
+                if server_configured {
+                    let result = match status {
+                        BwStatus::Unauthenticated => {
+                            run_bw_with_password(&["login", &email, "--raw"], &password)
+                        }
+                        BwStatus::Locked | BwStatus::Unlocked => {
+                            run_bw_with_password(&["unlock", "--raw"], &password)
+                        }
+                    };
 
-                match result {
-                    Ok(session_token) => {
-                        *token_for_closure.borrow_mut() = Some(session_token);
-                        done = true;
+                    match result {
+                        Ok(session_token) => {
+                            *token_for_closure.borrow_mut() = Some(session_token);
+                            error = None;
+                            done = true;
+                        }
+                        Err(e) => {
+                            log::warn!("bw login/unlock failed: {e}");
+                            error = Some(e);
+                        }
                     }
-                    Err(e) => error = Some(e),
                 }
             }
 
@@ -133,9 +198,47 @@ pub fn run_login_flow() -> String {
         });
     });
 
-    let session_token = token
-        .borrow_mut()
-        .take()
-        .expect("login flow closed without producing a session token");
-    session_token
+    let produced = token.borrow_mut().take();
+    match produced {
+        Some(session_token) => session_token,
+        None => {
+            // The user closed the window with the X button rather than
+            // completing the flow. There is nothing sensible to continue with
+            // -- every downstream operation needs a session -- so exit
+            // cleanly with a logged reason instead of a raw panic backtrace.
+            log::error!("login window was closed without producing a session token; exiting");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unlocked_status() {
+        assert_eq!(
+            parse_bw_status(r#"{"status":"unlocked","userEmail":"a@b.c"}"#),
+            BwStatus::Unlocked
+        );
+    }
+
+    #[test]
+    fn parses_locked_status() {
+        assert_eq!(
+            parse_bw_status(r#"{"status":"locked"}"#),
+            BwStatus::Locked
+        );
+    }
+
+    #[test]
+    fn treats_unauthenticated_and_unparseable_output_as_unauthenticated() {
+        assert_eq!(
+            parse_bw_status(r#"{"status":"unauthenticated"}"#),
+            BwStatus::Unauthenticated
+        );
+        assert_eq!(parse_bw_status(""), BwStatus::Unauthenticated);
+        assert_eq!(parse_bw_status("command not found"), BwStatus::Unauthenticated);
+    }
 }

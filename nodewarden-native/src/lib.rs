@@ -13,6 +13,7 @@ pub mod app;
 pub mod app_match;
 pub mod hotkey;
 pub mod injector;
+pub mod logging;
 pub mod login_ui;
 pub mod match_engine;
 pub mod overlay_ui;

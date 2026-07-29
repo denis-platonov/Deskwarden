@@ -9,7 +9,7 @@ use nodewarden_native::app::{
 use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
 use nodewarden_native::match_engine::MatchEngine;
 use nodewarden_native::vault_bridge::VaultBridge;
-use nodewarden_native::{hotkey, login_ui, session_store, tray, window_watch};
+use nodewarden_native::{hotkey, logging, login_ui, session_store, tray, window_watch};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -24,14 +24,27 @@ fn main() {
         .to_path_buf();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
 
+    // Logging first: a background tray app has no console, so without a log
+    // file every failure below is invisible to whoever has to diagnose it.
+    match logging::init(&config_dir) {
+        Ok(path) => log::info!("nodewarden-native starting; logging to {}", path.display()),
+        Err(e) => eprintln!("warning: {e}"),
+    }
+
     let session_path = config_dir.join("session.bin");
     let store = session_store::SessionStore::new(session_path);
 
     let session_token = match store.load() {
-        Some(token) => token,
+        Some(token) => {
+            log::info!("loaded cached session token");
+            token
+        }
         None => {
+            log::info!("no cached session token; showing login flow");
             let token = login_ui::run_login_flow();
-            store.save(&token).expect("failed to persist session token");
+            if let Err(e) = store.save(&token) {
+                log::error!("failed to persist session token: {e}");
+            }
             token
         }
     };
@@ -41,7 +54,10 @@ fn main() {
 
     let vault = VaultBridge::new(BW_SERVE_URL);
     let mut engine = MatchEngine::new();
-    let _ = refresh_match_engine(&vault, &mut engine);
+    match refresh_match_engine(&vault, &mut engine) {
+        Ok(count) => log::info!("match engine loaded with {count} app match(es)"),
+        Err(e) => log::error!("failed to load match engine from vault: {e:?}"),
+    }
 
     let injector = Injector { ui: RealUiAutomation, fallback: RealSendInput };
 
@@ -85,7 +101,10 @@ fn main() {
                 // process may already be gone (e.g. crashed, or killed
                 // externally), so a `kill()` error is expected and ignored
                 // rather than treated as fatal.
-                let _ = bw_serve.kill();
+                log::info!("quit requested from tray; killing bw serve");
+                if let Err(e) = bw_serve.kill() {
+                    log::warn!("bw serve kill on quit failed (already gone?): {e}");
+                }
                 std::process::exit(0);
             }
         }
@@ -133,11 +152,19 @@ fn main() {
 }
 
 fn spawn_bw_serve(session_token: &str) -> Child {
-    Command::new("bw")
+    match Command::new("bw")
         .args(["serve", "--port", "8087"])
         .env("BW_SESSION", session_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn `bw serve` (is the Bitwarden CLI installed and on PATH?)")
+    {
+        Ok(child) => child,
+        Err(e) => {
+            log::error!(
+                "failed to spawn `bw serve` (is the Bitwarden CLI installed and on PATH?): {e}"
+            );
+            std::process::exit(1);
+        }
+    }
 }

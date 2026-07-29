@@ -60,11 +60,13 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
         Ok(items) => match items.iter().find(|i| i.id == item_id) {
             Some(item) => {
                 let (username, password) = credentials_for(item);
-                let _ = injector.fill(hwnd, &username, &password);
+                if let Err(e) = injector.fill(hwnd, &username, &password) {
+                    log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
+                }
             }
-            None => {}
+            None => log::warn!("vault item {item_id} no longer exists; nothing filled"),
         },
-        Err(_) => {}
+        Err(e) => log::error!("could not read vault to fill item {item_id}: {e:?}"),
     }
 }
 
