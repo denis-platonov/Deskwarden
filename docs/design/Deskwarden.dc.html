@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="design_doc_mode" content="canvas">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap">
+<style>
+  html, body { margin: 0; padding: 0; background: #f3f2f2; color: #201e1d; font-family: "Archivo", system-ui, sans-serif; -webkit-font-smoothing: antialiased; }
+  a { color: #14307a; text-decoration: none; border-bottom: 2px solid #1b3fa0; }
+  a:hover { color: #1b3fa0; }
+  ::selection { background: #b8c7ea; }
+</style>
+</helmet>
+
+<section style="padding: 72px 72px 96px; display: flex; flex-direction: column; gap: 48px">
+  <div style="display: flex; flex-direction: column; gap: 16px; max-width: 900px">
+    <div style="display: flex; align-items: center; gap: 12px">
+      <div style="width: 26px; height: 26px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+      <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase">Deskwarden</div>
+      <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #605d5d; letter-spacing: 0.06em">TURN 3 · STATES, PREFERENCES, MACOS</div>
+    </div>
+    <div style="height: 1px; background: #dedbd9"></div>
+    <h1 style="margin: 0; font-size: 42px; line-height: 1.03; font-weight: 800; letter-spacing: -0.02em; max-width: 24ch">The rest of the overlay's life</h1>
+    <p style="margin: 0; font-size: 15px; line-height: 1.55; max-width: 62ch; color: #444141; text-wrap: pretty">Four states the overlay has to handle — <a href="#3a">3a</a> nothing matches, <a href="#3b">3b</a> vault locked, <a href="#3c">3c</a> save a new login, <a href="#3d">3d</a> fill a generated password — plus <a href="#3e">3e</a> preferences and <a href="#3f">3f</a> the macOS vault window. Same 2a/2b language throughout.</p>
+  </div>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 40px; align-items: flex-start">
+
+    <div id="3g" style="display: flex; flex-direction: column; gap: 14px; width: 1000px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3g</div>
+        <div style="font-size: 18px; font-weight: 800; letter-spacing: -0.01em">The mark</div>
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">QUARTERED SHIELD — FOUR VAULTS, ONE GUARD</div>
+      </div>
+      <div style="background: #ffffff; border: 1px solid #dedbd9; border-radius: 12px; padding: 28px; display: flex; flex-wrap: wrap; gap: 44px; align-items: flex-start">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Lockup</div>
+          <div style="display: flex; align-items: center; gap: 14px">
+            <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="display: flex; flex-direction: column; gap: 3px">
+              <div style="font-size: 28px; font-weight: 800; letter-spacing: -0.03em; line-height: 1">Deskwarden</div>
+              <div style="font-size: 11px; font-weight: 600; letter-spacing: 0.16em; text-transform: uppercase; color: #7d7979">Fills native windows</div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: flex-end; gap: 14px; padding-top: 4px">
+            <div style="width: 40px; height: 40px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div><div style="width: 28px; height: 28px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div><div style="width: 20px; height: 20px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div><div style="width: 14px; height: 14px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="font-size: 12px; color: #7d7979; padding-bottom: 2px">Holds at 14px — tray, field badge, favicon</div>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Variants</div>
+          <div style="display: flex; gap: 14px; align-items: center">
+            <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#14307a"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#14307a"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#14307a"></path></svg></div>
+            <div style="width: 48px; height: 48px; background: #1b3fa0; border-radius: 12px; padding: 6px; box-sizing: border-box; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#ffffff"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#ffffff"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#ffffff"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#ffffff"></path></svg></div>
+            <div style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#201e1d"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#201e1d"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#201e1d"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#201e1d"></path></svg></div>
+          </div>
+          <div style="display: flex; gap: 14px; font-size: 11px; color: #9b9797; text-align: center">
+            <div style="width: 48px">Full</div>
+            <div style="width: 48px">Solid</div>
+            <div style="width: 62px">Reversed</div>
+            <div style="width: 48px">Ink</div>
+          </div>
+          <div style="font-size: 12px; color: #7d7979; line-height: 1.55; max-width: 36ch">Four quarters for the four vault kinds — logins, passkeys, cards, notes. Solid or ink below 16px and for monochrome tray icons.</div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Palette</div>
+          <div style="display: flex; gap: 10px">
+            <div style="display: flex; flex-direction: column; gap: 6px"><div style="width: 56px; height: 40px; border-radius: 8px; background: #14307a"></div><div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979">14307A</div></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><div style="width: 56px; height: 40px; border-radius: 8px; background: #1b3fa0"></div><div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979">1B3FA0</div></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><div style="width: 56px; height: 40px; border-radius: 8px; background: #3b74e8"></div><div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979">3B74E8</div></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><div style="width: 56px; height: 40px; border-radius: 8px; background: #7fa4ef"></div><div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979">7FA4EF</div></div>
+          </div>
+          <div style="font-size: 12px; color: #7d7979; line-height: 1.55; max-width: 30ch">One hue, four values — reads as a single blue at icon size, resolves into quarters when large.</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="3a" style="display: flex; flex-direction: column; gap: 12px; width: 470px">
+      <div style="display: flex; align-items: baseline; gap: 10px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3a</div>
+        <div style="font-size: 17px; font-weight: 800; letter-spacing: -0.01em">No match</div>
+      </div>
+      <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #605d5d">Deskwarden knows the app but has nothing for it. One primary path, one escape.</p>
+      <div style="background: #ffffff; border: 1px solid #dedbd9; border-radius: 10px; padding: 22px; display: flex; flex-direction: column; gap: 12px">
+        <div style="font-size: 12px; color: #7d7979">Licence key</div>
+        <div style="height: 38px; border: 1px solid #1b3fa0; border-radius: 8px; box-shadow: 0 0 0 3px #dbe4f7; display: flex; align-items: center; padding: 0 10px; gap: 8px">
+          <div style="width: 1px; height: 17px; background: #201e1d"></div>
+          <div style="flex: 1"></div>
+          <div style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+        </div>
+        <div style="border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px 20px rgba(45, 43, 43, 0.12); overflow: hidden">
+          <div style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid #eae7e7">
+            <div style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #444141">Deskwarden</div>
+            <div style="flex: 1"></div>
+            <div style="font-size: 11px; color: #9b9797">Atlas Licence.exe</div>
+          </div>
+          <div style="padding: 20px 14px; display: flex; flex-direction: column; gap: 12px; align-items: flex-start">
+            <div style="font-size: 14px; font-weight: 700">No saved login for this app</div>
+            <div style="font-size: 12px; color: #7d7979; line-height: 1.5">Search the vault, or create an item that fills here from now on.</div>
+            <div style="display: flex; gap: 8px">
+              <div style="height: 30px; padding: 0 12px; border-radius: 7px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">Search vault <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.8">/</span></div>
+              <div style="height: 30px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">New login <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #9b9797">CTRL+N</span></div>
+            </div>
+          </div>
+          <sc-if value="{{ showKeyboardHints }}" hint-placeholder-val="{{ true }}">
+            <div style="display: flex; gap: 14px; padding: 8px 12px; border-top: 1px solid #eae7e7; background: #fbfaf9; font-size: 11px; color: #7d7979">
+              <div>/ Search</div>
+              <div>Esc Dismiss</div>
+              <div>Ctrl+⇧+D Never here</div>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+
+    <div id="3b" style="display: flex; flex-direction: column; gap: 12px; width: 470px">
+      <div style="display: flex; align-items: baseline; gap: 10px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3b</div>
+        <div style="font-size: 17px; font-weight: 800; letter-spacing: -0.01em">Locked</div>
+      </div>
+      <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #605d5d">Matches are counted but never named until the vault opens. Biometric first, PIN as fallback.</p>
+      <div style="background: #ffffff; border: 1px solid #dedbd9; border-radius: 10px; padding: 22px; display: flex; flex-direction: column; gap: 12px">
+        <div style="font-size: 12px; color: #7d7979">User name</div>
+        <div style="height: 38px; border: 1px solid #1b3fa0; border-radius: 8px; box-shadow: 0 0 0 3px #dbe4f7; display: flex; align-items: center; padding: 0 10px; gap: 8px">
+          <div style="width: 1px; height: 17px; background: #201e1d"></div>
+          <div style="flex: 1"></div>
+          <div style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+        </div>
+        <div style="border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px 20px rgba(45, 43, 43, 0.12); overflow: hidden">
+          <div style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid #eae7e7">
+            <div style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #444141">Deskwarden</div>
+            <div style="flex: 1"></div>
+            <div style="font-size: 11px; color: #14307a; background: #eef2fc; border-radius: 999px; padding: 2px 8px">Locked</div>
+          </div>
+          <div style="padding: 20px 14px; display: flex; flex-direction: column; gap: 14px; align-items: flex-start">
+            <div style="display: flex; flex-direction: column; gap: 4px">
+              <div style="font-size: 14px; font-weight: 700">3 logins for Ledgerline Desktop</div>
+              <div style="font-size: 12px; color: #7d7979; line-height: 1.5">Unlock to see and fill them.</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px; border-radius: 8px; background: #eef2fc">
+              <div style="width: 30px; height: 30px; border-radius: 8px; border: 1px solid #b8c7ea; background: #ffffff; display: flex; align-items: center; justify-content: center">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#1b3fa0" stroke-width="2"><rect x="4" y="10" width="16" height="10" rx="2"></rect><path d="M8 10V7a4 4 0 0 1 8 0v3"></path></svg>
+              </div>
+              <div style="font-size: 13px; font-weight: 600; color: #14307a; flex: 1">Confirm with Windows Hello</div>
+              <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #1b3fa0; background: #ffffff; border-radius: 5px; padding: 3px 7px">↵</div>
+            </div>
+            <div style="font-size: 12px; color: #7d7979">Or <span style="color: #14307a; font-weight: 600">enter PIN</span> · vault re-locks after 15 min idle</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="3c" style="display: flex; flex-direction: column; gap: 12px; width: 470px">
+      <div style="display: flex; align-items: baseline; gap: 10px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3c</div>
+        <div style="font-size: 17px; font-weight: 800; letter-spacing: -0.01em">Save a new login</div>
+      </div>
+      <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #605d5d">After a successful sign-in Deskwarden offers to remember it, pre-filled and editable in place.</p>
+      <div style="background: #ffffff; border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px 20px rgba(45, 43, 43, 0.12); overflow: hidden">
+        <div style="display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #eae7e7">
+          <div style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+          <div style="font-size: 13px; font-weight: 700">Save this login?</div>
+          <div style="flex: 1"></div>
+          <div style="font-size: 12px; color: #9b9797">✕</div>
+        </div>
+        <div style="padding: 14px; display: flex; flex-direction: column; gap: 10px">
+          <div style="display: flex; align-items: center; gap: 12px">
+            <div style="width: 80px; font-size: 12px; color: #7d7979">App</div>
+            <div style="flex: 1; display: flex; align-items: center; gap: 8px">
+              <div style="width: 22px; height: 22px; border-radius: 6px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 9px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">TR</div>
+              <div style="font-size: 13px; font-weight: 600">Tracker Desktop</div>
+              <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979; background: #f3f2f2; border-radius: 5px; padding: 2px 6px">tracker.exe</div>
+            </div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <div style="width: 80px; font-size: 12px; color: #7d7979">Username</div>
+            <div style="flex: 1; height: 32px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; padding: 0 10px; font-size: 13px">a.novak@ledgerline.com</div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <div style="width: 80px; font-size: 12px; color: #7d7979">Password</div>
+            <div style="flex: 1; height: 32px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; letter-spacing: 0.08em">••••••••••<span style="font-family: Archivo, sans-serif; font-size: 11px; color: #14307a; font-weight: 600; letter-spacing: 0">Reveal</span></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 12px">
+            <div style="width: 80px; font-size: 12px; color: #7d7979">Folder</div>
+            <div style="flex: 1; height: 32px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; font-size: 13px">Engineering<span style="font-size: 10px; color: #9b9797">▾</span></div>
+          </div>
+        </div>
+        <div style="padding: 12px 14px; border-top: 1px solid #eae7e7; background: #fbfaf9; display: flex; align-items: center; gap: 8px">
+          <div style="height: 30px; padding: 0 12px; border-radius: 7px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">Save <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.8">↵</span></div>
+          <div style="height: 30px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px; font-weight: 600">Not now</div>
+          <div style="flex: 1"></div>
+          <div style="font-size: 12px; color: #7d7979">Never for this app</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="3d" style="display: flex; flex-direction: column; gap: 12px; width: 470px">
+      <div style="display: flex; align-items: baseline; gap: 10px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3d</div>
+        <div style="font-size: 17px; font-weight: 800; letter-spacing: -0.01em">Generate &amp; fill</div>
+      </div>
+      <p style="margin: 0; font-size: 13px; line-height: 1.5; color: #605d5d">On a password field with no match, the overlay leads with a fresh password — fill and save in one keystroke.</p>
+      <div style="background: #ffffff; border: 1px solid #dedbd9; border-radius: 10px; padding: 22px; display: flex; flex-direction: column; gap: 12px">
+        <div style="font-size: 12px; color: #7d7979">New password</div>
+        <div style="height: 38px; border: 1px solid #1b3fa0; border-radius: 8px; box-shadow: 0 0 0 3px #dbe4f7; display: flex; align-items: center; padding: 0 10px; gap: 8px">
+          <div style="width: 1px; height: 17px; background: #201e1d"></div>
+          <div style="flex: 1"></div>
+          <div style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+        </div>
+        <div style="border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px 20px rgba(45, 43, 43, 0.12); overflow: hidden">
+          <div style="padding: 14px; display: flex; flex-direction: column; gap: 12px">
+            <div style="display: flex; align-items: center; justify-content: space-between">
+              <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #7d7979">Generated</div>
+              <div style="font-size: 11px; color: #14307a; background: #eef2fc; border-radius: 999px; padding: 2px 8px; font-weight: 600">Strong</div>
+            </div>
+            <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; letter-spacing: 0.02em; word-break: break-all; line-height: 1.35">tq7<span style="color: #1b3fa0">R</span>vk2<span style="color: #1b3fa0">9</span>mzp<span style="color: #1b3fa0">L</span>x4<span style="color: #1b3fa0">-</span>hd8</div>
+            <div style="display: flex; align-items: center; gap: 10px">
+              <div style="display: flex; border: 1px solid #d7d3d3; border-radius: 7px; overflow: hidden">
+                <div style="padding: 5px 11px; background: #1b3fa0; color: #ffffff; font-size: 12px; font-weight: 600">Words</div>
+                <div style="padding: 5px 11px; border-left: 1px solid #d7d3d3; font-size: 12px">Letters</div>
+                <div style="padding: 5px 11px; border-left: 1px solid #d7d3d3; font-size: 12px">PIN</div>
+              </div>
+              <div style="font-size: 12px; color: #7d7979">20 chars</div>
+              <div style="flex: 1"></div>
+              <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #14307a; font-weight: 600">CTRL+R NEW</div>
+            </div>
+          </div>
+          <div style="padding: 12px 14px; border-top: 1px solid #eae7e7; background: #fbfaf9; display: flex; align-items: center; gap: 8px">
+            <div style="height: 30px; padding: 0 12px; border-radius: 7px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">Fill &amp; save to vault <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.8">↵</span></div>
+            <div style="height: 30px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px; font-weight: 600">Copy</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="3e" style="display: flex; flex-direction: column; gap: 14px; width: 1000px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <div style="background: #201e1d; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3e</div>
+        <div style="font-size: 18px; font-weight: 800; letter-spacing: -0.01em">Preferences — Autofill</div>
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">MACOS</div>
+      </div>
+      <div style="border: 1px solid #dedbd9; border-radius: 12px; overflow: hidden; background: #f7f6f5; box-shadow: 0 10px 30px rgba(45, 43, 43, 0.14); display: flex; flex-direction: column; height: 700px">
+        <div style="height: 44px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 8px; padding: 0 14px">
+          <div style="width: 11px; height: 11px; border-radius: 999px; background: #1b3fa0"></div>
+          <div style="width: 11px; height: 11px; border-radius: 999px; background: #d7d3d3"></div>
+          <div style="width: 11px; height: 11px; border-radius: 999px; background: #d7d3d3"></div>
+          <div style="flex: 1; text-align: center; font-size: 13px; font-weight: 700; margin-right: 57px">Preferences</div>
+        </div>
+        <div style="flex: 1; display: grid; grid-template-columns: 208px 1fr; min-height: 0">
+          <div style="background: #ffffff; border-right: 1px solid #eae7e7; padding: 14px 10px; display: flex; flex-direction: column; gap: 2px">
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">General</div>
+            <div style="padding: 8px 10px; border-radius: 8px; background: #eef2fc; color: #14307a; font-size: 13px; font-weight: 700">Autofill</div>
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">Native apps</div>
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">Security</div>
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">Shortcuts</div>
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">Sync &amp; account</div>
+            <div style="padding: 8px 10px; border-radius: 8px; font-size: 13px">About</div>
+            <div style="flex: 1"></div>
+            <div style="padding: 10px; font-size: 11px; color: #9b9797; line-height: 1.6">Deskwarden 1.4.0<br>Bitwarden account linked</div>
+          </div>
+          <div style="padding: 24px 28px; display: flex; flex-direction: column; gap: 16px; overflow: hidden">
+            <div style="display: flex; flex-direction: column; gap: 4px">
+              <div style="font-size: 24px; font-weight: 800; letter-spacing: -0.02em">Autofill</div>
+              <div style="font-size: 13px; color: #7d7979">How Deskwarden behaves when a native login field takes focus.</div>
+            </div>
+            <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+              <div style="display: flex; align-items: center; gap: 20px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+                  <div style="font-size: 14px; font-weight: 600">Show the overlay when a login field is focused</div>
+                  <div style="font-size: 12px; color: #7d7979">Off means the overlay only opens on the hotkey.</div>
+                </div>
+                <div style="width: 40px; height: 22px; border-radius: 999px; background: #1b3fa0; display: flex; justify-content: flex-end; align-items: center; padding: 2px"><div style="width: 18px; height: 18px; border-radius: 999px; background: #ffffff"></div></div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 20px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+                  <div style="font-size: 14px; font-weight: 600">Fill and submit on Tab</div>
+                  <div style="font-size: 12px; color: #7d7979">Enter fills only; Tab also presses the app's default button.</div>
+                </div>
+                <div style="width: 40px; height: 22px; border-radius: 999px; background: #1b3fa0; display: flex; justify-content: flex-end; align-items: center; padding: 2px"><div style="width: 18px; height: 18px; border-radius: 999px; background: #ffffff"></div></div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 20px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+                  <div style="font-size: 14px; font-weight: 600">Require Touch ID before filling</div>
+                  <div style="font-size: 12px; color: #7d7979">Windows Hello on Windows. Applies to passwords and one-time codes.</div>
+                </div>
+                <div style="width: 40px; height: 22px; border-radius: 999px; background: #1b3fa0; display: flex; justify-content: flex-end; align-items: center; padding: 2px"><div style="width: 18px; height: 18px; border-radius: 999px; background: #ffffff"></div></div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 20px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+                  <div style="font-size: 14px; font-weight: 600">Copy the one-time code after filling</div>
+                  <div style="font-size: 12px; color: #7d7979">Clipboard clears after 30 seconds.</div>
+                </div>
+                <div style="width: 40px; height: 22px; border-radius: 999px; background: #e4e2e0; display: flex; justify-content: flex-start; align-items: center; padding: 2px"><div style="width: 18px; height: 18px; border-radius: 999px; background: #ffffff"></div></div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 20px; padding: 13px 16px">
+                <div style="flex: 1; display: flex; flex-direction: column; gap: 2px">
+                  <div style="font-size: 14px; font-weight: 600">Overlay position</div>
+                  <div style="font-size: 12px; color: #7d7979">Falls back automatically near a screen edge.</div>
+                </div>
+                <div style="display: flex; border: 1px solid #d7d3d3; border-radius: 7px; overflow: hidden">
+                  <div style="padding: 5px 11px; background: #1b3fa0; color: #ffffff; font-size: 12px; font-weight: 600">Below field</div>
+                  <div style="padding: 5px 11px; border-left: 1px solid #d7d3d3; font-size: 12px">Above</div>
+                  <div style="padding: 5px 11px; border-left: 1px solid #d7d3d3; font-size: 12px">At cursor</div>
+                </div>
+              </div>
+            </div>
+
+            <div style="display: flex; align-items: center; justify-content: space-between">
+              <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #7d7979">Per-app behaviour</div>
+              <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; background: #ffffff; display: flex; align-items: center; font-size: 12px; font-weight: 600">+ Add app</div>
+            </div>
+            <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+              <div style="display: grid; grid-template-columns: 1.3fr 1.4fr 0.9fr; padding: 9px 16px; border-bottom: 1px solid #eae7e7; background: #fbfaf9; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #9b9797">
+                <div>Application</div>
+                <div>Matched by</div>
+                <div>On focus</div>
+              </div>
+              <div style="display: grid; grid-template-columns: 1.3fr 1.4fr 0.9fr; align-items: center; padding: 11px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="font-size: 13px; font-weight: 600">Ledgerline Desktop</div>
+                <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #605d5d">ledgerline.exe</div>
+                <div><span style="font-size: 11px; font-weight: 600; color: #14307a; background: #eef2fc; border-radius: 999px; padding: 3px 9px">Show list</span></div>
+              </div>
+              <div style="display: grid; grid-template-columns: 1.3fr 1.4fr 0.9fr; align-items: center; padding: 11px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="font-size: 13px; font-weight: 600">Vantage VPN</div>
+                <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #605d5d">io.vantage.client</div>
+                <div><span style="font-size: 11px; font-weight: 600; color: #444141; background: #f3f2f2; border-radius: 999px; padding: 3px 9px">Best match</span></div>
+              </div>
+              <div style="display: grid; grid-template-columns: 1.3fr 1.4fr 0.9fr; align-items: center; padding: 11px 16px; border-bottom: 1px solid #f3f2f2">
+                <div style="font-size: 13px; font-weight: 600">Remote Desktop</div>
+                <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #605d5d">mstsc.exe</div>
+                <div><span style="font-size: 11px; font-weight: 600; color: #7d7979; background: #f3f2f2; border-radius: 999px; padding: 3px 9px">Hotkey only</span></div>
+              </div>
+              <div style="display: grid; grid-template-columns: 1.3fr 1.4fr 0.9fr; align-items: center; padding: 11px 16px">
+                <div style="font-size: 13px; font-weight: 600">Banking apps (4)</div>
+                <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #605d5d">group</div>
+                <div><span style="font-size: 11px; font-weight: 600; color: #7d7979; background: #f3f2f2; border-radius: 999px; padding: 3px 9px">Never</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="3f" style="display: flex; flex-direction: column; gap: 14px; width: 1180px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <div style="background: #201e1d; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">3f</div>
+        <div style="font-size: 18px; font-weight: 800; letter-spacing: -0.01em">Vault window — macOS</div>
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">UNIFIED TOOLBAR, ⌘ SHORTCUTS</div>
+      </div>
+      <div style="border: 1px solid #dedbd9; border-radius: 12px; overflow: hidden; background: #f7f6f5; box-shadow: 0 10px 30px rgba(45, 43, 43, 0.14); display: flex; flex-direction: column; height: 700px">
+        <div style="height: 50px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: grid; grid-template-columns: 212px 1fr; align-items: center">
+          <div style="display: flex; align-items: center; gap: 8px; padding: 0 14px">
+            <div style="width: 11px; height: 11px; border-radius: 999px; background: #1b3fa0"></div>
+            <div style="width: 11px; height: 11px; border-radius: 999px; background: #d7d3d3"></div>
+            <div style="width: 11px; height: 11px; border-radius: 999px; background: #d7d3d3"></div>
+            <div style="flex: 1"></div>
+            <div style="width: 22px; height: 22px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 10px; padding: 0 16px">
+            <div style="width: 300px; height: 30px; border: 1px solid #d7d3d3; border-radius: 999px; display: flex; align-items: center; gap: 8px; padding: 0 12px">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#9b9797" stroke-width="2.2"><circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line></svg>
+              <div style="font-size: 13px; color: #9b9797; flex: 1">Search vault</div>
+              <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #9b9797">⌘K</div>
+            </div>
+            <div style="flex: 1"></div>
+            <div style="height: 30px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 8px; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">Lock <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #9b9797">⌘L</span></div>
+            <div style="height: 30px; padding: 0 12px; border-radius: 8px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">+ New <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.8">⌘N</span></div>
+            <div style="width: 28px; height: 28px; border-radius: 999px; background: #201e1d; color: #ffffff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">AN</div>
+          </div>
+        </div>
+        <div style="flex: 1; display: grid; grid-template-columns: 212px 380px 1fr; min-height: 0">
+          <div style="background: #fbfaf9; border-right: 1px solid #eae7e7; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px">
+            <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Vault</div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">All items <span style="font-size: 11px; color: #9b9797">214</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Favorites <span style="font-size: 11px; color: #9b9797">12</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; background: #eef2fc; color: #14307a; font-size: 13px; font-weight: 700">Logins <span style="font-size: 11px">180</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Passkeys <span style="font-size: 11px; color: #9b9797">9</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Cards <span style="font-size: 11px; color: #9b9797">4</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Secure notes <span style="font-size: 11px; color: #9b9797">21</span></div>
+            <div style="height: 1px; background: #eae7e7; margin: 12px 8px"></div>
+            <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Folders</div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Engineering <span style="font-size: 11px; color: #9b9797">64</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Personal <span style="font-size: 11px; color: #9b9797">98</span></div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 7px 10px; border-radius: 8px; font-size: 13px">Shared with me <span style="font-size: 11px; color: #9b9797">52</span></div>
+            <div style="flex: 1"></div>
+            <div style="padding: 10px; font-size: 11px; color: #9b9797">Locks in 11:42</div>
+          </div>
+          <div style="border-right: 1px solid #eae7e7; padding: 10px; display: flex; flex-direction: column; gap: 6px; overflow: hidden; background: #ffffff">
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px; background: #eef2fc">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #ffffff; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center">VT</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 700; color: #14307a">Vantage VPN</div>
+                <div style="font-size: 11px; color: #605d5d">a.novak@vantage.io</div>
+              </div>
+              <div style="font-size: 10px; color: #14307a; background: #dbe4f7; border-radius: 5px; padding: 2px 6px">app</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">AT</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 600">Atlas Studio</div>
+                <div style="font-size: 11px; color: #7d7979">a.novak@studio.atlas.com</div>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">LG</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 600">Ledgerline</div>
+                <div style="font-size: 11px; color: #7d7979">a.novak@ledgerline.com</div>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">GH</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 600">Git Host</div>
+                <div style="font-size: 11px; color: #7d7979">anovak</div>
+              </div>
+              <div style="font-size: 10px; color: #605d5d; background: #f3f2f2; border-radius: 5px; padding: 2px 6px">2FA</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">SL</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 600">Studio Licence Server</div>
+                <div style="font-size: 11px; color: #7d7979">licence@studio.atlas.com</div>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border-radius: 10px">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">TR</div>
+              <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                <div style="font-size: 13px; font-weight: 600">Tracker</div>
+                <div style="font-size: 11px; color: #7d7979">a.novak@ledgerline.com</div>
+              </div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; min-height: 0">
+            <div style="padding: 18px 24px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 14px">
+              <div style="width: 42px; height: 42px; border-radius: 10px; background: #eef2fc; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: center">VT</div>
+              <div style="display: flex; flex-direction: column; gap: 3px; flex: 1">
+                <div style="font-size: 21px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1">Vantage VPN</div>
+                <div style="font-size: 12px; color: #7d7979">Login · Personal</div>
+              </div>
+              <div style="height: 32px; padding: 0 14px; border-radius: 8px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600">Fill in app <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.85">⌘⇧F</span></div>
+              <div style="height: 32px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px; display: flex; align-items: center; font-size: 13px; font-weight: 600">Edit</div>
+            </div>
+            <div style="padding: 18px 24px; display: flex; flex-direction: column; gap: 14px">
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+                <div style="padding: 11px 16px; border-bottom: 1px solid #eae7e7; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #605d5d">Login credentials</div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">Username</div>
+                  <div style="flex: 1; font-size: 14px">a.novak@vantage.io</div>
+                  <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">⌘B</div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">Password</div>
+                  <div style="flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; letter-spacing: 0.08em">••••••••••••</div>
+                  <div style="display: flex; gap: 8px">
+                    <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Reveal</div>
+                    <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">⌘C</div>
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">One-time code</div>
+                  <div style="flex: 1; display: flex; align-items: center; gap: 12px">
+                    <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; font-weight: 600; letter-spacing: 0.12em">309 774</div>
+                    <div style="width: 96px; height: 4px; border-radius: 2px; background: #eae7e7"><div style="width: 35%; height: 4px; border-radius: 2px; background: #1b3fa0"></div></div>
+                    <div style="font-size: 11px; color: #7d7979">11s</div>
+                  </div>
+                  <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">⌘T</div>
+                </div>
+              </div>
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+                <div style="padding: 11px 16px; border-bottom: 1px solid #eae7e7; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #605d5d">Autofill targets</div>
+                <div style="display: flex; align-items: flex-start; gap: 16px; padding: 13px 16px">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979; padding-top: 4px">Mac apps</div>
+                  <div style="flex: 1; display: flex; flex-wrap: wrap; gap: 8px">
+                    <div style="padding: 4px 9px; border-radius: 999px; background: #f3f2f2; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #444141">io.vantage.client</div>
+                    <div style="padding: 4px 9px; border-radius: 999px; background: #f3f2f2; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #444141">vantage.io</div>
+                    <div style="padding: 4px 9px; border-radius: 999px; border: 1px dashed #bab6b6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">+ add</div>
+                  </div>
+                </div>
+              </div>
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; padding: 13px 16px; display: flex; gap: 28px; font-size: 12px; color: #7d7979">
+                <div>Updated yesterday</div>
+                <div>Filled 12 times</div>
+                <div>Strength: strong</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<section style="padding: 72px 72px 96px; display: flex; flex-direction: column; gap: 56px">
+  <div style="display: flex; flex-direction: column; gap: 16px; max-width: 900px">
+    <div style="display: flex; align-items: center; gap: 12px">
+      <div style="width: 26px; height: 26px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+      <div style="font-size: 13px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase">Deskwarden</div>
+      <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #605d5d; letter-spacing: 0.06em">TURN 2 · SOFTER, SIMPLER</div>
+    </div>
+    <div style="height: 1px; background: #dedbd9"></div>
+    <h1 style="margin: 0; font-size: 42px; line-height: 1.03; font-weight: 800; letter-spacing: -0.02em; max-width: 24ch">Calmer surfaces, familiar structure</h1>
+    <p style="margin: 0; font-size: 15px; line-height: 1.55; max-width: 62ch; color: #444141; text-wrap: pretty">Same skeleton as the apps you shared — sidebar, item list, grouped detail cards — but softened: white cards on warm grey, hairline borders, 8px corners, and red used only where it means something. <a href="#2a">2a</a> is the overlay, <a href="#2b">2b</a> the vault window.</p>
+  </div>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 48px; align-items: flex-start">
+
+    <div id="2a" style="display: flex; flex-direction: column; gap: 14px; width: 720px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <div style="background: #1b3fa0; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">2a</div>
+        <div style="font-size: 18px; font-weight: 800; letter-spacing: -0.01em">Autofill overlay</div>
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">3 ROWS, NO CHROME</div>
+      </div>
+
+      <div style="position: relative; border: 1px solid #dedbd9; border-radius: 10px; overflow: hidden; background: #ffffff; box-shadow: 0 8px 24px rgba(45, 43, 43, 0.12)">
+        <div style="height: 38px; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; justify-content: space-between; padding-left: 14px; background: #fbfaf9">
+          <div style="font-size: 12px; font-weight: 600; color: #444141">Ledgerline Desktop — Sign in</div>
+          <div style="display: flex; font-size: 11px; color: #7d7979">
+            <div style="width: 40px; display: flex; align-items: center; justify-content: center">—</div>
+            <div style="width: 40px; display: flex; align-items: center; justify-content: center">▢</div>
+            <div style="width: 40px; display: flex; align-items: center; justify-content: center">✕</div>
+          </div>
+        </div>
+        <div style="padding: 34px 36px; display: flex; flex-direction: column; gap: 22px; min-height: 360px">
+          <div style="font-size: 18px; font-weight: 700; letter-spacing: -0.01em">Sign in to Ledgerline</div>
+          <div style="display: flex; flex-direction: column; gap: 7px">
+            <div style="font-size: 12px; color: #605d5d">User name</div>
+            <div style="width: 380px; height: 38px; border: 1px solid #1b3fa0; border-radius: 8px; background: #ffffff; display: flex; align-items: center; padding: 0 10px; gap: 8px; box-shadow: 0 0 0 3px #dbe4f7">
+              <div style="width: 1px; height: 17px; background: #201e1d"></div>
+              <div style="flex: 1"></div>
+              <div style="width: 18px; height: 18px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            </div>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 7px; opacity: 0.5">
+            <div style="font-size: 12px; color: #605d5d">Password</div>
+            <div style="width: 380px; height: 38px; border: 1px solid #d7d3d3; border-radius: 8px; background: #ffffff"></div>
+          </div>
+        </div>
+
+        <div style="position: absolute; left: 36px; top: 206px; width: 380px; background: #ffffff; border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 12px 28px rgba(45, 43, 43, 0.18); overflow: hidden">
+          <div style="display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid #eae7e7">
+            <div style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+            <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #444141">Deskwarden</div>
+            <div style="flex: 1"></div>
+            <div style="font-size: 11px; color: #9b9797">3 matches</div>
+          </div>
+          <div style="padding: 6px">
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px; background: #eef2fc">
+              <div style="width: 28px; height: 28px; border-radius: 7px; background: #ffffff; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">LG</div>
+              <div style="display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0">
+                <div style="font-size: 13px; font-weight: 600">a.novak@ledgerline.com</div>
+                <div style="font-size: 11px; color: #7d7979">Ledgerline</div>
+              </div>
+              <sc-if value="{{ showTotpRow }}" hint-placeholder-val="{{ true }}">
+                <div style="display: flex; align-items: center; gap: 7px">
+                  <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 600; color: #14307a">482 913</div>
+                  <div style="width: 26px; height: 3px; border-radius: 2px; background: #b8c7ea"><div style="width: 60%; height: 3px; border-radius: 2px; background: #1b3fa0"></div></div>
+                </div>
+              </sc-if>
+              <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #ffffff; background: #1b3fa0; border-radius: 4px; padding: 2px 6px">↵</div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px">
+              <div style="width: 28px; height: 28px; border-radius: 7px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 11px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">LG</div>
+              <div style="display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0">
+                <div style="font-size: 13px">deploy-bot@ledgerline.com</div>
+                <div style="font-size: 11px; color: #9b9797">Shared with me</div>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 8px">
+              <div style="width: 28px; height: 28px; border-radius: 7px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 11px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">LG</div>
+              <div style="display: flex; flex-direction: column; gap: 1px; flex: 1; min-width: 0">
+                <div style="font-size: 13px">a.novak@ledgerline.dev</div>
+                <div style="font-size: 11px; color: #9b9797">Ledgerline Staging</div>
+              </div>
+            </div>
+          </div>
+          <sc-if value="{{ showKeyboardHints }}" hint-placeholder-val="{{ true }}">
+            <div style="display: flex; gap: 14px; padding: 8px 12px; border-top: 1px solid #eae7e7; background: #fbfaf9; font-size: 11px; color: #7d7979">
+              <div>↑↓ Move</div>
+              <div>↵ Fill</div>
+              <div>⇥ Fill &amp; submit</div>
+              <div>Esc Dismiss</div>
+            </div>
+          </sc-if>
+        </div>
+      </div>
+    </div>
+
+    <div id="2b" style="display: flex; flex-direction: column; gap: 14px; width: 1240px">
+      <div style="display: flex; align-items: baseline; gap: 12px">
+        <div style="background: #201e1d; color: #ffffff; padding: 3px 9px; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; font-weight: 700">2b</div>
+        <div style="font-size: 18px; font-weight: 800; letter-spacing: -0.01em">Vault window</div>
+        <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">SIDEBAR · LIST · DETAIL</div>
+      </div>
+
+      <div style="border: 1px solid #dedbd9; border-radius: 12px; overflow: hidden; background: #f7f6f5; box-shadow: 0 10px 30px rgba(45, 43, 43, 0.14); display: flex; flex-direction: column; height: 740px">
+        <div style="height: 46px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 10px; padding: 0 0 0 16px">
+          <div style="width: 22px; height: 22px; display: flex; align-items: center; justify-content: center"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"></path><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"></path><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"></path><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"></path></svg></div>
+          <div style="font-size: 14px; font-weight: 800; letter-spacing: -0.01em">Deskwarden</div>
+          <div style="flex: 1"></div>
+          <div style="display: flex; align-items: center; gap: 8px">
+            <div style="display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid #eae7e7; border-radius: 999px; font-size: 12px; color: #444141"><span style="width: 7px; height: 7px; border-radius: 999px; background: #1b3fa0"></span>Synced 1 min ago</div>
+            <div style="height: 28px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 8px; display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 600">Lock <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #7d7979">CTRL+L</span></div>
+            <div style="width: 28px; height: 28px; border-radius: 999px; background: #201e1d; color: #ffffff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">AN</div>
+          </div>
+          <div style="display: flex; font-size: 11px; color: #7d7979; margin-left: 10px">
+            <div style="width: 42px; display: flex; align-items: center; justify-content: center">—</div>
+            <div style="width: 42px; display: flex; align-items: center; justify-content: center">▢</div>
+            <div style="width: 42px; display: flex; align-items: center; justify-content: center">✕</div>
+          </div>
+        </div>
+
+        <div style="flex: 1; display: grid; grid-template-columns: 212px 400px 1fr; min-height: 0">
+          <div style="background: #ffffff; border-right: 1px solid #eae7e7; display: flex; flex-direction: column; padding: 14px 10px">
+            <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Vault</div>
+            <div style="display: flex; flex-direction: column; gap: 2px">
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">All items <span style="font-size: 11px; color: #9b9797">214</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Favorites <span style="font-size: 11px; color: #9b9797">12</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; background: #eef2fc; color: #14307a; font-size: 13px; font-weight: 700">Logins <span style="font-size: 11px">180</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Passkeys <span style="font-size: 11px; color: #9b9797">9</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Cards <span style="font-size: 11px; color: #9b9797">4</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Secure notes <span style="font-size: 11px; color: #9b9797">21</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px; color: #605d5d">Archive <span style="font-size: 11px; color: #9b9797">18</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px; color: #605d5d">Trash <span style="font-size: 11px; color: #9b9797">6</span></div>
+            </div>
+            <div style="height: 1px; background: #eae7e7; margin: 14px 8px"></div>
+            <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Folders</div>
+            <div style="display: flex; flex-direction: column; gap: 2px">
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Engineering <span style="font-size: 11px; color: #9b9797">64</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Personal <span style="font-size: 11px; color: #9b9797">98</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px">Shared with me <span style="font-size: 11px; color: #9b9797">52</span></div>
+              <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px; color: #605d5d">No folder <span style="font-size: 11px; color: #9b9797">7</span></div>
+            </div>
+            <div style="flex: 1"></div>
+            <div style="padding: 10px; font-size: 11px; color: #9b9797">Locks in 11:42</div>
+          </div>
+
+          <div style="border-right: 1px solid #eae7e7; display: flex; flex-direction: column; min-height: 0">
+            <div style="padding: 12px; display: flex; gap: 8px; border-bottom: 1px solid #eae7e7; background: #ffffff">
+              <div style="flex: 1; height: 34px; border: 1px solid #d7d3d3; border-radius: 8px; background: #ffffff; display: flex; align-items: center; gap: 8px; padding: 0 10px">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#9b9797" stroke-width="2.2"><circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line></svg>
+                <div style="font-size: 13px; color: #9b9797; flex: 1">Search 180 logins</div>
+                <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; color: #9b9797">CTRL+K</div>
+              </div>
+              <div style="height: 34px; padding: 0 12px; border-radius: 8px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600">+ New</div>
+            </div>
+            <div style="padding: 10px; display: flex; flex-direction: column; gap: 6px; overflow: hidden">
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #1b3fa0; border-radius: 10px; box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #eef2fc; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center">LG</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 700; color: #14307a">Ledgerline</div>
+                  <div style="font-size: 11px; color: #7d7979">a.novak@ledgerline.com</div>
+                </div>
+                <div style="font-size: 10px; color: #14307a; background: #dbe4f7; border-radius: 5px; padding: 2px 6px">app</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">AT</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Atlas Studio</div>
+                  <div style="font-size: 11px; color: #7d7979">a.novak@studio.atlas.com</div>
+                </div>
+                <div style="font-size: 10px; color: #605d5d; background: #f3f2f2; border-radius: 5px; padding: 2px 6px">app</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">VT</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Vantage VPN</div>
+                  <div style="font-size: 11px; color: #7d7979">a.novak@vantage.io</div>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">GH</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Git Host</div>
+                  <div style="font-size: 11px; color: #7d7979">anovak</div>
+                </div>
+                <div style="font-size: 10px; color: #605d5d; background: #f3f2f2; border-radius: 5px; padding: 2px 6px">2FA</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">PG</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Postgres — Prod</div>
+                  <div style="font-size: 11px; color: #7d7979">svc_reporting</div>
+                </div>
+                <div style="font-size: 10px; color: #605d5d; background: #f3f2f2; border-radius: 5px; padding: 2px 6px">app</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">RD</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Remote Desktop — Bastion</div>
+                  <div style="font-size: 11px; color: #7d7979">CORP\\anovak</div>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">SL</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Studio Licence Server</div>
+                  <div style="font-size: 11px; color: #7d7979">licence@studio.atlas.com</div>
+                </div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center">TR</div>
+                <div style="display: flex; flex-direction: column; gap: 2px; flex: 1">
+                  <div style="font-size: 13px; font-weight: 600">Tracker</div>
+                  <div style="font-size: 11px; color: #7d7979">a.novak@ledgerline.com</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display: flex; flex-direction: column; min-height: 0; background: #f7f6f5">
+            <div style="padding: 20px 24px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 14px">
+              <div style="width: 44px; height: 44px; border-radius: 10px; background: #eef2fc; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 15px; font-weight: 700; display: flex; align-items: center; justify-content: center">LG</div>
+              <div style="display: flex; flex-direction: column; gap: 3px; flex: 1">
+                <div style="font-size: 22px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1">Ledgerline</div>
+                <div style="font-size: 12px; color: #7d7979">Login · Engineering</div>
+              </div>
+              <div style="height: 34px; padding: 0 14px; border-radius: 8px; background: #1b3fa0; color: #ffffff; display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600">Fill in app <span style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; opacity: 0.85">CTRL+⇧+F</span></div>
+              <div style="height: 34px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px; display: flex; align-items: center; font-size: 13px; font-weight: 600">Edit</div>
+            </div>
+
+            <div style="padding: 18px 24px; display: flex; flex-direction: column; gap: 14px; overflow: hidden">
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+                <div style="padding: 11px 16px; border-bottom: 1px solid #eae7e7; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #605d5d">Login credentials</div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">Username</div>
+                  <div style="flex: 1; font-size: 14px">a.novak@ledgerline.com</div>
+                  <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Copy</div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">Password</div>
+                  <div style="flex: 1; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 15px; letter-spacing: 0.08em">••••••••••••</div>
+                  <div style="display: flex; gap: 8px">
+                    <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Reveal</div>
+                    <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Copy</div>
+                  </div>
+                </div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">One-time code</div>
+                  <div style="flex: 1; display: flex; align-items: center; gap: 12px">
+                    <div style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 17px; font-weight: 600; letter-spacing: 0.12em">482 913</div>
+                    <div style="width: 96px; height: 4px; border-radius: 2px; background: #eae7e7"><div style="width: 60%; height: 4px; border-radius: 2px; background: #1b3fa0"></div></div>
+                    <div style="font-size: 11px; color: #7d7979">18s</div>
+                  </div>
+                  <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Copy</div>
+                </div>
+              </div>
+
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden">
+                <div style="padding: 11px 16px; border-bottom: 1px solid #eae7e7; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #605d5d">Autofill targets</div>
+                <div style="display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979">Website</div>
+                  <div style="flex: 1; font-size: 14px">app.ledgerline.com</div>
+                  <div style="height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px">Open</div>
+                </div>
+                <div style="display: flex; align-items: flex-start; gap: 16px; padding: 13px 16px">
+                  <div style="width: 130px; font-size: 12px; color: #7d7979; padding-top: 4px">Native apps</div>
+                  <div style="flex: 1; display: flex; flex-wrap: wrap; gap: 8px">
+                    <div style="padding: 4px 9px; border-radius: 999px; background: #f3f2f2; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #444141">ledgerline.exe</div>
+                    <div style="padding: 4px 9px; border-radius: 999px; background: #f3f2f2; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #444141">LedgerlineSync.exe</div>
+                    <div style="padding: 4px 9px; border-radius: 999px; border: 1px dashed #bab6b6; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #7d7979">+ add</div>
+                  </div>
+                </div>
+              </div>
+
+              <div style="background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; padding: 13px 16px; display: flex; gap: 28px; font-size: 12px; color: #7d7979">
+                <div>Updated 3 days ago</div>
+                <div>Filled 41 times</div>
+                <div>Strength: strong</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;showKeyboardHints&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Overlay&quot;},&quot;showTotpRow&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Overlay&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      showKeyboardHints: this.props.showKeyboardHints ?? true,
+      showTotpRow: this.props.showTotpRow ?? true,
+    };
+  }
+}
+</script>
+</body>
+</html>
