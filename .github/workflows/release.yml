@@ -26,8 +26,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # deskwarden.iss's AppVersion/OutputBaseFilename and updater.rs's
+      # release-asset parsing (`tag.strip_prefix('v')`, then
+      # `Version::parse`) both work in terms of a bare semver with no
+      # leading "v" -- e.g. deskwarden.iss was built and tested locally
+      # with `/DAppVersion=0.1.0`, not "v0.1.0". Release tags, on the other
+      # hand, are "vX.Y.Z" (github.ref_name for a "v*.*.*" tag push), so
+      # the leading "v" must be stripped here before it's passed to ISCC,
+      # to stay consistent with that convention.
+      - name: Determine app version from tag
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = $env:REF_NAME -replace '^v', ''
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # Nothing else ties the tag to the crate's own version, and they are
+      # read by different things: the installer's version and file name come
+      # from the tag (above), while the running binary reports
+      # env!("CARGO_PKG_VERSION") and updater.rs compares *that* against the
+      # latest release tag. Tag v0.2.0 without bumping Cargo.toml and the
+      # shipped build still calls itself 0.1.0, so after a "successful"
+      # update the tray permanently offers v0.2.0 and every click
+      # re-downloads and re-installs the same build forever. Fail the release
+      # here instead, before anything is built or published.
+      - name: Verify Cargo.toml version matches the release tag
+        working-directory: deskwarden
+        run: |
+          $metadata = cargo metadata --format-version=1 --no-deps | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq 'deskwarden' }
+          if (-not $package) {
+            Write-Error "could not find the 'deskwarden' package in cargo metadata output"
+            exit 1
+          }
+          $crateVersion = $package.version
+          Write-Host "tag version:   $env:APP_VERSION"
+          Write-Host "crate version: $crateVersion"
+          if ($crateVersion -ne $env:APP_VERSION) {
+            Write-Error ("Release tag and Cargo.toml disagree: tag says '$env:APP_VERSION', " +
+              "deskwarden/Cargo.toml says '$crateVersion'. Bump the crate version to match " +
+              "the tag (or retag), otherwise the shipped binary reports the wrong version to " +
+              "the updater and every user is stuck in a permanent update loop.")
+            exit 1
+          }
 
       - name: Build release binary
         working-directory: deskwarden
@@ -46,21 +90,6 @@ jobs:
 
       - name: Install Inno Setup
         run: choco install innosetup -y
-
-      # deskwarden.iss's AppVersion/OutputBaseFilename and updater.rs's
-      # release-asset parsing (`tag.strip_prefix('v')`, then
-      # `Version::parse`) both work in terms of a bare semver with no
-      # leading "v" -- e.g. deskwarden.iss was built and tested locally
-      # with `/DAppVersion=0.1.0`, not "v0.1.0". Release tags, on the other
-      # hand, are "vX.Y.Z" (github.ref_name for a "v*.*.*" tag push), so
-      # the leading "v" must be stripped here before it's passed to ISCC,
-      # to stay consistent with that convention.
-      - name: Determine app version from tag
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        run: |
-          $version = $env:REF_NAME -replace '^v', ''
-          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
 
       - name: Build installer
         run: iscc deskwarden/installer/deskwarden.iss /DAppVersion=$env:APP_VERSION
