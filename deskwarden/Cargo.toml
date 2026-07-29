@@ -5,8 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Autofill Bitwarden credentials into native Windows applications. Unofficial and unaffiliated with Bitwarden, Inc."
 readme = "README.md"
-# No `repository` field: no public repository exists yet, and a placeholder URL
-# would be worse than none.
+repository = "https://github.com/denis-platonov/deskwarden"
 
 [lib]
 name = "deskwarden"

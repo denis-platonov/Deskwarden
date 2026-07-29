@@ -62,7 +62,7 @@ machines like any other vault data.
 Both work. `deskwarden` doesn't talk to any server directly — it talks
 to your local `bw` CLI, so whatever server that CLI is configured against is
 what gets used. For an official Bitwarden account, just log in. For a
-self-hosted server (Vaultwarden, deskwarden, or any Bitwarden-API-compatible
+self-hosted server (Vaultwarden, nodewarden, or any Bitwarden-API-compatible
 server), tick **Self-hosted server** on the login screen and enter its URL;
 that runs the standard `bw config server <url>` for you. You can also configure
 it yourself beforehand with the CLI and the app will follow.
