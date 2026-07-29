@@ -9,8 +9,8 @@
 //! this file.
 
 use eframe::egui::{
-    self, Color32, FontFamily, FontId, Pos2, Rect, Response, RichText, Rounding, Sense, Stroke,
-    TextStyle, Ui, Vec2,
+    self, Color32, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Rounding, Sense,
+    Stroke, TextStyle, Ui, Vec2,
 };
 use std::sync::OnceLock;
 
@@ -495,6 +495,28 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 /// A muted field label ("User name", "Master password").
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
+}
+
+/// A full-width single-line text field with the design's focused-state halo
+/// (`box-shadow: 0 0 0 3px #dbe4f7` in the mockup, sections 2a/3a/3b) --
+/// egui's default widget styling gives a focused field a plain border color
+/// change, not this soft ring, so it's painted explicitly here.
+pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .password(password)
+            .desired_width(f32::INFINITY)
+            .margin(Margin::symmetric(10.0, 8.0)),
+    );
+    if response.has_focus() {
+        let rounding = ui.visuals().widgets.active.rounding;
+        ui.painter().rect_stroke(
+            response.rect.expand(3.0),
+            rounding,
+            Stroke::new(3.0, FOCUS_RING),
+        );
+    }
+    response
 }
 
 /// A full-width hairline separator in the card hairline color (egui's

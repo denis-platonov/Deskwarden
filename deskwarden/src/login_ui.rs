@@ -213,27 +213,14 @@ pub fn run_login_flow() -> String {
                             ui.checkbox(&mut self_hosted, "Self-hosted server");
                             if self_hosted {
                                 theme::field_label(ui, "Server URL");
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut server_url)
-                                        .desired_width(f32::INFINITY)
-                                        .margin(Margin::symmetric(10.0, 8.0)),
-                                );
+                                theme::text_field(ui, &mut server_url, false);
                             }
                             theme::field_label(ui, "Email");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut email)
-                                    .desired_width(f32::INFINITY)
-                                    .margin(Margin::symmetric(10.0, 8.0)),
-                            );
+                            theme::text_field(ui, &mut email, false);
                         }
 
                         theme::field_label(ui, "Master password");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut password)
-                                .password(true)
-                                .desired_width(f32::INFINITY)
-                                .margin(Margin::symmetric(10.0, 8.0)),
-                        );
+                        theme::text_field(ui, &mut password, true);
                     });
 
                 if let Some(err) = &error {
