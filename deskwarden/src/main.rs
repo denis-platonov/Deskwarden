@@ -185,12 +185,32 @@ fn main() {
     let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
         .expect("CARGO_PKG_VERSION is not valid semver");
 
-    // Checked here (startup) and then periodically from the main loop below,
-    // same "check on startup, then every N" shape as the match engine's
-    // initial build above plus its `REFRESH_INTERVAL` refresh.
-    let mut available_update: Option<ReleaseInfo> = check_for_update_logged(&current_version);
-    if let Some(release) = &available_update {
-        tray::set_update_available(&tray, &release.version);
+    // Bounded connect/read timeouts, same "don't trust an external dependency
+    // to answer promptly" reasoning as `bw_serve::READINESS_DEADLINE` -- just
+    // applied to `api.github.com` instead of localhost. `ureq::Agent` is a
+    // cheap `Arc`-backed handle, so it's fine to clone into the background
+    // threads below.
+    let http_agent = updater::build_agent();
+
+    // The update check talks to an external host and, prior to this fix, ran
+    // synchronously here -- before the tray, hotkey, and window-watch thread
+    // even existed -- so a stalled `api.github.com` connection hung the
+    // *entire app* on every launch before it became interactive at all. It's
+    // now kicked off on its own background thread and reported back over
+    // `update_rx`, polled non-blockingly from the main loop below, so a slow
+    // or hung check can never delay startup. Same shape as the
+    // `window_watch` thread just below.
+    let mut available_update: Option<ReleaseInfo> = None;
+    let (update_tx, update_rx) = mpsc::channel::<ReleaseInfo>();
+    {
+        let agent = http_agent.clone();
+        let version = current_version.clone();
+        let tx = update_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(release) = check_for_update_logged(&version, &agent) {
+                let _ = tx.send(release);
+            }
+        });
     }
     let mut last_update_check = Instant::now();
 
@@ -305,6 +325,7 @@ fn main() {
                         release,
                         EXPECTED_SIGNER_THUMBPRINT,
                         &config_dir,
+                        &http_agent,
                     ) {
                         Ok(installer_path) => match updater::apply_update(&installer_path) {
                             Ok(()) => {
@@ -459,11 +480,26 @@ fn main() {
         }
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
-            if let Some(release) = check_for_update_logged(&current_version) {
-                tray::set_update_available(&tray, &release.version);
-                available_update = Some(release);
-            }
+            // Same off-thread treatment as the startup check above: this now
+            // runs once a day from a live, interactive app, but it still
+            // talks to an external host, so it's still kicked off on a
+            // background thread rather than blocking the main loop (and
+            // therefore tray/hotkey/window-watch responsiveness) for however
+            // long `api.github.com` takes to answer.
+            let agent = http_agent.clone();
+            let version = current_version.clone();
+            let tx = update_tx.clone();
+            std::thread::spawn(move || {
+                if let Some(release) = check_for_update_logged(&version, &agent) {
+                    let _ = tx.send(release);
+                }
+            });
             last_update_check = Instant::now();
+        }
+
+        if let Ok(release) = update_rx.try_recv() {
+            tray::set_update_available(&tray, &release.version);
+            available_update = Some(release);
         }
 
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
@@ -538,11 +574,12 @@ fn process_foreground_event(
 
 /// Calls `updater::check_for_update` against the real GitHub API and logs the
 /// outcome. Network failures, a malformed release, and "no update" are all
-/// deliberately non-fatal here -- this runs on a background timer, so the
-/// worst case is that a check is skipped until the next cycle, not that the
-/// app goes down over a transient GitHub API problem.
-fn check_for_update_logged(current_version: &Version) -> Option<ReleaseInfo> {
-    match updater::check_for_update(GITHUB_API_BASE, current_version) {
+/// deliberately non-fatal here -- this runs on a background thread (see call
+/// sites), so the worst case is that a check is skipped until the next
+/// cycle, not that the app goes down (or hangs) over a transient GitHub API
+/// problem.
+fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Option<ReleaseInfo> {
+    match updater::check_for_update(GITHUB_API_BASE, current_version, agent) {
         Ok(Some(release)) => {
             log::info!(
                 "update available: v{} (current: v{current_version})",

@@ -2,15 +2,44 @@ use crate::signature::{is_trusted_signer, verify_authenticode};
 use semver::Version;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 pub struct ReleaseInfo {
     pub version: Version,
     pub installer_download_url: String,
 }
 
-pub fn check_for_update(base_url: &str, current_version: &Version) -> Result<Option<ReleaseInfo>, String> {
+/// How long to wait for a TCP connection to establish before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long to wait for the response body to finish arriving once connected.
+/// GitHub's API responses are tiny, and even a large installer download
+/// should comfortably stream within this window per read; ureq applies
+/// `timeout_read` per-read, not to the whole transfer, so this doesn't cap
+/// total download time for a slow-but-steady connection.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Builds a `ureq::Agent` with bounded connect/read timeouts, so a stalled
+/// `api.github.com` (or any host on the network path to it) can't hang a
+/// caller indefinitely the way the implicit default agent would. Mirrors the
+/// bounded-wait pattern `bw_serve::READINESS_DEADLINE` already uses for the
+/// local `bw serve` dependency -- just applied to an external host, which has
+/// strictly more failure modes than localhost.
+pub fn build_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(READ_TIMEOUT)
+        .build()
+}
+
+pub fn check_for_update(
+    base_url: &str,
+    current_version: &Version,
+    agent: &ureq::Agent,
+) -> Result<Option<ReleaseInfo>, String> {
     let url = format!("{base_url}/repos/denis-platonov/deskwarden/releases/latest");
-    let body: serde_json::Value = ureq::get(&url)
+    let body: serde_json::Value = agent
+        .get(&url)
         .call()
         .map_err(|e| format!("failed to reach GitHub releases API: {e}"))?
         .into_json()
@@ -45,10 +74,12 @@ pub fn download_and_verify(
     release: &ReleaseInfo,
     expected_thumbprint: &str,
     dest_dir: &Path,
+    agent: &ureq::Agent,
 ) -> Result<PathBuf, String> {
     let dest_path = dest_dir.join(format!("deskwarden-{}-installer.exe", release.version));
 
-    let response = ureq::get(&release.installer_download_url)
+    let response = agent
+        .get(&release.installer_download_url)
         .call()
         .map_err(|e| format!("failed to download installer: {e}"))?;
     let mut reader = response.into_reader();
@@ -94,7 +125,8 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let result = check_for_update(&server.url(), &current).unwrap();
+        let agent = build_agent();
+        let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         let release = result.expect("expected an available update");
         assert_eq!(release.version, Version::parse("1.2.0").unwrap());
@@ -121,7 +153,8 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let result = check_for_update(&server.url(), &current).unwrap();
+        let agent = build_agent();
+        let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         let release = result.expect("expected an available update");
         assert_eq!(release.installer_download_url, "https://example.com/deskwarden-installer.exe");
@@ -143,7 +176,8 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let result = check_for_update(&server.url(), &current).unwrap();
+        let agent = build_agent();
+        let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         assert!(result.is_none());
     }
@@ -164,7 +198,8 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let result = check_for_update(&server.url(), &current).unwrap();
+        let agent = build_agent();
+        let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         assert!(result.is_none());
     }
@@ -180,7 +215,8 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let result = check_for_update(&server.url(), &current);
+        let agent = build_agent();
+        let result = check_for_update(&server.url(), &current, &agent);
 
         assert!(result.is_err());
     }
