@@ -149,8 +149,15 @@ pub fn run_login_flow() -> String {
 
     let _ = eframe::run_simple_native("Log in to Deskwarden", options, move |ctx, _frame| {
         if !styled {
+            // egui applies a new font set at the *start* of the next frame,
+            // not the one that calls set_fonts -- drawing Archivo-styled
+            // text in this same frame would look up a family that doesn't
+            // exist yet and panic. Skip drawing this frame; the real UI
+            // starts on the next one, once the fonts are actually live.
             theme::apply(ctx);
             styled = true;
+            ctx.request_repaint();
+            return;
         }
 
         egui::CentralPanel::default()

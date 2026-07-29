@@ -129,8 +129,15 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
 
     let _ = eframe::run_simple_native("Choose a vault item", options, move |ctx, _frame| {
         if !styled {
+            // egui applies a new font set at the *start* of the next frame,
+            // not the one that calls set_fonts -- drawing Archivo-styled
+            // text in this same frame would look up a family that doesn't
+            // exist yet and panic. Skip drawing this frame; the real UI
+            // starts on the next one, once the fonts are actually live.
             theme::apply(ctx);
             styled = true;
+            ctx.request_repaint();
+            return;
         }
 
         egui::CentralPanel::default()
@@ -284,8 +291,15 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
 
     let _ = eframe::run_simple_native("Add app to Deskwarden", options, move |ctx, _frame| {
         if !styled {
+            // egui applies a new font set at the *start* of the next frame,
+            // not the one that calls set_fonts -- drawing Archivo-styled
+            // text in this same frame would look up a family that doesn't
+            // exist yet and panic. Skip drawing this frame; the real UI
+            // starts on the next one, once the fonts are actually live.
             theme::apply(ctx);
             styled = true;
+            ctx.request_repaint();
+            return;
         }
 
         egui::CentralPanel::default()
