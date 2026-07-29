@@ -2,6 +2,7 @@ use eframe::egui;
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BwStatus {
@@ -177,6 +178,12 @@ pub fn run_login_flow() -> String {
                             run_bw_with_password(&["unlock", "--raw"], &password)
                         }
                     };
+
+                    // The master password has served its purpose either way:
+                    // wipe the buffer instead of leaving it live in memory for
+                    // the rest of the process's lifetime. On failure this also
+                    // clears the field, which the user has to retype anyway.
+                    password.zeroize();
 
                     match result {
                         Ok(session_token) => {

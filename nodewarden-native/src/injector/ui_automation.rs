@@ -1,5 +1,5 @@
 use windows::core::{Result, BSTR, VARIANT};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RPC_E_CHANGED_MODE};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
@@ -19,7 +19,18 @@ use windows::Win32::UI::Accessibility::{
 /// - `Err` on a COM-level failure.
 pub fn fill_via_ui_automation(hwnd: isize, username: &str, password: &str) -> Result<bool> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // S_OK and S_FALSE (already initialised on this thread) are both fine,
+        // and RPC_E_CHANGED_MODE just means COM is already up on this thread
+        // in a different apartment model -- the UI Automation client still
+        // works. Anything else is a real problem worth seeing in the log, even
+        // though we continue and let the calls below fail with detail.
+        //
+        // No matching `CoUninitialize`: this runs on the long-lived main
+        // thread and process exit is adequate cleanup.
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+            log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
+        }
 
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)?;

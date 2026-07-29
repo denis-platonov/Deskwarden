@@ -7,12 +7,30 @@ pub struct VaultField {
     pub value: Option<String>,
 }
 
+/// The `login` object `bw serve` returns for login-type items.
+///
+/// Only the two fields we type are modelled; everything else `bw` sends inside
+/// `login` (TOTP, URIs, password history) is preserved through `other` so a
+/// round-trip write doesn't drop it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct LoginData {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultItem {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub fields: Vec<VaultField>,
+    /// `skip_serializing_if` so items with no login object (secure notes,
+    /// cards) don't gain a `"login": null` on write, which `bw serve`'s edit
+    /// endpoint would treat as new state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginData>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }
@@ -91,6 +109,22 @@ impl VaultBridge {
         Ok(body.data.data)
     }
 
+    /// Fetches a single item by id via `GET /object/item/{id}`.
+    ///
+    /// Used by the fill path, which previously pulled the *entire* vault and
+    /// linear-scanned it every time a single item's credentials were needed.
+    pub fn get_item(&self, id: &str) -> Result<VaultItem, VaultError> {
+        let url = format!("{}/object/item/{}", self.base_url, id);
+        let body: Envelope<VaultItem> = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| VaultError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
+    }
+
     pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
         let updated = with_app_match(item, m);
 
@@ -117,6 +151,7 @@ mod tests {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
             }],
+            login: None,
             other: serde_json::Map::new(),
         };
         let m = extract_app_match(&item).unwrap();
@@ -130,6 +165,7 @@ mod tests {
             id: "1".into(),
             name: "Other".into(),
             fields: vec![],
+            login: None,
             other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
@@ -144,6 +180,7 @@ mod tests {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some("not json".into()),
             }],
+            login: None,
             other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
@@ -203,6 +240,72 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].id, "1");
         assert_eq!(items[1].name, "Mabl");
+    }
+
+    #[test]
+    fn get_item_parses_a_single_item_envelope() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/object/item/abc")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"data":{"id":"abc","name":"Rockstar","fields":[],
+                    "login":{"username":"u","password":"p","totp":null}}}"#,
+            )
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let item = bridge.get_item("abc").unwrap();
+
+        assert_eq!(item.id, "abc");
+        let login = item.login.unwrap();
+        assert_eq!(login.username.as_deref(), Some("u"));
+        assert_eq!(login.password.as_deref(), Some("p"));
+    }
+
+    #[test]
+    fn get_item_reports_http_failure() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/object/item/missing")
+            .with_status(404)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert!(bridge.get_item("missing").is_err());
+    }
+
+    #[test]
+    fn items_without_a_login_object_do_not_gain_a_null_login_on_write() {
+        // `bw serve`'s edit endpoint takes the payload as the item's new
+        // state, so emitting `"login": null` for a secure note would be a
+        // destructive round-trip.
+        let item: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"Note","fields":[],"notes":"n"}"#).unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert!(value.get("login").is_none(), "got: {value}");
+    }
+
+    #[test]
+    fn login_object_extras_survive_a_round_trip() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],
+                "login":{"username":"u","password":"p","totp":"seed","uris":[{"uri":"x"}]}}"#,
+        )
+        .unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert_eq!(value["login"]["totp"], serde_json::json!("seed"));
+        assert_eq!(value["login"]["uris"], serde_json::json!([{"uri":"x"}]));
+        assert_eq!(value["login"]["username"], serde_json::json!("u"));
     }
 
     const APP_MATCH_FIELD_NAME_FOR_TEST: &str = crate::app_match::APP_MATCH_FIELD_NAME;

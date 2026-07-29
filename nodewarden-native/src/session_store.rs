@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use windows::core::PCWSTR;
+use zeroize::Zeroize;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
@@ -22,8 +23,12 @@ impl SessionStore {
 
     pub fn load(&self) -> Option<String> {
         let bytes = std::fs::read(&self.path).ok()?;
-        let plain = unprotect(&bytes).ok()?;
-        String::from_utf8(plain).ok()
+        let mut plain = unprotect(&bytes).ok()?;
+        // Copy out, then wipe the intermediate plaintext buffer rather than
+        // letting a decrypted session token linger in freed heap memory.
+        let token = std::str::from_utf8(&plain).ok().map(|s| s.to_string());
+        plain.zeroize();
+        token
     }
 }
 
@@ -66,6 +71,10 @@ fn unprotect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
             &mut output,
         )?;
         let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        // Wipe DPAPI's own output buffer before handing it back to the heap:
+        // `LocalFree` does not clear it, so the decrypted token would otherwise
+        // stay readable in freed memory.
+        std::slice::from_raw_parts_mut(output.pbData, output.cbData as usize).zeroize();
         let _ = LocalFree(HLOCAL(output.pbData as _));
         Ok(result)
     }

@@ -36,37 +36,41 @@ pub fn pump_windows_messages() {
     }
 }
 
-/// Extracts the credentials to type for a vault item.
-pub fn credentials_for(_item: &VaultItem) -> (String, String) {
-    // bw serve's item payload includes a `login: { username, password }`
-    // object, but `vault_bridge::VaultItem` (Task 4) only models
-    // `id`/`name`/`fields` -- that's all the app-match extraction logic
-    // needed. Before relying on real fills end-to-end, extend `VaultItem`
-    // with the `login: Option<LoginData>` shape `bw serve` actually returns
-    // and read it here instead. Left as an explicit placeholder (not
-    // silently glossed over) so the rest of the pipeline -- matching,
-    // triggering, injecting -- is wired and independently testable now.
-    (String::new(), String::new())
+/// Extracts the credentials to type for a vault item, from the `login` object
+/// `bw serve` returns. Items without a login object (secure notes, cards)
+/// yield empty strings.
+pub fn credentials_for(item: &VaultItem) -> (String, String) {
+    match &item.login {
+        Some(login) => (
+            login.username.clone().unwrap_or_default(),
+            login.password.clone().unwrap_or_default(),
+        ),
+        None => (String::new(), String::new()),
+    }
 }
 
 /// Fetches the item's credentials and injects them into `hwnd`.
+///
+/// Fetches the *single* item by id rather than pulling and scanning the whole
+/// vault, which is what a fill used to do on every keystroke-worth of work.
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     vault: &VaultBridge,
     injector: &Injector<A, B>,
     item_id: &str,
     hwnd: isize,
 ) {
-    match vault.list_items() {
-        Ok(items) => match items.iter().find(|i| i.id == item_id) {
-            Some(item) => {
-                let (username, password) = credentials_for(item);
-                if let Err(e) = injector.fill(hwnd, &username, &password) {
-                    log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
-                }
+    match vault.get_item(item_id) {
+        Ok(item) => {
+            let (username, password) = credentials_for(&item);
+            if username.is_empty() && password.is_empty() {
+                log::warn!("vault item {item_id} has no login credentials; nothing to fill");
+                return;
             }
-            None => log::warn!("vault item {item_id} no longer exists; nothing filled"),
-        },
-        Err(e) => log::error!("could not read vault to fill item {item_id}: {e:?}"),
+            if let Err(e) = injector.fill(hwnd, &username, &password) {
+                log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
+            }
+        }
+        Err(e) => log::error!("could not read vault item {item_id} to fill it: {e:?}"),
     }
 }
 
@@ -142,6 +146,7 @@ mod tests {
                     }]
                 })
                 .unwrap_or_default(),
+            login: None,
             other: serde_json::Map::new(),
         }
     }
@@ -162,5 +167,30 @@ mod tests {
     #[test]
     fn match_entries_is_empty_for_an_empty_vault() {
         assert!(match_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn credentials_come_from_the_login_object() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],"login":{"username":"u","password":"p"}}"#,
+        )
+        .unwrap();
+        assert_eq!(credentials_for(&item), ("u".to_string(), "p".to_string()));
+    }
+
+    #[test]
+    fn credentials_are_empty_for_items_without_a_login_object() {
+        assert_eq!(
+            credentials_for(&item("1", None)),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn credentials_tolerate_a_partial_login_object() {
+        let item: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{"username":"u"}}"#)
+                .unwrap();
+        assert_eq!(credentials_for(&item), ("u".to_string(), String::new()));
     }
 }

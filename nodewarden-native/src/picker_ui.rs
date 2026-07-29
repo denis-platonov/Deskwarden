@@ -209,6 +209,7 @@ mod tests {
             id: "1".into(),
             name: name.into(),
             fields: vec![],
+            login: None,
             other: serde_json::Map::new(),
         }
     }
