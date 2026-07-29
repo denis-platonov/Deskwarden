@@ -1,5 +1,5 @@
-# Rust build output (nodewarden-native and any future crates)
-/nodewarden-native/target/
+# Rust build output (deskwarden and any future crates)
+/deskwarden/target/
 target/
 
 # Rust backtrace/profiling leftovers
