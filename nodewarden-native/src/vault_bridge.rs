@@ -12,9 +12,18 @@ pub struct VaultField {
 /// Only the two fields we type are modelled; everything else `bw` sends inside
 /// `login` (TOTP, URIs, password history) is preserved through `other` so a
 /// round-trip write doesn't drop it.
+///
+/// Both modelled fields carry `skip_serializing_if`, for the same reason
+/// [`VaultItem::login`] does: `bw serve`'s edit endpoint takes the payload as
+/// the item's new state, so a login object that arrived as `{"password":"p"}`
+/// must not be written back as `{"username":null,"password":"p"}` -- that
+/// injects a key the source never had. Unmodelled keys already round-trip
+/// exactly through `other`; these two now do too.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct LoginData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -306,6 +315,56 @@ mod tests {
         assert_eq!(value["login"]["totp"], serde_json::json!("seed"));
         assert_eq!(value["login"]["uris"], serde_json::json!([{"uri":"x"}]));
         assert_eq!(value["login"]["username"], serde_json::json!("u"));
+    }
+
+    #[test]
+    fn a_partial_login_object_does_not_gain_the_keys_it_lacked() {
+        // Asymmetric serialisation would turn `{"password":"p"}` into
+        // `{"username":null,"password":"p"}`, inventing a key the source item
+        // never had -- and `bw serve`'s edit endpoint treats the payload as
+        // the new state, so the invented key sticks.
+        let item: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{"password":"p"}}"#)
+                .unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+
+        assert!(
+            value["login"].get("username").is_none(),
+            "login gained a username key: {value}"
+        );
+        assert_eq!(value["login"]["password"], serde_json::json!("p"));
+    }
+
+    #[test]
+    fn an_empty_login_object_stays_empty_through_a_round_trip() {
+        let item: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{}}"#).unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert_eq!(value["login"], serde_json::json!({}), "got: {value}");
+    }
+
+    #[test]
+    fn an_explicitly_null_login_field_is_still_dropped_rather_than_echoed() {
+        // `null` and "absent" are the same thing to `bw`, and dropping is the
+        // consistent choice: it matches what `VaultItem::login` already does.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],"login":{"username":null,"password":"p"}}"#,
+        )
+        .unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert!(value["login"].get("username").is_none(), "got: {value}");
     }
 
     const APP_MATCH_FIELD_NAME_FOR_TEST: &str = crate::app_match::APP_MATCH_FIELD_NAME;
