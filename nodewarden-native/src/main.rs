@@ -14,7 +14,7 @@ use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
 use nodewarden_native::match_engine::MatchEngine;
 use nodewarden_native::vault_bridge::VaultBridge;
 use nodewarden_native::{
-    hotkey, logging, login_ui, picker_ui, session_store, tray, window_watch,
+    hotkey, job_object, logging, login_ui, picker_ui, session_store, tray, window_watch,
 };
 use std::process::Child;
 use std::sync::mpsc;
@@ -43,55 +43,84 @@ fn main() {
     let session_path = config_dir.join("session.bin");
     let store = session_store::SessionStore::new(session_path);
 
-    let session_token = match store.load() {
-        Some(token) => {
-            log::info!("loaded cached session token");
-            token
-        }
-        None => {
-            log::info!("no cached session token; showing login flow");
-            let token = login_ui::run_login_flow();
-            if let Err(e) = store.save(&token) {
-                log::error!("failed to persist session token: {e}");
-            }
-            token
+    // Every child process we spawn joins this job object, which is configured
+    // to kill its members when the last handle closes. Our handles close when
+    // this process dies for *any* reason -- clean quit, panic, Ctrl+C, Task
+    // Manager -- so `bw serve` can no longer be orphaned holding an unlocked
+    // vault open on localhost. This must outlive the whole run, hence the
+    // binding here rather than inside the spawn helper.
+    let job = match job_object::KillOnCloseJob::new() {
+        Ok(job) => Some(job),
+        Err(e) => {
+            log::error!(
+                "could not create a kill-on-close job object ({e}); `bw serve` will only be \
+                 cleaned up on a clean quit"
+            );
+            None
         }
     };
 
-    // Pull the latest vault state down before building the match engine, so a
-    // match added on another device is live on first run rather than after the
-    // next incidental sync.
-    match bw_serve::run_bw_sync(&session_token) {
-        Ok(()) => log::info!("bw sync completed"),
-        Err(e) => log::warn!("bw sync failed (continuing with cached vault): {e}"),
-    }
-
-    let mut bw_serve_child = spawn_bw_serve(&session_token);
+    // A cached session token is worthless if it has since been invalidated
+    // (manual `bw lock`, password change, reboot). Trusting it unconditionally
+    // is how the app used to proceed "unlocked" with no recovery path.
+    let mut session_token = match store.load() {
+        Some(token) => match login_ui::check_bw_status_with_session(Some(&token)) {
+            login_ui::BwStatus::Unlocked => {
+                log::info!("cached session token verified as unlocked");
+                token
+            }
+            other => {
+                log::warn!("cached session token reports {other:?}; re-authenticating");
+                reauthenticate(&store)
+            }
+        },
+        None => {
+            log::info!("no cached session token; showing login flow");
+            reauthenticate(&store)
+        }
+    };
 
     let vault = VaultBridge::new(BW_SERVE_URL);
     let mut engine = MatchEngine::new();
+
+    let mut bw_serve_child = start_backend(&session_token, job.as_ref());
 
     // `bw serve` is a bundled Node binary: its cold start regularly takes
     // several seconds, far longer than the fixed 500ms sleep this replaces.
     // Losing that race used to leave the match engine permanently empty with
     // no diagnostic, so the app silently did nothing forever.
-    match wait_for_vault_ready(&vault, &readiness_schedule(READINESS_DEADLINE)) {
-        Ok(items) => {
-            let entries = match_entries(&items);
-            log::info!("match engine loaded with {} app match(es)", entries.len());
-            engine.rebuild(&entries);
-        }
+    let schedule = readiness_schedule(READINESS_DEADLINE);
+    let items = match wait_for_vault_ready(&vault, &schedule) {
+        Ok(items) => items,
         Err(e) => {
+            // A rejected session is indistinguishable from a slow start at
+            // this level, so give the user one chance to re-authenticate
+            // before giving up rather than exiting on a recoverable problem.
             log::error!("{e}");
-            log::error!(
-                "giving up: without a reachable, unlocked `bw serve` there is nothing to match \
-                 against. Check {}\\nodewarden.log and that the Bitwarden CLI is installed.",
-                config_dir.display()
-            );
+            log::warn!("retrying once after a fresh login, in case the session was rejected");
             let _ = bw_serve_child.kill();
-            std::process::exit(1);
+            session_token = reauthenticate(&store);
+            bw_serve_child = start_backend(&session_token, job.as_ref());
+
+            match wait_for_vault_ready(&vault, &schedule) {
+                Ok(items) => items,
+                Err(e) => {
+                    log::error!("{e}");
+                    log::error!(
+                        "giving up: without a reachable, unlocked `bw serve` there is nothing \
+                         to match against. See {}",
+                        logging::log_file_path(&config_dir).display()
+                    );
+                    let _ = bw_serve_child.kill();
+                    std::process::exit(1);
+                }
+            }
         }
-    }
+    };
+
+    let entries = match_entries(&items);
+    log::info!("match engine loaded with {} app match(es)", entries.len());
+    engine.rebuild(&entries);
 
     let injector = Injector {
         ui: RealUiAutomation,
@@ -228,7 +257,34 @@ fn main() {
             last_refresh = Instant::now();
             match refresh_match_engine(&vault, &mut engine) {
                 Ok(count) => log::debug!("match engine refreshed: {count} app match(es)"),
-                Err(e) => log::warn!("periodic match engine refresh failed: {e:?}"),
+                Err(e) => {
+                    // A failing refresh is the signal that the session went
+                    // stale *while running* (someone ran `bw lock`, the vault
+                    // timed out server-side, `bw serve` died). Verify, and if
+                    // the session really is no longer usable, re-authenticate
+                    // and restart the backend rather than failing silently
+                    // forever.
+                    log::warn!("periodic match engine refresh failed: {e:?}");
+                    let status = login_ui::check_bw_status_with_session(Some(&session_token));
+                    if status != login_ui::BwStatus::Unlocked {
+                        log::warn!("session is now {status:?}; re-authenticating");
+                        let _ = bw_serve_child.kill();
+                        session_token = reauthenticate(&store);
+                        bw_serve_child = start_backend(&session_token, job.as_ref());
+                        match wait_for_vault_ready(&vault, &schedule) {
+                            Ok(items) => {
+                                let entries = match_entries(&items);
+                                log::info!(
+                                    "re-authenticated; match engine reloaded with {} app \
+                                     match(es)",
+                                    entries.len()
+                                );
+                                engine.rebuild(&entries);
+                            }
+                            Err(e) => log::error!("backend still unusable after re-login: {e}"),
+                        }
+                    }
+                }
             }
         }
 
@@ -302,8 +358,42 @@ fn process_foreground_event(
     }
 }
 
-fn spawn_bw_serve(session_token: &str) -> Child {
-    match bw_serve::spawn_bw_serve(session_token) {
+/// Runs the login/unlock UI and persists the resulting session token.
+fn reauthenticate(store: &session_store::SessionStore) -> String {
+    let token = login_ui::run_login_flow();
+    if let Err(e) = store.save(&token) {
+        log::error!("failed to persist session token: {e}");
+    }
+    token
+}
+
+/// Syncs the vault, then spawns `bw serve` and attaches it to `job`.
+///
+/// Refuses to start if something is already listening on the `bw serve` port:
+/// that is almost always an orphaned `bw serve` from a previous unclean exit,
+/// and our newly spawned one would silently fail to bind while `VaultBridge`
+/// happily talked to the *other* process -- a different, unknown session
+/// serving an unknown vault.
+fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
+    if bw_serve::port_in_use(bw_serve::BW_SERVE_PORT) {
+        log::error!(
+            "something is already listening on localhost:{} -- most likely an orphaned \
+             `bw serve` from a previous run. Refusing to start rather than talking to an \
+             unknown process holding an unknown session; close it and try again.",
+            bw_serve::BW_SERVE_PORT
+        );
+        std::process::exit(1);
+    }
+
+    // Pull the latest vault state down before the match engine is built, so a
+    // match added on another device is live on first run rather than after the
+    // next incidental sync.
+    match bw_serve::run_bw_sync(session_token) {
+        Ok(()) => log::info!("bw sync completed"),
+        Err(e) => log::warn!("bw sync failed (continuing with cached vault): {e}"),
+    }
+
+    let child = match bw_serve::spawn_bw_serve(session_token) {
         Ok(child) => child,
         Err(e) => {
             log::error!(
@@ -311,5 +401,16 @@ fn spawn_bw_serve(session_token: &str) -> Child {
             );
             std::process::exit(1);
         }
+    };
+
+    if let Some(job) = job {
+        if let Err(e) = job.assign(&child) {
+            log::error!(
+                "could not assign `bw serve` to the kill-on-close job object ({e}); it may \
+                 survive an unclean exit of this process"
+            );
+        }
     }
+
+    child
 }

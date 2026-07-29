@@ -15,6 +15,7 @@ pub mod bw_serve;
 pub mod dispatch;
 pub mod hotkey;
 pub mod injector;
+pub mod job_object;
 pub mod logging;
 pub mod login_ui;
 pub mod match_engine;
