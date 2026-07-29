@@ -1,0 +1,17 @@
+# Rust build output (nodewarden-native and any future crates)
+/nodewarden-native/target/
+target/
+
+# Rust backtrace/profiling leftovers
+**/*.rs.bk
+*.pdb
+
+# Agent scratch/ledger directory (its `sdd/` subdirectory already has its own
+# `.gitignore` with `*`; this covers anything added alongside it later).
+/.superpowers/
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
