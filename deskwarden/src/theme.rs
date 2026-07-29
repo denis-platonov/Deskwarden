@@ -61,6 +61,8 @@ pub const BLUE_WASH: Color32 = Color32::from_rgb(0xee, 0xf2, 0xfc);
 pub const BLUE_EDGE: Color32 = Color32::from_rgb(0xb8, 0xc7, 0xea);
 /// Focus ring around the active input.
 pub const FOCUS_RING: Color32 = Color32::from_rgb(0xdb, 0xe4, 0xf7);
+/// Track of a switched-off toggle (design 3e's settings rows).
+pub const TOGGLE_OFF: Color32 = Color32::from_rgb(0xe4, 0xe2, 0xe0);
 
 /// Error text. The design keeps red out of the chrome entirely ("red used
 /// only where it means something"), so this appears only on actual failures.
@@ -136,6 +138,31 @@ pub fn bold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text.into())
         .size(size)
         .family(FontFamily::Name(BOLD.into()))
+}
+
+/// Letterspaced text, for the design's tracked uppercase tags ("FILLS
+/// NATIVE WINDOWS" at 0.15em, the card header wordmark at 0.1em).
+/// `RichText` has no tracking control, so this drops down to a `LayoutJob`;
+/// `tracking` is in points (design em × font size).
+pub fn letterspaced(
+    text: &str,
+    size: f32,
+    family: &str,
+    tracking: f32,
+    color: Color32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::new(size, FontFamily::Name(family.into())),
+            color,
+            extra_letter_spacing: tracking,
+            ..Default::default()
+        },
+    );
+    job
 }
 
 /// Applies the Deskwarden look to an egui context. Call once per window,
@@ -491,8 +518,9 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
 pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
     let paint_return = kbd == Some("↵");
     let text = match kbd {
-        // Trailing spaces reserve room for the painted arrow.
-        Some("↵") => format!("{label}    "),
+        // Trailing spaces reserve room for the painted arrow and the gap
+        // before it.
+        Some("↵") => format!("{label}      "),
         Some(k) => format!("{label}  {k}"),
         None => label.to_string(),
     };
@@ -508,9 +536,9 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
     if paint_return {
         paint_return_arrow(
             ui.painter(),
-            Pos2::new(response.rect.right() - 16.0, response.rect.center().y),
-            8.0,
-            Color32::from_white_alpha(210),
+            Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
+            6.5,
+            Color32::from_white_alpha(200),
         );
     }
     response
@@ -519,7 +547,7 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
 /// The ↵ return glyph, drawn: down the right side, along the bottom, arrowhead
 /// pointing left.
 fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.4, color);
+    let stroke = Stroke::new(1.2, color);
     let half = size / 2.0;
     let right_top = Pos2::new(center.x + half, center.y - half);
     let corner = Pos2::new(center.x + half, center.y + half * 0.7);
@@ -564,7 +592,8 @@ fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
     let mut dismissed = false;
     ui.horizontal(|ui| {
         mark(ui, 16.0);
-        ui.label(bold("D E S K W A R D E N", 11.0).color(TEXT_SECONDARY));
+        // Real tracking (0.1em at 11px), not spaces between letters.
+        ui.label(letterspaced("DESKWARDEN", 11.0, BOLD, 1.1, TEXT_SECONDARY));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if with_close {
                 dismissed = close_glyph(ui).clicked();
@@ -621,109 +650,23 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
 }
 
+/// The design's input-box height (sections 2a/3a/3b/3h).
+const FIELD_HEIGHT: f32 = 38.0;
+
 /// A full-width single-line text field with the design's focused-state halo
 /// (`box-shadow: 0 0 0 3px #dbe4f7` in the mockup, sections 2a/3a/3b) --
 /// egui's default widget styling gives a focused field a plain border color
 /// change, not this soft ring, so it's painted explicitly here.
 pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
-    // The field's box is painted here, not by egui: `.frame(egui::Frame::new())` plus a
-    // placeholder shape filled in after layout. Painting the design's box
-    // *around* egui's own frame would double the border; letting egui draw it
-    // misses the focus halo and sizes the box to the text rather than the
-    // design's 38px field.
-    let bg = ui.painter().add(egui::Shape::Noop);
-    let margin = Margin::symmetric(10, 11);
-    let response = ui.add(
-        egui::TextEdit::singleline(value)
-            .password(password)
-            .frame(egui::Frame::new())
-            // `desired_width` is the *text* width; the margin sits outside
-            // it, so f32::INFINITY here would push the box past the parent
-            // by exactly the margin.
-            .desired_width(field_text_width(ui, margin))
-            // 14px text + 11px vertical margins ≈ the design's 38px field
-            // height: a TextEdit is sized by its font's row height, so the
-            // height has to be expressed this way rather than set directly.
-            .font(FontId::new(14.0, FontFamily::Proportional))
-            .margin(margin),
-    );
-    paint_field_box(ui, &response, bg, margin);
-    response
-}
-
-/// The text width that makes a field's *box* (text + margin) exactly fill
-/// the available width.
-fn field_text_width(ui: &Ui, margin: Margin) -> f32 {
-    (ui.available_width() - (margin.left + margin.right) as f32).max(40.0)
-}
-
-/// Fills the placeholder `bg` shape with the field's box, and adds the focus
-/// halo when focused: the design's inputs are a 1px border at rest and a blue
-/// border with a 3px `FOCUS_RING` halo when active (`box-shadow: 0 0 0 3px
-/// #dbe4f7` in the mockup, sections 2a/3a/3b/3h) — a treatment egui's own
-/// `TextEdit` frame can't produce.
-///
-/// `margin` must be the margin the `TextEdit` was built with: a frameless
-/// TextEdit's `response.rect` is the inner text rect, so the visible box is
-/// that rect grown back out by the margin. Returns the box rect (for
-/// placing in-field affordances like the reveal toggle).
-fn paint_field_box(
-    ui: &mut Ui,
-    response: &Response,
-    bg: egui::layers::ShapeIdx,
-    margin: Margin,
-) -> Rect {
-    let rect = Rect::from_min_max(
-        response.rect.min - Vec2::new(margin.left as f32, margin.top as f32),
-        response.rect.max + Vec2::new(margin.right as f32, margin.bottom as f32),
-    );
-    let rounding = CornerRadius::same(8);
-    let border = if response.has_focus() {
-        // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
-        // flush against the 1px border's outer edge, like the mock's
-        // box-shadow -- expand(3.0) would leave a visible white ring between
-        // border and halo.
-        ui.painter().rect_stroke(
-            rect.expand(2.0),
-            rounding,
-            Stroke::new(3.0, FOCUS_RING),
-            StrokeKind::Middle,
-        );
-        Stroke::new(1.0, BLUE)
-    } else {
-        Stroke::new(1.0, BORDER_STRONG)
-    };
-    ui.painter().set(
-        bg,
-        egui::epaint::RectShape::new(rect, rounding, CARD, border, StrokeKind::Middle),
-    );
-    rect
+    field_box(ui, value, password, 10.0).0
 }
 
 /// A password field with the design's in-field "Show"/"Hide" reveal toggle
-/// (3h's master-password input). Same focused-state halo as [`text_field`];
+/// (3h's master-password input). Same box treatment as [`text_field`];
 /// `revealed` is the caller's persistent toggle state.
 pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
-    // Same painted-box approach as `text_field` (see there for why).
-    let bg = ui.painter().add(egui::Shape::Noop);
-    // The extra right margin keeps typed text from running under the
-    // toggle, which is painted inside the field's right edge below.
-    let margin = Margin {
-        left: 10,
-        right: 52,
-        top: 11,
-        bottom: 11,
-    };
-    let response = ui.add(
-        egui::TextEdit::singleline(value)
-            .password(!*revealed)
-            .frame(egui::Frame::new())
-            .desired_width(field_text_width(ui, margin))
-            // Same 38px-field metrics as `text_field`.
-            .font(FontId::new(14.0, FontFamily::Proportional))
-            .margin(margin),
-    );
-    let box_rect = paint_field_box(ui, &response, bg, margin);
+    // The wide right inset keeps typed text from running under the toggle.
+    let (response, box_rect) = field_box(ui, value, !*revealed, 52.0);
 
     // 3h's in-field reveal: a click-sensing label, not a Button, so no
     // padding or fill fights the field it sits inside.
@@ -741,6 +684,76 @@ pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> R
     }
 
     response
+}
+
+/// Allocates the design's full 38px input box, places a frameless `TextEdit`
+/// inside it (10px left inset, `right_pad` right inset), and paints the box:
+/// 1px border at rest, blue border with a flush 3px `FOCUS_RING` halo when
+/// focused — a treatment egui's own `TextEdit` frame can't produce.
+///
+/// The *box* is what gets allocated, not the text row: a frameless TextEdit
+/// only allocates its text height, and painting a 38px box around a 16px
+/// allocation made the box overlap the label above and shift left of its
+/// right inset (asymmetric padding). Returns the response and the box rect
+/// (for in-field affordances like the reveal toggle).
+fn field_box(ui: &mut Ui, value: &mut String, password: bool, right_pad: f32) -> (Response, Rect) {
+    // Placeholder so the box paints *under* the text egui draws in ui.put.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), FIELD_HEIGHT),
+        Sense::hover(),
+    );
+    let inner = Rect::from_min_max(
+        Pos2::new(outer.min.x + 10.0, outer.min.y),
+        Pos2::new(outer.max.x - right_pad, outer.max.y),
+    );
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .password(password)
+            .frame(egui::Frame::new())
+            .font(FontId::new(14.0, FontFamily::Proportional))
+            .margin(Margin::ZERO)
+            .desired_width(inner.width()),
+    );
+
+    let rounding = CornerRadius::same(8);
+    let border = if response.has_focus() {
+        // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
+        // flush against the 1px border's outer edge, like the mock's
+        // box-shadow -- expand(3.0) would leave a visible white ring between
+        // border and halo.
+        ui.painter().rect_stroke(
+            outer.expand(2.0),
+            rounding,
+            Stroke::new(3.0, FOCUS_RING),
+            StrokeKind::Middle,
+        );
+        Stroke::new(1.0, BLUE)
+    } else {
+        Stroke::new(1.0, BORDER_STRONG)
+    };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(outer, rounding, CARD, border, StrokeKind::Middle),
+    );
+    (response, outer)
+}
+
+/// The design's 40×22 toggle pill (section 3e's settings rows). Paints only;
+/// the caller owns the click handling on whatever element contains it.
+pub fn toggle_pill(ui: &mut Ui, on: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::hover());
+    let track = if on { BLUE } else { TOGGLE_OFF };
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(11), track);
+    let knob_x = if on {
+        rect.max.x - 11.0
+    } else {
+        rect.min.x + 11.0
+    };
+    ui.painter()
+        .circle_filled(Pos2::new(knob_x, rect.center().y), 9.0, Color32::WHITE);
 }
 
 /// A full-width hairline separator in the card hairline color (egui's

@@ -41,7 +41,7 @@ fn main() -> eframe::Result {
     let viewport = if login {
         // The real login window's size and chrome (login_ui::run_login_flow).
         egui::ViewportBuilder::default()
-            .with_inner_size([470.0, 560.0])
+            .with_inner_size([470.0, 588.0])
             .with_resizable(false)
             .with_decorations(false)
             .with_icon(theme::window_icon())
@@ -126,7 +126,12 @@ impl eframe::App for Preview {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             egui::Frame::new()
-                .inner_margin(Margin::symmetric(26, 24))
+                .inner_margin(Margin {
+                    left: 26,
+                    right: 26,
+                    top: 24,
+                    bottom: 30,
+                })
                 .show(root, |ui| {
                     ui.set_min_width(ui.available_width());
                     // Sample data mirroring the 3h mock (unlock: Hello shown

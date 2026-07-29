@@ -454,9 +454,16 @@ pub fn draw_login_window(
         theme::mark(ui, 44.0);
         ui.add_space(2.0);
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(theme::bold("Deskwarden", 25.0).color(theme::INK));
-            ui.label(theme::semibold("FILLS NATIVE WINDOWS", 10.0).color(theme::TEXT_FAINT));
+            // The design tracks the tag wide (0.15em at 10px = 1.5pt).
+            ui.label(theme::letterspaced(
+                "FILLS NATIVE WINDOWS",
+                10.0,
+                theme::SEMIBOLD,
+                1.5,
+                theme::TEXT_FAINT,
+            ));
         });
     });
 
@@ -512,18 +519,6 @@ pub fn draw_login_window(
             });
             theme::password_field(ui, &mut form.password, &mut form.reveal_password);
 
-            // Quick-unlock opt-in, offered until enrolled. Enrollment
-            // happens on the next successful password unlock, so the
-            // password being sealed is one that provably works.
-            if hello.available && !hello.enrolled {
-                ui.checkbox(
-                    &mut form.enable_hello,
-                    RichText::new("Unlock with Windows Hello next time")
-                        .size(12.0)
-                        .color(theme::TEXT_MUTED),
-                );
-            }
-
             if theme::primary_button(ui, "Continue", Some("↵")).clicked() {
                 action = Some(LoginAction::Submit);
             }
@@ -534,9 +529,14 @@ pub fn draw_login_window(
         ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
     }
 
-    // 3h's alternative path: the "or" divider and the Windows Hello panel,
-    // once quick unlock is enrolled.
-    if hello.available && hello.enrolled && status != BwStatus::Unauthenticated {
+    // 3h's alternative path: the "or" divider and the Windows Hello panel.
+    // Enrolled: click (or Ctrl+H) unlocks via Hello. Not yet enrolled: the
+    // same panel is the opt-in — its toggle arms enrollment, which then
+    // happens on the next successful password unlock, so the password
+    // being sealed is one that provably works.
+    let show_unlock = hello.available && hello.enrolled && status != BwStatus::Unauthenticated;
+    let show_enroll = hello.available && !hello.enrolled;
+    if show_unlock || show_enroll {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let half = (ui.available_width() - 30.0) / 2.0;
@@ -546,11 +546,15 @@ pub fn draw_login_window(
         });
         ui.add_space(10.0);
 
-        if hello_panel(ui) {
-            action = Some(LoginAction::HelloUnlock);
-        }
-        if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)) {
-            action = Some(LoginAction::HelloUnlock);
+        if show_unlock {
+            if hello_panel(ui, HelloPanelMode::Unlock) {
+                action = Some(LoginAction::HelloUnlock);
+            }
+            if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)) {
+                action = Some(LoginAction::HelloUnlock);
+            }
+        } else if hello_panel(ui, HelloPanelMode::Enroll(form.enable_hello)) {
+            form.enable_hello = !form.enable_hello;
         }
     }
 
@@ -623,9 +627,20 @@ fn hairline_segment(ui: &mut egui::Ui, width: f32) {
         .rect_filled(rect, CornerRadius::ZERO, theme::HAIRLINE);
 }
 
+/// Which job the Hello panel is doing this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelloPanelMode {
+    /// Quick unlock is enrolled: clicking runs it (trailing CTRL+H chip).
+    Unlock,
+    /// Not enrolled yet: the panel is the opt-in, with the design's toggle
+    /// pill showing the armed state; clicking flips it.
+    Enroll(bool),
+}
+
 /// The 3h Windows Hello panel: blue-washed row with a padlock tile, "Use
-/// Windows Hello", and the CTRL+H chip. Returns true when clicked.
-fn hello_panel(ui: &mut egui::Ui) -> bool {
+/// Windows Hello", and a trailing affordance per `mode`. Returns true when
+/// clicked.
+fn hello_panel(ui: &mut egui::Ui, mode: HelloPanelMode) -> bool {
     let panel = egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(Stroke::new(1.0, theme::FOCUS_RING))
@@ -648,28 +663,35 @@ fn hello_panel(ui: &mut egui::Ui) -> bool {
                 paint_padlock(ui.painter(), tile.shrink(7.5), theme::BLUE);
 
                 ui.add_space(3.0);
+                let subtitle = match mode {
+                    HelloPanelMode::Unlock => "Face, fingerprint, or PIN",
+                    HelloPanelMode::Enroll(true) => "Will be set up after you continue",
+                    HelloPanelMode::Enroll(false) => "Skip the master password next time",
+                };
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(theme::semibold("Use Windows Hello", 13.0).color(theme::BLUE_DEEP));
-                    ui.label(
-                        RichText::new("Face, fingerprint, or PIN")
-                            .size(11.0)
-                            .color(theme::TEXT_MUTED),
-                    );
+                    ui.label(RichText::new(subtitle).size(11.0).color(theme::TEXT_MUTED));
                 });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let chip = RichText::new("CTRL+H")
-                        .size(10.0)
-                        .family(egui::FontFamily::Monospace)
-                        .color(theme::BLUE);
-                    egui::Frame::new()
-                        .fill(theme::CARD)
-                        .corner_radius(CornerRadius::same(5))
-                        .inner_margin(Margin::symmetric(7, 3))
-                        .show(ui, |ui| {
-                            ui.label(chip);
-                        });
-                });
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match mode {
+                        HelloPanelMode::Unlock => {
+                            let chip = RichText::new("CTRL+H")
+                                .size(10.0)
+                                .family(egui::FontFamily::Monospace)
+                                .color(theme::BLUE);
+                            egui::Frame::new()
+                                .fill(theme::CARD)
+                                .corner_radius(CornerRadius::same(5))
+                                .inner_margin(Margin::symmetric(7, 3))
+                                .show(ui, |ui| {
+                                    ui.label(chip);
+                                });
+                        }
+                        HelloPanelMode::Enroll(armed) => theme::toggle_pill(ui, armed),
+                    },
+                );
             });
         });
     panel
@@ -735,7 +757,10 @@ pub fn run_login_flow() -> String {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([470.0, 560.0])
+            // 28 taller than the 3h mock: the sign-in state stacks an email
+            // field and the Hello opt-in panel that the unlock mock doesn't
+            // have, and the footer must never overlap them.
+            .with_inner_size([470.0, 588.0])
             // The design's window is a fixed composition; there is nothing
             // in it that grows, so resizing only breaks the layout.
             .with_resizable(false)
@@ -775,7 +800,14 @@ pub fn run_login_flow() -> String {
         }
 
         egui::Frame::new()
-            .inner_margin(Margin::symmetric(26, 24))
+            // Deeper at the bottom: the footer row's dropdown otherwise
+            // sits too close to the window edge (3h pads the body 30px).
+            .inner_margin(Margin {
+                left: 26,
+                right: 26,
+                top: 24,
+                bottom: 30,
+            })
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 let action = draw_login_window(
