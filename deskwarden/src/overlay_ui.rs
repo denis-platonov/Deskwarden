@@ -17,7 +17,8 @@ pub struct OverlayMatch {
 /// the matched credential row, and a keyboard-hint footer.
 ///
 /// Returns `true` if the user chose to fill (clicked the row or pressed
-/// Enter), `false` if they dismissed it (Esc, or closing the window).
+/// Enter), `false` if they dismissed it (the header's ✕, Esc, or closing the
+/// window).
 ///
 /// `matched` is `None` when the item couldn't be read back from the vault at
 /// prompt time; the overlay still shows, it just can't name the credentials.
@@ -98,14 +99,18 @@ impl eframe::App for OverlayApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                if draw_overlay_card(
+                match draw_overlay_card(
                     ui,
                     &self.app_name,
                     &self.item_name,
                     self.username.as_deref(),
                 ) {
-                    *self.fill_clicked.borrow_mut() = true;
-                    done = true;
+                    OverlayAction::Fill => {
+                        *self.fill_clicked.borrow_mut() = true;
+                        done = true;
+                    }
+                    OverlayAction::Dismiss => done = true,
+                    OverlayAction::None => {}
                 }
             });
 
@@ -115,9 +120,20 @@ impl eframe::App for OverlayApp {
     }
 }
 
-/// Draws the overlay card itself — header (mark, wordmark, match count),
-/// the matched credential row, and the keyboard-hint footer — and returns
-/// true if the credential row was clicked.
+/// What the user did to the overlay card on this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverlayAction {
+    /// Nothing yet; keep the overlay up.
+    #[default]
+    None,
+    /// Fill the matched credentials (the credential row was clicked).
+    Fill,
+    /// Close without filling (the header's ✕ was clicked).
+    Dismiss,
+}
+
+/// Draws the overlay card itself — header (mark, wordmark, match count,
+/// dismiss ✕), the matched credential row, and the keyboard-hint footer.
 ///
 /// Public (rather than folded into `OverlayApp::update`) so the
 /// `ui_preview` example can render the exact card the app ships, not a
@@ -127,8 +143,8 @@ pub fn draw_overlay_card(
     app_name: &str,
     item_name: &str,
     username: Option<&str>,
-) -> bool {
-    let mut fill = false;
+) -> OverlayAction {
+    let mut action = OverlayAction::None;
 
     let card = egui::Frame::none()
         .fill(theme::CARD)
@@ -150,11 +166,20 @@ pub fn draw_overlay_card(
     card.show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
 
-        // Header: mark, wordmark, match count.
+        // Header: mark, wordmark, match count, and the dismiss ✕. The ✕ is
+        // the only mouse-operable way out of a `with_decorations(false)`
+        // window — there is no title bar to close, and the footer's "Esc
+        // Dismiss" is a label, not a control. It matters more than it looks:
+        // this window is raised in response to *another* app being
+        // foregrounded, which is exactly the situation Windows' foreground
+        // lock refuses keyboard focus for, so Esc is not guaranteed to reach
+        // us at all.
         egui::Frame::none()
             .inner_margin(Margin::symmetric(12.0, 9.0))
             .show(ui, |ui| {
-                theme::card_header(ui, "1 match");
+                if theme::card_header_with_close(ui, "1 match") {
+                    action = OverlayAction::Dismiss;
+                }
             });
         theme::hairline(ui);
 
@@ -164,7 +189,7 @@ pub fn draw_overlay_card(
             .show(ui, |ui| {
                 let (primary, secondary) = row_text(app_name, item_name, username);
                 if credential_row(ui, &primary, &secondary) {
-                    fill = true;
+                    action = OverlayAction::Fill;
                 }
             });
 
@@ -184,7 +209,7 @@ pub fn draw_overlay_card(
             });
     });
 
-    fill
+    action
 }
 
 /// The two lines of the credential row: the recognizable identity on top

@@ -3,14 +3,16 @@
 //! The single place the design language lives: the palette, the global egui
 //! style, the quartered-shield mark, and the handful of composite widgets
 //! (buttons, avatars, keyboard chips, header/footer bars) every window is
-//! built from. Values here are lifted directly from the committed design
-//! document (`Deskwarden.dc.html`, sections 2a/2b and 3a–3g); nothing is
-//! invented locally, so a mismatch with the design is a bug in this file.
+//! built from. Values here are lifted directly from the design document
+//! committed at `docs/design/Deskwarden.dc.html` (sections 2a/2b and 3a–3g);
+//! nothing is invented locally, so a mismatch with the design is a bug in
+//! this file.
 
 use eframe::egui::{
     self, Color32, FontFamily, FontId, Pos2, Rect, Response, RichText, Rounding, Sense, Stroke,
     TextStyle, Ui, Vec2,
 };
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Palette (design 3g: one blue hue in four values, warm greys for everything
@@ -224,7 +226,18 @@ fn flatten_cubic(out: &mut Vec<Pos2>, p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, st
 /// coordinate space. Each is convex (a rectangle with one rounded or one
 /// elliptically-curved corner), which is what lets `paint_mark` use
 /// `Shape::convex_polygon` directly.
-fn quadrant_outlines() -> [Vec<Pos2>; 4] {
+///
+/// Flattened once and kept, rather than rebuilt per call: `paint_mark` runs
+/// on every frame the mark is visible, and the geometry is a compile-time
+/// constant in all but name (it just needs float arithmetic a `const` can't
+/// do). Callers scale the returned points into screen space themselves, so
+/// there is nothing frame-dependent to recompute.
+fn quadrant_outlines() -> &'static [Vec<Pos2>; 4] {
+    static OUTLINES: OnceLock<[Vec<Pos2>; 4]> = OnceLock::new();
+    OUTLINES.get_or_init(build_quadrant_outlines)
+}
+
+fn build_quadrant_outlines() -> [Vec<Pos2>; 4] {
     let p = Pos2::new;
 
     // Top-left: M12 2 H4.4 A2.4 2.4 0 0 0 2 4.4 V14 H12 Z
@@ -291,9 +304,9 @@ pub fn paint_mark_tinted(painter: &egui::Painter, rect: Rect, tint: Color32) {
 fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
     let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
-    for (outline, fill) in quadrant_outlines().into_iter().zip(QUADRANT_FILLS) {
+    for (outline, fill) in quadrant_outlines().iter().zip(QUADRANT_FILLS) {
         let points: Vec<Pos2> = outline
-            .into_iter()
+            .iter()
             .map(|p| origin + Vec2::new(p.x * scale, p.y * scale))
             .collect();
         painter.add(egui::Shape::convex_polygon(
@@ -407,13 +420,59 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
 /// The overlay/card header bar: 16px mark, letterspaced "DESKWARDEN", and a
 /// right-aligned status ("3 matches", the app name).
 pub fn card_header(ui: &mut Ui, right_text: &str) {
+    card_header_inner(ui, right_text, false);
+}
+
+/// [`card_header`] with a dismiss ✕ at the far right, as the design's card
+/// headers carry (3c: ghost-grey glyph, right-aligned in the header rule).
+/// Returns true on the frame it is clicked.
+///
+/// Needed by any window that has no title bar of its own: the overlay is
+/// `with_decorations(false)`, so without this the only way out for a
+/// mouse-only user is Alt+F4 — and the keyboard route can't be relied on,
+/// because Windows' foreground lock can hand an always-on-top window that was
+/// raised in response to *another* app's activity no keyboard focus at all.
+pub fn card_header_with_close(ui: &mut Ui, right_text: &str) -> bool {
+    card_header_inner(ui, right_text, true)
+}
+
+fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
+    let mut dismissed = false;
     ui.horizontal(|ui| {
         mark(ui, 16.0);
         ui.label(bold("D E S K W A R D E N", 10.5).color(TEXT_SECONDARY));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if with_close {
+                dismissed = close_glyph(ui).clicked();
+                ui.add_space(2.0);
+            }
             ui.label(RichText::new(right_text).size(11.0).color(TEXT_GHOST));
         });
     });
+    dismissed
+}
+
+/// The dismiss ✕ itself: a 16px hit target with the design's ghost-grey
+/// glyph, darkening to ink on hover so it reads as clickable despite having
+/// no button chrome (the design draws it as bare text).
+///
+/// Stroked as two crossing lines rather than drawn as the character U+2715:
+/// neither the bundled Archivo faces nor egui's fallback stack carry that
+/// codepoint, so as text it renders as a tofu box. Two strokes are also
+/// sharper at this size than any glyph would be.
+fn close_glyph(ui: &mut Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
+    let color = if response.hovered() { INK } else { TEXT_GHOST };
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let stroke = Stroke::new(1.3, color);
+    let arm = 3.5;
+    let c = rect.center();
+    let painter = ui.painter();
+    painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
+    painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
+    response.on_hover_text("Dismiss")
 }
 
 /// The footer keyboard-hint strip: `(key, action)` pairs in faint text, per

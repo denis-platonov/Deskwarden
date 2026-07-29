@@ -1,8 +1,7 @@
-use crate::bw_path::resolve_bw_exe;
+use crate::bw_path::bw_command;
 use crate::theme;
 use eframe::egui::{self, Margin, RichText, Rounding, Stroke};
 use std::cell::RefCell;
-use std::process::Command;
 use std::rc::Rc;
 use zeroize::Zeroize;
 
@@ -37,11 +36,18 @@ pub fn check_bw_status() -> BwStatus {
 ///
 /// A cached session token is worthless if it has since been invalidated (a
 /// manual `bw lock`, a password change, a reboot), so this is how startup
-/// checks a cached token before trusting it. Spawn failure -- typically the
-/// CLI not being on PATH -- is logged and reported as `Unauthenticated`
-/// rather than panicking the whole app.
+/// checks a cached token before trusting it. Failure to run the CLI at all --
+/// whether because no verified `bw.exe` was recorded at startup or because
+/// spawning it failed -- is logged and reported as `Unauthenticated` rather
+/// than panicking the whole app.
 pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
-    let mut cmd = Command::new(resolve_bw_exe());
+    let mut cmd = match bw_command() {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            log::error!("cannot run `bw status`: {e}");
+            return BwStatus::Unauthenticated;
+        }
+    };
     cmd.arg("status");
     if let Some(token) = session_token {
         cmd.env("BW_SESSION", token);
@@ -51,7 +57,8 @@ pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
         Ok(output) => parse_bw_status(&String::from_utf8_lossy(&output.stdout)),
         Err(e) => {
             log::error!(
-                "failed to run `bw status` (is the Bitwarden CLI installed and on PATH?): {e}"
+                "failed to run `bw status` from the verified Bitwarden CLI path \
+                 (see bw_path::resolve_bw_exe for where that path comes from): {e}"
             );
             BwStatus::Unauthenticated
         }
@@ -65,11 +72,14 @@ pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
 /// `run_bw_with_password` failures already are), not as a process-killing
 /// panic with a Rust backtrace.
 pub fn configure_server(url: &str) -> Result<(), String> {
-    let output = Command::new(resolve_bw_exe())
+    let output = bw_command()?
         .args(["config", "server", url])
         .output()
         .map_err(|e| {
-            format!("failed to run `bw config server` (is the Bitwarden CLI on PATH?): {e}")
+            format!(
+                "failed to run `bw config server` from the verified Bitwarden CLI path \
+                 (see bw_path::resolve_bw_exe for where that path comes from): {e}"
+            )
         })?;
 
     if output.status.success() {
@@ -88,8 +98,13 @@ pub fn configure_server(url: &str) -> Result<(), String> {
 /// environment variable (`--passwordenv`), never as a bare CLI argument --
 /// a bare-argument password would be visible to other processes/users
 /// via the OS process list.
+///
+/// The binary this spawns is the one startup resolved *and* verified as
+/// Bitwarden-signed (`bw_path::bw_command`), never a freshly-resolved one:
+/// this is the single call site that hands over the master password, so it
+/// must not be able to pick up a `bw.exe` that appeared after that check.
 fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String> {
-    let mut cmd = Command::new(resolve_bw_exe());
+    let mut cmd = bw_command()?;
     cmd.args(args);
     cmd.args(["--passwordenv", "DESKWARDEN_BW_PASSWORD"]);
     cmd.env("DESKWARDEN_BW_PASSWORD", password);

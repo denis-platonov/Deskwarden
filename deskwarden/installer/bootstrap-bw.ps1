@@ -116,6 +116,38 @@ $BitwardenSignerOrganizations = @(
 
 <#
 .SYNOPSIS
+    Consumes a quoted DN value that starts at the first character of $Text.
+.DESCRIPTION
+    Returns a hashtable @{ Closed = $bool; Value = $string }. Closed is $true
+    once the closing quote has been seen, in which case Value is the unquoted
+    text; while the quote is still open Value holds what has been read so far
+    and the caller must append the next line and try again. A doubled quote
+    ("") is an escaped quote inside the value, which is how CertNameToStr
+    emits one.
+#>
+function Read-QuotedDnValue {
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $out = New-Object System.Text.StringBuilder
+    $i = 1
+    while ($i -lt $Text.Length) {
+        $c = $Text[$i]
+        if ($c -eq '"') {
+            if (($i + 1) -lt $Text.Length -and $Text[$i + 1] -eq '"') {
+                [void]$out.Append('"')
+                $i += 2
+                continue
+            }
+            return @{ Closed = $true; Value = $out.ToString() }
+        }
+        [void]$out.Append($c)
+        $i++
+    }
+    return @{ Closed = $false; Value = $Text }
+}
+
+<#
+.SYNOPSIS
     Returns the values of one component (e.g. 'O', 'CN') of a certificate's
     subject DN.
 .DESCRIPTION
@@ -125,6 +157,19 @@ $BitwardenSignerOrganizations = @(
     and a naive split would tear it in half. Surrounding quotes (which Format
     keeps for values that need them) are stripped so callers compare against
     plain values.
+
+    Quoting is tracked *across* lines, which is a security property rather
+    than tidiness. Format($true) separates RDNs with CRLF, but a certificate
+    value may itself contain a newline, and CertNameToStr handles that by
+    quoting the value rather than escaping the newline. Parsing each line in
+    isolation would therefore read
+
+        CN="Innocent
+        O=Bitwarden Inc."
+
+    as two RDNs and report a forged organization that no CA ever issued.
+    Kept in sync by hand with dn_component in src/signature.rs, which does
+    exactly the same thing in Rust at app startup.
 #>
 function Get-CertificateDnComponent {
     param(
@@ -135,22 +180,86 @@ function Get-CertificateDnComponent {
     )
 
     $values = @()
+    $openMatches = $false
+    $open = $null
+
     foreach ($line in ($Certificate.SubjectName.Format($true) -split "`r?`n")) {
+        if ($null -ne $open) {
+            $open = "$open`n$line"
+            $parsed = Read-QuotedDnValue -Text $open
+            if ($parsed.Closed) {
+                if ($openMatches) { $values += $parsed.Value }
+                $open = $null
+            }
+            continue
+        }
+
         $line = $line.Trim()
         if ($line.Length -eq 0) { continue }
         $separator = $line.IndexOf('=')
         if ($separator -lt 1) { continue }
-        if ($line.Substring(0, $separator).Trim() -ieq $Key) {
-            $values += $line.Substring($separator + 1).Trim().Trim('"')
+
+        $matchesKey = $line.Substring(0, $separator).Trim() -ieq $Key
+        $value = $line.Substring($separator + 1).TrimStart()
+
+        if ($value.StartsWith('"')) {
+            $parsed = Read-QuotedDnValue -Text $value
+            if ($parsed.Closed) {
+                if ($matchesKey) { $values += $parsed.Value }
+            } else {
+                $open = $value
+                $openMatches = $matchesKey
+            }
+        } elseif ($matchesKey) {
+            $values += $value.TrimEnd()
         }
     }
+
     return $values
 }
 
+<#
+.SYNOPSIS
+    True if the given file carries a valid Authenticode signature whose
+    subject DN names one of $BitwardenSignerOrganizations in its O= component.
+#>
+function Test-BitwardenSigned {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate) { return $false }
+    $orgs = Get-CertificateDnComponent -Certificate $sig.SignerCertificate -Key 'O'
+    return @($orgs | Where-Object { $BitwardenSignerOrganizations -contains $_ }).Count -gt 0
+}
+
+<#
+.SYNOPSIS
+    True if a bw.exe deskwarden will actually accept is already installed.
+.DESCRIPTION
+    Deliberately stricter than "does `bw` resolve at all". The previous check
+    was `if (Get-Command bw.exe) { return $true }`, which skipped the download
+    whenever *any* bw.exe was on PATH -- including a Scoop or Chocolatey shim,
+    which is signed by somebody other than Bitwarden (or not signed at all).
+    That combination left the user with a CLI deskwarden's own startup check
+    does not recognize and no way to get a recognized one, since this script
+    only ever runs at install time. So a PATH-resolved bw.exe now has to pass
+    the same organization check the downloaded one does; if it doesn't, the
+    download proceeds and deskwarden's own <InstallDir>\bin\bw.exe -- which
+    bw_path::resolve_bw_exe prefers over anything on PATH -- becomes the one
+    that gets used.
+#>
 function Test-BwAlreadyAvailable {
     param([string]$BinDir)
-    if (Get-Command bw.exe -ErrorAction SilentlyContinue) { return $true }
-    if (Test-Path (Join-Path $BinDir 'bw.exe')) { return $true }
+
+    $installed = Join-Path $BinDir 'bw.exe'
+    if (Test-Path $installed) { return $true }
+
+    $onPath = Get-Command bw.exe -ErrorAction SilentlyContinue
+    if ($onPath) {
+        if (Test-BitwardenSigned -Path $onPath.Source) { return $true }
+        Write-Output "Found bw.exe at $($onPath.Source), but it is not signed by Bitwarden; installing a signed copy alongside it."
+    }
+
     return $false
 }
 
@@ -216,10 +325,13 @@ try {
     Copy-Item -Path $bwExe.FullName -Destination (Join-Path $binDir 'bw.exe') -Force
 
     # Add <InstallDir>\bin to the current user's PATH (HKCU, no admin
-    # needed) so `bw` resolves for deskwarden's bare `Command::new("bw")`
-    # calls. [Environment]::SetEnvironmentVariable(..., 'User') both writes
-    # HKCU\Environment and broadcasts WM_SETTINGCHANGE, so already-running
-    # Explorer picks up the change without a logoff/logon.
+    # needed). deskwarden itself does not depend on this -- it resolves
+    # <InstallDir>\bin\bw.exe by absolute path via bw_path::resolve_bw_exe --
+    # but putting the directory on PATH means the user gets a working `bw`
+    # in their own shell too, and it keeps the resolver's PATH fallback
+    # pointing somewhere sensible. [Environment]::SetEnvironmentVariable(...,
+    # 'User') both writes HKCU\Environment and broadcasts WM_SETTINGCHANGE,
+    # so already-running Explorer picks up the change without a logoff/logon.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     if ($null -eq $userPath) { $userPath = '' }
     $pathEntries = $userPath -split ';' | Where-Object { $_.Length -gt 0 }

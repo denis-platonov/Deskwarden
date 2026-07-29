@@ -68,7 +68,7 @@ fn search_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
 }
 
 /// The white, hairline-bordered card that scrollable lists live in.
-fn list_card<R>(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui) -> R) {
+fn list_card(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::none()
         .fill(theme::CARD)
         .rounding(Rounding::same(10.0))
@@ -153,7 +153,10 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
                 search_field(ui, &mut filter, "Search vault");
                 ui.add_space(8.0);
 
-                list_card(ui, ui.available_height() - 56.0, |ui| {
+                // Clamped: the subtrahend is the space reserved for the
+                // buttons below, and a window resized smaller than that would
+                // otherwise ask for a negative scroll-area height.
+                list_card(ui, (ui.available_height() - 56.0).max(0.0), |ui| {
                     for item in items.iter().filter(|i| item_matches_filter(i, &filter)) {
                         let selected = selected_id.as_deref() == Some(item.id.as_str());
                         let username = item
@@ -305,7 +308,7 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
                 search_field(ui, &mut filter, "Search running processes");
                 ui.add_space(8.0);
 
-                list_card(ui, ui.available_height() - 148.0, |ui| {
+                list_card(ui, (ui.available_height() - 148.0).max(0.0), |ui| {
                     for p in processes
                         .iter()
                         .filter(|p| p.exe_name.to_lowercase().contains(&filter.to_lowercase()))

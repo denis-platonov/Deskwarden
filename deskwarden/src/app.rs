@@ -99,11 +99,17 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // item name, never a bare "fill something?"). A failed read is
             // not fatal to the prompt -- the overlay just can't name the
             // credentials -- and the fill path re-fetches on its own anyway.
+            //
+            // The username is read straight off the login object rather than
+            // through `credentials_for`: that helper also clones the
+            // plaintext password into a `String` this path has no use for,
+            // and which would then be dropped without being zeroized. The
+            // overlay never shows a password, so it should never hold one.
             let matched = vault.get_item(item_id).ok().map(|item| {
-                let (username, _) = credentials_for(&item);
+                let username = item.login.as_ref().and_then(|l| l.username.clone());
                 overlay_ui::OverlayMatch {
                     item_name: item.name.clone(),
-                    username: (!username.is_empty()).then_some(username),
+                    username: username.filter(|u| !u.is_empty()),
                 }
             });
             if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref()) {

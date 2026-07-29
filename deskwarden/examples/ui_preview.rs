@@ -69,12 +69,17 @@ impl eframe::App for Preview {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                overlay_ui::draw_overlay_card(
+                // The preview closes on the dismiss ✕ too, so the affordance
+                // can actually be clicked here rather than only looked at.
+                if overlay_ui::draw_overlay_card(
                     ui,
                     "ledgerline.exe",
                     "Ledgerline",
                     Some("a.novak@ledgerline.com"),
-                );
+                ) == overlay_ui::OverlayAction::Dismiss
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             });
 
         if let Some(path) = self.screenshot_path.clone() {

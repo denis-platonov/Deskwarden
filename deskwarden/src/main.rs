@@ -13,8 +13,9 @@
 // Consequence: `println!`/`eprintln!` from this binary go nowhere. There is
 // exactly one such call left (the logging-init failure below, which by
 // definition can't use the log file), and it is a fallback for a case the
-// user cannot act on anyway; everything user-facing goes through the tray or
-// the log file.
+// user cannot act on anyway. Everything user-facing goes through the tray,
+// the log file, or -- for the startup failures that happen before the tray
+// exists -- a native message box; see `message_box`/`fatal_startup_error`.
 #![windows_subsystem = "windows"]
 
 //! Binary entry point.
@@ -40,7 +41,11 @@ use semver::Version;
 use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows::core::HSTRING;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK,
+    MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
+};
 
 /// How often the match engine is rebuilt from the vault while running, so
 /// matches added via the picker (or synced from another device) take effect
@@ -85,9 +90,15 @@ const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISS
 /// TODO (verify before shipping): this list has not yet been confirmed
 /// against a real Bitwarden-signed `bw.exe` -- see the identical TODO on
 /// `$BitwardenSignerOrganizations` in `installer/bootstrap-bw.ps1` for the
-/// verification step. Until then this fails closed by design, the same way
-/// `EXPECTED_SIGNER_THUMBPRINT` above does: every startup refuses to run an
-/// unverified `bw.exe` rather than silently trusting one.
+/// verification step.
+///
+/// Because the list is *known to be unverified*, a mismatch is deliberately
+/// **not** treated the same way `EXPECTED_SIGNER_THUMBPRINT` treats a bad
+/// update signature. See `check_bw_signature` below for the graded response
+/// and the reasoning behind it: an unsigned or tamper-detected binary is
+/// still refused outright, but "validly signed by an organization this
+/// unverified list doesn't happen to name" asks the user instead of killing a
+/// tray app with no console and no explanation.
 const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
     "Bitwarden Inc.",
     "Bitwarden, Inc.",
@@ -123,39 +134,30 @@ fn main() {
     // proceed with an unsigned or wrongly-signed `bw.exe` is the whole point
     // of resolving it to a specific path in the first place -- see
     // `bw_path::resolve_bw_exe` and `TRUSTED_BW_SIGNER_ORGANIZATIONS` above.
-    let bw_exe = deskwarden::bw_path::resolve_bw_exe();
-    if !bw_exe.exists() {
-        log::error!(
-            "Bitwarden CLI not found at {}; reinstall deskwarden or install the Bitwarden CLI \
-             and ensure it is on PATH",
-            bw_exe.display()
+    let Some(bw_exe) = deskwarden::bw_path::resolve_bw_exe() else {
+        fatal_startup_error(
+            "Deskwarden could not work out its own install directory, so it cannot tell which \
+             bw.exe is the real Bitwarden CLI.\n\nRather than guess -- and risk handing your \
+             master password to the wrong program -- it is stopping here.\n\nReinstalling \
+             Deskwarden should fix this.",
         );
-        std::process::exit(1);
+    };
+    if !bw_exe.exists() {
+        fatal_startup_error(&format!(
+            "Deskwarden needs the Bitwarden CLI (bw.exe) and could not find it.\n\nExpected it \
+             at:\n{}\n\nInstall the Bitwarden CLI, or reinstall Deskwarden (its installer \
+             downloads a signed copy for you).",
+            bw_exe.display()
+        ));
     }
-    match deskwarden::signature::verify_authenticode(&bw_exe) {
-        Ok(info) if deskwarden::signature::is_trusted_organization(&info, TRUSTED_BW_SIGNER_ORGANIZATIONS) => {
-            log::info!("bw CLI at {} verified as Bitwarden-signed", bw_exe.display());
-        }
-        Ok(info) => {
-            log::error!(
-                "refusing to start: {} is not signed by Bitwarden (valid: {}, subject: {:?}). \
-                 The master password and session token must never be handed to an unverified \
-                 binary. Reinstall deskwarden or the Bitwarden CLI.",
-                bw_exe.display(),
-                info.valid,
-                info.subject_dn
-            );
-            std::process::exit(1);
-        }
-        Err(e) => {
-            log::error!(
-                "refusing to start: could not verify the signature of {} ({e}). Reinstall \
-                 deskwarden or the Bitwarden CLI.",
-                bw_exe.display()
-            );
-            std::process::exit(1);
-        }
-    }
+    check_bw_signature(&bw_exe);
+
+    // Resolved and verified exactly once, here. Everything that later spawns
+    // the CLI -- `bw_serve`, `login_ui`, including the one call that hands
+    // over the master password -- reads this single recorded result instead of
+    // re-resolving, so a `bw.exe` appearing on disk *after* this point can
+    // never be the one that gets the secrets.
+    deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
 
     // Any installer still sitting in the download directory is spent by now:
     // either it was applied (and this process is the result) or its attempt
@@ -240,12 +242,11 @@ fn main() {
                 Ok(child) => child,
                 Err(e) => {
                     log::error!("{e}");
-                    log::error!(
-                        "giving up: `bw serve` could not be restarted after re-authenticating. \
-                         See {}",
+                    fatal_startup_error(&format!(
+                        "Deskwarden could not start its Bitwarden backend after you signed \
+                         in.\n\n{e}\n\nFull details are in:\n{}",
                         logging::log_file_path(&config_dir).display()
-                    );
-                    std::process::exit(1);
+                    ));
                 }
             };
 
@@ -253,13 +254,13 @@ fn main() {
                 Ok(items) => items,
                 Err(e) => {
                     log::error!("{e}");
-                    log::error!(
-                        "giving up: without a reachable, unlocked `bw serve` there is nothing \
-                         to match against. See {}",
-                        logging::log_file_path(&config_dir).display()
-                    );
                     bw_serve::stop_bw_serve(&mut bw_serve_child);
-                    std::process::exit(1);
+                    fatal_startup_error(&format!(
+                        "Deskwarden's Bitwarden backend started but never became usable, so \
+                         there is nothing to match your apps against.\n\n{e}\n\nFull details \
+                         are in:\n{}",
+                        logging::log_file_path(&config_dir).display()
+                    ));
                 }
             }
         }
@@ -288,8 +289,8 @@ fn main() {
     let fill_hotkey = hotkey::register_fill_hotkey();
     let tray = tray::build_tray();
 
-    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
-        .expect("CARGO_PKG_VERSION is not valid semver");
+    let current_version =
+        Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
 
     // Bounded connect/read timeouts, same "don't trust an external dependency
     // to answer promptly" reasoning as `bw_serve::READINESS_DEADLINE` -- just
@@ -686,6 +687,157 @@ fn main() {
     }
 }
 
+/// Shows a native message box.
+///
+/// The only user-visible channel that exists this early. Everything in this
+/// process is either a tray icon (not yet built at startup-check time) or an
+/// egui window (which needs an event loop this code hasn't reached), and the
+/// GUI subsystem means `eprintln!` goes nowhere at all -- so a plain
+/// `MessageBoxW` is the one mechanism that can actually put words in front of
+/// the user before anything else exists. `MB_SETFOREGROUND | MB_SYSTEMMODAL`
+/// because this fires during login-time autostart, when whatever the shell is
+/// doing would otherwise bury it.
+fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from(title),
+            style | MB_SETFOREGROUND | MB_SYSTEMMODAL,
+        )
+    }
+}
+
+/// Logs `message`, shows it to the user, and exits.
+///
+/// The failure paths this replaces logged a line to a file nobody has open and
+/// then called `exit(1)`: from the user's side, a double-clicked app that
+/// simply never appeared, with no clue as to why.
+fn fatal_startup_error(message: &str) -> ! {
+    log::error!("refusing to start: {}", message.replace('\n', " "));
+    message_box("Deskwarden cannot start", message, MB_ICONERROR | MB_OK);
+    std::process::exit(1);
+}
+
+/// Checks that the resolved `bw.exe` is Bitwarden's, and decides what to do
+/// when it can't be shown to be.
+///
+/// The response is graded rather than uniform, because the two failures are
+/// not equally conclusive:
+///
+/// * **The signature itself is invalid** (unsigned, tampered with, expired,
+///   or not chaining to a trusted root). That is a fact about the binary, not
+///   an opinion of ours, and it is exactly the case this check exists to stop.
+///   Refused outright -- with an explanation the user can actually see.
+/// * **The signature is valid but the signer's `O=` isn't in
+///   [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]**, or the check couldn't be run at
+///   all. Here the evidence points at *our* list as much as at the binary:
+///   that list carries a standing "not yet confirmed against a real
+///   Bitwarden-signed bw.exe" TODO, and `installer/bootstrap-bw.ps1` will
+///   happily leave a Scoop- or Chocolatey-installed `bw` in place, whose
+///   signer is legitimately somebody else. Hard-exiting on our own unverified
+///   data would brick those installs with no recovery path -- the updater
+///   can't help, this runs before it. So the user is told precisely what was
+///   found and asked, with "no, quit" as the default button.
+///
+/// The judgment call, stated plainly: a *known-unverified* allowlist should
+/// not be able to silently kill the app, but it also shouldn't be quietly
+/// ignored, because the next thing to happen is the master password being
+/// typed. Asking is the only option that is honest about both.
+fn check_bw_signature(bw_exe: &std::path::Path) {
+    let (headline, detail) = match deskwarden::signature::verify_authenticode(bw_exe) {
+        Ok(info)
+            if deskwarden::signature::is_trusted_organization(
+                &info,
+                TRUSTED_BW_SIGNER_ORGANIZATIONS,
+            ) =>
+        {
+            log::info!(
+                "bw CLI at {} verified as Bitwarden-signed",
+                bw_exe.display()
+            );
+            return;
+        }
+        Ok(info) if !info.valid => {
+            log::error!(
+                "refusing to start: {} does not carry a valid Authenticode signature \
+                 (subject: {:?})",
+                bw_exe.display(),
+                info.subject_dn
+            );
+            fatal_startup_error(&format!(
+                "The Bitwarden CLI that Deskwarden found is not validly signed, so Deskwarden \
+                 will not run it.\n\nFile:\n{}\n\nWindows could not confirm the file's \
+                 signature. It may have been modified or replaced. Deskwarden hands this \
+                 program your master password, so it is stopping instead.\n\nReinstall the \
+                 Bitwarden CLI from bitwarden.com, or reinstall Deskwarden.",
+                bw_exe.display()
+            ));
+        }
+        Ok(info) => {
+            log::warn!(
+                "{} is validly signed, but by an organization not in the (still unverified) \
+                 trusted list; subject: {:?}",
+                bw_exe.display(),
+                info.subject_dn
+            );
+            (
+                "signed by an organization Deskwarden does not recognize",
+                describe_signer(info.subject_dn.as_deref()),
+            )
+        }
+        Err(e) => {
+            log::warn!(
+                "could not verify the signature of {}: {e}",
+                bw_exe.display()
+            );
+            (
+                "could not be signature-checked at all",
+                format!("The check failed with: {e}"),
+            )
+        }
+    };
+
+    let answer = message_box(
+        "Deskwarden: unrecognized Bitwarden CLI",
+        &format!(
+            "The Bitwarden CLI Deskwarden is about to use {headline}.\n\nFile:\n{}\n\n{detail}\n\n\
+             Deskwarden gives this program your master password and vault session, so it should \
+             only be Bitwarden's own CLI. This can also happen with a `bw` installed through \
+             Scoop or Chocolatey, which are signed differently (or not at all).\n\nContinue \
+             anyway?\n\nChoose No unless you know where this bw.exe came from.",
+            bw_exe.display()
+        ),
+        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
+    );
+
+    if answer == IDYES {
+        log::warn!(
+            "user chose to continue with an unrecognized bw.exe at {}",
+            bw_exe.display()
+        );
+    } else {
+        log::error!(
+            "user declined to continue with an unrecognized bw.exe at {}; exiting",
+            bw_exe.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Turns a signer's subject DN into a sentence for the message box, since a
+/// raw multi-line DN in a dialog is noise to everyone who isn't debugging.
+fn describe_signer(subject_dn: Option<&str>) -> String {
+    let Some(dn) = subject_dn else {
+        return "It has no signer certificate.".to_string();
+    };
+    let orgs = deskwarden::signature::dn_component(dn, "O");
+    match orgs.first() {
+        Some(org) => format!("It is signed by: {org}"),
+        None => "Its signer certificate names no organization.".to_string(),
+    }
+}
+
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
 fn process_foreground_event(
@@ -786,6 +938,8 @@ fn reauthenticate(store: &session_store::SessionStore) -> String {
 enum BackendStartError {
     /// Something is still listening on the port after the grace period.
     PortHeld(Duration),
+    /// No verified `bw.exe` is on record, so there is nothing safe to spawn.
+    NoVerifiedCli(String),
     /// The `bw` process could not be spawned at all.
     Spawn(std::io::Error),
 }
@@ -801,9 +955,11 @@ impl std::fmt::Display for BackendStartError {
                  process holding an unknown session.",
                 bw_serve::BW_SERVE_PORT
             ),
+            Self::NoVerifiedCli(e) => write!(f, "cannot start `bw serve`: {e}"),
             Self::Spawn(e) => write!(
                 f,
-                "failed to spawn `bw serve` (is the Bitwarden CLI installed and on PATH?): {e}"
+                "failed to spawn `bw serve` from the verified Bitwarden CLI path (see \
+                 bw_path::resolve_bw_exe for where that path comes from): {e}"
             ),
         }
     }
@@ -843,8 +999,9 @@ fn try_start_backend(
     // Spawned suspended and assigned to the job before it runs a single
     // instruction, so there is no window in which a crash of *this* process
     // could orphan an unlocked-vault server. See `job_object::spawn_in_job`.
-    job_object::spawn_in_job(job, bw_serve::bw_serve_command(session_token))
-        .map_err(BackendStartError::Spawn)
+    let command =
+        bw_serve::bw_serve_command(session_token).map_err(BackendStartError::NoVerifiedCli)?;
+    job_object::spawn_in_job(job, command).map_err(BackendStartError::Spawn)
 }
 
 /// Startup variant of [`try_start_backend`]: there is nothing to fall back to
@@ -854,7 +1011,9 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
         Ok(child) => child,
         Err(e) => {
             log::error!("{e}");
-            std::process::exit(1);
+            fatal_startup_error(&format!(
+                "Deskwarden could not start its Bitwarden backend.\n\n{e}"
+            ));
         }
     }
 }

@@ -58,8 +58,8 @@ pub fn verify_authenticode(path: &Path) -> Result<SignatureInfo, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).map_err(|e| format!("failed to parse powershell output: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("failed to parse powershell output: {e}"))?;
 
     let status = parsed["Status"].as_str().unwrap_or("");
     let thumbprint = parsed["Thumbprint"].as_str().map(|s| s.to_string());
@@ -81,6 +81,30 @@ pub fn is_trusted_signer(info: &SignatureInfo, expected_thumbprint: &str) -> boo
             .unwrap_or(false)
 }
 
+/// Consumes a quoted DN value starting at `s[0] == '"'`.
+///
+/// `Some(value)` once the closing quote is seen (doubled `""` is an escaped
+/// quote inside the value, which is how `CertNameToStr` emits one);
+/// `None` while the quote is still open, meaning the value runs on into the
+/// following line and the caller must keep feeding it.
+fn close_quoted_value(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s[1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+                out.push('"');
+            } else {
+                return Some(out);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    None
+}
+
 /// Extracts every value of one Distinguished Name component (e.g. `"O"`,
 /// `"CN"`) from a subject DN formatted via `X500DistinguishedName.Format($true)`
 /// (one RDN per line, `Key=Value`). A Rust port of `Get-CertificateDnComponent`
@@ -89,20 +113,68 @@ pub fn is_trusted_signer(info: &SignatureInfo, expected_thumbprint: &str) -> boo
 /// startup (Rust). Parsed line-by-line rather than split on commas for the
 /// same reason that script gives: a value like `O="Bitwarden, Inc."` contains
 /// a comma of its own. Surrounding quotes are stripped.
+///
+/// Quoting is *tracked across lines* rather than each line being parsed in
+/// isolation, and that is a security property, not tidiness. `Format($true)`
+/// separates RDNs with CRLF, but a certificate value may itself contain a
+/// newline -- and `CertNameToStr` handles that by quoting the value, not by
+/// escaping the newline. A naive line-at-a-time parser therefore reads
+///
+/// ```text
+/// CN="Innocent
+/// O=Bitwarden Inc."
+/// ```
+///
+/// as two RDNs and reports a forged `O=Bitwarden Inc.` that no certificate
+/// authority ever issued as an organization. Following the quote to its real
+/// close keeps the whole thing as one `CN` value, where it belongs. (Reaching
+/// this check at all would still require a CA to issue such a certificate
+/// *and* the signature to chain validly, so it is theoretical -- but it is
+/// also two lines of parser, so there is no reason to leave it open.)
 pub fn dn_component(subject_dn: &str, key: &str) -> Vec<String> {
-    subject_dn
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let separator = line.find('=')?;
-            let (k, v) = line.split_at(separator);
-            if k.trim().eq_ignore_ascii_case(key) {
-                Some(v[1..].trim().trim_matches('"').to_string())
-            } else {
-                None
+    let mut values = Vec::new();
+    // `Some((this value's key matches, text accumulated so far))` while a
+    // quoted value is still open across a line break.
+    let mut open: Option<(bool, String)> = None;
+
+    for raw_line in subject_dn.lines() {
+        if let Some((matches, mut accumulated)) = open.take() {
+            accumulated.push('\n');
+            accumulated.push_str(raw_line);
+            match close_quoted_value(&accumulated) {
+                Some(value) => {
+                    if matches {
+                        values.push(value);
+                    }
+                }
+                None => open = Some((matches, accumulated)),
             }
-        })
-        .collect()
+            continue;
+        }
+
+        let line = raw_line.trim();
+        let Some(separator) = line.find('=') else {
+            continue;
+        };
+        let (k, rest) = line.split_at(separator);
+        let matches = k.trim().eq_ignore_ascii_case(key);
+        let value = rest[1..].trim_start();
+
+        if value.starts_with('"') {
+            match close_quoted_value(value) {
+                Some(value) => {
+                    if matches {
+                        values.push(value);
+                    }
+                }
+                None => open = Some((matches, value.to_string())),
+            }
+        } else if matches {
+            values.push(value.trim_end().to_string());
+        }
+    }
+
+    values
 }
 
 /// True if `info` is a validly-chained signature whose subject DN names one
@@ -159,7 +231,11 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_thumbprint() {
-        let info = SignatureInfo { valid: true, thumbprint: None, subject_dn: None };
+        let info = SignatureInfo {
+            valid: true,
+            thumbprint: None,
+            subject_dn: None,
+        };
         assert!(!is_trusted_signer(&info, "ABCDEF0123456789"));
     }
 
@@ -184,13 +260,56 @@ mod tests {
     }
 
     #[test]
+    fn dn_component_does_not_read_a_newline_inside_a_value_as_a_new_rdn() {
+        // The injection this guards against: a CN whose value contains a
+        // newline. `Format($true)` quotes such a value rather than escaping
+        // the newline, so a line-at-a-time parser would see a second line
+        // reading `O=Bitwarden Inc."` and report a Bitwarden organization
+        // that is really just the tail of somebody's common name.
+        let dn = "CN=\"Evil\r\nO=Bitwarden Inc.\"\r\nO=Definitely Not Bitwarden\r\nC=US";
+        assert!(
+            dn_component(dn, "O") == vec!["Definitely Not Bitwarden"],
+            "a forged O= smuggled inside a CN was accepted: {:?}",
+            dn_component(dn, "O")
+        );
+        assert_eq!(
+            dn_component(dn, "CN"),
+            vec!["Evil\nO=Bitwarden Inc."],
+            "the whole quoted value should stay with its own key"
+        );
+    }
+
+    #[test]
+    fn a_forged_organization_inside_a_common_name_is_not_trusted() {
+        // The end-to-end version of the parser test above, at the level the
+        // decision is actually made.
+        let info = SignatureInfo {
+            valid: true,
+            thumbprint: None,
+            subject_dn: Some("CN=\"Evil\r\nO=Bitwarden Inc.\"\r\nO=Evil Corp\r\nC=US".to_string()),
+        };
+        assert!(!is_trusted_organization(&info, &["Bitwarden Inc."]));
+    }
+
+    #[test]
+    fn dn_component_keeps_an_escaped_quote_inside_a_value() {
+        // `CertNameToStr` doubles an embedded quote; the parser must treat
+        // `""` as one literal quote rather than as the end of the value.
+        let dn = "O=\"Say \"\"hello\"\", Inc.\"\r\nC=US";
+        assert_eq!(dn_component(dn, "O"), vec!["Say \"hello\", Inc."]);
+    }
+
+    #[test]
     fn trusts_an_exact_organization_match() {
         let info = SignatureInfo {
             valid: true,
             thumbprint: None,
             subject_dn: Some("CN=bw.exe\r\nO=Bitwarden Inc.\r\nC=US".to_string()),
         };
-        assert!(is_trusted_organization(&info, &["Bitwarden Inc.", "8bit Solutions LLC"]));
+        assert!(is_trusted_organization(
+            &info,
+            &["Bitwarden Inc.", "8bit Solutions LLC"]
+        ));
     }
 
     #[test]
@@ -219,7 +338,11 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_subject_dn() {
-        let info = SignatureInfo { valid: true, thumbprint: None, subject_dn: None };
+        let info = SignatureInfo {
+            valid: true,
+            thumbprint: None,
+            subject_dn: None,
+        };
         assert!(!is_trusted_organization(&info, &["Bitwarden Inc."]));
     }
 
@@ -231,7 +354,9 @@ mod tests {
         let path = powershell_path();
         assert!(path.is_absolute(), "{} is not absolute", path.display());
         assert!(path.ends_with("System32/WindowsPowerShell/v1.0/powershell.exe"));
-        assert!(path.starts_with(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())));
+        assert!(path.starts_with(
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
+        ));
     }
 
     #[test]

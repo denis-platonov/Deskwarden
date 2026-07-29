@@ -4,7 +4,7 @@
 The icon is generated rather than drawn by hand so it is reproducible and
 reviewable as source: there is no binary asset here whose provenance or
 licensing anyone has to take on trust. The mark is the quartered shield from
-the committed design document (Deskwarden.dc.html, section 3g): four
+the design document committed at docs/design/Deskwarden.dc.html (section 3g): four
 quadrants in four values of one blue -- one quarter per vault kind (logins,
 passkeys, cards, notes) -- reading as a single blue shield at icon size. It
 is *not* derived from Bitwarden's branding (this project is unofficial and
