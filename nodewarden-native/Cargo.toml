@@ -2,6 +2,11 @@
 name = "nodewarden-native"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Autofill Bitwarden credentials into native Windows applications. Unofficial and unaffiliated with Bitwarden, Inc."
+readme = "README.md"
+# No `repository` field: no public repository exists yet, and a placeholder URL
+# would be worse than none.
 
 [lib]
 name = "nodewarden_native"

@@ -1,0 +1,68 @@
+# cargo-deny configuration.
+#
+# Run with:
+#   cargo deny check
+#
+# The license list below is the set of permissive licenses actually present in
+# this crate's dependency tree, all compatible with distributing this
+# MIT-licensed crate as a binary. Adding a license here is a deliberate
+# decision, not a formality -- anything not listed fails the check.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "OFL-1.1",
+    # webpki-roots: the Mozilla CA root store, published as data under the
+    # Community Data License Agreement (permissive variant). Redistribution,
+    # including in binaries, is explicitly permitted.
+    "CDLA-Permissive-2.0",
+    # option-ext (via directories/dirs): weak, file-level copyleft. Using it
+    # unmodified as a library imposes no obligation on this crate.
+    "MPL-2.0",
+    # error-code (via clipboard-win/arboard): permissive, no attribution
+    # requirement for binary distribution.
+    "BSL-1.0",
+]
+confidence-threshold = 0.8
+
+# epaint (via eframe/egui) bundles the Ubuntu Light font, licensed under the
+# Ubuntu Font Licence 1.0. UFL-1.0 has no SPDX identifier, so it appears as a
+# `LicenseRef` and has to be allowed for this crate specifically. It is a
+# permissive font licence that allows redistribution, including embedded in
+# software.
+[[licenses.exceptions]]
+name = "epaint_default_fonts"
+allow = ["LicenseRef-UFL-1.0"]
+
+[bans]
+# Duplicate versions of transitive crates are pulled in by the GUI stack
+# (eframe/winit) and are not a licensing or security concern.
+multiple-versions = "allow"
+
+[advisories]
+yanked = "warn"
+# Only crates this workspace depends on directly are failed for being
+# unmaintained. The unmaintained advisories in the tree are all deep transitive
+# dependencies of the GUI stack (`ttf-parser` via egui's font rasterizer,
+# `paste` as a build-time proc-macro, the gtk-rs bindings via tray-icon's
+# *Linux* backend) with no safe upgrade available and no fix under our control.
+unmaintained = "workspace"
+ignore = [
+    # quick-xml DoS advisories. Reached only through
+    # wayland-scanner -> smithay-client-toolkit -> winit, i.e. winit's Wayland
+    # backend: `cargo tree --target x86_64-pc-windows-msvc` shows no quick-xml
+    # at all, so no affected code is compiled into this Windows-only binary.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
