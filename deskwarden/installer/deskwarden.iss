@@ -34,6 +34,9 @@ OutputDir=.
 Compression=lzma2
 SolidCompression=yes
 
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
 [Files]
 Source: "..\target\release\deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; Helper script for the bw-CLI bootstrap step below. `dontcopy` means it's
@@ -92,8 +95,8 @@ begin
   ScriptPath := ExpandConstant('{tmp}\bootstrap-bw.ps1');
 
   ExecOk := Exec('powershell.exe',
-    Format('-NoProfile -ExecutionPolicy Bypass -File "%s" -InstallDir "%s"',
-      [ScriptPath, ExpandConstant('{app}')]),
+    Format('-NoProfile -ExecutionPolicy Bypass -File "%s" -InstallDir "%s"', [
+      ScriptPath, ExpandConstant('{app}')]),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
   if (not ExecOk) then

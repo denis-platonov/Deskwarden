@@ -15,8 +15,10 @@
     products (cli, desktop, browser, web) interleaved by date. GitHub's
     generic "latest release" for the repo is therefore NOT reliably the
     CLI's latest -- it can be whichever product last shipped. This script
-    filters explicitly for the "cli-v*" tag prefix and takes the newest
-    match, then picks the "bw-windows-<version>.zip" asset (the official
+    filters explicitly for the "cli-v*" tag prefix, excludes prereleases and
+    drafts (so an RC tagged "cli-v*" ahead of its stable promotion is never
+    picked up), and takes the newest remaining match, then picks the
+    "bw-windows-<version>.zip" asset (the official
     standalone Windows CLI build; NOT the "bw-oss-windows-*" build, which is
     open-source-only and lacks paid-tier features some vault users rely on).
 
@@ -84,9 +86,9 @@ try {
     New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
     $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/bitwarden/clients/releases?per_page=50' -Headers @{ 'User-Agent' = $UserAgent }
-    $cliRelease = $releases | Where-Object { $_.tag_name -like 'cli-v*' } | Select-Object -First 1
+    $cliRelease = $releases | Where-Object { $_.tag_name -like 'cli-v*' -and -not $_.prerelease -and -not $_.draft } | Select-Object -First 1
     if (-not $cliRelease) {
-        Write-Error 'Could not find a CLI release (tag matching cli-v*) among bitwarden/clients releases.'
+        Write-Error 'Could not find a stable CLI release (tag matching cli-v*, not a prerelease/draft) among bitwarden/clients releases.'
         exit 1
     }
 
