@@ -68,6 +68,82 @@ $ProgressPreference = 'SilentlyContinue'
 
 $UserAgent = 'deskwarden-installer'
 
+# Organization (O=) values accepted as proof that a downloaded bw.exe really
+# was signed by Bitwarden.
+#
+# Matched as whole, exact DN *components* (see Get-CertificateDnComponent
+# below), never as substrings of the subject string. The check this replaced
+# was `$sig.SignerCertificate.Subject -match 'Bitwarden'`: an unanchored,
+# case-insensitive regex over the entire subject DN, which would have accepted
+# any validly-signed binary whose subject merely contained the word somewhere
+# -- `O=Bitwarden Solutions LLC`, `CN=Not Bitwarden`, `OU=bitwarden-integration`
+# -- from an unrelated but legitimately-issued certificate.
+#
+# Several spellings are listed because Bitwarden Inc. was formerly 8bit
+# Solutions LLC and DN punctuation ("Bitwarden Inc." vs "Bitwarden, Inc.")
+# varies between issuances; each entry is still an exact whole-component
+# match, so the list widens what is accepted only by these named
+# organizations, not by anything that happens to contain the string.
+#
+# TODO (verify before shipping): confirm this list against a real
+# Bitwarden-signed bw.exe -- download a current bw-windows-*.zip release,
+# extract bw.exe, and run
+#   (Get-AuthenticodeSignature bw.exe).SignerCertificate.SubjectName.Format($true)
+# then make sure its O= value appears verbatim below (and drop the entries
+# that don't apply). This is the same verify-against-reality step the CLI
+# download URL and asset-naming pattern got on 2026-07-28 (see the .DESCRIPTION
+# block above); it could not be repeated for the certificate here because no
+# bw.exe was available on the machine this was written on and downloading one
+# was out of scope. Failure mode if the list is wrong is fail-closed and
+# recoverable: bootstrap exits 2, and the installer tells the user to install
+# the CLI themselves.
+#
+# Deliberately not a thumbprint pin (unlike updater.rs's pin on deskwarden's
+# own signer): that pin is appropriate for a binary verifying its own future
+# builds, whereas this is a third party whose signing certificate may
+# legitimately rotate without warning. Pinning the organization is the
+# strongest check that survives certificate rotation.
+$BitwardenSignerOrganizations = @(
+    'Bitwarden Inc.',
+    'Bitwarden, Inc.',
+    'Bitwarden Inc',
+    'Bitwarden',
+    '8bit Solutions LLC'
+)
+
+<#
+.SYNOPSIS
+    Returns the values of one component (e.g. 'O', 'CN') of a certificate's
+    subject DN.
+.DESCRIPTION
+    Uses X500DistinguishedName.Format($true), which emits one RDN per line
+    with proper DN parsing, rather than splitting the subject string on
+    commas -- a value like `O="Bitwarden, Inc."` contains a comma of its own
+    and a naive split would tear it in half. Surrounding quotes (which Format
+    keeps for values that need them) are stripped so callers compare against
+    plain values.
+#>
+function Get-CertificateDnComponent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
+        [Parameter(Mandatory = $true)]
+        [string]$Key
+    )
+
+    $values = @()
+    foreach ($line in ($Certificate.SubjectName.Format($true) -split "`r?`n")) {
+        $line = $line.Trim()
+        if ($line.Length -eq 0) { continue }
+        $separator = $line.IndexOf('=')
+        if ($separator -lt 1) { continue }
+        if ($line.Substring(0, $separator).Trim() -ieq $Key) {
+            $values += $line.Substring($separator + 1).Trim().Trim('"')
+        }
+    }
+    return $values
+}
+
 function Test-BwAlreadyAvailable {
     param([string]$BinDir)
     if (Get-Command bw.exe -ErrorAction SilentlyContinue) { return $true }
@@ -114,17 +190,19 @@ try {
     # Verify Bitwarden's own Authenticode signature before installing/running
     # anything extracted from the archive -- mirrors this project's own
     # signature.rs (Get-AuthenticodeSignature), applied here to a
-    # third-party binary instead of deskwarden's own installer/updater. We
-    # check validity plus that the signer is actually Bitwarden, but
-    # deliberately don't pin one exact certificate thumbprint the way
-    # updater.rs pins deskwarden's own self-update signer -- that pin is
-    # appropriate for a binary verifying *itself* build-over-build; here
-    # we're trusting a third party whose signing certificate may
-    # legitimately rotate, and the design spec's Installer section only
-    # requires a valid, genuinely-Bitwarden-signed binary, not thumbprint
-    # pinning.
+    # third-party binary instead of deskwarden's own installer/updater. Two
+    # independent conditions, both required: the signature itself is valid
+    # and chains to a trusted root ($sig.Status), and the signer's subject DN
+    # names Bitwarden in its organization component (see
+    # $BitwardenSignerOrganizations above for why that is an exact
+    # whole-component match rather than a substring search, and why it is not
+    # a thumbprint pin).
     $sig = Get-AuthenticodeSignature -FilePath $bwExe.FullName
-    $signerOk = $sig.SignerCertificate -and ($sig.SignerCertificate.Subject -match 'Bitwarden')
+    $signerOrgs = @()
+    if ($sig.SignerCertificate) {
+        $signerOrgs = Get-CertificateDnComponent -Certificate $sig.SignerCertificate -Key 'O'
+    }
+    $signerOk = @($signerOrgs | Where-Object { $BitwardenSignerOrganizations -contains $_ }).Count -gt 0
     if ($sig.Status -ne 'Valid' -or -not $signerOk) {
         $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '<none>' }
         Write-Error "Downloaded bw.exe failed signature verification (Status=$($sig.Status), Subject=$subject). Refusing to install it."

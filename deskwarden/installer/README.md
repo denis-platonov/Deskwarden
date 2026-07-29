@@ -61,8 +61,21 @@ extracts and runs `bootstrap-bw.ps1`, which:
 4. Verifies `bw.exe`'s Authenticode signature via PowerShell's
    `Get-AuthenticodeSignature` (same mechanism `src/signature.rs` uses for
    deskwarden's own self-update verification) — checks both that the
-   signature is `Valid` and that the signer's certificate subject actually
-   names Bitwarden. Refuses to install it otherwise.
+   signature is `Valid` and that the signer certificate's **organization
+   (`O=`) component** exactly matches one of the allowlisted Bitwarden
+   organization names (see `$BitwardenSignerOrganizations` in the script).
+   This is a whole-DN-component comparison, not a substring search over the
+   subject string: an unrelated but legitimately-issued certificate whose
+   subject merely *contains* "Bitwarden" somewhere (`O=Bitwarden Solutions
+   LLC`, `OU=bitwarden-integration`, …) is rejected. Refuses to install
+   otherwise. Not a thumbprint pin — unlike deskwarden's own self-update
+   signer, this is a third party whose certificate may legitimately rotate.
+
+   **Pre-ship check:** the allowlist itself has not yet been confirmed
+   against a real Bitwarden-signed `bw.exe` (no such binary was available on
+   the machine this was written on). Verify it the same way the download URL
+   and asset naming were verified below — see the TODO in the script for the
+   exact command.
 5. Copies the verified `bw.exe` into `<install dir>\bin\bw.exe` and adds
    `<install dir>\bin` to the current user's `PATH` (`HKCU`, no admin
    needed) — deskwarden invokes the CLI as a bare `bw` command (see
