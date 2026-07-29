@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 use vault_bridge::VaultBridge;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    DispatchMessageW, GetForegroundWindow, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
 const BW_SERVE_URL: &str = "http://localhost:8087";
@@ -43,7 +43,7 @@ fn main() {
         }
     };
 
-    let _bw_serve = spawn_bw_serve(&session_token);
+    let mut bw_serve = spawn_bw_serve(&session_token);
     std::thread::sleep(Duration::from_millis(500));
 
     let vault = VaultBridge::new(BW_SERVE_URL);
@@ -83,6 +83,16 @@ fn main() {
 
         if let Some(event) = tray::next_menu_event() {
             if event.id == tray.quit_id {
+                // `bw serve` doesn't get killed on its own: `Child` doesn't
+                // kill its process on `Drop`, and `process::exit` below
+                // skips destructors anyway. Kill it explicitly, before
+                // exiting -- nothing after `process::exit` ever runs -- so
+                // it doesn't keep serving the unlocked vault over
+                // `BW_SERVE_URL` after the user believes they've quit. The
+                // process may already be gone (e.g. crashed, or killed
+                // externally), so a `kill()` error is expected and ignored
+                // rather than treated as fatal.
+                let _ = bw_serve.kill();
                 std::process::exit(0);
             }
             // "Add app..." has no wired action: picker_ui::run_picker needs
@@ -94,11 +104,35 @@ fn main() {
 
         if hotkey::fill_hotkey_pressed(&fill_hotkey) {
             if let Some((item_id, hwnd)) = pending_hotkey_fill.take() {
-                fill_from_vault(&vault, &injector, &item_id, hwnd);
+                // Revalidate against the *actual* current foreground window
+                // rather than trusting the stored value alone: even with
+                // the invalidation below, there's a window between the
+                // event that armed this and the hotkey press where focus
+                // could have moved without us having processed a
+                // `ForegroundEvent` for it yet.
+                let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
+                if current_fg == hwnd {
+                    fill_from_vault(&vault, &injector, &item_id, hwnd);
+                }
             }
         }
 
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            // Any foreground-window change invalidates a pending hotkey
+            // fill unless it's the very window that armed it re-foregrounding
+            // (same hwnd). Without this, arming the fill and then switching
+            // away to an unrelated window -- without ever pressing the fill
+            // hotkey -- would leave `pending_hotkey_fill` stale: a later,
+            // unrelated Ctrl+Alt+B press would fire it against a `hwnd` that
+            // may since have been recycled by the OS for a different window,
+            // contradicting the guarantee that the hotkey does nothing when
+            // no matching window is foregrounded.
+            if let Some((_, armed_hwnd)) = pending_hotkey_fill {
+                if armed_hwnd != event.hwnd {
+                    pending_hotkey_fill = None;
+                }
+            }
+
             if let Some((item_id, m)) = engine.lookup(&event.exe_name) {
                 if let Some(armed) =
                     handle_match(&vault, &injector, item_id, m, event.hwnd, &event.exe_name)
