@@ -35,7 +35,8 @@ use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::{
-    hotkey, job_object, logging, login_ui, picker_ui, session_store, tray, window_watch,
+    hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store, tray,
+    window_watch,
 };
 use semver::Version;
 use std::process::Child;
@@ -229,7 +230,7 @@ fn main() {
     // Losing that race used to leave the match engine permanently empty with
     // no diagnostic, so the app silently did nothing forever.
     let schedule = readiness_schedule(READINESS_DEADLINE);
-    let items = match wait_for_vault_ready(&vault, &schedule) {
+    let items = match wait_for_vault_ready_with_spinner(&vault, &schedule) {
         Ok(items) => items,
         Err(e) => {
             // A rejected session is indistinguishable from a slow start at
@@ -258,7 +259,7 @@ fn main() {
                 }
             };
 
-            match wait_for_vault_ready(&vault, &schedule) {
+            match wait_for_vault_ready_with_spinner(&vault, &schedule) {
                 Ok(items) => items,
                 Err(e) => {
                     log::error!("{e}");
@@ -927,6 +928,27 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
             None
         }
     }
+}
+
+/// Same as `wait_for_vault_ready`, but shows a spinner window for the
+/// duration instead of blocking with nothing on screen.
+///
+/// `wait_for_vault_ready` itself never touches a window -- it's a plain
+/// network retry loop -- so it runs on a scoped background thread while the
+/// main thread shows `loading_ui::show_while`'s spinner. Scoped rather than
+/// a bare `std::thread::spawn`: the worker only needs `&vault`/`&schedule`
+/// for the length of this call, not `'static` ownership of them.
+fn wait_for_vault_ready_with_spinner(
+    vault: &VaultBridge,
+    schedule: &[Duration],
+) -> Result<Vec<deskwarden::vault_bridge::VaultItem>, String> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = mpsc::channel();
+        scope.spawn(move || {
+            let _ = tx.send(wait_for_vault_ready(vault, schedule));
+        });
+        loading_ui::show_while("Setting up your vault...", rx)
+    })
 }
 
 /// Runs the login/unlock UI and persists the resulting session token.

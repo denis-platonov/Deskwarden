@@ -18,6 +18,7 @@ pub mod hello;
 pub mod hotkey;
 pub mod injector;
 pub mod job_object;
+pub mod loading_ui;
 pub mod logging;
 pub mod login_ui;
 pub mod match_engine;
