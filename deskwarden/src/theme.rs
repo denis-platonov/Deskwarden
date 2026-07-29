@@ -32,6 +32,10 @@ pub const TEXT_GHOST: Color32 = Color32::from_rgb(0x9b, 0x97, 0x97);
 
 /// Window/canvas background (warm grey).
 pub const CANVAS: Color32 = Color32::from_rgb(0xf3, 0xf2, 0xf2);
+/// App-window body background — one step warmer than `CANVAS`. Every window
+/// mock in the design (3h login, 3e preferences, 2b/3f vault) fills its body
+/// with this rather than the page canvas.
+pub const WINDOW_BG: Color32 = Color32::from_rgb(0xf7, 0xf6, 0xf5);
 /// Card background.
 pub const CARD: Color32 = Color32::WHITE;
 /// Tinted card background (footers, table headers).
@@ -502,20 +506,111 @@ pub fn field_label(ui: &mut Ui, text: &str) {
 /// egui's default widget styling gives a focused field a plain border color
 /// change, not this soft ring, so it's painted explicitly here.
 pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
+    // The field's box is painted here, not by egui: `.frame(false)` plus a
+    // placeholder shape filled in after layout. Painting the design's box
+    // *around* egui's own frame would double the border; letting egui draw it
+    // misses the focus halo and sizes the box to the text rather than the
+    // design's 38px field.
+    let bg = ui.painter().add(egui::Shape::Noop);
     let response = ui.add(
         egui::TextEdit::singleline(value)
             .password(password)
+            .frame(false)
             .desired_width(f32::INFINITY)
-            .margin(Margin::symmetric(10.0, 8.0)),
+            // 14px text + 11px vertical margins ≈ the design's 38px field
+            // height: a TextEdit is sized by its font's row height, so the
+            // height has to be expressed this way rather than set directly.
+            .font(FontId::new(14.0, FontFamily::Proportional))
+            .margin(Margin::symmetric(10.0, 11.0)),
     );
-    if response.has_focus() {
-        let rounding = ui.visuals().widgets.active.rounding;
-        ui.painter().rect_stroke(
-            response.rect.expand(3.0),
-            rounding,
-            Stroke::new(3.0, FOCUS_RING),
-        );
+    paint_field_box(ui, &response, bg, Margin::symmetric(10.0, 11.0));
+    response
+}
+
+/// Fills the placeholder `bg` shape with the field's box, and adds the focus
+/// halo when focused: the design's inputs are a 1px border at rest and a blue
+/// border with a 3px `FOCUS_RING` halo when active (`box-shadow: 0 0 0 3px
+/// #dbe4f7` in the mockup, sections 2a/3a/3b/3h) — a treatment egui's own
+/// `TextEdit` frame can't produce.
+///
+/// `margin` must be the margin the `TextEdit` was built with: a frameless
+/// TextEdit's `response.rect` is the inner text rect, so the visible box is
+/// that rect grown back out by the margin. Returns the box rect (for
+/// placing in-field affordances like the reveal toggle).
+fn paint_field_box(
+    ui: &mut Ui,
+    response: &Response,
+    bg: egui::layers::ShapeIdx,
+    margin: Margin,
+) -> Rect {
+    let rect = Rect::from_min_max(
+        response.rect.min - Vec2::new(margin.left, margin.top),
+        response.rect.max + Vec2::new(margin.right, margin.bottom),
+    );
+    let rounding = Rounding::same(8.0);
+    let border = if response.has_focus() {
+        ui.painter()
+            .rect_stroke(rect.expand(3.0), rounding, Stroke::new(3.0, FOCUS_RING));
+        Stroke::new(1.0, BLUE)
+    } else {
+        Stroke::new(1.0, BORDER_STRONG)
+    };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(rect, rounding, CARD, border),
+    );
+    rect
+}
+
+/// A password field with the design's in-field "Show"/"Hide" reveal toggle
+/// (3h's master-password input). Same focused-state halo as [`text_field`];
+/// `revealed` is the caller's persistent toggle state.
+pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
+    // Same painted-box approach as `text_field` (see there for why).
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .password(!*revealed)
+            .frame(false)
+            .desired_width(f32::INFINITY)
+            // Same 38px-field metrics as `text_field`; the extra right
+            // margin keeps typed text from running under the toggle, which
+            // is painted inside the field's right edge below.
+            .font(FontId::new(14.0, FontFamily::Proportional))
+            .margin(Margin {
+                left: 10.0,
+                right: 52.0,
+                top: 11.0,
+                bottom: 11.0,
+            }),
+    );
+    let box_rect = paint_field_box(
+        ui,
+        &response,
+        bg,
+        Margin {
+            left: 10.0,
+            right: 52.0,
+            top: 11.0,
+            bottom: 11.0,
+        },
+    );
+
+    // 3h's in-field reveal: a click-sensing label, not a Button, so no
+    // padding or fill fights the field it sits inside.
+    let label = if *revealed { "Hide" } else { "Show" };
+    let toggle_rect = Rect::from_min_max(
+        Pos2::new(box_rect.right() - 50.0, box_rect.top() + 1.0),
+        Pos2::new(box_rect.right() - 6.0, box_rect.bottom() - 1.0),
+    );
+    let toggle = ui.put(
+        toggle_rect,
+        egui::Label::new(semibold(label, 11.0).color(BLUE_DEEP)).sense(Sense::click()),
+    );
+    if toggle.clicked() {
+        *revealed = !*revealed;
     }
+
     response
 }
 

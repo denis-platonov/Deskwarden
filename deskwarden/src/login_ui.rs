@@ -26,8 +26,87 @@ pub fn parse_bw_status(stdout: &str) -> BwStatus {
     }
 }
 
+/// Everything the login window wants from `bw status` beyond the bare
+/// status: whose vault this is and which server it talks to. Design 3h shows
+/// both -- the account email beside the password label and the server in the
+/// window footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BwStatusDetails {
+    pub status: BwStatus,
+    pub user_email: Option<String>,
+    pub server_url: Option<String>,
+}
+
+/// Parses the full `bw status` JSON. Falls back field-by-field rather than
+/// all-or-nothing: a malformed or partial payload still yields whatever
+/// status [`parse_bw_status`]'s substring check can salvage, with the
+/// optional fields absent.
+pub fn parse_bw_status_details(stdout: &str) -> BwStatusDetails {
+    let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap_or_default();
+    let string_field = |key: &str| {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    BwStatusDetails {
+        status: parse_bw_status(stdout),
+        user_email: string_field("userEmail"),
+        server_url: string_field("serverUrl"),
+    }
+}
+
+/// The display form of a server URL for the login footer: scheme and path
+/// stripped, so `https://vault.example.eu/api` reads as `vault.example.eu`.
+/// `None` -- the CLI's default -- is Bitwarden's own cloud.
+pub fn server_host(server_url: Option<&str>) -> String {
+    match server_url {
+        Some(url) if !url.trim().is_empty() => {
+            let stripped = url
+                .trim()
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            stripped
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or(stripped)
+                .to_string()
+        }
+        _ => "bitwarden.com".to_string(),
+    }
+}
+
 pub fn check_bw_status() -> BwStatus {
     check_bw_status_with_session(None)
+}
+
+/// Runs `bw status` and returns its raw stdout, optionally under a
+/// `BW_SESSION`. `None` when the CLI could not be run at all (no verified
+/// `bw.exe`, or the spawn failed) -- both already logged here.
+fn bw_status_stdout(session_token: Option<&str>) -> Option<String> {
+    let mut cmd = match bw_command() {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            log::error!("cannot run `bw status`: {e}");
+            return None;
+        }
+    };
+    cmd.arg("status");
+    if let Some(token) = session_token {
+        cmd.env("BW_SESSION", token);
+    }
+
+    match cmd.output() {
+        Ok(output) => Some(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Err(e) => {
+            log::error!(
+                "failed to run `bw status` from the verified Bitwarden CLI path \
+                 (see bw_path::resolve_bw_exe for where that path comes from): {e}"
+            );
+            None
+        }
+    }
 }
 
 /// Runs `bw status`, optionally with a `BW_SESSION` so the CLI can report
@@ -41,27 +120,41 @@ pub fn check_bw_status() -> BwStatus {
 /// spawning it failed -- is logged and reported as `Unauthenticated` rather
 /// than panicking the whole app.
 pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
-    let mut cmd = match bw_command() {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            log::error!("cannot run `bw status`: {e}");
-            return BwStatus::Unauthenticated;
-        }
-    };
-    cmd.arg("status");
-    if let Some(token) = session_token {
-        cmd.env("BW_SESSION", token);
-    }
+    bw_status_stdout(session_token)
+        .map(|stdout| parse_bw_status(&stdout))
+        .unwrap_or(BwStatus::Unauthenticated)
+}
 
-    match cmd.output() {
-        Ok(output) => parse_bw_status(&String::from_utf8_lossy(&output.stdout)),
-        Err(e) => {
-            log::error!(
-                "failed to run `bw status` from the verified Bitwarden CLI path \
-                 (see bw_path::resolve_bw_exe for where that path comes from): {e}"
-            );
-            BwStatus::Unauthenticated
-        }
+/// [`check_bw_status`] plus the account email and server URL, for the login
+/// window's 3h chrome.
+pub fn check_bw_status_details() -> BwStatusDetails {
+    bw_status_stdout(None)
+        .map(|stdout| parse_bw_status_details(&stdout))
+        .unwrap_or(BwStatusDetails {
+            status: BwStatus::Unauthenticated,
+            user_email: None,
+            server_url: None,
+        })
+}
+
+/// Runs `bw logout`, for 3h's "Log out" footer action. Already being logged
+/// out counts as success -- the goal state is "no account", however we got
+/// there.
+pub fn bw_logout() -> Result<(), String> {
+    let output = bw_command()?
+        .arg("logout")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.to_lowercase().contains("not logged in") {
+        Ok(())
+    } else if stderr.is_empty() {
+        Err("`bw logout` failed".to_string())
+    } else {
+        Err(stderr)
     }
 }
 
@@ -115,12 +208,159 @@ fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The login window's form state, owned by the caller across frames.
+#[derive(Default)]
+pub struct LoginForm {
+    pub self_hosted: bool,
+    pub server_url: String,
+    pub email: String,
+    pub password: String,
+    pub reveal_password: bool,
+    pub error: Option<String>,
+}
+
+/// What the user asked the login window to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAction {
+    /// Continue was clicked (or Enter pressed): log in / unlock.
+    Submit,
+    /// The footer's "Log out" was clicked: drop the account.
+    LogOut,
+}
+
+/// Draws the login/unlock window body (design 3h): brand lockup, title
+/// block, credential card with the account email and in-field reveal toggle,
+/// and the bottom account/server footer. Pure view -- the caller owns the
+/// state and performs the `bw` side effects for whatever action comes back.
+///
+/// Public (rather than folded into `run_login_flow`'s closure) so the
+/// `ui_preview` example renders the exact window the app ships, same as
+/// `overlay_ui::draw_overlay_card`.
+///
+/// Deviations from the 3h mock, all backend-gated: the "Use Windows Hello"
+/// panel (the CLI has no biometric unlock), "Forgot it?" (no password-hint
+/// API), and "Switch account" ("Log out" is the same primitive).
+pub fn draw_login_window(
+    ui: &mut egui::Ui,
+    status: BwStatus,
+    account_email: Option<&str>,
+    server_host: &str,
+    form: &mut LoginForm,
+) -> Option<LoginAction> {
+    let mut action = None;
+
+    // Brand lockup (3h: 38×44 mark, 25px wordmark, 10px tag).
+    ui.horizontal(|ui| {
+        theme::mark(ui, 44.0);
+        ui.add_space(2.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(theme::bold("Deskwarden", 25.0).color(theme::INK));
+            ui.label(theme::semibold("FILLS NATIVE WINDOWS", 10.0).color(theme::TEXT_FAINT));
+        });
+    });
+
+    ui.add_space(14.0);
+
+    // 3b/3h language: matches are counted but never named until the vault
+    // opens -- unlocking is what this window is for.
+    let (title, subtitle) = if status == BwStatus::Unauthenticated {
+        (
+            "Sign in to your vault",
+            "Works with bitwarden.com and self-hosted servers.",
+        )
+    } else {
+        (
+            "Unlock your vault",
+            "Matches stay hidden until the vault opens.",
+        )
+    };
+    ui.label(theme::bold(title, 19.0).color(theme::INK));
+    ui.label(RichText::new(subtitle).size(13.0).color(theme::TEXT_FAINT));
+
+    ui.add_space(14.0);
+
+    egui::Frame::none()
+        .fill(theme::CARD)
+        .rounding(Rounding::same(10.0))
+        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+        .inner_margin(Margin::same(16.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+
+            if status == BwStatus::Unauthenticated {
+                ui.checkbox(&mut form.self_hosted, "Self-hosted server");
+                if form.self_hosted {
+                    theme::field_label(ui, "Server URL");
+                    theme::text_field(ui, &mut form.server_url, false);
+                }
+                theme::field_label(ui, "Email");
+                theme::text_field(ui, &mut form.email, false);
+            }
+
+            // 3h's label row: field name left, account email right, so the
+            // user can see whose vault they're about to open.
+            ui.horizontal(|ui| {
+                theme::field_label(ui, "Master password");
+                if let Some(email) = account_email {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(email).size(11.0).color(theme::TEXT_GHOST));
+                    });
+                }
+            });
+            theme::password_field(ui, &mut form.password, &mut form.reveal_password);
+
+            ui.add_space(2.0);
+            if theme::primary_button(ui, "Continue", Some("Enter")).clicked() {
+                action = Some(LoginAction::Submit);
+            }
+        });
+
+    if let Some(err) = &form.error {
+        ui.add_space(6.0);
+        ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
+    }
+
+    // Enter submits from anywhere in the form, same as clicking Continue --
+    // 3h's Continue carries the ↵ affordance.
+    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        action = Some(LoginAction::Submit);
+    }
+
+    // Footer pinned to the window bottom (3h): account action left, server
+    // identity right.
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        ui.horizontal(|ui| {
+            if status != BwStatus::Unauthenticated {
+                let log_out = ui.add(
+                    egui::Button::new(RichText::new("Log out").size(12.0).color(theme::TEXT_FAINT))
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE),
+                );
+                if log_out.clicked() {
+                    action = Some(LoginAction::LogOut);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(server_host)
+                        .size(12.0)
+                        .color(theme::TEXT_GHOST),
+                );
+            });
+        });
+    });
+
+    action
+}
+
 /// Opens a blocking egui window that shows a server-choice + email field
-/// when `check_bw_status()` is `Unauthenticated`, or just a password field
-/// when `Locked`/`Unlocked`; runs `bw login`/`bw unlock` accordingly and
-/// returns the resulting session token.
+/// when the CLI reports `Unauthenticated`, or just a password field when
+/// `Locked`/`Unlocked`; runs `bw login`/`bw unlock` accordingly and returns
+/// the resulting session token.
 pub fn run_login_flow() -> String {
-    let status = check_bw_status();
+    let details = check_bw_status_details();
 
     // The update closure is FnMut + 'static and must move-capture its
     // state, so a plain local `Option<String>` can't be read back by this
@@ -134,14 +374,15 @@ pub fn run_login_flow() -> String {
     let token: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let token_for_closure = token.clone();
 
-    let mut self_hosted = false;
-    let mut server_url = String::new();
-    let mut email = String::new();
-    let mut password = String::new();
-    let mut error: Option<String> = None;
+    // Mutable because 3h's "Log out" flips the window into the sign-in state
+    // without closing it.
+    let mut status = details.status;
+    let mut account_email = details.user_email;
+    let host = server_host(details.server_url.as_deref());
+    let mut form = LoginForm::default();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 520.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([470.0, 560.0]),
         ..Default::default()
     };
 
@@ -163,127 +404,80 @@ pub fn run_login_flow() -> String {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(28.0, 24.0)),
+                    .fill(theme::WINDOW_BG)
+                    .inner_margin(Margin::symmetric(26.0, 24.0)),
             )
             .show(ctx, |ui| {
-                // Brand lockup (design 3g): mark beside the wordmark and tag.
-                ui.horizontal(|ui| {
-                    theme::mark(ui, 40.0);
-                    ui.add_space(4.0);
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(theme::bold("Deskwarden", 24.0).color(theme::INK));
-                        ui.label(
-                            theme::semibold("FILLS NATIVE WINDOWS", 9.5).color(theme::TEXT_FAINT),
-                        );
-                    });
-                });
-
-                ui.add_space(16.0);
-
-                // 3b's language: matches are counted but never named until the
-                // vault opens -- unlocking is what this window is for.
-                let (title, subtitle) = if status == BwStatus::Unauthenticated {
-                    (
-                        "Sign in to your vault",
-                        "Works with bitwarden.com and self-hosted servers.",
-                    )
-                } else {
-                    (
-                        "Unlock your vault",
-                        "Matches stay hidden until the vault opens.",
-                    )
-                };
-                ui.label(theme::bold(title, 17.0).color(theme::INK));
-                ui.label(RichText::new(subtitle).size(12.0).color(theme::TEXT_FAINT));
-
-                ui.add_space(10.0);
-
-                egui::Frame::none()
-                    .fill(theme::CARD)
-                    .rounding(Rounding::same(10.0))
-                    .stroke(Stroke::new(1.0, theme::BORDER))
-                    .inner_margin(Margin::same(16.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.spacing_mut().item_spacing.y = 6.0;
-
-                        if status == BwStatus::Unauthenticated {
-                            ui.checkbox(&mut self_hosted, "Self-hosted server");
-                            if self_hosted {
-                                theme::field_label(ui, "Server URL");
-                                theme::text_field(ui, &mut server_url, false);
-                            }
-                            theme::field_label(ui, "Email");
-                            theme::text_field(ui, &mut email, false);
-                        }
-
-                        theme::field_label(ui, "Master password");
-                        theme::text_field(ui, &mut password, true);
-                    });
-
-                if let Some(err) = &error {
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
-                }
-
-                ui.add_space(12.0);
+                let action =
+                    draw_login_window(ui, status, account_email.as_deref(), &host, &mut form);
 
                 let mut done = false;
 
-                // Enter submits from anywhere in the form, same as clicking
-                // Continue -- the design's fields all carry ↵ affordances.
-                let submitted = theme::primary_button(ui, "Continue", Some("Enter")).clicked()
-                    || ctx.input(|i| i.key_pressed(egui::Key::Enter));
-
-                if submitted {
-                    // A bad self-hosted URL is inline UI error, not a panic: bail
-                    // out of this Continue click and let the user correct it.
-                    let server_configured = if status == BwStatus::Unauthenticated
-                        && self_hosted
-                        && !server_url.is_empty()
-                    {
-                        match configure_server(&server_url) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                log::warn!("bw config server failed: {e}");
-                                error = Some(e);
-                                false
+                match action {
+                    Some(LoginAction::Submit) => {
+                        // A bad self-hosted URL is inline UI error, not a
+                        // panic: bail out of this submit and let the user
+                        // correct it.
+                        let server_configured = if status == BwStatus::Unauthenticated
+                            && form.self_hosted
+                            && !form.server_url.is_empty()
+                        {
+                            match configure_server(&form.server_url) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    log::warn!("bw config server failed: {e}");
+                                    form.error = Some(e);
+                                    false
+                                }
                             }
-                        }
-                    } else {
-                        true
-                    };
-
-                    if server_configured {
-                        let result = match status {
-                            BwStatus::Unauthenticated => {
-                                run_bw_with_password(&["login", &email, "--raw"], &password)
-                            }
-                            BwStatus::Locked | BwStatus::Unlocked => {
-                                run_bw_with_password(&["unlock", "--raw"], &password)
-                            }
+                        } else {
+                            true
                         };
 
-                        // The master password has served its purpose either way:
-                        // wipe the buffer instead of leaving it live in memory for
-                        // the rest of the process's lifetime. On failure this also
-                        // clears the field, which the user has to retype anyway.
-                        password.zeroize();
+                        if server_configured {
+                            let result = match status {
+                                BwStatus::Unauthenticated => run_bw_with_password(
+                                    &["login", &form.email, "--raw"],
+                                    &form.password,
+                                ),
+                                BwStatus::Locked | BwStatus::Unlocked => {
+                                    run_bw_with_password(&["unlock", "--raw"], &form.password)
+                                }
+                            };
 
-                        match result {
-                            Ok(session_token) => {
-                                *token_for_closure.borrow_mut() = Some(session_token);
-                                error = None;
-                                done = true;
-                            }
-                            Err(e) => {
-                                log::warn!("bw login/unlock failed: {e}");
-                                error = Some(e);
+                            // The master password has served its purpose
+                            // either way: wipe the buffer instead of leaving
+                            // it live in memory for the rest of the process's
+                            // lifetime. On failure this also clears the
+                            // field, which the user has to retype anyway.
+                            form.password.zeroize();
+
+                            match result {
+                                Ok(session_token) => {
+                                    *token_for_closure.borrow_mut() = Some(session_token);
+                                    form.error = None;
+                                    done = true;
+                                }
+                                Err(e) => {
+                                    log::warn!("bw login/unlock failed: {e}");
+                                    form.error = Some(e);
+                                }
                             }
                         }
                     }
+                    Some(LoginAction::LogOut) => match bw_logout() {
+                        Ok(()) => {
+                            log::info!("logged out at the user's request; showing sign-in");
+                            status = BwStatus::Unauthenticated;
+                            account_email = None;
+                            form.error = None;
+                        }
+                        Err(e) => {
+                            log::warn!("bw logout failed: {e}");
+                            form.error = Some(e);
+                        }
+                    },
+                    None => {}
                 }
 
                 if done {
@@ -334,5 +528,57 @@ mod tests {
             parse_bw_status("command not found"),
             BwStatus::Unauthenticated
         );
+    }
+
+    #[test]
+    fn details_carry_the_account_email_and_server() {
+        let details = parse_bw_status_details(
+            r#"{"serverUrl":"https://vault.ledgerline.eu","lastSync":"2026-07-29T01:00:00.000Z","userEmail":"a.novak@ledgerline.com","status":"locked"}"#,
+        );
+        assert_eq!(details.status, BwStatus::Locked);
+        assert_eq!(
+            details.user_email.as_deref(),
+            Some("a.novak@ledgerline.com")
+        );
+        assert_eq!(
+            details.server_url.as_deref(),
+            Some("https://vault.ledgerline.eu")
+        );
+    }
+
+    #[test]
+    fn details_survive_garbage_output() {
+        let details = parse_bw_status_details("command not found");
+        assert_eq!(details.status, BwStatus::Unauthenticated);
+        assert_eq!(details.user_email, None);
+        assert_eq!(details.server_url, None);
+    }
+
+    #[test]
+    fn details_treat_empty_strings_as_absent() {
+        // The CLI reports `"userEmail":""` in some states; showing an empty
+        // label beside "Master password" would look broken.
+        let details =
+            parse_bw_status_details(r#"{"status":"locked","userEmail":"","serverUrl":""}"#);
+        assert_eq!(details.user_email, None);
+        assert_eq!(details.server_url, None);
+    }
+
+    #[test]
+    fn server_host_strips_scheme_and_path() {
+        assert_eq!(
+            server_host(Some("https://vault.ledgerline.eu/api")),
+            "vault.ledgerline.eu"
+        );
+        assert_eq!(
+            server_host(Some("http://192.168.1.20:8443")),
+            "192.168.1.20:8443"
+        );
+    }
+
+    #[test]
+    fn server_host_defaults_to_the_bitwarden_cloud() {
+        assert_eq!(server_host(None), "bitwarden.com");
+        assert_eq!(server_host(Some("")), "bitwarden.com");
     }
 }

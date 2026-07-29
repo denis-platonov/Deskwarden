@@ -1,61 +1,90 @@
-//! Visual preview of the themed autofill overlay (design 2a).
+//! Visual preview of the themed windows.
 //!
 //! Interactive:
 //!
 //! ```text
-//! cargo run --example ui_preview
+//! cargo run --example ui_preview            # the autofill overlay (design 2a)
+//! cargo run --example ui_preview -- --login # the login/unlock window (design 3h)
 //! ```
 //!
-//! opens the overlay card with sample data; Enter or Esc closes it.
+//! The overlay closes on Enter/Esc/✕; the login preview just draws (its
+//! Continue does nothing here -- no `bw` is spawned from a preview).
 //!
 //! Self-screenshotting (for reviewing the design implementation without a
 //! human at the keyboard):
 //!
 //! ```text
 //! cargo run --example ui_preview -- --screenshot
+//! cargo run --example ui_preview -- --login --screenshot
 //! ```
 //!
-//! renders the card, saves it to `target/ui_preview_overlay.png`, and exits.
+//! renders the surface, saves it to `target/ui_preview_overlay.png` /
+//! `target/ui_preview_login.png`, and exits.
 //!
-//! This renders the exact `overlay_ui::draw_overlay_card` the app ships (not
-//! a copy), so what this shows is what a real match shows. The login and
-//! picker windows aren't previewed here: they run real `bw` commands (and
-//! `login_ui::run_login_flow` exits the process when closed without a
-//! token), which a preview must not do.
+//! Both modes render the exact draw functions the app ships
+//! (`overlay_ui::draw_overlay_card`, `login_ui::draw_login_window`), not
+//! copies, so what this shows is what the real app shows. The pickers aren't
+//! previewed: their windows are plain compositions of the same theme
+//! widgets, and they need a live vault to have anything to list.
 
+use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::{overlay_ui, theme};
-use eframe::egui;
+use eframe::egui::{self, Margin};
 use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     let screenshot = std::env::args().any(|a| a == "--screenshot");
+    let login = std::env::args().any(|a| a == "--login");
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
+    let viewport = if login {
+        // The real login window's size and chrome (login_ui::run_login_flow).
+        egui::ViewportBuilder::default().with_inner_size([470.0, 560.0])
+    } else {
+        egui::ViewportBuilder::default()
             .with_inner_size([396.0, 164.0])
             .with_decorations(false)
             .with_transparent(true)
-            .with_always_on_top(),
+            .with_always_on_top()
+    };
+    let options = eframe::NativeOptions {
+        viewport,
         ..Default::default()
+    };
+
+    let png_name = if login {
+        "target/ui_preview_login.png"
+    } else {
+        "target/ui_preview_overlay.png"
     };
 
     eframe::run_native(
         "Deskwarden preview",
         options,
-        Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx);
+        Box::new(move |_cc| {
             Ok(Box::new(Preview {
-                screenshot_path: screenshot.then(|| PathBuf::from("target/ui_preview_overlay.png")),
+                login,
+                form: LoginForm::default(),
+                screenshot_path: screenshot.then(|| PathBuf::from(png_name)),
                 frames: 0,
+                styled: false,
             }))
         }),
     )
 }
 
 struct Preview {
+    /// Which surface this run previews: the login window or the overlay.
+    login: bool,
+    /// Form state for the login preview (typing works; Continue doesn't).
+    form: LoginForm,
     /// `Some` in --screenshot mode: where the PNG goes.
     screenshot_path: Option<PathBuf>,
     frames: u32,
+    /// Whether the theme has been applied yet. Done on the first update
+    /// frame, not in the creation context, for the same reason as the real
+    /// windows (see login_ui): eframe re-applies its own style after
+    /// creation, and egui font sets go live a frame after `set_fonts`.
+    styled: bool,
 }
 
 impl eframe::App for Preview {
@@ -64,23 +93,50 @@ impl eframe::App for Preview {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.styled {
+            theme::apply(ctx);
+            self.styled = true;
+            ctx.request_repaint();
+            return;
+        }
         self.frames += 1;
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
-                // The preview closes on the dismiss ✕ too, so the affordance
-                // can actually be clicked here rather than only looked at.
-                if overlay_ui::draw_overlay_card(
-                    ui,
-                    "ledgerline.exe",
-                    "Ledgerline",
-                    Some("a.novak@ledgerline.com"),
-                ) == overlay_ui::OverlayAction::Dismiss
-                {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
+        if self.login {
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::WINDOW_BG)
+                        .inner_margin(Margin::symmetric(26.0, 24.0)),
+                )
+                .show(ctx, |ui| {
+                    // Sample data mirroring the 3h mock; actions are ignored
+                    // -- a preview must never spawn `bw`.
+                    let _ = login_ui::draw_login_window(
+                        ui,
+                        BwStatus::Locked,
+                        Some("a.novak@ledgerline.com"),
+                        "vault.ledgerline.eu",
+                        &mut self.form,
+                    );
+                });
+        } else {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none())
+                .show(ctx, |ui| {
+                    // The preview closes on the dismiss ✕ too, so the
+                    // affordance can actually be clicked here rather than
+                    // only looked at.
+                    if overlay_ui::draw_overlay_card(
+                        ui,
+                        "ledgerline.exe",
+                        "Ledgerline",
+                        Some("a.novak@ledgerline.com"),
+                    ) == overlay_ui::OverlayAction::Dismiss
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+        }
 
         if let Some(path) = self.screenshot_path.clone() {
             // A couple of warm-up frames first, so fonts and layout have
@@ -104,7 +160,9 @@ impl eframe::App for Preview {
             ctx.request_repaint();
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter)) {
+        if !self.login
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Enter))
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
