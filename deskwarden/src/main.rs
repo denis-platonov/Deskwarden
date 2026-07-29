@@ -566,7 +566,14 @@ fn main() {
         }
 
         if let Ok(release) = update_rx.try_recv() {
-            tray::set_update_available(&tray, &release.version);
+            // Not while a download is in flight: relabelling the item back to
+            // "Update available" mid-download would contradict what is
+            // actually happening (the click would be rejected anyway, see the
+            // handler above). Rare -- checks are 24h apart -- but the tray is
+            // the only status this app shows, so it shouldn't lie.
+            if !update_in_progress {
+                tray::set_update_available(&tray, &release.version);
+            }
             available_update = Some(release);
         }
 
