@@ -4,18 +4,25 @@
 //! note there). This file is only `fn main()` and the startup sequence.
 
 use nodewarden_native::app::{
-    handle_match, pump_windows_messages, refresh_match_engine,
+    fill_from_vault, handle_match, match_entries, pump_windows_messages, refresh_match_engine,
 };
+use nodewarden_native::bw_serve::{
+    self, readiness_schedule, wait_for_vault_ready, BW_SERVE_URL, READINESS_DEADLINE,
+};
+use nodewarden_native::dispatch;
 use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
 use nodewarden_native::match_engine::MatchEngine;
 use nodewarden_native::vault_bridge::VaultBridge;
 use nodewarden_native::{hotkey, logging, login_ui, session_store, tray, window_watch};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-const BW_SERVE_URL: &str = "http://localhost:8087";
+/// How often the match engine is rebuilt from the vault while running, so
+/// matches added via the picker (or synced from another device) take effect
+/// without restarting the app.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() {
     let config_dir = directories::ProjectDirs::from("dev", "nodewarden", "nodewarden-native")
@@ -49,17 +56,45 @@ fn main() {
         }
     };
 
-    let mut bw_serve = spawn_bw_serve(&session_token);
-    std::thread::sleep(Duration::from_millis(500));
+    // Pull the latest vault state down before building the match engine, so a
+    // match added on another device is live on first run rather than after the
+    // next incidental sync.
+    match bw_serve::run_bw_sync(&session_token) {
+        Ok(()) => log::info!("bw sync completed"),
+        Err(e) => log::warn!("bw sync failed (continuing with cached vault): {e}"),
+    }
+
+    let mut bw_serve_child = spawn_bw_serve(&session_token);
 
     let vault = VaultBridge::new(BW_SERVE_URL);
     let mut engine = MatchEngine::new();
-    match refresh_match_engine(&vault, &mut engine) {
-        Ok(count) => log::info!("match engine loaded with {count} app match(es)"),
-        Err(e) => log::error!("failed to load match engine from vault: {e:?}"),
+
+    // `bw serve` is a bundled Node binary: its cold start regularly takes
+    // several seconds, far longer than the fixed 500ms sleep this replaces.
+    // Losing that race used to leave the match engine permanently empty with
+    // no diagnostic, so the app silently did nothing forever.
+    match wait_for_vault_ready(&vault, &readiness_schedule(READINESS_DEADLINE)) {
+        Ok(items) => {
+            let entries = match_entries(&items);
+            log::info!("match engine loaded with {} app match(es)", entries.len());
+            engine.rebuild(&entries);
+        }
+        Err(e) => {
+            log::error!("{e}");
+            log::error!(
+                "giving up: without a reachable, unlocked `bw serve` there is nothing to match \
+                 against. Check {}\\nodewarden.log and that the Bitwarden CLI is installed.",
+                config_dir.display()
+            );
+            let _ = bw_serve_child.kill();
+            std::process::exit(1);
+        }
     }
 
-    let injector = Injector { ui: RealUiAutomation, fallback: RealSendInput };
+    let injector = Injector {
+        ui: RealUiAutomation,
+        fallback: RealSendInput,
+    };
 
     // The tray icon and the global hotkey manager each create a hidden
     // Win32 window on the thread that builds them (here, the main thread)
@@ -77,15 +112,46 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<window_watch::ForegroundEvent>();
     std::thread::spawn(move || {
-        let _ = window_watch::watch_foreground_windows(move |event| {
+        if let Err(e) = window_watch::watch_foreground_windows(move |event| {
             let _ = tx.send(event);
-        });
+        }) {
+            log::error!("foreground window watcher stopped: {e}");
+        }
     });
 
     // Set when a `Hotkey`-trigger match is seen: the item/window that's
     // eligible to be filled once the user presses the fill hotkey, rather
     // than being filled immediately from the window-match path.
     let mut pending_hotkey_fill: Option<(String, isize)> = None;
+
+    // The hwnd of the last foreground window we acted on. See
+    // `dispatch::should_dispatch` for why re-dispatching the same hwnd must be
+    // suppressed (short version: closing our own overlay hands foreground back
+    // to the target, which would otherwise re-match and re-show the overlay
+    // forever, so "Dismiss" never dismissed).
+    let mut last_dispatched_hwnd: Option<isize> = None;
+
+    // Seed with whatever is already focused: `SetWinEventHook` only reports
+    // foreground *changes*, so an app that was matched and already in front
+    // when nodewarden started would otherwise be ignored until the next window
+    // switch.
+    if let Some(event) = window_watch::current_foreground_event() {
+        log::info!(
+            "seeding with current foreground window: {} (hwnd {})",
+            event.exe_name,
+            event.hwnd
+        );
+        process_foreground_event(
+            &event,
+            &vault,
+            &injector,
+            &engine,
+            &mut pending_hotkey_fill,
+            &mut last_dispatched_hwnd,
+        );
+    }
+
+    let mut last_refresh = Instant::now();
 
     loop {
         pump_windows_messages();
@@ -102,7 +168,7 @@ fn main() {
                 // externally), so a `kill()` error is expected and ignored
                 // rather than treated as fatal.
                 log::info!("quit requested from tray; killing bw serve");
-                if let Err(e) = bw_serve.kill() {
+                if let Err(e) = bw_serve_child.kill() {
                     log::warn!("bw serve kill on quit failed (already gone?): {e}");
                 }
                 std::process::exit(0);
@@ -119,46 +185,93 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    nodewarden_native::app::fill_from_vault(&vault, &injector, &item_id, hwnd);
+                    fill_from_vault(&vault, &injector, &item_id, hwnd);
+                } else {
+                    log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
             }
         }
 
-        if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
-            // Any foreground-window change invalidates a pending hotkey
-            // fill unless it's the very window that armed it re-foregrounding
-            // (same hwnd). Without this, arming the fill and then switching
-            // away to an unrelated window -- without ever pressing the fill
-            // hotkey -- would leave `pending_hotkey_fill` stale: a later,
-            // unrelated Ctrl+Alt+B press would fire it against a `hwnd` that
-            // may since have been recycled by the OS for a different window,
-            // contradicting the guarantee that the hotkey does nothing when
-            // no matching window is foregrounded.
-            if let Some((_, armed_hwnd)) = pending_hotkey_fill {
-                if armed_hwnd != event.hwnd {
-                    pending_hotkey_fill = None;
-                }
+        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+            last_refresh = Instant::now();
+            match refresh_match_engine(&vault, &mut engine) {
+                Ok(count) => log::debug!("match engine refreshed: {count} app match(es)"),
+                Err(e) => log::warn!("periodic match engine refresh failed: {e:?}"),
             }
+        }
 
-            if let Some((item_id, m)) = engine.lookup(&event.exe_name) {
-                if let Some(armed) =
-                    handle_match(&vault, &injector, item_id, m, event.hwnd, &event.exe_name)
-                {
-                    pending_hotkey_fill = Some(armed);
-                }
-            }
+        if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            process_foreground_event(
+                &event,
+                &vault,
+                &injector,
+                &engine,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+            );
+        }
+    }
+}
+
+/// Applies the dispatch rules to one foreground event and, if it survives
+/// them, matches and dispatches it.
+fn process_foreground_event(
+    event: &window_watch::ForegroundEvent,
+    vault: &VaultBridge,
+    injector: &Injector<RealUiAutomation, RealSendInput>,
+    engine: &MatchEngine,
+    pending_hotkey_fill: &mut Option<(String, isize)>,
+    last_dispatched_hwnd: &mut Option<isize>,
+) {
+    // Our own windows (prompt overlay, process picker, login) are focused,
+    // always-on-top windows, so showing one fires EVENT_SYSTEM_FOREGROUND for
+    // this process. Those are not app switches: ignore them entirely, without
+    // even invalidating a pending hotkey fill (the target hasn't changed --
+    // we just temporarily covered it).
+    if dispatch::is_own_process(event.pid) {
+        return;
+    }
+
+    // Any foreground-window change invalidates a pending hotkey
+    // fill unless it's the very window that armed it re-foregrounding
+    // (same hwnd). Without this, arming the fill and then switching
+    // away to an unrelated window -- without ever pressing the fill
+    // hotkey -- would leave `pending_hotkey_fill` stale: a later,
+    // unrelated Ctrl+Alt+B press would fire it against a `hwnd` that
+    // may since have been recycled by the OS for a different window,
+    // contradicting the guarantee that the hotkey does nothing when
+    // no matching window is foregrounded.
+    if let Some((_, armed_hwnd)) = pending_hotkey_fill.as_ref() {
+        if *armed_hwnd != event.hwnd {
+            *pending_hotkey_fill = None;
+        }
+    }
+
+    if !dispatch::should_dispatch(event, *last_dispatched_hwnd) {
+        log::debug!(
+            "suppressing repeat foreground event for hwnd {} ({})",
+            event.hwnd,
+            event.exe_name
+        );
+        return;
+    }
+    *last_dispatched_hwnd = Some(event.hwnd);
+
+    if let Some((item_id, m)) = engine.lookup(&event.exe_name) {
+        log::info!(
+            "matched {} to vault item {item_id} (trigger {:?})",
+            event.exe_name,
+            m.trigger
+        );
+        if let Some(armed) = handle_match(vault, injector, item_id, m, event.hwnd, &event.exe_name)
+        {
+            *pending_hotkey_fill = Some(armed);
         }
     }
 }
 
 fn spawn_bw_serve(session_token: &str) -> Child {
-    match Command::new("bw")
-        .args(["serve", "--port", "8087"])
-        .env("BW_SESSION", session_token)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+    match bw_serve::spawn_bw_serve(session_token) {
         Ok(child) => child,
         Err(e) => {
             log::error!(
