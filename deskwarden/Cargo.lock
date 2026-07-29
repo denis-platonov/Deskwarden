@@ -971,6 +971,7 @@ dependencies = [
  "global-hotkey",
  "log",
  "mockito",
+ "semver",
  "serde",
  "serde_json",
  "tray-icon",

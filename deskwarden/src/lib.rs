@@ -25,5 +25,6 @@ pub mod process_list;
 pub mod session_store;
 pub mod signature;
 pub mod tray;
+pub mod updater;
 pub mod vault_bridge;
 pub mod window_watch;
