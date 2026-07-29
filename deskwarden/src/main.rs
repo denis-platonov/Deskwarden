@@ -50,17 +50,36 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
 
 fn main() {
-    let config_dir = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
-        .expect("could not resolve config directory")
-        .config_dir()
-        .to_path_buf();
+    let project_dirs = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
+        .expect("could not resolve config directory");
+    let config_dir = project_dirs.config_dir().to_path_buf();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
+
+    // Downloaded installers go under the *cache* directory, not next to
+    // `session.bin` and the log in the config directory: they are large,
+    // disposable, and regenerable, which is exactly what a cache directory is
+    // for -- and keeping multi-megabyte attacker-supplied-until-verified
+    // downloads out of the directory holding the encrypted session token is
+    // worth the one extra path. Created lazily by `download_and_verify`.
+    let update_download_dir = project_dirs.cache_dir().join("updates");
 
     // Logging first: a background tray app has no console, so without a log
     // file every failure below is invisible to whoever has to diagnose it.
     match logging::init(&config_dir) {
         Ok(path) => log::info!("deskwarden starting; logging to {}", path.display()),
         Err(e) => eprintln!("warning: {e}"),
+    }
+
+    // Any installer still sitting in the download directory is spent by now:
+    // either it was applied (and this process is the result) or its attempt
+    // failed. Deleting them here rather than after applying one is not a
+    // stylistic choice -- `apply_update` launches the installer and this
+    // process exits immediately after, so at that moment the file is a
+    // running process image and cannot be deleted.
+    match updater::cleanup_stale_downloads(&update_download_dir) {
+        Ok(0) => {}
+        Ok(n) => log::info!("cleaned up {n} stale update download(s)"),
+        Err(e) => log::warn!("could not clean up stale update downloads: {e}"),
     }
 
     let session_path = config_dir.join("session.bin");
@@ -214,6 +233,30 @@ fn main() {
     }
     let mut last_update_check = Instant::now();
 
+    // Outcome of a click-triggered update attempt. `Ok(())` means the
+    // installer was downloaded, signature-verified, and launched, and this
+    // process should now shut down for it; `Err` carries a message for the
+    // log and the tray.
+    //
+    // The work behind this channel used to run inline in the tray-click
+    // handler below, which streams a multi-megabyte download and then blocks
+    // on a `powershell.exe` spawn for signature verification -- all while
+    // `pump_windows_messages()` isn't running, so the tray, the global
+    // hotkey, and window-watching were dead for the whole duration and
+    // Windows would flag the app as not responding. It now runs on a
+    // background thread and reports back here, polled non-blockingly from the
+    // main loop, exactly like `update_rx` above.
+    //
+    // The *shutdown* deliberately stays on the main thread: `bw_serve_child`
+    // is owned here, and the whole point of the shutdown path is that the
+    // backend is killed before this process goes away.
+    let (apply_tx, apply_rx) = mpsc::channel::<Result<(), String>>();
+
+    // True from the moment a download starts until its outcome arrives, so a
+    // second click can't start a second concurrent download of the same
+    // installer into the same destination path.
+    let mut update_in_progress = false;
+
     let (tx, rx) = mpsc::channel::<window_watch::ForegroundEvent>();
     std::thread::spawn(move || {
         if let Err(e) = window_watch::watch_foreground_windows(move |event| {
@@ -315,37 +358,43 @@ fn main() {
                 // The item is disabled (and so shouldn't be clickable) until
                 // `available_update` is `Some`, but the check is repeated
                 // here defensively rather than trusting tray-icon's disabled
-                // state to suppress the click event.
-                if let Some(release) = &available_update {
-                    log::info!(
-                        "update requested from tray; downloading v{}",
-                        release.version
-                    );
-                    match updater::download_and_verify(
-                        release,
-                        EXPECTED_SIGNER_THUMBPRINT,
-                        &config_dir,
-                        &http_agent,
-                    ) {
-                        Ok(installer_path) => match updater::apply_update(&installer_path) {
-                            Ok(()) => {
-                                // Same shutdown path as the Quit handler
-                                // above: kill `bw serve` explicitly before
-                                // exiting so the installer (which will
-                                // replace/relaunch this binary) doesn't leave
-                                // an orphaned backend serving the unlocked
-                                // vault behind.
-                                log::info!(
-                                    "installer launched for v{}; shutting down for update",
-                                    release.version
-                                );
-                                bw_serve::stop_bw_serve(&mut bw_serve_child);
-                                std::process::exit(0);
-                            }
-                            Err(e) => log::error!("failed to launch update installer: {e}"),
-                        },
-                        Err(e) => log::error!("update download/verification failed: {e}"),
+                // state to suppress the click event. Same reasoning for
+                // re-checking `update_in_progress`.
+                match (&available_update, update_in_progress) {
+                    (Some(release), false) => {
+                        log::info!(
+                            "update requested from tray; downloading v{} in the background",
+                            release.version
+                        );
+                        tray::set_update_in_progress(&tray, &release.version);
+                        update_in_progress = true;
+
+                        // Everything the thread needs is cloned in: the
+                        // release (hence `ReleaseInfo: Clone`), the agent (a
+                        // cheap `Arc` handle), the destination directory, and
+                        // a sender. Nothing here is joined or waited on --
+                        // the main loop keeps pumping messages and picks the
+                        // outcome up from `apply_rx` whenever it lands.
+                        let release = release.clone();
+                        let agent = http_agent.clone();
+                        let dest_dir = update_download_dir.clone();
+                        let tx = apply_tx.clone();
+                        std::thread::spawn(move || {
+                            let outcome = updater::download_and_verify(
+                                &release,
+                                EXPECTED_SIGNER_THUMBPRINT,
+                                &dest_dir,
+                                &agent,
+                            )
+                            .and_then(|installer_path| updater::apply_update(&installer_path));
+                            let _ = tx.send(outcome);
+                        });
                     }
+                    (Some(release), true) => log::info!(
+                        "update to v{} is already being downloaded; ignoring repeat click",
+                        release.version
+                    ),
+                    (None, _) => log::debug!("update item clicked with no update available"),
                 }
             }
         }
@@ -500,6 +549,34 @@ fn main() {
         if let Ok(release) = update_rx.try_recv() {
             tray::set_update_available(&tray, &release.version);
             available_update = Some(release);
+        }
+
+        // Non-blocking, like the check above: the download thread reports here
+        // when it's finished (or failed), and the main loop never waits on it.
+        if let Ok(outcome) = apply_rx.try_recv() {
+            update_in_progress = false;
+            match outcome {
+                Ok(()) => {
+                    // Same shutdown path as the Quit handler above: kill
+                    // `bw serve` explicitly before exiting so the installer
+                    // (which replaces and relaunches this binary) doesn't
+                    // leave an orphaned backend serving the unlocked vault
+                    // behind.
+                    log::info!("update installer launched; shutting down for update");
+                    bw_serve::stop_bw_serve(&mut bw_serve_child);
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    // Surfaced, not just logged: a tray app with no window
+                    // and no console has nowhere else to say this, and the
+                    // user just asked for an update and is entitled to know
+                    // it didn't happen.
+                    log::error!("update failed: {e}");
+                    if let Some(release) = &available_update {
+                        tray::set_update_failed(&tray, &release.version);
+                    }
+                }
+            }
         }
 
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {

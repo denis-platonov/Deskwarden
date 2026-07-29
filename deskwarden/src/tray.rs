@@ -2,8 +2,17 @@ use semver::Version;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+/// Tooltip shown when nothing update-related is going on. Also the string the
+/// tray reverts to conceptually -- the update states below replace it while
+/// they apply.
+const IDLE_TOOLTIP: &str = "Deskwarden";
+
 pub struct AppTray {
-    _icon: TrayIcon,
+    /// Kept (not just dropped-on-the-floor) because the tooltip is this app's
+    /// only user-visible channel for update progress/failure: a tray app has
+    /// no window and no console, so without this a failed update would be
+    /// visible only to whoever goes looking in the log file.
+    icon: TrayIcon,
     pub add_app_id: MenuId,
     pub quit_id: MenuId,
     /// Id of the "Update available" item, for comparing against
@@ -35,12 +44,12 @@ pub fn build_tray() -> AppTray {
 
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Deskwarden")
+        .with_tooltip(IDLE_TOOLTIP)
         .build()
         .expect("failed to build tray icon");
 
     AppTray {
-        _icon: icon,
+        icon,
         add_app_id: add_app.id().clone(),
         quit_id: quit.id().clone(),
         update_id: update_item.id().clone(),
@@ -59,4 +68,44 @@ pub fn next_menu_event() -> Option<MenuEvent> {
 pub fn set_update_available(tray: &AppTray, version: &Version) {
     tray.update_item.set_text(format!("Update available (v{version})"));
     tray.update_item.set_enabled(true);
+    set_tooltip(tray, format!("Deskwarden - update available (v{version})"));
+}
+
+/// Reflects an in-flight download/verify/apply attempt (see `main.rs`'s
+/// background update thread).
+///
+/// The item is disabled for the duration so a second click can't start a
+/// second concurrent download of the same installer, and the label says what
+/// is happening: the work now runs off the main thread, so without this the
+/// only feedback for a multi-megabyte download would be a menu item that
+/// appears to do nothing.
+pub fn set_update_in_progress(tray: &AppTray, version: &Version) {
+    tray.update_item.set_text(format!("Downloading update (v{version})..."));
+    tray.update_item.set_enabled(false);
+    set_tooltip(tray, format!("Deskwarden - downloading update v{version}"));
+}
+
+/// Reports a failed update attempt.
+///
+/// A failure used to be logged and otherwise invisible: the app has no window
+/// and (deliberately) no console, so the user clicked "Update available" and
+/// simply nothing ever happened. The item is re-enabled -- the failure is
+/// frequently transient (network, a GitHub hiccup) and retrying is the right
+/// affordance -- and both the label and the tooltip say so.
+pub fn set_update_failed(tray: &AppTray, version: &Version) {
+    tray.update_item
+        .set_text(format!("Update to v{version} failed - click to retry"));
+    tray.update_item.set_enabled(true);
+    set_tooltip(
+        tray,
+        format!("Deskwarden - update to v{version} failed; see the log file"),
+    );
+}
+
+/// Best-effort tooltip update: a tooltip that won't set is a cosmetic
+/// problem, never a reason to fail the operation it was describing.
+fn set_tooltip(tray: &AppTray, text: String) {
+    if let Err(e) = tray.icon.set_tooltip(Some(&text)) {
+        log::debug!("could not set tray tooltip: {e}");
+    }
 }
