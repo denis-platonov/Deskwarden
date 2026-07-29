@@ -232,7 +232,41 @@ Header right: `Locked` pill (`BLUE_DEEP` on `BLUE_WASH`). Body:
 - Fallback line: "Or **enter PIN** · vault re-locks after 15 min idle"
   (12px faint; "enter PIN" in `BLUE_DEEP` 600).
 
-### 4.4 `3c` — Save a new login
+### 4.4 `3h` — Login window ("Unlock your vault", first run of the day)
+
+A real OS window, 470×560, titled **"Log in to Deskwarden"** (titlebar shows
+the 15×17 mark). Body on `WINDOW_BG`, padding 30px vertical / 26px
+horizontal, 22px gaps between blocks:
+
+1. **Brand lockup**: 38×44 mark · "Deskwarden" (25px, 800, −0.03em) over
+   "FILLS NATIVE WINDOWS" (10px, 700, uppercase, 0.15em, `TEXT_FAINT`).
+2. **Title block**: "Unlock your vault" (19px, 800, −0.02em) +
+   "Matches stay hidden until the vault opens." (13px `TEXT_FAINT`).
+3. **Password card** (white, 1px `HAIRLINE` border, radius 10, padding 16,
+   gap 12):
+   - Label row: "Master password" (12px `TEXT_MUTED`) — right-aligned
+     account email `a.novak@ledgerline.com` (11px `TEXT_GHOST`).
+   - 38px focused input (1px `BLUE` border + 3px `FOCUS_RING` halo) with an
+     in-field **"Show"** reveal toggle (11px, 600, `BLUE_DEEP`) at the right
+     edge.
+   - Action row: `Continue ↵` (primary, 32px) · "Forgot it?" (12px
+     `TEXT_FAINT`).
+4. **"or" divider**: two hairlines around an 11px `TEXT_GHOST` "or".
+5. **Biometric panel**: `BLUE_WASH` fill, 1px `FOCUS_RING` border, radius
+   10, padding 13×14 — 30px white tile (`BLUE_EDGE` border) with padlock
+   outline icon (`BLUE` stroke), "Use Windows Hello" (13px 600 `BLUE_DEEP`)
+   over "Face or fingerprint" (11px `TEXT_MUTED`), right mono chip `CTRL+H`
+   (10px `BLUE` on white).
+6. **Footer**, pinned to the window bottom (12px `TEXT_GHOST`):
+   "Switch account │ Log out" left (1px `BORDER` divider between), server
+   identity right ("Bitwarden · EU" in the mock — the account's actual
+   server in the app).
+
+The sign-in (unauthenticated) state reuses the same shell with the server
+choice + email fields inside the card; the mock covers only the unlock
+state.
+
+### 4.5 `3c` — Save a new login
 
 Dialog card (shadowed). Header: 16px mark + **"Save this login?"** (13px
 700) + `✕` dismiss. Form rows (80px label column, 12px faint labels):
@@ -245,7 +279,7 @@ Dialog card (shadowed). Header: 16px mark + **"Save this login?"** (13px
 Footer (`CARD_TINT`): `Save ↵` (primary), `Not now` (secondary), right:
 "Never for this app" (12px faint text link).
 
-### 4.5 `3d` — Generate & fill
+### 4.6 `3d` — Generate & fill
 
 Shown on a *password* field with no match; leads with a fresh password.
 
@@ -256,7 +290,7 @@ Shown on a *password* field with no match; leads with a fresh password.
   · right `CTRL+R NEW` (11px mono `BLUE_DEEP` 600).
 - Footer: `Fill & save to vault ↵` (primary) + `Copy` (secondary).
 
-### 4.6 `3e` — Preferences → Autofill (macOS mock)
+### 4.7 `3e` — Preferences → Autofill (macOS mock)
 
 Window 1000×700, titlebar with traffic lights (first dot `BLUE`), title
 "Preferences". Left nav (208px, white): General / **Autofill** (selected:
@@ -288,7 +322,7 @@ Matched by / On focus):
 | Remote Desktop | `mstsc.exe` | Hotkey only |
 | Banking apps (4) | `group` | Never |
 
-### 4.7 `2b` / `3f` — Vault window (Windows / macOS)
+### 4.8 `2b` / `3f` — Vault window (Windows / macOS)
 
 Three-pane: sidebar 212px · item list 380–400px · detail.
 
@@ -336,6 +370,7 @@ Server, Tracker.
 | `/` | overlay (no match) | Search vault |
 | `Ctrl+N` | overlay (no match) | New login |
 | `Ctrl+⇧+D` | overlay | Never show for this app |
+| `Ctrl+H` | login window | Unlock with Windows Hello |
 | `Ctrl+R` | generator | New password |
 | `Ctrl+⇧+F` / `⌘⇧F` | vault detail | Fill in app |
 | `Ctrl+K` / `⌘K` | vault | Focus search |
@@ -353,15 +388,15 @@ below / above / at cursor).
 
 ## Implementation status
 
-As of 2026-07-28 (see `deskwarden/src/theme.rs` and callers):
+As of 2026-07-29 (see `deskwarden/src/theme.rs` and callers):
 
 | Design section | Status |
 |---|---|
 | 3g mark + palette + lockup | ✅ `theme.rs`, icon regenerated (`assets/generate-icon.py`) |
 | Typography (Archivo) | ✅ bundled Regular/SemiBold/Bold, `assets/fonts/` |
 | 2a overlay | ✅ `overlay_ui.rs` (single-match row; multi-row/TOTP pending vault support) |
-| 3b locked wording | ✅ folded into `login_ui.rs` unlock window (overlay-locked state itself pending) |
-| Login window (not in design; built from tokens + 3b language) | ✅ `login_ui.rs` |
+| 3h login window | ✅ `login_ui.rs` (`draw_login_window`): lockup, account email, in-field Show/Hide, Continue ↵, Log out + server footer. Pending, backend-gated: Windows Hello panel (CLI has no biometric unlock), "Forgot it?" (no hint API), "Switch account" (= Log out today) |
+| 3b locked wording | ✅ folded into the 3h unlock window (overlay-locked state itself pending) |
 | Pickers (not in design; built from tokens + 3e "On focus" vocabulary) | ✅ `picker_ui.rs` |
 | 3a no-match overlay | ⬜ needs focus-driven overlay trigger (today the overlay only opens on a match) |
 | 3c save-login prompt | ⬜ needs successful-sign-in detection + vault write flow |
