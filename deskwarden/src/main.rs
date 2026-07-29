@@ -128,6 +128,14 @@ fn main() {
         Err(e) => eprintln!("warning: {e}"),
     }
 
+    // Building with windows_subsystem = "windows" (no console) means a
+    // panic's default stderr backtrace goes nowhere -- the process just
+    // vanishes with zero trace, which is exactly the invisibility logging
+    // was added to eliminate. Route panics into the same log file instead.
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panicked: {info}");
+    }));
+
     // Verified once, up front, before anything below spawns the CLI or shows
     // the login window: `bw_serve`/`login_ui` hand this binary the user's
     // master password and, afterwards, their live session token. Refusing to
