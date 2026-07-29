@@ -1,6 +1,12 @@
 use semver::Version;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+/// Ordinal of the icon resource `build.rs` embeds into the executable. Must
+/// stay in step with the id passed to `set_icon_with_id` there -- there is no
+/// compile-time link between the two, so this constant and that call are the
+/// contract.
+const APP_ICON_RESOURCE_ID: u16 = 1;
 
 /// Tooltip shown when nothing update-related is going on. Also the string the
 /// tray reverts to conceptually -- the update states below replace it while
@@ -42,11 +48,14 @@ pub fn build_tray() -> AppTray {
     menu.append(&update_item).unwrap();
     menu.append(&quit).unwrap();
 
-    let icon = TrayIconBuilder::new()
+    let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(IDLE_TOOLTIP)
-        .build()
-        .expect("failed to build tray icon");
+        .with_tooltip(IDLE_TOOLTIP);
+    if let Some(app_icon) = app_icon() {
+        builder = builder.with_icon(app_icon);
+    }
+
+    let icon = builder.build().expect("failed to build tray icon");
 
     AppTray {
         icon,
@@ -54,6 +63,23 @@ pub fn build_tray() -> AppTray {
         quit_id: quit.id().clone(),
         update_id: update_item.id().clone(),
         update_item,
+    }
+}
+
+/// Loads the icon `build.rs` embedded into this executable.
+///
+/// `None` (rather than a panic) if it isn't there: the resource step is
+/// best-effort by design -- a machine without `rc.exe`/`windres` builds a
+/// working binary with no icon resource -- and an iconless tray is a cosmetic
+/// problem, not a reason to refuse to start a password filler. That was the
+/// behaviour before an icon existed at all.
+fn app_icon() -> Option<Icon> {
+    match Icon::from_resource(APP_ICON_RESOURCE_ID, None) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            log::warn!("could not load the embedded application icon ({e}); tray will be iconless");
+            None
+        }
     }
 }
 
@@ -107,5 +133,26 @@ pub fn set_update_failed(tray: &AppTray, version: &Version) {
 fn set_tooltip(tray: &AppTray, text: String) {
     if let Err(e) = tray.icon.set_tooltip(Some(&text)) {
         log::debug!("could not set tray tooltip: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_embedded_application_icon_loads_by_ordinal() {
+        // The only thing tying `APP_ICON_RESOURCE_ID` to the id build.rs
+        // passes to `set_icon_with_id` is that both say 1. Nothing checks
+        // that at compile time, and a mismatch fails silently -- the tray
+        // just goes back to being iconless, which is exactly the state this
+        // was added to fix. `build_tray()` itself can't be tested here (it
+        // creates real Win32 windows and needs a message pump), so the icon
+        // load is tested on its own.
+        assert!(
+            app_icon().is_some(),
+            "the icon resource embedded by build.rs could not be loaded by ordinal \
+             {APP_ICON_RESOURCE_ID}"
+        );
     }
 }

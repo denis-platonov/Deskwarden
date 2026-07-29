@@ -38,3 +38,9 @@ semver = "1"
 
 [dev-dependencies]
 mockito = "1"
+
+[build-dependencies]
+# Embeds assets/deskwarden.ico as the executable's icon resource (see
+# build.rs). Build-time only: nothing from this crate is linked into the
+# shipped binary, only the .res it produces.
+winresource = "0.1"
