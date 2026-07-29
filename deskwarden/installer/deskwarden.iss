@@ -58,6 +58,22 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Tasks]
 Name: "autostart"; Description: "Start Deskwarden automatically when you sign in"; Flags: checkedonce
 
+[Run]
+; Relaunch Deskwarden once setup finishes. Required by the design spec's
+; Auto-update section ("with the installer configured to relaunch the app
+; after completing"), and load-bearing for the self-update path: updater.rs's
+; apply_update launches this installer and the running app then exits, so
+; without this the user clicks "Update available" and Deskwarden simply
+; disappears until the next sign-in -- or forever, if they declined the
+; autostart task.
+;
+; `postinstall` runs the entry after setup completes in *both* interactive
+; and /VERYSILENT modes. `skipifsilent` is deliberately NOT used: the update
+; path is precisely the silent one, and it is the case that most needs the
+; relaunch. `nowait` because Deskwarden is a long-lived tray app -- setup
+; must not sit waiting for the user to quit it.
+Filename: "{app}\deskwarden.exe"; Description: "Start Deskwarden"; Flags: postinstall nowait
+
 [Code]
 { Runs bootstrap-bw.ps1 (see that file for full detail) to ensure bw.exe is
   available, downloading it from Bitwarden's own GitHub releases and
@@ -94,28 +110,44 @@ begin
   ExtractTemporaryFile('bootstrap-bw.ps1');
   ScriptPath := ExpandConstant('{tmp}\bootstrap-bw.ps1');
 
-  ExecOk := Exec('powershell.exe',
+  { Absolute path rather than the bare 'powershell.exe' this used: setup runs
+    out of a user-writable temp directory, and Windows' process-creation
+    search order includes the application directory. Same reasoning as
+    src/signature.rs resolving powershell.exe absolutely.
+    (Note for editors: Pascal brace comments do not nest, so an Inno
+    constant written literally in one of these comments would end it early.) }
+  ExecOk := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     Format('-NoProfile -ExecutionPolicy Bypass -File "%s" -InstallDir "%s"', [
       ScriptPath, ExpandConstant('{app}')]),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 
+  { SuppressibleMsgBox, not MsgBox, everywhere below. Inno does NOT
+    auto-dismiss plain MsgBox under /SUPPRESSMSGBOXES -- that flag only
+    affects the Suppressible* variants. updater.rs's apply_update runs this
+    installer with `/VERYSILENT /SUPPRESSMSGBOXES` from a process the user
+    never interactively launched, so any of these failure paths (network
+    down, GitHub API shape change, signature check failure) would otherwise
+    put up an invisible modal dialog and block setup indefinitely. The final
+    argument is the answer returned when suppressed; every box here is
+    informational with a single OK button, so IDOK is both the only and the
+    correct answer. Interactively, these still display exactly as before. }
   if (not ExecOk) then
   begin
-    MsgBox('Deskwarden could not launch PowerShell to set up the Bitwarden CLI (bw). ' +
+    SuppressibleMsgBox('Deskwarden could not launch PowerShell to set up the Bitwarden CLI (bw). ' +
       'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-      mbInformation, MB_OK);
+      mbInformation, MB_OK, IDOK);
     exit;
   end;
 
   case ResultCode of
     0: ; { success: already present, or freshly installed and verified }
-    2: MsgBox('The Bitwarden CLI download did not pass signature verification, so it was not installed. ' +
+    2: SuppressibleMsgBox('The Bitwarden CLI download did not pass signature verification, so it was not installed. ' +
         'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-        mbError, MB_OK);
+        mbError, MB_OK, IDOK);
   else
-    MsgBox('Deskwarden could not automatically set up the Bitwarden CLI (bw). ' +
+    SuppressibleMsgBox('Deskwarden could not automatically set up the Bitwarden CLI (bw). ' +
       'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-      mbInformation, MB_OK);
+      mbInformation, MB_OK, IDOK);
   end;
 end;
 
