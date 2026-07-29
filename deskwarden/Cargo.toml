@@ -23,6 +23,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_Security",
+    # WinRT namespaces for Windows Hello quick unlock (src/hello.rs):
+    # KeyCredentialManager lives in Security.Credentials; its buffers come
+    # from Security.Cryptography (CryptographicBuffer) + Storage.Streams.
+    "Security_Credentials",
+    "Security_Cryptography",
+    "Storage_Streams",
+    "Foundation",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +42,12 @@ log = "0.4"
 env_logger = "0.11"
 zeroize = "1"
 semver = "1"
+# Windows Hello quick unlock (src/hello.rs): the master password is sealed
+# with AES-256-GCM under a key derived (SHA-256) from a Windows Hello
+# KeyCredential signature, then DPAPI-wrapped at rest.
+aes-gcm = "0.10"
+sha2 = "0.10"
+getrandom = "0.2"
 
 [dev-dependencies]
 mockito = "1"

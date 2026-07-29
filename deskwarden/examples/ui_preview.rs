@@ -27,6 +27,7 @@
 //! previewed: their windows are plain compositions of the same theme
 //! widgets, and they need a live vault to have anything to list.
 
+use deskwarden::hello::HelloState;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::{overlay_ui, theme};
 use eframe::egui::{self, Margin};
@@ -34,24 +35,30 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     let screenshot = std::env::args().any(|a| a == "--screenshot");
-    let login = std::env::args().any(|a| a == "--login");
+    let signin = std::env::args().any(|a| a == "--signin");
+    let login = signin || std::env::args().any(|a| a == "--login");
 
     let viewport = if login {
         // The real login window's size and chrome (login_ui::run_login_flow).
-        egui::ViewportBuilder::default().with_inner_size([470.0, 560.0])
+        egui::ViewportBuilder::default()
+            .with_inner_size([470.0, 560.0])
+            .with_icon(theme::window_icon())
     } else {
         egui::ViewportBuilder::default()
             .with_inner_size([396.0, 164.0])
             .with_decorations(false)
             .with_transparent(true)
             .with_always_on_top()
+            .with_icon(theme::window_icon())
     };
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
 
-    let png_name = if login {
+    let png_name = if signin {
+        "target/ui_preview_signin.png"
+    } else if login {
         "target/ui_preview_login.png"
     } else {
         "target/ui_preview_overlay.png"
@@ -63,6 +70,7 @@ fn main() -> eframe::Result {
         Box::new(move |_cc| {
             Ok(Box::new(Preview {
                 login,
+                signin,
                 form: LoginForm::default(),
                 screenshot_path: screenshot.then(|| PathBuf::from(png_name)),
                 frames: 0,
@@ -75,6 +83,9 @@ fn main() -> eframe::Result {
 struct Preview {
     /// Which surface this run previews: the login window or the overlay.
     login: bool,
+    /// In login mode: preview the sign-in (unauthenticated) state instead of
+    /// the unlock state, with the server dropdown and Hello opt-in visible.
+    signin: bool,
     /// Form state for the login preview (typing works; Continue doesn't).
     form: LoginForm,
     /// `Some` in --screenshot mode: where the PNG goes.
@@ -109,13 +120,36 @@ impl eframe::App for Preview {
                         .inner_margin(Margin::symmetric(26.0, 24.0)),
                 )
                 .show(ctx, |ui| {
-                    // Sample data mirroring the 3h mock; actions are ignored
-                    // -- a preview must never spawn `bw`.
+                    // Sample data mirroring the 3h mock (unlock: Hello shown
+                    // as enrolled so the panel renders; sign-in: available
+                    // but unenrolled so the opt-in and server dropdown
+                    // render); actions are ignored -- a preview must never
+                    // spawn `bw` or pop Hello.
+                    let (status, email, hello) = if self.signin {
+                        (
+                            BwStatus::Unauthenticated,
+                            None,
+                            HelloState {
+                                available: true,
+                                enrolled: false,
+                            },
+                        )
+                    } else {
+                        (
+                            BwStatus::Locked,
+                            Some("a.novak@ledgerline.com"),
+                            HelloState {
+                                available: true,
+                                enrolled: true,
+                            },
+                        )
+                    };
                     let _ = login_ui::draw_login_window(
                         ui,
-                        BwStatus::Locked,
-                        Some("a.novak@ledgerline.com"),
+                        status,
+                        email,
                         "vault.ledgerline.eu",
+                        hello,
                         &mut self.form,
                     );
                 });

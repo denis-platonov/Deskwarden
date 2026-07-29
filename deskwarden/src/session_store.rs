@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use windows::core::PCWSTR;
-use zeroize::Zeroize;
 use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
+use zeroize::Zeroize;
 
 pub struct SessionStore {
     path: PathBuf,
@@ -32,7 +32,9 @@ impl SessionStore {
     }
 }
 
-fn protect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
+/// DPAPI-wraps `data` for the current Windows user. `pub(crate)` because
+/// `hello.rs` uses the same at-rest wrapping for its sealed blob.
+pub(crate) fn protect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB {
             cbData: data.len() as u32,
@@ -54,7 +56,8 @@ fn protect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
     }
 }
 
-fn unprotect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
+/// Inverse of [`protect`]; see there for why it is `pub(crate)`.
+pub(crate) fn unprotect(data: &[u8]) -> windows::core::Result<Vec<u8>> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB {
             cbData: data.len() as u32,

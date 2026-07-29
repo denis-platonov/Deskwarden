@@ -41,7 +41,8 @@ pub fn show_prompt_overlay(app_name: &str, matched: Option<&OverlayMatch>) -> bo
             .with_inner_size([396.0, 164.0])
             .with_decorations(false)
             .with_transparent(true)
-            .with_always_on_top(),
+            .with_always_on_top()
+            .with_icon(theme::window_icon()),
         ..Default::default()
     };
 

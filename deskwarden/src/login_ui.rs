@@ -1,4 +1,5 @@
 use crate::bw_path::bw_command;
+use crate::hello::{self, HelloState};
 use crate::theme;
 use eframe::egui::{self, Margin, RichText, Rounding, Stroke};
 use std::cell::RefCell;
@@ -208,14 +209,58 @@ fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Which server the sign-in talks to — the native client's bottom-of-page
+/// "Logging in on" dropdown. Selection matters *before* `bw login`, because
+/// the CLI's server is global config (`bw config server`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerChoice {
+    #[default]
+    UsCloud,
+    EuCloud,
+    SelfHosted,
+}
+
+impl ServerChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UsCloud => "bitwarden.com",
+            Self::EuCloud => "bitwarden.eu",
+            Self::SelfHosted => "Self-hosted",
+        }
+    }
+
+    /// The URL `bw config server` gets for the cloud choices; `None` for
+    /// self-hosted (the form's URL field supplies it).
+    pub fn config_url(self) -> Option<&'static str> {
+        match self {
+            Self::UsCloud => Some("https://vault.bitwarden.com"),
+            Self::EuCloud => Some("https://vault.bitwarden.eu"),
+            Self::SelfHosted => None,
+        }
+    }
+
+    /// Initial dropdown state from the CLI's currently-configured server, so
+    /// re-login on a self-hosted setup doesn't silently flip to the cloud.
+    pub fn from_configured(server_url: Option<&str>) -> (Self, String) {
+        match server_url {
+            None => (Self::UsCloud, String::new()),
+            Some(url) if url.contains("bitwarden.eu") => (Self::EuCloud, String::new()),
+            Some(url) if url.contains("bitwarden.com") => (Self::UsCloud, String::new()),
+            Some(url) => (Self::SelfHosted, url.to_string()),
+        }
+    }
+}
+
 /// The login window's form state, owned by the caller across frames.
 #[derive(Default)]
 pub struct LoginForm {
-    pub self_hosted: bool,
+    pub server_choice: ServerChoice,
     pub server_url: String,
     pub email: String,
     pub password: String,
     pub reveal_password: bool,
+    /// The opt-in for Windows Hello quick unlock (see `hello::enroll`).
+    pub enable_hello: bool,
     pub error: Option<String>,
 }
 
@@ -224,6 +269,8 @@ pub struct LoginForm {
 pub enum LoginAction {
     /// Continue was clicked (or Enter pressed): log in / unlock.
     Submit,
+    /// The Hello panel was clicked (or Ctrl+H): unlock via Windows Hello.
+    HelloUnlock,
     /// The footer's "Log out" was clicked: drop the account.
     LogOut,
 }
@@ -237,14 +284,17 @@ pub enum LoginAction {
 /// `ui_preview` example renders the exact window the app ships, same as
 /// `overlay_ui::draw_overlay_card`.
 ///
-/// Deviations from the 3h mock, all backend-gated: the "Use Windows Hello"
-/// panel (the CLI has no biometric unlock), "Forgot it?" (no password-hint
-/// API), and "Switch account" ("Log out" is the same primitive).
+/// Deviations from the 3h mock, backend-gated: "Forgot it?" (the CLI has no
+/// password-hint API) and "Switch account" ("Log out" is the same
+/// primitive). The Hello panel appears once quick unlock is enrolled
+/// (`hello.enrolled`); the mock's static "Bitwarden · EU" footer is a live
+/// server dropdown while signing in.
 pub fn draw_login_window(
     ui: &mut egui::Ui,
     status: BwStatus,
     account_email: Option<&str>,
     server_host: &str,
+    hello: HelloState,
     form: &mut LoginForm,
 ) -> Option<LoginAction> {
     let mut action = None;
@@ -287,11 +337,12 @@ pub fn draw_login_window(
         .inner_margin(Margin::same(16.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 8.0;
+            // 3h's card gap: 12px between the label row, the field, and the
+            // action row.
+            ui.spacing_mut().item_spacing.y = 12.0;
 
             if status == BwStatus::Unauthenticated {
-                ui.checkbox(&mut form.self_hosted, "Self-hosted server");
-                if form.self_hosted {
+                if form.server_choice == ServerChoice::SelfHosted {
                     theme::field_label(ui, "Server URL");
                     theme::text_field(ui, &mut form.server_url, false);
                 }
@@ -311,8 +362,19 @@ pub fn draw_login_window(
             });
             theme::password_field(ui, &mut form.password, &mut form.reveal_password);
 
-            ui.add_space(2.0);
-            if theme::primary_button(ui, "Continue", Some("Enter")).clicked() {
+            // Quick-unlock opt-in, offered until enrolled. Enrollment
+            // happens on the next successful password unlock, so the
+            // password being sealed is one that provably works.
+            if hello.available && !hello.enrolled {
+                ui.checkbox(
+                    &mut form.enable_hello,
+                    RichText::new("Unlock with Windows Hello next time")
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            }
+
+            if theme::primary_button(ui, "Continue", Some("↵")).clicked() {
                 action = Some(LoginAction::Submit);
             }
         });
@@ -322,14 +384,35 @@ pub fn draw_login_window(
         ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
     }
 
+    // 3h's alternative path: the "or" divider and the Windows Hello panel,
+    // once quick unlock is enrolled.
+    if hello.available && hello.enrolled && status != BwStatus::Unauthenticated {
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            let half = (ui.available_width() - 30.0) / 2.0;
+            hairline_segment(ui, half);
+            ui.label(RichText::new("or").size(11.0).color(theme::TEXT_GHOST));
+            hairline_segment(ui, half);
+        });
+        ui.add_space(10.0);
+
+        if hello_panel(ui) {
+            action = Some(LoginAction::HelloUnlock);
+        }
+        if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)) {
+            action = Some(LoginAction::HelloUnlock);
+        }
+    }
+
     // Enter submits from anywhere in the form, same as clicking Continue --
     // 3h's Continue carries the ↵ affordance.
     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
     }
 
-    // Footer pinned to the window bottom (3h): account action left, server
-    // identity right.
+    // Footer pinned to the window bottom (3h): account action left; on the
+    // right, the server — a live dropdown while signing in (the native
+    // client's "Logging in on"), static text once an account is attached.
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         ui.horizontal(|ui| {
             if status != BwStatus::Unauthenticated {
@@ -343,16 +426,126 @@ pub fn draw_login_window(
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(server_host)
-                        .size(12.0)
-                        .color(theme::TEXT_GHOST),
-                );
+                if status == BwStatus::Unauthenticated {
+                    egui::ComboBox::from_id_salt("server-choice")
+                        .selected_text(
+                            RichText::new(form.server_choice.label())
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .show_ui(ui, |ui| {
+                            for choice in [
+                                ServerChoice::UsCloud,
+                                ServerChoice::EuCloud,
+                                ServerChoice::SelfHosted,
+                            ] {
+                                ui.selectable_value(
+                                    &mut form.server_choice,
+                                    choice,
+                                    choice.label(),
+                                );
+                            }
+                        });
+                    ui.label(
+                        RichText::new("Logging in on:")
+                            .size(12.0)
+                            .color(theme::TEXT_GHOST),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(server_host)
+                            .size(12.0)
+                            .color(theme::TEXT_GHOST),
+                    );
+                }
             });
         });
     });
 
     action
+}
+
+/// A fixed-width horizontal hairline, for the "or" divider.
+fn hairline_segment(ui: &mut egui::Ui, width: f32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::Vec2::new(width.max(0.0), 1.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::ZERO, theme::HAIRLINE);
+}
+
+/// The 3h Windows Hello panel: blue-washed row with a padlock tile, "Use
+/// Windows Hello", and the CTRL+H chip. Returns true when clicked.
+fn hello_panel(ui: &mut egui::Ui) -> bool {
+    let panel = egui::Frame::none()
+        .fill(theme::BLUE_WASH)
+        .stroke(Stroke::new(1.0, theme::FOCUS_RING))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(Margin::symmetric(14.0, 13.0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                // The white padlock tile.
+                let (tile, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(30.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(tile, Rounding::same(8.0), theme::CARD);
+                ui.painter().rect_stroke(
+                    tile,
+                    Rounding::same(8.0),
+                    Stroke::new(1.0, theme::BLUE_EDGE),
+                );
+                paint_padlock(ui.painter(), tile.shrink(7.5), theme::BLUE);
+
+                ui.add_space(3.0);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.label(theme::semibold("Use Windows Hello", 13.0).color(theme::BLUE_DEEP));
+                    ui.label(
+                        RichText::new("Face, fingerprint, or PIN")
+                            .size(11.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let chip = RichText::new("CTRL+H")
+                        .size(10.0)
+                        .family(egui::FontFamily::Monospace)
+                        .color(theme::BLUE);
+                    egui::Frame::none()
+                        .fill(theme::CARD)
+                        .rounding(Rounding::same(5.0))
+                        .inner_margin(Margin::symmetric(7.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.label(chip);
+                        });
+                });
+            });
+        });
+    panel
+        .response
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+/// A minimal padlock glyph: shackle (upper circle stroke, lower half masked)
+/// over a filled, rounded body. Drawn rather than typed because the bundled
+/// fonts have no padlock glyph at this size.
+fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke_width = 1.6;
+    let shackle_center = egui::Pos2::new(rect.center().x, rect.top() + rect.height() * 0.32);
+    let shackle_radius = rect.width() * 0.30;
+    painter.circle_stroke(
+        shackle_center,
+        shackle_radius,
+        Stroke::new(stroke_width, color),
+    );
+
+    let body = egui::Rect::from_min_max(
+        egui::Pos2::new(rect.left(), rect.top() + rect.height() * 0.42),
+        rect.max,
+    );
+    painter.rect_filled(body, Rounding::same(2.0), color);
 }
 
 /// Opens a blocking egui window that shows a server-choice + email field
@@ -380,9 +573,21 @@ pub fn run_login_flow() -> String {
     let mut account_email = details.user_email;
     let host = server_host(details.server_url.as_deref());
     let mut form = LoginForm::default();
+    // The dropdown starts on whatever server the CLI is already pointed at,
+    // so re-login on a self-hosted setup doesn't silently flip to the cloud.
+    let (choice, url) = ServerChoice::from_configured(details.server_url.as_deref());
+    form.server_choice = choice;
+    form.server_url = url;
+    // Probed once: Hello support doesn't change mid-dialog, and enrollment
+    // changes only through the actions handled below.
+    let mut hello_state = hello::state();
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([470.0, 560.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([470.0, 560.0])
+            // 3h shows the mark in the titlebar; without this, eframe
+            // windows get winit's default icon rather than the exe's.
+            .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
@@ -408,27 +613,48 @@ pub fn run_login_flow() -> String {
                     .inner_margin(Margin::symmetric(26.0, 24.0)),
             )
             .show(ctx, |ui| {
-                let action =
-                    draw_login_window(ui, status, account_email.as_deref(), &host, &mut form);
+                let action = draw_login_window(
+                    ui,
+                    status,
+                    account_email.as_deref(),
+                    &host,
+                    hello_state,
+                    &mut form,
+                );
 
                 let mut done = false;
 
                 match action {
                     Some(LoginAction::Submit) => {
-                        // A bad self-hosted URL is inline UI error, not a
-                        // panic: bail out of this submit and let the user
-                        // correct it.
-                        let server_configured = if status == BwStatus::Unauthenticated
-                            && form.self_hosted
-                            && !form.server_url.is_empty()
-                        {
-                            match configure_server(&form.server_url) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    log::warn!("bw config server failed: {e}");
-                                    form.error = Some(e);
-                                    false
+                        // The server must be configured before `bw login` --
+                        // it's global CLI config. A bad or missing
+                        // self-hosted URL is inline UI error, not a panic:
+                        // bail out of this submit and let the user correct
+                        // it.
+                        let server_configured = if status == BwStatus::Unauthenticated {
+                            let target = match form.server_choice {
+                                ServerChoice::SelfHosted => {
+                                    let url = form.server_url.trim().to_string();
+                                    if url.is_empty() {
+                                        form.error =
+                                            Some("Enter your server's URL first.".to_string());
+                                        None
+                                    } else {
+                                        Some(url)
+                                    }
                                 }
+                                choice => choice.config_url().map(str::to_string),
+                            };
+                            match target {
+                                Some(url) => match configure_server(&url) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        log::warn!("bw config server failed: {e}");
+                                        form.error = Some(e);
+                                        false
+                                    }
+                                },
+                                None => false,
                             }
                         } else {
                             true
@@ -444,6 +670,25 @@ pub fn run_login_flow() -> String {
                                     run_bw_with_password(&["unlock", "--raw"], &form.password)
                                 }
                             };
+
+                            // Enrollment happens only on success and only
+                            // before the wipe below: the password being
+                            // sealed for Windows Hello is the one that just
+                            // provably opened the vault. A failed enrollment
+                            // is logged, not surfaced -- the unlock itself
+                            // succeeded and the window is about to close.
+                            if result.is_ok()
+                                && form.enable_hello
+                                && hello_state.available
+                                && !hello_state.enrolled
+                            {
+                                match hello::enroll(&form.password) {
+                                    Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
+                                    Err(e) => log::warn!(
+                                        "could not enroll Windows Hello quick unlock: {e}"
+                                    ),
+                                }
+                            }
 
                             // The master password has served its purpose
                             // either way: wipe the buffer instead of leaving
@@ -465,9 +710,40 @@ pub fn run_login_flow() -> String {
                             }
                         }
                     }
+                    Some(LoginAction::HelloUnlock) => {
+                        match hello::unlock_password() {
+                            Ok(password) => {
+                                match run_bw_with_password(&["unlock", "--raw"], &password) {
+                                    Ok(session_token) => {
+                                        *token_for_closure.borrow_mut() = Some(session_token);
+                                        form.error = None;
+                                        done = true;
+                                    }
+                                    Err(e) => {
+                                        log::warn!("bw unlock via Windows Hello failed: {e}");
+                                        form.error = Some(e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Windows Hello quick unlock failed: {e}");
+                                form.error = Some(e);
+                                // A failed open deletes the blob (see
+                                // hello::unlock_password); re-probe so the
+                                // panel disappears rather than erroring
+                                // forever.
+                                hello_state = hello::state();
+                            }
+                        }
+                    }
                     Some(LoginAction::LogOut) => match bw_logout() {
                         Ok(()) => {
                             log::info!("logged out at the user's request; showing sign-in");
+                            // A sealed master password for an account the
+                            // CLI no longer knows is a liability: drop the
+                            // enrollment with the account.
+                            hello::unenroll();
+                            hello_state = hello::state();
                             status = BwStatus::Unauthenticated;
                             account_email = None;
                             form.error = None;

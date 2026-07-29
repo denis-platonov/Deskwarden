@@ -395,7 +395,7 @@ As of 2026-07-29 (see `deskwarden/src/theme.rs` and callers):
 | 3g mark + palette + lockup | ✅ `theme.rs`, icon regenerated (`assets/generate-icon.py`) |
 | Typography (Archivo) | ✅ bundled Regular/SemiBold/Bold, `assets/fonts/` |
 | 2a overlay | ✅ `overlay_ui.rs` (single-match row; multi-row/TOTP pending vault support) |
-| 3h login window | ✅ `login_ui.rs` (`draw_login_window`): lockup, account email, in-field Show/Hide, Continue ↵, Log out + server footer. Pending, backend-gated: Windows Hello panel (CLI has no biometric unlock), "Forgot it?" (no hint API), "Switch account" (= Log out today) |
+| 3h login window | ✅ `login_ui.rs` (`draw_login_window`): lockup, account email, in-field Show/Hide, Continue with a painted ↵ glyph, "or" divider + **Windows Hello panel** (Ctrl+H), Log out + server footer. Hello quick unlock is real (`hello.rs`): opt-in checkbox seals the master password under a KeyCredential-signature-derived AES-256-GCM key, DPAPI-wrapped at rest; logout unenrolls. The footer server identity is a live "Logging in on" dropdown while signing in (bitwarden.com / bitwarden.eu / self-hosted, native-client style). Still pending: "Forgot it?" (no hint API), "Switch account" (= Log out today) |
 | 3b locked wording | ✅ folded into the 3h unlock window (overlay-locked state itself pending) |
 | Pickers (not in design; built from tokens + 3e "On focus" vocabulary) | ✅ `picker_ui.rs` |
 | 3a no-match overlay | ⬜ needs focus-driven overlay trigger (today the overlay only opens on a match) |

@@ -123,7 +123,9 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
     let mut styled = false;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([440.0, 540.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([440.0, 540.0])
+            .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
@@ -285,7 +287,9 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
     let mut styled = false;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([440.0, 560.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([440.0, 560.0])
+            .with_icon(theme::window_icon()),
         ..Default::default()
     };
 

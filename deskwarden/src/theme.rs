@@ -140,12 +140,15 @@ pub fn apply(ctx: &egui::Context) {
 
     let mut style = (*ctx.style()).clone();
 
+    // All sizes are whole pixels on purpose: fractional font sizes land
+    // glyphs on subpixel boundaries, and egui's greyscale AA renders those
+    // visibly softer than the design's browser-hinted text.
     style.text_styles = [
         (
             TextStyle::Heading,
             FontId::new(22.0, FontFamily::Proportional),
         ),
-        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
         (
             TextStyle::Button,
             FontId::new(13.0, FontFamily::Proportional),
@@ -156,7 +159,7 @@ pub fn apply(ctx: &egui::Context) {
         ),
         (
             TextStyle::Monospace,
-            FontId::new(12.5, FontFamily::Monospace),
+            FontId::new(12.0, FontFamily::Monospace),
         ),
     ]
     .into();
@@ -328,6 +331,82 @@ pub fn mark(ui: &mut Ui, size: f32) -> Response {
     response
 }
 
+/// True if `p` is inside the convex polygon `poly` (used for rasterizing the
+/// mark's quadrants, which are all convex — see `quadrant_outlines`).
+fn inside_convex(poly: &[Pos2], p: Pos2) -> bool {
+    let mut sign = 0.0f32;
+    for i in 0..poly.len() {
+        let a = poly[i];
+        let b = poly[(i + 1) % poly.len()];
+        let cross = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+        if cross.abs() < 1e-4 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if sign != cross.signum() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The mark rasterized as an OS window icon (titlebar + taskbar), per the
+/// design's window mocks (3h shows the mark in the titlebar). 32px with 4×
+/// supersampling, same approach as `assets/generate-icon.py` — this one is
+/// generated at runtime because eframe windows take an `egui::IconData`, not
+/// the .ico resource `build.rs` embeds for the exe itself.
+pub fn window_icon() -> egui::IconData {
+    const SIZE: usize = 32;
+    const SS: usize = 4;
+    let outlines = quadrant_outlines();
+
+    let mut rgba = Vec::with_capacity(SIZE * SIZE * 4);
+    for py in 0..SIZE {
+        for px in 0..SIZE {
+            let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    // Map the sample into the 24×28 viewbox, centered in the
+                    // square (the viewbox is taller than wide by 4 units).
+                    let nx = (px * SS + sx) as f32 + 0.5;
+                    let ny = (py * SS + sy) as f32 + 0.5;
+                    let p = Pos2::new(
+                        nx / (SIZE * SS) as f32 * 28.0 - 2.0,
+                        ny / (SIZE * SS) as f32 * 28.0,
+                    );
+                    if let Some(idx) = outlines.iter().position(|o| inside_convex(o, p)) {
+                        let c = QUADRANT_FILLS[idx];
+                        r += c.r() as u32;
+                        g += c.g() as u32;
+                        b += c.b() as u32;
+                        a += 255;
+                    }
+                }
+            }
+            if a == 0 {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                // Premultiplied accumulation, unpremultiplied on the way out,
+                // so transparent samples don't drag edges towards black.
+                let samples = a / 255;
+                rgba.extend_from_slice(&[
+                    (r / samples) as u8,
+                    (g / samples) as u8,
+                    (b / samples) as u8,
+                    (a / (SS * SS) as u32) as u8,
+                ]);
+            }
+        }
+    }
+
+    egui::IconData {
+        rgba,
+        width: SIZE as u32,
+        height: SIZE as u32,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Composite widgets
 // ---------------------------------------------------------------------------
@@ -398,26 +477,60 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
 
 /// The filled primary action button, optionally with a trailing keyboard
 /// hint, per the design's "Save ↵" / "Fill in app CTRL+⇧+F" buttons.
+///
+/// A `kbd` of `"↵"` is painted as a vector return-arrow rather than typed:
+/// neither Archivo nor egui's fallback fonts carry U+21B5, so as text it
+/// renders as a tofu box.
 pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
+    let paint_return = kbd == Some("↵");
     let text = match kbd {
+        // Trailing spaces reserve room for the painted arrow.
+        Some("↵") => format!("{label}    "),
         Some(k) => format!("{label}  {k}"),
         None => label.to_string(),
     };
-    ui.add(
-        egui::Button::new(semibold(text, 12.5).color(Color32::WHITE))
+    let response = ui.add(
+        egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
             .fill(BLUE)
             .stroke(Stroke::NONE)
-            .rounding(Rounding::same(7.0)),
-    )
+            .rounding(Rounding::same(7.0))
+            // The design's action buttons are 32px tall (3h Continue, 2b/3f
+            // toolbar); text + padding alone comes up short.
+            .min_size(Vec2::new(0.0, 32.0)),
+    );
+    if paint_return {
+        paint_return_arrow(
+            ui.painter(),
+            Pos2::new(response.rect.right() - 16.0, response.rect.center().y),
+            8.0,
+            Color32::from_white_alpha(210),
+        );
+    }
+    response
+}
+
+/// The ↵ return glyph, drawn: down the right side, along the bottom, arrowhead
+/// pointing left.
+fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    let half = size / 2.0;
+    let right_top = Pos2::new(center.x + half, center.y - half);
+    let corner = Pos2::new(center.x + half, center.y + half * 0.7);
+    let left = Pos2::new(center.x - half, center.y + half * 0.7);
+    painter.line_segment([right_top, corner], stroke);
+    painter.line_segment([corner, left], stroke);
+    painter.line_segment([left, Pos2::new(left.x + 3.2, left.y - 3.2)], stroke);
+    painter.line_segment([left, Pos2::new(left.x + 3.2, left.y + 3.2)], stroke);
 }
 
 /// The outlined secondary button ("Not now", "Cancel", "Copy").
 pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     ui.add(
-        egui::Button::new(semibold(label, 12.5).color(INK))
+        egui::Button::new(semibold(label, 13.0).color(INK))
             .fill(CARD)
             .stroke(Stroke::new(1.0, BORDER_STRONG))
-            .rounding(Rounding::same(7.0)),
+            .rounding(Rounding::same(7.0))
+            .min_size(Vec2::new(0.0, 32.0)),
     )
 }
 
@@ -444,7 +557,7 @@ fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
     let mut dismissed = false;
     ui.horizontal(|ui| {
         mark(ui, 16.0);
-        ui.label(bold("D E S K W A R D E N", 10.5).color(TEXT_SECONDARY));
+        ui.label(bold("D E S K W A R D E N", 11.0).color(TEXT_SECONDARY));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if with_close {
                 dismissed = close_glyph(ui).clicked();
@@ -549,8 +662,12 @@ fn paint_field_box(
     );
     let rounding = Rounding::same(8.0);
     let border = if response.has_focus() {
+        // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
+        // flush against the 1px border's outer edge, like the mock's
+        // box-shadow -- expand(3.0) would leave a visible white ring between
+        // border and halo.
         ui.painter()
-            .rect_stroke(rect.expand(3.0), rounding, Stroke::new(3.0, FOCUS_RING));
+            .rect_stroke(rect.expand(2.0), rounding, Stroke::new(3.0, FOCUS_RING));
         Stroke::new(1.0, BLUE)
     } else {
         Stroke::new(1.0, BORDER_STRONG)
@@ -667,6 +784,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn window_icon_is_opaque_in_the_shield_and_transparent_outside() {
+        let icon = window_icon();
+        assert_eq!((icon.width, icon.height), (32, 32));
+        assert_eq!(icon.rgba.len(), 32 * 32 * 4);
+        let alpha = |x: usize, y: usize| icon.rgba[(y * 32 + x) * 4 + 3];
+        // Corners are outside the shield; the center is deep inside it.
+        assert_eq!(alpha(0, 0), 0);
+        assert_eq!(alpha(31, 0), 0);
+        assert_eq!(alpha(0, 31), 0);
+        assert_eq!(alpha(31, 31), 0);
+        assert_eq!(alpha(16, 14), 255);
     }
 
     #[test]
