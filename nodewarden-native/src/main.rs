@@ -13,7 +13,9 @@ use nodewarden_native::dispatch;
 use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
 use nodewarden_native::match_engine::MatchEngine;
 use nodewarden_native::vault_bridge::VaultBridge;
-use nodewarden_native::{hotkey, logging, login_ui, session_store, tray, window_watch};
+use nodewarden_native::{
+    hotkey, logging, login_ui, picker_ui, session_store, tray, window_watch,
+};
 use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -172,6 +174,36 @@ fn main() {
                     log::warn!("bw serve kill on quit failed (already gone?): {e}");
                 }
                 std::process::exit(0);
+            }
+
+            if event.id == tray.add_app_id {
+                // Two-step flow: choose the vault item the credentials come
+                // from, then choose the process to attach to it.
+                if let Some(item) = picker_ui::pick_vault_item(&vault) {
+                    log::info!("adding an app match to vault item {}", item.id);
+                    match picker_ui::run_picker(vault.clone(), item) {
+                        Some(m) => {
+                            log::info!("saved app match for {} ({:?})", m.process, m.trigger);
+                            // Make the new match live immediately rather than
+                            // waiting for the next periodic refresh.
+                            match refresh_match_engine(&vault, &mut engine) {
+                                Ok(count) => {
+                                    log::info!("match engine refreshed: {count} app match(es)")
+                                }
+                                Err(e) => {
+                                    log::warn!("refresh after saving app match failed: {e:?}")
+                                }
+                            }
+                        }
+                        None => log::info!("app-match picker cancelled (or save failed)"),
+                    }
+                }
+
+                // Our own picker windows just stole and released foreground.
+                // Forget the last-dispatched hwnd so the window the user
+                // returns to is treated as a fresh switch rather than being
+                // suppressed as a repeat.
+                last_dispatched_hwnd = None;
             }
         }
 
