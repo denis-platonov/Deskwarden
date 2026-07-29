@@ -1,3 +1,22 @@
+// Builds this binary against the Windows GUI subsystem instead of the console
+// subsystem (the default). Without it, every launch -- including the
+// autostart-on-login the installer registers -- pops a black console window
+// next to the tray icon, and closing that window kills the whole app.
+//
+// This attribute applies to the crate it appears in, and a Cargo binary
+// target is its own crate rooted at this file: it belongs here, in main.rs,
+// and specifically NOT in lib.rs (where it would do nothing for this binary
+// and would apply to `cargo test`'s harness and the examples, which *do* want
+// a console). Verified on the built artifact by reading the PE optional
+// header's Subsystem field (2 = GUI, 3 = console).
+//
+// Consequence: `println!`/`eprintln!` from this binary go nowhere. There is
+// exactly one such call left (the logging-init failure below, which by
+// definition can't use the log file), and it is a fallback for a case the
+// user cannot act on anyway; everything user-facing goes through the tray or
+// the log file.
+#![windows_subsystem = "windows"]
+
 //! Binary entry point.
 //!
 //! Declares no modules of its own: every module lives in `lib.rs` (see the
