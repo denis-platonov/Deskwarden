@@ -1,11 +1,18 @@
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Tells `CreateProcess` not to allocate a console for the child. PowerShell
+/// is a console-subsystem program; spawned plainly from this GUI-subsystem
+/// app, Windows briefly flashes a new console into existence for it on every
+/// single call otherwise.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Absolute path to Windows PowerShell, resolved under `%SystemRoot%`.
 ///
 /// Deliberately not the bare command name `powershell`: `CreateProcess`'s
 /// search order starts with the directory of the calling executable, and
-/// deskwarden installs per-user into `%LOCALAPPDATA%\deskwarden` -- a
+/// deskwarden installs per-user into `%LOCALAPPDATA%\Deskwarden` -- a
 /// user-writable directory. Anything able to drop a file there (same user, no
 /// privilege escalation needed) could otherwise substitute its own
 /// `powershell.exe` and have it answer the one question the entire update
@@ -50,6 +57,7 @@ pub fn verify_authenticode(path: &Path) -> Result<SignatureInfo, String> {
 
     let output = Command::new(powershell_path())
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("failed to run powershell: {e}"))?;
 

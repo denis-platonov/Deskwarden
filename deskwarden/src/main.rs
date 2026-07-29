@@ -108,7 +108,7 @@ const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
 ];
 
 fn main() {
-    let project_dirs = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
+    let project_dirs = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
         .expect("could not resolve config directory");
     let config_dir = project_dirs.config_dir().to_path_buf();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");

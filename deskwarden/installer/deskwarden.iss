@@ -20,7 +20,7 @@ AppId={{63CBCB72-5383-4AE7-AFB7-5EE0530E4630}
 AppName=Deskwarden
 AppVersion={#AppVersion}
 AppPublisher=deskwarden (unofficial, unaffiliated with Bitwarden, Inc.)
-DefaultDirName={localappdata}\deskwarden
+DefaultDirName={localappdata}\Deskwarden
 DefaultGroupName=Deskwarden
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -107,25 +107,81 @@ Filename: "{app}\deskwarden.exe"; Description: "Start Deskwarden"; Flags: postin
      workflow (choco install innosetup only installs Inno Setup itself, not
      the plugin) would otherwise need an extra step to fetch.
 }
+{ Copying deskwarden.exe itself (the [Files] section) already gets a visible
+  progress page from Inno's own wizard for a normal interactive install --
+  nothing custom is needed for that stage. The two stages below (the
+  compatibility check and the CLI bootstrap) are the ones that used to run
+  with SW_HIDE and zero visible feedback, which is what ProgressPage exists
+  to fix.
+
+  Gated on `not WizardSilent()` throughout: updater.rs's apply_update runs
+  this installer with /VERYSILENT for the app's own self-update relaunch,
+  and that path must stay fully silent (no windows at all) by design -- the
+  same reason the error dialogs below are Suppressible*, not plain, boxes. }
+var
+  ProgressPage: TOutputProgressWizardPage;
+
+procedure InitializeWizard();
+begin
+  if not WizardSilent() then
+    ProgressPage := CreateOutputProgressPage('Setting up Deskwarden',
+      'Please wait while Deskwarden finishes setting up.');
+end;
+
 procedure InstallBwCliIfMissing();
 var
   ScriptPath: String;
+  PowerShellPath: String;
   ResultCode: Integer;
   ExecOk: Boolean;
 begin
-  ExtractTemporaryFile('bootstrap-bw.ps1');
-  ScriptPath := ExpandConstant('{tmp}\bootstrap-bw.ps1');
-
   { Absolute path rather than the bare 'powershell.exe' this used: setup runs
     out of a user-writable temp directory, and Windows' process-creation
     search order includes the application directory. Same reasoning as
     src/signature.rs resolving powershell.exe absolutely.
     (Note for editors: Pascal brace comments do not nest, so an Inno
     constant written literally in one of these comments would end it early.) }
-  ExecOk := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+
+  if not WizardSilent() then
+  begin
+    ProgressPage.SetText('Checking compatibility...', 'Confirming PowerShell is available');
+    ProgressPage.SetProgress(1, 3);
+    ProgressPage.Show();
+  end;
+
+  { A real check, not a cosmetic delay: without it, a machine missing this
+    (extremely standard, but not guaranteed) component would hit the "could
+    not launch PowerShell" failure path below with no more specific cause. }
+  if not FileExists(PowerShellPath) then
+  begin
+    if not WizardSilent() then ProgressPage.Hide();
+    SuppressibleMsgBox('Deskwarden could not find PowerShell, which it needs to set up the Bitwarden CLI (bw). ' +
+      'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
+      mbInformation, MB_OK, IDOK);
+    exit;
+  end;
+
+  ExtractTemporaryFile('bootstrap-bw.ps1');
+  ScriptPath := ExpandConstant('{tmp}\bootstrap-bw.ps1');
+
+  if not WizardSilent() then
+  begin
+    ProgressPage.SetText('Installing Bitwarden CLI...',
+      'Downloading and verifying the official CLI if it is not already present -- this can take a minute');
+    ProgressPage.SetProgress(2, 3);
+  end;
+
+  ExecOk := Exec(PowerShellPath,
     Format('-NoProfile -ExecutionPolicy Bypass -File "%s" -InstallDir "%s"', [
       ScriptPath, ExpandConstant('{app}')]),
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+
+  if not WizardSilent() then
+  begin
+    ProgressPage.SetText('Finishing up...', '');
+    ProgressPage.SetProgress(3, 3);
+  end;
 
   { SuppressibleMsgBox, not MsgBox, everywhere below. Inno does NOT
     auto-dismiss plain MsgBox under /SUPPRESSMSGBOXES -- that flag only
@@ -139,6 +195,7 @@ begin
     correct answer. Interactively, these still display exactly as before. }
   if (not ExecOk) then
   begin
+    if not WizardSilent() then ProgressPage.Hide();
     SuppressibleMsgBox('Deskwarden could not launch PowerShell to set up the Bitwarden CLI (bw). ' +
       'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
       mbInformation, MB_OK, IDOK);
@@ -155,6 +212,8 @@ begin
       'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
       mbInformation, MB_OK, IDOK);
   end;
+
+  if not WizardSilent() then ProgressPage.Hide();
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

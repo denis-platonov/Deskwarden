@@ -15,9 +15,16 @@
 //!   prefers over the `PATH` entry startup actually verified.
 
 use std::ffi::OsStr;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+
+/// Tells `CreateProcess` not to allocate a console for the child. `bw.exe` is
+/// a console-subsystem program; spawned plainly from this GUI-subsystem app
+/// (deskwarden has no console of its own to inherit), Windows briefly flashes
+/// a new one into existence for it on every single call otherwise.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The one `bw.exe` this process has verified, populated by `main`'s startup
 /// check (see [`remember_verified_bw_exe`]).
@@ -55,7 +62,11 @@ pub fn verified_bw_exe() -> Option<&'static Path> {
 /// that answer is the one startup checked the signature of.
 pub fn bw_command() -> Result<Command, String> {
     match verified_bw_exe() {
-        Some(path) => Ok(Command::new(path)),
+        Some(path) => {
+            let mut cmd = Command::new(path);
+            cmd.creation_flags(CREATE_NO_WINDOW);
+            Ok(cmd)
+        }
         None => Err(
             "no verified Bitwarden CLI: the startup check that resolves bw.exe and confirms it \
              is Bitwarden-signed has not run (or did not pass), and deskwarden will not spawn an \
@@ -72,7 +83,7 @@ pub fn bw_command() -> Result<Command, String> {
 ///
 /// Deliberately never a bare `bw`: `CreateProcess`'s search order checks the
 /// calling executable's own directory *before* `PATH`, and deskwarden
-/// installs per-user into `%LOCALAPPDATA%\deskwarden` -- a user-writable
+/// installs per-user into `%LOCALAPPDATA%\Deskwarden` -- a user-writable
 /// directory, no privilege escalation needed to drop a file there. A `bw.exe`
 /// planted directly beside `deskwarden.exe` would otherwise be preferred over
 /// the real CLI, and would receive the user's master password

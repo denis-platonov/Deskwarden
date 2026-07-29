@@ -72,7 +72,7 @@ it yourself beforehand with the CLI and the app will follow.
 There's no console window, so everything is written to a log file:
 
 ```
-%APPDATA%\deskwarden\deskwarden\config\deskwarden.log
+%APPDATA%\Deskwarden\Deskwarden\config\deskwarden.log
 ```
 
 Set `RUST_LOG=debug` before launching for more detail. Common cases the log
