@@ -256,11 +256,12 @@ impl ServerChoice {
 pub const FOOTER_RESERVE: f32 = 62.0;
 
 /// Gap between a field's label and the field itself.
-const LABEL_GAP: f32 = 10.0;
+const LABEL_GAP: f32 = 7.0;
 /// Gap between one label+field group and the next (and before the action
-/// button). Deliberately larger than [`LABEL_GAP`] so each label reads as
-/// belonging to the field under it.
-const GROUP_GAP: f32 = 18.0;
+/// button). Deliberately much larger than [`LABEL_GAP`] -- roughly 3x -- so
+/// each label reads as bound to the field under it rather than floating
+/// between two of them.
+const GROUP_GAP: f32 = 22.0;
 
 /// What the custom titlebar asked for this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

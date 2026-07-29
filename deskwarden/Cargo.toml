@@ -26,6 +26,9 @@ windows = { version = "0.58", features = [
     # Rounded corners + shadow for the frameless login window's custom
     # titlebar (login_ui::round_window_corners).
     "Win32_Graphics_Dwm",
+    # Native Authenticode verification (src/signature.rs): WinVerifyTrust
+    # plus the crypt32 calls that read the signer certificate.
+    "Win32_Security_WinTrust",
     # WinRT namespaces for Windows Hello quick unlock (src/hello.rs):
     # KeyCredentialManager lives in Security.Credentials; its buffers come
     # from Security.Cryptography (CryptographicBuffer) + Storage.Streams.

@@ -1,83 +1,237 @@
-use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
-/// Tells `CreateProcess` not to allocate a console for the child. PowerShell
-/// is a console-subsystem program; spawned plainly from this GUI-subsystem
-/// app, Windows briefly flashes a new console into existence for it on every
-/// single call otherwise.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Absolute path to Windows PowerShell, resolved under `%SystemRoot%`.
-///
-/// Deliberately not the bare command name `powershell`: `CreateProcess`'s
-/// search order starts with the directory of the calling executable, and
-/// deskwarden installs per-user into `%LOCALAPPDATA%\Deskwarden` -- a
-/// user-writable directory. Anything able to drop a file there (same user, no
-/// privilege escalation needed) could otherwise substitute its own
-/// `powershell.exe` and have it answer the one question the entire update
-/// trust model rests on: "is this installer signed by us?". Naming the real
-/// binary absolutely removes that substitution.
-///
-/// `%SystemRoot%` is read from the environment rather than hardcoded because
-/// Windows genuinely is installable on other volumes, with `C:\Windows` as
-/// the fallback for the (practically impossible) case of the variable being
-/// missing -- a wrong-but-absolute path fails closed with "failed to run
-/// powershell", which is the safe direction.
-fn powershell_path() -> PathBuf {
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    PathBuf::from(system_root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
-}
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Security::Cryptography::{
+    CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext,
+    CertGetCertificateContextProperty, CertNameToStrW, CryptMsgClose, CryptMsgGetParam,
+    CryptQueryObject, CERT_CONTEXT, CERT_FIND_SUBJECT_CERT, CERT_INFO, CERT_NAME_STR_CRLF_FLAG,
+    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED, CERT_QUERY_FORMAT_FLAG_BINARY,
+    CERT_QUERY_OBJECT_FILE, CERT_SHA1_HASH_PROP_ID, CERT_STRING_TYPE, CERT_X500_NAME_STR,
+    CMSG_SIGNER_INFO, CMSG_SIGNER_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
+};
+use windows::Win32::Security::WinTrust::{
+    WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0,
+    WINTRUST_FILE_INFO, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+    WTD_STATEACTION_VERIFY, WTD_UI_NONE,
+};
 
 #[derive(Debug, Clone)]
 pub struct SignatureInfo {
     pub valid: bool,
     pub thumbprint: Option<String>,
-    /// The signer certificate's subject DN, one RDN per line (`X500DistinguishedName.Format($true)`).
-    /// `None` when there is no signer certificate at all.
+    /// The signer certificate's subject DN, one RDN per line (`CERT_X500_NAME_STR`
+    /// with `CERT_NAME_STR_CRLF_FLAG`). `None` when there is no signer
+    /// certificate at all.
     pub subject_dn: Option<String>,
 }
 
-/// Verifies a file's Authenticode signature using PowerShell's built-in
-/// `Get-AuthenticodeSignature` cmdlet. Deliberately shells out rather than
-/// binding raw `WinVerifyTrust`/WinTrust struct layouts directly: this
-/// cmdlet ships with every stock Windows install (Microsoft.PowerShell.Security),
-/// is stable, well-documented public surface, and avoids getting the
-/// WINTRUST_DATA/WINTRUST_FILE_INFO FFI wrong in a security-critical path.
+/// A NUL-terminated UTF-16 copy of `path`, for the Win32 calls below.
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Verifies a file's Authenticode signature via `WinVerifyTrust` and reads
+/// the signer certificate out of the embedded PKCS#7 message.
+///
+/// This used to shell out to PowerShell's `Get-AuthenticodeSignature`, which
+/// looked like the lower-risk choice (no WinTrust FFI to get wrong) but is
+/// not: that cmdlet lives in the `Microsoft.PowerShell.Security` module, and
+/// when module autoloading is unavailable -- a restricted execution
+/// environment, a sandbox, a clobbered `PSModulePath` -- the call fails with
+/// "the module could not be loaded" rather than a verdict. A trust gate that
+/// cannot answer is a trust gate that blocks the user, so the check now
+/// depends only on the OS APIs the cmdlet itself wraps, and on no external
+/// process at all.
+///
+/// `Err` means the answer is unknown (the file could not be read as a signed
+/// object); `Ok(info)` with `valid: false` means the OS gave a verdict and it
+/// was "not trusted". Both are refusals at the call site -- see `main`'s
+/// startup check -- but only the first is worth telling the user to
+/// investigate.
 pub fn verify_authenticode(path: &Path) -> Result<SignatureInfo, String> {
-    let path_str = path.to_str().ok_or("path is not valid UTF-8")?;
-    let script = format!(
-        "$sig = Get-AuthenticodeSignature -FilePath '{}'; \
-         [PSCustomObject]@{{ Status = $sig.Status.ToString(); \
-         Thumbprint = if ($sig.SignerCertificate) {{ $sig.SignerCertificate.Thumbprint }} else {{ $null }}; \
-         SubjectDn = if ($sig.SignerCertificate) {{ $sig.SignerCertificate.SubjectName.Format($true) }} else {{ $null }} }} \
-         | ConvertTo-Json -Compress",
-        path_str.replace('\'', "''")
-    );
-
-    let output = Command::new(powershell_path())
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("failed to run powershell: {e}"))?;
-
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("failed to parse powershell output: {e}"))?;
-
-    let status = parsed["Status"].as_str().unwrap_or("");
-    let thumbprint = parsed["Thumbprint"].as_str().map(|s| s.to_string());
-    let subject_dn = parsed["SubjectDn"].as_str().map(|s| s.to_string());
+    let path_w = wide(path);
+    let valid = win_verify_trust(&path_w);
+    // Read the certificate even when the verdict is "not trusted": the whole
+    // point of the error path is telling the user *who* signed the thing
+    // they're being warned about.
+    let (thumbprint, subject_dn) = match signer_certificate(&path_w) {
+        Ok(pair) => pair,
+        Err(e) if !valid => return Err(e),
+        Err(_) => (None, None),
+    };
 
     Ok(SignatureInfo {
-        valid: status == "Valid",
+        valid,
         thumbprint,
         subject_dn,
     })
+}
+
+/// The trust verdict proper: does this file carry a signature that chains to
+/// a trusted root and covers the file's current contents?
+///
+/// Revocation checking is deliberately off (`WTD_REVOKE_NONE`): it would make
+/// every app start depend on reaching a CRL/OCSP responder, so a captive
+/// portal or an offline laptop would turn into "deskwarden refuses to start".
+fn win_verify_trust(path_w: &[u16]) -> bool {
+    unsafe {
+        let mut file_info = WINTRUST_FILE_INFO {
+            cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+            pcwszFilePath: PCWSTR(path_w.as_ptr()),
+            hFile: HANDLE::default(),
+            pgKnownSubject: std::ptr::null_mut(),
+        };
+        let mut data = WINTRUST_DATA {
+            cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_NONE,
+            dwUnionChoice: WTD_CHOICE_FILE,
+            Anonymous: WINTRUST_DATA_0 {
+                pFile: &mut file_info,
+            },
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            ..Default::default()
+        };
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+        let status = WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut c_void,
+        );
+
+        // WinVerifyTrust allocates provider state on the VERIFY call and only
+        // releases it when asked; skipping this leaks a handle per check.
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrust(
+            HWND::default(),
+            &mut action,
+            &mut data as *mut _ as *mut c_void,
+        );
+
+        status == 0
+    }
+}
+
+/// Pulls the signer certificate's SHA-1 thumbprint and subject DN out of the
+/// file's embedded PKCS#7 signature.
+///
+/// The signer is found the way the OS does it -- take the issuer and serial
+/// number from the message's signer info, then look *that* certificate up in
+/// the message's own store -- rather than grabbing the first certificate
+/// present, which would as happily hand back an intermediate CA.
+fn signer_certificate(path_w: &[u16]) -> Result<(Option<String>, Option<String>), String> {
+    unsafe {
+        let mut store = HCERTSTORE::default();
+        let mut msg: *mut c_void = std::ptr::null_mut();
+        CryptQueryObject(
+            CERT_QUERY_OBJECT_FILE,
+            path_w.as_ptr() as *const c_void,
+            CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+            CERT_QUERY_FORMAT_FLAG_BINARY,
+            0,
+            None,
+            None,
+            None,
+            Some(&mut store),
+            Some(&mut msg),
+            None,
+        )
+        .map_err(|e| format!("the file carries no readable Authenticode signature ({e})"))?;
+
+        // Everything below shares one exit path so the store/message handles
+        // are always released.
+        let result = (|| -> Result<(Option<String>, Option<String>), String> {
+            let mut size = 0u32;
+            CryptMsgGetParam(msg, CMSG_SIGNER_INFO_PARAM, 0, None, &mut size)
+                .map_err(|e| format!("could not size the signer info ({e})"))?;
+            let mut buffer = vec![0u8; size as usize];
+            CryptMsgGetParam(
+                msg,
+                CMSG_SIGNER_INFO_PARAM,
+                0,
+                Some(buffer.as_mut_ptr() as *mut c_void),
+                &mut size,
+            )
+            .map_err(|e| format!("could not read the signer info ({e})"))?;
+
+            let signer = &*(buffer.as_ptr() as *const CMSG_SIGNER_INFO);
+            let mut find = CERT_INFO::default();
+            find.Issuer = signer.Issuer;
+            find.SerialNumber = signer.SerialNumber;
+
+            let cert = CertFindCertificateInStore(
+                store,
+                CERT_QUERY_ENCODING,
+                0,
+                CERT_FIND_SUBJECT_CERT,
+                Some(&find as *const _ as *const c_void),
+                None,
+            );
+            if cert.is_null() {
+                return Err("the signature names a signer that is not in its own \
+                            certificate store"
+                    .to_string());
+            }
+
+            let out = (thumbprint_of(cert), subject_dn_of(cert));
+            let _ = CertFreeCertificateContext(Some(cert));
+            Ok(out)
+        })();
+
+        let _ = CryptMsgClose(Some(msg));
+        let _ = CertCloseStore(store, 0);
+        result
+    }
+}
+
+/// The encoding Authenticode messages and certificates use.
+const CERT_QUERY_ENCODING: windows::Win32::Security::Cryptography::CERT_QUERY_ENCODING_TYPE =
+    windows::Win32::Security::Cryptography::CERT_QUERY_ENCODING_TYPE(
+        X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0,
+    );
+
+/// SHA-1 thumbprint as uppercase hex, matching the form
+/// `EXPECTED_SIGNER_THUMBPRINT` is written in (and what certificate UIs show).
+unsafe fn thumbprint_of(cert: *const CERT_CONTEXT) -> Option<String> {
+    let mut size = 0u32;
+    CertGetCertificateContextProperty(cert, CERT_SHA1_HASH_PROP_ID, None, &mut size).ok()?;
+    let mut hash = vec![0u8; size as usize];
+    CertGetCertificateContextProperty(
+        cert,
+        CERT_SHA1_HASH_PROP_ID,
+        Some(hash.as_mut_ptr() as *mut c_void),
+        &mut size,
+    )
+    .ok()?;
+    Some(hash.iter().map(|b| format!("{b:02X}")).collect())
+}
+
+/// Subject DN, one RDN per line -- the same shape `dn_component` parses.
+unsafe fn subject_dn_of(cert: *const CERT_CONTEXT) -> Option<String> {
+    let subject = &(*(*cert).pCertInfo).Subject;
+    let str_type = CERT_STRING_TYPE(CERT_X500_NAME_STR.0 | CERT_NAME_STR_CRLF_FLAG);
+
+    // Returns the character count *including* the NUL terminator, so the
+    // second call gets a buffer of exactly that size and the result is
+    // trimmed back below.
+    let len = CertNameToStrW(CERT_QUERY_ENCODING, subject, str_type, None);
+    if len <= 1 {
+        return None;
+    }
+    let mut buffer = vec![0u16; len as usize];
+    let written = CertNameToStrW(CERT_QUERY_ENCODING, subject, str_type, Some(&mut buffer));
+    if written == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(
+        &buffer[..written.saturating_sub(1) as usize],
+    ))
 }
 
 pub fn is_trusted_signer(info: &SignatureInfo, expected_thumbprint: &str) -> bool {
@@ -355,25 +509,33 @@ mod tests {
     }
 
     #[test]
-    fn resolves_powershell_by_absolute_path_under_the_system_root() {
-        // The point of the fix: never a bare command name, whose
-        // CreateProcess search order includes deskwarden's own (per-user,
-        // user-writable) install directory.
-        let path = powershell_path();
-        assert!(path.is_absolute(), "{} is not absolute", path.display());
-        assert!(path.ends_with("System32/WindowsPowerShell/v1.0/powershell.exe"));
-        assert!(path.starts_with(
-            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
-        ));
+    fn an_unsigned_file_is_never_reported_as_valid() {
+        // The test binary itself: built locally, so definitionally unsigned.
+        // Whether that surfaces as Err (no signature to read) or Ok(valid:
+        // false) is the OS's business; what must never happen is a `true`.
+        let me = std::env::current_exe().expect("no path for the test binary");
+        if let Ok(info) = verify_authenticode(&me) {
+            assert!(!info.valid, "an unsigned binary was reported as trusted");
+        }
     }
 
     #[test]
-    fn the_resolved_powershell_actually_exists() {
-        // Windows-only crate, so this is a real assertion about the machine
-        // the tests run on rather than an environment assumption: if the
-        // canonical path is ever wrong, signature verification -- and with it
-        // every update -- silently stops working, and this catches it.
-        let path = powershell_path();
-        assert!(path.exists(), "{} does not exist", path.display());
+    fn a_missing_file_is_an_error_not_a_verdict() {
+        let missing = std::env::temp_dir().join("deskwarden-does-not-exist-xyz.exe");
+        assert!(verify_authenticode(&missing).is_err());
+    }
+
+    #[test]
+    fn verification_needs_no_external_process() {
+        // A guard on the reason this module was rewritten: the check used to
+        // shell out to PowerShell's Get-AuthenticodeSignature, which fails
+        // wholesale wherever Microsoft.PowerShell.Security can't autoload.
+        // Nothing here may spawn a process again.
+        let source = include_str!("signature.rs");
+        let body = source.split("mod tests").next().unwrap_or_default();
+        assert!(
+            !body.contains("Command::new"),
+            "signature verification must not depend on an external process"
+        );
     }
 }

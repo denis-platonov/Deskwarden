@@ -708,10 +708,16 @@ fn field_box(ui: &mut Ui, value: &mut String, password: bool, right_pad: f32) ->
     // top instead of vertically centered.
     let font = FontId::new(14.0, FontFamily::Proportional);
     let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
+    // Nudged down by the descent gap: a row box is ascent+descent tall, but
+    // typical field text (no descenders on most characters) fills only the
+    // upper part, so geometric centering of the *box* reads as text sitting
+    // high. Centering on the glyphs instead is what "vertically centered"
+    // actually looks like.
+    let optical_nudge = row_height * 0.09;
     let inner = Rect::from_center_size(
         Pos2::new(
             (outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0,
-            outer.center().y,
+            outer.center().y + optical_nudge,
         ),
         Vec2::new(outer.width() - 10.0 - right_pad, row_height),
     );
