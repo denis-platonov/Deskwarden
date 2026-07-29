@@ -251,6 +251,17 @@ impl ServerChoice {
     }
 }
 
+/// Space the window keeps below the flowing content: the pinned footer row
+/// plus the body's bottom margin.
+pub const FOOTER_RESERVE: f32 = 62.0;
+
+/// Gap between a field's label and the field itself.
+const LABEL_GAP: f32 = 10.0;
+/// Gap between one label+field group and the next (and before the action
+/// button). Deliberately larger than [`LABEL_GAP`] so each label reads as
+/// belonging to the field under it.
+const GROUP_GAP: f32 = 18.0;
+
 /// What the custom titlebar asked for this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeAction {
@@ -446,6 +457,7 @@ pub fn draw_login_window(
     server_host: &str,
     hello: HelloState,
     form: &mut LoginForm,
+    flow_bottom: &mut f32,
 ) -> Option<LoginAction> {
     let mut action = None;
 
@@ -494,17 +506,23 @@ pub fn draw_login_window(
         .inner_margin(Margin::same(16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // 3h's card gap: 12px between the label row, the field, and the
-            // action row.
-            ui.spacing_mut().item_spacing.y = 12.0;
+            // Spacing is explicit per gap, not one uniform value: a label
+            // must sit closer to *its* field (LABEL_GAP) than one field
+            // group does to the next (GROUP_GAP), or the rows read as an
+            // undifferentiated stack.
+            ui.spacing_mut().item_spacing.y = 0.0;
 
             if status == BwStatus::Unauthenticated {
                 if form.server_choice == ServerChoice::SelfHosted {
                     theme::field_label(ui, "Server URL");
+                    ui.add_space(LABEL_GAP);
                     theme::text_field(ui, &mut form.server_url, false);
+                    ui.add_space(GROUP_GAP);
                 }
                 theme::field_label(ui, "Email");
+                ui.add_space(LABEL_GAP);
                 theme::text_field(ui, &mut form.email, false);
+                ui.add_space(GROUP_GAP);
             }
 
             // 3h's label row: field name left, account email right, so the
@@ -517,7 +535,9 @@ pub fn draw_login_window(
                     });
                 }
             });
+            ui.add_space(LABEL_GAP);
             theme::password_field(ui, &mut form.password, &mut form.reveal_password);
+            ui.add_space(GROUP_GAP);
 
             if theme::primary_button(ui, "Continue", Some("↵")).clicked() {
                 action = Some(LoginAction::Submit);
@@ -534,9 +554,14 @@ pub fn draw_login_window(
     // same panel is the opt-in — its toggle arms enrollment, which then
     // happens on the next successful password unlock, so the password
     // being sealed is one that provably works.
-    let show_unlock = hello.available && hello.enrolled && status != BwStatus::Unauthenticated;
-    let show_enroll = hello.available && !hello.enrolled;
-    if show_unlock || show_enroll {
+    // 3h's alternative path: the Hello panel is a *button* — click it (or
+    // Ctrl+H) to unlock with Windows Hello. Before enrollment it is the
+    // same button with a first-use twist: with the master password typed,
+    // clicking unlocks with it AND seals it for Hello, so every later visit
+    // is one click.
+    let needs_setup = !hello.enrolled;
+    let show_panel = hello.available && (needs_setup || status != BwStatus::Unauthenticated);
+    if show_panel {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
             let half = (ui.available_width() - 30.0) / 2.0;
@@ -546,15 +571,26 @@ pub fn draw_login_window(
         });
         ui.add_space(10.0);
 
-        if show_unlock {
-            if hello_panel(ui, HelloPanelMode::Unlock) {
+        let subtitle = if needs_setup {
+            "First use: enter your master password, then click here"
+        } else {
+            "Face, fingerprint, or PIN"
+        };
+        let clicked = hello_panel(ui, subtitle)
+            || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
+        if clicked {
+            if !needs_setup {
                 action = Some(LoginAction::HelloUnlock);
+            } else if form.password.is_empty() {
+                form.error = Some(
+                    "Type your master password first — Windows Hello is set up right \
+                     after it unlocks the vault."
+                        .to_string(),
+                );
+            } else {
+                form.enable_hello = true;
+                action = Some(LoginAction::Submit);
             }
-            if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)) {
-                action = Some(LoginAction::HelloUnlock);
-            }
-        } else if hello_panel(ui, HelloPanelMode::Enroll(form.enable_hello)) {
-            form.enable_hello = !form.enable_hello;
         }
     }
 
@@ -563,6 +599,12 @@ pub fn draw_login_window(
     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
     }
+
+    // Where the flowing content ends, in window coordinates. The caller
+    // resizes the window from this: the content stack varies per state
+    // (self-hosted URL field, Hello panel, wrapped error text), and a fixed
+    // height either wastes space or overflows.
+    *flow_bottom = ui.next_widget_position().y;
 
     // Footer pinned to the window bottom (3h): account action left; on the
     // right, the server — a live dropdown while signing in (the native
@@ -627,20 +669,10 @@ fn hairline_segment(ui: &mut egui::Ui, width: f32) {
         .rect_filled(rect, CornerRadius::ZERO, theme::HAIRLINE);
 }
 
-/// Which job the Hello panel is doing this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HelloPanelMode {
-    /// Quick unlock is enrolled: clicking runs it (trailing CTRL+H chip).
-    Unlock,
-    /// Not enrolled yet: the panel is the opt-in, with the design's toggle
-    /// pill showing the armed state; clicking flips it.
-    Enroll(bool),
-}
-
-/// The 3h Windows Hello panel: blue-washed row with a padlock tile, "Use
-/// Windows Hello", and a trailing affordance per `mode`. Returns true when
-/// clicked.
-fn hello_panel(ui: &mut egui::Ui, mode: HelloPanelMode) -> bool {
+/// The 3h Windows Hello panel: a blue-washed button row with a padlock
+/// tile, "Use Windows Hello", the given subtitle, and the CTRL+H chip.
+/// Returns true when clicked.
+fn hello_panel(ui: &mut egui::Ui, subtitle: &str) -> bool {
     let panel = egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(Stroke::new(1.0, theme::FOCUS_RING))
@@ -663,35 +695,24 @@ fn hello_panel(ui: &mut egui::Ui, mode: HelloPanelMode) -> bool {
                 paint_padlock(ui.painter(), tile.shrink(7.5), theme::BLUE);
 
                 ui.add_space(3.0);
-                let subtitle = match mode {
-                    HelloPanelMode::Unlock => "Face, fingerprint, or PIN",
-                    HelloPanelMode::Enroll(true) => "Will be set up after you continue",
-                    HelloPanelMode::Enroll(false) => "Skip the master password next time",
-                };
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
                     ui.label(theme::semibold("Use Windows Hello", 13.0).color(theme::BLUE_DEEP));
                     ui.label(RichText::new(subtitle).size(11.0).color(theme::TEXT_MUTED));
                 });
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| match mode {
-                        HelloPanelMode::Unlock => {
-                            let chip = RichText::new("CTRL+H")
-                                .size(10.0)
-                                .family(egui::FontFamily::Monospace)
-                                .color(theme::BLUE);
-                            egui::Frame::new()
-                                .fill(theme::CARD)
-                                .corner_radius(CornerRadius::same(5))
-                                .inner_margin(Margin::symmetric(7, 3))
-                                .show(ui, |ui| {
-                                    ui.label(chip);
-                                });
-                        }
-                        HelloPanelMode::Enroll(armed) => theme::toggle_pill(ui, armed),
-                    },
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let chip = RichText::new("CTRL+H")
+                        .size(10.0)
+                        .family(egui::FontFamily::Monospace)
+                        .color(theme::BLUE);
+                    egui::Frame::new()
+                        .fill(theme::CARD)
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(Margin::symmetric(7, 3))
+                        .show(ui, |ui| {
+                            ui.label(chip);
+                        });
+                });
             });
         });
     panel
@@ -755,11 +776,14 @@ pub fn run_login_flow() -> String {
     // changes only through the actions handled below.
     let mut hello_state = hello::state();
 
+    // Remeasured every frame and applied when it changes: the content
+    // stack differs per state (self-hosted URL field, Hello panel, wrapped
+    // error text), so any fixed height either clips or leaves a gap.
+    let mut window_height = 0.0f32;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            // 28 taller than the 3h mock: the sign-in state stacks an email
-            // field and the Hello opt-in panel that the unlock mock doesn't
-            // have, and the footer must never overlap them.
+            // Starting size only; grown/shrunk to fit below.
             .with_inner_size([470.0, 588.0])
             // The design's window is a fixed composition; there is nothing
             // in it that grows, so resizing only breaks the layout.
@@ -810,6 +834,7 @@ pub fn run_login_flow() -> String {
             })
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                let mut flow_bottom = 0.0f32;
                 let action = draw_login_window(
                     ui,
                     status,
@@ -817,7 +842,20 @@ pub fn run_login_flow() -> String {
                     &host,
                     hello_state,
                     &mut form,
+                    &mut flow_bottom,
                 );
+
+                // Content height + the footer row and the bottom margin the
+                // footer is pinned above. Rounded up to whole pixels so a
+                // sub-pixel wobble can't ping-pong the window size.
+                let wanted = (flow_bottom + FOOTER_RESERVE).ceil();
+                if (wanted - window_height).abs() > 0.5 {
+                    window_height = wanted;
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                            470.0, wanted,
+                        )));
+                }
 
                 let mut done = false;
 

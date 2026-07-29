@@ -703,16 +703,24 @@ fn field_box(ui: &mut Ui, value: &mut String, password: bool, right_pad: f32) ->
         Vec2::new(ui.available_width(), FIELD_HEIGHT),
         Sense::hover(),
     );
-    let inner = Rect::from_min_max(
-        Pos2::new(outer.min.x + 10.0, outer.min.y),
-        Pos2::new(outer.max.x - right_pad, outer.max.y),
+    // The TextEdit gets a rect of exactly its row height, centered in the
+    // box: handing it the full box height leaves its text sitting at the
+    // top instead of vertically centered.
+    let font = FontId::new(14.0, FontFamily::Proportional);
+    let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
+    let inner = Rect::from_center_size(
+        Pos2::new(
+            (outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0,
+            outer.center().y,
+        ),
+        Vec2::new(outer.width() - 10.0 - right_pad, row_height),
     );
     let response = ui.put(
         inner,
         egui::TextEdit::singleline(value)
             .password(password)
             .frame(egui::Frame::new())
-            .font(FontId::new(14.0, FontFamily::Proportional))
+            .font(font)
             .margin(Margin::ZERO)
             .desired_width(inner.width()),
     );

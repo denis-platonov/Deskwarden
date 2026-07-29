@@ -76,6 +76,7 @@ fn main() -> eframe::Result {
                 form: LoginForm::default(),
                 screenshot_path: screenshot.then(|| PathBuf::from(png_name)),
                 frames: 0,
+                window_height: 0.0,
                 styled: false,
             }))
         }),
@@ -93,6 +94,8 @@ struct Preview {
     /// `Some` in --screenshot mode: where the PNG goes.
     screenshot_path: Option<PathBuf>,
     frames: u32,
+    /// Last applied window height, for the size-to-content logic.
+    window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
     /// frame, not in the creation context, for the same reason as the real
     /// windows (see login_ui): eframe re-applies its own style after
@@ -140,6 +143,10 @@ impl eframe::App for Preview {
                     // render); actions are ignored -- a preview must never
                     // spawn `bw` or pop Hello.
                     let (status, email, hello) = if self.signin {
+                        // Self-hosted: the tallest state (URL field + email
+                        // + password + Hello panel), which is what overflowed
+                        // a fixed-height window.
+                        self.form.server_choice = login_ui::ServerChoice::SelfHosted;
                         (
                             BwStatus::Unauthenticated,
                             None,
@@ -158,6 +165,7 @@ impl eframe::App for Preview {
                             },
                         )
                     };
+                    let mut flow_bottom = 0.0;
                     let _ = login_ui::draw_login_window(
                         ui,
                         status,
@@ -165,7 +173,18 @@ impl eframe::App for Preview {
                         "vault.ledgerline.eu",
                         hello,
                         &mut self.form,
+                        &mut flow_bottom,
                     );
+                    // Size to content, exactly as run_login_flow does, so
+                    // the screenshot shows the window the app would show.
+                    let wanted = (flow_bottom + login_ui::FOOTER_RESERVE).ceil();
+                    if (wanted - self.window_height).abs() > 0.5 {
+                        self.window_height = wanted;
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                                470.0, wanted,
+                            )));
+                    }
                 });
         } else {
             egui::CentralPanel::default()
