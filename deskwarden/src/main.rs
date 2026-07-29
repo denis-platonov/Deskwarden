@@ -12,10 +12,12 @@ use deskwarden::bw_serve::{
 use deskwarden::dispatch;
 use deskwarden::injector::{Injector, RealSendInput, RealUiAutomation};
 use deskwarden::match_engine::MatchEngine;
+use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::{
     hotkey, job_object, logging, login_ui, picker_ui, session_store, tray, window_watch,
 };
+use semver::Version;
 use std::process::Child;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -25,6 +27,27 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 /// matches added via the picker (or synced from another device) take effect
 /// without restarting the app.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often to poll GitHub for a newer release. Checked on startup and then
+/// on this cadence from the main loop, same pattern as `REFRESH_INTERVAL`.
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Real GitHub REST API base, passed to `updater::check_for_update`. Not
+/// `github.com` itself -- that's the web UI host; `api.github.com` is the
+/// API host the releases endpoint actually lives on.
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Authenticode thumbprint an update's signature must match before it's
+/// trusted and applied.
+///
+/// TODO: set once SignPath cert is issued (Task 5's manual prerequisite).
+/// The real certificate deskwarden's release builds will be signed with does
+/// not exist yet at this point in the project, so there is no genuine value
+/// to put here. This placeholder is intentionally not a plausible-looking
+/// thumbprint: it can never match a real signature, so `is_trusted_signer`
+/// (and therefore `download_and_verify`) fails closed -- refusing every
+/// update -- until this constant is replaced with the real one.
+const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
 
 fn main() {
     let config_dir = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
@@ -159,6 +182,18 @@ fn main() {
     let fill_hotkey = hotkey::register_fill_hotkey();
     let tray = tray::build_tray();
 
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION is not valid semver");
+
+    // Checked here (startup) and then periodically from the main loop below,
+    // same "check on startup, then every N" shape as the match engine's
+    // initial build above plus its `REFRESH_INTERVAL` refresh.
+    let mut available_update: Option<ReleaseInfo> = check_for_update_logged(&current_version);
+    if let Some(release) = &available_update {
+        tray::set_update_available(&tray, &release.version);
+    }
+    let mut last_update_check = Instant::now();
+
     let (tx, rx) = mpsc::channel::<window_watch::ForegroundEvent>();
     std::thread::spawn(move || {
         if let Err(e) = window_watch::watch_foreground_windows(move |event| {
@@ -254,6 +289,43 @@ fn main() {
                 // returns to is treated as a fresh switch rather than being
                 // suppressed as a repeat.
                 last_dispatched_hwnd = None;
+            }
+
+            if event.id == tray.update_id {
+                // The item is disabled (and so shouldn't be clickable) until
+                // `available_update` is `Some`, but the check is repeated
+                // here defensively rather than trusting tray-icon's disabled
+                // state to suppress the click event.
+                if let Some(release) = &available_update {
+                    log::info!(
+                        "update requested from tray; downloading v{}",
+                        release.version
+                    );
+                    match updater::download_and_verify(
+                        release,
+                        EXPECTED_SIGNER_THUMBPRINT,
+                        &config_dir,
+                    ) {
+                        Ok(installer_path) => match updater::apply_update(&installer_path) {
+                            Ok(()) => {
+                                // Same shutdown path as the Quit handler
+                                // above: kill `bw serve` explicitly before
+                                // exiting so the installer (which will
+                                // replace/relaunch this binary) doesn't leave
+                                // an orphaned backend serving the unlocked
+                                // vault behind.
+                                log::info!(
+                                    "installer launched for v{}; shutting down for update",
+                                    release.version
+                                );
+                                bw_serve::stop_bw_serve(&mut bw_serve_child);
+                                std::process::exit(0);
+                            }
+                            Err(e) => log::error!("failed to launch update installer: {e}"),
+                        },
+                        Err(e) => log::error!("update download/verification failed: {e}"),
+                    }
+                }
             }
         }
 
@@ -386,6 +458,14 @@ fn main() {
             last_refresh = Instant::now();
         }
 
+        if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
+            if let Some(release) = check_for_update_logged(&current_version) {
+                tray::set_update_available(&tray, &release.version);
+                available_update = Some(release);
+            }
+            last_update_check = Instant::now();
+        }
+
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
             process_foreground_event(
                 &event,
@@ -452,6 +532,31 @@ fn process_foreground_event(
         if let Some(armed) = handle_match(vault, injector, item_id, m, event.hwnd, &event.exe_name)
         {
             *pending_hotkey_fill = Some(armed);
+        }
+    }
+}
+
+/// Calls `updater::check_for_update` against the real GitHub API and logs the
+/// outcome. Network failures, a malformed release, and "no update" are all
+/// deliberately non-fatal here -- this runs on a background timer, so the
+/// worst case is that a check is skipped until the next cycle, not that the
+/// app goes down over a transient GitHub API problem.
+fn check_for_update_logged(current_version: &Version) -> Option<ReleaseInfo> {
+    match updater::check_for_update(GITHUB_API_BASE, current_version) {
+        Ok(Some(release)) => {
+            log::info!(
+                "update available: v{} (current: v{current_version})",
+                release.version
+            );
+            Some(release)
+        }
+        Ok(None) => {
+            log::debug!("no update available (current: v{current_version})");
+            None
+        }
+        Err(e) => {
+            log::warn!("update check failed: {e}");
+            None
         }
     }
 }
