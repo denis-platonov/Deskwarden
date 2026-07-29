@@ -1,5 +1,5 @@
 use crate::theme;
-use eframe::egui::{self, Margin, RichText, Rounding, Sense, Stroke, Vec2};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -84,7 +84,8 @@ impl eframe::App for OverlayApp {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
         let mut done = false;
 
         // The overlay is keyboard-first (design 2a's footer: "↵ Fill · Esc
@@ -97,23 +98,19 @@ impl eframe::App for OverlayApp {
             done = true;
         }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none())
-            .show(ctx, |ui| {
-                match draw_overlay_card(
-                    ui,
-                    &self.app_name,
-                    &self.item_name,
-                    self.username.as_deref(),
-                ) {
-                    OverlayAction::Fill => {
-                        *self.fill_clicked.borrow_mut() = true;
-                        done = true;
-                    }
-                    OverlayAction::Dismiss => done = true,
-                    OverlayAction::None => {}
-                }
-            });
+        match draw_overlay_card(
+            ui,
+            &self.app_name,
+            &self.item_name,
+            self.username.as_deref(),
+        ) {
+            OverlayAction::Fill => {
+                *self.fill_clicked.borrow_mut() = true;
+                done = true;
+            }
+            OverlayAction::Dismiss => done = true,
+            OverlayAction::None => {}
+        }
 
         if done {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -147,21 +144,21 @@ pub fn draw_overlay_card(
 ) -> OverlayAction {
     let mut action = OverlayAction::None;
 
-    let card = egui::Frame::none()
+    let card = egui::Frame::new()
         .fill(theme::CARD)
-        .rounding(Rounding::same(10.0))
+        .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
         .shadow(egui::epaint::Shadow {
-            offset: Vec2::new(0.0, 6.0),
-            blur: 18.0,
-            spread: 0.0,
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
             color: egui::Color32::from_black_alpha(36),
         })
         .outer_margin(Margin {
-            left: 4.0,
-            right: 12.0,
-            top: 2.0,
-            bottom: 20.0,
+            left: 4,
+            right: 12,
+            top: 2,
+            bottom: 20,
         });
 
     card.show(ui, |ui| {
@@ -175,8 +172,8 @@ pub fn draw_overlay_card(
         // foregrounded, which is exactly the situation Windows' foreground
         // lock refuses keyboard focus for, so Esc is not guaranteed to reach
         // us at all.
-        egui::Frame::none()
-            .inner_margin(Margin::symmetric(12.0, 9.0))
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(12, 9))
             .show(ui, |ui| {
                 if theme::card_header_with_close(ui, "1 match") {
                     action = OverlayAction::Dismiss;
@@ -185,8 +182,8 @@ pub fn draw_overlay_card(
         theme::hairline(ui);
 
         // The matched credential row, selected treatment.
-        egui::Frame::none()
-            .inner_margin(Margin::same(6.0))
+        egui::Frame::new()
+            .inner_margin(Margin::same(6))
             .show(ui, |ui| {
                 let (primary, secondary) = row_text(app_name, item_name, username);
                 if credential_row(ui, &primary, &secondary) {
@@ -196,14 +193,14 @@ pub fn draw_overlay_card(
 
         // Footer: keyboard hints on the tinted strip.
         theme::hairline(ui);
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(theme::CARD_TINT)
-            .rounding(Rounding {
-                sw: 9.0,
-                se: 9.0,
-                ..Rounding::ZERO
+            .corner_radius(CornerRadius {
+                sw: 9,
+                se: 9,
+                ..CornerRadius::ZERO
             })
-            .inner_margin(Margin::symmetric(12.0, 8.0))
+            .inner_margin(Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 theme::footer_hints(ui, &[("Enter", "Fill"), ("Esc", "Dismiss")]);
@@ -227,10 +224,10 @@ fn row_text(app_name: &str, item_name: &str, username: Option<&str>) -> (String,
 /// The selected credential row (blue wash, avatar, Enter chip). Returns true
 /// when clicked.
 fn credential_row(ui: &mut egui::Ui, primary: &str, secondary: &str) -> bool {
-    let row = egui::Frame::none()
+    let row = egui::Frame::new()
         .fill(theme::BLUE_WASH)
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(10.0, 9.0))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 9))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {

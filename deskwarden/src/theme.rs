@@ -9,10 +9,10 @@
 //! this file.
 
 use eframe::egui::{
-    self, Color32, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Rounding, Sense,
-    Stroke, TextStyle, Ui, Vec2,
+    self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Sense,
+    Stroke, StrokeKind, TextStyle, Ui, Vec2,
 };
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Palette (design 3g: one blue hue in four values, warm greys for everything
@@ -88,15 +88,21 @@ fn font_definitions() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "Archivo-Regular".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Archivo-Regular.ttf")),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Archivo-Regular.ttf"
+        ))),
     );
     fonts.font_data.insert(
         SEMIBOLD.to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Archivo-SemiBold.ttf")),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Archivo-SemiBold.ttf"
+        ))),
     );
     fonts.font_data.insert(
         BOLD.to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/fonts/Archivo-Bold.ttf")),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Archivo-Bold.ttf"
+        ))),
     );
 
     let default_stack = fonts
@@ -138,7 +144,7 @@ pub fn bold(text: impl Into<String>, size: f32) -> RichText {
 pub fn apply(ctx: &egui::Context) {
     ctx.set_fonts(font_definitions());
 
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.style_of(egui::Theme::Light)).clone();
 
     // All sizes are whole pixels on purpose: fractional font sizes land
     // glyphs on subpixel boundaries, and egui's greyscale AA renders those
@@ -185,22 +191,23 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = CARD;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_STRONG);
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, INK);
-    v.widgets.inactive.rounding = Rounding::same(7.0);
+    v.widgets.inactive.corner_radius = CornerRadius::same(7);
     v.widgets.hovered.bg_fill = CARD_TINT;
     v.widgets.hovered.weak_bg_fill = CARD_TINT;
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, BLUE_EDGE);
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, INK);
-    v.widgets.hovered.rounding = Rounding::same(7.0);
+    v.widgets.hovered.corner_radius = CornerRadius::same(7);
     v.widgets.active.bg_fill = BLUE_WASH;
     v.widgets.active.weak_bg_fill = BLUE_WASH;
     v.widgets.active.bg_stroke = Stroke::new(1.0, BLUE);
     v.widgets.active.fg_stroke = Stroke::new(1.0, BLUE_DEEP);
-    v.widgets.active.rounding = Rounding::same(7.0);
+    v.widgets.active.corner_radius = CornerRadius::same(7);
     v.widgets.open.weak_bg_fill = BLUE_WASH;
     v.widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
 
     style.visuals = v;
-    ctx.set_style(style);
+    ctx.set_theme(egui::Theme::Light);
+    ctx.set_style_of(egui::Theme::Light, style);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,10 +450,10 @@ pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
     } else {
         (CANVAS, HAIRLINE, TEXT_MUTED)
     };
-    let rounding = Rounding::same(size * 0.25);
+    let rounding = CornerRadius::same((size * 0.25) as u8);
     ui.painter().rect_filled(rect, rounding, bg);
     ui.painter()
-        .rect_stroke(rect, rounding, Stroke::new(1.0, border));
+        .rect_stroke(rect, rounding, Stroke::new(1.0, border), StrokeKind::Middle);
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
@@ -471,7 +478,7 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
     );
     let padding = Vec2::new(6.0, 3.0);
     let (rect, _) = ui.allocate_exact_size(galley.size() + padding * 2.0, Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::same(4.0), bg);
+    ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
     ui.painter().galley(rect.min + padding, galley, fg);
 }
 
@@ -493,7 +500,7 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
         egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
             .fill(BLUE)
             .stroke(Stroke::NONE)
-            .rounding(Rounding::same(7.0))
+            .corner_radius(CornerRadius::same(7))
             // The design's action buttons are 32px tall (3h Continue, 2b/3f
             // toolbar); text + padding alone comes up short.
             .min_size(Vec2::new(0.0, 32.0)),
@@ -529,7 +536,7 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
         egui::Button::new(semibold(label, 13.0).color(INK))
             .fill(CARD)
             .stroke(Stroke::new(1.0, BORDER_STRONG))
-            .rounding(Rounding::same(7.0))
+            .corner_radius(CornerRadius::same(7))
             .min_size(Vec2::new(0.0, 32.0)),
     )
 }
@@ -619,25 +626,35 @@ pub fn field_label(ui: &mut Ui, text: &str) {
 /// egui's default widget styling gives a focused field a plain border color
 /// change, not this soft ring, so it's painted explicitly here.
 pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
-    // The field's box is painted here, not by egui: `.frame(false)` plus a
+    // The field's box is painted here, not by egui: `.frame(egui::Frame::new())` plus a
     // placeholder shape filled in after layout. Painting the design's box
     // *around* egui's own frame would double the border; letting egui draw it
     // misses the focus halo and sizes the box to the text rather than the
     // design's 38px field.
     let bg = ui.painter().add(egui::Shape::Noop);
+    let margin = Margin::symmetric(10, 11);
     let response = ui.add(
         egui::TextEdit::singleline(value)
             .password(password)
-            .frame(false)
-            .desired_width(f32::INFINITY)
+            .frame(egui::Frame::new())
+            // `desired_width` is the *text* width; the margin sits outside
+            // it, so f32::INFINITY here would push the box past the parent
+            // by exactly the margin.
+            .desired_width(field_text_width(ui, margin))
             // 14px text + 11px vertical margins ≈ the design's 38px field
             // height: a TextEdit is sized by its font's row height, so the
             // height has to be expressed this way rather than set directly.
             .font(FontId::new(14.0, FontFamily::Proportional))
-            .margin(Margin::symmetric(10.0, 11.0)),
+            .margin(margin),
     );
-    paint_field_box(ui, &response, bg, Margin::symmetric(10.0, 11.0));
+    paint_field_box(ui, &response, bg, margin);
     response
+}
+
+/// The text width that makes a field's *box* (text + margin) exactly fill
+/// the available width.
+fn field_text_width(ui: &Ui, margin: Margin) -> f32 {
+    (ui.available_width() - (margin.left + margin.right) as f32).max(40.0)
 }
 
 /// Fills the placeholder `bg` shape with the field's box, and adds the focus
@@ -657,24 +674,28 @@ fn paint_field_box(
     margin: Margin,
 ) -> Rect {
     let rect = Rect::from_min_max(
-        response.rect.min - Vec2::new(margin.left, margin.top),
-        response.rect.max + Vec2::new(margin.right, margin.bottom),
+        response.rect.min - Vec2::new(margin.left as f32, margin.top as f32),
+        response.rect.max + Vec2::new(margin.right as f32, margin.bottom as f32),
     );
-    let rounding = Rounding::same(8.0);
+    let rounding = CornerRadius::same(8);
     let border = if response.has_focus() {
         // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
         // flush against the 1px border's outer edge, like the mock's
         // box-shadow -- expand(3.0) would leave a visible white ring between
         // border and halo.
-        ui.painter()
-            .rect_stroke(rect.expand(2.0), rounding, Stroke::new(3.0, FOCUS_RING));
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            rounding,
+            Stroke::new(3.0, FOCUS_RING),
+            StrokeKind::Middle,
+        );
         Stroke::new(1.0, BLUE)
     } else {
         Stroke::new(1.0, BORDER_STRONG)
     };
     ui.painter().set(
         bg,
-        egui::epaint::RectShape::new(rect, rounding, CARD, border),
+        egui::epaint::RectShape::new(rect, rounding, CARD, border, StrokeKind::Middle),
     );
     rect
 }
@@ -685,33 +706,24 @@ fn paint_field_box(
 pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
     // Same painted-box approach as `text_field` (see there for why).
     let bg = ui.painter().add(egui::Shape::Noop);
+    // The extra right margin keeps typed text from running under the
+    // toggle, which is painted inside the field's right edge below.
+    let margin = Margin {
+        left: 10,
+        right: 52,
+        top: 11,
+        bottom: 11,
+    };
     let response = ui.add(
         egui::TextEdit::singleline(value)
             .password(!*revealed)
-            .frame(false)
-            .desired_width(f32::INFINITY)
-            // Same 38px-field metrics as `text_field`; the extra right
-            // margin keeps typed text from running under the toggle, which
-            // is painted inside the field's right edge below.
+            .frame(egui::Frame::new())
+            .desired_width(field_text_width(ui, margin))
+            // Same 38px-field metrics as `text_field`.
             .font(FontId::new(14.0, FontFamily::Proportional))
-            .margin(Margin {
-                left: 10.0,
-                right: 52.0,
-                top: 11.0,
-                bottom: 11.0,
-            }),
+            .margin(margin),
     );
-    let box_rect = paint_field_box(
-        ui,
-        &response,
-        bg,
-        Margin {
-            left: 10.0,
-            right: 52.0,
-            top: 11.0,
-            bottom: 11.0,
-        },
-    );
+    let box_rect = paint_field_box(ui, &response, bg, margin);
 
     // 3h's in-field reveal: a click-sensing label, not a Button, so no
     // padding or fill fights the field it sits inside.
@@ -735,7 +747,7 @@ pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> R
 /// default separator is darker than the design's).
 pub fn hairline(ui: &mut Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, Rounding::ZERO, HAIRLINE);
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, HAIRLINE);
 }
 
 #[cfg(test)]

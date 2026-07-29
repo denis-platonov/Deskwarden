@@ -23,6 +23,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Com",
     "Win32_System_JobObjects",
     "Win32_Security",
+    # Rounded corners + shadow for the frameless login window's custom
+    # titlebar (login_ui::round_window_corners).
+    "Win32_Graphics_Dwm",
     # WinRT namespaces for Windows Hello quick unlock (src/hello.rs):
     # KeyCredentialManager lives in Security.Credentials; its buffers come
     # from Security.Cryptography (CryptographicBuffer) + Storage.Streams.
@@ -36,7 +39,15 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 directories = "5"
 tray-icon = "0.19"
-eframe = "0.29"
+# 0.31+ is where egui's text rendering got visibly sharper (better gamma
+# handling / AlphaFromCoverage); the design comparison was done against 0.35.
+# default-features off to keep the glow renderer 0.29 used: the default wgpu
+# renderer's DX12 backend pins a newer `windows` crate than this app does,
+# and the two cannot coexist in one build.
+eframe = { version = "0.35", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
 global-hotkey = "0.6"
 log = "0.4"
 env_logger = "0.11"

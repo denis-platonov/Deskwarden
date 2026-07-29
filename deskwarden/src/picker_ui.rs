@@ -2,7 +2,7 @@ use crate::app_match::{AppMatch, TriggerMode};
 use crate::process_list::{list_processes, ProcessInfo};
 use crate::theme;
 use crate::vault_bridge::{VaultBridge, VaultItem};
-use eframe::egui::{self, Margin, RichText, Rounding, Sense, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -21,14 +21,14 @@ pub fn item_matches_filter(item: &VaultItem, filter: &str) -> bool {
 /// A design-2a list row: initials avatar, primary line, muted secondary
 /// line, blue-washed when selected. Returns true when clicked.
 fn list_row(ui: &mut egui::Ui, primary: &str, secondary: &str, selected: bool) -> bool {
-    let frame = egui::Frame::none()
+    let frame = egui::Frame::new()
         .fill(if selected {
             theme::BLUE_WASH
         } else {
             theme::CARD
         })
-        .rounding(Rounding::same(8.0))
-        .inner_margin(Margin::symmetric(10.0, 8.0))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -59,21 +59,25 @@ fn title_block(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 
 /// A full-width search field with the design's placeholder treatment.
 fn search_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
+    // Text width, not box width: the margin sits outside `desired_width`,
+    // so f32::INFINITY would overflow the parent by the margin (see
+    // theme::text_field).
+    let width = (ui.available_width() - 20.0).max(40.0);
     ui.add(
         egui::TextEdit::singleline(filter)
             .hint_text(RichText::new(hint).color(theme::TEXT_GHOST))
-            .desired_width(f32::INFINITY)
-            .margin(Margin::symmetric(10.0, 8.0)),
+            .desired_width(width)
+            .margin(Margin::symmetric(10, 8)),
     );
 }
 
 /// The white, hairline-bordered card that scrollable lists live in.
 fn list_card(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(theme::CARD)
-        .rounding(Rounding::same(10.0))
+        .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, theme::BORDER))
-        .inner_margin(Margin::same(6.0))
+        .inner_margin(Margin::same(6))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical()
@@ -129,26 +133,26 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("Choose a vault item", options, move |ctx, _frame| {
+    let _ = eframe::run_ui_native("Choose a vault item", options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
-            theme::apply(ctx);
+            theme::apply(ui.ctx());
             styled = true;
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
             return;
         }
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(20.0, 18.0)),
+                    .inner_margin(Margin::symmetric(20, 18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let mut done = false;
 
                 theme::card_header(ui, "Add app");
@@ -195,7 +199,7 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
                 });
 
                 if done {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
     });
@@ -244,7 +248,7 @@ fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
             } else {
                 Stroke::new(1.0, theme::BORDER_STRONG)
             })
-            .rounding(Rounding::same(7.0));
+            .corner_radius(CornerRadius::same(7));
             if ui.add(button).clicked() {
                 *trigger = *mode;
             }
@@ -293,26 +297,26 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("Add app to Deskwarden", options, move |ctx, _frame| {
+    let _ = eframe::run_ui_native("Add app to Deskwarden", options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
-            theme::apply(ctx);
+            theme::apply(ui.ctx());
             styled = true;
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
             return;
         }
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(theme::CANVAS)
-                    .inner_margin(Margin::symmetric(20.0, 18.0)),
+                    .inner_margin(Margin::symmetric(20, 18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let mut done = false;
 
                 theme::card_header(ui, "Add app");
@@ -370,7 +374,7 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
                 });
 
                 if done {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
     });

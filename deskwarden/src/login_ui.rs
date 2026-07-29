@@ -1,7 +1,7 @@
 use crate::bw_path::bw_command;
 use crate::hello::{self, HelloState};
 use crate::theme;
-use eframe::egui::{self, Margin, RichText, Rounding, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
 use std::rc::Rc;
 use zeroize::Zeroize;
@@ -251,6 +251,156 @@ impl ServerChoice {
     }
 }
 
+/// What the custom titlebar asked for this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChromeAction {
+    None,
+    Minimize,
+    Close,
+}
+
+/// Draws 3h's window chrome — the design's titlebar is a custom white bar
+/// (15×17 mark, 12px title, ghost window controls), which the native
+/// Windows frame cannot be themed into, so the window runs frameless and
+/// this paints the chrome: full-window background, a 40px draggable
+/// titlebar, a hairline under it, and — ▢ ✕ controls (▢ inert: the window
+/// is fixed-size). Reserves the titlebar's space in `ui`'s layout; window
+/// rounding comes from DWM (see [`round_window_corners`]).
+pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
+    let mut action = ChromeAction::None;
+    let full = ui.max_rect();
+    let bar = egui::Rect::from_min_max(full.min, egui::Pos2::new(full.max.x, full.min.y + 40.0));
+
+    // Backgrounds first: window body, titlebar, hairline.
+    ui.painter()
+        .rect_filled(full, CornerRadius::ZERO, theme::WINDOW_BG);
+    ui.painter()
+        .rect_filled(bar, CornerRadius::ZERO, theme::CARD);
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(egui::Pos2::new(bar.min.x, bar.max.y - 1.0), bar.max),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+    ui.painter().rect_stroke(
+        full,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    // Left: the mark and the title (3h: 15×17 mark, 12px 600 title).
+    let mark_rect = egui::Rect::from_min_size(
+        egui::Pos2::new(bar.min.x + 14.0, bar.center().y - 8.5),
+        egui::Vec2::new(15.0, 17.0),
+    );
+    theme::paint_mark(ui.painter(), mark_rect);
+    ui.painter().text(
+        egui::Pos2::new(mark_rect.right() + 10.0, bar.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::TEXT_SECONDARY,
+    );
+
+    // Right: the three 40px control zones. Glyphs are drawn, not typed, so
+    // they can't fall through to a fallback font's rendition.
+    let control = |i: usize| {
+        egui::Rect::from_min_max(
+            egui::Pos2::new(bar.max.x - 40.0 * (i + 1) as f32, bar.min.y + 1.0),
+            egui::Pos2::new(bar.max.x - 40.0 * i as f32, bar.max.y - 1.0),
+        )
+    };
+    let glyph_stroke = Stroke::new(1.2, theme::TEXT_FAINT);
+
+    // Close (✕).
+    let close_rect = control(0);
+    let close = ui.interact(close_rect, ui.id().with("chrome-close"), Sense::click());
+    if close.hovered() {
+        ui.painter()
+            .rect_filled(close_rect, CornerRadius::ZERO, theme::CANVAS);
+    }
+    let c = close_rect.center();
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.5, -4.5), c + egui::vec2(4.5, 4.5)],
+        glyph_stroke,
+    );
+    ui.painter().line_segment(
+        [c + egui::vec2(-4.5, 4.5), c + egui::vec2(4.5, -4.5)],
+        glyph_stroke,
+    );
+    if close.clicked() {
+        action = ChromeAction::Close;
+    }
+
+    // Maximize (▢) — drawn but inert: the window is fixed-size, so the
+    // affordance is shown ghosted with no hover or click.
+    let max_rect = control(1);
+    ui.painter().rect_stroke(
+        egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
+        CornerRadius::ZERO,
+        Stroke::new(1.2, theme::TEXT_GHOST),
+        egui::StrokeKind::Middle,
+    );
+
+    // Minimize (—).
+    let min_rect = control(2);
+    let minimize = ui.interact(min_rect, ui.id().with("chrome-min"), Sense::click());
+    if minimize.hovered() {
+        ui.painter()
+            .rect_filled(min_rect, CornerRadius::ZERO, theme::CANVAS);
+    }
+    let m = min_rect.center();
+    ui.painter().line_segment(
+        [m + egui::vec2(-4.5, 0.0), m + egui::vec2(4.5, 0.0)],
+        glyph_stroke,
+    );
+    if minimize.clicked() {
+        action = ChromeAction::Minimize;
+    }
+
+    // Everything left of the controls drags the window.
+    let drag_zone =
+        egui::Rect::from_min_max(bar.min, egui::Pos2::new(bar.max.x - 120.0, bar.max.y));
+    let drag = ui.interact(
+        drag_zone,
+        ui.id().with("chrome-drag"),
+        Sense::click_and_drag(),
+    );
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    ui.advance_cursor_after_rect(bar);
+    action
+}
+
+/// Asks DWM to round this window's corners (and give it the standard
+/// drop-shadow) even though it is frameless. Windows 11 only; on Windows 10
+/// the call fails harmlessly and the window stays square. Resolved by title
+/// because eframe never exposes the HWND.
+pub fn round_window_corners(window_title: &str) {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    unsafe {
+        let hwnd: HWND = match FindWindowW(None, &HSTRING::from(window_title)) {
+            Ok(hwnd) if !hwnd.is_invalid() => hwnd,
+            _ => return,
+        };
+        let preference = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&preference) as u32,
+        );
+    }
+}
+
 /// The login window's form state, owned by the caller across frames.
 #[derive(Default)]
 pub struct LoginForm {
@@ -330,11 +480,11 @@ pub fn draw_login_window(
 
     ui.add_space(14.0);
 
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(theme::CARD)
-        .rounding(Rounding::same(10.0))
+        .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, theme::HAIRLINE))
-        .inner_margin(Margin::same(16.0))
+        .inner_margin(Margin::same(16))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             // 3h's card gap: 12px between the label row, the field, and the
@@ -470,17 +620,17 @@ fn hairline_segment(ui: &mut egui::Ui, width: f32) {
     let (rect, _) =
         ui.allocate_exact_size(egui::Vec2::new(width.max(0.0), 1.0), egui::Sense::hover());
     ui.painter()
-        .rect_filled(rect, Rounding::ZERO, theme::HAIRLINE);
+        .rect_filled(rect, CornerRadius::ZERO, theme::HAIRLINE);
 }
 
 /// The 3h Windows Hello panel: blue-washed row with a padlock tile, "Use
 /// Windows Hello", and the CTRL+H chip. Returns true when clicked.
 fn hello_panel(ui: &mut egui::Ui) -> bool {
-    let panel = egui::Frame::none()
+    let panel = egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(Stroke::new(1.0, theme::FOCUS_RING))
-        .rounding(Rounding::same(10.0))
-        .inner_margin(Margin::symmetric(14.0, 13.0))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 13))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -488,11 +638,12 @@ fn hello_panel(ui: &mut egui::Ui) -> bool {
                 let (tile, _) =
                     ui.allocate_exact_size(egui::Vec2::splat(30.0), egui::Sense::hover());
                 ui.painter()
-                    .rect_filled(tile, Rounding::same(8.0), theme::CARD);
+                    .rect_filled(tile, CornerRadius::same(8), theme::CARD);
                 ui.painter().rect_stroke(
                     tile,
-                    Rounding::same(8.0),
+                    CornerRadius::same(8),
                     Stroke::new(1.0, theme::BLUE_EDGE),
+                    egui::StrokeKind::Middle,
                 );
                 paint_padlock(ui.painter(), tile.shrink(7.5), theme::BLUE);
 
@@ -511,10 +662,10 @@ fn hello_panel(ui: &mut egui::Ui) -> bool {
                         .size(10.0)
                         .family(egui::FontFamily::Monospace)
                         .color(theme::BLUE);
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .fill(theme::CARD)
-                        .rounding(Rounding::same(5.0))
-                        .inner_margin(Margin::symmetric(7.0, 3.0))
+                        .corner_radius(CornerRadius::same(5))
+                        .inner_margin(Margin::symmetric(7, 3))
                         .show(ui, |ui| {
                             ui.label(chip);
                         });
@@ -545,7 +696,7 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
         egui::Pos2::new(rect.left(), rect.top() + rect.height() * 0.42),
         rect.max,
     );
-    painter.rect_filled(body, Rounding::same(2.0), color);
+    painter.rect_filled(body, CornerRadius::same(2), color);
 }
 
 /// Opens a blocking egui window that shows a server-choice + email field
@@ -585,34 +736,48 @@ pub fn run_login_flow() -> String {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([470.0, 560.0])
-            // 3h shows the mark in the titlebar; without this, eframe
-            // windows get winit's default icon rather than the exe's.
+            // The design's window is a fixed composition; there is nothing
+            // in it that grows, so resizing only breaks the layout.
+            .with_resizable(false)
+            .with_maximize_button(false)
+            // The titlebar is the design's own (white, mark, ghost
+            // controls), drawn by draw_window_chrome; the native frame
+            // can't be themed into it.
+            .with_decorations(false)
+            // The taskbar icon (there is no native titlebar to show one);
+            // eframe windows don't inherit the exe's icon resource.
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
     let mut styled = false;
 
-    let _ = eframe::run_simple_native("Log in to Deskwarden", options, move |ctx, _frame| {
+    let _ = eframe::run_ui_native("Log in to Deskwarden", options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
-            theme::apply(ctx);
+            theme::apply(ui.ctx());
+            round_window_corners("Log in to Deskwarden");
             styled = true;
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
             return;
         }
 
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(theme::WINDOW_BG)
-                    .inner_margin(Margin::symmetric(26.0, 24.0)),
-            )
-            .show(ctx, |ui| {
+        match draw_window_chrome(ui, "Log in to Deskwarden") {
+            ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            ChromeAction::Minimize => ui
+                .ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            ChromeAction::None => {}
+        }
+
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(26, 24))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 let action = draw_login_window(
                     ui,
                     status,
@@ -757,7 +922,7 @@ pub fn run_login_flow() -> String {
                 }
 
                 if done {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
     });

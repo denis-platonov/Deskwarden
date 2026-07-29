@@ -42,6 +42,8 @@ fn main() -> eframe::Result {
         // The real login window's size and chrome (login_ui::run_login_flow).
         egui::ViewportBuilder::default()
             .with_inner_size([470.0, 560.0])
+            .with_resizable(false)
+            .with_decorations(false)
             .with_icon(theme::window_icon())
     } else {
         egui::ViewportBuilder::default()
@@ -103,9 +105,13 @@ impl eframe::App for Preview {
         egui::Rgba::TRANSPARENT.to_array()
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root.ctx().clone();
         if !self.styled {
-            theme::apply(ctx);
+            theme::apply(&ctx);
+            if self.login {
+                login_ui::round_window_corners("Deskwarden preview");
+            }
             self.styled = true;
             ctx.request_repaint();
             return;
@@ -113,13 +119,16 @@ impl eframe::App for Preview {
         self.frames += 1;
 
         if self.login {
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::none()
-                        .fill(theme::WINDOW_BG)
-                        .inner_margin(Margin::symmetric(26.0, 24.0)),
-                )
-                .show(ctx, |ui| {
+            // The exact chrome the shipped window draws.
+            if login_ui::draw_window_chrome(root, "Log in to Deskwarden")
+                == login_ui::ChromeAction::Close
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            egui::Frame::new()
+                .inner_margin(Margin::symmetric(26, 24))
+                .show(root, |ui| {
+                    ui.set_min_width(ui.available_width());
                     // Sample data mirroring the 3h mock (unlock: Hello shown
                     // as enrolled so the panel renders; sign-in: available
                     // but unenrolled so the opt-in and server dropdown
@@ -155,8 +164,8 @@ impl eframe::App for Preview {
                 });
         } else {
             egui::CentralPanel::default()
-                .frame(egui::Frame::none())
-                .show(ctx, |ui| {
+                .frame(egui::Frame::new())
+                .show(root, |ui| {
                     // The preview closes on the dismiss ✕ too, so the
                     // affordance can actually be clicked here rather than
                     // only looked at.
@@ -176,7 +185,7 @@ impl eframe::App for Preview {
             // A couple of warm-up frames first, so fonts and layout have
             // settled before the capture.
             if self.frames == 3 {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             }
             let captured = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
