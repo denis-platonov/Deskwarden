@@ -1,26 +1,19 @@
-mod app_match;
-mod hotkey;
-mod injector;
-mod login_ui;
-mod match_engine;
-mod overlay_ui;
-mod picker_ui;
-mod process_list;
-mod session_store;
-mod tray;
-mod vault_bridge;
-mod window_watch;
+//! Binary entry point.
+//!
+//! Declares no modules of its own: every module lives in `lib.rs` (see the
+//! note there). This file is only `fn main()` and the startup sequence.
 
-use app_match::AppMatch;
-use injector::{Injector, RealSendInput, RealUiAutomation};
-use match_engine::MatchEngine;
+use nodewarden_native::app::{
+    handle_match, pump_windows_messages, refresh_match_engine,
+};
+use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
+use nodewarden_native::match_engine::MatchEngine;
+use nodewarden_native::vault_bridge::VaultBridge;
+use nodewarden_native::{hotkey, login_ui, session_store, tray, window_watch};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
-use vault_bridge::VaultBridge;
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-};
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 const BW_SERVE_URL: &str = "http://localhost:8087";
 
@@ -48,7 +41,7 @@ fn main() {
 
     let vault = VaultBridge::new(BW_SERVE_URL);
     let mut engine = MatchEngine::new();
-    refresh_match_engine(&vault, &mut engine);
+    let _ = refresh_match_engine(&vault, &mut engine);
 
     let injector = Injector { ui: RealUiAutomation, fallback: RealSendInput };
 
@@ -95,11 +88,6 @@ fn main() {
                 let _ = bw_serve.kill();
                 std::process::exit(0);
             }
-            // "Add app..." has no wired action: picker_ui::run_picker needs
-            // a specific vault item to attach the match to, and nothing in
-            // this task's UI selects one from the tray. Left as a visible
-            // but inert menu entry, same as the brief's own main.rs sample,
-            // which never references picker_ui either.
         }
 
         if hotkey::fill_hotkey_pressed(&fill_hotkey) {
@@ -112,7 +100,7 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    fill_from_vault(&vault, &injector, &item_id, hwnd);
+                    nodewarden_native::app::fill_from_vault(&vault, &injector, &item_id, hwnd);
                 }
             }
         }
@@ -142,84 +130,6 @@ fn main() {
             }
         }
     }
-}
-
-/// Drains any pending Win32 messages on the calling (main) thread without
-/// blocking, so the hidden windows owned by the tray icon and the global
-/// hotkey manager get their WM_COMMAND/WM_HOTKEY messages dispatched.
-fn pump_windows_messages() {
-    let mut msg = MSG::default();
-    unsafe {
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-fn fill_from_vault(
-    vault: &VaultBridge,
-    injector: &Injector<RealUiAutomation, RealSendInput>,
-    item_id: &str,
-    hwnd: isize,
-) {
-    if let Ok(items) = vault.list_items() {
-        if let Some(item) = items.iter().find(|i| i.id == item_id) {
-            let (username, password) = credentials_for(item);
-            let _ = injector.fill(hwnd, &username, &password);
-        }
-    }
-}
-
-/// Dispatches a freshly foregrounded, matched window according to its
-/// trigger mode. `Auto` and `Prompt` fill immediately (`Prompt` only if the
-/// user clicks Fill on the overlay) and return `None`. `Hotkey` doesn't fill
-/// from this path at all -- per the spec, it arms `(item_id, hwnd)` and
-/// returns it so the main loop's separate `fill_hotkey_pressed` check can
-/// fill it later, once the user actually presses the fill hotkey.
-fn handle_match(
-    vault: &VaultBridge,
-    injector: &Injector<RealUiAutomation, RealSendInput>,
-    item_id: &str,
-    m: &AppMatch,
-    hwnd: isize,
-    exe_name: &str,
-) -> Option<(String, isize)> {
-    match m.trigger {
-        app_match::TriggerMode::Auto => {
-            fill_from_vault(vault, injector, item_id, hwnd);
-            None
-        }
-        app_match::TriggerMode::Prompt => {
-            if overlay_ui::show_prompt_overlay(exe_name) {
-                fill_from_vault(vault, injector, item_id, hwnd);
-            }
-            None
-        }
-        app_match::TriggerMode::Hotkey => Some((item_id.to_string(), hwnd)),
-    }
-}
-
-fn credentials_for(_item: &vault_bridge::VaultItem) -> (String, String) {
-    // bw serve's item payload includes a `login: { username, password }`
-    // object, but `vault_bridge::VaultItem` (Task 4) only models
-    // `id`/`name`/`fields` -- that's all the app-match extraction logic
-    // needed. Before relying on real fills end-to-end, extend `VaultItem`
-    // with the `login: Option<LoginData>` shape `bw serve` actually returns
-    // and read it here instead. Left as an explicit placeholder (not
-    // silently glossed over) so the rest of the pipeline -- matching,
-    // triggering, injecting -- is wired and independently testable now.
-    (String::new(), String::new())
-}
-
-fn refresh_match_engine(vault: &VaultBridge, engine: &mut MatchEngine) {
-    let entries = vault
-        .list_items()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|item| vault_bridge::extract_app_match(item).map(|m| (item.id.clone(), m)))
-        .collect::<Vec<_>>();
-    engine.rebuild(&entries);
 }
 
 fn spawn_bw_serve(session_token: &str) -> Child {
