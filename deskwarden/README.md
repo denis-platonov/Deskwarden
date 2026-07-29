@@ -1,4 +1,4 @@
-# nodewarden-native
+# deskwarden
 
 > **Unofficial and unaffiliated with Bitwarden.**
 > This is an independent, community-built tool. It is not made by, endorsed by,
@@ -7,7 +7,7 @@
 > interoperates with. If you have a problem with this tool, do not contact
 > Bitwarden support — open an issue here instead.
 
-`nodewarden-native` fills credentials into **native Windows applications** —
+`deskwarden` fills credentials into **native Windows applications** —
 the kind of desktop app or game launcher a browser extension can't reach. It
 runs quietly in the system tray, watches which window comes to the foreground,
 matches its process name against your vault items, and types the matching
@@ -54,15 +54,15 @@ Each app match has one of three trigger modes:
 | `auto` | Fills as soon as the matched window comes to the foreground. |
 
 App matches are stored in your vault, in a custom field named
-`nodewarden:app-match` on the item they belong to, so they sync between
+`deskwarden:app-match` on the item they belong to, so they sync between
 machines like any other vault data.
 
 ## Official and self-hosted servers
 
-Both work. `nodewarden-native` doesn't talk to any server directly — it talks
+Both work. `deskwarden` doesn't talk to any server directly — it talks
 to your local `bw` CLI, so whatever server that CLI is configured against is
 what gets used. For an official Bitwarden account, just log in. For a
-self-hosted server (Vaultwarden, nodewarden, or any Bitwarden-API-compatible
+self-hosted server (Vaultwarden, deskwarden, or any Bitwarden-API-compatible
 server), tick **Self-hosted server** on the login screen and enter its URL;
 that runs the standard `bw config server <url>` for you. You can also configure
 it yourself beforehand with the CLI and the app will follow.
@@ -72,7 +72,7 @@ it yourself beforehand with the CLI and the app will follow.
 There's no console window, so everything is written to a log file:
 
 ```
-%APPDATA%\nodewarden\nodewarden-native\config\nodewarden.log
+%APPDATA%\deskwarden\deskwarden\config\deskwarden.log
 ```
 
 Set `RUST_LOG=debug` before launching for more detail. Common cases the log

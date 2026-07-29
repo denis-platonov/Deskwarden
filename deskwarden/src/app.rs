@@ -105,7 +105,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
 
 /// Pure helper: turns a list of vault items into the `(item_id, AppMatch)`
 /// entries the match engine is rebuilt from, dropping items with no
-/// `nodewarden:app-match` field.
+/// `deskwarden:app-match` field.
 pub fn match_entries(items: &[VaultItem]) -> Vec<(String, AppMatch)> {
     items
         .iter()

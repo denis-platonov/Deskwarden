@@ -1,5 +1,5 @@
 [package]
-name = "nodewarden-native"
+name = "deskwarden"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -9,7 +9,7 @@ readme = "README.md"
 # would be worse than none.
 
 [lib]
-name = "nodewarden_native"
+name = "deskwarden"
 path = "src/lib.rs"
 
 [dependencies]

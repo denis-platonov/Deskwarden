@@ -962,6 +962,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "deskwarden"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "eframe",
+ "env_logger",
+ "global-hotkey",
+ "log",
+ "mockito",
+ "serde",
+ "serde_json",
+ "tray-icon",
+ "ureq",
+ "windows 0.58.0",
+ "zeroize",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2667,24 +2685,6 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
  "memoffset",
-]
-
-[[package]]
-name = "nodewarden-native"
-version = "0.1.0"
-dependencies = [
- "directories",
- "eframe",
- "env_logger",
- "global-hotkey",
- "log",
- "mockito",
- "serde",
- "serde_json",
- "tray-icon",
- "ureq",
- "windows 0.58.0",
- "zeroize",
 ]
 
 [[package]]

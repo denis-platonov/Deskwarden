@@ -3,17 +3,17 @@
 //! Declares no modules of its own: every module lives in `lib.rs` (see the
 //! note there). This file is only `fn main()` and the startup sequence.
 
-use nodewarden_native::app::{
+use deskwarden::app::{
     fill_from_vault, handle_match, match_entries, pump_windows_messages, refresh_match_engine,
 };
-use nodewarden_native::bw_serve::{
+use deskwarden::bw_serve::{
     self, readiness_schedule, wait_for_vault_ready, BW_SERVE_URL, READINESS_DEADLINE,
 };
-use nodewarden_native::dispatch;
-use nodewarden_native::injector::{Injector, RealSendInput, RealUiAutomation};
-use nodewarden_native::match_engine::MatchEngine;
-use nodewarden_native::vault_bridge::VaultBridge;
-use nodewarden_native::{
+use deskwarden::dispatch;
+use deskwarden::injector::{Injector, RealSendInput, RealUiAutomation};
+use deskwarden::match_engine::MatchEngine;
+use deskwarden::vault_bridge::VaultBridge;
+use deskwarden::{
     hotkey, job_object, logging, login_ui, picker_ui, session_store, tray, window_watch,
 };
 use std::process::Child;
@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() {
-    let config_dir = directories::ProjectDirs::from("dev", "nodewarden", "nodewarden-native")
+    let config_dir = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
         .expect("could not resolve config directory")
         .config_dir()
         .to_path_buf();
@@ -36,7 +36,7 @@ fn main() {
     // Logging first: a background tray app has no console, so without a log
     // file every failure below is invisible to whoever has to diagnose it.
     match logging::init(&config_dir) {
-        Ok(path) => log::info!("nodewarden-native starting; logging to {}", path.display()),
+        Ok(path) => log::info!("deskwarden starting; logging to {}", path.display()),
         Err(e) => eprintln!("warning: {e}"),
     }
 
@@ -182,7 +182,7 @@ fn main() {
 
     // Seed with whatever is already focused: `SetWinEventHook` only reports
     // foreground *changes*, so an app that was matched and already in front
-    // when nodewarden started would otherwise be ignored until the next window
+    // when deskwarden started would otherwise be ignored until the next window
     // switch.
     if let Some(event) = window_watch::current_foreground_event() {
         log::info!(

@@ -1,4 +1,4 @@
-//! `nodewarden-native` — a Windows background app that watches the foreground
+//! `deskwarden` — a Windows background app that watches the foreground
 //! window, matches it against Bitwarden vault items (via `bw serve`), and fills
 //! credentials into the matched app.
 //!

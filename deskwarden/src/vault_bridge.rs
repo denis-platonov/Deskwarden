@@ -44,7 +44,7 @@ pub struct VaultItem {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Pure helper: returns a copy of `item` with its `nodewarden:app-match`
+/// Pure helper: returns a copy of `item` with its `deskwarden:app-match`
 /// custom field replaced (or added) to encode `m`. All other fields —
 /// including anything not modeled by `VaultItem` and captured in `other` —
 /// are preserved unchanged, since `bw serve`'s edit endpoint expects the

@@ -16,7 +16,7 @@ pub fn build_tray() -> AppTray {
 
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("nodewarden-native")
+        .with_tooltip("deskwarden")
         .build()
         .expect("failed to build tray icon");
 

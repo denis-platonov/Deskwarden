@@ -1,8 +1,8 @@
 //! File-backed logging setup.
 //!
-//! `nodewarden-native` runs as a background tray app with no console attached,
+//! `deskwarden` runs as a background tray app with no console attached,
 //! so `env_logger`'s default stderr target is invisible to the user (and to
-//! anyone diagnosing a failure). Everything is routed to `nodewarden.log` in
+//! anyone diagnosing a failure). Everything is routed to `deskwarden.log` in
 //! the same config directory `session_store` already uses, which is the one
 //! directory we know exists and is writable per-user.
 
@@ -10,10 +10,10 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 /// Name of the log file created inside the config directory.
-pub const LOG_FILE_NAME: &str = "nodewarden.log";
+pub const LOG_FILE_NAME: &str = "deskwarden.log";
 
 /// Name of the single retained previous log.
-pub const OLD_LOG_FILE_NAME: &str = "nodewarden.log.old";
+pub const OLD_LOG_FILE_NAME: &str = "deskwarden.log.old";
 
 /// Size at which the log is rotated on startup.
 ///
@@ -62,7 +62,7 @@ pub fn rotate_if_oversized(path: &Path, old_path: &Path, max_bytes: u64) -> std:
     Ok(true)
 }
 
-/// Initialises the global logger, appending to `<config_dir>/nodewarden.log`.
+/// Initialises the global logger, appending to `<config_dir>/deskwarden.log`.
 ///
 /// Rotates the log first if the previous runs left it oversized, so a
 /// long-lived tray app can't grow it without bound. The default level is
@@ -128,7 +128,7 @@ mod tests {
     impl TempDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "nodewarden-logging-{tag}-{}-{:?}",
+                "deskwarden-logging-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));

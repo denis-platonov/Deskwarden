@@ -2,7 +2,7 @@
 //!
 //! `bw serve` holds an unlocked vault and serves it over plain HTTP on
 //! localhost. Killing it only on the tray's Quit path is not enough: a panic,
-//! a Ctrl+C, or a Task Manager kill of `nodewarden-native` leaves it running
+//! a Ctrl+C, or a Task Manager kill of `deskwarden` leaves it running
 //! and serving decrypted secrets with nothing left to stop it.
 //!
 //! A job object with kill-on-close moves that guarantee into the kernel. Every

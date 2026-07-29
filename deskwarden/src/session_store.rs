@@ -88,7 +88,7 @@ mod tests {
     #[test]
     fn round_trips_a_token_through_dpapi_and_disk() {
         let path = temp_dir().join(format!(
-            "nodewarden-test-session-{}.bin",
+            "deskwarden-test-session-{}.bin",
             std::process::id()
         ));
         let store = SessionStore::new(path.clone());
@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn load_returns_none_when_file_missing() {
-        let path = temp_dir().join("nodewarden-test-session-does-not-exist.bin");
+        let path = temp_dir().join("deskwarden-test-session-does-not-exist.bin");
         let store = SessionStore::new(path);
         assert_eq!(store.load(), None);
     }

@@ -133,7 +133,7 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("Add app to nodewarden", options, move |ctx, _frame| {
+    let _ = eframe::run_simple_native("Add app to deskwarden", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut done = false;
 

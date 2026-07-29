@@ -7,7 +7,7 @@ fn main() {
         hwnd.0
     );
 
-    match nodewarden_native::injector::ui_automation::fill_via_ui_automation(
+    match deskwarden::injector::ui_automation::fill_via_ui_automation(
         hwnd.0 as isize,
         "probe-username",
         "probe-password",

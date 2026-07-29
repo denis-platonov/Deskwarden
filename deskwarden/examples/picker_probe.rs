@@ -18,11 +18,11 @@
 //
 // After step 2, confirm the write actually landed with:
 //   bw list items --search <item name>
-// and check the `nodewarden:app-match` custom field is present.
+// and check the `deskwarden:app-match` custom field is present.
 
-use nodewarden_native::overlay_ui::show_prompt_overlay;
-use nodewarden_native::picker_ui::run_picker;
-use nodewarden_native::vault_bridge::VaultBridge;
+use deskwarden::overlay_ui::show_prompt_overlay;
+use deskwarden::picker_ui::run_picker;
+use deskwarden::vault_bridge::VaultBridge;
 
 fn main() {
     let search = std::env::args().nth(1);

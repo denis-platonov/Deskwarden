@@ -25,7 +25,7 @@ pub fn show_prompt_overlay(app_name: &str) -> bool {
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("nodewarden", options, move |ctx, _frame| {
+    let _ = eframe::run_simple_native("deskwarden", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
             let mut done = false;
 

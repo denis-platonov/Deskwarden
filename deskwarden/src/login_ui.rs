@@ -89,8 +89,8 @@ pub fn configure_server(url: &str) -> Result<(), String> {
 fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String> {
     let mut cmd = Command::new("bw");
     cmd.args(args);
-    cmd.args(["--passwordenv", "NODEWARDEN_BW_PASSWORD"]);
-    cmd.env("NODEWARDEN_BW_PASSWORD", password);
+    cmd.args(["--passwordenv", "DESKWARDEN_BW_PASSWORD"]);
+    cmd.env("DESKWARDEN_BW_PASSWORD", password);
     let output = cmd.output().map_err(|e| e.to_string())?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -128,9 +128,9 @@ pub fn run_login_flow() -> String {
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("Log in to nodewarden", options, move |ctx, _frame| {
+    let _ = eframe::run_simple_native("Log in to deskwarden", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("nodewarden-native");
+            ui.heading("deskwarden");
 
             if status == BwStatus::Unauthenticated {
                 ui.checkbox(&mut self_hosted, "Self-hosted server");

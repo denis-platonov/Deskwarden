@@ -90,7 +90,7 @@ pub fn process_name_for_pid(pid: u32) -> Option<String> {
 /// Builds a [`ForegroundEvent`] for whatever window is foreground *right now*.
 ///
 /// The `SetWinEventHook` watcher only reports foreground *changes*, so an app
-/// that was already focused when nodewarden started would never be matched
+/// that was already focused when deskwarden started would never be matched
 /// until the user switched away and back. This lets startup seed the pipeline
 /// with the current window once.
 pub fn current_foreground_event() -> Option<ForegroundEvent> {

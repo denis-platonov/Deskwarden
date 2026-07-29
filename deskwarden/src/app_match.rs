@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const APP_MATCH_FIELD_NAME: &str = "nodewarden:app-match";
+pub const APP_MATCH_FIELD_NAME: &str = "deskwarden:app-match";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,7 +32,7 @@ mod tests {
 
     #[test]
     fn field_name_matches_spec() {
-        assert_eq!(APP_MATCH_FIELD_NAME, "nodewarden:app-match");
+        assert_eq!(APP_MATCH_FIELD_NAME, "deskwarden:app-match");
     }
 
     #[test]
