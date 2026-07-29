@@ -59,7 +59,7 @@ impl KillOnCloseJob {
     /// Safe to call on a process that has already exited (it simply fails);
     /// callers should log rather than treat that as fatal.
     pub fn assign(&self, child: &Child) -> windows::core::Result<()> {
-        let process_handle = HANDLE(child.as_raw_handle() as *mut core::ffi::c_void);
+        let process_handle = HANDLE(child.as_raw_handle());
         unsafe { AssignProcessToJobObject(self.handle, process_handle) }
     }
 }

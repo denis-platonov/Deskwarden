@@ -53,6 +53,43 @@ pub fn port_in_use(port: u16) -> bool {
     TcpStream::connect_timeout(&addr.into(), Duration::from_millis(300)).is_ok()
 }
 
+/// How long to allow a just-killed `bw serve` to release its port before
+/// concluding that whatever holds it isn't ours.
+pub const PORT_RELEASE_GRACE: Duration = Duration::from_secs(5);
+
+/// Waits for `port` to stop being listened on, up to `deadline`.
+///
+/// Needed on the restart paths: `Child::kill` only *requests* termination, so
+/// the socket is typically still bound for a moment afterwards. Without this
+/// grace period a restart would immediately trip the port-collision guard and
+/// abort the app over its own, already-dying child.
+///
+/// Returns `true` if the port is free, `false` if it was still held when the
+/// deadline expired.
+pub fn wait_for_port_free(port: u16, deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if !port_in_use(port) {
+            return true;
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Kills `bw serve` and reaps it, so it releases its port and doesn't linger
+/// as a zombie.
+pub fn stop_bw_serve(child: &mut Child) {
+    if let Err(e) = child.kill() {
+        log::warn!("bw serve kill failed (already gone?): {e}");
+    }
+    if let Err(e) = child.wait() {
+        log::warn!("waiting for bw serve to exit failed: {e}");
+    }
+}
+
 /// Spawns `bw serve` bound to [`BW_SERVE_PORT`] with `BW_SESSION` set.
 ///
 /// Returns the error rather than panicking so the caller can log a diagnosable
@@ -188,6 +225,25 @@ mod tests {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(port_in_use(port));
+    }
+
+    #[test]
+    fn wait_for_port_free_returns_immediately_for_a_free_port() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let start = std::time::Instant::now();
+        assert!(wait_for_port_free(port, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn wait_for_port_free_gives_up_on_a_held_port() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        assert!(!wait_for_port_free(port, Duration::from_millis(300)));
     }
 
     #[test]

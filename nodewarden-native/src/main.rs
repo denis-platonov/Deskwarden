@@ -98,7 +98,7 @@ fn main() {
             // before giving up rather than exiting on a recoverable problem.
             log::error!("{e}");
             log::warn!("retrying once after a fresh login, in case the session was rejected");
-            let _ = bw_serve_child.kill();
+            bw_serve::stop_bw_serve(&mut bw_serve_child);
             session_token = reauthenticate(&store);
             bw_serve_child = start_backend(&session_token, job.as_ref());
 
@@ -111,7 +111,7 @@ fn main() {
                          to match against. See {}",
                         logging::log_file_path(&config_dir).display()
                     );
-                    let _ = bw_serve_child.kill();
+                    bw_serve::stop_bw_serve(&mut bw_serve_child);
                     std::process::exit(1);
                 }
             }
@@ -199,9 +199,7 @@ fn main() {
                 // externally), so a `kill()` error is expected and ignored
                 // rather than treated as fatal.
                 log::info!("quit requested from tray; killing bw serve");
-                if let Err(e) = bw_serve_child.kill() {
-                    log::warn!("bw serve kill on quit failed (already gone?): {e}");
-                }
+                bw_serve::stop_bw_serve(&mut bw_serve_child);
                 std::process::exit(0);
             }
 
@@ -268,7 +266,7 @@ fn main() {
                     let status = login_ui::check_bw_status_with_session(Some(&session_token));
                     if status != login_ui::BwStatus::Unlocked {
                         log::warn!("session is now {status:?}; re-authenticating");
-                        let _ = bw_serve_child.kill();
+                        bw_serve::stop_bw_serve(&mut bw_serve_child);
                         session_token = reauthenticate(&store);
                         bw_serve_child = start_backend(&session_token, job.as_ref());
                         match wait_for_vault_ready(&vault, &schedule) {
@@ -375,9 +373,12 @@ fn reauthenticate(store: &session_store::SessionStore) -> String {
 /// happily talked to the *other* process -- a different, unknown session
 /// serving an unknown vault.
 fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
-    if bw_serve::port_in_use(bw_serve::BW_SERVE_PORT) {
+    // The grace period matters on the restart paths: a `bw serve` we killed a
+    // moment ago still holds its socket briefly, and aborting over our own
+    // dying child would be absurd.
+    if !bw_serve::wait_for_port_free(bw_serve::BW_SERVE_PORT, bw_serve::PORT_RELEASE_GRACE) {
         log::error!(
-            "something is already listening on localhost:{} -- most likely an orphaned \
+            "something is still listening on localhost:{} -- most likely an orphaned \
              `bw serve` from a previous run. Refusing to start rather than talking to an \
              unknown process holding an unknown session; close it and try again.",
             bw_serve::BW_SERVE_PORT
