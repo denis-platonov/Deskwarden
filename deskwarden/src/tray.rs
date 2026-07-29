@@ -35,7 +35,7 @@ pub fn build_tray() -> AppTray {
 
     let icon = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("deskwarden")
+        .with_tooltip("Deskwarden")
         .build()
         .expect("failed to build tray icon");
 

@@ -128,9 +128,9 @@ pub fn run_login_flow() -> String {
         ..Default::default()
     };
 
-    let _ = eframe::run_simple_native("Log in to deskwarden", options, move |ctx, _frame| {
+    let _ = eframe::run_simple_native("Log in to Deskwarden", options, move |ctx, _frame| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("deskwarden");
+            ui.heading("Deskwarden");
 
             if status == BwStatus::Unauthenticated {
                 ui.checkbox(&mut self_hosted, "Self-hosted server");

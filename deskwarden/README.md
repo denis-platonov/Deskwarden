@@ -1,4 +1,4 @@
-# deskwarden
+# Deskwarden
 
 > **Unofficial and unaffiliated with Bitwarden.**
 > This is an independent, community-built tool. It is not made by, endorsed by,
