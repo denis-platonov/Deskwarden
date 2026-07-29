@@ -2,6 +2,10 @@
 /deskwarden/target/
 target/
 
+# Inno Setup installer build output (deskwarden.iss sets OutputDir=. so this
+# lands directly in installer/, alongside the .iss/.ps1 sources)
+/deskwarden/installer/*.exe
+
 # Rust backtrace/profiling leftovers
 **/*.rs.bk
 *.pdb
