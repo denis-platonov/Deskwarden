@@ -32,9 +32,12 @@
 .PARAMETER InstallDir
     deskwarden's own install directory (Inno Setup's {app}). bw.exe is
     placed in "<InstallDir>\bin\bw.exe", and "<InstallDir>\bin" is added to
-    the current user's PATH so deskwarden's `Command::new("bw")` calls
-    (see src/bw_serve.rs, src/login_ui.rs -- both invoke it as a bare `bw`,
-    relying entirely on PATH) can find it.
+    the current user's PATH. deskwarden's own `bw_path::resolve_bw_exe`
+    (see src/bw_path.rs) looks for bw.exe here first, by absolute path --
+    never as a bare `bw` left to CreateProcess's search order -- falling
+    back to a PATH search that skips deskwarden's own directory only if it
+    isn't here. src/bw_serve.rs and src/login_ui.rs both go through that
+    resolver rather than invoking `bw` directly.
 
 .EXITCODE 0
     bw is available (either it was already installed, or it was just

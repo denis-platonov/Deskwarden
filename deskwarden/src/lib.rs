@@ -11,6 +11,7 @@
 
 pub mod app;
 pub mod app_match;
+pub mod bw_path;
 pub mod bw_serve;
 pub mod dispatch;
 pub mod hotkey;

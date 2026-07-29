@@ -68,6 +68,34 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// update -- until this constant is replaced with the real one.
 const EXPECTED_SIGNER_THUMBPRINT: &str = "PLACEHOLDER_SET_ONCE_SIGNPATH_CERT_ISSUED";
 
+/// Organization (`O=`) values accepted as proof that the resolved `bw.exe`
+/// (see `bw_path::resolve_bw_exe`) really is Bitwarden's own CLI.
+///
+/// Mirrors `$BitwardenSignerOrganizations` in `installer/bootstrap-bw.ps1` --
+/// kept in sync there by hand, not shared code, since one runs at install
+/// time (PowerShell) and this runs at every app startup (Rust). Pinning the
+/// *path* `bw.exe` is resolved from isn't enough on its own: the installer's
+/// `bin` directory is itself inside deskwarden's user-writable install tree,
+/// so anything able to plant a file beside `deskwarden.exe` can just as
+/// easily overwrite `bin\bw.exe`. This is the check that actually matters --
+/// whatever ends up at that path must be signed by Bitwarden before it's
+/// handed the user's master password (`login_ui::run_bw_with_password`) or
+/// session token.
+///
+/// TODO (verify before shipping): this list has not yet been confirmed
+/// against a real Bitwarden-signed `bw.exe` -- see the identical TODO on
+/// `$BitwardenSignerOrganizations` in `installer/bootstrap-bw.ps1` for the
+/// verification step. Until then this fails closed by design, the same way
+/// `EXPECTED_SIGNER_THUMBPRINT` above does: every startup refuses to run an
+/// unverified `bw.exe` rather than silently trusting one.
+const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
+    "Bitwarden Inc.",
+    "Bitwarden, Inc.",
+    "Bitwarden Inc",
+    "Bitwarden",
+    "8bit Solutions LLC",
+];
+
 fn main() {
     let project_dirs = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")
         .expect("could not resolve config directory");
@@ -87,6 +115,46 @@ fn main() {
     match logging::init(&config_dir) {
         Ok(path) => log::info!("deskwarden starting; logging to {}", path.display()),
         Err(e) => eprintln!("warning: {e}"),
+    }
+
+    // Verified once, up front, before anything below spawns the CLI or shows
+    // the login window: `bw_serve`/`login_ui` hand this binary the user's
+    // master password and, afterwards, their live session token. Refusing to
+    // proceed with an unsigned or wrongly-signed `bw.exe` is the whole point
+    // of resolving it to a specific path in the first place -- see
+    // `bw_path::resolve_bw_exe` and `TRUSTED_BW_SIGNER_ORGANIZATIONS` above.
+    let bw_exe = deskwarden::bw_path::resolve_bw_exe();
+    if !bw_exe.exists() {
+        log::error!(
+            "Bitwarden CLI not found at {}; reinstall deskwarden or install the Bitwarden CLI \
+             and ensure it is on PATH",
+            bw_exe.display()
+        );
+        std::process::exit(1);
+    }
+    match deskwarden::signature::verify_authenticode(&bw_exe) {
+        Ok(info) if deskwarden::signature::is_trusted_organization(&info, TRUSTED_BW_SIGNER_ORGANIZATIONS) => {
+            log::info!("bw CLI at {} verified as Bitwarden-signed", bw_exe.display());
+        }
+        Ok(info) => {
+            log::error!(
+                "refusing to start: {} is not signed by Bitwarden (valid: {}, subject: {:?}). \
+                 The master password and session token must never be handed to an unverified \
+                 binary. Reinstall deskwarden or the Bitwarden CLI.",
+                bw_exe.display(),
+                info.valid,
+                info.subject_dn
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            log::error!(
+                "refusing to start: could not verify the signature of {} ({e}). Reinstall \
+                 deskwarden or the Bitwarden CLI.",
+                bw_exe.display()
+            );
+            std::process::exit(1);
+        }
     }
 
     // Any installer still sitting in the download directory is spent by now:

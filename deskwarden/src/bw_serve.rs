@@ -4,6 +4,7 @@
 //! waiting for it to actually become ready (its cold start is a Node process
 //! and routinely takes multiple seconds), and running `bw sync`.
 
+use crate::bw_path::resolve_bw_exe;
 use crate::vault_bridge::{VaultBridge, VaultItem};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -153,7 +154,7 @@ pub fn stop_bw_serve(child: &mut Child) {
 /// `job_object::spawn_in_job` needs to add `CREATE_SUSPENDED` before spawning
 /// so the child can join the kill-on-close job before it runs.
 pub fn bw_serve_command(session_token: &str) -> Command {
-    let mut cmd = Command::new("bw");
+    let mut cmd = Command::new(resolve_bw_exe());
     cmd.args(["serve", "--port", &BW_SERVE_PORT.to_string()])
         .env("BW_SESSION", session_token)
         .stdout(Stdio::null())
@@ -218,7 +219,7 @@ pub fn wait_for_vault_ready(
 /// Failure is non-fatal (we can still work from the cached vault), so this
 /// returns a `Result` for the caller to log rather than propagating.
 pub fn run_bw_sync(session_token: &str) -> Result<(), String> {
-    let output = Command::new("bw")
+    let output = Command::new(resolve_bw_exe())
         .arg("sync")
         .env("BW_SESSION", session_token)
         .output()

@@ -1,3 +1,4 @@
+use crate::bw_path::resolve_bw_exe;
 use eframe::egui;
 use std::cell::RefCell;
 use std::process::Command;
@@ -39,7 +40,7 @@ pub fn check_bw_status() -> BwStatus {
 /// CLI not being on PATH -- is logged and reported as `Unauthenticated`
 /// rather than panicking the whole app.
 pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
-    let mut cmd = Command::new("bw");
+    let mut cmd = Command::new(resolve_bw_exe());
     cmd.arg("status");
     if let Some(token) = session_token {
         cmd.env("BW_SESSION", token);
@@ -63,7 +64,7 @@ pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
 /// `run_bw_with_password` failures already are), not as a process-killing
 /// panic with a Rust backtrace.
 pub fn configure_server(url: &str) -> Result<(), String> {
-    let output = Command::new("bw")
+    let output = Command::new(resolve_bw_exe())
         .args(["config", "server", url])
         .output()
         .map_err(|e| {
@@ -87,7 +88,7 @@ pub fn configure_server(url: &str) -> Result<(), String> {
 /// a bare-argument password would be visible to other processes/users
 /// via the OS process list.
 fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String> {
-    let mut cmd = Command::new("bw");
+    let mut cmd = Command::new(resolve_bw_exe());
     cmd.args(args);
     cmd.args(["--passwordenv", "DESKWARDEN_BW_PASSWORD"]);
     cmd.env("DESKWARDEN_BW_PASSWORD", password);
