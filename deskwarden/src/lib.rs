@@ -23,6 +23,7 @@ pub mod overlay_ui;
 pub mod picker_ui;
 pub mod process_list;
 pub mod session_store;
+pub mod signature;
 pub mod tray;
 pub mod vault_bridge;
 pub mod window_watch;
