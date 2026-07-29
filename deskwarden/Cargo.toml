@@ -38,6 +38,9 @@ semver = "1"
 
 [dev-dependencies]
 mockito = "1"
+# Only for the ui_preview example's --screenshot mode (saving the rendered
+# overlay card as a PNG for visual review); nothing in the shipped binary.
+png = "0.17"
 
 [build-dependencies]
 # Embeds assets/deskwarden.ico as the executable's icon resource (see

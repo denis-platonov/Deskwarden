@@ -25,6 +25,7 @@ pub mod picker_ui;
 pub mod process_list;
 pub mod session_store;
 pub mod signature;
+pub mod theme;
 pub mod tray;
 pub mod updater;
 pub mod vault_bridge;

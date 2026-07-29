@@ -20,7 +20,7 @@
 //   bw list items --search <item name>
 // and check the `deskwarden:app-match` custom field is present.
 
-use deskwarden::overlay_ui::show_prompt_overlay;
+use deskwarden::overlay_ui::{show_prompt_overlay, OverlayMatch};
 use deskwarden::picker_ui::run_picker;
 use deskwarden::vault_bridge::VaultBridge;
 
@@ -28,9 +28,9 @@ fn main() {
     let search = std::env::args().nth(1);
 
     let vault = VaultBridge::new("http://localhost:8087");
-    let items = vault.list_items().expect(
-        "failed to list vault items -- is `bw serve --port 8087` running and unlocked?",
-    );
+    let items = vault
+        .list_items()
+        .expect("failed to list vault items -- is `bw serve --port 8087` running and unlocked?");
 
     let target = match &search {
         Some(term) => items
@@ -43,15 +43,25 @@ fn main() {
 
     println!("Opening picker window...");
     match run_picker(vault.clone(), target.clone()) {
-        Some(m) => println!("Saved AppMatch: process={} trigger={:?}", m.process, m.trigger),
+        Some(m) => println!(
+            "Saved AppMatch: process={} trigger={:?}",
+            m.process, m.trigger
+        ),
         None => println!("Picker was cancelled (or save failed) -- got None"),
     }
 
-    println!("Opening overlay window -- click Fill this time...");
-    let filled = show_prompt_overlay("Test App");
+    // The real app shows the matched item's name/username on the overlay
+    // (see app::handle_match); mirror that here with the probed item.
+    let matched = OverlayMatch {
+        item_name: target.name.clone(),
+        username: target.login.as_ref().and_then(|l| l.username.clone()),
+    };
+
+    println!("Opening overlay window -- click the row (or press Enter) this time...");
+    let filled = show_prompt_overlay("Test App", Some(&matched));
     println!("show_prompt_overlay returned: {filled}");
 
-    println!("Opening overlay window again -- click Dismiss this time...");
-    let filled_again = show_prompt_overlay("Test App");
+    println!("Opening overlay window again -- press Esc this time...");
+    let filled_again = show_prompt_overlay("Test App", Some(&matched));
     println!("show_prompt_overlay returned: {filled_again}");
 }

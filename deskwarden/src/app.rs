@@ -94,7 +94,19 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             None
         }
         TriggerMode::Prompt => {
-            if overlay_ui::show_prompt_overlay(exe_name) {
+            // Read the item back first so the overlay can say *which*
+            // credentials it is offering (design 2a shows the username and
+            // item name, never a bare "fill something?"). A failed read is
+            // not fatal to the prompt -- the overlay just can't name the
+            // credentials -- and the fill path re-fetches on its own anyway.
+            let matched = vault.get_item(item_id).ok().map(|item| {
+                let (username, _) = credentials_for(&item);
+                overlay_ui::OverlayMatch {
+                    item_name: item.name.clone(),
+                    username: (!username.is_empty()).then_some(username),
+                }
+            });
+            if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref()) {
                 fill_from_vault(vault, injector, item_id, hwnd);
             }
             None

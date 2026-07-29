@@ -1,5 +1,6 @@
 use crate::bw_path::resolve_bw_exe;
-use eframe::egui;
+use crate::theme;
+use eframe::egui::{self, Margin, RichText, Rounding, Stroke};
 use std::cell::RefCell;
 use std::process::Command;
 use std::rc::Rc;
@@ -125,38 +126,114 @@ pub fn run_login_flow() -> String {
     let mut error: Option<String> = None;
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([360.0, 320.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 520.0]),
         ..Default::default()
     };
 
+    let mut styled = false;
+
     let _ = eframe::run_simple_native("Log in to Deskwarden", options, move |ctx, _frame| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Deskwarden");
+        if !styled {
+            theme::apply(ctx);
+            styled = true;
+        }
 
-            if status == BwStatus::Unauthenticated {
-                ui.checkbox(&mut self_hosted, "Self-hosted server");
-                if self_hosted {
-                    ui.label("Server URL");
-                    ui.text_edit_singleline(&mut server_url);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::CANVAS)
+                    .inner_margin(Margin::symmetric(28.0, 24.0)),
+            )
+            .show(ctx, |ui| {
+                // Brand lockup (design 3g): mark beside the wordmark and tag.
+                ui.horizontal(|ui| {
+                    theme::mark(ui, 40.0);
+                    ui.add_space(4.0);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(theme::bold("Deskwarden", 24.0).color(theme::INK));
+                        ui.label(
+                            theme::semibold("FILLS NATIVE WINDOWS", 9.5).color(theme::TEXT_FAINT),
+                        );
+                    });
+                });
+
+                ui.add_space(16.0);
+
+                // 3b's language: matches are counted but never named until the
+                // vault opens -- unlocking is what this window is for.
+                let (title, subtitle) = if status == BwStatus::Unauthenticated {
+                    (
+                        "Sign in to your vault",
+                        "Works with bitwarden.com and self-hosted servers.",
+                    )
+                } else {
+                    (
+                        "Unlock your vault",
+                        "Matches stay hidden until the vault opens.",
+                    )
+                };
+                ui.label(theme::bold(title, 17.0).color(theme::INK));
+                ui.label(RichText::new(subtitle).size(12.0).color(theme::TEXT_FAINT));
+
+                ui.add_space(10.0);
+
+                egui::Frame::none()
+                    .fill(theme::CARD)
+                    .rounding(Rounding::same(10.0))
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .inner_margin(Margin::same(16.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 6.0;
+
+                        if status == BwStatus::Unauthenticated {
+                            ui.checkbox(&mut self_hosted, "Self-hosted server");
+                            if self_hosted {
+                                theme::field_label(ui, "Server URL");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut server_url)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(Margin::symmetric(10.0, 8.0)),
+                                );
+                            }
+                            theme::field_label(ui, "Email");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut email)
+                                    .desired_width(f32::INFINITY)
+                                    .margin(Margin::symmetric(10.0, 8.0)),
+                            );
+                        }
+
+                        theme::field_label(ui, "Master password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut password)
+                                .password(true)
+                                .desired_width(f32::INFINITY)
+                                .margin(Margin::symmetric(10.0, 8.0)),
+                        );
+                    });
+
+                if let Some(err) = &error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
                 }
-                ui.label("Email");
-                ui.text_edit_singleline(&mut email);
-            }
 
-            ui.label("Master password");
-            ui.add(egui::TextEdit::singleline(&mut password).password(true));
+                ui.add_space(12.0);
 
-            if let Some(err) = &error {
-                ui.colored_label(egui::Color32::RED, err);
-            }
+                let mut done = false;
 
-            let mut done = false;
+                // Enter submits from anywhere in the form, same as clicking
+                // Continue -- the design's fields all carry ↵ affordances.
+                let submitted = theme::primary_button(ui, "Continue", Some("Enter")).clicked()
+                    || ctx.input(|i| i.key_pressed(egui::Key::Enter));
 
-            if ui.button("Continue").clicked() {
-                // A bad self-hosted URL is inline UI error, not a panic: bail
-                // out of this Continue click and let the user correct it.
-                let server_configured =
-                    if status == BwStatus::Unauthenticated && self_hosted && !server_url.is_empty()
+                if submitted {
+                    // A bad self-hosted URL is inline UI error, not a panic: bail
+                    // out of this Continue click and let the user correct it.
+                    let server_configured = if status == BwStatus::Unauthenticated
+                        && self_hosted
+                        && !server_url.is_empty()
                     {
                         match configure_server(&server_url) {
                             Ok(()) => true,
@@ -170,40 +247,40 @@ pub fn run_login_flow() -> String {
                         true
                     };
 
-                if server_configured {
-                    let result = match status {
-                        BwStatus::Unauthenticated => {
-                            run_bw_with_password(&["login", &email, "--raw"], &password)
-                        }
-                        BwStatus::Locked | BwStatus::Unlocked => {
-                            run_bw_with_password(&["unlock", "--raw"], &password)
-                        }
-                    };
+                    if server_configured {
+                        let result = match status {
+                            BwStatus::Unauthenticated => {
+                                run_bw_with_password(&["login", &email, "--raw"], &password)
+                            }
+                            BwStatus::Locked | BwStatus::Unlocked => {
+                                run_bw_with_password(&["unlock", "--raw"], &password)
+                            }
+                        };
 
-                    // The master password has served its purpose either way:
-                    // wipe the buffer instead of leaving it live in memory for
-                    // the rest of the process's lifetime. On failure this also
-                    // clears the field, which the user has to retype anyway.
-                    password.zeroize();
+                        // The master password has served its purpose either way:
+                        // wipe the buffer instead of leaving it live in memory for
+                        // the rest of the process's lifetime. On failure this also
+                        // clears the field, which the user has to retype anyway.
+                        password.zeroize();
 
-                    match result {
-                        Ok(session_token) => {
-                            *token_for_closure.borrow_mut() = Some(session_token);
-                            error = None;
-                            done = true;
-                        }
-                        Err(e) => {
-                            log::warn!("bw login/unlock failed: {e}");
-                            error = Some(e);
+                        match result {
+                            Ok(session_token) => {
+                                *token_for_closure.borrow_mut() = Some(session_token);
+                                error = None;
+                                done = true;
+                            }
+                            Err(e) => {
+                                log::warn!("bw login/unlock failed: {e}");
+                                error = Some(e);
+                            }
                         }
                     }
                 }
-            }
 
-            if done {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-        });
+                if done {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
     });
 
     let produced = token.borrow_mut().take();
@@ -234,10 +311,7 @@ mod tests {
 
     #[test]
     fn parses_locked_status() {
-        assert_eq!(
-            parse_bw_status(r#"{"status":"locked"}"#),
-            BwStatus::Locked
-        );
+        assert_eq!(parse_bw_status(r#"{"status":"locked"}"#), BwStatus::Locked);
     }
 
     #[test]
@@ -247,6 +321,9 @@ mod tests {
             BwStatus::Unauthenticated
         );
         assert_eq!(parse_bw_status(""), BwStatus::Unauthenticated);
-        assert_eq!(parse_bw_status("command not found"), BwStatus::Unauthenticated);
+        assert_eq!(
+            parse_bw_status("command not found"),
+            BwStatus::Unauthenticated
+        );
     }
 }
