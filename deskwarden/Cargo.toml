@@ -40,7 +40,10 @@ windows = { version = "0.58", features = [
     # (MonitorFromWindow/GetMonitorInfoW) and pixel access for extracting an
     # app icon from its HICON (GetDIBits) in the Add-app picker.
     "Win32_Graphics_Gdi",
-    # SHGetFileInfoW, for reading an exe's small icon (picker_ui.rs).
+    # SHGetFileInfoW, for reading an exe's small icon (picker_ui.rs), and
+    # ShellExecuteW, for opening a vault item's website in the default
+    # browser (vault_window/mod.rs::webbrowser_open) without shelling out to
+    # cmd.exe.
     "Win32_UI_Shell",
     "Win32_Storage_FileSystem",
 ] }
@@ -82,3 +85,11 @@ mockito = "1"
 # build.rs). Build-time only: nothing from this crate is linked into the
 # shipped binary, only the .res it produces.
 winresource = "0.1"
+
+[profile.release]
+# This app spends nearly all its life sitting in the tray with no window
+# open -- smaller, more cross-crate-inlined code means less of it resident
+# at idle, not just a smaller installer download.
+lto = true
+codegen-units = 1
+strip = true

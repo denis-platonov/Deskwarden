@@ -409,7 +409,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                     }
                                 }
                                 DetailAction::OpenWebsite(url) => {
-                                    let _ = webbrowser_open(&url);
+                                    webbrowser_open(&url);
                                 }
                                 DetailAction::None => {}
                             }
@@ -471,7 +471,98 @@ fn spawn_favicon_fetch(item_id: String, domain: String, server_url: Option<Strin
     });
 }
 
-fn webbrowser_open(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
-    Ok(())
+/// True when `url` is safe to hand off to the shell to open: an `http://`
+/// or `https://` URL (case-insensitive scheme), nothing else. This is
+/// defense in depth alongside `webbrowser_open`'s use of `ShellExecuteW`
+/// (which, unlike the `cmd.exe /C start` invocation it replaced, isn't
+/// vulnerable to shell-metacharacter injection in the first place) -- the
+/// URL here is vault data, reachable from shared/imported collections and
+/// not just what the user typed themselves, so a `javascript:`/`file:`/
+/// no-scheme value is rejected outright rather than trusted to be a normal
+/// web link.
+fn is_safe_web_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Opens `url` in the user's default browser. Uses `ShellExecuteW` rather
+/// than the previous `std::process::Command::new("cmd").args(["/C",
+/// "start", "", url])`: `Command` on Windows only quotes an argument that
+/// contains whitespace, it does not escape `cmd.exe` metacharacters (`&`,
+/// `|`, `<`, `>`, `^`, `"`), so a vault URI like `https://x.com&calc.exe`
+/// was able to run an arbitrary second command when a user clicked "Open".
+/// `ShellExecuteW` takes the URL as a single string parameter with no
+/// shell/argument parsing involved, so it isn't subject to that class of
+/// injection. `is_safe_web_url` is still checked first, as defense in
+/// depth against anything other than a normal web link (`javascript:`,
+/// `file:`, ...); a rejection is logged and otherwise silently ignored --
+/// this is reached from a button click, not something worth erroring the
+/// whole window over.
+fn webbrowser_open(url: &str) {
+    if !is_safe_web_url(url) {
+        log::warn!("refusing to open non-http(s) URL from vault data: {url}");
+        return;
+    }
+    let wide_url: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide_verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    // Safety: `wide_url`/`wide_verb` are NUL-terminated UTF-16 buffers kept
+    // alive for the duration of this call (ShellExecuteW does not retain
+    // the pointers past return); the other three PCWSTR params are
+    // intentionally null (no parameters/directory, default verb resolution
+    // via "open"); `HWND::default()` is the documented way to pass no owner
+    // window.
+    unsafe {
+        let _ = windows::Win32::UI::Shell::ShellExecuteW(
+            windows::Win32::Foundation::HWND::default(),
+            windows::core::PCWSTR(wide_verb.as_ptr()),
+            windows::core::PCWSTR(wide_url.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(test)]
+mod url_safety_tests {
+    use super::is_safe_web_url;
+
+    #[test]
+    fn accepts_http_and_https() {
+        assert!(is_safe_web_url("http://example.com"));
+        assert!(is_safe_web_url("https://example.com/login"));
+    }
+
+    #[test]
+    fn accepts_https_scheme_case_insensitively() {
+        assert!(is_safe_web_url("HTTPS://Example.com"));
+        assert!(is_safe_web_url("HtTp://example.com"));
+    }
+
+    #[test]
+    fn rejects_javascript_scheme() {
+        assert!(!is_safe_web_url("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn rejects_file_scheme() {
+        assert!(!is_safe_web_url("file:///C:/Windows/System32/calc.exe"));
+    }
+
+    #[test]
+    fn rejects_url_with_no_scheme() {
+        assert!(!is_safe_web_url("example.com"));
+    }
+
+    #[test]
+    fn accepts_https_even_with_shell_metacharacters_in_it() {
+        // A URI like `https://x.com&calc.exe` was the actual injection
+        // vector against the old `cmd.exe /C start` invocation. It's an
+        // irrelevant string to safety now that `ShellExecuteW` (not a
+        // shell) does the opening -- the scheme check is what gates this,
+        // and an http(s) URL passes it regardless of what shell
+        // metacharacters happen to be embedded elsewhere in the string.
+        assert!(is_safe_web_url("https://x.com&calc.exe"));
+    }
 }
