@@ -3,13 +3,74 @@
 //! locked inside the binary target.
 
 use crate::app_match::{AppMatch, TriggerMode};
+use crate::injector::ui_automation;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::match_engine::MatchEngine;
 use crate::overlay_ui;
 use crate::vault_bridge::{extract_app_match, VaultBridge, VaultError, VaultItem};
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+};
+
+/// The overlay's fixed size (must match `overlay_ui::show_prompt_overlay`'s
+/// `with_inner_size`) -- needed here to clamp its position on-screen before
+/// the window exists to measure.
+const OVERLAY_WIDTH: f32 = 396.0;
+const OVERLAY_HEIGHT: f32 = 164.0;
+/// Gap between the field/window edge and the overlay, so it doesn't sit
+/// flush against the thing it's about to fill.
+const OVERLAY_GAP: f32 = 10.0;
+
+/// Where to place the autofill overlay so it reads as "next to the field"
+/// rather than wherever the OS happens to put a new window: just below the
+/// focused/matched field if UI Automation can find one, else just outside
+/// the matched window's own top-right corner. Clamped to the nearest
+/// monitor's work area so it can't land off-screen or under the taskbar.
+fn overlay_position(hwnd: isize) -> Option<(f32, f32)> {
+    let (x, y) = match ui_automation::field_anchor_rect(hwnd) {
+        Ok(Some(rect)) => (rect.left as f32, rect.bottom as f32 + OVERLAY_GAP),
+        _ => {
+            let window = window_rect(hwnd)?;
+            (
+                window.right as f32 - OVERLAY_WIDTH,
+                window.top as f32 + OVERLAY_GAP,
+            )
+        }
+    };
+    Some(clamp_to_monitor(hwnd, x, y))
+}
+
+fn window_rect(hwnd: isize) -> Option<RECT> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(HWND(hwnd as *mut core::ffi::c_void), &mut rect).ok()? };
+    Some(rect)
+}
+
+fn clamp_to_monitor(hwnd: isize, x: f32, y: f32) -> (f32, f32) {
+    unsafe {
+        let monitor =
+            MonitorFromWindow(HWND(hwnd as *mut core::ffi::c_void), MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            let clamped_x = x
+                .min(work.right as f32 - OVERLAY_WIDTH)
+                .max(work.left as f32);
+            let clamped_y = y
+                .min(work.bottom as f32 - OVERLAY_HEIGHT)
+                .max(work.top as f32);
+            return (clamped_x, clamped_y);
+        }
+    }
+    (x, y)
+}
 
 /// Drains any pending Win32 messages on the calling (main) thread without
 /// blocking, so the hidden windows owned by the tray icon and the global
@@ -112,7 +173,8 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
                     username: username.filter(|u| !u.is_empty()),
                 }
             });
-            if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref()) {
+            if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref(), overlay_position(hwnd))
+            {
                 fill_from_vault(vault, injector, item_id, hwnd);
             }
             None

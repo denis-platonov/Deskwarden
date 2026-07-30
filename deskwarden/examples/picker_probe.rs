@@ -42,7 +42,7 @@ fn main() {
     println!("Using vault item: {} ({})", target.name, target.id);
 
     println!("Opening picker window...");
-    match run_picker(vault.clone(), target.clone()) {
+    match run_picker(vault.clone(), target.clone(), None) {
         Some(m) => println!(
             "Saved AppMatch: process={} trigger={:?}",
             m.process, m.trigger
@@ -58,10 +58,10 @@ fn main() {
     };
 
     println!("Opening overlay window -- click the row (or press Enter) this time...");
-    let filled = show_prompt_overlay("Test App", Some(&matched));
+    let filled = show_prompt_overlay("Test App", Some(&matched), None);
     println!("show_prompt_overlay returned: {filled}");
 
     println!("Opening overlay window again -- press Esc this time...");
-    let filled_again = show_prompt_overlay("Test App", Some(&matched));
+    let filled_again = show_prompt_overlay("Test App", Some(&matched), None);
     println!("show_prompt_overlay returned: {filled_again}");
 }
