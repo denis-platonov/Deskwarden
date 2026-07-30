@@ -18,6 +18,7 @@
 - Favicons: fetched over HTTP from `{icon_base}/{domain}/icon.png`, `icon_base` being `https://icons.bitwarden.net` for the default cloud server or `{server_url}/icons` for a configured self-hosted one (see Task 4). Any failure — no URI on the item, fetch error, non-200, decode error — falls back to the existing colored-initials monogram (`theme::avatar`). Never blocks the UI thread; loads on a background thread, drained via a channel, exactly like `loading_ui::show_while`'s pattern.
 - Scope boundary on item types: the design's own detail-pane examples (Ledgerline, Vantage VPN) are both **Login** items, and autofill only ever fills Logins. Cards / Secure notes / Identities appear in the sidebar counts, list rows, and type badges (per spec), but selecting one shows a minimal read-only "not editable yet" panel in the detail pane rather than a bespoke card/note editor. Full create/edit/delete is Login-only and folder-only.
 - Folder scope: **create and delete only**, no rename — the user asked for "folder creation" specifically; rename is not in the design spec's folder rows either.
+- Sync: this app has nothing that auto-syncs with Bitwarden's server on a timer -- `main()` runs `bw sync` exactly once, at startup; everything after that (including this window's own item/folder lists) only re-reads whatever `bw serve` already has cached locally. Task 9 adds a manual "Sync" toolbar button (`bw_serve::run_bw_sync`, reloading `items`/`folders` on success) as the escape hatch for "I changed something on another device" -- this is a deliberate, minimal addition (a button, not a background poller) requested mid-plan; do not expand it into automatic periodic syncing, which is a materially different (and more failure-prone, given `bw sync` is a real network+CLI round-trip) feature than what was asked for.
 - Toolbar scope cut: the design's toolbar also shows a live "● Synced 1 min ago" pill and an account-initials avatar circle. The avatar is cheap (Task 9 adds it: `theme::avatar` fed from `login_ui::check_bw_status_details().user_email`, same source the login window already uses). The sync pill is **not built** — this app has nowhere that records a last-sync timestamp today, and adding one is a separate, real feature (tracking `bw sync` completion times) rather than a vault-window detail; flagged here as a deliberate cut, not an oversight, so it isn't quietly expected of Task 9's implementer.
 - Keyboard shortcuts from spec section 5 that apply to this window (`Ctrl+K` focus search, `Ctrl+L` lock, `Ctrl+N` new item, `Ctrl+Shift+F` fill in app) are real requirements, not nice-to-haves — Task 9 wires all four alongside the window's own logic, not left as a "click the button" fallback.
 - Every new Win32/`egui` window follows the established font-timing guard (`styled` bool, `theme::apply` on frame 1, real UI from frame 2) — this is a confirmed real crash source elsewhere in this codebase (see `login_ui.rs`, `picker_ui.rs`).
@@ -1895,7 +1896,7 @@ git commit -m "feat: add the vault window's edit/create form for login items"
 
 **Interfaces:**
 - Consumes: everything from Tasks 1-8 (`vault_bridge::{VaultBridge, VaultItem, Folder}`, `fill_stats::FillStats`, `favicon`, `sidebar::{draw_sidebar, SidebarFilter, SidebarAction}`, `item_list::{draw_item_list, ItemListAction, IconCache}`, `detail::{draw_detail_read, DetailAction}`, `detail_edit::{draw_detail_edit, EditDraft, EditAction}`, `theme`, `login_ui::draw_window_chrome`/`round_window_corners` (reused directly, not copied -- both are already `pub fn` in `login_ui.rs`)).
-- Produces: `pub fn run(vault: VaultBridge, fill_stats: FillStats, injector: &Injector<impl UiAutomationFiller, impl SendInputFiller>, server_url: Option<String>) -> VaultWindowResult` where `pub struct VaultWindowResult { pub locked: bool }` (tells the caller in `main.rs` whether the window's own "Lock" action or the auto-lock timer fired, so `main.rs` knows to route back to `login_ui::run_login_flow` next).
+- Produces: `pub fn run(vault: VaultBridge, fill_stats: FillStats, injector: &Injector<impl UiAutomationFiller, impl SendInputFiller>, server_url: Option<String>, session_token: String) -> VaultWindowResult` where `pub struct VaultWindowResult { pub locked: bool }` (tells the caller in `main.rs` whether the window's own "Lock" action or the auto-lock timer fired, so `main.rs` knows to route back to `login_ui::run_login_flow` next). `session_token` is needed for the toolbar's manual "Sync" button (`bw_serve::run_bw_sync` takes a session token) -- this app has nothing that auto-syncs with the remote server on a timer (see the Global Constraints addition on this), so a manual sync action is the only way to pull in changes made on another device without restarting the whole app.
 - `AUTO_LOCK_TIMEOUT: Duration` constant, `const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);` (Global Constraints).
 
 - [ ] **Step 1: Replace the module stub**
@@ -1915,6 +1916,7 @@ pub mod detail_edit;
 pub mod item_list;
 pub mod sidebar;
 
+use crate::bw_serve;
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome, round_window_corners, ChromeAction};
@@ -1922,7 +1924,7 @@ use crate::theme;
 use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
 use detail::DetailAction;
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
-use eframe::egui::{self, CornerRadius, Margin, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use item_list::{draw_item_list, IconCache, ItemListAction};
 use sidebar::{draw_sidebar, SidebarAction, SidebarFilter};
 use std::cell::RefCell;
@@ -1971,9 +1973,11 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
     fill_stats: FillStats,
     injector: &Injector<A, B>,
     server_url: Option<String>,
+    session_token: String,
 ) -> VaultWindowResult {
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
+    let mut sync_status: Option<Result<(), String>> = None;
 
     let mut items: Vec<VaultItem> = vault.list_items().unwrap_or_default();
     let mut folders: Vec<Folder> = vault.list_folders().unwrap_or_default();
@@ -2078,6 +2082,29 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
                         }
                         if let Some(email) = &account_email {
                             theme::avatar(ui, &theme::initials(email), 26.0, false);
+                        }
+                        // Manual sync: this app has nowhere that auto-syncs on
+                        // a timer (see `main()`'s own single startup-time
+                        // `bw sync` -- everything after that only re-reads
+                        // whatever's already local). A change made on another
+                        // device otherwise wouldn't show up here until the
+                        // whole app restarts; this button is the escape hatch.
+                        if theme::secondary_button(ui, "Sync").clicked() {
+                            let result = bw_serve::run_bw_sync(&session_token);
+                            if result.is_ok() {
+                                items = vault.list_items().unwrap_or_default();
+                                folders = vault.list_folders().unwrap_or_default();
+                            } else if let Err(e) = &result {
+                                log::warn!("manual vault sync failed: {e}");
+                            }
+                            sync_status = Some(result);
+                        }
+                        if let Some(status) = &sync_status {
+                            let (text, color) = match status {
+                                Ok(()) => ("Synced", theme::TEXT_GHOST),
+                                Err(_) => ("Sync failed", theme::ERROR),
+                            };
+                            ui.label(RichText::new(text).size(11.0).color(color));
                         }
                     });
                 });
@@ -2406,7 +2433,7 @@ In `deskwarden/src/main.rs`, alongside the existing `if event.id == tray.add_app
 ```rust
             if event.id == tray.open_vault_id {
                 let server_url = login_ui::check_bw_status_details().server_url;
-                let result = vault_window::run(vault.clone(), fill_stats.clone(), &injector, server_url);
+                let result = vault_window::run(vault.clone(), fill_stats.clone(), &injector, server_url, session_token.clone());
 
                 if result.locked {
                     log::info!("vault window locked itself; re-authenticating");
