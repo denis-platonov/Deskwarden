@@ -13,7 +13,7 @@ pub mod sidebar;
 use crate::bw_serve;
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
-use crate::login_ui::{draw_window_chrome, round_window_corners, ChromeAction};
+use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction};
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
 use detail::{draw_detail_read, DetailAction};
@@ -116,7 +116,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
     // Outcome of a click-triggered manual sync. Backgrounded for the same
     // reason `main.rs` backgrounds its update-check and update-apply flows
-    // (see the `spawn_favicon_fetch` doc comment below for this file's own
+    // (see the `ensure_icon_loaded` doc comment below for this file's own
     // prior art): `bw_serve::run_bw_sync` shells out and blocks on a real
     // network round-trip, and running it inline on this thread -- as it used
     // to -- froze the entire vault window (no repaint, no input) for however
@@ -266,7 +266,44 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             sync_status = Some(result);
         }
 
-        match draw_window_chrome(ui, "Deskwarden Vault") {
+        // Sync, the account avatar, and Lock live in the titlebar itself
+        // (spec 4.8's single toolbar row), not a separate bar underneath --
+        // `draw_window_chrome_with_extra` reserves space for them between
+        // the title and the ✕/▢/— controls and narrows the drag zone to
+        // stop where they actually start (see its doc comment).
+        match draw_window_chrome_with_extra(ui, "Deskwarden Vault", |ui| {
+            // Right-to-left: Lock nearest the window controls, then the
+            // avatar, then the Sync button and its status label innermost.
+            if theme::secondary_button(ui, "Lock").clicked() {
+                *locked_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            if let Some(email) = &account_email {
+                theme::avatar(ui, &theme::initials(email), 26.0, false);
+            }
+            // Manual sync: this app has nowhere that auto-syncs on a timer
+            // (see `main()`'s own single startup-time `bw sync` -- everything
+            // after that only re-reads whatever's already local). A change
+            // made on another device otherwise wouldn't show up here until
+            // the whole app restarts; this button is the escape hatch.
+            let sync_clicked = ui
+                .add_enabled_ui(!sync_in_progress, |ui| theme::secondary_button(ui, "Sync"))
+                .inner
+                .clicked();
+            if sync_clicked && !sync_in_progress {
+                sync_in_progress = true;
+                spawn_vault_sync(sync_tx.clone(), session_token.clone());
+            }
+            if sync_in_progress {
+                ui.label(RichText::new("Syncing…").size(11.0).color(theme::TEXT_GHOST));
+            } else if let Some(status) = &sync_status {
+                let (text, color) = match status {
+                    Ok(()) => ("Synced", theme::TEXT_GHOST),
+                    Err(_) => ("Sync failed", theme::ERROR),
+                };
+                ui.label(RichText::new(text).size(11.0).color(color));
+            }
+        }) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
@@ -293,49 +330,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         if ctrl_n {
             mode = DetailMode::Create(EditDraft::empty());
         }
-
-        egui::Panel::top("vault-toolbar")
-            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(20, 10)))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    theme::mark(ui, 20.0);
-                    ui.label(theme::bold("Deskwarden", 14.0).color(theme::INK));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::secondary_button(ui, "Lock").clicked() {
-                            *locked_for_closure.borrow_mut() = true;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        if let Some(email) = &account_email {
-                            theme::avatar(ui, &theme::initials(email), 26.0, false);
-                        }
-                        // Manual sync: this app has nowhere that auto-syncs on
-                        // a timer (see `main()`'s own single startup-time
-                        // `bw sync` -- everything after that only re-reads
-                        // whatever's already local). A change made on another
-                        // device otherwise wouldn't show up here until the
-                        // whole app restarts; this button is the escape hatch.
-                        let sync_clicked = ui
-                            .add_enabled_ui(!sync_in_progress, |ui| {
-                                theme::secondary_button(ui, "Sync")
-                            })
-                            .inner
-                            .clicked();
-                        if sync_clicked && !sync_in_progress {
-                            sync_in_progress = true;
-                            spawn_vault_sync(sync_tx.clone(), session_token.clone());
-                        }
-                        if sync_in_progress {
-                            ui.label(RichText::new("Syncing…").size(11.0).color(theme::TEXT_GHOST));
-                        } else if let Some(status) = &sync_status {
-                            let (text, color) = match status {
-                                Ok(()) => ("Synced", theme::TEXT_GHOST),
-                                Err(_) => ("Sync failed", theme::ERROR),
-                            };
-                            ui.label(RichText::new(text).size(11.0).color(color));
-                        }
-                    });
-                });
-            });
 
         // Auto-expire a stale armed folder delete before deciding what to
         // show the sidebar this frame -- `is_armed` does this too on the

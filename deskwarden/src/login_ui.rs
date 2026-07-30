@@ -278,7 +278,29 @@ pub enum ChromeAction {
 /// titlebar, a hairline under it, and — ▢ ✕ controls (▢ inert: the window
 /// is fixed-size). Reserves the titlebar's space in `ui`'s layout; window
 /// rounding comes from DWM (see [`round_window_corners`]).
+///
+/// Thin wrapper around [`draw_window_chrome_with_extra`] with no extra
+/// content — see that function for the shared implementation.
 pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
+    draw_window_chrome_with_extra(ui, title, |_ui| {})
+}
+
+/// Same as [`draw_window_chrome`], but calls `extra_content` to draw
+/// additional widgets in the bar between the title and the window controls
+/// (used by the vault window's toolbar buttons: Lock, the account avatar,
+/// and Sync). `extra_content` is laid out right-to-left, packed against the
+/// left edge of the window-control zones, so it reads as continuing
+/// naturally into ✕/▢/—. The draggable region is shrunk to end where
+/// `extra_content`'s actually-rendered content begins (not just the
+/// reserved area for it), so clicking those widgets doesn't also start
+/// dragging the window; when `extra_content` draws nothing (the plain
+/// [`draw_window_chrome`] case above) the drag zone is unchanged from
+/// before this function existed.
+pub fn draw_window_chrome_with_extra(
+    ui: &mut egui::Ui,
+    title: &str,
+    extra_content: impl FnOnce(&mut egui::Ui),
+) -> ChromeAction {
     let mut action = ChromeAction::None;
     let full = ui.max_rect();
     let bar = egui::Rect::from_min_max(full.min, egui::Pos2::new(full.max.x, full.min.y + 40.0));
@@ -322,7 +344,35 @@ pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
             egui::Pos2::new(bar.max.x - 40.0 * i as f32, bar.max.y - 1.0),
         )
     };
+    let controls_left = control(2).min.x;
     let glyph_stroke = Stroke::new(1.2, theme::TEXT_FAINT);
+
+    // Between the title and the control zones: `extra_content`'s reserved
+    // area, right-to-left so it packs against the controls rather than
+    // floating in the middle of the bar. The left bound (200px in from the
+    // titlebar's left edge) is just generously past where the mark+title
+    // ends -- it only caps how far left content is *allowed* to grow, it
+    // isn't where empty content would visually start.
+    let extra_max_rect = egui::Rect::from_min_max(
+        egui::Pos2::new(bar.min.x + 200.0, bar.min.y),
+        egui::Pos2::new(controls_left - 16.0, bar.max.y),
+    );
+    let extra_response = ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(extra_max_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        extra_content,
+    );
+    let extra_used = extra_response.response.rect;
+    // Empty `extra_content` (the plain `draw_window_chrome` case) leaves
+    // `extra_used` a zero-width rect with nothing actually drawn in it --
+    // fall back to the controls' own left edge, exactly matching this
+    // function's drag-zone width before `extra_content` existed.
+    let drag_zone_end_x = if extra_used.width() > 0.0 {
+        extra_used.left().min(controls_left)
+    } else {
+        controls_left
+    };
 
     // Close (✕).
     let close_rect = control(0);
@@ -370,9 +420,10 @@ pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
         action = ChromeAction::Minimize;
     }
 
-    // Everything left of the controls drags the window.
+    // Everything left of the controls (and left of any `extra_content` that
+    // was actually drawn) drags the window.
     let drag_zone =
-        egui::Rect::from_min_max(bar.min, egui::Pos2::new(bar.max.x - 120.0, bar.max.y));
+        egui::Rect::from_min_max(bar.min, egui::Pos2::new(drag_zone_end_x, bar.max.y));
     let drag = ui.interact(
         drag_zone,
         ui.id().with("chrome-drag"),
