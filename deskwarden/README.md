@@ -38,9 +38,15 @@ nothing.
 
 Once running, it lives in the system tray:
 
+- **Left-click the tray icon** (or right-click → **Open Vault**) — opens the
+  vault window: folders, search, item create/edit/delete, live TOTP codes, a
+  password-strength indicator, real website favicons, and manual/auto sync.
+  Full CRUD is Login-item only; Cards/Secure notes/Identities show up in the
+  list and counts but aren't editable here yet.
 - **Add app...** — a two-step picker. First choose the vault item whose
   credentials you want to use, then choose the running process to attach it to
-  and pick a trigger mode.
+  and pick a trigger mode. You can also do this from the vault window's
+  **Fill in app** button on a login item that's already matched.
 - **Quit** — exits and shuts down the `bw serve` bridge.
 
 ### Trigger modes
