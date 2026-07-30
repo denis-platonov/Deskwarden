@@ -13,7 +13,7 @@ pub mod sidebar;
 use crate::bw_serve;
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
-use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction};
+use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
 use detail::{draw_detail_read, DetailAction};
@@ -27,6 +27,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const WINDOW_TITLE: &str = "Deskwarden Vault";
+/// The window's initial/default size -- not a fixed size. Since the
+/// titlebar's maximize control was wired up (see this window's
+/// `NativeOptions.with_resizable(true)` and its `maximizable: true` chrome
+/// call), the window can grow past this; it just opens at this size.
 const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
 const SIDEBAR_WIDTH: f32 = 212.0;
 const LIST_WIDTH: f32 = 390.0;
@@ -188,8 +192,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut styled = false;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            // Starting/default size only -- see WINDOW_SIZE's doc comment.
+            // Unlike the login window (fixed-size by design), this window's
+            // three-pane layout (fixed-width sidebar/list, flexible detail
+            // pane -- see the `Panel`/`CentralPanel` setup below) degrades
+            // fine at larger sizes, so it's resizable/maximizable now that
+            // the titlebar's ▢ control (`draw_window_chrome_with_extra`'s
+            // `maximizable: true` at this window's call site) actually does
+            // something.
             .with_inner_size(WINDOW_SIZE)
-            .with_resizable(false)
+            .with_resizable(true)
             .with_decorations(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
@@ -278,21 +290,46 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // `draw_window_chrome_with_extra` reserves space for them between
         // the title and the ✕/▢/— controls and narrows the drag zone to
         // stop where they actually start (see its doc comment).
-        match draw_window_chrome_with_extra(ui, "Deskwarden Vault", |ui| {
+        //
+        // `draw_window_chrome_with_extra` advances the cursor past the bar
+        // via `ui.advance_cursor_after_rect`, which -- per egui's own doc
+        // comment on `Ui::cursor` -- leaves the *next* widget positioned
+        // `item_spacing.y` further down than that; `advance_cursor_after_rect`
+        // itself reads `self.spacing().item_spacing` *eagerly*, at the moment
+        // it runs, and bakes that value into the cursor position it computes.
+        // So the gap this is meant to close has to be zeroed *before* the
+        // call below, not after it -- setting it afterward (as a previous fix
+        // here did) has already missed the window and does nothing. The
+        // panels drawn below (sidebar/list/detail) are the next things drawn
+        // in this same outer `ui`, so the value is restored immediately after
+        // the call returns and before any of them are shown -- left zeroed,
+        // it would silently become their ambient `item_spacing.y` too (they
+        // don't set their own), collapsing the vertical gap between e.g. the
+        // sidebar's VAULT/FOLDERS rows.
+        let saved_item_spacing_y = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        match draw_window_chrome_with_extra(ui, "Deskwarden Vault", ChromeMetrics::VAULT, true, |ui| {
             // Right-to-left: the CTRL+L chip nearest the window controls,
             // then Lock immediately to its left (so the two read left-to-
             // right as "Lock CTRL+L", per spec 4.8), then the avatar, then
             // the Sync button and its status pill innermost.
             theme::kbd_chip(ui, "CTRL+L", false);
-            if theme::secondary_button(ui, "Lock").clicked() {
+            // Design 2b's exact Lock sizing (28px tall, 8px radius) --
+            // `theme::secondary_button` is close but not exact (32px/7px),
+            // and changing its own hardcoded dimensions would affect every
+            // other caller, so this uses the dedicated `toolbar_button`
+            // helper instead, just for this one button.
+            if theme::toolbar_button(ui, "Lock").clicked() {
                 *locked_for_closure.borrow_mut() = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
             if let Some(email) = &account_email {
-                // `true` for the dark/emphasized treatment -- spec 4.8's
-                // "avatar circle AN (dark)", versus the light/muted style
-                // this used before.
-                theme::avatar(ui, &theme::initials(email), 26.0, true);
+                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
+                // draws a rounded square (used elsewhere: item-list rows,
+                // the detail pane header, neither of which were asked to
+                // change), so this is painted directly here rather than
+                // changing that shared helper's shape for every caller.
+                draw_circle_avatar(ui, &theme::initials(email));
             }
             // Manual sync: this app has nowhere that auto-syncs on a timer
             // (see `main()`'s own single startup-time `bw sync` -- everything
@@ -331,18 +368,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
         }
-
-        // `draw_window_chrome_with_extra` advances the cursor past the 40px
-        // bar via `ui.advance_cursor_after_rect`, which -- per egui's own
-        // doc comment on `Ui::cursor` -- leaves the *next* widget positioned
-        // `item_spacing.y` further down than that. The sidebar/list/detail
-        // panels below are the next things drawn in this same outer `ui`, so
-        // without this they'd start a few pixels below the bar with the
-        // chrome's `WINDOW_BG` full-window fill showing through the gap --
-        // a stray grey seam between the titlebar and the panels. Zeroing it
-        // here (rather than passing a frame margin into the panels) keeps
-        // the fix scoped to exactly the one gap it's meant to close.
-        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
 
         // Spec section 5's keyboard model for this window: Ctrl+K focuses
         // search, Ctrl+L locks, Ctrl+N opens the new-item form. Ctrl+Shift+F
@@ -682,6 +708,26 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
     std::thread::spawn(move || {
         let _ = tx.send(bw_serve::run_bw_sync(&session_token));
     });
+}
+
+/// Design 2b's titlebar avatar: a 28px circle, `theme::INK` background,
+/// white 11px Bold initials. Paints the same way `theme::avatar` does
+/// (allocate a square, paint a shape, center the text) but with a full
+/// circle instead of a rounded rect -- kept local to this one call site
+/// rather than added to `theme::avatar` itself, since that helper's rounded-
+/// square shape is still correct for its other callers (item-list rows, the
+/// detail pane header).
+fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) {
+    const SIZE: f32 = 28.0;
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(SIZE), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), SIZE / 2.0, theme::INK);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::new(11.0, egui::FontFamily::Name(theme::BOLD.into())),
+        egui::Color32::WHITE,
+    );
 }
 
 /// The toolbar sync pill's relative-time wording for a successful sync:

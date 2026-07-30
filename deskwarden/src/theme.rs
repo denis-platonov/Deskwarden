@@ -490,18 +490,52 @@ pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
     );
 }
 
-/// A small status pill: a colored dot plus text, in the toolbar's sync
-/// status style ("● Synced 1 min ago" per design spec 4.8). Written
-/// generically -- nothing here is vault-window-specific -- so any future
-/// status readout (connection state, background job progress, ...) can
-/// reuse it instead of hand-rolling another dot+label pairing.
+/// A small status pill: a bordered, fully-rounded pill (design 2b's exact
+/// "● Synced 1 min ago" toolbar readout -- `height: 28px; padding: 0 10px;
+/// border: 1px solid #eae7e7; border-radius: 999px; font-size: 12px; color:
+/// #444141`) with a colored dot plus text. Written generically -- nothing
+/// here is vault-window-specific -- so any future status readout
+/// (connection state, background job progress, ...) can reuse it instead of
+/// hand-rolling another dot+label pairing.
+///
+/// `dot_color` is the only thing that varies per status; the pill's own
+/// border/background/text color stay fixed to the design regardless of
+/// state (the design only ever shows the dot itself changing meaning --
+/// blue for synced, this app's error red for failed, a ghost tone while in
+/// flight).
 pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 5.0;
-        let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
-        ui.painter().circle_filled(dot_rect.center(), 3.0, dot_color);
-        ui.label(RichText::new(text).size(11.0).color(TEXT_GHOST));
-    });
+    const HEIGHT: f32 = 28.0;
+    const PAD_X: f32 = 10.0;
+    const GAP: f32 = 6.0;
+    const DOT_DIAMETER: f32 = 7.0;
+
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::new(12.0, FontFamily::Proportional),
+        TEXT_SECONDARY,
+    );
+    let content_width = DOT_DIAMETER + GAP + galley.size().x;
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(content_width + PAD_X * 2.0, HEIGHT),
+        Sense::hover(),
+    );
+
+    // `border-radius: 999px` on a fixed-height pill is shorthand for "fully
+    // rounded" -- half the height is the largest radius that still reads as
+    // a stadium shape rather than clipping the corners.
+    let rounding = CornerRadius::same((HEIGHT / 2.0) as u8);
+    ui.painter()
+        .rect_stroke(rect, rounding, Stroke::new(1.0, HAIRLINE), StrokeKind::Inside);
+
+    let dot_center = Pos2::new(rect.min.x + PAD_X + DOT_DIAMETER / 2.0, rect.center().y);
+    ui.painter()
+        .circle_filled(dot_center, DOT_DIAMETER / 2.0, dot_color);
+
+    let text_pos = Pos2::new(
+        dot_center.x + DOT_DIAMETER / 2.0 + GAP,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(text_pos, galley, TEXT_SECONDARY);
 }
 
 /// A small monospace keyboard-hint chip ("↵", "CTRL+N"). `on_primary` is the
@@ -580,6 +614,26 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
             .stroke(Stroke::new(1.0, BORDER_STRONG))
             .corner_radius(CornerRadius::same(7))
             .min_size(Vec2::new(0.0, 32.0)),
+    )
+}
+
+/// The vault window titlebar's compact outlined button (design 2b's Lock:
+/// `height: 28px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius:
+/// 8px; font-size: 12px; font-weight: 600`). [`secondary_button`] is close
+/// but not exact (32px tall, 7px radius, 13px text) -- its own hardcoded
+/// dimensions are shared by every other caller in the app, so rather than
+/// change those for everyone, this is a separate, smaller variant sized to
+/// this one spot. The 12px horizontal padding comes from the ambient
+/// `style.spacing.button_padding` (`theme::apply` sets it to `(12.0, 6.0)`)
+/// the same way `secondary_button`'s does -- only the forced min height,
+/// corner radius, and text size differ here.
+pub fn toolbar_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(semibold(label, 12.0).color(INK))
+            .fill(CARD)
+            .stroke(Stroke::new(1.0, BORDER_STRONG))
+            .corner_radius(CornerRadius::same(8))
+            .min_size(Vec2::new(0.0, 28.0)),
     )
 }
 

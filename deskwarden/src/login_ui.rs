@@ -1,7 +1,7 @@
 use crate::bw_path::bw_command;
 use crate::hello::{self, HelloState};
 use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
+use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
 use std::cell::RefCell;
 use std::rc::Rc;
 use zeroize::Zeroize;
@@ -271,6 +271,57 @@ pub enum ChromeAction {
     Close,
 }
 
+/// Sizing/color knobs for [`draw_window_chrome_with_extra`]'s bar, mark, and
+/// title. The login window (design 3h) and the vault window (design 2b)
+/// share every other line of the chrome-painting logic but use different
+/// exact values for these -- rather than duplicate the whole function per
+/// window, this is the one part that varies, passed in instead of
+/// hardcoded.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromeMetrics {
+    pub bar_height: f32,
+    /// Left padding from the bar's left edge to the mark.
+    pub left_padding: f32,
+    pub mark_size: Vec2,
+    pub title_font_size: f32,
+    /// [`theme::SEMIBOLD`] or [`theme::BOLD`].
+    pub title_family: &'static str,
+    pub title_color: Color32,
+    /// Width of each of the three ✕/▢/— control zones.
+    pub control_width: f32,
+}
+
+impl ChromeMetrics {
+    /// Design 3h (login/unlock window): 40px bar, 14px left padding, 15×17
+    /// mark, 12px SemiBold title in `TEXT_SECONDARY`, 40px control zones.
+    pub const LOGIN: Self = Self {
+        bar_height: 40.0,
+        left_padding: 14.0,
+        mark_size: Vec2::new(15.0, 17.0),
+        title_font_size: 12.0,
+        title_family: theme::SEMIBOLD,
+        title_color: theme::TEXT_SECONDARY,
+        control_width: 40.0,
+    };
+
+    /// Design 2b (vault window): 46px bar, 16px left padding, 22×22 mark,
+    /// 14px Bold title. The design's title `<div>` carries no explicit
+    /// `color`, unlike the login window's (`#444141`/`TEXT_SECONDARY`) --
+    /// it inherits the page's default body text color (`#201e1d`/`INK`,
+    /// set on `html, body` in `Deskwarden.dc.html`), so that's what this
+    /// uses. 42px control zones (design: `width: 42px` per — /▢/✕ cell,
+    /// versus the login window's 40px).
+    pub const VAULT: Self = Self {
+        bar_height: 46.0,
+        left_padding: 16.0,
+        mark_size: Vec2::new(22.0, 22.0),
+        title_font_size: 14.0,
+        title_family: theme::BOLD,
+        title_color: theme::INK,
+        control_width: 42.0,
+    };
+}
+
 /// Draws 3h's window chrome — the design's titlebar is a custom white bar
 /// (15×17 mark, 12px title, ghost window controls), which the native
 /// Windows frame cannot be themed into, so the window runs frameless and
@@ -280,30 +331,40 @@ pub enum ChromeAction {
 /// rounding comes from DWM (see [`round_window_corners`]).
 ///
 /// Thin wrapper around [`draw_window_chrome_with_extra`] with no extra
-/// content — see that function for the shared implementation.
+/// content, [`ChromeMetrics::LOGIN`]'s sizing, and `maximizable: false` --
+/// this window is fixed-size, so ▢ stays the inert, ghosted affordance it
+/// has always been. See that function for the shared implementation.
 pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
-    draw_window_chrome_with_extra(ui, title, |_ui| {})
+    draw_window_chrome_with_extra(ui, title, ChromeMetrics::LOGIN, false, |_ui| {})
 }
 
 /// Same as [`draw_window_chrome`], but calls `extra_content` to draw
 /// additional widgets in the bar between the title and the window controls
 /// (used by the vault window's toolbar buttons: Lock, the account avatar,
-/// and Sync). `extra_content` is laid out right-to-left, packed against the
-/// left edge of the window-control zones, so it reads as continuing
-/// naturally into ✕/▢/—. The draggable region is shrunk to end where
-/// `extra_content`'s actually-rendered content begins (not just the
-/// reserved area for it), so clicking those widgets doesn't also start
-/// dragging the window; when `extra_content` draws nothing (the plain
-/// [`draw_window_chrome`] case above) the drag zone is unchanged from
-/// before this function existed.
+/// and Sync), paints the bar/mark/title per `metrics` (see
+/// [`ChromeMetrics`]), and -- when `maximizable` is true -- makes the ▢
+/// control a real, clickable maximize/restore toggle instead of the
+/// permanently-ghosted affordance both windows used to show unconditionally.
+/// `extra_content` is laid out right-to-left, packed against the left edge
+/// of the window-control zones, so it reads as continuing naturally into
+/// ✕/▢/—. The draggable region is shrunk to end where `extra_content`'s
+/// actually-rendered content begins (not just the reserved area for it), so
+/// clicking those widgets doesn't also start dragging the window; when
+/// `extra_content` draws nothing (the plain [`draw_window_chrome`] case
+/// above) the drag zone is unchanged from before this function existed.
 pub fn draw_window_chrome_with_extra(
     ui: &mut egui::Ui,
     title: &str,
+    metrics: ChromeMetrics,
+    maximizable: bool,
     extra_content: impl FnOnce(&mut egui::Ui),
 ) -> ChromeAction {
     let mut action = ChromeAction::None;
     let full = ui.max_rect();
-    let bar = egui::Rect::from_min_max(full.min, egui::Pos2::new(full.max.x, full.min.y + 40.0));
+    let bar = egui::Rect::from_min_max(
+        full.min,
+        egui::Pos2::new(full.max.x, full.min.y + metrics.bar_height),
+    );
 
     // Backgrounds first: window body, titlebar, hairline.
     ui.painter()
@@ -322,26 +383,33 @@ pub fn draw_window_chrome_with_extra(
         egui::StrokeKind::Inside,
     );
 
-    // Left: the mark and the title (3h: 15×17 mark, 12px 600 title).
+    // Left: the mark and the title, sized/colored per `metrics`.
     let mark_rect = egui::Rect::from_min_size(
-        egui::Pos2::new(bar.min.x + 14.0, bar.center().y - 8.5),
-        egui::Vec2::new(15.0, 17.0),
+        egui::Pos2::new(
+            bar.min.x + metrics.left_padding,
+            bar.center().y - metrics.mark_size.y / 2.0,
+        ),
+        metrics.mark_size,
     );
     theme::paint_mark(ui.painter(), mark_rect);
     ui.painter().text(
         egui::Pos2::new(mark_rect.right() + 10.0, bar.center().y),
         egui::Align2::LEFT_CENTER,
         title,
-        egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::TEXT_SECONDARY,
+        egui::FontId::new(
+            metrics.title_font_size,
+            egui::FontFamily::Name(metrics.title_family.into()),
+        ),
+        metrics.title_color,
     );
 
-    // Right: the three 40px control zones. Glyphs are drawn, not typed, so
-    // they can't fall through to a fallback font's rendition.
+    // Right: the three control zones (40px login, 42px vault). Glyphs are
+    // drawn, not typed, so they can't fall through to a fallback font's
+    // rendition.
     let control = |i: usize| {
         egui::Rect::from_min_max(
-            egui::Pos2::new(bar.max.x - 40.0 * (i + 1) as f32, bar.min.y + 1.0),
-            egui::Pos2::new(bar.max.x - 40.0 * i as f32, bar.max.y - 1.0),
+            egui::Pos2::new(bar.max.x - metrics.control_width * (i + 1) as f32, bar.min.y + 1.0),
+            egui::Pos2::new(bar.max.x - metrics.control_width * i as f32, bar.max.y - 1.0),
         )
     };
     let controls_left = control(2).min.x;
@@ -394,15 +462,43 @@ pub fn draw_window_chrome_with_extra(
         action = ChromeAction::Close;
     }
 
-    // Maximize (▢) — drawn but inert: the window is fixed-size, so the
-    // affordance is shown ghosted with no hover or click.
+    // Maximize (▢). When `maximizable` (the vault window): the same active
+    // glyph/hover treatment as ✕/— below, and a click toggles the OS-level
+    // maximized state. The current state is queried fresh from
+    // `ViewportInfo::maximized` on every click rather than tracked in a
+    // local flag here -- this function has no persistent state of its own,
+    // and querying avoids this control ever drifting out of sync with a
+    // maximize/restore that happened some other way (e.g. a taskbar
+    // action). When not `maximizable` (the login window, which is
+    // fixed-size): unchanged from before -- drawn ghosted, with no hover or
+    // click handler at all.
     let max_rect = control(1);
-    ui.painter().rect_stroke(
-        egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
-        CornerRadius::ZERO,
-        Stroke::new(1.2, theme::TEXT_GHOST),
-        egui::StrokeKind::Middle,
-    );
+    if maximizable {
+        let maximize = ui.interact(max_rect, ui.id().with("chrome-max"), Sense::click());
+        if maximize.hovered() {
+            ui.painter()
+                .rect_filled(max_rect, CornerRadius::ZERO, theme::CANVAS);
+        }
+        ui.painter().rect_stroke(
+            egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
+            CornerRadius::ZERO,
+            glyph_stroke,
+            egui::StrokeKind::Middle,
+        );
+        if maximize.clicked() {
+            let currently_maximized =
+                ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!currently_maximized));
+        }
+    } else {
+        ui.painter().rect_stroke(
+            egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
+            CornerRadius::ZERO,
+            Stroke::new(1.2, theme::TEXT_GHOST),
+            egui::StrokeKind::Middle,
+        );
+    }
 
     // Minimize (—).
     let min_rect = control(2);
