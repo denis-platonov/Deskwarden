@@ -33,14 +33,19 @@ pub struct LoginData {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
-/// One entry of `login.uris`. Only the URI itself is modelled -- `bw`'s
-/// match-strategy field on each entry is preserved through `VaultItem.other`
-/// via the top-level flatten, same as everything else this struct doesn't
-/// name.
+/// One entry of `login.uris`. `bw`'s match-strategy field (`match`) on each
+/// entry is not modelled here, so `UriEntry` needs its own `other` flatten
+/// for the same reason `LoginData.other` and `VaultItem.other` exist:
+/// `#[serde(flatten)]` only captures unknown keys at the level of the struct
+/// it's declared on, so `VaultItem`'s or `LoginData`'s flatten cannot reach
+/// into the elements of this nested `Vec` -- without its own flatten field,
+/// unmodelled keys on a URI entry would be silently dropped on write.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UriEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -368,6 +373,29 @@ mod tests {
         assert_eq!(value["login"]["totp"], serde_json::json!("seed"));
         assert_eq!(value["login"]["uris"], serde_json::json!([{"uri":"x"}]));
         assert_eq!(value["login"]["username"], serde_json::json!("u"));
+    }
+
+    #[test]
+    fn uri_entry_extras_survive_a_round_trip() {
+        // `bw serve`'s login URI entries carry a `match` key (the per-URI
+        // match-detection strategy) alongside `uri`. Without its own
+        // `#[serde(flatten)] other` field, `UriEntry` would silently drop
+        // `match` on every write -- including the app-match-saving path
+        // exercised here via `with_app_match`.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],
+                "login":{"username":"u","uris":[{"uri":"https://x.com","match":2}]}}"#,
+        )
+        .unwrap();
+        let m = AppMatch {
+            process: "a.exe".into(),
+            trigger: TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert_eq!(
+            value["login"]["uris"],
+            serde_json::json!([{"uri": "https://x.com", "match": 2}])
+        );
     }
 
     #[test]
