@@ -80,7 +80,12 @@ pub fn draw_detail_read(
                 action = DetailAction::Fill;
             }
             let (delete_label, delete_hover, delete_color) = if delete_pending {
-                ("Delete? Click to confirm", "Click again to permanently delete this item", theme::ERROR)
+                (
+                    "Delete? Click to confirm",
+                    "Click again to delete this item. It may still be recoverable from \
+                     bitwarden.com or another Bitwarden client afterward.",
+                    theme::ERROR,
+                )
             } else {
                 ("Delete", "Delete this item", theme::INK)
             };

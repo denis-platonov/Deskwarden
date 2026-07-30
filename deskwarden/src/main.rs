@@ -281,6 +281,17 @@ fn main() {
     let entries = match_entries(&items);
     log::info!("match engine loaded with {} app match(es)", entries.len());
     engine.rebuild(&entries);
+    // `items` is not read again after this point. Without dropping it
+    // explicitly, this plain top-level `let` in `main()`'s body would keep
+    // the entire deserialized vault (potentially thousands of items, each
+    // carrying a serde_json::Map "other" catch-all) resident for the rest of
+    // the process's life -- and this app spends nearly all its runtime idle
+    // in the tray with no window open, so that would be pure waste paid at
+    // idle, not just at startup. Contrast `app::refresh_match_engine`, whose
+    // own local `items` is already dropped correctly by ordinary scoping
+    // because it's a small function that returns right after building
+    // `entries`.
+    drop(items);
 
     let injector = Injector {
         ui: RealUiAutomation,
@@ -683,6 +694,10 @@ fn main() {
                                                 entries.len()
                                             );
                                             engine.rebuild(&entries);
+                                            // See the `drop(items)` at startup, above, for why:
+                                            // `items` is not read again after this point and
+                                            // this app is idle far more than it's active.
+                                            drop(items);
                                             consecutive_refresh_failures = 0;
                                         }
                                         Err(e) => {

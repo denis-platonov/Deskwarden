@@ -51,6 +51,16 @@ const TOTP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// item delete (see `confirm_click`).
 const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 
+/// Minimum time that must pass between the arming click and the confirming
+/// click before a second click on the same id is actually treated as a
+/// confirmation. Without this, a habitual double-click delivers both clicks
+/// to egui within the same (or an adjacent) frame, so the intermediate
+/// "armed, click again" state is never actually seen on screen before the
+/// delete already fires -- defeating the entire point of the two-click
+/// confirmation. This is a *lower* bound on top of `DELETE_CONFIRM_WINDOW`'s
+/// existing upper bound (the arm still expires after that long either way).
+const MIN_CONFIRM_DWELL: Duration = Duration::from_millis(300);
+
 pub struct VaultWindowResult {
     pub locked: bool,
 }
@@ -112,6 +122,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // second click can't start a second concurrent sync -- same guard
     // `main.rs` uses for its update-apply flow.
     let mut sync_in_progress = false;
+    // True once the auto-sync below has fired. The window's first paint
+    // shows whatever's already cached locally -- exactly like the Sync
+    // button, this never blocks on the sync itself -- but the vault is
+    // otherwise only refreshed via that manual button (see its comment) or
+    // this app's single startup-time `bw sync`, so a change made on another
+    // device since then wouldn't show up here without either. Syncing once,
+    // automatically, the first time this window opens closes that gap
+    // without needing a click.
+    let mut auto_synced = false;
 
     let mut items: Vec<VaultItem> = vault.list_items().unwrap_or_default();
     let mut folders: Vec<Folder> = vault.list_folders().unwrap_or_default();
@@ -143,10 +162,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // Two-click "delete" confirmation state, shared in *pattern* (not
     // storage -- each button owns its own slot so arming one doesn't
     // disturb the other) by the sidebar's per-folder × button and the
-    // detail pane's item Delete button. `(id, expires_at)`: a second click
-    // on the same id before `expires_at` confirms the delete; anything else
-    // (a different id, or the window elapsing) just (re)arms it. See
-    // `confirm_click`.
+    // detail pane's item Delete button. `(id, armed_at)`: a second click on
+    // the same id, at least `MIN_CONFIRM_DWELL` but less than
+    // `DELETE_CONFIRM_WINDOW` after `armed_at`, confirms the delete;
+    // anything else (a different id, too fast, or the window elapsing) just
+    // (re)arms it. See `confirm_click`.
     let mut folder_delete_pending: Option<(String, Instant)> = None;
     let mut item_delete_pending: Option<(String, Instant)> = None;
 
@@ -167,6 +187,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // Fires once, on the window's first *real* frame (after the guard
+        // above, so fonts are ready) -- not before the window paints:
+        // `spawn_vault_sync` only starts a background thread and returns
+        // immediately, so this doesn't delay the frame it runs in, and the
+        // window shows whatever's already cached locally right away. The
+        // result is applied silently by the same `sync_rx` drain the Sync
+        // button's click already uses, below -- no special "just synced" UI
+        // beyond the existing `sync_status`/`sync_in_progress` labels.
+        if !auto_synced {
+            auto_synced = true;
+            sync_in_progress = true;
+            spawn_vault_sync(sync_tx.clone(), session_token.clone());
         }
 
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
@@ -279,11 +313,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             .clicked();
                         if sync_clicked && !sync_in_progress {
                             sync_in_progress = true;
-                            let tx = sync_tx.clone();
-                            let token = session_token.clone();
-                            std::thread::spawn(move || {
-                                let _ = tx.send(bw_serve::run_bw_sync(&token));
-                            });
+                            spawn_vault_sync(sync_tx.clone(), session_token.clone());
                         }
                         if sync_in_progress {
                             ui.label(RichText::new("Syncing…").size(11.0).color(theme::TEXT_GHOST));
@@ -302,8 +332,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // show the sidebar this frame -- `is_armed` does this too on the
         // click path, but the display needs it checked independently since
         // it runs whether or not a click happened this frame.
-        if let Some((_, expires_at)) = folder_delete_pending {
-            if Instant::now() >= expires_at {
+        if let Some((_, armed_at)) = folder_delete_pending {
+            if Instant::now() >= armed_at + DELETE_CONFIRM_WINDOW {
                 folder_delete_pending = None;
             }
         }
@@ -428,8 +458,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
                             // Auto-expire a stale armed item delete the same
                             // way the sidebar's folder delete does above.
-                            if let Some((_, expires_at)) = item_delete_pending {
-                                if Instant::now() >= expires_at {
+                            if let Some((_, armed_at)) = item_delete_pending {
+                                if Instant::now() >= armed_at + DELETE_CONFIRM_WINDOW {
                                     item_delete_pending = None;
                                 }
                             }
@@ -570,6 +600,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     VaultWindowResult { locked }
 }
 
+/// Spawns a one-shot background thread that runs `bw sync` and reports the
+/// outcome over `tx`. Shared by both the Sync button's click handler and the
+/// window's own auto-sync-on-open (see `run`, right after the `styled`
+/// first-frame guard) so the actual thread-spawn logic exists in exactly one
+/// place instead of being duplicated between them; the caller is still
+/// responsible for setting `sync_in_progress` before calling this, same as
+/// before this was extracted.
+fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String) {
+    std::thread::spawn(move || {
+        let _ = tx.send(bw_serve::run_bw_sync(&session_token));
+    });
+}
+
 /// Spawns a one-shot background thread to fetch and decode `domain`'s
 /// favicon, sending the result back over `tx`. A bare `thread::spawn` (not
 /// `thread::scope`) because the result travels back over an owned channel
@@ -584,15 +627,16 @@ fn spawn_favicon_fetch(item_id: String, domain: String, server_url: Option<Strin
     });
 }
 
-/// True when `pending` is currently armed for `id` -- i.e. a delete-button
-/// click on `id` right now would be a *confirming* second click, not the
-/// first arming click. Also clears `pending` once it has expired, so a
-/// stale arm from several seconds ago can never be silently confirmed by an
-/// unrelated later click.
-fn is_armed(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
+/// True when `pending` is currently armed for `id` as of `now` -- i.e. a
+/// delete-button click on `id` at `now` would be on the same id as the
+/// arming click and within `DELETE_CONFIRM_WINDOW` of it (the dwell-time
+/// floor is checked separately, by the caller). Also clears `pending` once
+/// it has expired, so a stale arm from several seconds ago can never be
+/// silently confirmed by an unrelated later click.
+fn is_armed_at(pending: &mut Option<(String, Instant)>, id: &str, now: Instant) -> bool {
     match pending {
-        Some((pending_id, expires_at)) => {
-            if Instant::now() >= *expires_at {
+        Some((pending_id, armed_at)) => {
+            if now >= *armed_at + DELETE_CONFIRM_WINDOW {
                 *pending = None;
                 false
             } else {
@@ -603,20 +647,41 @@ fn is_armed(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
     }
 }
 
-/// Handles one click on a click-to-delete button for `id`. The first click
-/// arms a `DELETE_CONFIRM_WINDOW`-second confirmation and returns `false`
-/// (don't delete yet); a second click on the *same* `id` within that window
-/// confirms it -- clears `pending` and returns `true`, telling the caller
-/// to actually perform the delete. A click on a different id (or after the
-/// window elapsed) just (re)arms that id instead of confirming anything.
-fn confirm_click(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
-    if is_armed(pending, id) {
-        *pending = None;
-        true
+/// Handles one click, at `now`, on a click-to-delete button for `id`.
+///
+/// The first click arms a `DELETE_CONFIRM_WINDOW`-long confirmation (storing
+/// `now` as when it was armed) and returns `false` (don't delete yet). A
+/// second click on the *same* `id`, within that window, only counts as the
+/// *confirming* click -- clearing `pending` and returning `true` -- once at
+/// least `MIN_CONFIRM_DWELL` has passed since the arming click; egui
+/// delivers both clicks of a fast double-click within the same or adjacent
+/// frames, so without this floor a habitual double-click would arm and
+/// confirm before the user ever saw the intermediate "armed, click again"
+/// state, defeating the confirmation entirely. A click on the same id that's
+/// too fast, on a different id, or after the window has elapsed just
+/// (re)arms `id` instead of confirming anything.
+fn confirm_click_at(pending: &mut Option<(String, Instant)>, id: &str, now: Instant) -> bool {
+    if is_armed_at(pending, id, now) {
+        let armed_at = pending.as_ref().map(|(_, armed_at)| *armed_at).expect(
+            "is_armed_at only returns true when pending is Some, so this is always populated",
+        );
+        if now.saturating_duration_since(armed_at) >= MIN_CONFIRM_DWELL {
+            *pending = None;
+            true
+        } else {
+            false
+        }
     } else {
-        *pending = Some((id.to_string(), Instant::now() + DELETE_CONFIRM_WINDOW));
+        *pending = Some((id.to_string(), now));
         false
     }
+}
+
+/// [`confirm_click_at`] using the real clock. Split out so tests can drive
+/// `confirm_click_at` with synthetic `Instant`s instead of relying on real
+/// `std::thread::sleep` calls to exercise `MIN_CONFIRM_DWELL`.
+fn confirm_click(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
+    confirm_click_at(pending, id, Instant::now())
 }
 
 /// True when `url` is safe to hand off to the shell to open: an `http://`
@@ -652,6 +717,11 @@ fn webbrowser_open(url: &str) {
         log::warn!("refusing to open non-http(s) URL from vault data: {url}");
         return;
     }
+    // Trimmed, not the raw `url`: `is_safe_web_url` validates `url.trim()`
+    // (leading/trailing whitespace can't change a scheme check's verdict),
+    // and the two should agree on which string is "the URL" -- validate and
+    // use the same value rather than checking one and opening the other.
+    let url = url.trim();
     let wide_url: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
     let wide_verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
     // Safety: `wide_url`/`wide_verb` are NUL-terminated UTF-16 buffers kept
@@ -717,7 +787,8 @@ mod url_safety_tests {
 
 #[cfg(test)]
 mod delete_confirm_tests {
-    use super::confirm_click;
+    use super::{confirm_click, confirm_click_at, DELETE_CONFIRM_WINDOW, MIN_CONFIRM_DWELL};
+    use std::time::Instant;
 
     #[test]
     fn first_click_arms_but_does_not_confirm() {
@@ -727,19 +798,94 @@ mod delete_confirm_tests {
     }
 
     #[test]
-    fn second_click_on_the_same_id_confirms_and_disarms() {
+    fn second_click_on_the_same_id_after_the_dwell_confirms_and_disarms() {
+        let start = Instant::now();
         let mut pending = None;
-        assert!(!confirm_click(&mut pending, "f1"));
-        assert!(confirm_click(&mut pending, "f1"));
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        // Comfortably past MIN_CONFIRM_DWELL but still well inside
+        // DELETE_CONFIRM_WINDOW.
+        let later = start + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1);
+        assert!(confirm_click_at(&mut pending, "f1", later));
         assert!(pending.is_none());
     }
 
     #[test]
     fn a_click_on_a_different_id_rearms_instead_of_confirming() {
+        let start = Instant::now();
         let mut pending = None;
-        assert!(!confirm_click(&mut pending, "f1"));
-        assert!(!confirm_click(&mut pending, "f2"));
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        let later = start + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1);
+        assert!(!confirm_click_at(&mut pending, "f2", later));
         // f2 is now armed, not f1 -- confirming f1 again should just re-arm it.
-        assert!(!confirm_click(&mut pending, "f1"));
+        assert!(!confirm_click_at(
+            &mut pending,
+            "f1",
+            later + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1)
+        ));
+    }
+
+    // -- Fix: a fast double-click must not arm and confirm in one gesture --
+    //
+    // egui delivers both clicks of a rapid double-click within the same (or
+    // an adjacent) frame, so the two `confirm_click` calls land only
+    // microseconds apart in real time -- far under `MIN_CONFIRM_DWELL`. The
+    // pre-fix implementation treated any second click on the same id within
+    // `DELETE_CONFIRM_WINDOW` as confirming, so a habitual double-click could
+    // arm and confirm a delete before the "armed, click again" state was
+    // ever rendered. These tests exercise that exact timing directly, via
+    // synthetic `Instant`s, without needing a real sleep or an egui context.
+
+    #[test]
+    fn a_second_click_faster_than_the_dwell_window_does_not_confirm() {
+        let start = Instant::now();
+        let mut pending = None;
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        // Simulates both clicks of a fast double-click landing in the same
+        // frame: well under MIN_CONFIRM_DWELL after the arming click.
+        let too_soon = start + std::time::Duration::from_millis(1);
+        assert!(!confirm_click_at(&mut pending, "f1", too_soon));
+        // Still armed for f1, not silently dropped -- the user gets another
+        // chance to actually see the armed state and confirm it for real.
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn a_click_exactly_at_the_dwell_boundary_confirms() {
+        let start = Instant::now();
+        let mut pending = None;
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        let at_boundary = start + MIN_CONFIRM_DWELL;
+        assert!(confirm_click_at(&mut pending, "f1", at_boundary));
+    }
+
+    #[test]
+    fn a_click_still_too_fast_after_a_rearm_still_does_not_confirm() {
+        // Arm, then immediately click again (too fast -- stays armed per the
+        // test above), then click again immediately once more: still too
+        // fast relative to the *original* arming click, so this must still
+        // not confirm.
+        let start = Instant::now();
+        let mut pending = None;
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        let too_soon = start + std::time::Duration::from_millis(1);
+        assert!(!confirm_click_at(&mut pending, "f1", too_soon));
+        let still_too_soon = start + std::time::Duration::from_millis(2);
+        assert!(!confirm_click_at(&mut pending, "f1", still_too_soon));
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn confirmation_still_expires_after_delete_confirm_window() {
+        // The dwell floor is additive, not a replacement for the existing
+        // upper bound: an arm still lapses after DELETE_CONFIRM_WINDOW, well
+        // past MIN_CONFIRM_DWELL, and a "confirming" click that arrives only
+        // after the window elapsed just re-arms instead.
+        let start = Instant::now();
+        let mut pending = None;
+        assert!(!confirm_click_at(&mut pending, "f1", start));
+        let after_window = start + DELETE_CONFIRM_WINDOW + std::time::Duration::from_millis(1);
+        assert!(!confirm_click_at(&mut pending, "f1", after_window));
+        // Re-armed, not confirmed or empty.
+        assert!(pending.is_some());
     }
 }
