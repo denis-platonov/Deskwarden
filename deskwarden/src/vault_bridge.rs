@@ -129,6 +129,28 @@ struct FolderList {
     data: Vec<Folder>,
 }
 
+/// The minimal payload to create a new Login item. `bw serve`'s create
+/// endpoint wants a full item shape (like the edit endpoint), but a brand
+/// new item has nothing else to preserve, unlike `update_item`.
+#[derive(Debug, Clone)]
+pub struct NewLoginItem {
+    pub name: String,
+    pub username: String,
+    pub password: String,
+    pub folder_id: Option<String>,
+}
+
+/// `GET /object/totp/{id}` wraps its answer the same way `list_items` and
+/// `list_folders` do: the envelope's `data` is itself an object carrying a
+/// nested `data` field, not the bare value. `Envelope<Option<String>>` would
+/// try to deserialize that nested object directly as an `Option<String>` and
+/// fail on the very success case it's meant to handle -- so it needs this
+/// wrapper, same as `ItemList`/`FolderList`.
+#[derive(Deserialize)]
+struct TotpData {
+    data: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct VaultBridge {
     base_url: String,
@@ -184,14 +206,89 @@ impl VaultBridge {
     }
 
     pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
-        let updated = with_app_match(item, m);
+        self.update_item(&with_app_match(item, m))
+    }
 
+    pub fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+        let url = format!("{}/object/folder", self.base_url);
+        let body: Envelope<Folder> = self
+            .agent
+            .post(&url)
+            .send_json(serde_json::json!({ "name": name }))
+            .map_err(|e| VaultError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
+    }
+
+    pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/object/folder/{}", self.base_url, id);
+        self.agent
+            .delete(&url)
+            .call()
+            .map_err(|e| VaultError::Http(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
+        let url = format!("{}/object/item", self.base_url);
+        let payload = serde_json::json!({
+            "name": new_item.name,
+            "type": 1,
+            "folderId": new_item.folder_id,
+            "login": {
+                "username": new_item.username,
+                "password": new_item.password,
+            },
+        });
+        let body: Envelope<VaultItem> = self
+            .agent
+            .post(&url)
+            .send_json(payload)
+            .map_err(|e| VaultError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
+    }
+
+    /// Writes `item` back as its own new state -- the same PUT `set_app_match`
+    /// already used, generalized so the vault window's edit flow doesn't need
+    /// its own copy of it.
+    pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, item.id);
         self.agent
             .put(&url)
-            .send_json(&updated)
+            .send_json(item)
             .map_err(|e| VaultError::Http(e.to_string()))?;
         Ok(())
+    }
+
+    pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/object/item/{}", self.base_url, id);
+        self.agent
+            .delete(&url)
+            .call()
+            .map_err(|e| VaultError::Http(e.to_string()))?;
+        Ok(())
+    }
+
+    /// `None` when the item has no TOTP secret configured -- `bw serve`
+    /// answers that with a non-2xx rather than a null payload, so any HTTP
+    /// failure here is treated as "no code" rather than propagated as
+    /// `VaultError`. A *parse* failure on an actual 2xx response still is one:
+    /// that would mean `bw serve` changed shape under us, worth surfacing.
+    pub fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
+        let url = format!("{}/object/totp/{}", self.base_url, id);
+        match self.agent.get(&url).call() {
+            Ok(response) => {
+                let body: Envelope<TotpData> = response
+                    .into_json()
+                    .map_err(|e| VaultError::Parse(e.to_string()))?;
+                Ok(body.data.data)
+            }
+            Err(ureq::Error::Status(_, _)) => Ok(None),
+            Err(e) => Err(VaultError::Http(e.to_string())),
+        }
     }
 }
 
@@ -513,5 +610,91 @@ mod tests {
 
         assert_eq!(folders.len(), 2);
         assert_eq!(folders[0].name, "Engineering");
+    }
+
+    #[test]
+    fn create_folder_posts_and_parses_the_new_folder() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/folder")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"f3","name":"Shared"}}"#)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let folder = bridge.create_folder("Shared").unwrap();
+        assert_eq!(folder.id, "f3");
+    }
+
+    #[test]
+    fn delete_folder_calls_the_delete_endpoint() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("DELETE", "/object/folder/f3").with_status(200).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(bridge.delete_folder("f3").is_ok());
+    }
+
+    #[test]
+    fn create_item_posts_a_login_shaped_payload() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"9","name":"New","type":1,"fields":[],
+                "login":{"username":"u","password":"p"}}}"#)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewLoginItem {
+            name: "New".into(),
+            username: "u".into(),
+            password: "p".into(),
+            folder_id: None,
+        };
+        let created = bridge.create_item(&new_item).unwrap();
+        assert_eq!(created.id, "9");
+        assert_eq!(created.login.unwrap().username.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn update_item_puts_the_full_item_state() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let bridge = VaultBridge::new(server.url());
+        let item: VaultItem = serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
+        assert!(bridge.update_item(&item).is_ok());
+    }
+
+    #[test]
+    fn delete_item_calls_the_delete_endpoint() {
+        let mut server = mockito::Server::new();
+        let _m = server.mock("DELETE", "/object/item/1").with_status(200).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(bridge.delete_item("1").is_ok());
+    }
+
+    #[test]
+    fn get_totp_returns_the_current_code() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/object/totp/1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":"482913"}}"#)
+            .create();
+        let bridge = VaultBridge::new(server.url());
+        assert_eq!(bridge.get_totp("1").unwrap(), Some("482913".to_string()));
+    }
+
+    #[test]
+    fn get_totp_returns_none_when_the_item_has_no_totp() {
+        // bw serve answers a 400 for an item with no TOTP secret configured --
+        // that's an expected "no code", not a real error.
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/object/totp/2").with_status(400).create();
+        let bridge = VaultBridge::new(server.url());
+        assert_eq!(bridge.get_totp("2").unwrap(), None);
     }
 }
