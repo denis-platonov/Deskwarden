@@ -25,8 +25,22 @@ pub struct LoginData {
     pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uris: Vec<UriEntry>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// One entry of `login.uris`. Only the URI itself is modelled -- `bw`'s
+/// match-strategy field on each entry is preserved through `VaultItem.other`
+/// via the top-level flatten, same as everything else this struct doesn't
+/// name.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UriEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -40,6 +54,13 @@ pub struct VaultItem {
     /// endpoint would treat as new state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<LoginData>,
+    /// Raw `bw` item type: 1=Login, 2=SecureNote, 3=Card, 4=Identity.
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<i64>,
+    #[serde(rename = "folderId", default, skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<String>,
+    #[serde(default)]
+    pub favorite: bool,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }
@@ -92,6 +113,17 @@ struct ItemList {
     data: Vec<VaultItem>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+struct FolderList {
+    data: Vec<Folder>,
+}
+
 #[derive(Clone)]
 pub struct VaultBridge {
     base_url: String,
@@ -134,6 +166,18 @@ impl VaultBridge {
         Ok(body.data)
     }
 
+    pub fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
+        let url = format!("{}/list/object/folders", self.base_url);
+        let body: Envelope<FolderList> = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| VaultError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data.data)
+    }
+
     pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
         let updated = with_app_match(item, m);
 
@@ -161,6 +205,9 @@ mod tests {
                 value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
             }],
             login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
             other: serde_json::Map::new(),
         };
         let m = extract_app_match(&item).unwrap();
@@ -175,6 +222,9 @@ mod tests {
             name: "Other".into(),
             fields: vec![],
             login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
             other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
@@ -190,6 +240,9 @@ mod tests {
                 value: Some("not json".into()),
             }],
             login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
             other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
@@ -368,4 +421,69 @@ mod tests {
     }
 
     const APP_MATCH_FIELD_NAME_FOR_TEST: &str = crate::app_match::APP_MATCH_FIELD_NAME;
+
+    #[test]
+    fn typed_fields_round_trip_through_real_bw_shapes() {
+        let json = r#"{
+            "id": "1", "name": "Ledgerline", "type": 1, "favorite": true,
+            "folderId": "f1", "fields": [],
+            "login": {"username": "a", "password": "b", "totp": "SEED123",
+                       "uris": [{"uri": "https://app.ledgerline.com"}]}
+        }"#;
+        let item: VaultItem = serde_json::from_str(json).unwrap();
+        assert_eq!(item.item_type, Some(1));
+        assert_eq!(item.folder_id.as_deref(), Some("f1"));
+        assert!(item.favorite);
+        let login = item.login.unwrap();
+        assert_eq!(login.totp.as_deref(), Some("SEED123"));
+        assert_eq!(login.uris[0].uri.as_deref(), Some("https://app.ledgerline.com"));
+    }
+
+    #[test]
+    fn typed_fields_default_sanely_when_absent() {
+        let item: VaultItem = serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
+        assert_eq!(item.item_type, None);
+        assert_eq!(item.folder_id, None);
+        assert!(!item.favorite);
+    }
+
+    #[test]
+    fn typed_fields_do_not_break_existing_app_match_round_trip() {
+        // with_app_match must still preserve type/folderId/favorite exactly
+        // as extract_app_match's existing tests already check for `other` --
+        // this locks the same guarantee for the newly-typed fields.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","type":3,"favorite":true,"folderId":"f9","fields":[]}"#,
+        )
+        .unwrap();
+        let m = crate::app_match::AppMatch {
+            process: "a.exe".into(),
+            trigger: crate::app_match::TriggerMode::Auto,
+        };
+        let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
+        assert_eq!(value["type"], serde_json::json!(3));
+        assert_eq!(value["favorite"], serde_json::json!(true));
+        assert_eq!(value["folderId"], serde_json::json!("f9"));
+    }
+
+    #[test]
+    fn list_folders_parses_bw_serve_envelope() {
+        let mut server = mockito::Server::new();
+        let body = r#"{"success":true,"data":{"data":[
+            {"id":"f1","name":"Engineering"},
+            {"id":"f2","name":"Personal"}
+        ]}}"#;
+        let _m = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let folders = bridge.list_folders().unwrap();
+
+        assert_eq!(folders.len(), 2);
+        assert_eq!(folders[0].name, "Engineering");
+    }
 }

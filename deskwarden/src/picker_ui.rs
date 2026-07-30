@@ -532,6 +532,9 @@ mod tests {
             name: name.into(),
             fields: vec![],
             login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
             other: serde_json::Map::new(),
         }
     }

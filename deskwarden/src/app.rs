@@ -227,6 +227,9 @@ mod tests {
                 })
                 .unwrap_or_default(),
             login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
             other: serde_json::Map::new(),
         }
     }
