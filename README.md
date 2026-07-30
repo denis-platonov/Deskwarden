@@ -63,18 +63,40 @@ open.
 ## Size
 
 Numbers from an actual release build (`cargo build --release`, with LTO +
-single codegen unit + stripped symbols):
+single codegen unit + stripped symbols), measured live and side-by-side
+against the official Bitwarden desktop app on the same machine — not vendor
+figures, not estimates.
 
-| | |
-| --- | --- |
-| Binary | ~11 MB |
-| Idle RAM (tray only, no window open) | ~75–90 MB |
-| Source | ~11,800 lines of Rust across 36 modules |
+deskwarden depends on the official Bitwarden CLI (`bw serve`, a bundled Node
+runtime) for all real vault work, spawned as its own subprocess. That
+process's footprint isn't something deskwarden's own code controls, so it's
+broken out separately below rather than hidden inside one number.
 
-For scale: the Bitwarden CLI itself (`bw serve`, a bundled Node runtime that
-deskwarden spawns as a subprocess) uses roughly **150–180 MB** on its own —
-more than deskwarden's own process, and outside deskwarden's control either
-way, since it's the official CLI doing the actual vault work.
+**RAM**, tray-only (no window open) vs. with the main window open:
+
+| | Tray only | Window open |
+| --- | --- | --- |
+| **deskwarden.exe** (own process) | 79 MB | 91 MB |
+| `bw serve` (bundled CLI, unavoidable) | 117–162 MB | 162 MB |
+| **deskwarden total** | **196–241 MB** | **253 MB** |
+| Bitwarden Desktop (all 4 of its processes) | 404–466 MB | 487 MB |
+
+Even counting the CLI dependency it can't avoid, deskwarden's total stays
+roughly **half** of Bitwarden Desktop's footprint in either state — and
+deskwarden's *own* process alone is under a fifth of it. The gap is
+structural, not incidental: Bitwarden Desktop is Electron (a bundled
+Chromium renderer + Node.js runtime, 4 OS processes minimum), where
+deskwarden is a single native binary with an immediate-mode GUI that adds
+single-digit megabytes to the executable and nothing else running.
+
+**Disk**:
+
+| | deskwarden | Bitwarden Desktop |
+| --- | --- | --- |
+| App itself | ~11 MB | 456 MB |
+| Full install (app + bundled `bw` CLI) | 164 MB | 456 MB |
+
+Source: ~11,800 lines of Rust across 36 modules.
 
 ## Dependencies
 
