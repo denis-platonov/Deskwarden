@@ -73,6 +73,19 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
     let locked_for_closure = locked.clone();
     let mut sync_status: Option<Result<(), String>> = None;
 
+    // Outcome of a click-triggered manual sync. Backgrounded for the same
+    // reason `main.rs` backgrounds its update-check and update-apply flows
+    // (see the `spawn_favicon_fetch` doc comment below for this file's own
+    // prior art): `bw_serve::run_bw_sync` shells out and blocks on a real
+    // network round-trip, and running it inline on this thread -- as it used
+    // to -- froze the entire vault window (no repaint, no input) for however
+    // long the sync took.
+    let (sync_tx, sync_rx): (mpsc::Sender<Result<(), String>>, Receiver<Result<(), String>>) = mpsc::channel();
+    // True from the moment a sync starts until its outcome arrives, so a
+    // second click can't start a second concurrent sync -- same guard
+    // `main.rs` uses for its update-apply flow.
+    let mut sync_in_progress = false;
+
     let mut items: Vec<VaultItem> = vault.list_items().unwrap_or_default();
     let mut folders: Vec<Folder> = vault.list_folders().unwrap_or_default();
     // For the toolbar's avatar circle (design 4.8's `AN` initials badge).
@@ -82,6 +95,11 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
     let mut filter = SidebarFilter::All;
     let mut search = String::new();
     let mut selected_id: Option<String> = items.first().map(|i| i.id.clone());
+    // Tracks the previous frame's `selected_id` so a change (from clicking a
+    // different row in `draw_item_list`) can be detected and used to reset
+    // the per-selection state below (`mode`, `reveal_password`, the TOTP
+    // cache) -- see the reset block after the item-list panel further down.
+    let mut last_selected_id: Option<String> = selected_id.clone();
     let mut mode = DetailMode::Read;
     let mut reveal_password = false;
     let mut icons = IconCache::default();
@@ -135,6 +153,22 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
             }
         }
 
+        // Non-blocking, like the favicon drain above: the sync thread
+        // (spawned from the Sync button below) reports its outcome here, and
+        // this loop never waits on it. The fast local `bw serve` reads
+        // (`list_items`/`list_folders`) stay on the main thread -- only the
+        // slow remote-network `run_bw_sync` call itself was backgrounded.
+        if let Ok(result) = sync_rx.try_recv() {
+            sync_in_progress = false;
+            if result.is_ok() {
+                items = vault.list_items().unwrap_or_default();
+                folders = vault.list_folders().unwrap_or_default();
+            } else if let Err(e) = &result {
+                log::warn!("manual vault sync failed: {e}");
+            }
+            sync_status = Some(result);
+        }
+
         match draw_window_chrome(ui, "Deskwarden Vault") {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -183,17 +217,23 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
                         // whatever's already local). A change made on another
                         // device otherwise wouldn't show up here until the
                         // whole app restarts; this button is the escape hatch.
-                        if theme::secondary_button(ui, "Sync").clicked() {
-                            let result = bw_serve::run_bw_sync(&session_token);
-                            if result.is_ok() {
-                                items = vault.list_items().unwrap_or_default();
-                                folders = vault.list_folders().unwrap_or_default();
-                            } else if let Err(e) = &result {
-                                log::warn!("manual vault sync failed: {e}");
-                            }
-                            sync_status = Some(result);
+                        let sync_clicked = ui
+                            .add_enabled_ui(!sync_in_progress, |ui| {
+                                theme::secondary_button(ui, "Sync")
+                            })
+                            .inner
+                            .clicked();
+                        if sync_clicked && !sync_in_progress {
+                            sync_in_progress = true;
+                            let tx = sync_tx.clone();
+                            let token = session_token.clone();
+                            std::thread::spawn(move || {
+                                let _ = tx.send(bw_serve::run_bw_sync(&token));
+                            });
                         }
-                        if let Some(status) = &sync_status {
+                        if sync_in_progress {
+                            ui.label(RichText::new("Syncing…").size(11.0).color(theme::TEXT_GHOST));
+                        } else if let Some(status) = &sync_status {
                             let (text, color) = match status {
                                 Ok(()) => ("Synced", theme::TEXT_GHOST),
                                 Err(_) => ("Sync failed", theme::ERROR),
@@ -237,6 +277,27 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
                     ItemListAction::None => {}
                 }
             });
+
+        // `draw_item_list` above is the only place `selected_id` can change
+        // (a row click). When it does, everything below is state that was
+        // only ever meaningful for the *previous* selection, so it has to be
+        // reset here -- before the detail pane (further down) reads any of
+        // it to draw itself. Left stale, this is what let switching from
+        // item A to item B while mid-edit silently save A's edits onto B,
+        // leaked A's revealed password onto B's row, and briefly showed A's
+        // TOTP code under B.
+        if selected_id != last_selected_id {
+            mode = DetailMode::Read;
+            reveal_password = false;
+            totp_code = None;
+            // Force the `totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL`
+            // check below to be true on the very next check, matching how
+            // the pre-loop initial value is already set, so the newly
+            // selected item's code is fetched immediately instead of
+            // waiting out the rest of the previous item's poll interval.
+            totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
+            last_selected_id = selected_id.clone();
+        }
 
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
