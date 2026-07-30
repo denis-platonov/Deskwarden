@@ -72,22 +72,29 @@ runtime) for all real vault work, spawned as its own subprocess. That
 process's footprint isn't something deskwarden's own code controls, so it's
 broken out separately below rather than hidden inside one number.
 
-**RAM**, tray-only (no window open) vs. with the main window open:
+**RAM** — private working set (the same figure Windows Task Manager's
+"Memory" column shows: resident memory unique to that process, excluding
+anything shared with sibling processes of the same app). This matters
+because a naive "total resident memory" sum inflates a multi-process app
+like Electron, which shares a lot of memory *between* its own processes —
+private working set is the number that's actually comparable, and the one
+you can verify yourself in Task Manager:
 
 | | Tray only | Window open |
 | --- | --- | --- |
-| **deskwarden.exe** (own process) | 79 MB | 91 MB |
-| `bw serve` (bundled CLI, unavoidable) | 117–162 MB | 162 MB |
-| **deskwarden total** | **196–241 MB** | **253 MB** |
-| Bitwarden Desktop (all 4 of its processes) | 404–466 MB | 487 MB |
+| **deskwarden.exe** (own process) | 44 MB | 52 MB |
+| `bw serve` (bundled CLI, unavoidable) | 76 MB | 80 MB |
+| **deskwarden total** | **120 MB** | **132 MB** |
+| Bitwarden Desktop (all 4 of its processes) | 132 MB | 135 MB |
 
-Even counting the CLI dependency it can't avoid, deskwarden's total stays
-roughly **half** of Bitwarden Desktop's footprint in either state — and
-deskwarden's *own* process alone is under a fifth of it. The gap is
-structural, not incidental: Bitwarden Desktop is Electron (a bundled
-Chromium renderer + Node.js runtime, 4 OS processes minimum), where
-deskwarden is a single native binary with an immediate-mode GUI that adds
-single-digit megabytes to the executable and nothing else running.
+deskwarden's *own* process alone is consistently smaller — roughly a third
+to two-fifths of Bitwarden Desktop's total. But once the `bw` CLI dependency
+is counted in (which it has to be — it's what does the real vault work),
+the **total is close to parity** with Bitwarden Desktop, not the dramatic
+gap a shared-memory-inflated number would suggest. Where deskwarden actually
+wins clearly is disk footprint and its own process's isolated cost; RAM
+parity mostly comes from a Node.js CLI dependency neither app's own UI code
+controls.
 
 **Disk**:
 
