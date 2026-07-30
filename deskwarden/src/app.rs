@@ -117,6 +117,7 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     vault: &VaultBridge,
     injector: &Injector<A, B>,
+    fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     hwnd: isize,
 ) {
@@ -127,8 +128,9 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                 log::warn!("vault item {item_id} has no login credentials; nothing to fill");
                 return;
             }
-            if let Err(e) = injector.fill(hwnd, &username, &password) {
-                log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
+            match injector.fill(hwnd, &username, &password) {
+                Ok(()) => fill_stats.record_fill(item_id),
+                Err(e) => log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}"),
             }
         }
         Err(e) => log::error!("could not read vault item {item_id} to fill it: {e:?}"),
@@ -144,6 +146,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
 pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     vault: &VaultBridge,
     injector: &Injector<A, B>,
+    fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     m: &AppMatch,
     hwnd: isize,
@@ -151,7 +154,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
 ) -> Option<(String, isize)> {
     match m.trigger {
         TriggerMode::Auto => {
-            fill_from_vault(vault, injector, item_id, hwnd);
+            fill_from_vault(vault, injector, fill_stats, item_id, hwnd);
             None
         }
         TriggerMode::Prompt => {
@@ -175,7 +178,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             });
             if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref(), overlay_position(hwnd))
             {
-                fill_from_vault(vault, injector, item_id, hwnd);
+                fill_from_vault(vault, injector, fill_stats, item_id, hwnd);
             }
             None
         }

@@ -35,8 +35,8 @@ use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::{
-    hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store, tray,
-    window_watch,
+    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store,
+    tray, window_watch,
 };
 use semver::Version;
 use std::process::Child;
@@ -182,6 +182,9 @@ fn main() {
 
     let session_path = config_dir.join("session.bin");
     let store = session_store::SessionStore::new(session_path);
+
+    let fill_stats_path = config_dir.join("fill-stats.json");
+    let fill_stats = fill_stats::FillStats::new(fill_stats_path);
 
     // Every child process we spawn joins this job object, which is configured
     // to kill its members when the last handle closes. Our handles close when
@@ -399,6 +402,7 @@ fn main() {
             &event,
             &vault,
             &injector,
+            &fill_stats,
             &engine,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
@@ -516,7 +520,7 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    fill_from_vault(&vault, &injector, &item_id, hwnd);
+                    fill_from_vault(&vault, &injector, &fill_stats, &item_id, hwnd);
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
@@ -701,6 +705,7 @@ fn main() {
                 &event,
                 &vault,
                 &injector,
+                &fill_stats,
                 &engine,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
@@ -866,6 +871,7 @@ fn process_foreground_event(
     event: &window_watch::ForegroundEvent,
     vault: &VaultBridge,
     injector: &Injector<RealUiAutomation, RealSendInput>,
+    fill_stats: &fill_stats::FillStats,
     engine: &MatchEngine,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
@@ -910,7 +916,8 @@ fn process_foreground_event(
             event.exe_name,
             m.trigger
         );
-        if let Some(armed) = handle_match(vault, injector, item_id, m, event.hwnd, &event.exe_name)
+        if let Some(armed) =
+            handle_match(vault, injector, fill_stats, item_id, m, event.hwnd, &event.exe_name)
         {
             *pending_hotkey_fill = Some(armed);
         }
