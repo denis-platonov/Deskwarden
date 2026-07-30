@@ -2,5 +2,6 @@
 //! `docs/design/deskwarden-design-spec.md` section 4.8.
 
 pub mod detail;
+pub mod detail_edit;
 pub mod item_list;
 pub mod sidebar;
