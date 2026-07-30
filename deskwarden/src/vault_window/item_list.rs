@@ -128,7 +128,17 @@ fn item_row(
             ui.horizontal(|ui| {
                 match icon {
                     Some(tex) => {
-                        ui.add(egui::Image::new((tex.id(), tex.size_vec2())).fit_to_exact_size(egui::Vec2::splat(32.0)));
+                        // Rounded to match `theme::avatar`'s initials-tile
+                        // treatment (same `size * 0.25` formula) -- a sharp-
+                        // cornered square in the identical box read as
+                        // visually heavier/bigger than the monogram fallback
+                        // even at the same pixel dimensions.
+                        const SIZE: f32 = 32.0;
+                        ui.add(
+                            egui::Image::new((tex.id(), tex.size_vec2()))
+                                .fit_to_exact_size(egui::Vec2::splat(SIZE))
+                                .corner_radius(CornerRadius::same((SIZE * 0.25) as u8)),
+                        );
                     }
                     None => theme::avatar(ui, &theme::initials(&item.name), 32.0, selected),
                 }

@@ -18,7 +18,7 @@ use crate::theme;
 use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
 use detail::{draw_detail_read, DetailAction};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
-use eframe::egui::{self, Margin, RichText, Stroke};
+use eframe::egui::{self, Margin, Stroke};
 use item_list::{draw_item_list, IconCache, ItemListAction};
 use sidebar::{draw_sidebar, SidebarAction, SidebarFilter};
 use std::cell::RefCell;
@@ -113,6 +113,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
     let mut sync_status: Option<Result<(), String>> = None;
+    // When the most recent successful sync completed, for the toolbar's
+    // sync pill ("Synced N min ago" per design spec 4.8) -- set below
+    // whenever `sync_status` transitions to `Ok(())`. A per-session value on
+    // purpose: it resets to "just now" every time this window's own
+    // auto-sync-on-open fires, so nothing here needs to survive a restart.
+    let mut last_sync_at: Option<Instant> = None;
 
     // Outcome of a click-triggered manual sync. Backgrounded for the same
     // reason `main.rs` backgrounds its update-check and update-apply flows
@@ -243,6 +249,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         if let Ok(result) = sync_rx.try_recv() {
             sync_in_progress = false;
             if result.is_ok() {
+                last_sync_at = Some(Instant::now());
                 items = vault.list_items().unwrap_or_default();
                 folders = vault.list_folders().unwrap_or_default();
                 // If the item that was selected before this sync no longer
@@ -272,14 +279,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // the title and the ✕/▢/— controls and narrows the drag zone to
         // stop where they actually start (see its doc comment).
         match draw_window_chrome_with_extra(ui, "Deskwarden Vault", |ui| {
-            // Right-to-left: Lock nearest the window controls, then the
-            // avatar, then the Sync button and its status label innermost.
+            // Right-to-left: the CTRL+L chip nearest the window controls,
+            // then Lock immediately to its left (so the two read left-to-
+            // right as "Lock CTRL+L", per spec 4.8), then the avatar, then
+            // the Sync button and its status pill innermost.
+            theme::kbd_chip(ui, "CTRL+L", false);
             if theme::secondary_button(ui, "Lock").clicked() {
                 *locked_for_closure.borrow_mut() = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
             if let Some(email) = &account_email {
-                theme::avatar(ui, &theme::initials(email), 26.0, false);
+                // `true` for the dark/emphasized treatment -- spec 4.8's
+                // "avatar circle AN (dark)", versus the light/muted style
+                // this used before.
+                theme::avatar(ui, &theme::initials(email), 26.0, true);
             }
             // Manual sync: this app has nowhere that auto-syncs on a timer
             // (see `main()`'s own single startup-time `bw sync` -- everything
@@ -294,20 +307,42 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 sync_in_progress = true;
                 spawn_vault_sync(sync_tx.clone(), session_token.clone());
             }
+            // Spec 4.8's "sync pill" ("● Synced 1 min ago"): a colored dot
+            // plus text via `theme::status_pill`, not the bare label this
+            // used before. Blue for success (there's no dedicated "success"
+            // green in this app's palette -- see `theme.rs`'s module doc on
+            // "one blue hue... red reserved for actual errors" -- so blue is
+            // the existing color that reads as "good" here), the design's
+            // error red for failure, and a neutral ghost dot while in
+            // flight.
             if sync_in_progress {
-                ui.label(RichText::new("Syncing…").size(11.0).color(theme::TEXT_GHOST));
+                theme::status_pill(ui, theme::TEXT_GHOST, "Syncing…");
             } else if let Some(status) = &sync_status {
-                let (text, color) = match status {
-                    Ok(()) => ("Synced", theme::TEXT_GHOST),
-                    Err(_) => ("Sync failed", theme::ERROR),
-                };
-                ui.label(RichText::new(text).size(11.0).color(color));
+                match status {
+                    Ok(()) => {
+                        let ago = synced_ago_text(last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()));
+                        theme::status_pill(ui, theme::BLUE, &format!("Synced {ago}"));
+                    }
+                    Err(_) => theme::status_pill(ui, theme::ERROR, "Sync failed"),
+                }
             }
         }) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
         }
+
+        // `draw_window_chrome_with_extra` advances the cursor past the 40px
+        // bar via `ui.advance_cursor_after_rect`, which -- per egui's own
+        // doc comment on `Ui::cursor` -- leaves the *next* widget positioned
+        // `item_spacing.y` further down than that. The sidebar/list/detail
+        // panels below are the next things drawn in this same outer `ui`, so
+        // without this they'd start a few pixels below the bar with the
+        // chrome's `WINDOW_BG` full-window fill showing through the gap --
+        // a stray grey seam between the titlebar and the panels. Zeroing it
+        // here (rather than passing a frame margin into the panels) keeps
+        // the fix scoped to exactly the one gap it's meant to close.
+        ui.spacing_mut().item_spacing.y = 0.0;
 
         // Spec section 5's keyboard model for this window: Ctrl+K focuses
         // search, Ctrl+L locks, Ctrl+N opens the new-item form. Ctrl+Shift+F
@@ -348,7 +383,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::WINDOW_BG).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
+            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
             .show(ui, |ui| {
                 match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown, armed_folder_id.as_deref()) {
                     SidebarAction::NewFolder => {
@@ -649,6 +684,22 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
     });
 }
 
+/// The toolbar sync pill's relative-time wording for a successful sync:
+/// "just now" for under a minute, "N min ago" beyond that. Matches
+/// `detail.rs`'s `metadata_line` relative-time pattern ("Updated N days
+/// ago"), one unit down -- minutes rather than days, since `last_sync_at` is
+/// a per-session value that resets to "just now" on every auto-sync-on-open
+/// this window already does, so hour/day granularity would never actually
+/// be reached.
+fn synced_ago_text(elapsed: Duration) -> String {
+    let minutes = elapsed.as_secs() / 60;
+    if minutes == 0 {
+        "just now".to_string()
+    } else {
+        format!("{minutes} min ago")
+    }
+}
+
 /// Ensures `item`'s favicon is loading or loaded, doing as little work as
 /// possible: skips entirely if already resolved (loaded or a fetch already
 /// dispatched) this session, serves instantly from the on-disk cache if
@@ -823,6 +874,24 @@ fn webbrowser_open(url: &str) {
             windows::core::PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
         );
+    }
+}
+
+#[cfg(test)]
+mod synced_ago_text_tests {
+    use super::synced_ago_text;
+    use std::time::Duration;
+
+    #[test]
+    fn under_a_minute_reads_just_now() {
+        assert_eq!(synced_ago_text(Duration::from_secs(0)), "just now");
+        assert_eq!(synced_ago_text(Duration::from_secs(59)), "just now");
+    }
+
+    #[test]
+    fn a_minute_or_more_reads_n_min_ago() {
+        assert_eq!(synced_ago_text(Duration::from_secs(60)), "1 min ago");
+        assert_eq!(synced_ago_text(Duration::from_secs(125)), "2 min ago");
     }
 }
 

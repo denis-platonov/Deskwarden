@@ -490,6 +490,20 @@ pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
     );
 }
 
+/// A small status pill: a colored dot plus text, in the toolbar's sync
+/// status style ("● Synced 1 min ago" per design spec 4.8). Written
+/// generically -- nothing here is vault-window-specific -- so any future
+/// status readout (connection state, background job progress, ...) can
+/// reuse it instead of hand-rolling another dot+label pairing.
+pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 5.0;
+        let (dot_rect, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
+        ui.painter().circle_filled(dot_rect.center(), 3.0, dot_color);
+        ui.label(RichText::new(text).size(11.0).color(TEXT_GHOST));
+    });
+}
+
 /// A small monospace keyboard-hint chip ("↵", "CTRL+N"). `on_primary` is the
 /// white-on-blue treatment used inside primary buttons and selected rows.
 pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {

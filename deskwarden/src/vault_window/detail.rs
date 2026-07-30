@@ -74,7 +74,16 @@ pub fn draw_detail_read(
     ui.horizontal(|ui| {
         match icon {
             Some(tex) => {
-                ui.add(egui::Image::new((tex.id(), tex.size_vec2())).fit_to_exact_size(egui::Vec2::splat(44.0)));
+                // Rounded to match `theme::avatar`'s initials-tile treatment
+                // (same `size * 0.25` formula) -- see `item_list.rs`'s
+                // matching fix for why an unrounded favicon in an identical
+                // box reads as visually heavier than the monogram fallback.
+                const SIZE: f32 = 44.0;
+                ui.add(
+                    egui::Image::new((tex.id(), tex.size_vec2()))
+                        .fit_to_exact_size(egui::Vec2::splat(SIZE))
+                        .corner_radius(CornerRadius::same((SIZE * 0.25) as u8)),
+                );
             }
             None => theme::avatar(ui, &theme::initials(&item.name), 44.0, true),
         }
