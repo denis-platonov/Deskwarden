@@ -375,6 +375,13 @@ fn main() {
     // forever, so "Dismiss" never dismissed).
     let mut last_dispatched_hwnd: Option<isize> = None;
 
+    // The process id of the last real (not our own) foreground window, kept
+    // up to date alongside every event below. "Add app..." defaults its
+    // process picker to this -- the app the user was just in -- rather than
+    // making them search for it every time.
+    let mut last_active_pid: Option<u32> = None;
+    let own_pid = std::process::id();
+
     // Seed with whatever is already focused: `SetWinEventHook` only reports
     // foreground *changes*, so an app that was matched and already in front
     // when deskwarden started would otherwise be ignored until the next window
@@ -385,6 +392,9 @@ fn main() {
             event.exe_name,
             event.hwnd
         );
+        if event.pid != own_pid {
+            last_active_pid = Some(event.pid);
+        }
         process_foreground_event(
             &event,
             &vault,
@@ -426,7 +436,7 @@ fn main() {
                 // from, then choose the process to attach to it.
                 if let Some(item) = picker_ui::pick_vault_item(&vault) {
                     log::info!("adding an app match to vault item {}", item.id);
-                    match picker_ui::run_picker(vault.clone(), item) {
+                    match picker_ui::run_picker(vault.clone(), item, last_active_pid) {
                         Some(m) => {
                             log::info!("saved app match for {} ({:?})", m.process, m.trigger);
                             // Make the new match live immediately rather than
@@ -684,6 +694,9 @@ fn main() {
         }
 
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(200)) {
+            if event.pid != own_pid {
+                last_active_pid = Some(event.pid);
+            }
             process_foreground_event(
                 &event,
                 &vault,

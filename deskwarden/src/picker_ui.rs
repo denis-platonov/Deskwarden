@@ -1,26 +1,76 @@
 use crate::app_match::{AppMatch, TriggerMode};
-use crate::process_list::{list_processes, ProcessInfo};
+use crate::icon;
 use crate::theme;
 use crate::vault_bridge::{VaultBridge, VaultItem};
+use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
+};
 
-/// Case-insensitive substring match of a vault item's name against a search
-/// box's contents. An empty filter matches everything.
+/// The position for a picker window's top-left corner that centers it on the
+/// primary monitor's work area (excludes the taskbar). These are plain
+/// standalone dialogs with no associated target window to center against, so
+/// unlike the autofill overlay (`app::overlay_position`) there's no better
+/// anchor than the screen itself -- but they still need an *explicit* one:
+/// left to the OS default, eframe windows on this system open pinned near
+/// the top of the screen rather than anywhere near where the user is
+/// looking.
+fn centered_position(width: f32, height: f32) -> [f32; 2] {
+    let mut work_area = RECT::default();
+    let got_work_area = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work_area as *mut RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok();
+
+    if !got_work_area {
+        return [200.0, 150.0];
+    }
+
+    let work_w = (work_area.right - work_area.left) as f32;
+    let work_h = (work_area.bottom - work_area.top) as f32;
+    [
+        work_area.left as f32 + (work_w - width) / 2.0,
+        work_area.top as f32 + (work_h - height) / 2.0,
+    ]
+}
+
+/// Case-insensitive substring match of a vault item's name against an
+/// already-lowercased filter. Takes the filter pre-lowered rather than
+/// lowering it internally: callers filter an entire list against one filter
+/// string every repaint, and with a vault in the thousands, lowering the
+/// filter once outside the scan -- instead of once per item inside this
+/// function -- is the difference between one allocation per frame and one
+/// per vault item per frame.
 ///
 /// Pure and separate from the UI so the search behaviour is testable without
 /// opening a window.
-pub fn item_matches_filter(item: &VaultItem, filter: &str) -> bool {
-    if filter.is_empty() {
+pub fn item_matches_filter(item: &VaultItem, filter_lower: &str) -> bool {
+    if filter_lower.is_empty() {
         return true;
     }
-    item.name.to_lowercase().contains(&filter.to_lowercase())
+    item.name.to_lowercase().contains(filter_lower)
 }
 
-/// A design-2a list row: initials avatar, primary line, muted secondary
-/// line, blue-washed when selected. Returns true when clicked.
-fn list_row(ui: &mut egui::Ui, primary: &str, secondary: &str, selected: bool) -> bool {
+/// A design-2a list row: icon (or, absent one, an initials avatar), primary
+/// line, muted secondary line, blue-washed when selected. Returns true when
+/// clicked.
+fn list_row(
+    ui: &mut egui::Ui,
+    primary: &str,
+    secondary: &str,
+    selected: bool,
+    icon: Option<&egui::TextureHandle>,
+) -> bool {
     let frame = egui::Frame::new()
         .fill(if selected {
             theme::BLUE_WASH
@@ -32,7 +82,15 @@ fn list_row(ui: &mut egui::Ui, primary: &str, secondary: &str, selected: bool) -
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::avatar(ui, &theme::initials(primary), 28.0, selected);
+                match icon {
+                    Some(tex) => {
+                        ui.add(
+                            egui::Image::new((tex.id(), tex.size_vec2()))
+                                .fit_to_exact_size(egui::Vec2::splat(28.0)),
+                        );
+                    }
+                    None => theme::avatar(ui, &theme::initials(primary), 28.0, selected),
+                }
                 ui.add_space(2.0);
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
@@ -71,8 +129,26 @@ fn search_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
     );
 }
 
-/// The white, hairline-bordered card that scrollable lists live in.
-fn list_card(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui::Ui)) {
+/// Estimated height (content + the 2px inter-row gap) of one [`list_row`].
+/// Only needs to be close, not exact -- it drives [`egui::ScrollArea::show_rows`]'s
+/// scroll-geometry estimate, not the rows' actual layout.
+const LIST_ROW_HEIGHT: f32 = 48.0;
+
+/// The white, hairline-bordered card that scrollable lists live in, showing
+/// only the rows within the visible scroll range rather than laying out
+/// and painting `row_count` rows on every repaint.
+///
+/// egui repaints on every keystroke *and* every mouse move over the window
+/// (hover detection), so an unvirtualized list re-lays-out and re-paints
+/// every one of its rows that often. That's fine for a few dozen rows; for a
+/// vault with thousands of items it was the actual cause of the picker
+/// feeling laggy while typing or moving the mouse over the list.
+fn list_card(
+    ui: &mut egui::Ui,
+    height: f32,
+    row_count: usize,
+    mut add_row: impl FnMut(&mut egui::Ui, usize),
+) {
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
@@ -83,9 +159,11 @@ fn list_card(ui: &mut egui::Ui, height: f32, add_contents: impl FnOnce(&mut egui
             egui::ScrollArea::vertical()
                 .max_height(height)
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
+                .show_rows(ui, LIST_ROW_HEIGHT, row_count, |ui, row_range| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    add_contents(ui);
+                    for row in row_range {
+                        add_row(ui, row);
+                    }
                 });
         });
 }
@@ -129,6 +207,7 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 540.0])
+            .with_position(centered_position(440.0, 540.0))
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -166,22 +245,34 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
                 search_field(ui, &mut filter, "Search vault");
                 ui.add_space(8.0);
 
+                // Filter lowered once per frame, not once per item inside
+                // item_matches_filter (see its doc comment) -- this scan is
+                // still O(items), but a cheap one now.
+                let filter_lower = filter.to_lowercase();
+                let filtered: Vec<usize> = (0..items.len())
+                    .filter(|&i| item_matches_filter(&items[i], &filter_lower))
+                    .collect();
+
                 // Clamped: the subtrahend is the space reserved for the
                 // buttons below, and a window resized smaller than that would
                 // otherwise ask for a negative scroll-area height.
-                list_card(ui, (ui.available_height() - 56.0).max(0.0), |ui| {
-                    for item in items.iter().filter(|i| item_matches_filter(i, &filter)) {
+                list_card(
+                    ui,
+                    (ui.available_height() - 56.0).max(0.0),
+                    filtered.len(),
+                    |ui, row| {
+                        let item = &items[filtered[row]];
                         let selected = selected_id.as_deref() == Some(item.id.as_str());
                         let username = item
                             .login
                             .as_ref()
                             .and_then(|l| l.username.clone())
                             .unwrap_or_default();
-                        if list_row(ui, &item.name, &username, selected) {
+                        if list_row(ui, &item.name, &username, selected, None) {
                             selected_id = Some(item.id.clone());
                         }
-                    }
-                });
+                    },
+                );
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -259,8 +350,8 @@ fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
     }
 }
 
-/// Opens a blocking egui window that lets the user search running processes,
-/// pick one, choose a trigger mode, and save the resulting `AppMatch` onto
+/// Opens a blocking egui window that lets the user search open windows, pick
+/// one, choose a trigger mode, and save the resulting `AppMatch` onto
 /// `target_item` via `vault.set_app_match`.
 ///
 /// Returns `Some(AppMatch)` if the user clicked Save and the vault write
@@ -271,8 +362,15 @@ fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
 /// `eframe::run_simple_native`'s update closure is `FnMut + 'static` and must
 /// `move`-capture everything it uses; callers clone a `VaultBridge` and
 /// `VaultItem` before calling this.
-pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch> {
-    let processes: Vec<ProcessInfo> = list_processes().unwrap_or_default();
+///
+/// `default_pid` is the process id of whatever window was active right
+/// before "Add app..." was invoked (see `main`'s `last_active_pid`
+/// tracking), if any. When it's still in the window list, the picker opens
+/// with it pre-selected *and* the search box pre-filled with its name -- the
+/// common case (matching the app you were just using) needs no typing at
+/// all, while the search box stays live to pick something else.
+pub fn run_picker(vault: VaultBridge, target_item: VaultItem, default_pid: Option<u32>) -> Option<AppMatch> {
+    let windows: Vec<WindowInfo> = window_list::list_windows(std::process::id());
 
     // The update closure must `move`-capture its state (it's FnMut + 'static
     // and runs on every repaint), so a plain local `Option<AppMatch>` can't be
@@ -285,14 +383,25 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
     let result: Rc<RefCell<Option<AppMatch>>> = Rc::new(RefCell::new(None));
     let result_for_closure = result.clone();
 
-    let mut filter = String::new();
-    let mut selected_pid: Option<u32> = None;
+    let default_window = default_pid.and_then(|pid| windows.iter().find(|w| w.pid == pid));
+    let mut filter = default_window.map(|w| w.exe_name.clone()).unwrap_or_default();
+    let mut selected_pid: Option<u32> = default_window.map(|w| w.pid);
     let mut trigger = TriggerMode::Prompt;
     let mut styled = false;
+
+    // Icon textures are loaded lazily, one GDI round-trip and one GPU upload
+    // per distinct exe the *visible* rows actually need, not eagerly for
+    // every window in the list -- with a couple hundred windows open,
+    // extracting every icon up front would make the picker visibly slow to
+    // open. A `None` cache entry means extraction was already tried and
+    // failed (no icon on the file, or a GDI call errored), so a row without
+    // an icon doesn't retry every single frame.
+    let mut icon_cache: HashMap<String, Option<egui::TextureHandle>> = HashMap::new();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 560.0])
+            .with_position(centered_position(440.0, 560.0))
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -327,20 +436,50 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
                     "The chosen process fills from this item from now on.",
                 );
                 ui.add_space(8.0);
-                search_field(ui, &mut filter, "Search running processes");
+                search_field(ui, &mut filter, "Search open windows");
                 ui.add_space(8.0);
 
-                list_card(ui, (ui.available_height() - 148.0).max(0.0), |ui| {
-                    for p in processes
-                        .iter()
-                        .filter(|p| p.exe_name.to_lowercase().contains(&filter.to_lowercase()))
-                    {
-                        let selected = selected_pid == Some(p.pid);
-                        if list_row(ui, &p.exe_name, &format!("pid {}", p.pid), selected) {
-                            selected_pid = Some(p.pid);
+                // Matches against the window title (what's shown as the
+                // primary line) as well as the exe name, so searching either
+                // "epic" or "epicgameslauncher" finds the same row.
+                let filter_lower = filter.to_lowercase();
+                let filtered: Vec<usize> = (0..windows.len())
+                    .filter(|&i| {
+                        let w = &windows[i];
+                        w.title.to_lowercase().contains(&filter_lower)
+                            || w.exe_name.to_lowercase().contains(&filter_lower)
+                    })
+                    .collect();
+
+                list_card(
+                    ui,
+                    (ui.available_height() - 148.0).max(0.0),
+                    filtered.len(),
+                    |ui, row| {
+                        let w = &windows[filtered[row]];
+                        let selected = selected_pid == Some(w.pid);
+                        let secondary = format!("({} \u{b7} {})", w.exe_name, w.pid);
+                        let texture = icon_cache
+                            .entry(w.exe_path.clone())
+                            .or_insert_with(|| {
+                                icon::extract_small_icon(&w.exe_path).map(|rgba| {
+                                    let image = egui::ColorImage::from_rgba_unmultiplied(
+                                        [rgba.width as usize, rgba.height as usize],
+                                        &rgba.rgba,
+                                    );
+                                    ui.ctx().load_texture(
+                                        w.exe_path.clone(),
+                                        image,
+                                        egui::TextureOptions::default(),
+                                    )
+                                })
+                            })
+                            .as_ref();
+                        if list_row(ui, &w.title, &secondary, selected, texture) {
+                            selected_pid = Some(w.pid);
                         }
-                    }
-                });
+                    },
+                );
 
                 ui.add_space(10.0);
                 theme::field_label(ui, "On focus");
@@ -350,9 +489,9 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem) -> Option<AppMatch
                 ui.horizontal(|ui| {
                     if theme::primary_button(ui, "Save", None).clicked() {
                         if let Some(pid) = selected_pid {
-                            if let Some(p) = processes.iter().find(|p| p.pid == pid) {
+                            if let Some(w) = windows.iter().find(|w| w.pid == pid) {
                                 let m = AppMatch {
-                                    process: p.exe_name.clone(),
+                                    process: w.exe_name.clone(),
                                     trigger,
                                 };
                                 match vault.set_app_match(&target_item, &m) {
@@ -403,8 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn filter_is_case_insensitive_substring() {
-        assert!(item_matches_filter(&item("Rockstar Games"), "ROCK"));
+    fn filter_matches_a_lowercased_substring_against_the_items_name() {
+        // The caller lowercases the filter once before scanning a list (see
+        // this fn's doc comment); item_matches_filter itself only lowercases
+        // the item's name, so this exercises it with an already-lower filter.
+        assert!(item_matches_filter(&item("Rockstar Games"), "rock"));
         assert!(item_matches_filter(&item("Rockstar Games"), "games"));
     }
 

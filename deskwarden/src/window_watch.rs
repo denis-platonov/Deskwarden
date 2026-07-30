@@ -53,6 +53,23 @@ pub fn watch_foreground_windows(
 /// Returns `None` when the process can't be opened (permissions, or it exited
 /// between the event and this call) or has no resolvable image name.
 pub fn process_name_for_pid(pid: u32) -> Option<String> {
+    process_image_path_for_pid(pid).map(|full_path| {
+        full_path
+            .rsplit('\\')
+            .next()
+            .unwrap_or(&full_path)
+            .to_string()
+    })
+}
+
+/// Resolves the full executable path for a process id -- unlike
+/// [`process_name_for_pid`], the path is kept rather than trimmed to the
+/// file name, since callers that need to load the exe's icon
+/// (`window_list::list_windows`) need somewhere to load it from.
+///
+/// Returns `None` when the process can't be opened (permissions, or it exited
+/// between the event and this call) or has no resolvable image name.
+pub fn process_image_path_for_pid(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -62,7 +79,7 @@ pub fn process_name_for_pid(pid: u32) -> Option<String> {
 
         let mut buffer = [0u16; MAX_PATH as usize];
         let mut size = buffer.len() as u32;
-        let name = if QueryFullProcessImageNameW(
+        let path = if QueryFullProcessImageNameW(
             handle,
             PROCESS_NAME_WIN32,
             windows::core::PWSTR(buffer.as_mut_ptr()),
@@ -70,20 +87,13 @@ pub fn process_name_for_pid(pid: u32) -> Option<String> {
         )
         .is_ok()
         {
-            let full_path = String::from_utf16_lossy(&buffer[..size as usize]);
-            Some(
-                full_path
-                    .rsplit('\\')
-                    .next()
-                    .unwrap_or(&full_path)
-                    .to_string(),
-            )
+            Some(String::from_utf16_lossy(&buffer[..size as usize]))
         } else {
             None
         };
 
         let _ = CloseHandle(handle);
-        name.filter(|n| !n.is_empty())
+        path.filter(|n| !n.is_empty())
     }
 }
 

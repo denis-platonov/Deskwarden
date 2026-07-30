@@ -36,6 +36,13 @@ windows = { version = "0.58", features = [
     "Security_Cryptography",
     "Storage_Streams",
     "Foundation",
+    # Monitor geometry for clamping the autofill overlay on-screen
+    # (MonitorFromWindow/GetMonitorInfoW) and pixel access for extracting an
+    # app icon from its HICON (GetDIBits) in the Add-app picker.
+    "Win32_Graphics_Gdi",
+    # SHGetFileInfoW, for reading an exe's small icon (picker_ui.rs).
+    "Win32_UI_Shell",
+    "Win32_Storage_FileSystem",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
