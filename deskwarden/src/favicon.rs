@@ -10,13 +10,43 @@ use std::io::Read;
 /// cloud, or the self-hosted server's own icon proxy otherwise. Self-hosted
 /// Bitwarden servers proxy icon fetches themselves (`{server}/icons/...`)
 /// rather than having the client reach out to a third party directly.
+///
+/// Detection is by exact host / host-suffix match (the same normalization
+/// `login_ui::server_host` uses), not a naive substring check -- a substring
+/// check would misclassify an unrelated self-hosted domain like
+/// `vault.bitwarden.community` as the default cloud (it contains the
+/// substring `bitwarden.com`), silently leaking that user's icon requests to
+/// Bitwarden's third-party icon service instead of proxying through their
+/// own server.
 pub fn icon_base_url(server_url: Option<&str>) -> String {
     match server_url {
-        Some(url) if !url.trim().is_empty() && !url.contains("bitwarden.com") && !url.contains("bitwarden.eu") => {
+        Some(url) if !url.trim().is_empty() && !is_bitwarden_cloud_host(&host_from_url(url)) => {
             format!("{}/icons", url.trim().trim_end_matches('/'))
         }
         _ => "https://icons.bitwarden.net".to_string(),
     }
+}
+
+/// Extracts just the host (no scheme, path, query, fragment, or port) from a
+/// server URL, e.g. `https://vault.example.com:8443/api` -> `vault.example.com`.
+fn host_from_url(url: &str) -> String {
+    let stripped = url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host = stripped.split(['/', '?', '#']).next().unwrap_or(stripped);
+    let host = host.split(':').next().unwrap_or(host);
+    host.to_string()
+}
+
+/// True only for `bitwarden.com`/`bitwarden.eu` themselves or a subdomain of
+/// one of them -- not for unrelated domains that merely contain those
+/// strings as a substring (e.g. `vault.bitwarden.community`).
+fn is_bitwarden_cloud_host(host: &str) -> bool {
+    host == "bitwarden.com"
+        || host.ends_with(".bitwarden.com")
+        || host == "bitwarden.eu"
+        || host.ends_with(".bitwarden.eu")
 }
 
 /// Extracts a bare domain (`vault.example.com`, no scheme/path/port) from a
@@ -50,6 +80,13 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
 /// color type/bit depth the source used (indexed, grayscale, RGB without
 /// alpha, ...) to straight 8-bit RGBA via `png`'s built-in transformations,
 /// so the caller never has to branch on source format.
+///
+/// This includes indexed-color (palette) PNGs, an extremely common format
+/// for small icons/favicons: `Transformations::normalize_to_color8()`
+/// includes `EXPAND`, which the `png` crate applies while decoding the
+/// frame, so by the time `next_frame` returns, an indexed source has
+/// already been expanded to full RGB/RGBA. `info.color_type` below can
+/// never actually observe `Indexed` -- see the comment on that match arm.
 pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     let mut decoder = png::Decoder::new(png_bytes);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
@@ -72,6 +109,12 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
             .chunks_exact(2)
             .flat_map(|ga| [ga[0], ga[0], ga[0], ga[1]])
             .collect(),
+        // Unreachable in practice: `EXPAND` (part of `normalize_to_color8()`
+        // set above) makes the `png` crate expand indexed-color frames to
+        // RGB/RGBA during decode, so `info.color_type` is never `Indexed`
+        // here. Kept only so this match on `png::ColorType` stays
+        // exhaustive -- not a real rejection path, and not something to
+        // "fix" by adding pre-transformation indexed-PNG detection.
         png::ColorType::Indexed => return None,
     };
 
@@ -97,6 +140,18 @@ mod tests {
         assert_eq!(
             icon_base_url(Some("https://vault.example.eu/")),
             "https://vault.example.eu/icons"
+        );
+    }
+
+    #[test]
+    fn icon_base_does_not_mistake_a_substring_match_for_the_bitwarden_cloud() {
+        // "vault.bitwarden.community" contains the substring "bitwarden.com"
+        // (from "...bitwarden.COMmunity") but is an unrelated self-hosted
+        // domain, not a Bitwarden cloud subdomain -- it must be proxied
+        // through its own server, not routed to icons.bitwarden.net.
+        assert_eq!(
+            icon_base_url(Some("https://vault.bitwarden.community")),
+            "https://vault.bitwarden.community/icons"
         );
     }
 
