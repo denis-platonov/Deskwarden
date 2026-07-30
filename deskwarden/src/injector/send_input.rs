@@ -20,6 +20,15 @@ const INTER_KEYSTROKE_DELAY: Duration = Duration::from_millis(3);
 /// How long to let a foreground transition settle before re-checking it.
 const FOREGROUND_SETTLE: Duration = Duration::from_millis(120);
 
+/// How many times to retry handing focus to `hwnd` before giving up. Windows
+/// does not synchronously return focus to the previous window when ours
+/// closes -- observed live against Epic Games Launcher, a single 120ms
+/// settle window was sometimes not enough (heavier, Chromium-based apps in
+/// particular can take longer to actually repaint as foreground), and one
+/// miss meant the whole fill was refused even though the target window
+/// showed up as foreground moments later.
+const FOREGROUND_RETRY_ATTEMPTS: u32 = 5;
+
 /// Makes sure `hwnd` is the foreground window before anything is typed.
 ///
 /// `SendInput` types into whatever currently holds keyboard focus, with no
@@ -28,29 +37,35 @@ const FOREGROUND_SETTLE: Duration = Duration::from_millis(120);
 /// `auto` -- especially in the moments right after our overlay window closes
 /// and focus is being handed back -- focus placement is not guaranteed. Typing
 /// a password into the wrong window is the worst failure this app can produce,
-/// so a mismatch is reported as an error and nothing is typed.
+/// so a mismatch after every retry is reported as an error and nothing is
+/// typed.
 pub fn ensure_foreground(hwnd: isize) -> Result<(), String> {
     let current = unsafe { GetForegroundWindow() }.0 as isize;
     if may_type_into(hwnd, current) {
         return Ok(());
     }
 
-    // Only call SetForegroundWindow when it's actually needed: calling it on a
-    // window that is already foreground can reset focus to that window's
-    // default control, undoing the field the user just clicked into.
-    unsafe {
-        let _ = SetForegroundWindow(HWND(hwnd as *mut core::ffi::c_void));
+    for _ in 0..FOREGROUND_RETRY_ATTEMPTS {
+        // Only call SetForegroundWindow when it's actually needed: calling it
+        // on a window that is already foreground can reset focus to that
+        // window's default control, undoing the field the user just clicked
+        // into.
+        unsafe {
+            let _ = SetForegroundWindow(HWND(hwnd as *mut core::ffi::c_void));
+        }
+        std::thread::sleep(FOREGROUND_SETTLE);
+
+        let current = unsafe { GetForegroundWindow() }.0 as isize;
+        if may_type_into(hwnd, current) {
+            return Ok(());
+        }
     }
-    std::thread::sleep(FOREGROUND_SETTLE);
 
     let current = unsafe { GetForegroundWindow() }.0 as isize;
-    if may_type_into(hwnd, current) {
-        Ok(())
-    } else {
-        Err(format!(
-            "refusing to type: target window {hwnd} is not foreground (foreground is {current})"
-        ))
-    }
+    Err(format!(
+        "refusing to type: target window {hwnd} is not foreground (foreground is {current}) \
+         after {FOREGROUND_RETRY_ATTEMPTS} attempts"
+    ))
 }
 
 /// Types `username`, presses Tab, then types `password`, into whatever
