@@ -24,20 +24,12 @@ pub enum ItemListAction {
     NewItem,
 }
 
-/// True when `item` is both in `filter`'s scope (see
-/// `sidebar::count_for` for the same per-filter logic) and matches
+/// True when `item` is both in `filter`'s scope (delegates to
+/// `SidebarFilter::scope_contains` -- the one place that logic lives, so
+/// this and `sidebar::count_for` can't drift apart) and matches
 /// `search_lower` against its name or username.
 pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &str) -> bool {
-    let in_scope = match filter {
-        SidebarFilter::All => true,
-        SidebarFilter::Favorites => item.favorite,
-        SidebarFilter::Logins => item.item_type == Some(1),
-        SidebarFilter::Cards => item.item_type == Some(3),
-        SidebarFilter::SecureNotes => item.item_type == Some(2),
-        SidebarFilter::Trash => false,
-        SidebarFilter::Folder(id) => item.folder_id.as_deref() == Some(id.as_str()),
-    };
-    if !in_scope {
+    if !filter.scope_contains(item) {
         return false;
     }
     if search_lower.is_empty() {

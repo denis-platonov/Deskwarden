@@ -18,29 +18,58 @@ pub enum SidebarFilter {
     Folder(String),
 }
 
+impl SidebarFilter {
+    /// Whether `item` falls under this filter. The single place that
+    /// encodes "what does each filter variant mean" -- both `count_for`
+    /// (this file) and `item_list::matches_filter` delegate to it, rather
+    /// than each hand-duplicating the same per-variant scoping logic (which
+    /// had drifted into two copies that happened to still agree, but had no
+    /// mechanism keeping them that way).
+    ///
+    /// `Trash` always returns `false`: this codebase has no confirmed
+    /// knowledge of `bw serve`'s trash/deletedDate JSON shape, so rather
+    /// than guess at it (and risk silently misclassifying real data), Trash
+    /// is left as an explicit "not implemented" no-op. There is no prior
+    /// task that wired this up to real trash state -- if you're looking for
+    /// one, it doesn't exist yet.
+    pub(crate) fn scope_contains(&self, item: &VaultItem) -> bool {
+        match self {
+            SidebarFilter::All => true,
+            SidebarFilter::Favorites => item.favorite,
+            SidebarFilter::Logins => item.item_type == Some(1),
+            SidebarFilter::Cards => item.item_type == Some(3),
+            SidebarFilter::SecureNotes => item.item_type == Some(2),
+            SidebarFilter::Trash => false,
+            SidebarFilter::Folder(id) => item.folder_id.as_deref() == Some(id.as_str()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarAction {
     None,
     NewFolder,
+    /// A click on a folder's × button -- the id, not yet confirmed as an
+    /// actual delete. `vault_window::mod`'s `confirm_click` decides whether
+    /// this particular click arms or confirms the delete; only a confirming
+    /// click results in `VaultBridge::delete_folder` actually being called.
     DeleteFolder(String),
 }
 
 /// How many of `items` fall under `filter`. Pure and separate from drawing
 /// so the sidebar's counts are testable without an egui context.
 pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
-    items
-        .iter()
-        .filter(|item| match filter {
-            SidebarFilter::All => true,
-            SidebarFilter::Favorites => item.favorite,
-            SidebarFilter::Logins => item.item_type == Some(1),
-            SidebarFilter::Cards => item.item_type == Some(3),
-            SidebarFilter::SecureNotes => item.item_type == Some(2),
-            SidebarFilter::Trash => false, // wired to real trash state in Task 6
-            SidebarFilter::Folder(id) => item.folder_id.as_deref() == Some(id.as_str()),
-        })
-        .count()
+    items.iter().filter(|item| filter.scope_contains(item)).count()
 }
+
+/// Reserved width for a folder row's × delete button, subtracted from
+/// `sidebar_row`'s width *before* the row itself is laid out. `sidebar_row`
+/// claims `min_size(width, 26.0)` -- if it were handed the full
+/// `ui.available_width()` (as it used to be, implicitly, by being laid out
+/// before the × in the same `ui.horizontal`), there would be nothing left
+/// for the × button, which is what put it outside the panel's clickable
+/// area in the first place.
+const FOLDER_DELETE_BUTTON_WIDTH: f32 = 28.0;
 
 pub fn draw_sidebar(
     ui: &mut egui::Ui,
@@ -48,6 +77,12 @@ pub fn draw_sidebar(
     folders: &[Folder],
     selected: &mut SidebarFilter,
     lock_countdown: &str,
+    // The folder id (if any) whose × delete button is currently armed --
+    // i.e. its first click already happened and the confirm window (see
+    // `vault_window::mod::DELETE_CONFIRM_WINDOW`) hasn't expired yet. Purely
+    // for what that row's button shows; `vault_window::mod::confirm_click`
+    // is what actually decides whether a click here arms or confirms.
+    pending_delete_id: Option<&str>,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -64,7 +99,8 @@ pub fn draw_sidebar(
             ("Trash", SidebarFilter::Trash),
         ] {
             let count = count_for(items, &filter);
-            if sidebar_row(ui, label, count, *selected == filter) {
+            let width = ui.available_width();
+            if sidebar_row(ui, label, count, *selected == filter, width) {
                 *selected = filter;
             }
         }
@@ -81,11 +117,17 @@ pub fn draw_sidebar(
         for folder in folders {
             let filter = SidebarFilter::Folder(folder.id.clone());
             let count = count_for(items, &filter);
+            let confirming = pending_delete_id == Some(folder.id.as_str());
             ui.horizontal(|ui| {
-                if sidebar_row(ui, &folder.name, count, *selected == filter) {
+                // Reserve the ×'s width *before* the row claims the rest of
+                // the available width -- see `FOLDER_DELETE_BUTTON_WIDTH`.
+                let row_width = (ui.available_width() - FOLDER_DELETE_BUTTON_WIDTH).max(0.0);
+                if sidebar_row(ui, &folder.name, count, *selected == filter, row_width) {
                     *selected = filter.clone();
                 }
-                if ui.small_button("×").on_hover_text("Delete folder").clicked() {
+                let hover = if confirming { "Click again to permanently delete this folder" } else { "Delete folder" };
+                let label = RichText::new("×").color(if confirming { theme::ERROR } else { theme::TEXT_SECONDARY });
+                if ui.small_button(label).on_hover_text(hover).clicked() {
                     action = SidebarAction::DeleteFolder(folder.id.clone());
                 }
             });
@@ -105,13 +147,14 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.add_space(4.0);
 }
 
-/// One VAULT/FOLDERS row: label left, right-aligned count. Returns true when
-/// clicked.
-fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool) -> bool {
+/// One VAULT/FOLDERS row: label left, right-aligned count, allocated at
+/// exactly `width` wide (not necessarily all of `ui.available_width()` --
+/// see `FOLDER_DELETE_BUTTON_WIDTH`). Returns true when clicked.
+fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool, width: f32) -> bool {
     let response = ui.add(
         egui::Button::new("")
             .frame(false)
-            .min_size(egui::vec2(ui.available_width(), 26.0)),
+            .min_size(egui::vec2(width, 26.0)),
     );
     ui.scope_builder(egui::UiBuilder::new().max_rect(response.rect), |ui| {
         ui.horizontal(|ui| {
@@ -131,7 +174,6 @@ fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vault_bridge::VaultField;
 
     fn item(item_type: Option<i64>, favorite: bool, folder_id: Option<&str>) -> VaultItem {
         VaultItem {

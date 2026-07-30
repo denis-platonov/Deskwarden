@@ -4,9 +4,9 @@
 //! from read mode.
 
 use crate::theme;
-use crate::vault_bridge::{Folder, LoginData, NewLoginItem, VaultItem};
+use crate::vault_bridge::{Folder, NewLoginItem, VaultItem};
 #[cfg(test)]
-use crate::vault_bridge::UriEntry;
+use crate::vault_bridge::{LoginData, UriEntry};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
 #[derive(Debug, Clone, Default)]

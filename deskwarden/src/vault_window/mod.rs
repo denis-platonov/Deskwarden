@@ -40,12 +40,22 @@ const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// already exposes the current code directly.
 const TOTP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a click-to-delete button (the sidebar's per-folder × button, or
+/// the detail pane's item Delete button) stays armed waiting for a
+/// confirming second click before reverting to its normal state. Chosen
+/// over a native Win32 `MessageBox` (which would block the async egui event
+/// loop) or a full inline "Delete X? [Yes] [No]" row (more UI than a
+/// two-click pattern needs) as the simplest way to make deletion not be a
+/// single accidental click away, for either the only irreversible
+/// destructive action in this window (folder delete) or the newly-wired-up
+/// item delete (see `confirm_click`).
+const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
+
 pub struct VaultWindowResult {
     pub locked: bool,
 }
 
 enum DetailMode {
-    None,
     Read,
     Edit(EditDraft),
     Create(EditDraft),
@@ -67,6 +77,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     fill_stats: FillStats,
     injector: &Injector<A, B>,
     server_url: Option<String>,
+    // The account email for the toolbar's avatar initials. Passed in from
+    // `main.rs`'s single `check_bw_status_details()` call rather than this
+    // function calling it again itself -- that call spawns the `bw` CLI
+    // (~1-3s on Windows), and this window used to pay that cost twice on
+    // every open (once here, once in `main.rs` for `server_url`) with no UI
+    // feedback before the window even appeared.
+    account_email: Option<String>,
     session_token: String,
 ) -> VaultWindowResult {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
@@ -98,10 +115,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
     let mut items: Vec<VaultItem> = vault.list_items().unwrap_or_default();
     let mut folders: Vec<Folder> = vault.list_folders().unwrap_or_default();
-    // For the toolbar's avatar circle (design 4.8's `AN` initials badge).
-    // `None` just omits the avatar -- an unreadable account email is not
-    // worth failing the window over.
-    let account_email = crate::login_ui::check_bw_status_details().user_email;
     let mut filter = SidebarFilter::All;
     let mut search = String::new();
     let mut selected_id: Option<String> = items.first().map(|i| i.id.clone());
@@ -120,6 +133,22 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut totp_code: Option<String> = None;
     let mut totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
     let mut last_activity = Instant::now();
+    // The fill count shown in the detail pane's metadata line. Computed
+    // once per selection change (below, and here for the initial
+    // selection) rather than every frame: `fill_stats.count()` does a full
+    // file read + JSON parse, which was previously happening on every
+    // single repaint while an item was selected.
+    let mut fill_count: u32 = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
+
+    // Two-click "delete" confirmation state, shared in *pattern* (not
+    // storage -- each button owns its own slot so arming one doesn't
+    // disturb the other) by the sidebar's per-folder × button and the
+    // detail pane's item Delete button. `(id, expires_at)`: a second click
+    // on the same id before `expires_at` confirms the delete; anything else
+    // (a different id, or the window elapsing) just (re)arms it. See
+    // `confirm_click`.
+    let mut folder_delete_pending: Option<(String, Instant)> = None;
+    let mut item_delete_pending: Option<(String, Instant)> = None;
 
     let mut styled = false;
     let options = eframe::NativeOptions {
@@ -173,6 +202,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             if result.is_ok() {
                 items = vault.list_items().unwrap_or_default();
                 folders = vault.list_folders().unwrap_or_default();
+                // If the item that was selected before this sync no longer
+                // exists in the reloaded `items` (e.g. deleted on another
+                // device), drop the stale id. The detail pane already falls
+                // back to "Select an item." when `selected_id` doesn't
+                // resolve, but left alone `selected_id`/`last_selected_id`
+                // would keep pointing at the vanished item, leaving `mode`/
+                // `reveal_password`/`totp_code` stuck in whatever they were.
+                // Clearing it here makes `selected_id != last_selected_id`
+                // true on the next frame, so the existing per-selection
+                // reset block (below) takes care of the rest normally.
+                if let Some(id) = &selected_id {
+                    if !items.iter().any(|i| &i.id == id) {
+                        selected_id = None;
+                    }
+                }
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
             }
@@ -254,22 +298,45 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 });
             });
 
+        // Auto-expire a stale armed folder delete before deciding what to
+        // show the sidebar this frame -- `is_armed` does this too on the
+        // click path, but the display needs it checked independently since
+        // it runs whether or not a click happened this frame.
+        if let Some((_, expires_at)) = folder_delete_pending {
+            if Instant::now() >= expires_at {
+                folder_delete_pending = None;
+            }
+        }
+        // Owned, not borrowed: an `&str` borrow of `folder_delete_pending`
+        // would still be held live inside the closure below, which also
+        // needs `&mut folder_delete_pending` for `confirm_click`.
+        let armed_folder_id: Option<String> = folder_delete_pending.as_ref().map(|(id, _)| id.clone());
+
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
             .frame(egui::Frame::new().fill(theme::WINDOW_BG).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
             .show(ui, |ui| {
-                match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown) {
+                match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown, armed_folder_id.as_deref()) {
                     SidebarAction::NewFolder => {
                         if let Ok(folder) = vault.create_folder("New folder") {
                             folders.push(folder);
                         }
                     }
+                    // A click on a folder's × button: `confirm_click` is
+                    // what actually decides whether this is the first
+                    // (arming) click or the confirming second one -- see
+                    // its doc comment. Only a confirming click reaches
+                    // `delete_folder`.
                     SidebarAction::DeleteFolder(id) => {
-                        if vault.delete_folder(&id).is_ok() {
-                            folders.retain(|f| f.id != id);
-                            if filter == SidebarFilter::Folder(id) {
-                                filter = SidebarFilter::All;
+                        if confirm_click(&mut folder_delete_pending, &id) {
+                            if vault.delete_folder(&id).is_ok() {
+                                folders.retain(|f| f.id != id);
+                                if filter == SidebarFilter::Folder(id) {
+                                    filter = SidebarFilter::All;
+                                }
+                            } else {
+                                log::warn!("failed to delete folder {id}");
                             }
                         }
                     }
@@ -306,6 +373,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // selected item's code is fetched immediately instead of
             // waiting out the rest of the previous item's poll interval.
             totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
+            // Recompute once per selection change, not every frame -- see
+            // `fill_count`'s declaration above.
+            fill_count = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
+            // A delete armed on the previous item shouldn't silently carry
+            // over and be confirmable against the newly selected one.
+            item_delete_pending = None;
             last_selected_id = selected_id.clone();
         }
 
@@ -328,9 +401,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 }
 
                 match &mut mode {
-                    DetailMode::None => {
-                        ui.label("Select an item.");
-                    }
                     DetailMode::Read => {
                         if let Some(item) = &selected_item {
                             if item.item_type != Some(1) {
@@ -340,7 +410,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 return;
                             }
 
-                            if totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL {
+                            // Only poll `bw serve` for a TOTP code if this
+                            // item's own login data says one is configured.
+                            // `LoginData::totp` is known locally (Task 1),
+                            // so items with no TOTP secret at all no longer
+                            // pay for a real HTTP round-trip to `bw serve`
+                            // every ~1s just to be told "no code" again.
+                            let has_totp_secret = item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some();
+                            if has_totp_secret && totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL {
                                 totp_last_poll = Instant::now();
                                 totp_code = vault.get_totp(&item.id).ok().flatten();
                             }
@@ -349,8 +426,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 .map(|d| d.as_secs() % 30)
                                 .unwrap_or(0))) as u8;
 
-                            let fill_count = fill_stats.count(&item.id);
-                            let mut action = draw_detail_read(ui, item, fill_count, totp_code.as_deref(), seconds_left, &mut reveal_password);
+                            // Auto-expire a stale armed item delete the same
+                            // way the sidebar's folder delete does above.
+                            if let Some((_, expires_at)) = item_delete_pending {
+                                if Instant::now() >= expires_at {
+                                    item_delete_pending = None;
+                                }
+                            }
+                            let delete_pending = item_delete_pending.as_ref().map(|(id, _)| id.as_str()) == Some(item.id.as_str());
+
+                            let mut action = draw_detail_read(ui, item, fill_count, totp_code.as_deref(), seconds_left, delete_pending, &mut reveal_password);
                             // Ctrl+Shift+F (spec section 5) is the keyboard
                             // equivalent of clicking "Fill in app" -- checked
                             // here, not at the top level, because it needs
@@ -411,6 +496,34 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 DetailAction::OpenWebsite(url) => {
                                     webbrowser_open(&url);
                                 }
+                                // As with the sidebar's folder ×,
+                                // `confirm_click` gates this on a confirming
+                                // second click -- see its doc comment. Only
+                                // then does this actually call
+                                // `vault.delete_item`.
+                                DetailAction::Delete => {
+                                    if confirm_click(&mut item_delete_pending, &item.id) {
+                                        match vault.delete_item(&item.id) {
+                                            Ok(()) => {
+                                                let deleted_id = item.id.clone();
+                                                items.retain(|i| i.id != deleted_id);
+                                                // Select the first remaining
+                                                // item, or `None` if the
+                                                // vault is now empty --
+                                                // either way the reset block
+                                                // above clears `mode`/
+                                                // `reveal_password`/
+                                                // `totp_code` for us on the
+                                                // next frame.
+                                                selected_id = items.first().map(|i| i.id.clone());
+                                            }
+                                            Err(e) => log::warn!(
+                                                "failed to delete item {} ({}): {e:?}",
+                                                item.id, item.name
+                                            ),
+                                        }
+                                    }
+                                }
                                 DetailAction::None => {}
                             }
                         } else {
@@ -469,6 +582,41 @@ fn spawn_favicon_fetch(item_id: String, domain: String, server_url: Option<Strin
         let pixels = crate::favicon::fetch_icon_bytes(&url).and_then(|bytes| crate::favicon::decode_rgba(&bytes));
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
+}
+
+/// True when `pending` is currently armed for `id` -- i.e. a delete-button
+/// click on `id` right now would be a *confirming* second click, not the
+/// first arming click. Also clears `pending` once it has expired, so a
+/// stale arm from several seconds ago can never be silently confirmed by an
+/// unrelated later click.
+fn is_armed(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
+    match pending {
+        Some((pending_id, expires_at)) => {
+            if Instant::now() >= *expires_at {
+                *pending = None;
+                false
+            } else {
+                pending_id == id
+            }
+        }
+        None => false,
+    }
+}
+
+/// Handles one click on a click-to-delete button for `id`. The first click
+/// arms a `DELETE_CONFIRM_WINDOW`-second confirmation and returns `false`
+/// (don't delete yet); a second click on the *same* `id` within that window
+/// confirms it -- clears `pending` and returns `true`, telling the caller
+/// to actually perform the delete. A click on a different id (or after the
+/// window elapsed) just (re)arms that id instead of confirming anything.
+fn confirm_click(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
+    if is_armed(pending, id) {
+        *pending = None;
+        true
+    } else {
+        *pending = Some((id.to_string(), Instant::now() + DELETE_CONFIRM_WINDOW));
+        false
+    }
 }
 
 /// True when `url` is safe to hand off to the shell to open: an `http://`
@@ -564,5 +712,34 @@ mod url_safety_tests {
         // and an http(s) URL passes it regardless of what shell
         // metacharacters happen to be embedded elsewhere in the string.
         assert!(is_safe_web_url("https://x.com&calc.exe"));
+    }
+}
+
+#[cfg(test)]
+mod delete_confirm_tests {
+    use super::confirm_click;
+
+    #[test]
+    fn first_click_arms_but_does_not_confirm() {
+        let mut pending = None;
+        assert!(!confirm_click(&mut pending, "f1"));
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn second_click_on_the_same_id_confirms_and_disarms() {
+        let mut pending = None;
+        assert!(!confirm_click(&mut pending, "f1"));
+        assert!(confirm_click(&mut pending, "f1"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn a_click_on_a_different_id_rearms_instead_of_confirming() {
+        let mut pending = None;
+        assert!(!confirm_click(&mut pending, "f1"));
+        assert!(!confirm_click(&mut pending, "f2"));
+        // f2 is now armed, not f1 -- confirming f1 again should just re-arm it.
+        assert!(!confirm_click(&mut pending, "f1"));
     }
 }

@@ -232,14 +232,25 @@ impl VaultBridge {
 
     pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item", self.base_url);
+        // Blank means absent, not an empty string -- matching
+        // `EditDraft::apply_to`'s convention (and `LoginData`'s own
+        // `skip_serializing_if = "Option::is_none"`) for the edit path. A
+        // newly-created item with a blank username, saved verbatim here as
+        // `"username": ""` and then immediately re-saved once through the
+        // edit form (which maps blank to an absent key), would otherwise
+        // silently change shape server-side between the two saves.
+        let mut login = serde_json::Map::new();
+        if !new_item.username.is_empty() {
+            login.insert("username".to_string(), serde_json::json!(new_item.username));
+        }
+        if !new_item.password.is_empty() {
+            login.insert("password".to_string(), serde_json::json!(new_item.password));
+        }
         let payload = serde_json::json!({
             "name": new_item.name,
             "type": 1,
             "folderId": new_item.folder_id,
-            "login": {
-                "username": new_item.username,
-                "password": new_item.password,
-            },
+            "login": login,
         });
         let body: Envelope<VaultItem> = self
             .agent
@@ -656,6 +667,38 @@ mod tests {
         let created = bridge.create_item(&new_item).unwrap();
         assert_eq!(created.id, "9");
         assert_eq!(created.login.unwrap().username.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn create_item_omits_blank_username_and_password_instead_of_sending_empty_strings() {
+        // Matches `EditDraft::apply_to`'s "blank means absent" convention:
+        // the mock only matches a request body whose `login` object has no
+        // `username`/`password` keys at all (not `""`), so if `create_item`
+        // regresses to sending them as empty strings this test fails with a
+        // 501 from the unmatched mock rather than silently passing.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "New",
+                "type": 1,
+                "folderId": null,
+                "login": {},
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"9","name":"New","type":1,"fields":[]}}"#)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewLoginItem {
+            name: "New".into(),
+            username: "".into(),
+            password: "".into(),
+            folder_id: None,
+        };
+        let created = bridge.create_item(&new_item).unwrap();
+        assert_eq!(created.id, "9");
     }
 
     #[test]

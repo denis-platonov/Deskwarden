@@ -436,12 +436,19 @@ fn main() {
             }
 
             if event.id == tray.open_vault_id {
-                let server_url = login_ui::check_bw_status_details().server_url;
+                // One call, not two: `vault_window::run` used to make its
+                // own separate `check_bw_status_details()` call just for
+                // `user_email`, meaning opening the vault window spawned the
+                // `bw` CLI (~1-3s on Windows) twice in a row with no UI
+                // feedback before the window appeared. Both fields come from
+                // this one struct, so one call covers both.
+                let status_details = login_ui::check_bw_status_details();
                 let result = vault_window::run(
                     vault.clone(),
                     fill_stats.clone(),
                     &injector,
-                    server_url,
+                    status_details.server_url,
+                    status_details.user_email,
                     session_token.clone(),
                 );
 

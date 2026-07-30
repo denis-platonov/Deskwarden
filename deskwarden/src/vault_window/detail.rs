@@ -19,6 +19,12 @@ pub enum DetailAction {
     CopyPassword,
     CopyTotp,
     OpenWebsite(String),
+    /// The header's Delete button was clicked. `vault_window::mod`'s
+    /// two-click `confirm_click` gates whether this click is armed or
+    /// confirming -- `draw_detail_read` itself only reports the click, via
+    /// `delete_pending` (see that param's doc comment) for which label/state
+    /// to show.
+    Delete,
 }
 
 /// The metadata strip's text: "Updated N days ago · Filled N times ·
@@ -47,6 +53,11 @@ pub fn draw_detail_read(
     fill_count: u32,
     totp: Option<&str>,
     totp_seconds_left: u8,
+    // Whether *this* item currently has a delete armed (its first click
+    // already happened and the confirm window hasn't expired) -- purely for
+    // what the Delete button shows; `vault_window::mod`'s `confirm_click` is
+    // what actually decides whether a click here is arming or confirming.
+    delete_pending: bool,
     reveal_password: &mut bool,
 ) -> DetailAction {
     let mut action = DetailAction::None;
@@ -67,6 +78,19 @@ pub fn draw_detail_read(
             }
             if theme::primary_button(ui, "Fill in app", Some("CTRL+SHIFT+F")).clicked() {
                 action = DetailAction::Fill;
+            }
+            let (delete_label, delete_hover, delete_color) = if delete_pending {
+                ("Delete? Click to confirm", "Click again to permanently delete this item", theme::ERROR)
+            } else {
+                ("Delete", "Delete this item", theme::INK)
+            };
+            let delete_button = egui::Button::new(theme::semibold(delete_label, 13.0).color(delete_color))
+                .fill(theme::CARD)
+                .stroke(Stroke::new(1.0, if delete_pending { theme::ERROR } else { theme::BORDER_STRONG }))
+                .corner_radius(CornerRadius::same(7))
+                .min_size(egui::Vec2::new(0.0, 32.0));
+            if ui.add(delete_button).on_hover_text(delete_hover).clicked() {
+                action = DetailAction::Delete;
             }
         });
     });
