@@ -62,13 +62,23 @@ struct FaviconResult {
 /// path) or locked (the `Lock` button or the auto-lock timer). Mirrors
 /// `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
 /// update closure is `FnMut + 'static` and can't return anything directly.
-pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
+pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     vault: VaultBridge,
     fill_stats: FillStats,
     injector: &Injector<A, B>,
     server_url: Option<String>,
     session_token: String,
 ) -> VaultWindowResult {
+    // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
+    // to a real winit event loop, not run on a borrowed stack), but `injector`
+    // arrives here as a plain `&Injector<A, B>` borrowed from the caller's
+    // stack (see `main.rs`, which keeps its own `injector` alive across the
+    // whole run loop and can only lend a reference into this call). Cloning
+    // once, up front, turns it into an owned value the `move` closure below
+    // can actually capture; `Injector<A, B>`'s `Clone` impl (added for this)
+    // is trivial for the real fillers (`RealUiAutomation`/`RealSendInput` are
+    // zero-sized), so this is not a meaningful runtime cost.
+    let injector = injector.clone();
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
     let mut sync_status: Option<Result<(), String>> = None;
@@ -357,10 +367,31 @@ pub fn run<A: UiAutomationFiller, B: SendInputFiller>(
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
                                 DetailAction::Fill => {
-                                    // Fills into whatever native app targets
-                                    // this item -- wired up in Task 10, which
-                                    // has window-watch context this module
-                                    // doesn't.
+                                    match crate::vault_bridge::extract_app_match(item) {
+                                        Some(app_match) => {
+                                            let windows = crate::window_list::list_windows(std::process::id());
+                                            match crate::app::find_window_for_process(&windows, &app_match.process) {
+                                                // fill_from_vault does its own credential lookup
+                                                // and the fill in one call -- nothing else here
+                                                // needs to touch `injector` directly.
+                                                Some(target) => crate::app::fill_from_vault(
+                                                    &vault,
+                                                    &injector,
+                                                    &fill_stats,
+                                                    &item.id,
+                                                    target.hwnd,
+                                                ),
+                                                None => log::info!(
+                                                    "\"Fill in app\" for {}: {} isn't currently open",
+                                                    item.name, app_match.process
+                                                ),
+                                            }
+                                        }
+                                        None => log::info!(
+                                            "\"Fill in app\" for {}: no app is matched to this item yet",
+                                            item.name
+                                        ),
+                                    }
                                 }
                                 DetailAction::CopyUsername => {
                                     if let Some(username) = login.and_then(|l| l.username.as_deref()) {

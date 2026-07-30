@@ -186,6 +186,17 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     }
 }
 
+/// Finds a currently-open window whose exe name matches `process` -- for
+/// "Fill in app" (the vault window's detail pane), which has no
+/// window-watch context of its own and needs to resolve a target hwnd from
+/// just an item's `deskwarden:app-match` process name.
+pub fn find_window_for_process<'a>(
+    windows: &'a [crate::window_list::WindowInfo],
+    process: &str,
+) -> Option<&'a crate::window_list::WindowInfo> {
+    windows.iter().find(|w| w.exe_name.eq_ignore_ascii_case(process))
+}
+
 /// Pure helper: turns a list of vault items into the `(item_id, AppMatch)`
 /// entries the match engine is rebuilt from, dropping items with no
 /// `deskwarden:app-match` field.
@@ -278,5 +289,28 @@ mod tests {
             serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{"username":"u"}}"#)
                 .unwrap();
         assert_eq!(credentials_for(&item), ("u".to_string(), String::new()));
+    }
+
+    #[test]
+    fn find_window_for_process_matches_case_insensitively() {
+        let windows = vec![
+            crate::window_list::WindowInfo {
+                hwnd: 1,
+                pid: 100,
+                exe_path: r"C:\Games\EpicGamesLauncher.exe".into(),
+                exe_name: "EpicGamesLauncher.exe".into(),
+                title: "Epic Games Launcher".into(),
+            },
+            crate::window_list::WindowInfo {
+                hwnd: 2,
+                pid: 200,
+                exe_path: r"C:\Windows\notepad.exe".into(),
+                exe_name: "notepad.exe".into(),
+                title: "Untitled - Notepad".into(),
+            },
+        ];
+        let found = find_window_for_process(&windows, "epicgameslauncher.exe").unwrap();
+        assert_eq!(found.hwnd, 1);
+        assert!(find_window_for_process(&windows, "steam.exe").is_none());
     }
 }

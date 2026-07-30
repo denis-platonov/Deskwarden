@@ -13,6 +13,7 @@ pub trait SendInputFiller {
     fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String>;
 }
 
+#[derive(Clone)]
 pub struct Injector<A: UiAutomationFiller, B: SendInputFiller> {
     pub ui: A,
     pub fallback: B,
@@ -31,6 +32,7 @@ impl<A: UiAutomationFiller, B: SendInputFiller> Injector<A, B> {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct RealUiAutomation;
 impl UiAutomationFiller for RealUiAutomation {
     fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<bool, String> {
@@ -38,6 +40,7 @@ impl UiAutomationFiller for RealUiAutomation {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct RealSendInput;
 impl SendInputFiller for RealSendInput {
     fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {

@@ -36,7 +36,7 @@ use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store,
-    tray, window_watch,
+    tray, vault_window, window_watch,
 };
 use semver::Version;
 use std::process::Child;
@@ -433,6 +433,69 @@ fn main() {
                 log::info!("quit requested from tray; killing bw serve");
                 bw_serve::stop_bw_serve(&mut bw_serve_child);
                 std::process::exit(0);
+            }
+
+            if event.id == tray.open_vault_id {
+                let server_url = login_ui::check_bw_status_details().server_url;
+                let result = vault_window::run(
+                    vault.clone(),
+                    fill_stats.clone(),
+                    &injector,
+                    server_url,
+                    session_token.clone(),
+                );
+
+                if result.locked {
+                    // Mirrors the startup retry path above (`stop_bw_serve` on
+                    // the old child -> `reauthenticate` -> `try_start_backend`
+                    // -> `wait_for_vault_ready_with_spinner` -> rebuild the
+                    // match engine) rather than inventing a second recovery
+                    // sequence: the vault window locked itself (manual Lock
+                    // button or its own auto-lock timer), which invalidates
+                    // `bw serve`'s session exactly the same way a rejected
+                    // cached session does at startup.
+                    log::info!("vault window locked itself; re-authenticating");
+                    bw_serve::stop_bw_serve(&mut bw_serve_child);
+                    session_token = reauthenticate(&store);
+                    bw_serve_child = match try_start_backend(
+                        &session_token,
+                        job.as_ref(),
+                        bw_serve::PORT_RELEASE_GRACE_RESTART,
+                    ) {
+                        Ok(child) => child,
+                        Err(e) => {
+                            log::error!("{e}");
+                            fatal_startup_error(&format!(
+                                "Deskwarden could not restart its Bitwarden backend after the \
+                                 vault window locked.\n\n{e}\n\nFull details are in:\n{}",
+                                logging::log_file_path(&config_dir).display()
+                            ));
+                        }
+                    };
+                    match wait_for_vault_ready_with_spinner(&vault, &schedule) {
+                        Ok(_items) => match refresh_match_engine(&vault, &mut engine) {
+                            Ok(count) => log::info!(
+                                "match engine refreshed after unlock: {count} app match(es)"
+                            ),
+                            Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
+                        },
+                        Err(e) => {
+                            log::error!("{e}");
+                            bw_serve::stop_bw_serve(&mut bw_serve_child);
+                            fatal_startup_error(&format!(
+                                "Deskwarden's Bitwarden backend did not come back up after the \
+                                 vault window locked.\n\n{e}\n\nFull details are in:\n{}",
+                                logging::log_file_path(&config_dir).display()
+                            ));
+                        }
+                    }
+                }
+
+                // The vault window just stole and released foreground, same
+                // as the picker windows below: forget the last-dispatched
+                // hwnd so the window the user returns to is treated as a
+                // fresh switch rather than being suppressed as a repeat.
+                last_dispatched_hwnd = None;
             }
 
             if event.id == tray.add_app_id {

@@ -19,6 +19,7 @@ pub struct AppTray {
     /// no window and no console, so without this a failed update would be
     /// visible only to whoever goes looking in the log file.
     icon: TrayIcon,
+    pub open_vault_id: MenuId,
     pub add_app_id: MenuId,
     pub quit_id: MenuId,
     /// Id of the "Update available" item, for comparing against
@@ -35,6 +36,7 @@ pub struct AppTray {
 
 pub fn build_tray() -> AppTray {
     let menu = Menu::new();
+    let open_vault = MenuItem::new("Open Vault", true, None);
     let add_app = MenuItem::new("Add app...", true, None);
     let quit = MenuItem::new("Quit", true, None);
     // Present in the menu from startup, but disabled until an update is
@@ -44,6 +46,7 @@ pub fn build_tray() -> AppTray {
     // entries at runtime, so that's the mechanism `set_update_available`
     // uses rather than rebuilding the menu.
     let update_item = MenuItem::new("Update available", false, None);
+    menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
     menu.append(&update_item).unwrap();
     menu.append(&quit).unwrap();
@@ -59,6 +62,7 @@ pub fn build_tray() -> AppTray {
 
     AppTray {
         icon,
+        open_vault_id: open_vault.id().clone(),
         add_app_id: add_app.id().clone(),
         quit_id: quit.id().clone(),
         update_id: update_item.id().clone(),

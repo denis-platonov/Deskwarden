@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct FillStats {
     path: PathBuf,
 }
