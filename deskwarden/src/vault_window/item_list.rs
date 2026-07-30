@@ -45,6 +45,16 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
 
 const ROW_HEIGHT: f32 = 50.0;
 
+/// Draws the search box, `+ New` button, and the virtualized item list.
+///
+/// `visible_ids` is cleared at the top of this call and then filled with the
+/// id of every item row actually rendered this frame (i.e. within
+/// `show_rows`'s returned range) -- `vault_window::mod` uses this to know
+/// which items are currently on screen so it can trigger favicon fetches for
+/// exactly those, matching official Bitwarden clients' "load icons for
+/// what's visible" behavior instead of only the single selected item. This
+/// module stays otherwise unaware of favicons/threads/caching -- it just
+/// reports what it drew.
 pub fn draw_item_list(
     ui: &mut egui::Ui,
     items: &[VaultItem],
@@ -52,8 +62,10 @@ pub fn draw_item_list(
     search: &mut String,
     selected_id: &mut Option<String>,
     icons: &IconCache,
+    visible_ids: &mut Vec<String>,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
+    visible_ids.clear();
 
     ui.horizontal(|ui| {
         let width = (ui.available_width() - 70.0).max(40.0);
@@ -84,6 +96,7 @@ pub fn draw_item_list(
             ui.spacing_mut().item_spacing.y = 2.0;
             for row in row_range {
                 let item = filtered[row];
+                visible_ids.push(item.id.clone());
                 let selected = selected_id.as_deref() == Some(item.id.as_str());
                 if item_row(ui, item, selected, icons.textures.get(&item.id)) {
                     *selected_id = Some(item.id.clone());

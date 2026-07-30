@@ -95,6 +95,10 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // feedback before the window even appeared.
     account_email: Option<String>,
     session_token: String,
+    // Directory the on-disk favicon cache lives in (`main.rs`'s
+    // `project_dirs.cache_dir().join("icons")`). Not created here --
+    // `favicon::write_cached_icon` creates it lazily on first write.
+    icon_cache_dir: std::path::PathBuf,
 ) -> VaultWindowResult {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
     // to a real winit event loop, not run on a borrowed stack), but `injector`
@@ -145,6 +149,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut mode = DetailMode::Read;
     let mut reveal_password = false;
     let mut icons = IconCache::default();
+    // Ids of the item rows `draw_item_list` actually rendered this frame --
+    // populated by that call each frame, then used right after to trigger
+    // favicon loads for whatever's currently scrolled into view (see
+    // `ensure_icon_loaded`), not just the one selected item.
+    let mut visible_ids: Vec<String> = Vec::new();
 
     let (favicon_tx, favicon_rx): (mpsc::Sender<FaviconResult>, Receiver<FaviconResult>) = mpsc::channel();
     let mut favicon_requested: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -379,11 +388,31 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             .resizable(false)
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
             .show(ui, |ui| {
-                match draw_item_list(ui, &items, &filter, &mut search, &mut selected_id, &icons) {
+                match draw_item_list(ui, &items, &filter, &mut search, &mut selected_id, &icons, &mut visible_ids) {
                     ItemListAction::NewItem => mode = DetailMode::Create(EditDraft::empty()),
                     ItemListAction::None => {}
                 }
             });
+
+        // Load favicons for whatever `draw_item_list` actually drew this
+        // frame, matching official Bitwarden clients ("visible items get
+        // icons", not just the single selected one). `ensure_icon_loaded`'s
+        // own already-resolved check makes this cheap on every frame after
+        // the first for a given scroll position -- it's a HashMap/HashSet
+        // lookup per id, not a fetch.
+        for id in &visible_ids {
+            if let Some(item) = items.iter().find(|i| &i.id == id) {
+                ensure_icon_loaded(
+                    ui.ctx(),
+                    item,
+                    &icon_cache_dir,
+                    &server_url,
+                    &favicon_tx,
+                    &mut favicon_requested,
+                    &mut icons,
+                );
+            }
+        }
 
         // `draw_item_list` above is the only place `selected_id` can change
         // (a row click). When it does, everything below is state that was
@@ -417,17 +446,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             .show(ui, |ui| {
                 let selected_item = selected_id.as_ref().and_then(|id| items.iter().find(|i| &i.id == id)).cloned();
 
-                // Kick off a favicon fetch the first time this item is seen,
-                // and only for items with a website to derive a domain from.
+                // The detail pane wants its own icon regardless of whether
+                // the selected item also happens to be part of this frame's
+                // `visible_ids` (it's a row in `item_list`'s scrolled range) --
+                // if it's selected, it's effectively "visible" too. Cheap to
+                // call every frame: see `ensure_icon_loaded`'s doc comment.
                 if let Some(item) = &selected_item {
-                    if !icons.textures.contains_key(&item.id) && !favicon_requested.contains(&item.id) {
-                        if let Some(uri) = item.login.as_ref().and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()) {
-                            if let Some(domain) = crate::favicon::domain_from_uri(uri) {
-                                favicon_requested.insert(item.id.clone());
-                                spawn_favicon_fetch(item.id.clone(), domain, server_url.clone(), favicon_tx.clone());
-                            }
-                        }
-                    }
+                    ensure_icon_loaded(
+                        ui.ctx(),
+                        item,
+                        &icon_cache_dir,
+                        &server_url,
+                        &favicon_tx,
+                        &mut favicon_requested,
+                        &mut icons,
+                    );
                 }
 
                 match &mut mode {
@@ -465,7 +498,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             }
                             let delete_pending = item_delete_pending.as_ref().map(|(id, _)| id.as_str()) == Some(item.id.as_str());
 
-                            let mut action = draw_detail_read(ui, item, fill_count, totp_code.as_deref(), seconds_left, delete_pending, &mut reveal_password);
+                            let mut action = draw_detail_read(
+                                ui,
+                                item,
+                                fill_count,
+                                totp_code.as_deref(),
+                                seconds_left,
+                                delete_pending,
+                                &mut reveal_password,
+                                icons.textures.get(item.id.as_str()),
+                            );
                             // Ctrl+Shift+F (spec section 5) is the keyboard
                             // equivalent of clicking "Fill in app" -- checked
                             // here, not at the top level, because it needs
@@ -613,16 +655,64 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
     });
 }
 
-/// Spawns a one-shot background thread to fetch and decode `domain`'s
-/// favicon, sending the result back over `tx`. A bare `thread::spawn` (not
-/// `thread::scope`) because the result travels back over an owned channel
-/// with no borrowed data -- there's nothing here that needs the caller's
-/// stack to stay alive, unlike `loading_ui::show_while`'s worker.
-fn spawn_favicon_fetch(item_id: String, domain: String, server_url: Option<String>, tx: mpsc::Sender<FaviconResult>) {
+/// Ensures `item`'s favicon is loading or loaded, doing as little work as
+/// possible: skips entirely if already resolved (loaded or a fetch already
+/// dispatched) this session, serves instantly from the on-disk cache if
+/// present (no thread, no network), and only falls back to a background
+/// network fetch on a genuine cache miss -- writing the result to the disk
+/// cache on success so future opens (and every other item on the same
+/// domain) never re-fetch it.
+///
+/// Cheap to call redundantly: this is called once per selected item and once
+/// per currently-visible item, every frame, and the vast majority of those
+/// calls hit the first check below and return immediately.
+fn ensure_icon_loaded(
+    ctx: &egui::Context,
+    item: &VaultItem,
+    icon_cache_dir: &std::path::Path,
+    server_url: &Option<String>,
+    favicon_tx: &mpsc::Sender<FaviconResult>,
+    favicon_requested: &mut std::collections::HashSet<String>,
+    icons: &mut IconCache,
+) {
+    if icons.textures.contains_key(&item.id) || favicon_requested.contains(&item.id) {
+        return;
+    }
+    let Some(uri) = item.login.as_ref().and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()) else {
+        favicon_requested.insert(item.id.clone());
+        return;
+    };
+    let Some(domain) = crate::favicon::domain_from_uri(uri) else {
+        favicon_requested.insert(item.id.clone());
+        return;
+    };
+    favicon_requested.insert(item.id.clone());
+
+    if let Some(cached_bytes) = crate::favicon::read_cached_icon(icon_cache_dir, &domain) {
+        if let Some((w, h, rgba)) = crate::favicon::decode_rgba(&cached_bytes) {
+            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let tex = ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default());
+            icons.textures.insert(item.id.clone(), tex);
+            return;
+        }
+        // Corrupt/unreadable cache entry -- fall through and re-fetch as if
+        // it were a miss, rather than permanently failing this domain.
+    }
+
+    let tx = favicon_tx.clone();
+    let item_id = item.id.clone();
+    let server_url = server_url.clone();
+    let cache_dir = icon_cache_dir.to_path_buf();
     std::thread::spawn(move || {
         let base = crate::favicon::icon_base_url(server_url.as_deref());
         let url = format!("{base}/{domain}/icon.png");
-        let pixels = crate::favicon::fetch_icon_bytes(&url).and_then(|bytes| crate::favicon::decode_rgba(&bytes));
+        let pixels = crate::favicon::fetch_icon_bytes(&url).and_then(|bytes| {
+            let decoded = crate::favicon::decode_rgba(&bytes);
+            if decoded.is_some() {
+                crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
+            }
+            decoded
+        });
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
 }

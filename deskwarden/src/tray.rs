@@ -1,6 +1,6 @@
 use semver::Version;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Ordinal of the icon resource `build.rs` embeds into the executable. Must
 /// stay in step with the id passed to `set_icon_with_id` there -- there is no
@@ -53,7 +53,12 @@ pub fn build_tray() -> AppTray {
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(IDLE_TOOLTIP);
+        .with_tooltip(IDLE_TOOLTIP)
+        // Left click opens the vault directly (see `next_tray_icon_event`'s
+        // caller in `main.rs`) instead of showing the same menu right-click
+        // already shows -- this crate's default is to show the menu on
+        // either button.
+        .with_menu_on_left_click(false);
     if let Some(app_icon) = app_icon() {
         builder = builder.with_icon(app_icon);
     }
@@ -89,6 +94,25 @@ fn app_icon() -> Option<Icon> {
 
 pub fn next_menu_event() -> Option<MenuEvent> {
     MenuEvent::receiver().try_recv().ok()
+}
+
+/// True when `event` is a completed left click on the tray icon (the button
+/// release, not the press -- Windows reports both as separate `Click`
+/// events with a `button_state`, and reacting on `Down` as well would fire
+/// this twice per physical click).
+pub fn is_left_click(event: &TrayIconEvent) -> bool {
+    matches!(
+        event,
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+    )
+}
+
+pub fn next_tray_icon_event() -> Option<TrayIconEvent> {
+    TrayIconEvent::receiver().try_recv().ok()
 }
 
 /// Enables the "Update available" tray item and labels it with the version

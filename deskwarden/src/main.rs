@@ -30,7 +30,9 @@ use deskwarden::bw_serve::{
     self, readiness_schedule, wait_for_vault_ready, BW_SERVE_URL, READINESS_DEADLINE,
 };
 use deskwarden::dispatch;
-use deskwarden::injector::{Injector, RealSendInput, RealUiAutomation};
+use deskwarden::injector::{
+    Injector, RealSendInput, RealUiAutomation, SendInputFiller, UiAutomationFiller,
+};
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
@@ -121,6 +123,14 @@ fn main() {
     // downloads out of the directory holding the encrypted session token is
     // worth the one extra path. Created lazily by `download_and_verify`.
     let update_download_dir = project_dirs.cache_dir().join("updates");
+
+    // On-disk favicon cache, keyed by domain (see `favicon::write_cached_icon`).
+    // Also a cache directory, for the same reason `update_download_dir` is:
+    // disposable and regenerable, so it belongs alongside it rather than in
+    // `config_dir`. Not created here -- `favicon::write_cached_icon` creates
+    // it lazily on first write, same as `update_download_dir`'s directory is
+    // created lazily by `download_and_verify`.
+    let icon_cache_dir = project_dirs.cache_dir().join("icons");
 
     // Logging first: a background tray app has no console, so without a log
     // file every failure below is invisible to whoever has to diagnose it.
@@ -447,72 +457,19 @@ fn main() {
             }
 
             if event.id == tray.open_vault_id {
-                // One call, not two: `vault_window::run` used to make its
-                // own separate `check_bw_status_details()` call just for
-                // `user_email`, meaning opening the vault window spawned the
-                // `bw` CLI (~1-3s on Windows) twice in a row with no UI
-                // feedback before the window appeared. Both fields come from
-                // this one struct, so one call covers both.
-                let status_details = login_ui::check_bw_status_details();
-                let result = vault_window::run(
-                    vault.clone(),
-                    fill_stats.clone(),
+                open_vault_window(
+                    &vault,
+                    &fill_stats,
                     &injector,
-                    status_details.server_url,
-                    status_details.user_email,
-                    session_token.clone(),
+                    &mut session_token,
+                    &mut bw_serve_child,
+                    job.as_ref(),
+                    &store,
+                    &schedule,
+                    &mut engine,
+                    &config_dir,
+                    &icon_cache_dir,
                 );
-
-                if result.locked {
-                    // Mirrors the startup retry path above (`stop_bw_serve` on
-                    // the old child -> `reauthenticate` -> `try_start_backend`
-                    // -> `wait_for_vault_ready_with_spinner` -> rebuild the
-                    // match engine) rather than inventing a second recovery
-                    // sequence: the vault window locked itself (manual Lock
-                    // button or its own auto-lock timer), which invalidates
-                    // `bw serve`'s session exactly the same way a rejected
-                    // cached session does at startup.
-                    log::info!("vault window locked itself; re-authenticating");
-                    bw_serve::stop_bw_serve(&mut bw_serve_child);
-                    session_token = reauthenticate(&store);
-                    bw_serve_child = match try_start_backend(
-                        &session_token,
-                        job.as_ref(),
-                        bw_serve::PORT_RELEASE_GRACE_RESTART,
-                    ) {
-                        Ok(child) => child,
-                        Err(e) => {
-                            log::error!("{e}");
-                            fatal_startup_error(&format!(
-                                "Deskwarden could not restart its Bitwarden backend after the \
-                                 vault window locked.\n\n{e}\n\nFull details are in:\n{}",
-                                logging::log_file_path(&config_dir).display()
-                            ));
-                        }
-                    };
-                    match wait_for_vault_ready_with_spinner(&vault, &schedule) {
-                        Ok(_items) => match refresh_match_engine(&vault, &mut engine) {
-                            Ok(count) => log::info!(
-                                "match engine refreshed after unlock: {count} app match(es)"
-                            ),
-                            Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
-                        },
-                        Err(e) => {
-                            log::error!("{e}");
-                            bw_serve::stop_bw_serve(&mut bw_serve_child);
-                            fatal_startup_error(&format!(
-                                "Deskwarden's Bitwarden backend did not come back up after the \
-                                 vault window locked.\n\n{e}\n\nFull details are in:\n{}",
-                                logging::log_file_path(&config_dir).display()
-                            ));
-                        }
-                    }
-                }
-
-                // The vault window just stole and released foreground, same
-                // as the picker windows below: forget the last-dispatched
-                // hwnd so the window the user returns to is treated as a
-                // fresh switch rather than being suppressed as a repeat.
                 last_dispatched_hwnd = None;
             }
 
@@ -588,6 +545,29 @@ fn main() {
                     ),
                     (None, _) => log::debug!("update item clicked with no update available"),
                 }
+            }
+        }
+
+        // Left click opens the vault directly; right click still shows the
+        // menu (built with `with_menu_on_left_click(false)` specifically so
+        // the two aren't the same action). Same event, same recovery path as
+        // the menu's "Open Vault" item above -- just a different trigger.
+        if let Some(event) = tray::next_tray_icon_event() {
+            if tray::is_left_click(&event) {
+                open_vault_window(
+                    &vault,
+                    &fill_stats,
+                    &injector,
+                    &mut session_token,
+                    &mut bw_serve_child,
+                    job.as_ref(),
+                    &store,
+                    &schedule,
+                    &mut engine,
+                    &config_dir,
+                    &icon_cache_dir,
+                );
+                last_dispatched_hwnd = None;
             }
         }
 
@@ -1043,6 +1023,84 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 /// main thread shows `loading_ui::show_while`'s spinner. Scoped rather than
 /// a bare `std::thread::spawn`: the worker only needs `&vault`/`&schedule`
 /// for the length of this call, not `'static` ownership of them.
+/// Opens the vault window and handles it locking itself before returning.
+/// Shared by both ways of asking for it -- the tray menu's "Open Vault" item
+/// and a left click on the tray icon -- so the recovery sequence (mirroring
+/// the startup retry path: `stop_bw_serve` on the old child ->
+/// `reauthenticate` -> `try_start_backend` -> `wait_for_vault_ready_with_spinner`
+/// -> rebuild the match engine) exists in exactly one place.
+#[allow(clippy::too_many_arguments)]
+fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+    vault: &VaultBridge,
+    fill_stats: &deskwarden::fill_stats::FillStats,
+    injector: &Injector<A, B>,
+    session_token: &mut String,
+    bw_serve_child: &mut Child,
+    job: Option<&job_object::KillOnCloseJob>,
+    store: &session_store::SessionStore,
+    schedule: &[Duration],
+    engine: &mut MatchEngine,
+    config_dir: &std::path::Path,
+    icon_cache_dir: &std::path::Path,
+) {
+    // One call, not two: `vault_window::run` used to make its own separate
+    // `check_bw_status_details()` call just for `user_email`, meaning
+    // opening the vault window spawned the `bw` CLI (~1-3s on Windows) twice
+    // in a row with no UI feedback before the window appeared. Both fields
+    // come from this one struct, so one call covers both.
+    let status_details = login_ui::check_bw_status_details();
+    let result = vault_window::run(
+        vault.clone(),
+        fill_stats.clone(),
+        injector,
+        status_details.server_url,
+        status_details.user_email,
+        session_token.clone(),
+        icon_cache_dir.to_path_buf(),
+    );
+
+    if result.locked {
+        // The vault window locked itself (manual Lock button or its own
+        // auto-lock timer), which invalidates `bw serve`'s session exactly
+        // the same way a rejected cached session does at startup.
+        log::info!("vault window locked itself; re-authenticating");
+        bw_serve::stop_bw_serve(bw_serve_child);
+        *session_token = reauthenticate(store);
+        *bw_serve_child = match try_start_backend(
+            session_token,
+            job,
+            bw_serve::PORT_RELEASE_GRACE_RESTART,
+        ) {
+            Ok(child) => child,
+            Err(e) => {
+                log::error!("{e}");
+                fatal_startup_error(&format!(
+                    "Deskwarden could not restart its Bitwarden backend after the vault \
+                     window locked.\n\n{e}\n\nFull details are in:\n{}",
+                    logging::log_file_path(config_dir).display()
+                ));
+            }
+        };
+        match wait_for_vault_ready_with_spinner(vault, schedule) {
+            Ok(_items) => match refresh_match_engine(vault, engine) {
+                Ok(count) => {
+                    log::info!("match engine refreshed after unlock: {count} app match(es)")
+                }
+                Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
+            },
+            Err(e) => {
+                log::error!("{e}");
+                bw_serve::stop_bw_serve(bw_serve_child);
+                fatal_startup_error(&format!(
+                    "Deskwarden's Bitwarden backend did not come back up after the vault \
+                     window locked.\n\n{e}\n\nFull details are in:\n{}",
+                    logging::log_file_path(config_dir).display()
+                ));
+            }
+        }
+    }
+}
+
 fn wait_for_vault_ready_with_spinner(
     vault: &VaultBridge,
     schedule: &[Duration],

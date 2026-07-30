@@ -5,6 +5,7 @@
 //! worth an error path, this app already has one perfectly good fallback.
 
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 /// Where to fetch icons from: Bitwarden's own icon service for the default
 /// cloud, or the self-hosted server's own icon proxy otherwise. Self-hosted
@@ -121,6 +122,38 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     Some((width, height, rgba))
 }
 
+/// Reads a previously-cached icon for `domain` from disk, if one exists.
+/// `cache_dir` is a directory the caller owns (created if needed by
+/// `write_cached_icon`) -- this function does not create it, just reads.
+pub fn read_cached_icon(cache_dir: &Path, domain: &str) -> Option<Vec<u8>> {
+    std::fs::read(icon_cache_path(cache_dir, domain)).ok()
+}
+
+/// Writes `png_bytes` to the on-disk cache for `domain`. Best-effort: a
+/// failure to persist (permissions, disk full, whatever) just means this
+/// domain gets re-fetched next time rather than being treated as fatal --
+/// this is a cache, not a source of truth.
+pub fn write_cached_icon(cache_dir: &Path, domain: &str, png_bytes: &[u8]) {
+    let path = icon_cache_path(cache_dir, domain);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, png_bytes);
+}
+
+/// Builds a cache-file path for `domain`, sanitizing it into a safe file
+/// name first. `domain_from_uri` already strips scheme/path/port, so this
+/// is normally just alphanumerics/dots/hyphens already -- but treat that as
+/// a property to defend, not a guarantee, since this ends up as an actual
+/// file path on disk.
+fn icon_cache_path(cache_dir: &Path, domain: &str) -> PathBuf {
+    let safe: String = domain
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    cache_dir.join(format!("{safe}.png"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +210,43 @@ mod tests {
     fn domain_rejects_uris_with_no_dotted_host() {
         assert_eq!(domain_from_uri("localhost"), None);
         assert_eq!(domain_from_uri(""), None);
+    }
+
+    fn unique_cache_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "deskwarden-test-favicon-cache-{label}-{}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn cached_icon_round_trips_through_disk() {
+        let dir = unique_cache_dir("round-trip");
+        let bytes = vec![1u8, 2, 3, 4, 5];
+
+        write_cached_icon(&dir, "app.ledgerline.com", &bytes);
+        assert_eq!(read_cached_icon(&dir, "app.ledgerline.com"), Some(bytes));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reading_an_uncached_domain_returns_none() {
+        let dir = unique_cache_dir("miss");
+        assert_eq!(read_cached_icon(&dir, "never-written.example.com"), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_domain_with_unsafe_filename_characters_still_round_trips() {
+        let dir = unique_cache_dir("unsafe-chars");
+        let domain = "evil/../../etc:passwd";
+        let bytes = vec![9u8, 8, 7];
+
+        write_cached_icon(&dir, domain, &bytes);
+        assert_eq!(read_cached_icon(&dir, domain), Some(bytes));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

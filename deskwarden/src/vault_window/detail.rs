@@ -59,6 +59,12 @@ pub fn draw_detail_read(
     // what actually decides whether a click here is arming or confirming.
     delete_pending: bool,
     reveal_password: &mut bool,
+    // This item's favicon texture, if `vault_window::mod`'s icon cache has
+    // already loaded one -- mirrors `item_list.rs`'s `item_row`, which uses
+    // the exact same `Some(tex)`/`None` pattern for its row avatar. `None`
+    // falls back to the colored-initials monogram, same as every other
+    // avatar in this app when no favicon is available.
+    icon: Option<&egui::TextureHandle>,
 ) -> DetailAction {
     let mut action = DetailAction::None;
     let login = item.login.as_ref();
@@ -66,7 +72,12 @@ pub fn draw_detail_read(
     let password = login.and_then(|l| l.password.as_deref()).unwrap_or("");
 
     ui.horizontal(|ui| {
-        theme::avatar(ui, &theme::initials(&item.name), 44.0, true);
+        match icon {
+            Some(tex) => {
+                ui.add(egui::Image::new((tex.id(), tex.size_vec2())).fit_to_exact_size(egui::Vec2::splat(44.0)));
+            }
+            None => theme::avatar(ui, &theme::initials(&item.name), 44.0, true),
+        }
         ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.label(theme::bold(&item.name, 22.0).color(theme::INK));
