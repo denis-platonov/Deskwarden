@@ -14,6 +14,7 @@ pub mod app_match;
 pub mod bw_path;
 pub mod bw_serve;
 pub mod dispatch;
+pub mod favicon;
 pub mod fill_stats;
 pub mod hello;
 pub mod hotkey;
