@@ -629,22 +629,41 @@ fn main() {
                 // `pick_vault_item` and `run_picker`'s window/trigger choice
                 // work purely from the cache and `window_list` -- but the
                 // Save at the very end of `run_picker` calls
-                // `cache.set_app_match`, a write, which needs `bw serve` up.
+                // `cache.set_app_match`, a write, which needs `bw serve` up
+                // *and answering*, not merely started (review 10's Important
+                // 2 -- see `run_picker`'s own doc for how it now waits for
+                // that itself rather than assuming a kicked-off start is
+                // enough). Read once, before it might change, and reused for
+                // `run_picker`'s own readiness wait below: whether `bw serve`
+                // was already up at this exact moment is also exactly what
+                // decides whether `run_picker` needs to wait for it at all
+                // (same `backend_already_running` exemption `open_vault_window`
+                // and `vault_window::run` already make).
+                let backend_already_running = backend_is_running(&mut bw_serve_child);
+
                 // Review 9's Important: in save-memory mode nothing here used
-                // to start it, so a save always failed after two windows of
-                // user effort with nothing visible on screen. Kick a start
-                // off now, the same non-blocking way `open_vault_window`
-                // does -- by the time the user has picked an item, picked a
-                // process, and clicked Save, it has had as long to come up as
-                // opening the vault window does.
-                if needs_backend_start(&backend_task_in_progress, backend_is_running(&mut bw_serve_child)) {
+                // to start `bw serve` at all, so a save always failed after
+                // two windows of user effort with nothing visible on screen.
+                // Kick a start off now, the same non-blocking way
+                // `open_vault_window` does. `run_picker` itself waits for it
+                // to actually answer before letting Save fire.
+                if needs_backend_start(&backend_task_in_progress, backend_already_running) {
                     backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+                    // A Sync click landing while this start is in flight
+                    // would otherwise be silently dropped by the
+                    // `backend_task_in_progress` guard below with nothing to
+                    // show for it (review 10's Minor 6). Disabling the item
+                    // here (not `set_sync_in_progress` -- this isn't a sync)
+                    // means the click can't be issued in the first place;
+                    // `apply_backend_op`'s `EnsureRunning` arms re-enable it
+                    // once this completes.
+                    tray::set_sync_item_enabled(&tray, false);
                     spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
                 }
 
                 if let Some(item) = picker_ui::pick_vault_item(&cache) {
                     log::info!("adding an app match to vault item {}", item.id);
-                    match picker_ui::run_picker(cache.clone(), item, last_active_pid) {
+                    match picker_ui::run_picker(cache.clone(), item, last_active_pid, backend_already_running) {
                         Some(m) => {
                             log::info!("saved app match for {} ({:?})", m.process, m.trigger);
                             // Make the new match live immediately rather than
@@ -1576,11 +1595,17 @@ fn apply_backend_op(
             if adopt_started_child(bw_serve_child, child) {
                 log::info!("bw serve started for the vault window");
             }
+            // A no-op unless the "Add app..." handler disabled it before
+            // kicking this off (see that call site); harmless either way.
+            tray::set_sync_item_enabled(tray, true);
         }
-        BackendOp::EnsureRunning(Err(e)) => log::error!(
-            "could not start bw serve for the vault window (writes and TOTP will fail until \
-             the next attempt; reads still work from the cache): {e}"
-        ),
+        BackendOp::EnsureRunning(Err(e)) => {
+            log::error!(
+                "could not start bw serve for the vault window (writes and TOTP will fail until \
+                 the next attempt; reads still work from the cache): {e}"
+            );
+            tray::set_sync_item_enabled(tray, true);
+        }
         BackendOp::Sync { child, outcome } => {
             match child {
                 Some(Ok(c)) => {

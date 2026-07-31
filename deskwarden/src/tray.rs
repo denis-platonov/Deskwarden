@@ -216,6 +216,22 @@ pub fn set_sync_failed(tray: &AppTray) {
     set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
 }
 
+/// Disables (or re-enables) the "Sync" item without touching its label, for
+/// an in-flight backend operation that needs `bw serve` up but isn't itself
+/// a sync -- the tray's "Add app..." handler starting the backend so the
+/// picker can save.
+///
+/// Without this, a Sync click landing while that start is still in flight
+/// used to be silently dropped by `main`'s `backend_task_in_progress` guard
+/// (review 10's Minor 6): the item still looked normal and clickable, so the
+/// click appeared to do nothing. Kept separate from `set_sync_in_progress`
+/// deliberately: that label says "Syncing...", which would be untrue for a
+/// plain backend start with no `bw sync` attached -- this only changes
+/// whether the item can be clicked, not what it claims is happening.
+pub fn set_sync_item_enabled(tray: &AppTray, enabled: bool) {
+    tray.sync_item.set_enabled(enabled);
+}
+
 /// Best-effort tooltip update: a tooltip that won't set is a cosmetic
 /// problem, never a reason to fail the operation it was describing.
 fn set_tooltip(tray: &AppTray, text: String) {

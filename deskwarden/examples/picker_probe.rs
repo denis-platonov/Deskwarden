@@ -48,7 +48,11 @@ fn main() {
     println!("Using vault item: {} ({})", target.name, target.id);
 
     println!("Opening picker window...");
-    match run_picker(cache.clone(), target.clone(), None) {
+    // `true`: this probe already proved `bw serve` is up and answering via
+    // the `list_items()`/`populate()` calls above, so `run_picker` doesn't
+    // need to spawn its own readiness wait -- same `backend_already_running`
+    // meaning `main.rs`'s real call site passes.
+    match run_picker(cache.clone(), target.clone(), None, true) {
         Some(m) => println!(
             "Saved AppMatch: process={} trigger={:?}",
             m.process, m.trigger
