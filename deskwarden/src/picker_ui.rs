@@ -1,7 +1,7 @@
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::icon;
 use crate::theme;
-use crate::vault_bridge::{VaultBridge, VaultItem};
+use crate::vault_bridge::{VaultError, VaultItem};
 use crate::vault_cache::VaultCache;
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
@@ -9,9 +9,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use windows::core::HSTRING;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
+    MessageBoxW, SystemParametersInfoW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
 };
 
 /// The position for a picker window's top-left corner that centers it on the
@@ -176,24 +178,26 @@ fn list_card(
 
 /// Opens a blocking egui window listing the user's vault items with a search
 /// box, and returns the one they pick (or `None` if they cancel, or the vault
-/// couldn't be read).
+/// has nothing to show).
 ///
 /// This is step one of the tray's "Add app..." flow: `run_picker` needs a
 /// specific `VaultItem` to attach a match to, and nothing previously chose
 /// one, which is why "Add app..." was an inert menu entry and `run_picker` was
 /// dead code in the bin target.
 ///
-/// Takes `&VaultBridge` rather than owning it because the vault is only used
-/// *before* the (`FnMut + 'static`) update closure is built; the fetched items
-/// are what gets moved in.
-pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
-    let items: Vec<VaultItem> = match vault.list_items() {
-        Ok(items) => items,
-        Err(e) => {
-            log::error!("could not list vault items for the item picker: {e:?}");
-            return None;
-        }
-    };
+/// Reads [`VaultCache::items`] rather than listing via `VaultBridge`: with
+/// `keep_backend_running` off, `bw serve` is normally stopped at idle, so a
+/// bridge call here failed with a connection error every time -- logged, but
+/// with nothing on screen, "Add app..." just appeared to do nothing. The
+/// cache holds the same data in memory regardless of whether the backend is
+/// running (see `vault_cache`'s module doc), so listing items for the picker
+/// never needs to start it.
+///
+/// Takes `&VaultCache` rather than owning it because it's only used *before*
+/// the (`FnMut + 'static`) update closure is built; the items already read
+/// out of it are what gets moved in.
+pub fn pick_vault_item(cache: &VaultCache) -> Option<VaultItem> {
+    let items: Vec<VaultItem> = cache.items();
 
     if items.is_empty() {
         log::warn!("vault has no items to attach an app match to");
@@ -514,6 +518,40 @@ pub fn run_picker(cache: Arc<VaultCache>, target_item: VaultItem, default_pid: O
                                 };
                                 match cache.set_app_match(&target_item, &m) {
                                     Ok(()) => *result_for_closure.borrow_mut() = Some(m),
+                                    // A stale/invalidated session (`bw lock`
+                                    // elsewhere, a server-side timeout, a
+                                    // password change) needs the user to
+                                    // actually re-authenticate, not just a
+                                    // log line nobody but this app's own log
+                                    // file ever sees -- the same distinction
+                                    // the vault window's writes already make
+                                    // via `flag_reauth_if_unauthorized`. This
+                                    // flow has no equivalent window-level
+                                    // recovery to route through, so it
+                                    // surfaces the failure directly and tells
+                                    // the user how to recover instead of
+                                    // silently discarding the match they just
+                                    // picked.
+                                    Err(VaultError::Unauthorized) => {
+                                        log::warn!(
+                                            "session rejected while saving app match for {}; \
+                                             nothing was saved",
+                                            target_item.id
+                                        );
+                                        unsafe {
+                                            MessageBoxW(
+                                                None,
+                                                &HSTRING::from(
+                                                    "Your Bitwarden session has expired, so this \
+                                                     app match was not saved.\n\nOpen the vault \
+                                                     to sign in again, then use \u{201c}Add \
+                                                     app\u{2026}\u{201d} once more.",
+                                                ),
+                                                &HSTRING::from("Deskwarden: sign-in expired"),
+                                                MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+                                            );
+                                        }
+                                    }
                                     Err(e) => {
                                         log::error!(
                                             "failed to save app match onto vault item {}: {e:?}",

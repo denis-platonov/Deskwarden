@@ -633,7 +633,7 @@ fn main() {
             if event.id == tray.add_app_id {
                 // Two-step flow: choose the vault item the credentials come
                 // from, then choose the process to attach to it.
-                if let Some(item) = picker_ui::pick_vault_item(&vault) {
+                if let Some(item) = picker_ui::pick_vault_item(&cache) {
                     log::info!("adding an app match to vault item {}", item.id);
                     match picker_ui::run_picker(cache.clone(), item, last_active_pid) {
                         Some(m) => {
