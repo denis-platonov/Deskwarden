@@ -1,0 +1,283 @@
+//! An in-memory snapshot of the vault, in front of `VaultBridge`.
+//!
+//! Every read in the app used to be an HTTP call to `bw serve`, which is
+//! why it had to run permanently. Holding items here means reads -- the
+//! vault window's list and the autofill match path -- never touch it, so
+//! the backend is only needed for sync, writes and TOTP.
+//!
+//! **Memory only, by design.** Nothing here is written to disk: decrypted
+//! vault data at rest would contradict the README's claim that deskwarden
+//! never touches encryption or storage. `clear` drops everything, and
+//! `main` calls it on lock so idle holds no vault contents.
+//!
+//! **All writes go through here.** Each write updates the snapshot on
+//! success, so there is exactly one place that can leave the cache stale
+//! rather than one per call site.
+
+use crate::vault_bridge::{Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
+use std::sync::Mutex;
+
+#[derive(Default)]
+struct Snapshot {
+    items: Vec<VaultItem>,
+    folders: Vec<Folder>,
+    populated: bool,
+}
+
+pub struct VaultCache {
+    bridge: VaultBridge,
+    snapshot: Mutex<Snapshot>,
+}
+
+impl VaultCache {
+    pub fn new(bridge: VaultBridge) -> Self {
+        Self {
+            bridge,
+            snapshot: Mutex::new(Snapshot::default()),
+        }
+    }
+
+    /// The underlying bridge, for the operations that genuinely need the
+    /// backend and are not cached: TOTP and `bw sync`.
+    pub fn bridge(&self) -> &VaultBridge {
+        &self.bridge
+    }
+
+    /// Fills the snapshot from the backend. Called once per unlock, and
+    /// again after a sync.
+    pub fn populate(&self) -> Result<(), VaultError> {
+        let items = self.bridge.list_items()?;
+        let folders = self.bridge.list_folders()?;
+        let mut snapshot = self.lock();
+        snapshot.items = items;
+        snapshot.folders = folders;
+        snapshot.populated = true;
+        Ok(())
+    }
+
+    pub fn is_populated(&self) -> bool {
+        self.lock().populated
+    }
+
+    pub fn items(&self) -> Vec<VaultItem> {
+        self.lock().items.clone()
+    }
+
+    pub fn folders(&self) -> Vec<Folder> {
+        self.lock().folders.clone()
+    }
+
+    /// Drops everything. Called on lock and on quit.
+    pub fn clear(&self) {
+        let mut snapshot = self.lock();
+        snapshot.items.clear();
+        snapshot.items.shrink_to_fit();
+        snapshot.folders.clear();
+        snapshot.folders.shrink_to_fit();
+        snapshot.populated = false;
+    }
+
+    pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
+        let created = self.bridge.create_item(new_item)?;
+        self.lock().items.push(created.clone());
+        Ok(created)
+    }
+
+    pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+        self.bridge.update_item(item)?;
+        let mut snapshot = self.lock();
+        if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
+            *existing = item.clone();
+        }
+        Ok(())
+    }
+
+    pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
+        self.bridge.delete_item(id)?;
+        self.lock().items.retain(|i| i.id != id);
+        Ok(())
+    }
+
+    pub fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
+        let created = self.bridge.create_folder(name)?;
+        self.lock().folders.push(created.clone());
+        Ok(created)
+    }
+
+    pub fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
+        let updated = self.bridge.update_folder(id, name)?;
+        let mut snapshot = self.lock();
+        if let Some(existing) = snapshot.folders.iter_mut().find(|f| f.id == updated.id) {
+            existing.name = updated.name.clone();
+        }
+        Ok(updated)
+    }
+
+    pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
+        self.bridge.delete_folder(id)?;
+        self.lock().folders.retain(|f| f.id != id);
+        Ok(())
+    }
+
+    /// A poisoned lock means another thread panicked mid-update, which
+    /// cannot corrupt anything here worse than a stale snapshot -- recover
+    /// rather than propagating a panic into the UI thread.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Snapshot> {
+        self.snapshot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache_for(url: String) -> VaultCache {
+        VaultCache::new(VaultBridge::new(url))
+    }
+
+    fn items_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1},
+            {"id":"2","name":"Beta","fields":[],"type":1}
+        ]}}"#
+    }
+
+    fn folders_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[{"id":"f1","name":"Work"}]}}"#
+    }
+
+    #[test]
+    fn populate_fills_the_snapshot_and_reads_come_from_it() {
+        let mut server = mockito::Server::new();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(1)
+            .create();
+        let folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .expect(1)
+            .create();
+
+        let cache = cache_for(server.url());
+        assert!(!cache.is_populated());
+        cache.populate().unwrap();
+
+        // Many reads, one fetch: `expect(1)` fails if a read hits HTTP.
+        for _ in 0..5 {
+            assert_eq!(cache.items().len(), 2);
+            assert_eq!(cache.folders().len(), 1);
+        }
+        items.assert();
+        folders.assert();
+    }
+
+    #[test]
+    fn clear_empties_the_snapshot_so_idle_holds_no_vault_contents() {
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        assert_eq!(cache.items().len(), 2);
+
+        cache.clear();
+        assert!(cache.items().is_empty());
+        assert!(cache.folders().is_empty());
+        assert!(!cache.is_populated());
+    }
+
+    #[test]
+    fn a_deleted_item_leaves_the_cache_immediately() {
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _d = server.mock("DELETE", "/object/item/1").with_status(200).create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        cache.delete_item("1").unwrap();
+
+        let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec!["2".to_string()]);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_cache_untouched() {
+        // The cache must reflect the server, never an optimistic guess.
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _d = server.mock("DELETE", "/object/item/1").with_status(500).create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        assert!(cache.delete_item("1").is_err());
+        assert_eq!(cache.items().len(), 2, "a failed delete removed it anyway");
+    }
+
+    #[test]
+    fn a_renamed_folder_updates_in_place() {
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _u = server
+            .mock("PUT", "/object/folder/f1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"f1","name":"Renamed"}}"#)
+            .create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        cache.update_folder("f1", "Renamed").unwrap();
+
+        assert_eq!(cache.folders()[0].name, "Renamed");
+    }
+}
