@@ -21,6 +21,12 @@ pub struct AppTray {
     icon: TrayIcon,
     pub open_vault_id: MenuId,
     pub add_app_id: MenuId,
+    /// Id of the "Sync" item. With the periodic match-engine refresh gone
+    /// (see `main.rs`), this is the only way to pull in a match added on
+    /// another device, or a change made there, without opening the vault
+    /// window (whose own toolbar already has a sync pill) or restarting the
+    /// app.
+    pub sync_id: MenuId,
     pub quit_id: MenuId,
     /// Id of the "Update available" item, for comparing against
     /// `MenuEvent::id` in the main loop -- same pattern as `add_app_id` and
@@ -32,12 +38,16 @@ pub struct AppTray {
     /// callers go through `set_update_available` rather than poking at menu
     /// internals directly.
     update_item: MenuItem,
+    /// Same reasoning as `update_item`, for `set_sync_in_progress`/
+    /// `set_sync_idle`/`set_sync_failed`.
+    sync_item: MenuItem,
 }
 
 pub fn build_tray() -> AppTray {
     let menu = Menu::new();
     let open_vault = MenuItem::new("Open Vault", true, None);
     let add_app = MenuItem::new("Add app...", true, None);
+    let sync_item = MenuItem::new("Sync", true, None);
     let quit = MenuItem::new("Quit", true, None);
     // Present in the menu from startup, but disabled until an update is
     // actually found. Muda's `MenuItem` supports updating text and enabled
@@ -48,6 +58,7 @@ pub fn build_tray() -> AppTray {
     let update_item = MenuItem::new("Update available", false, None);
     menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
+    menu.append(&sync_item).unwrap();
     menu.append(&update_item).unwrap();
     menu.append(&quit).unwrap();
 
@@ -69,9 +80,11 @@ pub fn build_tray() -> AppTray {
         icon,
         open_vault_id: open_vault.id().clone(),
         add_app_id: add_app.id().clone(),
+        sync_id: sync_item.id().clone(),
         quit_id: quit.id().clone(),
         update_id: update_item.id().clone(),
         update_item,
+        sync_item,
     }
 }
 
@@ -154,6 +167,40 @@ pub fn set_update_failed(tray: &AppTray, version: &Version) {
         tray,
         format!("Deskwarden - update to v{version} failed; see the log file"),
     );
+}
+
+/// Reflects an in-flight tray-triggered sync (see `main.rs`'s background sync
+/// thread, spawned from the "Sync" menu item).
+///
+/// Same shape as `set_update_in_progress`: the item is disabled for the
+/// duration so a second click can't start a second concurrent sync, and the
+/// label says what's happening -- the work runs off the main thread, so
+/// without this the item would just appear to do nothing while it's running.
+pub fn set_sync_in_progress(tray: &AppTray) {
+    tray.sync_item.set_text("Syncing...");
+    tray.sync_item.set_enabled(false);
+    set_tooltip(tray, "Deskwarden - syncing...".to_string());
+}
+
+/// Reverts the "Sync" item to normal after a sync completes (successfully
+/// or not) and restores the idle tooltip -- called once the outcome, whatever
+/// it was, has been applied.
+pub fn set_sync_idle(tray: &AppTray) {
+    tray.sync_item.set_text("Sync");
+    tray.sync_item.set_enabled(true);
+    set_tooltip(tray, IDLE_TOOLTIP.to_string());
+}
+
+/// Reports a failed tray-triggered sync. Re-enabled immediately (unlike the
+/// update item, which stays on a "click to retry" label): a sync failure is
+/// frequently transient (network, `bw serve` still coming up) and the item's
+/// label doubling as an error state for longer than the tooltip already
+/// shown here would be an odd asymmetry with the sync pill inside the vault
+/// window, which doesn't do that either.
+pub fn set_sync_failed(tray: &AppTray) {
+    tray.sync_item.set_text("Sync");
+    tray.sync_item.set_enabled(true);
+    set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
 }
 
 /// Best-effort tooltip update: a tooltip that won't set is a cosmetic

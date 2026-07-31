@@ -52,11 +52,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
 };
 
-/// How often the match engine is rebuilt from the vault while running, so
-/// matches added via the picker (or synced from another device) take effect
-/// without restarting the app.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-
 /// How often to poll GitHub for a newer release. Checked on startup and then
 /// on this cadence from the main loop, same pattern as `REFRESH_INTERVAL`.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -209,7 +204,15 @@ fn main() {
     // Manager -- so `bw serve` can no longer be orphaned holding an unlocked
     // vault open on localhost. This must outlive the whole run, hence the
     // binding here rather than inside the spawn helper.
-    let job = match job_object::KillOnCloseJob::new() {
+    // `Arc`-wrapped (rather than a plain `Option<KillOnCloseJob>` borrowed by
+    // reference, as before) so a clone can be handed to the background
+    // threads that now start `bw serve` off the main thread -- see
+    // `spawn_backend_start` -- without them needing a `'static` borrow of a
+    // stack local. `KillOnCloseJob` itself is `Send + Sync` with no `unsafe`
+    // now that it's backed by `OwnedHandle` (see `job_object`), so this needs
+    // no unsafe either.
+    let job: Arc<Option<job_object::KillOnCloseJob>> = Arc::new(match job_object::KillOnCloseJob::new()
+    {
         Ok(job) => Some(job),
         Err(e) => {
             log::error!(
@@ -218,7 +221,7 @@ fn main() {
             );
             None
         }
-    };
+    });
 
     // A cached session token is worthless if it has since been invalidated
     // (manual `bw lock`, password change, reboot). Trusting it unconditionally
@@ -258,7 +261,7 @@ fn main() {
     // it unconditionally, since something has to answer the very first
     // `wait_for_vault_ready_with_spinner` call below regardless of the
     // setting.
-    let mut bw_serve_child: Option<Child> = Some(start_backend(&session_token, job.as_ref()));
+    let mut bw_serve_child: Option<Child> = Some(start_backend(&session_token, job_ref(&job)));
 
     // `bw serve` is a bundled Node binary: its cold start regularly takes
     // several seconds, far longer than the fixed 500ms sleep this replaces.
@@ -282,7 +285,7 @@ fn main() {
             // time to come free rather than aborting on them.
             bw_serve_child = match try_start_backend(
                 &session_token,
-                job.as_ref(),
+                job_ref(&job),
                 bw_serve::PORT_RELEASE_GRACE_RESTART,
             ) {
                 Ok(child) => Some(child),
@@ -339,6 +342,18 @@ fn main() {
     // because it's a small function that returns right after building
     // `entries`.
     drop(items);
+
+    // The lifecycle this app promises: unlock -> start the backend -> fill
+    // the cache once -> *then* obey the policy. The backend has had to be up
+    // unconditionally until now, because nothing above this point could have
+    // populated the cache without it -- but with the cache now filled, a
+    // `keep_backend_running = false` setting means it should already be
+    // torn back down again before the tray even appears, not "eventually,
+    // the next time something happens to notice". Everything downstream (the
+    // vault window opening, the tray's Sync item, another lock) restarts it
+    // only for as long as it is actually needed and reconciles again
+    // afterwards -- see `stop_backend_if_idle` and the main loop below.
+    stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
 
     let injector = Injector {
         ui: RealUiAutomation,
@@ -484,12 +499,24 @@ fn main() {
         );
     }
 
-    let mut last_refresh = Instant::now();
-
-    // How many periodic refreshes have failed in a row. A backend that still
-    // holds its port but keeps failing is assumed busy at first and wedged
-    // after a few tries; see `bw_serve::recovery_action`.
-    let mut consecutive_refresh_failures: u32 = 0;
+    // Outcome of a background operation that starts or restarts `bw serve`:
+    // either `open_vault_window` making sure it's up before showing the
+    // window, or the tray's "Sync" item forcing a resync. Reported back here
+    // rather than joined inline on whichever thread kicked it off --
+    // `try_start_backend` can take up to 30s (a port-release wait plus a
+    // synchronous `bw sync`), and blocking on that before returning control
+    // to the main loop used to freeze the tray, hotkey, and window-watching
+    // for the whole wait -- see the fix note on `open_vault_window`.
+    //
+    // Both operations funnel through this one channel (rather than one each)
+    // so `backend_task_in_progress` below can guarantee at most one is ever
+    // in flight: two `try_start_backend` calls racing to bind the same port
+    // would make one fail for a reason that has nothing to do with a real
+    // problem, and it also means there is exactly one place -- not two -- a
+    // lock event has to drain before it can safely stop/restart the backend
+    // itself (see `open_vault_window`'s `locked` branch).
+    let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
+    let mut backend_task_in_progress = false;
 
     loop {
         pump_windows_messages();
@@ -525,7 +552,7 @@ fn main() {
                     &injector,
                     &mut session_token,
                     &mut bw_serve_child,
-                    job.as_ref(),
+                    &job,
                     &store,
                     &schedule,
                     &mut engine,
@@ -533,7 +560,10 @@ fn main() {
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
-                    settings.keep_backend_running,
+                    &tray,
+                    &backend_op_tx,
+                    &backend_op_rx,
+                    &mut backend_task_in_progress,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -547,7 +577,7 @@ fn main() {
                         Some(m) => {
                             log::info!("saved app match for {} ({:?})", m.process, m.trigger);
                             // Make the new match live immediately rather than
-                            // waiting for the next periodic refresh.
+                            // waiting for the user to trigger a sync.
                             match refresh_match_engine(&vault, &mut engine) {
                                 Ok(count) => {
                                     log::info!("match engine refreshed: {count} app match(es)")
@@ -566,6 +596,36 @@ fn main() {
                 // returns to is treated as a fresh switch rather than being
                 // suppressed as a repeat.
                 last_dispatched_hwnd = None;
+            }
+
+            if event.id == tray.sync_id {
+                // Defensive re-check, same reasoning as the update item just
+                // below: the item is disabled while a sync (or a
+                // window-open's own backend start) is in flight, but the
+                // click event is handled the same way regardless of whether
+                // tray-icon's disabled state actually suppressed the click.
+                if backend_task_in_progress {
+                    log::info!("sync requested from tray but a backend operation is already in \
+                                 progress; ignoring");
+                } else {
+                    log::info!("sync requested from tray");
+                    tray::set_sync_in_progress(&tray);
+                    backend_task_in_progress = true;
+
+                    // Whether `bw serve` needs to be started first is decided
+                    // here, on the main thread (the only place that owns
+                    // `bw_serve_child`), and handed to the background thread
+                    // as a plain bool -- see `backend_is_running`'s doc for
+                    // why a `Some` child isn't automatically "running".
+                    let currently_running = backend_is_running(&mut bw_serve_child);
+                    spawn_sync(
+                        session_token.clone(),
+                        job.clone(),
+                        cache.clone(),
+                        currently_running,
+                        backend_op_tx.clone(),
+                    );
+                }
             }
 
             if event.id == tray.update_id {
@@ -625,7 +685,7 @@ fn main() {
                     &injector,
                     &mut session_token,
                     &mut bw_serve_child,
-                    job.as_ref(),
+                    &job,
                     &store,
                     &schedule,
                     &mut engine,
@@ -633,7 +693,10 @@ fn main() {
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
-                    settings.keep_backend_running,
+                    &tray,
+                    &backend_op_tx,
+                    &backend_op_rx,
+                    &mut backend_task_in_progress,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -656,136 +719,32 @@ fn main() {
             }
         }
 
-        if last_refresh.elapsed() >= REFRESH_INTERVAL {
-            match refresh_match_engine(&vault, &mut engine) {
-                Ok(count) => {
-                    consecutive_refresh_failures = 0;
-                    log::debug!("match engine refreshed: {count} app match(es)");
-                }
-                Err(e) => {
-                    // A failing refresh is the signal that something broke
-                    // *while running*. Two independent things can cause it and
-                    // they need different fixes, so both are probed:
-                    //
-                    // * the session went stale (`bw lock`, a server-side vault
-                    //   timeout, a password change elsewhere) -- `bw status`
-                    //   sees this, because it shells out to the CLI and does
-                    //   not go through `bw serve` at all;
-                    // * `bw serve` itself died or wedged while the session
-                    //   stayed valid -- `bw status` is *blind* to this and
-                    //   cheerfully reports `Unlocked`, so the port is probed
-                    //   separately. Relying on the status check alone (as this
-                    //   used to) meant a crashed backend logged this warning
-                    //   every 60s forever and never restarted.
-                    consecutive_refresh_failures += 1;
-                    log::warn!(
-                        "periodic match engine refresh failed \
-                         (consecutive failures: {consecutive_refresh_failures}): {e:?}"
-                    );
+        // Non-blocking: whenever a background backend operation
+        // (`open_vault_window` making sure `bw serve` is up, or a
+        // tray-triggered Sync) reports back, apply its outcome. This is also
+        // where `backend_task_in_progress` is cleared, so the reconciliation
+        // step right after it is never fighting a still-in-flight operation.
+        if let Ok(op) = backend_op_rx.try_recv() {
+            backend_task_in_progress = false;
+            apply_backend_op(op, &mut bw_serve_child, &cache, &mut engine, &tray);
+        }
 
-                    let status = login_ui::check_bw_status_with_session(Some(&session_token));
-                    let port_listening = bw_serve::port_in_use(bw_serve::BW_SERVE_PORT);
-                    let action = bw_serve::recovery_action(
-                        status == login_ui::BwStatus::Unlocked,
-                        port_listening,
-                        consecutive_refresh_failures,
-                    );
-
-                    match action {
-                        bw_serve::RecoveryAction::Wait => log::info!(
-                            "session is {status:?} and `bw serve` is still listening on port \
-                             {}; treating this as a transient failure and retrying next cycle",
-                            bw_serve::BW_SERVE_PORT
-                        ),
-                        _ => {
-                            if action == bw_serve::RecoveryAction::Reauthenticate {
-                                log::warn!("session is now {status:?}; re-authenticating");
-                                // Same reasoning as the vault window's own
-                                // lock handling (see `open_vault_window`):
-                                // re-authenticating here can land on a
-                                // *different* account than the one this
-                                // snapshot was built from (another `bw lock`,
-                                // a password change, a different sign-in
-                                // entirely), and this path is reachable
-                                // without the vault window ever having been
-                                // opened. Left uncleared, the next fill or
-                                // window open would silently serve the
-                                // previous account's items.
-                                cache.clear();
-                                if let Some(child) = bw_serve_child.as_mut() {
-                                    bw_serve::stop_bw_serve(child);
-                                }
-                                session_token = reauthenticate(&store);
-                                // The login window we just showed stole and
-                                // released foreground, exactly like the tray
-                                // picker above: forget the last-dispatched
-                                // hwnd so the window the user returns to is
-                                // treated as a fresh switch instead of being
-                                // suppressed as a repeat.
-                                last_dispatched_hwnd = None;
-                            } else {
-                                log::warn!(
-                                    "session is still unlocked but `bw serve` is unusable \
-                                     (port {} listening: {port_listening}); restarting the \
-                                     backend",
-                                    bw_serve::BW_SERVE_PORT
-                                );
-                                if let Some(child) = bw_serve_child.as_mut() {
-                                    bw_serve::stop_bw_serve(child);
-                                }
-                            }
-
-                            // Deliberately *not* fatal, and deliberately more
-                            // patient than the startup path. Exiting here --
-                            // possibly seconds after the user retyped their
-                            // master password -- over a socket that a `bw`
-                            // grandchild has not released yet would punish
-                            // them for a timing problem that usually resolves
-                            // itself. Log it and try again next cycle.
-                            match try_start_backend(
-                                &session_token,
-                                job.as_ref(),
-                                bw_serve::PORT_RELEASE_GRACE_RESTART,
-                            ) {
-                                Ok(child) => {
-                                    bw_serve_child = Some(child);
-                                    match wait_for_vault_ready(&vault, &schedule) {
-                                        Ok(items) => {
-                                            let entries = match_entries(&items);
-                                            log::info!(
-                                                "backend restarted; match engine reloaded with \
-                                                 {} app match(es)",
-                                                entries.len()
-                                            );
-                                            engine.rebuild(&entries);
-                                            // See the `drop(items)` at startup, above, for why:
-                                            // `items` is not read again after this point and
-                                            // this app is idle far more than it's active.
-                                            drop(items);
-                                            consecutive_refresh_failures = 0;
-                                        }
-                                        Err(e) => {
-                                            log::error!("backend still unusable after restart: {e}")
-                                        }
-                                    }
-                                }
-                                Err(e) => log::error!(
-                                    "could not restart `bw serve`: {e} -- staying up and \
-                                     retrying on the next refresh cycle rather than exiting"
-                                ),
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Re-stamped *after* the work, not just before it. Recovery can
-            // block for a long time -- a 30s port wait, a 30s readiness wait,
-            // or a login window the user leaves open -- and measuring the next
-            // interval from before all that would make the following cycle
-            // fire immediately, turning a persistent failure into a tight
-            // retry loop instead of one attempt per minute.
-            last_refresh = Instant::now();
+        // The policy, reconciled here -- at idle, in the main loop -- rather
+        // than only as a side effect of the vault window opening or closing.
+        // This is what makes `keep_backend_running = false` actually save
+        // memory in the common case (autofill-only, vault window never
+        // opened this session): without it, `bw serve` -- started
+        // unconditionally at startup so the cache could be populated --
+        // would simply stay up forever, since nothing else was ever in a
+        // position to notice and stop it. Only the "stop" half is evaluated
+        // here; "start" is never something idle should initiate on its own
+        // now that the periodic refresh that used to do that is gone (a
+        // failed start would otherwise retry every ~200ms with nothing
+        // throttling it) -- the three places that *do* need the backend
+        // (startup, `open_vault_window`, the tray's Sync item) each ask for
+        // it explicitly and this only ever tears it back down afterwards.
+        if !backend_task_in_progress {
+            stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
         }
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
@@ -1130,10 +1089,33 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
 /// the startup retry path: `stop_bw_serve` on the old child ->
 /// `reauthenticate` -> `try_start_backend` -> `wait_for_vault_ready_with_spinner`
-/// -> rebuild the match engine) exists in exactly one place. For the same
-/// reason, this is also where the `backend_policy` lifecycle around a window
-/// open/close is applied -- both callers need it, so it belongs here rather
-/// than being duplicated at each tray event handler.
+/// -> rebuild the match engine) exists in exactly one place.
+///
+/// Does **not** decide whether `bw serve` should keep running once the
+/// window closes. That decision used to live here, as an `else if
+/// !backend_policy::should_run(..)` right after this function's old body --
+/// which is exactly what review Critical 2 flagged: the *only* place the
+/// policy was ever reconciled was a side effect of calling this function, so
+/// a session that never opens the vault window (the normal autofill-only
+/// case) held `bw serve` up forever under `keep_backend_running = false`.
+/// The policy is now reconciled every idle iteration of `main`'s own loop
+/// instead (see `stop_backend_if_idle`), which runs whether or not this
+/// function was ever called. That also fixes review Important 4 as a direct
+/// consequence: the old `locked` branch below never rechecked the policy (it
+/// was the `if` half of an `if`/`else`, and the policy check was only in the
+/// `else`), so locking the vault window in save-memory mode used to leave
+/// the backend up indefinitely. Now both branches just return, and the
+/// caller's next loop iteration reconciles either way.
+///
+/// Starting the backend for the window is also no longer awaited inline
+/// (review Important 5): that used to be a scoped background thread joined
+/// right after `vault_window::run` returned, which blocked the tray, the
+/// global hotkey, and window-watching for up to ~30s (a port-release wait
+/// plus a synchronous `bw sync`) on a window that may have been open for all
+/// of two seconds -- and then immediately killed the child it just waited
+/// for, if the policy said to. It's now a detached background operation
+/// reported back through `backend_op_tx`/`backend_op_rx` and applied by
+/// `main`'s own loop, same non-blocking shape as the update-download flow.
 ///
 /// Takes `cache`, not a separate `vault: &VaultBridge` -- `cache.bridge()` is
 /// that same bridge, so a second parameter would just be another name for it.
@@ -1144,7 +1126,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     injector: &Injector<A, B>,
     session_token: &mut String,
     bw_serve_child: &mut Option<Child>,
-    job: Option<&job_object::KillOnCloseJob>,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
     store: &session_store::SessionStore,
     schedule: &[Duration],
     engine: &mut MatchEngine,
@@ -1159,10 +1141,10 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // single open.
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
     auto_lock: Duration,
-    // `Settings::keep_backend_running`, passed by value rather than the
-    // whole `Settings` so this function doesn't need to know about anything
-    // else in it.
-    keep_backend_running: bool,
+    tray: &tray::AppTray,
+    backend_op_tx: &mpsc::Sender<BackendOp>,
+    backend_op_rx: &mpsc::Receiver<BackendOp>,
+    backend_task_in_progress: &mut bool,
 ) {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
@@ -1173,56 +1155,52 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // spawn too when this call itself was the one that had to fall back.
     *cached_status_details = Some(status_details.clone());
 
-    // `backend_policy::should_run(_, vault_window_open = true)` is always
-    // `true` -- a window is about to be open -- so the only question is
-    // whether `bw serve` is already up. It won't be if save-memory mode tore
-    // it down after the previous window closed. Started on a scoped
-    // background thread rather than awaited here, so `vault_window::run`
-    // below -- which paints entirely from `cache` -- shows up immediately
-    // instead of making the click that opened it wait out `bw serve`'s ~8s
-    // cold start; that start overlaps with whatever the user does first
-    // (search, navigate) instead of blocking it. Scoped (not a bare
-    // `std::thread::spawn`) for the same reason `wait_for_vault_ready_with_
-    // spinner` above is: the worker only needs to borrow `session_token` and
-    // `job` for the length of this call, not `'static` ownership of them.
-    let result = std::thread::scope(|scope| {
-        let backend_handle = bw_serve_child.is_none().then(|| {
-            let token = session_token.clone();
-            scope.spawn(move || {
-                try_start_backend(&token, job, bw_serve::PORT_RELEASE_GRACE_RESTART)
-            })
-        });
+    // Reads don't need `bw serve` at all (`vault_window::run` paints
+    // entirely from `cache`); writes and TOTP do. If save-memory mode tore
+    // the backend down after the last close (or it crashed -- review Minor
+    // 8: `backend_is_running` catches a `Some(dead child)` that a plain
+    // `.is_none()` check would miss), kick a start off in the background and
+    // move straight on to opening the window rather than waiting for it --
+    // see this function's doc for why waiting here used to be a real freeze.
+    if !*backend_task_in_progress && !backend_is_running(bw_serve_child) {
+        *backend_task_in_progress = true;
+        spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
+    }
 
-        let result = vault_window::run(
-            cache.clone(),
-            fill_stats.clone(),
-            injector,
-            status_details.server_url,
-            status_details.user_email,
-            session_token.clone(),
-            icon_cache_dir.to_path_buf(),
-            auto_lock,
-        );
-
-        if let Some(handle) = backend_handle {
-            match handle.join() {
-                Ok(Ok(child)) => *bw_serve_child = Some(child),
-                Ok(Err(e)) => log::error!(
-                    "could not start bw serve for the vault window (writes and TOTP will fail \
-                     until the next restart attempt; reads still work from the cache): {e}"
-                ),
-                Err(_) => log::error!("bw serve startup thread panicked"),
-            }
-        }
-
-        result
-    });
+    let result = vault_window::run(
+        cache.clone(),
+        fill_stats.clone(),
+        injector,
+        status_details.server_url,
+        status_details.user_email,
+        session_token.clone(),
+        icon_cache_dir.to_path_buf(),
+        auto_lock,
+    );
 
     if result.locked {
         // The vault window locked itself (manual Lock button or its own
         // auto-lock timer), which invalidates `bw serve`'s session exactly
         // the same way a rejected cached session does at startup.
         log::info!("vault window locked itself; re-authenticating");
+
+        // A backend operation kicked off above (or a tray Sync click that
+        // landed while the window was open) may still be in flight. Unlike
+        // `main`'s own non-blocking drain, this path is about to tear the
+        // backend down and start a fresh one right now, so it has to wait
+        // for that operation to actually finish first -- otherwise the two
+        // attempts race to bind the same port. The user is already looking
+        // at a blocking re-authentication flow at this point, so a few more
+        // seconds here is not a new freeze, just a longer instance of one
+        // that was already happening.
+        if *backend_task_in_progress {
+            log::info!("waiting for an in-flight backend operation before handling the lock");
+            if let Ok(op) = backend_op_rx.recv() {
+                apply_backend_op(op, bw_serve_child, cache, engine, tray);
+            }
+            *backend_task_in_progress = false;
+        }
+
         // The account the *next* unlock lands on may not be this one (a
         // "Log out" followed by a different sign-in), so the snapshot built
         // from this account must not survive into that one. Left populated,
@@ -1231,17 +1209,27 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // passwords under the new session, indefinitely if `bw sync` then
         // fails offline.
         cache.clear();
-        if let Some(child) = bw_serve_child.as_mut() {
-            bw_serve::stop_bw_serve(child);
+        if backend_is_running(bw_serve_child) {
+            if let Some(child) = bw_serve_child.as_mut() {
+                bw_serve::stop_bw_serve(child);
+            }
         }
+        *bw_serve_child = None;
         *session_token = reauthenticate(store);
         // Drop the cached email/server too, for the same reason: the *next*
         // open must re-fetch rather than show a stale account in the
         // toolbar.
         *cached_status_details = None;
+
+        // Same lifecycle as startup: the backend has to come up -- blocking,
+        // with a spinner, since there is nothing useful to show without it
+        // -- to re-populate the cache. `main`'s idle reconciliation tears it
+        // back down afterwards if the policy says to, exactly as it does
+        // after startup's own unconditional start; this function no longer
+        // needs to know or care what the policy says.
         *bw_serve_child = match try_start_backend(
             session_token,
-            job,
+            job_ref(job),
             bw_serve::PORT_RELEASE_GRACE_RESTART,
         ) {
             Ok(child) => Some(child),
@@ -1255,12 +1243,17 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             }
         };
         match wait_for_vault_ready_with_spinner(cache.bridge(), schedule) {
-            Ok(_items) => match refresh_match_engine(cache.bridge(), engine) {
-                Ok(count) => {
-                    log::info!("match engine refreshed after unlock: {count} app match(es)")
+            Ok(_items) => {
+                if let Err(e) = cache.populate() {
+                    log::warn!("could not repopulate the vault cache after unlock: {e:?}");
                 }
-                Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
-            },
+                match refresh_match_engine(cache.bridge(), engine) {
+                    Ok(count) => {
+                        log::info!("match engine refreshed after unlock: {count} app match(es)")
+                    }
+                    Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
+                }
+            }
             Err(e) => {
                 log::error!("{e}");
                 if let Some(child) = bw_serve_child.as_mut() {
@@ -1273,16 +1266,207 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 ));
             }
         }
-    } else if !backend_policy::should_run(keep_backend_running, false) {
-        // The window closed normally (not locked), and the policy for "no
-        // vault window open" says the backend shouldn't be running -- i.e.
-        // save-memory mode. Tear it down now that nothing needs it; reads
-        // stay served from `cache` regardless.
+    }
+}
+
+/// Borrows the job object out of its `Arc` wrapper for a synchronous call.
+///
+/// The `Arc` only exists so a clone can be handed off to a background
+/// thread (see `spawn_backend_start`/`spawn_sync`); every other call site
+/// still just wants a plain `Option<&KillOnCloseJob>`, same as before that
+/// wrapper existed.
+fn job_ref(job: &Arc<Option<job_object::KillOnCloseJob>>) -> Option<&job_object::KillOnCloseJob> {
+    job.as_ref().as_ref()
+}
+
+/// Whether `bw serve` is currently running, treating an already-exited child
+/// the same as `None` rather than trusting `Option::is_some` alone.
+///
+/// `Child` has no way to notice its own process exiting on its own --
+/// `bw_serve_child` stays `Some` even long after the process is gone unless
+/// something calls `try_wait`. Review Minor 8: code that only checked
+/// `.is_none()` to decide whether `bw serve` needed (re)starting would never
+/// notice a `Some(dead child)` and so never restart it. Clears `*child` to
+/// `None` on a detected exit, so callers can go back to the simpler
+/// `is_none()` check afterwards.
+fn backend_is_running(child: &mut Option<Child>) -> bool {
+    let Some(c) = child.as_mut() else {
+        return false;
+    };
+    match c.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            log::warn!("bw serve exited on its own (status: {status}); treating it as stopped");
+            *child = None;
+            false
+        }
+        Err(e) => {
+            // Can't tell either way. Assuming it's still running is the
+            // safer failure mode: the alternative risks a second
+            // `try_start_backend` racing the still-alive first one to bind
+            // the same port.
+            log::warn!("could not check whether bw serve is still running ({e}); assuming it is");
+            true
+        }
+    }
+}
+
+/// Stops `bw serve` if it's running but [`backend_policy::should_run`] says
+/// it shouldn't be, with no vault window open.
+///
+/// The other half of the policy -- starting the backend when it should be
+/// running but isn't -- is deliberately not handled here as a symmetric
+/// "else start it": with the periodic refresh removed (review Critical 1),
+/// nothing throttles a repeated failure, and calling this every idle loop
+/// iteration (as `main` does) would turn a backend that keeps failing to
+/// start into a retry storm. The three places that genuinely need the
+/// backend -- startup, `open_vault_window`, and the tray's Sync item -- each
+/// ask for it explicitly instead; this function only ever tears it back
+/// down again afterwards once the policy says it's no longer needed.
+fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running: bool) {
+    if backend_policy::should_run(keep_backend_running, false) {
+        return;
+    }
+    if backend_is_running(bw_serve_child) {
+        log::info!("save-memory mode: nothing needs bw serve right now; stopping it");
         if let Some(child) = bw_serve_child.as_mut() {
             bw_serve::stop_bw_serve(child);
         }
         *bw_serve_child = None;
     }
+}
+
+/// Outcome of a background operation that starts or restarts `bw serve`.
+///
+/// Both kinds -- `open_vault_window` making sure the backend is up, and the
+/// tray's "Sync" item -- funnel through this one enum/channel rather than
+/// one each, so `main`'s `backend_task_in_progress` flag can guarantee at
+/// most one is ever in flight. Two concurrent `try_start_backend` calls
+/// would race to bind the same port and make one fail for a reason that has
+/// nothing to do with a real problem; sharing one channel also means there
+/// is exactly one place -- not two -- a lock event has to drain before it
+/// can safely stop and restart the backend itself (see `open_vault_window`'s
+/// `locked` branch).
+enum BackendOp {
+    /// `open_vault_window` made sure the backend was up before showing the
+    /// window. No sync/populate/rebuild attached -- reads already come from
+    /// `cache` regardless of whether this succeeded.
+    EnsureRunning(Result<Child, BackendStartError>),
+    /// The tray's "Sync" item: ensure the backend is running (`child` is
+    /// `Some` only if this operation itself had to start it), then run
+    /// `bw sync` and repopulate the cache. `outcome` is `Err` if starting,
+    /// syncing, or repopulating failed.
+    Sync {
+        child: Option<Result<Child, BackendStartError>>,
+        outcome: Result<(), String>,
+    },
+}
+
+/// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
+/// `Sync`, rebuilds the match engine from the freshly repopulated cache and
+/// reflects the outcome on the tray.
+fn apply_backend_op(
+    op: BackendOp,
+    bw_serve_child: &mut Option<Child>,
+    cache: &Arc<VaultCache>,
+    engine: &mut MatchEngine,
+    tray: &tray::AppTray,
+) {
+    match op {
+        BackendOp::EnsureRunning(Ok(child)) => {
+            log::info!("bw serve started for the vault window");
+            *bw_serve_child = Some(child);
+        }
+        BackendOp::EnsureRunning(Err(e)) => log::error!(
+            "could not start bw serve for the vault window (writes and TOTP will fail until \
+             the next attempt; reads still work from the cache): {e}"
+        ),
+        BackendOp::Sync { child, outcome } => {
+            match child {
+                Some(Ok(c)) => *bw_serve_child = Some(c),
+                Some(Err(e)) => log::error!("sync could not start bw serve: {e}"),
+                None => {}
+            }
+            match outcome {
+                Ok(()) => {
+                    let entries = match_entries(&cache.items());
+                    log::info!(
+                        "sync complete; match engine refreshed: {} app match(es)",
+                        entries.len()
+                    );
+                    engine.rebuild(&entries);
+                    tray::set_sync_idle(tray);
+                }
+                Err(e) => {
+                    log::error!("sync failed: {e}");
+                    tray::set_sync_failed(tray);
+                }
+            }
+        }
+    }
+}
+
+/// Kicks off a background attempt to make sure `bw serve` is running,
+/// reporting the outcome through `tx` rather than being joined -- see
+/// `BackendOp`'s doc for why this can't just be awaited inline.
+fn spawn_backend_start(
+    session_token: String,
+    job: Arc<Option<job_object::KillOnCloseJob>>,
+    tx: mpsc::Sender<BackendOp>,
+) {
+    std::thread::spawn(move || {
+        let result = try_start_backend(
+            &session_token,
+            job_ref(&job),
+            bw_serve::PORT_RELEASE_GRACE_RESTART,
+        );
+        let _ = tx.send(BackendOp::EnsureRunning(result));
+    });
+}
+
+/// Kicks off the tray's "Sync" item in the background: ensure the backend is
+/// running, `bw sync`, then repopulate the cache.
+///
+/// `currently_running` is decided by the caller -- on the main thread, the
+/// only place that owns `bw_serve_child` -- before this thread starts, so
+/// there is no race between this thread's own start attempt and the main
+/// loop's idle `stop_backend_if_idle`.
+///
+/// `try_start_backend` already runs `bw sync` itself as part of coming up
+/// (see its doc), so this only issues a separate, explicit sync when the
+/// backend was already running and therefore never got that free one.
+fn spawn_sync(
+    session_token: String,
+    job: Arc<Option<job_object::KillOnCloseJob>>,
+    cache: Arc<VaultCache>,
+    currently_running: bool,
+    tx: mpsc::Sender<BackendOp>,
+) {
+    std::thread::spawn(move || {
+        let child = if currently_running {
+            None
+        } else {
+            Some(try_start_backend(
+                &session_token,
+                job_ref(&job),
+                bw_serve::PORT_RELEASE_GRACE_RESTART,
+            ))
+        };
+
+        let start_failed = matches!(&child, Some(Err(_)));
+        let outcome = if start_failed {
+            Err("bw serve could not be started".to_string())
+        } else if currently_running {
+            bw_serve::run_bw_sync(&session_token)
+        } else {
+            // `try_start_backend` above already ran `bw sync` as part of
+            // coming up.
+            Ok(())
+        }
+        .and_then(|()| cache.populate().map_err(|e| format!("{e:?}")));
+
+        let _ = tx.send(BackendOp::Sync { child, outcome });
+    });
 }
 
 fn wait_for_vault_ready_with_spinner(
@@ -1392,5 +1576,114 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
                 "Deskwarden could not start its Bitwarden backend.\n\n{e}"
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real, short-lived child process, for exercising `backend_is_running`
+    /// and `stop_backend_if_idle` against an actual `Child` without needing a
+    /// real `bw serve` -- neither function cares what the process is, only
+    /// whether it's alive.
+    fn long_lived_command() -> std::process::Command {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "ping", "-n", "20", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
+    fn quick_exit_command() -> std::process::Command {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/c", "exit", "0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd
+    }
+
+    fn kill_and_reap(child: &mut Option<Child>) {
+        if let Some(c) = child.as_mut() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    #[test]
+    fn backend_is_running_is_true_for_a_live_child() {
+        let mut child = Some(long_lived_command().spawn().unwrap());
+        assert!(backend_is_running(&mut child));
+        assert!(child.is_some(), "a live child must not be cleared");
+        kill_and_reap(&mut child);
+    }
+
+    #[test]
+    fn backend_is_running_detects_an_already_exited_child_and_clears_it() {
+        // Regression test for review Minor 8: code that only checked
+        // `bw_serve_child.is_none()` never noticed a `Some(dead child)` and so
+        // never restarted it. `wait()` blocks until the process has actually
+        // exited (not just been asked to), so the `try_wait()` inside
+        // `backend_is_running` is guaranteed to see it as gone rather than
+        // racing a process that hasn't finished exiting yet.
+        let mut c = quick_exit_command().spawn().unwrap();
+        let _ = c.wait();
+        let mut child = Some(c);
+
+        assert!(!backend_is_running(&mut child));
+        assert!(
+            child.is_none(),
+            "a dead child must be cleared to None, not left dangling as a stale Some"
+        );
+    }
+
+    #[test]
+    fn backend_is_running_is_false_with_nothing_running() {
+        let mut child: Option<Child> = None;
+        assert!(!backend_is_running(&mut child));
+    }
+
+    #[test]
+    fn stop_backend_if_idle_leaves_a_running_backend_alone_when_keeping_it() {
+        let mut child = Some(long_lived_command().spawn().unwrap());
+        stop_backend_if_idle(&mut child, true);
+        assert!(
+            backend_is_running(&mut child),
+            "keep_backend_running = true must never stop the backend"
+        );
+        kill_and_reap(&mut child);
+    }
+
+    #[test]
+    fn stop_backend_if_idle_stops_a_running_backend_in_save_memory_mode() {
+        // The core of review Critical 2's fix: with no vault window open and
+        // `keep_backend_running = false`, idle reconciliation must actually
+        // tear the backend down rather than leaving it running forever.
+        let mut child = Some(long_lived_command().spawn().unwrap());
+        stop_backend_if_idle(&mut child, false);
+        assert!(
+            child.is_none(),
+            "save-memory mode must stop bw serve once nothing needs it"
+        );
+    }
+
+    #[test]
+    fn stop_backend_if_idle_is_a_no_op_with_nothing_running() {
+        let mut child: Option<Child> = None;
+        stop_backend_if_idle(&mut child, false);
+        assert!(child.is_none());
+    }
+
+    #[test]
+    fn stop_backend_if_idle_clears_an_already_dead_child_too() {
+        // The `backend_is_running` fix applies here too: a dead child left in
+        // `Some` must not be treated as "still needs stopping" (harmless) but
+        // must at least end up cleared to `None` either way.
+        let mut c = quick_exit_command().spawn().unwrap();
+        let _ = c.wait();
+        let mut child = Some(c);
+
+        stop_backend_if_idle(&mut child, false);
+        assert!(child.is_none());
     }
 }

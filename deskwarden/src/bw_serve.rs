@@ -69,51 +69,6 @@ pub const PORT_RELEASE_GRACE: Duration = Duration::from_secs(5);
 /// compared to giving up on them.
 pub const PORT_RELEASE_GRACE_RESTART: Duration = Duration::from_secs(30);
 
-/// How many consecutive failed refreshes are tolerated before a backend that
-/// still holds its port is assumed to be wedged rather than merely busy.
-pub const WEDGED_BACKEND_FAILURES: u32 = 3;
-
-/// What the periodic-refresh failure handler should do next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecoveryAction {
-    /// The session itself is no longer usable: re-authenticate, then restart
-    /// the backend with the new token.
-    Reauthenticate,
-    /// The session is fine but `bw serve` is gone or wedged: restart it.
-    RestartBackend,
-    /// Nothing conclusive. The failure looks transient (a slow or dropped
-    /// request against a live backend), so wait for the next cycle.
-    Wait,
-}
-
-/// Decides how to recover from a failed periodic refresh.
-///
-/// Two independent things break a refresh and they need different fixes:
-///
-/// * the *session* went stale while running (`bw lock`, a server-side vault
-///   timeout, a password change on another device). `bw status` detects this,
-///   because it shells out to the CLI and does not depend on `bw serve`;
-/// * `bw serve` itself died or wedged while the session stayed perfectly
-///   valid. `bw status` is blind to this -- it reports `Unlocked` quite
-///   happily -- which is why `port_listening` has to be probed separately.
-///   Without that probe a crashed backend produced a warning every 60s
-///   forever and never recovered.
-///
-/// Pure so the decision table is testable without a vault, a CLI or a socket.
-pub fn recovery_action(
-    session_unlocked: bool,
-    port_listening: bool,
-    consecutive_failures: u32,
-) -> RecoveryAction {
-    if !session_unlocked {
-        RecoveryAction::Reauthenticate
-    } else if !port_listening || consecutive_failures >= WEDGED_BACKEND_FAILURES {
-        RecoveryAction::RestartBackend
-    } else {
-        RecoveryAction::Wait
-    }
-}
-
 /// Waits for `port` to stop being listened on, up to `deadline`.
 ///
 /// Needed on the restart paths: `Child::kill` only *requests* termination, so
@@ -314,52 +269,6 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         assert!(!wait_for_port_free(port, Duration::from_millis(300)));
-    }
-
-    #[test]
-    fn a_stale_session_is_recovered_by_re_authenticating() {
-        // Whatever the port says: without a usable session a restart would
-        // just bring up another backend that rejects every request.
-        assert_eq!(
-            recovery_action(false, true, 1),
-            RecoveryAction::Reauthenticate
-        );
-        assert_eq!(
-            recovery_action(false, false, 1),
-            RecoveryAction::Reauthenticate
-        );
-    }
-
-    #[test]
-    fn a_dead_backend_with_a_valid_session_is_restarted_immediately() {
-        // The regression this exists for: `bw status` reports `Unlocked`
-        // because it never touches `bw serve`, so relying on it alone left a
-        // crashed backend logging a warning every 60s forever.
-        assert_eq!(
-            recovery_action(true, false, 1),
-            RecoveryAction::RestartBackend
-        );
-    }
-
-    #[test]
-    fn a_live_backend_gets_the_benefit_of_the_doubt_at_first() {
-        assert_eq!(recovery_action(true, true, 1), RecoveryAction::Wait);
-        assert_eq!(
-            recovery_action(true, true, WEDGED_BACKEND_FAILURES - 1),
-            RecoveryAction::Wait
-        );
-    }
-
-    #[test]
-    fn a_backend_that_holds_its_port_but_keeps_failing_is_treated_as_wedged() {
-        assert_eq!(
-            recovery_action(true, true, WEDGED_BACKEND_FAILURES),
-            RecoveryAction::RestartBackend
-        );
-        assert_eq!(
-            recovery_action(true, true, WEDGED_BACKEND_FAILURES + 10),
-            RecoveryAction::RestartBackend
-        );
     }
 
     #[test]

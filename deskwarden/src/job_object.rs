@@ -12,7 +12,7 @@
 //! destructors, and an unhandled panic or an external `TerminateProcess`).
 
 use std::io;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command};
 use windows::core::PCWSTR;
@@ -32,27 +32,18 @@ use windows::Win32::System::Threading::{
 /// An owned job-object handle. **Must be kept alive** for as long as the child
 /// processes should live: dropping it closes the handle, which (with
 /// kill-on-close set) terminates everything assigned to the job.
+///
+/// Stored as a `std::os::windows::io::OwnedHandle` rather than the raw
+/// `windows::Win32::Foundation::HANDLE` it's created as. `OwnedHandle` is
+/// `Send + Sync` in std itself -- no `unsafe impl` needed here -- and closes
+/// the handle in its own `Drop`, which is exactly the kill-on-close trigger
+/// this type exists for; that's also why the manual `Drop` impl this used to
+/// need is gone too. This is what lets `main.rs` share the job object with a
+/// background thread that starts `bw serve` without blocking the vault
+/// window's first paint on the backend's cold start.
 pub struct KillOnCloseJob {
-    handle: HANDLE,
+    handle: OwnedHandle,
 }
-
-// `HANDLE` wraps a `*mut c_void`, and raw pointers unconditionally opt out of
-// the auto-derived `Send`/`Sync` -- reasonably, since in general a raw
-// pointer might alias memory another thread could race on. That general
-// caution doesn't apply to a Win32 handle: it's an opaque kernel-object
-// token, not a pointer this process ever dereferences, and every operation
-// `KillOnCloseJob` performs with it (`AssignProcessToJobObject` in `assign`,
-// `CloseHandle` in `Drop`) is documented as safe to call from any thread, on
-// the same handle value, without external synchronization -- the kernel
-// serializes access to the job object itself. `assign` only ever takes
-// `&self`, so `Sync` is what's actually load-bearing; `Send` is added too
-// since a value that's safe to share is safe to hand to a single other
-// thread. This is what lets `main.rs`'s `open_vault_window` start `bw serve`
-// on a background thread -- borrowing this job object across the scoped
-// thread boundary -- without blocking the vault window's first paint on the
-// backend's cold start.
-unsafe impl Send for KillOnCloseJob {}
-unsafe impl Sync for KillOnCloseJob {}
 
 impl KillOnCloseJob {
     /// Creates an unnamed job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
@@ -76,7 +67,11 @@ impl KillOnCloseJob {
                 return Err(e);
             }
 
-            Ok(Self { handle })
+            // `HANDLE` wraps a `*mut c_void`, which is exactly what
+            // `OwnedHandle::from_raw_handle` expects (`RawHandle` is the same
+            // type). From here on this handle's lifetime is std's problem,
+            // not ours.
+            Ok(Self { handle: OwnedHandle::from_raw_handle(handle.0) })
         }
     }
 
@@ -86,7 +81,8 @@ impl KillOnCloseJob {
     /// callers should log rather than treat that as fatal.
     pub fn assign(&self, child: &Child) -> windows::core::Result<()> {
         let process_handle = HANDLE(child.as_raw_handle());
-        unsafe { AssignProcessToJobObject(self.handle, process_handle) }
+        let job_handle = HANDLE(self.handle.as_raw_handle());
+        unsafe { AssignProcessToJobObject(job_handle, process_handle) }
     }
 }
 
@@ -191,16 +187,6 @@ fn resume_process(pid: u32) -> windows::core::Result<u32> {
     }
 
     Ok(resumed)
-}
-
-impl Drop for KillOnCloseJob {
-    fn drop(&mut self) {
-        // Closing the last handle is what triggers the kill. That's the
-        // intended behaviour, not a leak being cleaned up.
-        unsafe {
-            let _ = CloseHandle(self.handle);
-        }
-    }
 }
 
 #[cfg(test)]
