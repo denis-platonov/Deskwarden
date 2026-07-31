@@ -221,6 +221,20 @@ impl VaultBridge {
         Ok(body.data)
     }
 
+    /// Renames a folder via `bw serve`'s `PUT /object/folder/{id}` -- the
+    /// same endpoint shape as [`Self::update_item`], scoped to folders.
+    pub fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
+        let url = format!("{}/object/folder/{}", self.base_url, id);
+        let body: Envelope<Folder> = self
+            .agent
+            .put(&url)
+            .send_json(serde_json::json!({ "name": name }))
+            .map_err(|e| VaultError::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
+    }
+
     pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
         let url = format!("{}/object/folder/{}", self.base_url, id);
         self.agent
@@ -636,6 +650,23 @@ mod tests {
         let bridge = VaultBridge::new(server.url());
         let folder = bridge.create_folder("Shared").unwrap();
         assert_eq!(folder.id, "f3");
+    }
+
+    #[test]
+    fn update_folder_puts_the_new_name_and_parses_the_result() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("PUT", "/object/folder/f3")
+            .match_body(mockito::Matcher::Json(serde_json::json!({ "name": "Renamed" })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"f3","name":"Renamed"}}"#)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let folder = bridge.update_folder("f3", "Renamed").unwrap();
+        assert_eq!(folder.id, "f3");
+        assert_eq!(folder.name, "Renamed");
     }
 
     #[test]

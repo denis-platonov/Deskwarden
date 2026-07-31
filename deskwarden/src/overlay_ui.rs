@@ -285,6 +285,9 @@ fn credential_row(ui: &mut egui::Ui, primary: &str, secondary: &str) -> bool {
         });
 
     let response = row.response.interact(Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     response.clicked()
 }
 

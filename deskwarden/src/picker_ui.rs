@@ -105,7 +105,11 @@ fn list_row(
                 });
             });
         });
-    frame.response.interact(Sense::click()).clicked()
+    let response = frame.response.interact(Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
 }
 
 /// The window's title block: a small heading with a muted one-line
@@ -219,6 +223,7 @@ pub fn pick_vault_item(vault: &VaultBridge) -> Option<VaultItem> {
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             styled = true;
             ui.ctx().request_repaint();

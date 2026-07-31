@@ -93,8 +93,16 @@ pub fn spawn_in_job(job: Option<&KillOnCloseJob>, mut command: Command) -> io::R
         return command.spawn();
     };
 
-    // OR-ed into whatever std sets internally; it does not replace those.
-    command.creation_flags(CREATE_SUSPENDED.0);
+    // `CREATE_NO_WINDOW` is re-applied here, not just `CREATE_SUSPENDED`.
+    //
+    // `Command::creation_flags` *replaces* the flags the `Command` is
+    // holding -- it only ORs with the ones std adds for itself at spawn
+    // time. So setting `CREATE_SUSPENDED` alone silently discarded the
+    // `CREATE_NO_WINDOW` that `bw_path::bw_command` had already set, and
+    // `bw serve` -- the one child spawned through here -- came up with a
+    // real console attached (confirmed by it owning a `conhost.exe` child),
+    // flashing a console window on screen every time the backend started.
+    command.creation_flags(crate::bw_path::CREATE_NO_WINDOW | CREATE_SUSPENDED.0);
     let mut child = command.spawn()?;
 
     if let Err(e) = job.assign(&child) {
@@ -180,6 +188,33 @@ impl Drop for KillOnCloseJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `spawn_in_job` must keep the child windowless as well as suspended.
+    ///
+    /// The two flags are independent bits, and the bug this guards was
+    /// setting only `CREATE_SUSPENDED` -- which, because
+    /// `Command::creation_flags` replaces rather than merges, dropped the
+    /// `CREATE_NO_WINDOW` set earlier by `bw_path::bw_command` and gave
+    /// `bw serve` a visible console. There is no way to read the flags back
+    /// off a `Command`, so this asserts the composed value directly.
+    #[test]
+    fn the_spawn_flags_keep_the_child_both_windowless_and_suspended() {
+        let flags = crate::bw_path::CREATE_NO_WINDOW | CREATE_SUSPENDED.0;
+
+        assert_eq!(
+            flags & crate::bw_path::CREATE_NO_WINDOW,
+            crate::bw_path::CREATE_NO_WINDOW,
+            "CREATE_NO_WINDOW is missing -- the child would get a console window"
+        );
+        assert_eq!(
+            flags & CREATE_SUSPENDED.0,
+            CREATE_SUSPENDED.0,
+            "CREATE_SUSPENDED is missing -- the child could run before it is \
+             assigned to the job, escaping kill-on-close"
+        );
+        // Distinct bits, so neither can mask the other.
+        assert_eq!(crate::bw_path::CREATE_NO_WINDOW & CREATE_SUSPENDED.0, 0);
+    }
 
     #[test]
     fn creates_a_configured_job_object() {

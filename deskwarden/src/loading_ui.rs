@@ -49,6 +49,7 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> T {
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             styled = true;
             ui.ctx().request_repaint();

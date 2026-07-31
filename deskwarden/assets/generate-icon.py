@@ -27,11 +27,16 @@ import zlib
 # Quadrant fills, as (r, g, b): top-left, top-right, bottom-left,
 # bottom-right. Same hex values as theme.rs's BLUE_DEEP / BLUE / BLUE_BRIGHT
 # / BLUE_SOFT -- kept in sync by hand (one is Rust, one is Python).
+#
+# The assignment must match theme.rs's QUADRANT_FILLS exactly, or the tray
+# and Explorer icon (generated here) would show a differently-arranged mark
+# from the one the app paints in its own windows. See that constant for why
+# the tones alternate diagonally rather than running in palette order.
 QUADRANT_RGB = {
-    "tl": (0x14, 0x30, 0x7A),
-    "tr": (0x1B, 0x3F, 0xA0),
-    "bl": (0x3B, 0x74, 0xE8),
-    "br": (0x7F, 0xA4, 0xEF),
+    "tl": (0x14, 0x30, 0x7A),  # BLUE_DEEP   -- dark
+    "tr": (0x3B, 0x74, 0xE8),  # BLUE_BRIGHT -- light
+    "bl": (0x7F, 0xA4, 0xEF),  # BLUE_SOFT   -- light
+    "br": (0x1B, 0x3F, 0xA0),  # BLUE        -- dark
 }
 
 # Supersampling factor per axis. 4 means each output pixel is the average of

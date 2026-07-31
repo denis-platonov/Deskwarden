@@ -75,9 +75,52 @@ pub const ERROR: Color32 = Color32::from_rgb(0xb4, 0x23, 0x18);
 /// Named font family for Archivo SemiBold (the design's 600 weight: buttons,
 /// row titles, field emphasis). Use via [`semibold`].
 pub const SEMIBOLD: &str = "Archivo-SemiBold";
-/// Named font family for Archivo Bold (the design's 700–800 weights:
-/// headings, the wordmark). Use via [`bold`].
+/// Named font family for Archivo Bold (the design's 700 weight: headings,
+/// section labels). Use via [`bold`].
 pub const BOLD: &str = "Archivo-Bold";
+/// Named font family for Archivo ExtraBold — the design's 800 weight, used
+/// for the wordmark ("Deskwarden" at 25px in the login window, 14px in the
+/// vault titlebar) and nothing else. Use via [`extrabold`].
+///
+/// Bundled as its own face because Archivo's 800 is genuinely a different
+/// cut, not a synthesised one: it is both heavier *and* slightly wider per
+/// glyph than 700, so rendering the wordmark in Bold read as simultaneously
+/// too light and too narrow against the design, and no amount of tracking
+/// could reconcile it.
+pub const EXTRABOLD: &str = "Archivo-ExtraBold";
+
+/// The face the design's keyboard-shortcut runs actually render in.
+///
+/// The design declares them (`CTRL+L`, `CTRL+K`, `CTRL+H`, the `/` and `↵`
+/// chips) as `font-family: ui-monospace, SFMono-Regular, Menlo, monospace`
+/// — i.e. "the platform's own UI monospace". On Windows none of the first
+/// three exist, so a browser rendering `Deskwarden.dc.html` falls through
+/// to generic `monospace`, which Chromium resolves to Consolas. egui's
+/// bundled default for [`FontFamily::Monospace`] is Hack instead: a
+/// noticeably heavier and wider face, which is why these chips read as the
+/// wrong font against the design even though the *family* was already
+/// correct.
+///
+/// Reading the system copy puts the app on the same face the design
+/// document itself renders with here, and costs nothing in binary size.
+/// `None` — leaving egui's Hack in place — whenever it can't be read: this
+/// is a cosmetic match, never a reason to fail startup.
+fn system_monospace() -> Option<Vec<u8>> {
+    let system_root = std::env::var_os("SystemRoot")?;
+    let path = std::path::Path::new(&system_root)
+        .join("Fonts")
+        .join("consola.ttf");
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::debug!(
+                "could not read {} ({e}); keeping egui's bundled monospace face",
+                path.display()
+            );
+            None
+        }
+    }
+}
 
 /// The bundled Archivo faces (the design's typeface, OFL-licensed; see
 /// assets/fonts/OFL.txt), layered over egui's defaults.
@@ -106,6 +149,12 @@ fn font_definitions() -> egui::FontDefinitions {
             "../assets/fonts/Archivo-Bold.ttf"
         ))),
     );
+    fonts.font_data.insert(
+        EXTRABOLD.to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Archivo-ExtraBold.ttf"
+        ))),
+    );
 
     let default_stack = fonts
         .families
@@ -116,13 +165,26 @@ fn font_definitions() -> egui::FontDefinitions {
     if let Some(proportional) = fonts.families.get_mut(&FontFamily::Proportional) {
         proportional.insert(0, "Archivo-Regular".to_owned());
     }
-    for weight in [SEMIBOLD, BOLD] {
+    for weight in [SEMIBOLD, BOLD, EXTRABOLD] {
         let mut stack = vec![weight.to_owned()];
         stack.extend(default_stack.iter().cloned());
         fonts
             .families
             .insert(FontFamily::Name(weight.into()), stack);
     }
+
+    // Front of the monospace stack, not a replacement for it -- egui's Hack
+    // stays behind as the fallback for anything Consolas lacks, and as the
+    // whole family if `system_monospace` came back empty.
+    if let Some(bytes) = system_monospace() {
+        fonts
+            .font_data
+            .insert("Consolas".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+        if let Some(monospace) = fonts.families.get_mut(&FontFamily::Monospace) {
+            monospace.insert(0, "Consolas".to_owned());
+        }
+    }
+
     fonts
 }
 
@@ -133,11 +195,19 @@ pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
         .family(FontFamily::Name(SEMIBOLD.into()))
 }
 
-/// `RichText` in Archivo Bold — the design's 700–800 weights.
+/// `RichText` in Archivo Bold — the design's 700 weight.
 pub fn bold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text.into())
         .size(size)
         .family(FontFamily::Name(BOLD.into()))
+}
+
+/// `RichText` in Archivo ExtraBold — the design's 800 weight. See
+/// [`EXTRABOLD`] for why this is a bundled face rather than [`bold`].
+pub fn extrabold(text: impl Into<String>, size: f32) -> RichText {
+    RichText::new(text.into())
+        .size(size)
+        .family(FontFamily::Name(EXTRABOLD.into()))
 }
 
 /// Letterspaced text, for the design's tracked uppercase tags ("FILLS
@@ -163,6 +233,24 @@ pub fn letterspaced(
         },
     );
     job
+}
+
+/// Fills `ui` with the app's window background.
+///
+/// Every window here skips drawing on its first frame: [`apply`]'s fonts
+/// only become live at the *start* of the next one, so laying out
+/// Archivo-styled text in the same frame that registers it would look up a
+/// family that does not exist yet. Returning early left that frame
+/// completely unpainted, which shows eframe's near-black default clear
+/// colour — a dark rectangle flashing open at window creation, and with the
+/// login, loading and vault windows opening in sequence, three of them. It
+/// reads exactly like a console window appearing.
+///
+/// Painting a plain rect needs no fonts, so it is safe on that first frame
+/// and turns the flash into the window's own colour.
+pub fn paint_window_background(ui: &Ui) {
+    ui.painter()
+        .rect_filled(ui.max_rect(), CornerRadius::ZERO, WINDOW_BG);
 }
 
 /// Applies the Deskwarden look to an egui context. Call once per window,
@@ -200,7 +288,27 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
 
+    // egui defaults every `ui.label()` to selectable text, which shows a
+    // text-beam cursor on hover regardless of whether the label sits inside
+    // something clickable -- since labels make up most of this app's
+    // surface (row text, field labels, buttons' own text), that read as a
+    // text-beam cursor almost everywhere. This app has no text-selection
+    // feature anywhere, so there is nothing lost by turning it off; the
+    // cursor now stays the OS default arrow over plain text and switches to
+    // a hand only over what's actually clickable (see `interact_cursor`
+    // below).
+    style.interaction.selectable_labels = false;
+
     let mut v = egui::Visuals::light();
+    // The web-like affordance the design implies but egui doesn't apply on
+    // its own: every `egui::Button`-based control (which is most of this
+    // app's clickables -- `primary_button`/`secondary_button`/
+    // `toolbar_button`/plain `egui::Button`) shows a pointing hand on
+    // hover. Hand-painted clickables that don't go through `Button` (the
+    // window chrome's ✕/▢/— controls, item-list rows, the sidebar's status
+    // pill and edit-pencil) set this themselves via `on_hover_cursor`/
+    // `set_cursor_icon` at their own call sites instead.
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
     v.panel_fill = CANVAS;
     v.window_fill = CARD;
     v.faint_bg_color = CARD_TINT;
@@ -243,7 +351,24 @@ pub fn apply(ctx: &egui::Context) {
 
 /// The four quadrant fills of the full-color mark, in reading order
 /// (top-left, top-right, bottom-left, bottom-right).
-const QUADRANT_FILLS: [Color32; 4] = [BLUE_DEEP, BLUE, BLUE_BRIGHT, BLUE_SOFT];
+///
+/// Arranged as a *checkerboard* of tone — the two dark values diagonally
+/// opposite each other, likewise the two light ones — so that every shared
+/// edge in the mark divides a dark quadrant from a light one.
+///
+/// This is a deliberate divergence from `Deskwarden.dc.html`, which lays
+/// the four values out in palette order (deep, blue, bright, soft) and so
+/// puts `BLUE_DEEP` and `BLUE` next to each other along the mark's entire
+/// top edge. Those two differ by ~15 in relative luminance against ~50-114
+/// for every other pairing, so that edge visually disappeared and the mark
+/// read as three shapes rather than four. This order raises the *weakest*
+/// adjacent contrast in the mark from ~15 to ~50.
+///
+/// Note this is the one place the module doc's "a mismatch with the design
+/// is a bug in this file" does not hold: the mismatch is the fix, and
+/// `quadrant_tones_alternate_around_the_mark` locks it in so it cannot be
+/// quietly reverted to palette order.
+const QUADRANT_FILLS: [Color32; 4] = [BLUE_DEEP, BLUE_BRIGHT, BLUE_SOFT, BLUE];
 
 /// Kappa for approximating a 90° circular arc with one cubic Bézier,
 /// pre-multiplied by the design's 2.4-unit corner radius.
@@ -356,6 +481,44 @@ fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
             Stroke::NONE,
         ));
     }
+}
+
+/// Where the shield's *ink* lands when the mark is painted into `rect`.
+///
+/// The artboard is 24×28 but the shield only spans 2..22 horizontally and
+/// 2..26 vertically — two units of padding on every side (see
+/// `quadrant_outlines_stay_inside_the_design_viewbox`). [`paint_mark`] fits
+/// the whole artboard into `rect`, so the shield's visible left edge sits
+/// inset from `rect.left()`, and a mark box flush against a text column
+/// looks *indented* relative to it.
+///
+/// Callers that need the shield optically aligned to something — rather
+/// than its artboard mathematically aligned — use this to compensate.
+pub fn mark_ink_rect(rect: Rect) -> Rect {
+    let scale = (rect.width() / 24.0).min(rect.height() / 28.0);
+    let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
+    Rect::from_min_max(
+        origin + Vec2::new(2.0 * scale, 2.0 * scale),
+        origin + Vec2::new(22.0 * scale, 26.0 * scale),
+    )
+}
+
+/// How far a laid-out run's first visible ink sits from its galley origin.
+///
+/// egui (like a browser) positions text by its layout origin, but every
+/// glyph carries its own left side bearing, and that bearing scales with
+/// the font size. So two runs painted at the same x in *different* sizes do
+/// not have their visible left edges aligned — at 25px and 10px the gap is
+/// a full pixel, which is plainly visible when one sits directly above the
+/// other. Painting each at `x - ink_offset_x(galley)` aligns the ink rather
+/// than the origins.
+pub fn ink_offset_x(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first())
+        .map(|glyph| glyph.pos.x + glyph.uv_rect.offset.x)
+        .unwrap_or(0.0)
 }
 
 /// Allocates a `size`×`size` square and paints the mark into it.
@@ -504,6 +667,21 @@ pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
 /// blue for synced, this app's error red for failed, a ghost tone while in
 /// flight).
 pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str) {
+    status_pill_impl(ui, dot_color, text, Sense::hover());
+}
+
+/// [`status_pill`], but clickable: the vault window's toolbar merges the
+/// "Sync" action into its own status readout (design 2b's "● Synced 1 min
+/// ago") instead of keeping them as two separate controls next to each
+/// other -- the whole pill is the sync button, and what it reads is also
+/// its own result. Darkens the border and swaps in a pointer cursor on
+/// hover, the same affordance-on-hover treatment [`hello_panel`] and
+/// [`close_glyph`] already use for text/shape-only clickables.
+pub fn status_pill_button(ui: &mut Ui, dot_color: Color32, text: &str) -> Response {
+    status_pill_impl(ui, dot_color, text, Sense::click())
+}
+
+fn status_pill_impl(ui: &mut Ui, dot_color: Color32, text: &str, sense: Sense) -> Response {
     const HEIGHT: f32 = 28.0;
     const PAD_X: f32 = 10.0;
     const GAP: f32 = 6.0;
@@ -515,17 +693,20 @@ pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str) {
         TEXT_SECONDARY,
     );
     let content_width = DOT_DIAMETER + GAP + galley.size().x;
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(content_width + PAD_X * 2.0, HEIGHT),
-        Sense::hover(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(content_width + PAD_X * 2.0, HEIGHT), sense);
+
+    if response.hovered() && sense == Sense::click() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
 
     // `border-radius: 999px` on a fixed-height pill is shorthand for "fully
     // rounded" -- half the height is the largest radius that still reads as
     // a stadium shape rather than clipping the corners.
     let rounding = CornerRadius::same((HEIGHT / 2.0) as u8);
+    let border = if response.hovered() { BORDER_STRONG } else { HAIRLINE };
     ui.painter()
-        .rect_stroke(rect, rounding, Stroke::new(1.0, HAIRLINE), StrokeKind::Inside);
+        .rect_stroke(rect, rounding, Stroke::new(1.0, border), StrokeKind::Inside);
 
     let dot_center = Pos2::new(rect.min.x + PAD_X + DOT_DIAMETER / 2.0, rect.center().y);
     ui.painter()
@@ -536,6 +717,36 @@ pub fn status_pill(ui: &mut Ui, dot_color: Color32, text: &str) {
         rect.center().y - galley.size().y / 2.0,
     );
     ui.painter().galley(text_pos, galley, TEXT_SECONDARY);
+    response
+}
+
+/// Height of the design's keyboard-hint chips: a 10px monospace line
+/// (~12px line box) inside 3px of vertical padding.
+///
+/// Fixed rather than derived from the galley's own height, which is ascent
+/// + descent — it reserves room for descenders that strings like "CTRL+H",
+/// "CTRL+N" and "Enter" never contain, so a galley-sized chip always came
+/// out taller than the design's. That gap widened when the monospace face
+/// became Consolas (see `system_monospace`), whose descent is deeper than
+/// the previously-used bundled face.
+const CHIP_HEIGHT: f32 = 18.0;
+
+/// Paints one keyboard-hint chip: `text` in 10px monospace, centered in a
+/// rounded box of exactly [`CHIP_HEIGHT`] with `pad_x` either side.
+fn paint_chip(ui: &mut Ui, text: &str, bg: Color32, fg: Color32, radius: u8, pad_x: f32) {
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), FontId::new(10.0, FontFamily::Monospace), fg);
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(galley.size().x + pad_x * 2.0, CHIP_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(radius), bg);
+    let pos = Pos2::new(
+        rect.min.x + pad_x,
+        rect.center().y - galley.size().y / 2.0,
+    );
+    ui.painter().galley(pos, galley, fg);
 }
 
 /// A small monospace keyboard-hint chip ("↵", "CTRL+N"). `on_primary` is the
@@ -546,16 +757,22 @@ pub fn kbd_chip(ui: &mut Ui, text: &str, on_primary: bool) {
     } else {
         (CANVAS, TEXT_FAINT)
     };
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        FontId::new(10.0, FontFamily::Monospace),
-        fg,
-    );
-    let padding = Vec2::new(6.0, 3.0);
-    let (rect, _) = ui.allocate_exact_size(galley.size() + padding * 2.0, Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(4), bg);
-    ui.painter().galley(rect.min + padding, galley, fg);
+    paint_chip(ui, text, bg, fg, 4, 6.0);
 }
+
+/// The Windows Hello panel's CTRL+H chip (design 3h: `font-size: 10px;
+/// color: #1b3fa0; background: #ffffff; border-radius: 5px; padding: 3px
+/// 7px`) — a white chip on the panel's blue wash, which is neither of
+/// [`kbd_chip`]'s two treatments.
+pub fn kbd_chip_on_card(ui: &mut Ui, text: &str) {
+    paint_chip(ui, text, CARD, BLUE, 5, 7.0);
+}
+
+/// Height of the design's action buttons (3h Continue, 2b/3f toolbar).
+/// Named because things placed *beside* a button — the login window's
+/// in-flight spinner — have to match it, and a second hardcoded `32.0`
+/// could drift away from this one unnoticed.
+pub const BUTTON_HEIGHT: f32 = 32.0;
 
 /// The filled primary action button, optionally with a trailing keyboard
 /// hint, per the design's "Save ↵" / "Fill in app CTRL+⇧+F" buttons.
@@ -579,31 +796,40 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
             .corner_radius(CornerRadius::same(7))
             // The design's action buttons are 32px tall (3h Continue, 2b/3f
             // toolbar); text + padding alone comes up short.
-            .min_size(Vec2::new(0.0, 32.0)),
+            .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
     );
     if paint_return {
         paint_return_arrow(
             ui.painter(),
             Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
-            6.5,
-            Color32::from_white_alpha(200),
+            RETURN_GLYPH_SIZE,
+            Color32::from_white_alpha(204),
         );
     }
     response
 }
 
+/// Extent of the drawn ↵ glyph. The design sets it in 10px monospace beside
+/// a 13px label (`opacity: 0.8`, which is the 204 alpha above); a real 10px
+/// ↵ glyph's ink is roughly half its em box, so the arrow is drawn at 5px
+/// rather than the 6.5 it used before, which read as heavier than the
+/// design's at the same nominal size.
+const RETURN_GLYPH_SIZE: f32 = 5.0;
+
 /// The ↵ return glyph, drawn: down the right side, along the bottom, arrowhead
-/// pointing left.
+/// pointing left. Every part scales with `size` -- the arrowhead barbs used
+/// to be a fixed 3.2px, so shrinking the glyph left them oversized.
 fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.2, color);
+    let stroke = Stroke::new(1.0, color);
     let half = size / 2.0;
+    let barb = size * 0.5;
     let right_top = Pos2::new(center.x + half, center.y - half);
     let corner = Pos2::new(center.x + half, center.y + half * 0.7);
     let left = Pos2::new(center.x - half, center.y + half * 0.7);
     painter.line_segment([right_top, corner], stroke);
     painter.line_segment([corner, left], stroke);
-    painter.line_segment([left, Pos2::new(left.x + 3.2, left.y - 3.2)], stroke);
-    painter.line_segment([left, Pos2::new(left.x + 3.2, left.y + 3.2)], stroke);
+    painter.line_segment([left, Pos2::new(left.x + barb, left.y - barb)], stroke);
+    painter.line_segment([left, Pos2::new(left.x + barb, left.y + barb)], stroke);
 }
 
 /// The outlined secondary button ("Not now", "Cancel", "Copy").
@@ -613,28 +839,55 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
             .fill(CARD)
             .stroke(Stroke::new(1.0, BORDER_STRONG))
             .corner_radius(CornerRadius::same(7))
-            .min_size(Vec2::new(0.0, 32.0)),
+            .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
     )
 }
 
-/// The vault window titlebar's compact outlined button (design 2b's Lock:
-/// `height: 28px; padding: 0 12px; border: 1px solid #d7d3d3; border-radius:
-/// 8px; font-size: 12px; font-weight: 600`). [`secondary_button`] is close
-/// but not exact (32px tall, 7px radius, 13px text) -- its own hardcoded
-/// dimensions are shared by every other caller in the app, so rather than
-/// change those for everyone, this is a separate, smaller variant sized to
-/// this one spot. The 12px horizontal padding comes from the ambient
-/// `style.spacing.button_padding` (`theme::apply` sets it to `(12.0, 6.0)`)
-/// the same way `secondary_button`'s does -- only the forced min height,
-/// corner radius, and text size differ here.
-pub fn toolbar_button(ui: &mut Ui, label: &str) -> Response {
-    ui.add(
-        egui::Button::new(semibold(label, 12.0).color(INK))
-            .fill(CARD)
-            .stroke(Stroke::new(1.0, BORDER_STRONG))
-            .corner_radius(CornerRadius::same(8))
-            .min_size(Vec2::new(0.0, 28.0)),
-    )
+/// The vault window titlebar's Lock control (design 2b: `height: 28px;
+/// padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 8px;`), with
+/// its keyboard shortcut nested *inside* the same bordered pill -- "Lock"
+/// in 12px SemiBold ink, then its shortcut in 10px monospace faint text, an
+/// 8px gap apart -- rather than [`secondary_button`] (close but not exact:
+/// 32px tall, 7px radius, 13px text) plus a separate [`kbd_chip`] floating
+/// beside it. The design's markup is one element containing both text
+/// runs, not two adjacent ones, and clicking anywhere in the pill --
+/// including over the shortcut text -- activates it.
+pub fn toolbar_button_with_shortcut(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
+    const PAD_X: f32 = 12.0;
+    const GAP: f32 = 8.0;
+    const HEIGHT: f32 = 28.0;
+
+    let label_galley =
+        ui.painter()
+            .layout_no_wrap(label.to_string(), FontId::new(12.0, FontFamily::Name(SEMIBOLD.into())), INK);
+    let shortcut_galley =
+        ui.painter()
+            .layout_no_wrap(shortcut.to_string(), FontId::new(10.0, FontFamily::Monospace), TEXT_FAINT);
+
+    let content_width = label_galley.size().x + GAP + shortcut_galley.size().x;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(content_width + PAD_X * 2.0, HEIGHT),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let rounding = CornerRadius::same(8);
+    ui.painter()
+        .rect_filled(rect, rounding, if response.hovered() { CARD_TINT } else { CARD });
+    ui.painter()
+        .rect_stroke(rect, rounding, Stroke::new(1.0, BORDER_STRONG), StrokeKind::Inside);
+
+    let label_pos = Pos2::new(rect.min.x + PAD_X, rect.center().y - label_galley.size().y / 2.0);
+    let shortcut_pos = Pos2::new(
+        label_pos.x + label_galley.size().x + GAP,
+        rect.center().y - shortcut_galley.size().y / 2.0,
+    );
+    ui.painter().galley(label_pos, label_galley, INK);
+    ui.painter().galley(shortcut_pos, shortcut_galley, TEXT_FAINT);
+
+    response
 }
 
 /// The overlay/card header bar: 16px mark, letterspaced "DESKWARDEN", and a
@@ -696,6 +949,76 @@ fn close_glyph(ui: &mut Ui) -> Response {
     response.on_hover_text("Dismiss")
 }
 
+/// A small edit-pencil glyph (sidebar folder rows' edit affordance): a
+/// diagonal body with a filled triangular tip, plus a flat tail. Drawn
+/// rather than typed for the same reason [`close_glyph`] is -- neither the
+/// bundled Archivo faces nor egui's fallback stack reliably carry a pencil
+/// codepoint (U+270F/U+270E) at this size, so as text it risks a tofu box.
+/// Darkens to ink and shows a pointing hand on hover, matching every other
+/// bare-glyph affordance in this file.
+///
+/// The shape is built in local coordinates around the origin, then
+/// translated so *its own bounding box* -- not an arbitrary anchor point --
+/// lands on `rect`'s center. Anchoring by a single point (an earlier
+/// version of this glyph did) looks off-center whenever the shape itself
+/// isn't symmetric around that point, which a pencil with a pointed tip and
+/// a flat tail never is.
+pub fn pencil_glyph_at(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
+    // `ui.interact`, not `allocate_*`/`scope_*`: this glyph is positioned
+    // *beside* a row that already allocated the vertical space they share,
+    // so anything that touched the cursor here would allocate that space a
+    // second time. Interacting with an explicit rect registers the click
+    // target without participating in layout at all.
+    let response = ui.interact(rect, id, Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() { INK } else { TEXT_GHOST };
+
+    // Body: a thin rectangle running along the (1,-1) diagonal, capped with
+    // a triangular tip at one end.
+    let dir = Vec2::new(1.0, -1.0).normalized();
+    // True 90° rotation `(-y, x)`, NOT the `(y, x)` swap: for a `(d, -d)`
+    // diagonal, swapping components yields `(-d, d)` -- the *antiparallel*
+    // of `dir`, which collapsed both polygons below into zero-area slivers
+    // of collinear points. epaint's anti-aliasing computes miter joins from
+    // adjacent edge normals, and for antiparallel edges those normals sum
+    // to zero and normalize to NaN -- the GPU then rasterized the resulting
+    // garbage triangles as a solid `TEXT_GHOST` smear across the sidebar's
+    // entire clip rect (the "gray box covering the left menu" bug).
+    let normal = Vec2::new(-dir.y, dir.x) * 1.3; // perpendicular, half-width 1.3
+    let tail = Vec2::new(-6.0, 6.0);
+    let shoulder = Vec2::new(3.0, -3.0);
+    let tip = shoulder + dir * 3.2;
+    let body = [tail + normal, shoulder + normal, shoulder - normal, tail - normal];
+    let nib = [shoulder + normal, tip, shoulder - normal];
+
+    let local: Vec<Vec2> = body.iter().chain(nib.iter()).copied().collect();
+    let min = local.iter().fold(Vec2::new(f32::INFINITY, f32::INFINITY), |a, p| {
+        Vec2::new(a.x.min(p.x), a.y.min(p.y))
+    });
+    let max = local
+        .iter()
+        .fold(Vec2::new(f32::NEG_INFINITY, f32::NEG_INFINITY), |a, p| {
+            Vec2::new(a.x.max(p.x), a.y.max(p.y))
+        });
+    let bbox_center = (min + max) / 2.0;
+    let offset = rect.center() - bbox_center.to_pos2();
+
+    let to_screen = |v: Vec2| Pos2::new(v.x, v.y) + offset;
+    ui.painter().add(egui::Shape::convex_polygon(
+        body.iter().map(|p| to_screen(*p)).collect(),
+        color,
+        Stroke::NONE,
+    ));
+    ui.painter().add(egui::Shape::convex_polygon(
+        nib.iter().map(|p| to_screen(*p)).collect(),
+        color,
+        Stroke::NONE,
+    ));
+    response.on_hover_text("Edit folder")
+}
+
 /// The footer keyboard-hint strip: `(key, action)` pairs in faint text, per
 /// the design's "↑↓ Move · ↵ Fill · Esc Dismiss" bar.
 pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
@@ -747,6 +1070,9 @@ pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> R
         toggle_rect,
         egui::Label::new(semibold(label, 11.0).color(BLUE_DEEP)).sense(Sense::click()),
     );
+    if toggle.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if toggle.clicked() {
         *revealed = !*revealed;
     }
@@ -881,6 +1207,146 @@ mod tests {
         assert_eq!(initials("a b"), "AB");
     }
 
+    /// Runs `apply` against a fresh context and returns it ready to lay out
+    /// text with this app's real font set. `set_fonts` only takes effect at
+    /// the *start* of the next frame (see `apply`'s own call sites, which
+    /// all skip drawing on the frame they style in), so this deliberately
+    /// runs two frames before handing the context back.
+    fn ctx_with_fonts() -> egui::Context {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        ctx
+    }
+
+    /// The design renders the Lock pill's shortcut in `ui-monospace`, a
+    /// visibly different face from the "Lock" label beside it. Asserting
+    /// "the code passes `FontFamily::Monospace`" would only restate the
+    /// source; this checks the property that actually makes a face
+    /// monospaced -- every glyph advancing by the same width -- against the
+    /// font that really gets resolved after `apply` replaces the font set.
+    #[test]
+    fn the_toolbar_shortcut_font_is_really_monospaced() {
+        let ctx = ctx_with_fonts();
+        let font = FontId::new(10.0, FontFamily::Monospace);
+
+        // 'i' and 'M' are the widest-apart pair in almost any proportional
+        // face, and exactly equal in any monospaced one.
+        let narrow = ctx.fonts_mut(|f| f.layout_no_wrap("iiiiii".to_owned(), font.clone(), INK));
+        let wide = ctx.fonts_mut(|f| f.layout_no_wrap("MMMMMM".to_owned(), font.clone(), INK));
+
+        assert!(
+            (narrow.size().x - wide.size().x).abs() < 0.5,
+            "the shortcut font is not monospaced: \"iiiiii\" measures {}px but \
+             \"MMMMMM\" measures {}px",
+            narrow.size().x,
+            wide.size().x
+        );
+    }
+
+    /// ...and that it is genuinely a *different* face from the label's, not
+    /// silently falling back to the same Archivo the rest of the pill uses.
+    #[test]
+    fn the_toolbar_shortcut_font_differs_from_the_label_font() {
+        let ctx = ctx_with_fonts();
+        let text = "CTRL+L";
+
+        let mono = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(text.to_owned(), FontId::new(10.0, FontFamily::Monospace), INK)
+        });
+        let label_face = ctx.fonts_mut(|f| {
+            f.layout_no_wrap(
+                text.to_owned(),
+                FontId::new(10.0, FontFamily::Name(SEMIBOLD.into())),
+                INK,
+            )
+        });
+
+        assert!(
+            (mono.size().x - label_face.size().x).abs() > 0.5,
+            "the shortcut and the label resolve to the same face -- both \
+             measure {}px for {text:?}, so the shortcut is not visually \
+             distinct the way the design requires",
+            mono.size().x
+        );
+    }
+
+    /// Guards the silent-fallback case: `system_monospace` returning `None`
+    /// (or its result never reaching the family stack) would leave egui's
+    /// Hack in place, and both tests above would still pass while the app
+    /// kept rendering the wrong face. Comparing against a context that
+    /// never ran `apply` is what actually proves the substitution took.
+    #[test]
+    fn the_system_monospace_face_actually_replaces_egui_default() {
+        let Some(_) = system_monospace() else {
+            // Not a Windows install carrying the standard font set. The
+            // fallback is deliberate and correct, so there is nothing to
+            // assert here.
+            return;
+        };
+
+        let styled = ctx_with_fonts();
+        let bare = egui::Context::default();
+        let _ = bare.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+                ..Default::default()
+            },
+            |_ui| {},
+        );
+
+        let font = FontId::new(10.0, FontFamily::Monospace);
+        let text = "CTRL+L";
+        let ours = styled.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), INK));
+        let egui_default = bare.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, INK));
+
+        assert!(
+            (ours.size().x - egui_default.size().x).abs() > 0.5,
+            "the monospace face is still egui's bundled Hack -- both measure \
+             {}px for {text:?}, so the system face never made it into the \
+             family stack",
+            ours.size().x
+        );
+    }
+
+    /// The wordmark reads as both too light and too narrow when rendered in
+    /// Bold instead of ExtraBold, because Archivo's 800 cut is genuinely
+    /// wider per glyph than its 700 -- not just heavier. If the ExtraBold
+    /// face ever failed to load, the named family would fall back through
+    /// the stack and this measurement would collapse onto Bold's, silently
+    /// restoring exactly the appearance the extra face was added to fix.
+    #[test]
+    fn extrabold_is_a_distinct_wider_face_than_bold() {
+        let ctx = ctx_with_fonts();
+        let word = "Deskwarden";
+
+        let measure = |family: &str| {
+            ctx.fonts_mut(|f| {
+                f.layout_no_wrap(
+                    word.to_owned(),
+                    FontId::new(25.0, FontFamily::Name(family.into())),
+                    INK,
+                )
+                .size()
+                .x
+            })
+        };
+
+        let bold = measure(BOLD);
+        let extrabold = measure(EXTRABOLD);
+
+        assert!(
+            extrabold > bold + 0.5,
+            "ExtraBold is not wider than Bold ({extrabold}px vs {bold}px for {word:?}) \
+             -- the 800 face is probably not loading"
+        );
+    }
+
     #[test]
     fn quadrant_outlines_stay_inside_the_design_viewbox() {
         for outline in quadrant_outlines() {
@@ -905,6 +1371,51 @@ mod tests {
         assert_eq!(alpha(0, 31), 0);
         assert_eq!(alpha(31, 31), 0);
         assert_eq!(alpha(16, 14), 255);
+    }
+
+    /// Every shared edge in the mark must divide a dark quadrant from a
+    /// light one. Palette order (deep, blue, bright, soft) fails this: it
+    /// puts the two darkest values along the whole top edge, ~15 apart in
+    /// luminance, and the mark reads as three shapes instead of four.
+    #[test]
+    fn quadrant_tones_alternate_around_the_mark() {
+        // Rec. 709 relative luminance -- how light each fill actually reads,
+        // rather than how far apart the raw RGB triples happen to be.
+        fn luminance(c: Color32) -> f32 {
+            0.2126 * c.r() as f32 + 0.7152 * c.g() as f32 + 0.0722 * c.b() as f32
+        }
+
+        let [tl, tr, bl, br] = QUADRANT_FILLS.map(luminance);
+
+        // The four edges quadrants actually share: the mark is split by one
+        // vertical and one horizontal line, so corners touching only
+        // diagonally are not adjacent.
+        let adjacent = [
+            ("top edge", tl, tr),
+            ("bottom edge", bl, br),
+            ("left edge", tl, bl),
+            ("right edge", tr, br),
+        ];
+        for (edge, a, b) in adjacent {
+            let delta = (a - b).abs();
+            assert!(
+                delta > 40.0,
+                "the {edge} divides two quadrants only {delta:.1} apart in \
+                 luminance -- too close to read as separate shapes"
+            );
+        }
+
+        // ...and the near-matching pair must be diagonal, which is what
+        // makes the alternation possible at all.
+        let diagonals = [(tl - br).abs(), (tr - bl).abs()];
+        let closest_adjacent = adjacent
+            .iter()
+            .map(|(_, a, b)| (a - b).abs())
+            .fold(f32::INFINITY, f32::min);
+        assert!(
+            diagonals.iter().cloned().fold(f32::INFINITY, f32::min) < closest_adjacent,
+            "the two most similar quadrants are edge-adjacent, not diagonal"
+        );
     }
 
     #[test]

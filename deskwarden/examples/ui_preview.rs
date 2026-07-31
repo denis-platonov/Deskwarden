@@ -174,6 +174,9 @@ impl eframe::App for Preview {
                         hello,
                         &mut self.form,
                         &mut flow_bottom,
+                        // Never in flight here: this preview draws the
+                        // window's states, it does not run a real sign-in.
+                        false,
                     );
                     // Size to content, exactly as run_login_flow does, so
                     // the screenshot shows the window the app would show.

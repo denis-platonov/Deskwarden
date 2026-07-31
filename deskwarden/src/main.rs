@@ -354,6 +354,23 @@ fn main() {
     }
     let mut last_update_check = Instant::now();
 
+    // Prefetches the account email + server URL the vault window's toolbar
+    // needs (see `open_vault_window`), on its own thread: `bw status`
+    // regularly takes 1-3s to spawn on Windows, and `open_vault_window`
+    // used to call it inline in the tray-click handler, so every "Open
+    // Vault" -- including the very first one -- waited that long before the
+    // window even appeared. Polled non-blockingly below, same shape as
+    // `update_rx`; `open_vault_window` still falls back to a synchronous
+    // call itself if a click lands before this has reported back.
+    let mut cached_status_details: Option<login_ui::BwStatusDetails> = None;
+    let (status_details_tx, status_details_rx) = mpsc::channel::<login_ui::BwStatusDetails>();
+    {
+        let tx = status_details_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(login_ui::check_bw_status_details());
+        });
+    }
+
     // Outcome of a click-triggered update attempt. `Ok(())` means the
     // installer was downloaded, signature-verified, and launched, and this
     // process should now shut down for it; `Err` carries a message for the
@@ -469,6 +486,7 @@ fn main() {
                     &mut engine,
                     &config_dir,
                     &icon_cache_dir,
+                    &mut cached_status_details,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -566,6 +584,7 @@ fn main() {
                     &mut engine,
                     &config_dir,
                     &icon_cache_dir,
+                    &mut cached_status_details,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -720,6 +739,14 @@ fn main() {
                 }
             });
             last_update_check = Instant::now();
+        }
+
+        // Non-blocking: whenever the prefetch thread (or a fallback
+        // synchronous call inside `open_vault_window`) reports back, keep
+        // the cache warm so the next "Open Vault" doesn't pay the `bw
+        // status` spawn again.
+        if let Ok(details) = status_details_rx.try_recv() {
+            cached_status_details = Some(details);
         }
 
         if let Ok(release) = update_rx.try_recv() {
@@ -1042,13 +1069,23 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     engine: &mut MatchEngine,
     config_dir: &std::path::Path,
     icon_cache_dir: &std::path::Path,
+    // Warmed by a background thread at startup (see `main`'s
+    // `status_details_rx`) and reused across opens, so the common case pays
+    // no `bw status` spawn at all here. `None` only on a genuine cache miss
+    // (a click landing before the prefetch reports back, or right after the
+    // invalidation below) -- that path still falls back to the same
+    // synchronous call this function always made, just no longer on every
+    // single open.
+    cached_status_details: &mut Option<login_ui::BwStatusDetails>,
 ) {
-    // One call, not two: `vault_window::run` used to make its own separate
-    // `check_bw_status_details()` call just for `user_email`, meaning
-    // opening the vault window spawned the `bw` CLI (~1-3s on Windows) twice
-    // in a row with no UI feedback before the window appeared. Both fields
-    // come from this one struct, so one call covers both.
-    let status_details = login_ui::check_bw_status_details();
+    let status_details = match cached_status_details.take() {
+        Some(details) => details,
+        None => login_ui::check_bw_status_details(),
+    };
+    // Refill the cache with what this open just used -- a cheap clone in the
+    // common (already-cached) case, and what lets the *next* open skip the
+    // spawn too when this call itself was the one that had to fall back.
+    *cached_status_details = Some(status_details.clone());
     let result = vault_window::run(
         vault.clone(),
         fill_stats.clone(),
@@ -1066,6 +1103,10 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         log::info!("vault window locked itself; re-authenticating");
         bw_serve::stop_bw_serve(bw_serve_child);
         *session_token = reauthenticate(store);
+        // The account may have changed (a "Log out" followed by a different
+        // sign-in) -- drop the cached email/server so the *next* open
+        // re-fetches instead of showing a stale account in the toolbar.
+        *cached_status_details = None;
         *bw_serve_child = match try_start_backend(
             session_token,
             job,

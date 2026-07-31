@@ -156,7 +156,11 @@ fn item_row(
                 });
             });
         });
-    frame.response.interact(Sense::click()).clicked()
+    let response = frame.response.interact(Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
 }
 
 #[cfg(test)]

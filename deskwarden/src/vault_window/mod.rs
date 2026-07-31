@@ -7,6 +7,7 @@
 
 pub mod detail;
 pub mod detail_edit;
+pub mod folder_modal;
 pub mod item_list;
 pub mod sidebar;
 
@@ -18,7 +19,8 @@ use crate::theme;
 use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
 use detail::{draw_detail_read, DetailAction};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
-use eframe::egui::{self, Margin, Stroke};
+use eframe::egui::{self, Margin};
+use folder_modal::{draw_folder_edit_modal, FolderEditAction, FolderEditState};
 use item_list::{draw_item_list, IconCache, ItemListAction};
 use sidebar::{draw_sidebar, SidebarAction, SidebarFilter};
 use std::cell::RefCell;
@@ -26,7 +28,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
-const WINDOW_TITLE: &str = "Deskwarden Vault";
+const WINDOW_TITLE: &str = "Deskwarden";
 /// The window's initial/default size -- not a fixed size. Since the
 /// titlebar's maximize control was wired up (see this window's
 /// `NativeOptions.with_resizable(true)` and its `maximizable: true` chrome
@@ -146,11 +148,32 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // without needing a click.
     let mut auto_synced = false;
 
-    let mut items: Vec<VaultItem> = vault.list_items().unwrap_or_default();
-    let mut folders: Vec<Folder> = vault.list_folders().unwrap_or_default();
+    // The vault is loaded on a background thread, not here.
+    //
+    // These two calls used to run *before* `run_ui_native` below, so no
+    // window existed until both had finished -- and `list_items` pulls the
+    // entire vault in one response (measured: ~1.1s and 1.08 MB for 1657
+    // items on a cold `bw serve`, plus deserialising all of it into
+    // `VaultItem`s, which is slow in an unoptimised build). Every one of
+    // those seconds was spent with nothing on screen at all after the user
+    // clicked the tray. Starting empty and filling in when the data lands
+    // lets the window paint immediately; `vault_loading` drives a spinner
+    // until then.
+    let (vault_tx, vault_rx): (
+        mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>,
+        Receiver<(Vec<VaultItem>, Vec<Folder>)>,
+    ) = mpsc::channel();
+    // Cloned because the update closure below move-captures both, and needs
+    // its own pair to re-issue a load after each sync.
+    spawn_vault_load(vault.clone(), vault_tx.clone());
+    let mut items: Vec<VaultItem> = Vec::new();
+    let mut folders: Vec<Folder> = Vec::new();
+    // True until the background load above reports back.
+    let mut vault_loading = true;
     let mut filter = SidebarFilter::All;
     let mut search = String::new();
-    let mut selected_id: Option<String> = items.first().map(|i| i.id.clone());
+    // Nothing to select yet -- set from the first item once the load lands.
+    let mut selected_id: Option<String> = None;
     // Tracks the previous frame's `selected_id` so a change (from clicking a
     // different row in `draw_item_list`) can be detected and used to reset
     // the per-selection state below (`mode`, `reveal_password`, the TOTP
@@ -178,16 +201,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // single repaint while an item was selected.
     let mut fill_count: u32 = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
 
-    // Two-click "delete" confirmation state, shared in *pattern* (not
-    // storage -- each button owns its own slot so arming one doesn't
-    // disturb the other) by the sidebar's per-folder × button and the
-    // detail pane's item Delete button. `(id, armed_at)`: a second click on
-    // the same id, at least `MIN_CONFIRM_DWELL` but less than
-    // `DELETE_CONFIRM_WINDOW` after `armed_at`, confirms the delete;
-    // anything else (a different id, too fast, or the window elapsing) just
-    // (re)arms it. See `confirm_click`.
-    let mut folder_delete_pending: Option<(String, Instant)> = None;
+    // Two-click "delete" confirmation state for the detail pane's item
+    // Delete button. `(id, armed_at)`: a second click on the same id, at
+    // least `MIN_CONFIRM_DWELL` but less than `DELETE_CONFIRM_WINDOW` after
+    // `armed_at`, confirms the delete; anything else (a different id, too
+    // fast, or the window elapsing) just (re)arms it. See `confirm_click`.
+    // Folder delete used to have its own copy of this same pattern for the
+    // sidebar's inline × button; it now lives in the "Edit folder" modal
+    // (`folder_edit` below) instead, which already requires a deliberate
+    // open-the-editor step before Delete is even reachable.
     let mut item_delete_pending: Option<(String, Instant)> = None;
+    // The "Edit folder" modal's state, `Some` while open. Set from the
+    // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
+    // current name; cleared on Save/Delete success or Cancel/Esc.
+    let mut folder_edit: Option<FolderEditState> = None;
 
     let mut styled = false;
     let options = eframe::NativeOptions {
@@ -209,6 +236,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
             styled = true;
@@ -253,32 +281,50 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             }
         }
 
-        // Non-blocking, like the favicon drain above: the sync thread
-        // (spawned from the Sync button below) reports its outcome here, and
-        // this loop never waits on it. The fast local `bw serve` reads
-        // (`list_items`/`list_folders`) stay on the main thread -- only the
-        // slow remote-network `run_bw_sync` call itself was backgrounded.
-        if let Ok(result) = sync_rx.try_recv() {
-            sync_in_progress = false;
-            if result.is_ok() {
-                last_sync_at = Some(Instant::now());
-                items = vault.list_items().unwrap_or_default();
-                folders = vault.list_folders().unwrap_or_default();
-                // If the item that was selected before this sync no longer
-                // exists in the reloaded `items` (e.g. deleted on another
-                // device), drop the stale id. The detail pane already falls
-                // back to "Select an item." when `selected_id` doesn't
-                // resolve, but left alone `selected_id`/`last_selected_id`
-                // would keep pointing at the vanished item, leaving `mode`/
-                // `reveal_password`/`totp_code` stuck in whatever they were.
-                // Clearing it here makes `selected_id != last_selected_id`
-                // true on the next frame, so the existing per-selection
-                // reset block (below) takes care of the rest normally.
-                if let Some(id) = &selected_id {
+        // The initial vault load, arriving from the thread spawned before
+        // the window opened. Non-blocking like every other drain here, so
+        // the window stays responsive (draggable, closable) throughout.
+        // Also where a post-sync reload lands, so both paths share this
+        // handling rather than each keeping its own copy.
+        if let Ok((loaded_items, loaded_folders)) = vault_rx.try_recv() {
+            items = loaded_items;
+            folders = loaded_folders;
+            vault_loading = false;
+            match &selected_id {
+                // Nothing selected yet (the initial load): select the first
+                // item now that there is one. This makes `selected_id !=
+                // last_selected_id` true next frame, so the existing
+                // per-selection reset block recomputes `fill_count` and
+                // friends normally rather than needing its own copy here.
+                None => selected_id = items.first().map(|i| i.id.clone()),
+                // A reload where the selected item no longer exists (deleted
+                // on another device, say): drop the stale id. Left alone,
+                // `selected_id` would keep pointing at the vanished item and
+                // leave `mode`/`reveal_password`/`totp_code` stuck as they
+                // were; clearing it routes through that same reset block.
+                Some(id) => {
                     if !items.iter().any(|i| &i.id == id) {
                         selected_id = None;
                     }
                 }
+            }
+        }
+
+        // Non-blocking, like the favicon drain above: the sync thread
+        // (spawned from the Sync button below) reports its outcome here, and
+        // this loop never waits on it.
+        if let Ok(result) = sync_rx.try_recv() {
+            sync_in_progress = false;
+            if result.is_ok() {
+                last_sync_at = Some(Instant::now());
+                // Re-read on the same background path the initial load uses,
+                // rather than inline here. These are "fast local `bw serve`
+                // reads" only in relative terms -- `list_items` still pulls
+                // and parses the whole vault (~1.1s cold, 1.08 MB for 1657
+                // items), and doing that here froze the window for the
+                // duration every time a sync finished, which is exactly the
+                // stall the background load was introduced to remove.
+                spawn_vault_load(vault.clone(), vault_tx.clone());
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
             }
@@ -308,21 +354,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // sidebar's VAULT/FOLDERS rows.
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
-        match draw_window_chrome_with_extra(ui, "Deskwarden Vault", ChromeMetrics::VAULT, true, |ui| {
-            // Right-to-left: the CTRL+L chip nearest the window controls,
-            // then Lock immediately to its left (so the two read left-to-
-            // right as "Lock CTRL+L", per spec 4.8), then the avatar, then
-            // the Sync button and its status pill innermost.
-            theme::kbd_chip(ui, "CTRL+L", false);
-            // Design 2b's exact Lock sizing (28px tall, 8px radius) --
-            // `theme::secondary_button` is close but not exact (32px/7px),
-            // and changing its own hardcoded dimensions would affect every
-            // other caller, so this uses the dedicated `toolbar_button`
-            // helper instead, just for this one button.
-            if theme::toolbar_button(ui, "Lock").clicked() {
-                *locked_for_closure.borrow_mut() = true;
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+        match draw_window_chrome_with_extra(ui, WINDOW_TITLE, ChromeMetrics::VAULT, true, |ui| {
+            // Right-to-left, so this reads left-to-right (nearest the title,
+            // furthest from the window controls, first) as: Sync status
+            // pill, "Lock CTRL+L", avatar -- design 2b's exact order. Added
+            // here in the opposite order (avatar closest to the window
+            // controls, sync pill furthest) since `right_to_left` packs
+            // each new widget just to the left of the previous one.
             if let Some(email) = &account_email {
                 // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
                 // draws a rounded square (used elsewhere: item-list rows,
@@ -331,37 +369,42 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // changing that shared helper's shape for every caller.
                 draw_circle_avatar(ui, &theme::initials(email));
             }
+            // Design 2b's Lock control carries its own "CTRL+L" shortcut
+            // nested inside the same bordered pill, not as a separate
+            // floating `kbd_chip` beside it.
+            if theme::toolbar_button_with_shortcut(ui, "Lock", "CTRL+L").clicked() {
+                *locked_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             // Manual sync: this app has nowhere that auto-syncs on a timer
             // (see `main()`'s own single startup-time `bw sync` -- everything
             // after that only re-reads whatever's already local). A change
             // made on another device otherwise wouldn't show up here until
-            // the whole app restarts; this button is the escape hatch.
-            let sync_clicked = ui
-                .add_enabled_ui(!sync_in_progress, |ui| theme::secondary_button(ui, "Sync"))
-                .inner
-                .clicked();
-            if sync_clicked && !sync_in_progress {
+            // the whole app restarts, so the sync status readout itself is
+            // also the sync button -- clicking "● Synced 1 min ago" (design
+            // 4.8's pill) starts a fresh sync rather than needing a separate
+            // "Sync" button beside it. Blue for success (there's no
+            // dedicated "success" green in this app's palette -- see
+            // `theme.rs`'s module doc on "one blue hue... red reserved for
+            // actual errors" -- so blue is the existing color that reads as
+            // "good" here), the design's error red for failure, and a
+            // neutral ghost dot both while in flight and before the first
+            // sync has reported anything.
+            let (dot, label) = if sync_in_progress {
+                (theme::TEXT_GHOST, "Syncing…".to_string())
+            } else {
+                match &sync_status {
+                    Some(Ok(())) => {
+                        let ago = synced_ago_text(last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()));
+                        (theme::BLUE, format!("Synced {ago}"))
+                    }
+                    Some(Err(_)) => (theme::ERROR, "Sync failed".to_string()),
+                    None => (theme::TEXT_GHOST, "Sync".to_string()),
+                }
+            };
+            if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                 sync_in_progress = true;
                 spawn_vault_sync(sync_tx.clone(), session_token.clone());
-            }
-            // Spec 4.8's "sync pill" ("● Synced 1 min ago"): a colored dot
-            // plus text via `theme::status_pill`, not the bare label this
-            // used before. Blue for success (there's no dedicated "success"
-            // green in this app's palette -- see `theme.rs`'s module doc on
-            // "one blue hue... red reserved for actual errors" -- so blue is
-            // the existing color that reads as "good" here), the design's
-            // error red for failure, and a neutral ghost dot while in
-            // flight.
-            if sync_in_progress {
-                theme::status_pill(ui, theme::TEXT_GHOST, "Syncing…");
-            } else if let Some(status) = &sync_status {
-                match status {
-                    Ok(()) => {
-                        let ago = synced_ago_text(last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()));
-                        theme::status_pill(ui, theme::BLUE, &format!("Synced {ago}"));
-                    }
-                    Err(_) => theme::status_pill(ui, theme::ERROR, "Sync failed"),
-                }
             }
         }) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
@@ -392,56 +435,81 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             mode = DetailMode::Create(EditDraft::empty());
         }
 
-        // Auto-expire a stale armed folder delete before deciding what to
-        // show the sidebar this frame -- `is_armed` does this too on the
-        // click path, but the display needs it checked independently since
-        // it runs whether or not a click happened this frame.
-        if let Some((_, armed_at)) = folder_delete_pending {
-            if Instant::now() >= armed_at + DELETE_CONFIRM_WINDOW {
-                folder_delete_pending = None;
-            }
+        // Until the vault arrives, the whole body is one centred spinner --
+        // sidebar and item list included, rather than drawing the nav around
+        // an empty list. Half-drawn chrome would be showing real-looking
+        // structure filled with placeholder values (every sidebar count at
+        // 0, no items, nothing selectable), which reads as an empty vault
+        // rather than one still loading.
+        //
+        // Placed after the drains and the shortcut handling above, so
+        // `vault_loading` is already up to date for this frame and Ctrl+L
+        // still locks while loading; the titlebar is drawn either way, so
+        // the window stays draggable and closable throughout.
+        if vault_loading {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(theme::CANVAS))
+                .show(ui, |ui| {
+                    let available = ui.available_height();
+                    ui.vertical_centered(|ui| {
+                        // Roughly half the spinner-plus-label block, so the
+                        // pair sits centred rather than the spinner alone.
+                        ui.add_space((available / 2.0 - 30.0).max(0.0));
+                        ui.add(egui::Spinner::new().size(28.0).color(theme::BLUE));
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Loading your vault…")
+                                .size(13.0)
+                                .color(theme::TEXT_FAINT),
+                        );
+                    });
+                });
+            // Same fast cadence as the tail of this closure: drives the
+            // spinner's animation and how promptly the load is noticed.
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+            return;
         }
-        // Owned, not borrowed: an `&str` borrow of `folder_delete_pending`
-        // would still be held live inside the closure below, which also
-        // needs `&mut folder_delete_pending` for `confirm_click`.
-        let armed_folder_id: Option<String> = folder_delete_pending.as_ref().map(|(id, _)| id.clone());
 
+        // No `.stroke(...)` on this frame: `egui::Panel` already paints its
+        // own right-edge separator (`show_separator_line`, on by default) in
+        // the same `theme::HAIRLINE` color via the ambient
+        // `noninteractive.bg_stroke` style (see `theme::apply`). A full-box
+        // stroke here used to duplicate that on the right edge and, worse,
+        // duplicate the chrome bar's own bottom hairline on the *top* edge
+        // -- the two sat flush against each other and read as one doubled
+        // line right under the titlebar.
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
+            // Design 4.8: `padding: 14px 10px` -- top/bottom 14, left/right
+            // 10 (`Margin::symmetric`'s args are x=left/right, y=top/bottom,
+            // the opposite order CSS shorthand uses).
+            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
             .show(ui, |ui| {
-                match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown, armed_folder_id.as_deref()) {
+                match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown) {
                     SidebarAction::NewFolder => {
                         if let Ok(folder) = vault.create_folder("New folder") {
                             folders.push(folder);
                         }
                     }
-                    // A click on a folder's × button: `confirm_click` is
-                    // what actually decides whether this is the first
-                    // (arming) click or the confirming second one -- see
-                    // its doc comment. Only a confirming click reaches
-                    // `delete_folder`.
-                    SidebarAction::DeleteFolder(id) => {
-                        if confirm_click(&mut folder_delete_pending, &id) {
-                            if vault.delete_folder(&id).is_ok() {
-                                folders.retain(|f| f.id != id);
-                                if filter == SidebarFilter::Folder(id) {
-                                    filter = SidebarFilter::All;
-                                }
-                            } else {
-                                log::warn!("failed to delete folder {id}");
-                            }
+                    // Opens the "Edit folder" modal (drawn once, after all
+                    // three panels, further down) seeded with this folder's
+                    // current name. Rename and delete both happen there.
+                    SidebarAction::EditFolder(id) => {
+                        if let Some(folder) = folders.iter().find(|f| f.id == id) {
+                            folder_edit = Some(FolderEditState::new(folder.id.clone(), folder.name.clone()));
                         }
                     }
                     SidebarAction::None => {}
                 }
             });
 
+        // Same reasoning as `vault-sidebar` above: no own stroke, `Panel`'s
+        // built-in separator already draws the right-edge divider.
         egui::Panel::left("vault-item-list")
             .exact_size(LIST_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(14, 12)).stroke(Stroke::new(1.0, theme::HAIRLINE)))
+            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(14, 12)))
             .show(ui, |ui| {
                 match draw_item_list(ui, &items, &filter, &mut search, &mut selected_id, &icons, &mut visible_ids) {
                     ItemListAction::NewItem => mode = DetailMode::Create(EditDraft::empty()),
@@ -690,6 +758,50 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 }
             });
 
+        // Drawn last so it's the newest thing on the `Foreground` layer, on
+        // top of the three panels above regardless of their own draw order
+        // -- `egui::Area`'s layering is independent of when in the frame
+        // it's shown, but keeping this after everything else is the
+        // simplest way to read "this can cover the whole window".
+        if let Some(state) = &mut folder_edit {
+            match draw_folder_edit_modal(ui.ctx(), state) {
+                // Both arms report failure into the modal as well as the
+                // log. Logging alone left the modal open and unchanged on
+                // failure, which from the outside is indistinguishable from
+                // the click never having registered.
+                FolderEditAction::Save => match vault.update_folder(&state.folder_id, &state.name) {
+                    Ok(updated) => {
+                        if let Some(f) = folders.iter_mut().find(|f| f.id == updated.id) {
+                            f.name = updated.name;
+                        }
+                        folder_edit = None;
+                    }
+                    Err(e) => {
+                        log::warn!("failed to rename folder {}: {e:?}", state.folder_id);
+                        state.error = Some("Could not rename this folder.".to_string());
+                    }
+                },
+                FolderEditAction::Delete => match vault.delete_folder(&state.folder_id) {
+                    Ok(()) => {
+                        let deleted_id = state.folder_id.clone();
+                        folders.retain(|f| f.id != deleted_id);
+                        if filter == SidebarFilter::Folder(deleted_id.clone()) {
+                            filter = SidebarFilter::All;
+                        }
+                        folder_edit = None;
+                    }
+                    Err(e) => {
+                        log::warn!("failed to delete folder {}: {e:?}", state.folder_id);
+                        state.error = Some("Could not delete this folder.".to_string());
+                    }
+                },
+                FolderEditAction::Cancel => folder_edit = None,
+                FolderEditAction::None => {}
+            }
+        }
+
+        // Only reached once loaded -- the loading branch above returns with
+        // its own, much faster, cadence.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     });
 
@@ -704,6 +816,24 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 /// place instead of being duplicated between them; the caller is still
 /// responsible for setting `sync_in_progress` before calling this, same as
 /// before this was extracted.
+/// Reads the whole vault (items + folders) on a one-shot background thread
+/// and reports it over `tx`.
+///
+/// Every vault read in this window goes through here rather than being
+/// called inline. `list_items` returns the entire vault in one response —
+/// measured at ~1.1s and 1.08 MB for 1657 items against a cold `bw serve`,
+/// before the cost of deserialising all of it — so on the UI thread it is
+/// long enough to stall the window outright. A failed read yields an empty
+/// vault rather than propagating: the window is already open by then, and
+/// the next sync re-issues a load anyway.
+fn spawn_vault_load(vault: VaultBridge, tx: mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>) {
+    std::thread::spawn(move || {
+        let items = vault.list_items().unwrap_or_default();
+        let folders = vault.list_folders().unwrap_or_default();
+        let _ = tx.send((items, folders));
+    });
+}
+
 fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String) {
     std::thread::spawn(move || {
         let _ = tx.send(bw_serve::run_bw_sync(&session_token));

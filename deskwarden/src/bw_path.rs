@@ -24,7 +24,11 @@ use std::sync::OnceLock;
 /// a console-subsystem program; spawned plainly from this GUI-subsystem app
 /// (deskwarden has no console of its own to inherit), Windows briefly flashes
 /// a new one into existence for it on every single call otherwise.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Public because anything that re-sets a spawned command's creation flags
+/// has to OR this back in: `Command::creation_flags` *replaces* the value
+/// it holds, so a later call silently drops this one (see
+/// `job_object::spawn_in_job`).
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// The one `bw.exe` this process has verified, populated by `main`'s startup
 /// check (see [`remember_verified_bw_exe`]).

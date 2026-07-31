@@ -1,7 +1,7 @@
 use crate::bw_path::bw_command;
 use crate::hello::{self, HelloState};
 use crate::theme;
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
 use std::cell::RefCell;
 use std::rc::Rc;
 use zeroize::Zeroize;
@@ -209,6 +209,117 @@ fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Turns the Bitwarden CLI's raw stderr from a failed `bw login`/`bw unlock`
+/// into one line a person can act on.
+///
+/// A mistyped master password makes the CLI print four framework-level log
+/// lines, led by `ERROR bitwarden_crypto::keys::master_key: error=The
+/// decryption operation failed` — alarming, and useless to someone who
+/// simply typed the wrong thing. The raw text still reaches the log at the
+/// call site; this is only what the window shows.
+///
+/// Unrecognised failures fall back to the CLI's own wording with the
+/// `ERROR <module>: error=` scaffolding stripped, rather than a blanket
+/// "something went wrong": an unfamiliar but real message is far easier to
+/// act on — or report — than none at all.
+/// The inline error for a submit that can't succeed because a required
+/// field is blank, or `None` when there's something to send.
+///
+/// Checked before the CLI is spawned rather than after. `bw` receives the
+/// master password through an environment variable (`--passwordenv`, so it
+/// never appears in the process list), and on Windows setting a variable to
+/// an empty string is indistinguishable from not setting it at all — so an
+/// empty field produced a spawned CLI answering "Provided passwordenv
+/// DESKWARDEN_BW_PASSWORD is not set", which describes our own plumbing
+/// rather than telling the user they left a box blank.
+///
+/// The email is only required when signing in; unlocking an existing
+/// account already knows whose vault it is.
+pub fn missing_credential_message(
+    status: BwStatus,
+    email: &str,
+    password: &str,
+) -> Option<&'static str> {
+    if status == BwStatus::Unauthenticated && email.trim().is_empty() {
+        Some("Enter your email address first.")
+    } else if password.is_empty() {
+        Some("Enter your master password first.")
+    } else {
+        None
+    }
+}
+
+pub fn friendly_auth_error(stderr: &str) -> String {
+    let haystack = stderr.to_ascii_lowercase();
+    let mentions = |needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
+
+    // Unlock against a bad password fails inside the crypto layer (the vault
+    // key simply won't decrypt), which is why this reads as a cryptography
+    // fault rather than an authentication one.
+    if mentions(&[
+        "decryption operation failed",
+        "invalid master password",
+        "cryptography error",
+    ]) {
+        return "That master password didn't work. Check it and try again.".to_string();
+    }
+    // Sign-in, by contrast, is rejected by the server, and either field
+    // could be the wrong one.
+    if mentions(&[
+        "username or password is incorrect",
+        "invalid username or password",
+    ]) {
+        return "That email or master password didn't work. Check them and try again."
+            .to_string();
+    }
+    if mentions(&["two-step", "two step", "two-factor", "twofactor"]) {
+        return "This account uses two-step login, which Deskwarden can't prompt for. \
+                Run `bw login` in a terminal once to complete it, then come back."
+            .to_string();
+    }
+    if mentions(&["too many", "rate limit", "traffic from your network"]) {
+        return "Too many failed attempts. Wait a few minutes, then try again.".to_string();
+    }
+    if mentions(&[
+        "econnrefused",
+        "enotfound",
+        "etimedout",
+        "getaddrinfo",
+        "failed to fetch",
+    ]) {
+        return "Couldn't reach the server. Check your connection — and the server URL, \
+                if this is a self-hosted account."
+            .to_string();
+    }
+
+    strip_cli_log_scaffolding(stderr)
+}
+
+/// The most human line the CLI printed, with its log framing removed. Used
+/// only for failures [`friendly_auth_error`] has no specific wording for.
+fn strip_cli_log_scaffolding(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // The CLI prints its own plain summary alongside the `ERROR <module>:`
+    // lines; that summary is the most readable thing available, so prefer it.
+    if let Some(summary) = lines.iter().find(|line| !line.starts_with("ERROR ")) {
+        return (*summary).to_string();
+    }
+    // Otherwise unwrap the first framework line: everything after `error=`
+    // is the real message.
+    if let Some(first) = lines.first() {
+        return match first.split_once("error=") {
+            Some((_, message)) => message.to_string(),
+            None => (*first).to_string(),
+        };
+    }
+    "Could not unlock the vault. The log has the details.".to_string()
+}
+
 /// Which server the sign-in talks to — the native client's bottom-of-page
 /// "Logging in on" dropdown. Selection matters *before* `bw login`, because
 /// the CLI's server is global config (`bw config server`).
@@ -263,6 +374,18 @@ const LABEL_GAP: f32 = 7.0;
 /// between two of them.
 const GROUP_GAP: f32 = 22.0;
 
+/// Diameter of the in-flight spinner beside Continue.
+///
+/// Deliberately *not* [`theme::BUTTON_HEIGHT`]. egui allocates a `Spinner`
+/// as a square and draws a ring of `size / 2 - 2` radius inside it, so
+/// matching the button's 32px box gave a 28px ring — the same size as the
+/// button by measurement, but visibly heavier beside it, because what the
+/// eye weighs the button by is its 13px label rather than its bounding box.
+/// Sized against the label instead; `ui.horizontal`'s `Align::Center` keeps
+/// it centred on the taller button, and the row's height is still the
+/// button's, so nothing reflows when it appears.
+const AUTH_SPINNER_SIZE: f32 = 20.0;
+
 /// What the custom titlebar asked for this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChromeAction {
@@ -305,7 +428,9 @@ impl ChromeMetrics {
     };
 
     /// Design 2b (vault window): 46px bar, 16px left padding, 22×22 mark,
-    /// 14px Bold title. The design's title `<div>` carries no explicit
+    /// 14px ExtraBold title (the design's `font-weight: 800`, same wordmark
+    /// treatment as the login window's larger one). The design's title
+    /// `<div>` carries no explicit
     /// `color`, unlike the login window's (`#444141`/`TEXT_SECONDARY`) --
     /// it inherits the page's default body text color (`#201e1d`/`INK`,
     /// set on `html, body` in `Deskwarden.dc.html`), so that's what this
@@ -316,7 +441,7 @@ impl ChromeMetrics {
         left_padding: 16.0,
         mark_size: Vec2::new(22.0, 22.0),
         title_font_size: 14.0,
-        title_family: theme::BOLD,
+        title_family: theme::EXTRABOLD,
         title_color: theme::INK,
         control_width: 42.0,
     };
@@ -448,6 +573,7 @@ pub fn draw_window_chrome_with_extra(
     if close.hovered() {
         ui.painter()
             .rect_filled(close_rect, CornerRadius::ZERO, theme::CANVAS);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let c = close_rect.center();
     ui.painter().line_segment(
@@ -478,6 +604,7 @@ pub fn draw_window_chrome_with_extra(
         if maximize.hovered() {
             ui.painter()
                 .rect_filled(max_rect, CornerRadius::ZERO, theme::CANVAS);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         ui.painter().rect_stroke(
             egui::Rect::from_center_size(max_rect.center(), egui::Vec2::splat(9.0)),
@@ -506,6 +633,7 @@ pub fn draw_window_chrome_with_extra(
     if minimize.hovered() {
         ui.painter()
             .rect_filled(min_rect, CornerRadius::ZERO, theme::CANVAS);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let m = min_rect.center();
     ui.painter().line_segment(
@@ -606,26 +734,14 @@ pub fn draw_login_window(
     hello: HelloState,
     form: &mut LoginForm,
     flow_bottom: &mut f32,
+    // True from the moment credentials are handed to the `bw` CLI until it
+    // answers. Disables every control that could start a second sign-in and
+    // shows the spinner beside Continue.
+    auth_in_progress: bool,
 ) -> Option<LoginAction> {
     let mut action = None;
 
-    // Brand lockup (3h: 38×44 mark, 25px wordmark, 10px tag).
-    ui.horizontal(|ui| {
-        theme::mark(ui, 44.0);
-        ui.add_space(2.0);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(theme::bold("Deskwarden", 25.0).color(theme::INK));
-            // The design tracks the tag wide (0.15em at 10px = 1.5pt).
-            ui.label(theme::letterspaced(
-                "FILLS NATIVE WINDOWS",
-                10.0,
-                theme::SEMIBOLD,
-                1.5,
-                theme::TEXT_FAINT,
-            ));
-        });
-    });
+    draw_brand_lockup(ui);
 
     ui.add_space(14.0);
 
@@ -687,9 +803,29 @@ pub fn draw_login_window(
             theme::password_field(ui, &mut form.password, &mut form.reveal_password);
             ui.add_space(GROUP_GAP);
 
-            if theme::primary_button(ui, "Continue", Some("↵")).clicked() {
-                action = Some(LoginAction::Submit);
-            }
+            // While the credentials are with the server, Continue is
+            // disabled and a spinner sits beside it, sized to the button so
+            // the two read as one control. Disabling matters beyond looks:
+            // a second submit would spawn another `bw login` against the
+            // same account while the first is still running.
+            ui.horizontal(|ui| {
+                let continue_button = ui
+                    .add_enabled_ui(!auth_in_progress, |ui| {
+                        theme::primary_button(ui, "Continue", Some("↵"))
+                    })
+                    .inner;
+                if continue_button.clicked() {
+                    action = Some(LoginAction::Submit);
+                }
+                if auth_in_progress {
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::Spinner::new()
+                            .size(AUTH_SPINNER_SIZE)
+                            .color(theme::BLUE),
+                    );
+                }
+            });
         });
 
     if let Some(err) = &form.error {
@@ -724,8 +860,12 @@ pub fn draw_login_window(
         } else {
             "Face, fingerprint, or PIN"
         };
-        let clicked = hello_panel(ui, subtitle)
-            || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
+        // Gated like Continue and Enter: this is the third way to start a
+        // sign-in, and it must not fire a second one over an in-flight
+        // first.
+        let clicked = !auth_in_progress
+            && (hello_panel(ui, subtitle)
+                || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)));
         if clicked {
             if !needs_setup {
                 action = Some(LoginAction::HelloUnlock);
@@ -743,8 +883,10 @@ pub fn draw_login_window(
     }
 
     // Enter submits from anywhere in the form, same as clicking Continue --
-    // 3h's Continue carries the ↵ affordance.
-    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+    // 3h's Continue carries the ↵ affordance. Gated on `auth_in_progress`
+    // for the same reason the button itself is: Enter is the *easier* way
+    // to fire a second login while the first is still in flight.
+    if !auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
     }
 
@@ -809,6 +951,107 @@ pub fn draw_login_window(
     action
 }
 
+// --- Brand lockup (design 3h) -----------------------------------------------
+//
+// `display: flex; align-items: center; gap: 13px` of a 38×44 mark box and a
+// two-line text column (`gap: 2px`): the 25px/800 wordmark over the 10px/700
+// tracked tag.
+
+/// The mark's box in the lockup. The design sizes it 38×44, *not* square —
+/// which is what the mark's own 24:28 artboard scales to at 44 tall. Passing
+/// `theme::mark` a single 44 (as this used to) allocates 44×44 and leaves
+/// ~6px of dead space around a mark drawn at the same visual size, pushing
+/// the wordmark right and widening the whole lockup.
+const LOCKUP_MARK_SIZE: Vec2 = Vec2::new(38.0, 44.0);
+/// Design: `gap: 13px` between the mark box and the text column.
+const LOCKUP_GAP_X: f32 = 13.0;
+/// Design: `gap: 2px` between the wordmark and the tag under it.
+const LOCKUP_GAP_Y: f32 = 2.0;
+/// The wordmark's line box. The design sets `font-size: 25px` with
+/// `line-height: 1`, so its box is exactly the font size — whereas the
+/// galley egui lays out is the font's natural ascent + descent, which
+/// measures 27px for Archivo ExtraBold at this size. Using the galley's own
+/// height dropped the tag 2px below where the design puts it and made the
+/// whole lockup read taller.
+const LOCKUP_WORDMARK_LINE_BOX: f32 = 25.0;
+
+/// Draws the brand lockup by painting into one explicitly-allocated band
+/// rather than nesting a `horizontal` around a `vertical` around two
+/// labels.
+///
+/// Layout containers were giving away control of exactly the things the
+/// design pins down here: an `egui` label's box is the font's full ascent +
+/// descent, whereas the design sets `line-height: 1` on the wordmark, so the
+/// text column came out taller than 25 + 2 + tag and centred differently
+/// against the mark. Painting positions both runs directly, so the gaps and
+/// the vertical centring are the design's numbers rather than a byproduct of
+/// font metrics.
+fn draw_brand_lockup(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), LOCKUP_MARK_SIZE.y),
+        Sense::hover(),
+    );
+
+    // Shift the whole lockup left by the shield's own artboard padding, so
+    // what lines up with the window's content edge is the shield's *visible*
+    // edge rather than its invisible 24×28 artboard. Every heading and card
+    // below starts at that edge, and against them a mathematically-flush
+    // artboard reads as an indented logo (the padding measures 3.3px here).
+    // Shifting the whole lockup keeps the design's mark-to-text gap intact.
+    let nominal = egui::Rect::from_min_size(rect.min, LOCKUP_MARK_SIZE);
+    let artboard_inset = theme::mark_ink_rect(nominal).left() - nominal.left();
+    let mark_rect = nominal.translate(Vec2::new(-artboard_inset, 0.0));
+    theme::paint_mark(ui.painter(), mark_rect);
+
+    // The design tracks the wordmark tight (-0.03em at 25px = -0.75pt) and
+    // sets it in weight 800 (`theme::EXTRABOLD`); the tag is tracked wide
+    // (0.15em at 10px = 1.5pt) in weight 700 — Bold, not SemiBold, which is
+    // what this drew before.
+    let wordmark = ui.painter().layout_job(theme::letterspaced(
+        "Deskwarden",
+        25.0,
+        theme::EXTRABOLD,
+        -0.75,
+        theme::INK,
+    ));
+    let tag = ui.painter().layout_job(theme::letterspaced(
+        "FILLS NATIVE WINDOWS",
+        10.0,
+        theme::BOLD,
+        1.5,
+        theme::TEXT_FAINT,
+    ));
+
+    let column_x = mark_rect.right() + LOCKUP_GAP_X;
+    let column_height = LOCKUP_WORDMARK_LINE_BOX + LOCKUP_GAP_Y + tag.size().y;
+    let column_top = rect.center().y - column_height / 2.0;
+
+    // Positioned by ink, not by galley origin: the two runs are different
+    // sizes, so their glyphs' left side bearings differ (1.0px vs 0.0px
+    // here) and painting both at `column_x` leaves the tag visibly hanging
+    // a pixel further left than the wordmark above it.
+    let wordmark_height = wordmark.size().y;
+    let wordmark_x = column_x - theme::ink_offset_x(&wordmark);
+    let tag_x = column_x - theme::ink_offset_x(&tag);
+
+    ui.painter().galley(
+        Pos2::new(
+            wordmark_x,
+            // Centre the glyphs in the design's 25px line box; since the
+            // galley is taller than that box, this lifts it slightly, which
+            // is exactly what `line-height: 1` does in the design.
+            column_top + (LOCKUP_WORDMARK_LINE_BOX - wordmark_height) / 2.0,
+        ),
+        wordmark,
+        theme::INK,
+    );
+    ui.painter().galley(
+        Pos2::new(tag_x, column_top + LOCKUP_WORDMARK_LINE_BOX + LOCKUP_GAP_Y),
+        tag,
+        theme::TEXT_FAINT,
+    );
+}
+
 /// A fixed-width horizontal hairline, for the "or" divider.
 fn hairline_segment(ui: &mut egui::Ui, width: f32) {
     let (rect, _) =
@@ -849,17 +1092,7 @@ fn hello_panel(ui: &mut egui::Ui, subtitle: &str) -> bool {
                     ui.label(RichText::new(subtitle).size(11.0).color(theme::TEXT_MUTED));
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let chip = RichText::new("CTRL+H")
-                        .size(10.0)
-                        .family(egui::FontFamily::Monospace)
-                        .color(theme::BLUE);
-                    egui::Frame::new()
-                        .fill(theme::CARD)
-                        .corner_radius(CornerRadius::same(5))
-                        .inner_margin(Margin::symmetric(7, 3))
-                        .show(ui, |ui| {
-                            ui.label(chip);
-                        });
+                    theme::kbd_chip_on_card(ui, "CTRL+H");
                 });
             });
         });
@@ -888,6 +1121,41 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
         rect.max,
     );
     painter.rect_filled(body, CornerRadius::same(2), color);
+}
+
+/// Runs a `bw login`/`bw unlock` on a one-shot background thread and reports
+/// the result over `tx`.
+///
+/// This used to run inline in the update closure, which froze the login
+/// window for the whole of a CLI spawn plus a network round trip — several
+/// seconds with no repaint, so not even a spinner could animate. `password`
+/// is moved in and zeroized here once the CLI and any Hello enrollment are
+/// done with it, so the worker does not leave a live copy behind either.
+///
+/// Enrollment runs here, on success only, *before* that wipe: the password
+/// sealed for Windows Hello has to be one that provably opened the vault. A
+/// failed enrollment is logged rather than surfaced — the unlock itself
+/// succeeded and the window is about to close.
+fn spawn_auth(
+    tx: std::sync::mpsc::Sender<Result<String, String>>,
+    args: Vec<String>,
+    mut password: String,
+    enroll_hello: bool,
+) {
+    std::thread::spawn(move || {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let result = run_bw_with_password(&arg_refs, &password);
+
+        if result.is_ok() && enroll_hello {
+            match hello::enroll(&password) {
+                Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
+                Err(e) => log::warn!("could not enroll Windows Hello quick unlock: {e}"),
+            }
+        }
+        password.zeroize();
+
+        let _ = tx.send(result);
+    });
 }
 
 /// Opens a blocking egui window that shows a server-choice + email field
@@ -929,6 +1197,13 @@ pub fn run_login_flow() -> String {
     // error text), so any fixed height either clips or leaves a gap.
     let mut window_height = 0.0f32;
 
+    // Outcome of an in-flight `bw login`/`bw unlock` (see `spawn_auth`),
+    // polled non-blockingly each frame. `auth_in_progress` gates every
+    // control that could start a second one and drives the spinner beside
+    // Continue.
+    let (auth_tx, auth_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let mut auth_in_progress = false;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             // Starting size only; grown/shrunk to fit below.
@@ -956,6 +1231,7 @@ pub fn run_login_flow() -> String {
             // text in this same frame would look up a family that doesn't
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
+            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners("Log in to Deskwarden");
             styled = true;
@@ -982,6 +1258,27 @@ pub fn run_login_flow() -> String {
             })
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+
+                // Non-blocking: the worker reports here and the window keeps
+                // painting (and animating its spinner) until it does.
+                if let Ok(result) = auth_rx.try_recv() {
+                    auth_in_progress = false;
+                    match result {
+                        Ok(session_token) => {
+                            *token_for_closure.borrow_mut() = Some(session_token);
+                            form.error = None;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(e) => {
+                            // Raw CLI output to the log (it's the only
+                            // diagnostic channel this console-less binary
+                            // has), one actionable line to the window.
+                            log::warn!("bw login/unlock failed: {e}");
+                            form.error = Some(friendly_auth_error(&e));
+                        }
+                    }
+                }
+
                 let mut flow_bottom = 0.0f32;
                 let action = draw_login_window(
                     ui,
@@ -991,6 +1288,7 @@ pub fn run_login_flow() -> String {
                     hello_state,
                     &mut form,
                     &mut flow_bottom,
+                    auth_in_progress,
                 );
 
                 // Content height + the footer row and the bottom margin the
@@ -1005,16 +1303,28 @@ pub fn run_login_flow() -> String {
                         )));
                 }
 
-                let mut done = false;
-
                 match action {
                     Some(LoginAction::Submit) => {
+                        // Blank fields are caught here, before anything is
+                        // spawned -- see `missing_credential_message`. This
+                        // is deliberately ahead of the server config below,
+                        // which also shells out to `bw`: there is no point
+                        // configuring a server for a submit that cannot go
+                        // anywhere.
+                        let missing = missing_credential_message(
+                            status,
+                            &form.email,
+                            &form.password,
+                        );
+
                         // The server must be configured before `bw login` --
                         // it's global CLI config. A bad or missing
                         // self-hosted URL is inline UI error, not a panic:
                         // bail out of this submit and let the user correct
                         // it.
-                        let server_configured = if status == BwStatus::Unauthenticated {
+                        let server_configured = if missing.is_some() {
+                            false
+                        } else if status == BwStatus::Unauthenticated {
                             let target = match form.server_choice {
                                 ServerChoice::SelfHosted => {
                                     let url = form.server_url.trim().to_string();
@@ -1043,70 +1353,56 @@ pub fn run_login_flow() -> String {
                             true
                         };
 
-                        if server_configured {
-                            let result = match status {
-                                BwStatus::Unauthenticated => run_bw_with_password(
-                                    &["login", &form.email, "--raw"],
-                                    &form.password,
-                                ),
+                        if let Some(message) = missing {
+                            form.error = Some(message.to_string());
+                        } else if server_configured {
+                            let args = match status {
+                                BwStatus::Unauthenticated => {
+                                    vec!["login".to_string(), form.email.clone(), "--raw".to_string()]
+                                }
                                 BwStatus::Locked | BwStatus::Unlocked => {
-                                    run_bw_with_password(&["unlock", "--raw"], &form.password)
+                                    vec!["unlock".to_string(), "--raw".to_string()]
                                 }
                             };
-
-                            // Enrollment happens only on success and only
-                            // before the wipe below: the password being
-                            // sealed for Windows Hello is the one that just
-                            // provably opened the vault. A failed enrollment
-                            // is logged, not surfaced -- the unlock itself
-                            // succeeded and the window is about to close.
-                            if result.is_ok()
-                                && form.enable_hello
+                            let enroll_hello = form.enable_hello
                                 && hello_state.available
-                                && !hello_state.enrolled
-                            {
-                                match hello::enroll(&form.password) {
-                                    Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
-                                    Err(e) => log::warn!(
-                                        "could not enroll Windows Hello quick unlock: {e}"
-                                    ),
-                                }
-                            }
+                                && !hello_state.enrolled;
 
-                            // The master password has served its purpose
-                            // either way: wipe the buffer instead of leaving
-                            // it live in memory for the rest of the process's
-                            // lifetime. On failure this also clears the
-                            // field, which the user has to retype anyway.
+                            // Handed to the worker, then wiped from the form
+                            // immediately -- the buffer has served its
+                            // purpose here either way, and not leaving a
+                            // second live copy sitting in the widget while
+                            // the CLI runs is strictly better. On failure
+                            // this also clears the field, which the user has
+                            // to retype anyway.
+                            spawn_auth(auth_tx.clone(), args, form.password.clone(), enroll_hello);
                             form.password.zeroize();
-
-                            match result {
-                                Ok(session_token) => {
-                                    *token_for_closure.borrow_mut() = Some(session_token);
-                                    form.error = None;
-                                    done = true;
-                                }
-                                Err(e) => {
-                                    log::warn!("bw login/unlock failed: {e}");
-                                    form.error = Some(e);
-                                }
-                            }
+                            form.error = None;
+                            auth_in_progress = true;
                         }
                     }
                     Some(LoginAction::HelloUnlock) => {
+                        // The biometric prompt itself stays on this thread:
+                        // it puts system UI on screen and returns as soon as
+                        // the user responds. Only the `bw unlock` that
+                        // follows -- a CLI spawn plus a network round trip --
+                        // moves to the worker, which is the part that was
+                        // freezing the window.
                         match hello::unlock_password() {
                             Ok(password) => {
-                                match run_bw_with_password(&["unlock", "--raw"], &password) {
-                                    Ok(session_token) => {
-                                        *token_for_closure.borrow_mut() = Some(session_token);
-                                        form.error = None;
-                                        done = true;
-                                    }
-                                    Err(e) => {
-                                        log::warn!("bw unlock via Windows Hello failed: {e}");
-                                        form.error = Some(e);
-                                    }
-                                }
+                                spawn_auth(
+                                    auth_tx.clone(),
+                                    vec!["unlock".to_string(), "--raw".to_string()],
+                                    // Clone the inner `String` out of the
+                                    // `Zeroizing` wrapper: that wrapper still
+                                    // wipes its own copy when it drops at the
+                                    // end of this arm, and `spawn_auth` wipes
+                                    // the worker's.
+                                    (*password).clone(),
+                                    false,
+                                );
+                                form.error = None;
+                                auth_in_progress = true;
                             }
                             Err(e) => {
                                 log::warn!("Windows Hello quick unlock failed: {e}");
@@ -1137,10 +1433,6 @@ pub fn run_login_flow() -> String {
                         }
                     },
                     None => {}
-                }
-
-                if done {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
     });
@@ -1223,6 +1515,79 @@ mod tests {
         assert_eq!(details.server_url, None);
     }
 
+    /// The exact stderr a wrong master password produced, verbatim. Four
+    /// lines of crypto-internals is what the login window used to show.
+    const WRONG_PASSWORD_STDERR: &str = "\
+ERROR bitwarden_crypto::keys::master_key: error=The decryption operation failed
+ERROR bitwarden_core::client::internal: error=Cryptography error, The decryption operation failed
+ERROR bitwarden_core::key_management::crypto: error=Cryptography error, The decryption operation failed
+Cryptography error, The decryption operation failed";
+
+    #[test]
+    fn a_wrong_master_password_reads_as_a_wrong_master_password() {
+        let shown = friendly_auth_error(WRONG_PASSWORD_STDERR);
+        assert_eq!(
+            shown,
+            "That master password didn't work. Check it and try again."
+        );
+        // Whatever else changes, none of the CLI's internals may reach the
+        // window: those are for the log.
+        assert!(!shown.contains("bitwarden_crypto"), "got: {shown}");
+        assert!(!shown.contains("decryption"), "got: {shown}");
+        assert!(!shown.contains('\n'), "got a multi-line message: {shown}");
+    }
+
+    #[test]
+    fn a_rejected_sign_in_names_both_fields_it_could_be() {
+        let shown =
+            friendly_auth_error("Username or password is incorrect. Try again.");
+        assert_eq!(
+            shown,
+            "That email or master password didn't work. Check them and try again."
+        );
+    }
+
+    #[test]
+    fn two_step_login_says_what_to_actually_do_about_it() {
+        let shown = friendly_auth_error("Two-step login is required for this account.");
+        assert!(shown.contains("bw login"), "got: {shown}");
+    }
+
+    #[test]
+    fn an_unreachable_server_is_not_reported_as_a_bad_password() {
+        let shown = friendly_auth_error("request to https://vault.example.eu failed, \
+                                         reason: getaddrinfo ENOTFOUND vault.example.eu");
+        assert!(shown.starts_with("Couldn't reach the server"), "got: {shown}");
+    }
+
+    #[test]
+    fn an_unrecognised_failure_keeps_the_clis_own_wording() {
+        // Falling back to something generic would strand whoever hits a
+        // failure mode this function has no case for. The CLI's own plain
+        // summary line survives; only the `ERROR <module>:` framing goes.
+        let shown = friendly_auth_error(
+            "ERROR bitwarden_core::something: error=Vault is in an unexpected state\n\
+             Vault is in an unexpected state",
+        );
+        assert_eq!(shown, "Vault is in an unexpected state");
+    }
+
+    #[test]
+    fn a_framework_only_failure_still_yields_its_message() {
+        // No plain summary line this time -- the `error=` payload is all
+        // there is, so it gets unwrapped rather than shown with its framing.
+        let shown = friendly_auth_error(
+            "ERROR bitwarden_core::something: error=Vault is in an unexpected state",
+        );
+        assert_eq!(shown, "Vault is in an unexpected state");
+    }
+
+    #[test]
+    fn a_silent_failure_still_says_something() {
+        assert!(!friendly_auth_error("").is_empty());
+        assert!(!friendly_auth_error("   \n  \n").is_empty());
+    }
+
     #[test]
     fn server_host_strips_scheme_and_path() {
         assert_eq!(
@@ -1239,5 +1604,59 @@ mod tests {
     fn server_host_defaults_to_the_bitwarden_cloud() {
         assert_eq!(server_host(None), "bitwarden.com");
         assert_eq!(server_host(Some("")), "bitwarden.com");
+    }
+
+    // -- Blank fields must never reach the CLI ------------------------------
+    //
+    // An empty password used to be handed to `bw` anyway, and because
+    // Windows treats an environment variable set to "" as unset, the CLI
+    // answered "Provided passwordenv DESKWARDEN_BW_PASSWORD is not set" --
+    // our own plumbing leaking into the window instead of "you left the box
+    // blank".
+
+    #[test]
+    fn an_empty_password_is_caught_before_the_cli_is_spawned() {
+        for status in [
+            BwStatus::Unauthenticated,
+            BwStatus::Locked,
+            BwStatus::Unlocked,
+        ] {
+            assert_eq!(
+                missing_credential_message(status, "a@b.c", ""),
+                Some("Enter your master password first."),
+                "{status:?} let an empty password through"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_email_is_caught_only_when_signing_in() {
+        // Signing in needs one...
+        assert_eq!(
+            missing_credential_message(BwStatus::Unauthenticated, "   ", "pw"),
+            Some("Enter your email address first.")
+        );
+        // ...whereas unlocking already knows whose vault this is, so a blank
+        // email is irrelevant and must not block the unlock.
+        assert_eq!(
+            missing_credential_message(BwStatus::Locked, "", "pw"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_filled_in_form_reports_nothing_missing() {
+        assert_eq!(
+            missing_credential_message(BwStatus::Unauthenticated, "a@b.c", "pw"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_password_is_still_submitted() {
+        // Spaces are legal in a master password, so unlike the email this is
+        // deliberately not trimmed -- rejecting it would lock out anyone
+        // whose password legitimately starts or ends with one.
+        assert_eq!(missing_credential_message(BwStatus::Locked, "", " "), None);
     }
 }

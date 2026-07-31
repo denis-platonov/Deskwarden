@@ -24,6 +24,15 @@ fn main() {
         // winresource that the runtime lookup would silently depend on.
         resource.set_icon_with_id("assets/deskwarden.ico", "1");
 
+        // Left unset, winresource falls back to Cargo.toml's package `name`
+        // ("deskwarden", all lowercase) for these VERSIONINFO fields --
+        // that's what Explorer/the taskbar show in places that read the
+        // exe's own metadata rather than a window's title text (process
+        // properties, some taskbar grouping tooltips). Set explicitly so
+        // the app's proper-cased name shows up there too.
+        resource.set("ProductName", "Deskwarden");
+        resource.set("FileDescription", "Deskwarden");
+
         // Deliberately a warning rather than a hard failure. Embedding
         // resources needs `rc.exe` (Windows SDK) or `windres`; on a machine
         // that has neither, failing the build would make the whole crate
