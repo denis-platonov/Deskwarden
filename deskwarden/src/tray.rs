@@ -27,6 +27,9 @@ pub struct AppTray {
     /// window (whose own toolbar already has a sync pill) or restarting the
     /// app.
     pub sync_id: MenuId,
+    /// Id of the "Preferences..." item -- opens `prefs_ui::run` (see
+    /// `main.rs`'s menu-event handling).
+    pub preferences_id: MenuId,
     pub quit_id: MenuId,
     /// Id of the "Update available" item, for comparing against
     /// `MenuEvent::id` in the main loop -- same pattern as `add_app_id` and
@@ -56,10 +59,12 @@ pub fn build_tray() -> AppTray {
     // entries at runtime, so that's the mechanism `set_update_available`
     // uses rather than rebuilding the menu.
     let update_item = MenuItem::new("Update available", false, None);
+    let preferences = MenuItem::new("Preferences...", true, None);
     menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
     menu.append(&sync_item).unwrap();
     menu.append(&update_item).unwrap();
+    menu.append(&preferences).unwrap();
     menu.append(&quit).unwrap();
 
     let mut builder = TrayIconBuilder::new()
@@ -81,6 +86,7 @@ pub fn build_tray() -> AppTray {
         open_vault_id: open_vault.id().clone(),
         add_app_id: add_app.id().clone(),
         sync_id: sync_item.id().clone(),
+        preferences_id: preferences.id().clone(),
         quit_id: quit.id().clone(),
         update_id: update_item.id().clone(),
         update_item,

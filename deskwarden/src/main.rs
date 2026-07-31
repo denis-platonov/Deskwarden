@@ -39,8 +39,8 @@ use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
 use deskwarden::vault_cache::VaultCache;
 use deskwarden::{
-    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store,
-    settings, tray, vault_window, window_watch,
+    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, prefs_ui,
+    session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
 use std::process::Child;
@@ -208,10 +208,19 @@ fn main() {
     let fill_stats_path = config_dir.join("fill-stats.json");
     let fill_stats = fill_stats::FillStats::new(fill_stats_path);
 
-    // User preferences (currently just the auto-lock timeout). A missing or
+    // User preferences (backend lifecycle, auto-lock timeout). A missing or
     // corrupt file falls back to defaults -- see `Settings::load` -- so this
     // is never a reason startup fails.
-    let settings = settings::Settings::load(&config_dir.join("settings.json"));
+    //
+    // `mut`, and the path kept around as `settings_path`: the preferences
+    // window (`prefs_ui::run`) can change and save these mid-session, and
+    // this binding -- not the file on disk -- is what every later read in
+    // this loop (`settings.auto_lock_timeout()`, `settings.keep_backend_running`
+    // in the idle reconciliation below) actually consults. Reassigning it in
+    // the tray handler is what makes a change take effect immediately rather
+    // than only on next launch.
+    let settings_path = config_dir.join("settings.json");
+    let mut settings = settings::Settings::load(&settings_path);
 
     // Every child process we spawn joins this job object, which is configured
     // to kill its members when the last handle closes. Our handles close when
@@ -580,6 +589,23 @@ fn main() {
                     &backend_op_rx,
                     &mut backend_task_in_progress,
                 );
+                last_dispatched_hwnd = None;
+            }
+
+            if event.id == tray.preferences_id {
+                // Blocks the main loop for as long as the window is open --
+                // same as every other window here (`open_vault_window`,
+                // `picker_ui::run_picker`). The idle backend reconciliation
+                // a bit further down only runs once this returns, so a
+                // changed `keep_backend_running` takes effect on the very
+                // next iteration rather than waiting for the next launch.
+                let edited = prefs_ui::run(settings.clone());
+                if edited != settings {
+                    settings = edited;
+                    if let Err(e) = settings.save(&settings_path) {
+                        log::warn!("could not save settings: {e}");
+                    }
+                }
                 last_dispatched_hwnd = None;
             }
 

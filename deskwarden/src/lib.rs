@@ -29,6 +29,7 @@ pub mod match_engine;
 pub mod overlay_ui;
 pub mod password_strength;
 pub mod picker_ui;
+pub mod prefs_ui;
 pub mod session_store;
 pub mod settings;
 pub mod signature;
