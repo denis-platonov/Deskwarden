@@ -36,13 +36,14 @@ use deskwarden::injector::{
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
+use deskwarden::vault_cache::VaultCache;
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, session_store,
-    tray, vault_window, window_watch,
+    settings, tray, vault_window, window_watch,
 };
 use semver::Version;
 use std::process::Child;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -196,6 +197,11 @@ fn main() {
     let fill_stats_path = config_dir.join("fill-stats.json");
     let fill_stats = fill_stats::FillStats::new(fill_stats_path);
 
+    // User preferences (currently just the auto-lock timeout). A missing or
+    // corrupt file falls back to defaults -- see `Settings::load` -- so this
+    // is never a reason startup fails.
+    let settings = settings::Settings::load(&config_dir.join("settings.json"));
+
     // Every child process we spawn joins this job object, which is configured
     // to kill its members when the last handle closes. Our handles close when
     // this process dies for *any* reason -- clean quit, panic, Ctrl+C, Task
@@ -234,6 +240,14 @@ fn main() {
     };
 
     let vault = VaultBridge::new(BW_SERVE_URL);
+    // The vault window's reads and writes go through this in-memory snapshot
+    // rather than straight to `bw serve` -- see `vault_cache`'s module doc.
+    // Built once, here, wrapping the same bridge everything else in `main`
+    // still uses directly (startup's readiness check, the picker, the match
+    // engine refresh) -- this task only moves the vault *window* onto the
+    // cache; those other call sites, and the cache's own lock/quit lifecycle,
+    // are for a later task.
+    let cache = Arc::new(VaultCache::new(vault.clone()));
     let mut engine = MatchEngine::new();
 
     let mut bw_serve_child = start_backend(&session_token, job.as_ref());
@@ -476,6 +490,7 @@ fn main() {
             if event.id == tray.open_vault_id {
                 open_vault_window(
                     &vault,
+                    &cache,
                     &fill_stats,
                     &injector,
                     &mut session_token,
@@ -487,6 +502,7 @@ fn main() {
                     &config_dir,
                     &icon_cache_dir,
                     &mut cached_status_details,
+                    settings.auto_lock_timeout(),
                 );
                 last_dispatched_hwnd = None;
             }
@@ -574,6 +590,7 @@ fn main() {
             if tray::is_left_click(&event) {
                 open_vault_window(
                     &vault,
+                    &cache,
                     &fill_stats,
                     &injector,
                     &mut session_token,
@@ -585,6 +602,7 @@ fn main() {
                     &config_dir,
                     &icon_cache_dir,
                     &mut cached_status_details,
+                    settings.auto_lock_timeout(),
                 );
                 last_dispatched_hwnd = None;
             }
@@ -1059,6 +1077,7 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 #[allow(clippy::too_many_arguments)]
 fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     vault: &VaultBridge,
+    cache: &Arc<VaultCache>,
     fill_stats: &deskwarden::fill_stats::FillStats,
     injector: &Injector<A, B>,
     session_token: &mut String,
@@ -1077,6 +1096,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // synchronous call this function always made, just no longer on every
     // single open.
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
+    auto_lock: Duration,
 ) {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
@@ -1087,13 +1107,14 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // spawn too when this call itself was the one that had to fall back.
     *cached_status_details = Some(status_details.clone());
     let result = vault_window::run(
-        vault.clone(),
+        cache.clone(),
         fill_stats.clone(),
         injector,
         status_details.server_url,
         status_details.user_email,
         session_token.clone(),
         icon_cache_dir.to_path_buf(),
+        auto_lock,
     );
 
     if result.locked {

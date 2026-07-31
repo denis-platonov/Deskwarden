@@ -16,7 +16,8 @@ use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
 use crate::theme;
-use crate::vault_bridge::{Folder, VaultBridge, VaultItem};
+use crate::vault_bridge::{Folder, VaultItem};
+use crate::vault_cache::VaultCache;
 use detail::{draw_detail_read, DetailAction};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
 use eframe::egui::{self, Margin};
@@ -36,9 +37,6 @@ const WINDOW_TITLE: &str = "Deskwarden";
 const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
 const SIDEBAR_WIDTH: f32 = 212.0;
 const LIST_WIDTH: f32 = 390.0;
-
-/// See Global Constraints: hardcoded until the 3e preferences window exists.
-const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// TOTP is re-fetched from `bw serve` on this interval while an item with a
 /// code is selected -- cheap enough to poll (one local HTTP call) and far
@@ -89,7 +87,7 @@ struct FaviconResult {
 /// `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
 /// update closure is `FnMut + 'static` and can't return anything directly.
 pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
-    vault: VaultBridge,
+    cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
     injector: &Injector<A, B>,
     server_url: Option<String>,
@@ -105,6 +103,10 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // `project_dirs.cache_dir().join("icons")`). Not created here --
     // `favicon::write_cached_icon` creates it lazily on first write.
     icon_cache_dir: std::path::PathBuf,
+    // Idle timeout before this window locks itself. Was a hardcoded
+    // module-level constant ("until the 3e preferences window exists"); now
+    // that `Settings` exists, `main.rs` loads it once and passes it in here.
+    auto_lock: Duration,
 ) -> VaultWindowResult {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
     // to a real winit event loop, not run on a borrowed stack), but `injector`
@@ -164,8 +166,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         Receiver<(Vec<VaultItem>, Vec<Folder>)>,
     ) = mpsc::channel();
     // Cloned because the update closure below move-captures both, and needs
-    // its own pair to re-issue a load after each sync.
-    spawn_vault_load(vault.clone(), vault_tx.clone());
+    // its own pair to re-issue a load after each sync. `false`: the snapshot
+    // from unlock (if any) is current, so this only actually hits the
+    // backend the first time the window is opened after unlock -- see
+    // `spawn_vault_load`'s doc comment.
+    spawn_vault_load(cache.clone(), vault_tx.clone(), false);
     let mut items: Vec<VaultItem> = Vec::new();
     let mut folders: Vec<Folder> = Vec::new();
     // True until the background load above reports back.
@@ -261,12 +266,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
             last_activity = Instant::now();
         }
-        if last_activity.elapsed() >= AUTO_LOCK_TIMEOUT {
+        if last_activity.elapsed() >= auto_lock {
             *locked_for_closure.borrow_mut() = true;
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        let remaining = AUTO_LOCK_TIMEOUT.saturating_sub(last_activity.elapsed());
+        let remaining = auto_lock.saturating_sub(last_activity.elapsed());
         let lock_countdown = format!(
             "Locks in {}:{:02}",
             remaining.as_secs() / 60,
@@ -324,7 +329,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // items), and doing that here froze the window for the
                 // duration every time a sync finished, which is exactly the
                 // stall the background load was introduced to remove.
-                spawn_vault_load(vault.clone(), vault_tx.clone());
+                //
+                // `true`: `bw sync` just changed the vault underneath the
+                // cache. The snapshot is still marked populated, so without
+                // forcing a refresh here `spawn_vault_load` would short-
+                // circuit on `is_populated` and serve the pre-sync data --
+                // Sync would appear to do nothing.
+                spawn_vault_load(cache.clone(), vault_tx.clone(), true);
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
             }
@@ -488,7 +499,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             .show(ui, |ui| {
                 match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown) {
                     SidebarAction::NewFolder => {
-                        if let Ok(folder) = vault.create_folder("New folder") {
+                        if let Ok(folder) = cache.create_folder("New folder") {
                             folders.push(folder);
                         }
                     }
@@ -605,7 +616,10 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             let has_totp_secret = item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some();
                             if has_totp_secret && totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL {
                                 totp_last_poll = Instant::now();
-                                totp_code = vault.get_totp(&item.id).ok().flatten();
+                                // The deliberate exception: TOTP codes are
+                                // generated by the CLI per request and are
+                                // not cacheable, so this stays on the bridge.
+                                totp_code = cache.bridge().get_totp(&item.id).ok().flatten();
                             }
                             let seconds_left = (30 - (std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -655,7 +669,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                                 // and the fill in one call -- nothing else here
                                                 // needs to touch `injector` directly.
                                                 Some(target) => crate::app::fill_from_vault(
-                                                    &vault,
+                                                    cache.bridge(),
                                                     &injector,
                                                     &fill_stats,
                                                     &item.id,
@@ -695,10 +709,10 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // `confirm_click` gates this on a confirming
                                 // second click -- see its doc comment. Only
                                 // then does this actually call
-                                // `vault.delete_item`.
+                                // `cache.delete_item`.
                                 DetailAction::Delete => {
                                     if confirm_click(&mut item_delete_pending, &item.id) {
-                                        match vault.delete_item(&item.id) {
+                                        match cache.delete_item(&item.id) {
                                             Ok(()) => {
                                                 let deleted_id = item.id.clone();
                                                 items.retain(|i| i.id != deleted_id);
@@ -730,7 +744,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
-                                    if vault.update_item(&updated).is_ok() {
+                                    if cache.update_item(&updated).is_ok() {
                                         if let Some(pos) = items.iter().position(|i| i.id == item.id) {
                                             items[pos] = updated;
                                         }
@@ -745,7 +759,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     DetailMode::Create(draft) => {
                         match draw_detail_edit(ui, draft, &folders, true) {
                             EditAction::Save => {
-                                if let Ok(created) = vault.create_item(&draft.to_new_item()) {
+                                if let Ok(created) = cache.create_item(&draft.to_new_item()) {
                                     selected_id = Some(created.id.clone());
                                     items.push(created);
                                     mode = DetailMode::Read;
@@ -769,7 +783,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // log. Logging alone left the modal open and unchanged on
                 // failure, which from the outside is indistinguishable from
                 // the click never having registered.
-                FolderEditAction::Save => match vault.update_folder(&state.folder_id, &state.name) {
+                FolderEditAction::Save => match cache.update_folder(&state.folder_id, &state.name) {
                     Ok(updated) => {
                         if let Some(f) = folders.iter_mut().find(|f| f.id == updated.id) {
                             f.name = updated.name;
@@ -781,7 +795,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                         state.error = Some("Could not rename this folder.".to_string());
                     }
                 },
-                FolderEditAction::Delete => match vault.delete_folder(&state.folder_id) {
+                FolderEditAction::Delete => match cache.delete_folder(&state.folder_id) {
                     Ok(()) => {
                         let deleted_id = state.folder_id.clone();
                         folders.retain(|f| f.id != deleted_id);
@@ -816,21 +830,37 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 /// place instead of being duplicated between them; the caller is still
 /// responsible for setting `sync_in_progress` before calling this, same as
 /// before this was extracted.
-/// Reads the whole vault (items + folders) on a one-shot background thread
-/// and reports it over `tx`.
+/// Reads the whole vault (items + folders) from the cache on a one-shot
+/// background thread and reports it over `tx`.
 ///
 /// Every vault read in this window goes through here rather than being
-/// called inline. `list_items` returns the entire vault in one response —
-/// measured at ~1.1s and 1.08 MB for 1657 items against a cold `bw serve`,
-/// before the cost of deserialising all of it — so on the UI thread it is
-/// long enough to stall the window outright. A failed read yields an empty
-/// vault rather than propagating: the window is already open by then, and
-/// the next sync re-issues a load anyway.
-fn spawn_vault_load(vault: VaultBridge, tx: mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>) {
+/// called inline. Backgrounded even though `VaultCache`'s reads themselves
+/// are in-memory and effectively free, because `populate()` below is not:
+/// it's the one path that still hits `bw serve`, pulling the entire vault in
+/// one response -- measured at ~1.1s and 1.08 MB for 1657 items against a
+/// cold backend, before the cost of deserialising all of it -- which would
+/// stall the window outright on the UI thread. A failed populate leaves
+/// whatever was already in the cache (empty, on a first load) rather than
+/// propagating: the window is already open by then, and the next sync
+/// re-issues a load anyway.
+fn spawn_vault_load(
+    cache: std::sync::Arc<VaultCache>,
+    tx: mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>,
+    // `true` after a sync, which changes the vault underneath us: the
+    // snapshot is still marked populated but is now stale, so the
+    // `is_populated` short-circuit below would serve pre-sync data and the
+    // sync would appear to do nothing. `false` on window open, where the
+    // snapshot from unlock is current and re-fetching would throw away the
+    // whole point of the cache.
+    force_refresh: bool,
+) {
     std::thread::spawn(move || {
-        let items = vault.list_items().unwrap_or_default();
-        let folders = vault.list_folders().unwrap_or_default();
-        let _ = tx.send((items, folders));
+        if force_refresh || !cache.is_populated() {
+            if let Err(e) = cache.populate() {
+                log::warn!("could not populate the vault cache: {e:?}");
+            }
+        }
+        let _ = tx.send((cache.items(), cache.folders()));
     });
 }
 
