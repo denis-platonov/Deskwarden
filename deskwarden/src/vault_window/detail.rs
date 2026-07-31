@@ -10,6 +10,39 @@ use crate::theme;
 use crate::vault_bridge::VaultItem;
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
+/// The One-time code row's single source of truth. Replaces a bare
+/// `Option<String>` (`Some(code)` / `None`), which could not tell apart
+/// three genuinely different situations: no TOTP secret configured on this
+/// item, a live code, and "the backend could not be reached to find out
+/// which of the other two is true". Collapsing those onto one `Option`
+/// is what let three consecutive commits each fix one confusion between
+/// them and introduce another (independent review of a7b33cb) -- a stale
+/// code kept rendering after its secret was removed elsewhere, and later a
+/// backend outage made the row vanish entirely, looking identical to "no
+/// TOTP here" and inviting a needless 2FA re-enrolment.
+///
+/// Computed in exactly one place (`vault_window::mod`'s per-frame TOTP
+/// block) and rendered exhaustively below (`draw_detail_read`'s `match` has
+/// no catch-all arm), so a future variant is a compile error here rather
+/// than a silently-unhandled case.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TotpState {
+    /// This item has no TOTP secret configured -- the row is omitted
+    /// entirely, same as before TOTP existed in this pane at all.
+    NoSecret,
+    /// A live code, fetched from `bw serve` on the last successful poll.
+    /// `seconds_left` is derived from the wall clock (the 30s TOTP window),
+    /// not from the fetch, and is refreshed every frame regardless of
+    /// whether a poll happened this tick.
+    Code { code: String, seconds_left: u8 },
+    /// This item *does* have a TOTP secret configured, but the last poll
+    /// could not reach `bw serve` (or it answered with an error other than
+    /// "no TOTP configured") to fetch the current code. Distinct from
+    /// `NoSecret` specifically so the row stays visible with an honest
+    /// "unavailable" state instead of vanishing and reading as "not set up".
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailAction {
     None,
@@ -51,8 +84,7 @@ pub fn draw_detail_read(
     ui: &mut egui::Ui,
     item: &VaultItem,
     fill_count: u32,
-    totp: Option<&str>,
-    totp_seconds_left: u8,
+    totp: &TotpState,
     // Whether *this* item currently has a delete armed (its first click
     // already happened and the confirm window hasn't expired) -- purely for
     // what the Delete button shows; `vault_window::mod`'s `confirm_click` is
@@ -125,9 +157,23 @@ pub fn draw_detail_read(
         credential_row(ui, "Username", username, "Copy", &mut action, DetailAction::CopyUsername);
         theme::hairline(ui);
         password_row(ui, password, reveal_password, &mut action);
-        if let Some(code) = totp {
-            theme::hairline(ui);
-            totp_row(ui, code, totp_seconds_left, &mut action);
+        // Exhaustive on purpose -- no catch-all arm -- so a new `TotpState`
+        // variant fails to compile here instead of silently falling through
+        // to whatever the last arm happened to do. `NoSecret` omits the row
+        // entirely (this item never had a code to show); `Unavailable` keeps
+        // the row but says so honestly instead of vanishing, which used to
+        // be pixel-identical to `NoSecret` and read as "TOTP isn't set up
+        // here" even when it was, just unreachable right now.
+        match totp {
+            TotpState::NoSecret => {}
+            TotpState::Code { code, seconds_left } => {
+                theme::hairline(ui);
+                totp_row(ui, code, *seconds_left, &mut action);
+            }
+            TotpState::Unavailable => {
+                theme::hairline(ui);
+                totp_unavailable_row(ui);
+            }
         }
     });
     ui.add_space(10.0);
@@ -240,6 +286,32 @@ fn totp_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut Detail
             if theme::secondary_button(ui, "Copy").clicked() {
                 *action = DetailAction::CopyTotp;
             }
+        });
+    });
+}
+
+/// The One-time code row for `TotpState::Unavailable`: this item has a TOTP
+/// secret, but the last attempt to fetch its current code couldn't reach
+/// `bw serve`. Keeps the row's label in place (so the item still visibly
+/// *has* one-time codes) without a code, a countdown, or a Copy button --
+/// there is nothing valid to show or copy right now, and a countdown here
+/// would falsely suggest a code is still live. Wording is a plain status,
+/// not an alarm: this is very likely `bw serve` still starting up or a
+/// transient hiccup, not something the user needs to act on.
+fn totp_unavailable_row(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
+            ui.label(
+                RichText::new("Unavailable right now")
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.label(
+                RichText::new("Couldn't reach the vault to get the current code.")
+                    .size(10.0)
+                    .color(theme::TEXT_GHOST),
+            );
         });
     });
 }

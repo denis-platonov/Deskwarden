@@ -1,5 +1,6 @@
 use crate::app_match::{AppMatch, APP_MATCH_FIELD_NAME};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultField {
@@ -175,11 +176,34 @@ pub struct VaultBridge {
     agent: ureq::Agent,
 }
 
+/// Connect timeout for `agent` below. `bw serve` is a local process on
+/// `localhost`, not a remote host, so even this is generous for a plain TCP
+/// handshake -- the point is only to fail fast if the port stops accepting
+/// connections at all (the process died, or never started), not to give a
+/// slow network the benefit of the doubt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Read timeout for `agent` below (time to receive the response once the
+/// request has been sent, not overall request time). `list_items` -- the
+/// slowest normal call, pulling the entire vault in one response -- was
+/// measured at ~1.1s for 1657 items against a cold `bw serve`; this leaves
+/// generous headroom above that for a larger vault or a loaded machine while
+/// still bounding the worst case. Notably: this agent is shared by every
+/// vault call in this app, including the once-per-second TOTP poll on the
+/// vault window's UI thread (review Minor 4, independent review of a7b33cb)
+/// -- with no timeout at all, a `bw serve` that accepted the connection but
+/// then hung (not crashed -- a crash fails fast on its own) blocked that
+/// poll, and the whole UI thread with it, indefinitely.
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl VaultBridge {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            agent: ureq::Agent::new(),
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout_read(READ_TIMEOUT)
+                .build(),
         }
     }
 
@@ -316,21 +340,32 @@ impl VaultBridge {
     }
 
     /// `None` when the item has no TOTP secret configured -- `bw serve`
-    /// answers that with a non-2xx rather than a null payload, so any HTTP
-    /// failure here is treated as "no code" rather than propagated as
-    /// `VaultError`. A *parse* failure on an actual 2xx response still is one:
-    /// that would mean `bw serve` changed shape under us, worth surfacing.
+    /// answers that with `400 Bad Request` rather than a null payload (see
+    /// the `get_totp_returns_none_when_the_item_has_no_totp` test), so *that
+    /// specific* status is treated as "no code" rather than propagated as
+    /// `VaultError`. A *parse* failure on an actual 2xx response still is
+    /// one: that would mean `bw serve` changed shape under us, worth
+    /// surfacing.
     ///
-    /// A `401` is the one non-2xx that is *not* "no code": every other call
-    /// site routes a `401` through `map_http_err` to `VaultError::Unauthorized`
+    /// A `401` is the other non-2xx handled specially: every other call site
+    /// routes a `401` through `map_http_err` to `VaultError::Unauthorized`
     /// so a stale/invalidated session (`bw lock` elsewhere, a server-side
     /// timeout, a password change on another device) triggers re-
-    /// authentication. This was the one call site that skipped that -- a
-    /// blanket `Err(ureq::Error::Status(_, _)) => Ok(None)` swallowed a `401`
-    /// the exact same way it swallows a genuine "no TOTP configured" `400`,
-    /// so a stale session read as "this item has no TOTP secret": codes went
-    /// silently blank with no re-auth prompt until some unrelated write
-    /// happened to hit the same `401` on a call site that *did* check.
+    /// authentication. This used to be the one call site that skipped that --
+    /// a blanket `Err(ureq::Error::Status(_, _)) => Ok(None)` swallowed a
+    /// `401` the exact same way it swallowed a genuine "no TOTP configured"
+    /// `400`, so a stale session read as "this item has no TOTP secret":
+    /// codes went silently blank with no re-auth prompt until some unrelated
+    /// write happened to hit the same `401` on a call site that *did* check.
+    ///
+    /// Every *other* status (500, 503, a proxy timeout, ...) is a genuine
+    /// failure, not "no code" (review Minor 3, independent review of
+    /// a7b33cb): the old blanket mapping to `Ok(None)` made a 500 from a
+    /// struggling `bw serve` indistinguishable, at the poll site, from an
+    /// item that was never TOTP-enabled -- the row silently vanished, no
+    /// line was logged, and a failure-streak flag elsewhere reset as if the
+    /// poll had actually succeeded, so a backend flapping between refused
+    /// and 5xx could log a false "recovered".
     pub fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let url = format!("{}/object/totp/{}", self.base_url, id);
         match self.agent.get(&url).call() {
@@ -341,7 +376,10 @@ impl VaultBridge {
                 Ok(body.data.data)
             }
             Err(ureq::Error::Status(401, _)) => Err(VaultError::Unauthorized),
-            Err(ureq::Error::Status(_, _)) => Ok(None),
+            Err(ureq::Error::Status(400, _)) => Ok(None),
+            Err(ureq::Error::Status(status, _)) => {
+                Err(VaultError::Http(format!("bw serve returned {status} fetching a TOTP code")))
+            }
             Err(e) => Err(VaultError::Http(e.to_string())),
         }
     }
@@ -856,5 +894,20 @@ mod tests {
         let _m = server.mock("GET", "/object/totp/3").with_status(401).create();
         let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.get_totp("3"), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn get_totp_reports_an_error_on_a_500_instead_of_no_totp() {
+        // Regression test for review Minor 3 (independent review of
+        // a7b33cb): only a 400 means "no TOTP configured". A 500/503 from a
+        // struggling bw serve must surface as a real error -- folding it
+        // into `Ok(None)` made it indistinguishable, at the poll site, from
+        // an item that was never TOTP-enabled: the row silently vanished,
+        // nothing was logged, and a failure-streak flag elsewhere reset as
+        // though the poll had succeeded.
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/object/totp/4").with_status(500).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.get_totp("4"), Err(VaultError::Http(_))));
     }
 }
