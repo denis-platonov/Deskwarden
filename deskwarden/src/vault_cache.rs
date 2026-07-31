@@ -14,7 +14,8 @@
 //! success, so there is exactly one place that can leave the cache stale
 //! rather than one per call site.
 
-use crate::vault_bridge::{Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
+use crate::app_match::AppMatch;
+use crate::vault_bridge::{with_app_match, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -79,43 +80,80 @@ impl VaultCache {
 
     pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
         let created = self.bridge.create_item(new_item)?;
-        self.lock().items.push(created.clone());
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.items.push(created.clone());
+        }
         Ok(created)
     }
 
     pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
         self.bridge.update_item(item)?;
         let mut snapshot = self.lock();
-        if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
-            *existing = item.clone();
+        if snapshot.populated {
+            if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
+                *existing = item.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Attaches an app match to `item` via [`VaultBridge::set_app_match`] and
+    /// updates the cached copy on success, using [`with_app_match`] so the
+    /// snapshot holds exactly what was sent -- not a reconstruction of it.
+    ///
+    /// This exists so callers never have to reach around the cache via
+    /// [`Self::bridge`] to save an app match, which would leave the snapshot
+    /// holding the pre-change item. Since the edit endpoint is
+    /// state-replacing, a later edit of that item would then PUT the stale
+    /// copy back as the item's new full state, silently deleting the app
+    /// match field the server had just been told to save.
+    pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
+        self.bridge.set_app_match(item, m)?;
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
+                *existing = with_app_match(item, m);
+            }
         }
         Ok(())
     }
 
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_item(id)?;
-        self.lock().items.retain(|i| i.id != id);
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.items.retain(|i| i.id != id);
+        }
         Ok(())
     }
 
     pub fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
         let created = self.bridge.create_folder(name)?;
-        self.lock().folders.push(created.clone());
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.folders.push(created.clone());
+        }
         Ok(created)
     }
 
     pub fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
         let updated = self.bridge.update_folder(id, name)?;
         let mut snapshot = self.lock();
-        if let Some(existing) = snapshot.folders.iter_mut().find(|f| f.id == updated.id) {
-            existing.name = updated.name.clone();
+        if snapshot.populated {
+            if let Some(existing) = snapshot.folders.iter_mut().find(|f| f.id == updated.id) {
+                existing.name = updated.name.clone();
+            }
         }
         Ok(updated)
     }
 
     pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_folder(id)?;
-        self.lock().folders.retain(|f| f.id != id);
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.folders.retain(|f| f.id != id);
+        }
         Ok(())
     }
 
@@ -130,6 +168,7 @@ impl VaultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_match::TriggerMode;
 
     fn cache_for(url: String) -> VaultCache {
         VaultCache::new(VaultBridge::new(url))
@@ -279,5 +318,102 @@ mod tests {
         cache.update_folder("f1", "Renamed").unwrap();
 
         assert_eq!(cache.folders()[0].name, "Renamed");
+    }
+
+    fn an_app_match() -> AppMatch {
+        AppMatch { process: "notepad.exe".to_string(), trigger: TriggerMode::Prompt }
+    }
+
+    #[test]
+    fn set_app_match_updates_the_cached_item() {
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        let m = an_app_match();
+
+        cache.set_app_match(&item, &m).unwrap();
+
+        let updated = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        let field = updated
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some(crate::app_match::APP_MATCH_FIELD_NAME))
+            .expect("app-match field missing after set_app_match");
+        assert_eq!(field.value.as_deref(), Some(m.to_field_value().as_str()));
+    }
+
+    #[test]
+    fn a_failed_set_app_match_leaves_the_cache_untouched() {
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _u = server.mock("PUT", "/object/item/1").with_status(500).create();
+
+        let cache = cache_for(server.url());
+        cache.populate().unwrap();
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+
+        assert!(cache.set_app_match(&item, &an_app_match()).is_err());
+
+        let unchanged = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(
+            unchanged.fields.is_empty(),
+            "a failed set_app_match modified the cached item anyway"
+        );
+    }
+
+    #[test]
+    fn a_write_against_a_cleared_cache_does_not_resurrect_a_one_item_snapshot() {
+        // After `clear()` (idle/locked), the snapshot must stay empty until
+        // the next `populate()` -- the bridge call still happens and its
+        // result is still returned, but the local snapshot must not gain a
+        // one-item "vault" from a stray write while locked.
+        let mut server = mockito::Server::new();
+        let created_body = r#"{"success":true,"data":{"id":"3","name":"Gamma","fields":[],"type":1}}"#;
+        let _c = server
+            .mock("POST", "/object/item")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(created_body)
+            .create();
+
+        let cache = cache_for(server.url());
+        assert!(!cache.is_populated());
+
+        let new_item = NewLoginItem {
+            name: "Gamma".to_string(),
+            username: String::new(),
+            password: String::new(),
+            folder_id: None,
+        };
+        cache.create_item(&new_item).unwrap();
+
+        assert!(cache.items().is_empty(), "a write on a cleared cache resurrected a snapshot");
+        assert!(!cache.is_populated());
     }
 }
