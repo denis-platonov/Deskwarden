@@ -545,19 +545,23 @@ fn main() {
     // lock event has to drain before it can safely stop/restart the backend
     // itself (see `open_vault_window`'s `locked` branch).
     let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
-    // `Some(started)` while a background backend operation is in flight, the
-    // instant it was set recording when -- rather than a plain `bool` -- so
-    // the main loop below can tell a merely-slow operation apart from one
-    // that has been outstanding so long it must be treated as wedged (see
-    // the `BACKEND_OP_TIMEOUT` check right after the non-blocking drain).
-    // `run_bw_sync` (`Command::output()`, no timeout of its own) and
-    // `try_start_backend` (which calls it) have no bound on how long they can
-    // take, so without this a stalled `bw sync` would leave this flag `Some`
-    // forever: `stop_backend_if_idle` refuses to run while it's set (save-
-    // memory mode never reclaims the backend's memory), `open_vault_window`
-    // refuses to start a fresh attempt while it's set (writes and TOTP stay
-    // dead), and the tray item is stuck disabled on "Syncing...".
-    let mut backend_task_in_progress: Option<Instant> = None;
+    // `Some((started, kind))` while a background backend operation is in
+    // flight, the instant it was set recording when -- rather than a plain
+    // `bool` -- so the main loop below can tell a merely-slow operation
+    // apart from one that has been outstanding so long it must be treated as
+    // wedged (see the `BACKEND_OP_TIMEOUT` check right after the
+    // non-blocking drain). `run_bw_sync` (`Command::output()`, no timeout of
+    // its own) and `try_start_backend` (which calls it) have no bound on how
+    // long they can take, so without this a stalled `bw sync` would leave
+    // this flag `Some` forever: `stop_backend_if_idle` refuses to run while
+    // it's set (save-memory mode never reclaims the backend's memory),
+    // `open_vault_window` refuses to start a fresh attempt while it's set
+    // (writes and TOTP stay dead), and the tray item is stuck disabled on
+    // "Syncing...". `kind` records which of the two operations
+    // (`BackendOpKind`) this is, so the wedge-deadline check can report a
+    // stall in terms of what was actually requested (review Minor 4) instead
+    // of always assuming a sync.
+    let mut backend_task_in_progress: Option<(Instant, BackendOpKind)> = None;
 
     loop {
         pump_windows_messages();
@@ -668,7 +672,7 @@ fn main() {
                 } else {
                     log::info!("sync requested from tray");
                     tray::set_sync_in_progress(&tray);
-                    backend_task_in_progress = Some(Instant::now());
+                    backend_task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
 
                     // Whether `bw serve` needs to be started first is decided
                     // here, on the main thread (the only place that owns
@@ -795,15 +799,34 @@ fn main() {
         // legitimate backend operation can take before something is
         // genuinely wrong" for `open_vault_window`'s own bounded wait on this
         // same flag, and that reasoning applies here unchanged.
-        if let Some(started) = backend_task_in_progress {
+        if let Some((started, kind)) = backend_task_in_progress {
             if backend_task_is_wedged(started, BACKEND_OP_TIMEOUT) {
-                log::error!(
-                    "a background backend operation has been outstanding for over \
-                     {BACKEND_OP_TIMEOUT:?} with no result; treating it as failed so the \
-                     backend lifecycle (and the tray) don't stay wedged on it forever"
-                );
                 backend_task_in_progress = None;
-                tray::set_sync_failed(&tray);
+                // Report -- and, on the tray, only claim -- what actually
+                // stalled (review Minor 4). An `EnsureRunning` wedge never
+                // touched the tray's "Sync" item in the first place (only
+                // the click handler above calls `set_sync_in_progress`), so
+                // there's nothing on it to revert; unconditionally calling
+                // `set_sync_failed` here used to show "Sync failed - click
+                // to retry" for a stall that was never a sync at all.
+                match kind {
+                    BackendOpKind::Sync => {
+                        log::error!(
+                            "a background sync has been outstanding for over \
+                             {BACKEND_OP_TIMEOUT:?} with no result; treating it as failed so the \
+                             tray doesn't stay stuck on \"Syncing...\" forever"
+                        );
+                        tray::set_sync_failed(&tray);
+                    }
+                    BackendOpKind::EnsureRunning => {
+                        log::error!(
+                            "a background bw serve start (no sync requested) has been \
+                             outstanding for over {BACKEND_OP_TIMEOUT:?} with no result; \
+                             treating it as failed so the backend lifecycle doesn't stay wedged \
+                             on it forever"
+                        );
+                    }
+                }
             }
         }
 
@@ -1222,7 +1245,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     tray: &tray::AppTray,
     backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
-    backend_task_in_progress: &mut Option<Instant>,
+    backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
 ) {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
@@ -1233,6 +1256,17 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // spawn too when this call itself was the one that had to fall back.
     *cached_status_details = Some(status_details.clone());
 
+    // Read once, before the `if` below might short-circuit past it, and
+    // reused for `vault_window::run`'s own `backend_already_running`
+    // (review Minor 3): whether `bw serve` was already up at this exact
+    // moment -- before this function might kick off a start of its own --
+    // is also exactly the fact `spawn_vault_load` needs to know it can skip
+    // its readiness wait. Nothing between here and `vault_window::run`
+    // returning stops or restarts the backend out from under this snapshot
+    // (the only paths that do -- lock/reauth recovery -- close the window
+    // and return first), so it stays valid for the window's whole session.
+    let backend_already_running = backend_is_running(bw_serve_child);
+
     // Reads don't need `bw serve` at all (`vault_window::run` paints
     // entirely from `cache`); writes and TOTP do. If save-memory mode tore
     // the backend down after the last close (or it crashed -- review Minor
@@ -1240,8 +1274,8 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // `.is_none()` check would miss), kick a start off in the background and
     // move straight on to opening the window rather than waiting for it --
     // see this function's doc for why waiting here used to be a real freeze.
-    if backend_task_in_progress.is_none() && !backend_is_running(bw_serve_child) {
-        *backend_task_in_progress = Some(Instant::now());
+    if backend_task_in_progress.is_none() && !backend_already_running {
+        *backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
         spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
     }
 
@@ -1254,6 +1288,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         session_token.clone(),
         icon_cache_dir.to_path_buf(),
         auto_lock,
+        backend_already_running,
     );
 
     if result.locked || result.needs_reauth {
@@ -1456,6 +1491,19 @@ fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running
 /// what not catching this leads to.
 fn backend_task_is_wedged(started: Instant, deadline: Duration) -> bool {
     started.elapsed() >= deadline
+}
+
+/// Which kind of background backend operation `backend_task_in_progress` is
+/// currently tracking. Recorded alongside the `Instant` so the wedge-deadline
+/// check in `main`'s loop can say what actually stalled (review Minor 4):
+/// `open_vault_window`'s `EnsureRunning` -- just making sure `bw serve` is up
+/// before showing the window, no sync requested at all -- used to always be
+/// reported (and shown on the tray) as a failed *sync* if it wedged, which
+/// was simply untrue whenever no sync was involved.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendOpKind {
+    EnsureRunning,
+    Sync,
 }
 
 /// Outcome of a background operation that starts or restarts `bw serve`.
