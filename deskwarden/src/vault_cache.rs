@@ -51,6 +51,21 @@ impl VaultCache {
     /// again after a sync.
     pub fn populate(&self) -> Result<(), VaultError> {
         let items = self.bridge.list_items()?;
+        self.populate_with(items)
+    }
+
+    /// Same as [`Self::populate`], but with items already fetched by the
+    /// caller instead of listing them again here.
+    ///
+    /// Startup's readiness probe (`bw_serve::wait_for_vault_ready`) already
+    /// has to call `list_items()` itself, to confirm `bw serve` is actually
+    /// answering before anything else proceeds -- so a plain `populate()`
+    /// right after it repeated that exact request for data that cannot have
+    /// changed in the instant between the two calls. This still fetches
+    /// folders, since nothing else already has, and mirrors `populate`'s
+    /// atomicity: the snapshot is only replaced if that fetch also succeeds,
+    /// not left holding the given `items` with no folders to match.
+    pub fn populate_with(&self, items: Vec<VaultItem>) -> Result<(), VaultError> {
         let folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
         snapshot.items = items;
@@ -217,6 +232,65 @@ mod tests {
         }
         items.assert();
         folders.assert();
+    }
+
+    #[test]
+    fn populate_with_seeds_items_without_refetching_them() {
+        // No `/list/object/items` mock at all: `populate_with` must use the
+        // `items` it's given rather than listing them again itself. If it
+        // did, the request would hit this unmocked endpoint and the eventual
+        // `unwrap()` below would fail.
+        let mut server = mockito::Server::new();
+        let folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .expect(1)
+            .create();
+
+        let cache = cache_for(server.url());
+        let seeded = vec![VaultItem {
+            id: "1".to_string(),
+            name: "Alpha".to_string(),
+            fields: vec![],
+            login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }];
+
+        cache.populate_with(seeded).unwrap();
+
+        assert_eq!(cache.items().len(), 1);
+        assert_eq!(cache.folders().len(), 1);
+        assert!(cache.is_populated());
+        folders.assert();
+    }
+
+    #[test]
+    fn a_failed_populate_with_leaves_the_cache_unpopulated() {
+        // Mirrors `populate`'s atomicity: if the folder fetch fails, the
+        // given items must not be adopted into a half-formed snapshot.
+        let mut server = mockito::Server::new();
+        let _f = server.mock("GET", "/list/object/folders").with_status(500).create();
+
+        let cache = cache_for(server.url());
+        let seeded = vec![VaultItem {
+            id: "1".to_string(),
+            name: "Alpha".to_string(),
+            fields: vec![],
+            login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }];
+
+        assert!(cache.populate_with(seeded).is_err());
+        assert!(!cache.is_populated());
+        assert!(cache.items().is_empty());
     }
 
     #[test]

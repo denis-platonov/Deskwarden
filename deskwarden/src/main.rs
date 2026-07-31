@@ -346,31 +346,24 @@ fn main() {
         }
     };
 
-    // One fetch per unlock. Everything downstream -- the match engine, the
-    // vault window, autofill -- reads this snapshot rather than re-fetching.
-    // Separate from the `items` just resolved above (which only fed the
-    // match engine build below): this call also pulls folders, and keeping
-    // the readiness probe and the cache population as two distinct steps
-    // means a slow/failing populate can't be confused with a backend that
-    // never came up in the first place.
-    if let Err(e) = cache.populate() {
-        log::warn!("could not populate the vault cache at startup: {e:?}");
-    }
-
     let entries = match_entries(&items);
     log::info!("match engine loaded with {} app match(es)", entries.len());
     engine.rebuild(&entries);
-    // `items` is not read again after this point. Without dropping it
-    // explicitly, this plain top-level `let` in `main()`'s body would keep
-    // the entire deserialized vault (potentially thousands of items, each
+
+    // Seeds the cache with the `items` the readiness probe just fetched
+    // (`VaultCache::populate_with`), rather than a plain `populate()`
+    // listing them all over again right after -- the same request, for data
+    // that cannot have changed in the instant between the two calls. Still
+    // fetches folders, since nothing above needed those. This also means
+    // `items` doesn't need a separate `drop()`: it becomes the cache's own
+    // storage instead of a throwaway local that would otherwise keep the
+    // entire deserialized vault (potentially thousands of items, each
     // carrying a serde_json::Map "other" catch-all) resident for the rest of
-    // the process's life -- and this app spends nearly all its runtime idle
-    // in the tray with no window open, so that would be pure waste paid at
-    // idle, not just at startup. Contrast `app::refresh_match_engine`, whose
-    // own local `items` is already dropped correctly by ordinary scoping
-    // because it's a small function that returns right after building
-    // `entries`.
-    drop(items);
+    // the process's life doing nothing -- this app spends nearly all its
+    // runtime idle in the tray with no window open.
+    if let Err(e) = cache.populate_with(items) {
+        log::warn!("could not populate the vault cache at startup: {e:?}");
+    }
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
     // the cache once -> *then* obey the policy. The backend has had to be up
