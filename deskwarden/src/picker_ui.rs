@@ -176,6 +176,39 @@ fn list_card(
         });
 }
 
+/// The items the picker should list: the cache's own snapshot if it has one,
+/// otherwise a live populate as a fallback.
+///
+/// `main`'s startup fills the cache once via `populate_with` and warns (but
+/// otherwise continues) if that fails -- e.g. `list_folders` answering 500.
+/// Before this, that left the cache permanently empty for the rest of the
+/// session with no retry, so "Add app..." stayed inert even once `bw serve`
+/// was healthy again: `pick_vault_item` read an empty `cache.items()` and
+/// gave up. `fill_from_vault` has a bridge fallback for exactly this kind of
+/// cache miss (`app.rs`'s `credentials_for` caller); this is the picker's
+/// equivalent -- try to populate the cache (which needs `bw serve` up, same
+/// as any other write/TOTP path) rather than trusting a snapshot that was
+/// never actually taken.
+///
+/// Pure with respect to its one side effect (`cache.populate`) being the
+/// thing under test, not UI -- exercised directly in this module's tests
+/// against a mock `bw serve` via `VaultCache::new`, the same pattern
+/// `vault_cache`'s own tests use.
+fn items_for_picker(cache: &VaultCache) -> Vec<VaultItem> {
+    if cache.is_populated() {
+        return cache.items();
+    }
+
+    log::warn!("vault cache is not populated; populating it now for the picker");
+    match cache.populate() {
+        Ok(()) => cache.items(),
+        Err(e) => {
+            log::error!("could not populate the vault cache for the picker: {e:?}");
+            Vec::new()
+        }
+    }
+}
+
 /// Opens a blocking egui window listing the user's vault items with a search
 /// box, and returns the one they pick (or `None` if they cancel, or the vault
 /// has nothing to show).
@@ -185,22 +218,36 @@ fn list_card(
 /// one, which is why "Add app..." was an inert menu entry and `run_picker` was
 /// dead code in the bin target.
 ///
-/// Reads [`VaultCache::items`] rather than listing via `VaultBridge`: with
-/// `keep_backend_running` off, `bw serve` is normally stopped at idle, so a
-/// bridge call here failed with a connection error every time -- logged, but
-/// with nothing on screen, "Add app..." just appeared to do nothing. The
-/// cache holds the same data in memory regardless of whether the backend is
-/// running (see `vault_cache`'s module doc), so listing items for the picker
-/// never needs to start it.
+/// Reads [`VaultCache::items`] (via `items_for_picker`) rather than listing
+/// via `VaultBridge` directly: with `keep_backend_running` off, `bw serve` is
+/// normally stopped at idle, so a bridge call here failed with a connection
+/// error every time -- logged, but with nothing on screen, "Add app..." just
+/// appeared to do nothing. The cache holds the same data in memory regardless
+/// of whether the backend is running (see `vault_cache`'s module doc), so the
+/// common case of listing items for the picker never needs to start it;
+/// `items_for_picker` only reaches for the backend in the fallback case where
+/// the cache was never successfully filled in the first place.
 ///
 /// Takes `&VaultCache` rather than owning it because it's only used *before*
 /// the (`FnMut + 'static`) update closure is built; the items already read
 /// out of it are what gets moved in.
 pub fn pick_vault_item(cache: &VaultCache) -> Option<VaultItem> {
-    let items: Vec<VaultItem> = cache.items();
+    let items = items_for_picker(cache);
 
     if items.is_empty() {
         log::warn!("vault has no items to attach an app match to");
+        unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(
+                    "Deskwarden could not find any vault items to attach this app to.\n\nMake \
+                     sure Deskwarden's Bitwarden backend is reachable (try Sync from the tray \
+                     menu), then use \u{201c}Add app\u{2026}\u{201d} again.",
+                ),
+                &HSTRING::from("Deskwarden: no vault items"),
+                MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+            );
+        }
         return None;
     }
 
@@ -552,11 +599,38 @@ pub fn run_picker(cache: Arc<VaultCache>, target_item: VaultItem, default_pid: O
                                             );
                                         }
                                     }
+                                    // Review 9's Important: this used to be a
+                                    // bare log line, so in save-memory mode --
+                                    // where `bw serve` is normally down and
+                                    // this is the *common* failure, not the
+                                    // rare one `Unauthorized` above covers --
+                                    // Save silently closed the window exactly
+                                    // like Cancel, with nothing on screen.
+                                    // Whatever the cause (dead backend, a 5xx,
+                                    // a parse failure), the user picked an
+                                    // item and a process and clicked Save; a
+                                    // failure to persist that must never be
+                                    // silent.
                                     Err(e) => {
                                         log::error!(
                                             "failed to save app match onto vault item {}: {e:?}",
                                             target_item.id
-                                        )
+                                        );
+                                        unsafe {
+                                            MessageBoxW(
+                                                None,
+                                                &HSTRING::from(
+                                                    "This app match could not be saved because \
+                                                     Deskwarden's Bitwarden backend is not \
+                                                     reachable right now.\n\nOpen the vault \
+                                                     (which starts it) or try Sync from the tray \
+                                                     menu, then use \u{201c}Add \
+                                                     app\u{2026}\u{201d} again.",
+                                                ),
+                                                &HSTRING::from("Deskwarden: could not save"),
+                                                MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -624,5 +698,92 @@ mod tests {
                 "{mode:?} is missing from TRIGGER_CHOICES"
             );
         }
+    }
+
+    use crate::vault_bridge::VaultBridge;
+
+    fn cache_for(url: String) -> VaultCache {
+        VaultCache::new(VaultBridge::new(url))
+    }
+
+    fn items_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1}
+        ]}}"#
+    }
+
+    fn folders_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[]}}"#
+    }
+
+    #[test]
+    fn items_for_picker_reads_a_populated_cache_without_touching_the_backend() {
+        // Only `/list/object/folders` is mocked, for `populate_with`'s own
+        // setup call below -- `/list/object/items` deliberately is not: if
+        // `items_for_picker` fell back to a live populate instead of trusting
+        // the already-populated cache, that unmocked request would come back
+        // as an error and the assertion below would fail with an empty list.
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        cache.populate_with(vec![item("Alpha")]).unwrap();
+
+        let items = items_for_picker(&cache);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Alpha");
+    }
+
+    #[test]
+    fn items_for_picker_falls_back_to_a_live_populate_when_the_cache_is_empty() {
+        // Regression test for review 9's Minor: a failed startup
+        // `populate_with` (see main.rs) used to leave `pick_vault_item`
+        // stuck reading an empty cache for the rest of the session, even
+        // with a healthy `bw serve`. `items_for_picker` must notice the
+        // cache was never populated and go fetch instead of trusting the
+        // empty snapshot.
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(1)
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .expect(1)
+            .create();
+        let cache = cache_for(server.url());
+        assert!(!cache.is_populated());
+
+        let items = items_for_picker(&cache);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "Alpha");
+        assert!(cache.is_populated(), "the fallback populate should fill the cache");
+    }
+
+    #[test]
+    fn items_for_picker_returns_empty_when_the_backend_is_unreachable() {
+        // The other half of the same fallback: if the backend is still down
+        // (or errors), the picker gets an empty list back -- not a panic --
+        // and `pick_vault_item` is the one that turns that into a visible
+        // message instead of a silent no-op.
+        let cache = cache_for("http://127.0.0.1:1".to_string());
+        assert!(!cache.is_populated());
+
+        let items = items_for_picker(&cache);
+
+        assert!(items.is_empty());
+        assert!(!cache.is_populated());
     }
 }

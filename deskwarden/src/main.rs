@@ -625,7 +625,23 @@ fn main() {
 
             if event.id == tray.add_app_id {
                 // Two-step flow: choose the vault item the credentials come
-                // from, then choose the process to attach to it.
+                // from, then choose the process to attach to it. Both
+                // `pick_vault_item` and `run_picker`'s window/trigger choice
+                // work purely from the cache and `window_list` -- but the
+                // Save at the very end of `run_picker` calls
+                // `cache.set_app_match`, a write, which needs `bw serve` up.
+                // Review 9's Important: in save-memory mode nothing here used
+                // to start it, so a save always failed after two windows of
+                // user effort with nothing visible on screen. Kick a start
+                // off now, the same non-blocking way `open_vault_window`
+                // does -- by the time the user has picked an item, picked a
+                // process, and clicked Save, it has had as long to come up as
+                // opening the vault window does.
+                if needs_backend_start(&backend_task_in_progress, backend_is_running(&mut bw_serve_child)) {
+                    backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+                    spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
+                }
+
                 if let Some(item) = picker_ui::pick_vault_item(&cache) {
                     log::info!("adding an app match to vault item {}", item.id);
                     match picker_ui::run_picker(cache.clone(), item, last_active_pid) {
@@ -1267,7 +1283,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // `.is_none()` check would miss), kick a start off in the background and
     // move straight on to opening the window rather than waiting for it --
     // see this function's doc for why waiting here used to be a real freeze.
-    if backend_task_in_progress.is_none() && !backend_already_running {
+    if needs_backend_start(backend_task_in_progress, backend_already_running) {
         *backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
         spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
     }
@@ -1484,6 +1500,26 @@ fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running
 /// what not catching this leads to.
 fn backend_task_is_wedged(started: Instant, deadline: Duration) -> bool {
     started.elapsed() >= deadline
+}
+
+/// Whether a background "ensure `bw serve` is running" kick should be
+/// started right now.
+///
+/// Shared by `open_vault_window` and the tray's "Add app..." handler
+/// (review 9's Important finding): both reach a step -- the vault window's
+/// writes/TOTP, the picker's Save -- that needs `bw serve` up, and both
+/// start it the same non-blocking way rather than waiting. Never start a
+/// second attempt on top of one already in flight (`backend_task_in_progress`
+/// racing itself to bind the same port), and never restart something that's
+/// already running.
+///
+/// A standalone predicate for the same reason as `backend_task_is_wedged`:
+/// testable without opening a window.
+fn needs_backend_start(
+    backend_task_in_progress: &Option<(Instant, BackendOpKind)>,
+    backend_already_running: bool,
+) -> bool {
+    backend_task_in_progress.is_none() && !backend_already_running
 }
 
 /// Which kind of background backend operation `backend_task_in_progress` is
@@ -1917,6 +1953,24 @@ mod tests {
         // test instant.
         let started = Instant::now() - Duration::from_secs(120);
         assert!(backend_task_is_wedged(started, Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn needs_backend_start_is_true_with_nothing_running_and_no_task_in_flight() {
+        assert!(needs_backend_start(&None, false));
+    }
+
+    #[test]
+    fn needs_backend_start_is_false_while_a_task_is_already_in_flight() {
+        // Guards against two attempts racing to bind the same port -- see
+        // this fn's doc.
+        let in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+        assert!(!needs_backend_start(&in_progress, false));
+    }
+
+    #[test]
+    fn needs_backend_start_is_false_when_the_backend_is_already_running() {
+        assert!(!needs_backend_start(&None, true));
     }
 
     #[test]
