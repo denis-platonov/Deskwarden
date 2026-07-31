@@ -9,9 +9,9 @@
 //! vault data at rest would contradict the README's claim that deskwarden
 //! never touches encryption or storage. `clear` drops everything; `main`
 //! calls it whenever the current snapshot might outlive the session it was
-//! built from -- a lock (the vault window's own, or one discovered by the
-//! periodic refresh), re-authenticating into a possibly different account,
-//! and quitting -- so idle never holds stale or leftover vault contents.
+//! built from -- the vault window locking itself, re-authenticating into a
+//! possibly different account, and quitting -- so idle never holds stale or
+//! leftover vault contents.
 //!
 //! **All writes go through here.** Each write updates the snapshot on
 //! success, so there is exactly one place that can leave the cache stale

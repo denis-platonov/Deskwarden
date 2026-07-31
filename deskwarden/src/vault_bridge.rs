@@ -320,6 +320,17 @@ impl VaultBridge {
     /// failure here is treated as "no code" rather than propagated as
     /// `VaultError`. A *parse* failure on an actual 2xx response still is one:
     /// that would mean `bw serve` changed shape under us, worth surfacing.
+    ///
+    /// A `401` is the one non-2xx that is *not* "no code": every other call
+    /// site routes a `401` through `map_http_err` to `VaultError::Unauthorized`
+    /// so a stale/invalidated session (`bw lock` elsewhere, a server-side
+    /// timeout, a password change on another device) triggers re-
+    /// authentication. This was the one call site that skipped that -- a
+    /// blanket `Err(ureq::Error::Status(_, _)) => Ok(None)` swallowed a `401`
+    /// the exact same way it swallows a genuine "no TOTP configured" `400`,
+    /// so a stale session read as "this item has no TOTP secret": codes went
+    /// silently blank with no re-auth prompt until some unrelated write
+    /// happened to hit the same `401` on a call site that *did* check.
     pub fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let url = format!("{}/object/totp/{}", self.base_url, id);
         match self.agent.get(&url).call() {
@@ -329,6 +340,7 @@ impl VaultBridge {
                     .map_err(|e| VaultError::Parse(e.to_string()))?;
                 Ok(body.data.data)
             }
+            Err(ureq::Error::Status(401, _)) => Err(VaultError::Unauthorized),
             Err(ureq::Error::Status(_, _)) => Ok(None),
             Err(e) => Err(VaultError::Http(e.to_string())),
         }
@@ -831,5 +843,18 @@ mod tests {
         let _m = server.mock("GET", "/object/totp/2").with_status(400).create();
         let bridge = VaultBridge::new(server.url());
         assert_eq!(bridge.get_totp("2").unwrap(), None);
+    }
+
+    #[test]
+    fn get_totp_reports_unauthorized_on_a_401_instead_of_no_totp() {
+        // Regression test (final review Minor): a stale session must surface
+        // as `VaultError::Unauthorized` here too, not be folded into the same
+        // "no TOTP configured" bucket as a genuine 400 -- otherwise a code
+        // that should be re-authenticated for instead reads as an item that
+        // simply has no TOTP secret, and goes silently blank.
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/object/totp/3").with_status(401).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.get_totp("3"), Err(VaultError::Unauthorized)));
     }
 }

@@ -56,9 +56,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// on this cadence from the main loop, same pattern as `REFRESH_INTERVAL`.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Upper bound on how long `open_vault_window`'s lock-recovery path waits for
-/// an in-flight backend operation to report back over `backend_op_rx` before
-/// giving up on it and proceeding anyway.
+/// Upper bound on how long a background backend operation may legitimately
+/// stay outstanding before something is treated as having gone wrong. Used
+/// two ways: `open_vault_window`'s lock-recovery path waits this long for an
+/// in-flight operation to report back over `backend_op_rx` before giving up
+/// on it and proceeding anyway; `main`'s own loop uses the same bound as a
+/// deadline on `backend_task_in_progress` itself (see that variable's doc),
+/// clearing it and surfacing a tray failure if nothing has reported back in
+/// this long.
 ///
 /// `backend_op_tx` lives in `main` for the lifetime of the process, so the
 /// channel itself never disconnects -- an unbounded `recv()` here would block
@@ -540,7 +545,19 @@ fn main() {
     // lock event has to drain before it can safely stop/restart the backend
     // itself (see `open_vault_window`'s `locked` branch).
     let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
-    let mut backend_task_in_progress = false;
+    // `Some(started)` while a background backend operation is in flight, the
+    // instant it was set recording when -- rather than a plain `bool` -- so
+    // the main loop below can tell a merely-slow operation apart from one
+    // that has been outstanding so long it must be treated as wedged (see
+    // the `BACKEND_OP_TIMEOUT` check right after the non-blocking drain).
+    // `run_bw_sync` (`Command::output()`, no timeout of its own) and
+    // `try_start_backend` (which calls it) have no bound on how long they can
+    // take, so without this a stalled `bw sync` would leave this flag `Some`
+    // forever: `stop_backend_if_idle` refuses to run while it's set (save-
+    // memory mode never reclaims the backend's memory), `open_vault_window`
+    // refuses to start a fresh attempt while it's set (writes and TOTP stay
+    // dead), and the tray item is stuck disabled on "Syncing...".
+    let mut backend_task_in_progress: Option<Instant> = None;
 
     loop {
         pump_windows_messages();
@@ -645,13 +662,13 @@ fn main() {
                 // window-open's own backend start) is in flight, but the
                 // click event is handled the same way regardless of whether
                 // tray-icon's disabled state actually suppressed the click.
-                if backend_task_in_progress {
+                if backend_task_in_progress.is_some() {
                     log::info!("sync requested from tray but a backend operation is already in \
                                  progress; ignoring");
                 } else {
                     log::info!("sync requested from tray");
                     tray::set_sync_in_progress(&tray);
-                    backend_task_in_progress = true;
+                    backend_task_in_progress = Some(Instant::now());
 
                     // Whether `bw serve` needs to be started first is decided
                     // here, on the main thread (the only place that owns
@@ -766,8 +783,28 @@ fn main() {
         // where `backend_task_in_progress` is cleared, so the reconciliation
         // step right after it is never fighting a still-in-flight operation.
         if let Ok(op) = backend_op_rx.try_recv() {
-            backend_task_in_progress = false;
+            backend_task_in_progress = None;
             apply_backend_op(op, &mut bw_serve_child, &cache, &mut engine, &tray);
+        }
+
+        // A deadline on the FLAG itself, not just on any one `recv` -- see
+        // `backend_task_in_progress`'s own doc for why a stalled `bw sync`
+        // (or backend start) can otherwise wedge it `Some` forever with
+        // nothing here ever noticing on its own. Reusing `BACKEND_OP_TIMEOUT`
+        // rather than a second constant: it already means "how long a
+        // legitimate backend operation can take before something is
+        // genuinely wrong" for `open_vault_window`'s own bounded wait on this
+        // same flag, and that reasoning applies here unchanged.
+        if let Some(started) = backend_task_in_progress {
+            if backend_task_is_wedged(started, BACKEND_OP_TIMEOUT) {
+                log::error!(
+                    "a background backend operation has been outstanding for over \
+                     {BACKEND_OP_TIMEOUT:?} with no result; treating it as failed so the \
+                     backend lifecycle (and the tray) don't stay wedged on it forever"
+                );
+                backend_task_in_progress = None;
+                tray::set_sync_failed(&tray);
+            }
         }
 
         // The policy, reconciled here -- at idle, in the main loop -- rather
@@ -784,7 +821,7 @@ fn main() {
         // throttling it) -- the three places that *do* need the backend
         // (startup, `open_vault_window`, the tray's Sync item) each ask for
         // it explicitly and this only ever tears it back down afterwards.
-        if !backend_task_in_progress {
+        if backend_task_in_progress.is_none() {
             stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
         }
 
@@ -1185,7 +1222,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     tray: &tray::AppTray,
     backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
-    backend_task_in_progress: &mut bool,
+    backend_task_in_progress: &mut Option<Instant>,
 ) {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
@@ -1203,8 +1240,8 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // `.is_none()` check would miss), kick a start off in the background and
     // move straight on to opening the window rather than waiting for it --
     // see this function's doc for why waiting here used to be a real freeze.
-    if !*backend_task_in_progress && !backend_is_running(bw_serve_child) {
-        *backend_task_in_progress = true;
+    if backend_task_in_progress.is_none() && !backend_is_running(bw_serve_child) {
+        *backend_task_in_progress = Some(Instant::now());
         spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
     }
 
@@ -1259,16 +1296,19 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // `BACKEND_OP_TIMEOUT` and proceeding anyway is strictly safer: the
         // worst case is racing a start/sync that eventually does land (see
         // `apply_backend_op`'s callers), not an unkillable app.
-        if *backend_task_in_progress {
+        if backend_task_in_progress.is_some() {
             log::info!("waiting for an in-flight backend operation before handling the lock");
             match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
                 Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
                 Err(_) => log::warn!(
                     "in-flight backend operation did not report back within \
-                     {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway"
+                     {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway. If it later \
+                     reports back late (see `apply_backend_op`'s child-adoption guard), its \
+                     child is stopped rather than allowed to overwrite the one this recovery is \
+                     about to start."
                 ),
             }
-            *backend_task_in_progress = false;
+            *backend_task_in_progress = None;
         }
 
         // The account the *next* unlock lands on may not be this one (a
@@ -1406,6 +1446,18 @@ fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running
     }
 }
 
+/// Whether a backend operation marked in-flight since `started` has been
+/// outstanding long enough to treat as wedged rather than merely slow.
+///
+/// A standalone predicate (rather than the `Duration` comparison inlined at
+/// its one call site in `main`'s loop) purely so it can be unit tested --
+/// `main` itself never returns, so nothing inside its loop is otherwise
+/// reachable from a test. See `backend_task_in_progress`'s doc in `main` for
+/// what not catching this leads to.
+fn backend_task_is_wedged(started: Instant, deadline: Duration) -> bool {
+    started.elapsed() >= deadline
+}
+
 /// Outcome of a background operation that starts or restarts `bw serve`.
 ///
 /// Both kinds -- `open_vault_window` making sure the backend is up, and the
@@ -1444,8 +1496,9 @@ fn apply_backend_op(
 ) {
     match op {
         BackendOp::EnsureRunning(Ok(child)) => {
-            log::info!("bw serve started for the vault window");
-            *bw_serve_child = Some(child);
+            if adopt_started_child(bw_serve_child, child) {
+                log::info!("bw serve started for the vault window");
+            }
         }
         BackendOp::EnsureRunning(Err(e)) => log::error!(
             "could not start bw serve for the vault window (writes and TOTP will fail until \
@@ -1453,7 +1506,9 @@ fn apply_backend_op(
         ),
         BackendOp::Sync { child, outcome } => {
             match child {
-                Some(Ok(c)) => *bw_serve_child = Some(c),
+                Some(Ok(c)) => {
+                    adopt_started_child(bw_serve_child, c);
+                }
                 Some(Err(e)) => log::error!("sync could not start bw serve: {e}"),
                 None => {}
             }
@@ -1474,6 +1529,40 @@ fn apply_backend_op(
             }
         }
     }
+}
+
+/// Adopts a freshly started `bw serve` child into `*bw_serve_child`, unless
+/// one is already tracked there and still alive -- in which case the
+/// incoming `child` is stopped instead. Returns whether it was adopted.
+///
+/// Exists for the race the final review's lock-recovery Minor flagged:
+/// `open_vault_window`'s lock-recovery path gives up waiting on an in-flight
+/// backend operation after `BACKEND_OP_TIMEOUT` and starts a fresh backend of
+/// its own, synchronously, right there -- but giving up does not stop the
+/// background thread it was waiting on. That thread can still complete
+/// afterwards and send its own `Ok(child)` through the same channel, which
+/// `main`'s ordinary non-blocking drain then hands to `apply_backend_op` like
+/// any other result. Applying it unconditionally -- as this used to -- would
+/// silently replace `*bw_serve_child` with that late, stale handle, orphaning
+/// the newer process lock recovery is actually using: `Child`'s `Drop` does
+/// not kill its process, so the replaced handle would simply be gone, with
+/// nothing left able to stop or restart the process it pointed to on
+/// purpose. Since at most one process can hold `BW_SERVE_PORT` at a time, a
+/// late arrival landing while a live child is already tracked is by
+/// definition redundant (or never got as far as actually binding the port),
+/// so it's stopped outright rather than risking the swap.
+fn adopt_started_child(bw_serve_child: &mut Option<Child>, mut child: Child) -> bool {
+    if backend_is_running(bw_serve_child) {
+        log::warn!(
+            "a bw serve start reported back after a backend was already running (most likely \
+             abandoned during lock recovery); stopping the redundant instance instead of \
+             losing track of the one already in use"
+        );
+        bw_serve::stop_bw_serve(&mut child);
+        return false;
+    }
+    *bw_serve_child = Some(child);
+    true
 }
 
 /// Kicks off a background attempt to make sure `bw serve` is running,
@@ -1770,5 +1859,82 @@ mod tests {
 
         stop_backend_if_idle(&mut child, false);
         assert!(child.is_none());
+    }
+
+    #[test]
+    fn backend_task_is_wedged_is_false_while_within_the_deadline() {
+        let started = Instant::now();
+        assert!(!backend_task_is_wedged(started, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn backend_task_is_wedged_is_true_once_the_deadline_has_passed() {
+        // Regression test for final review Important 2: `run_bw_sync` has no
+        // timeout of its own, so nothing else ever notices a stalled
+        // operation on its own -- this predicate is what `main`'s loop uses
+        // to catch it. Backdating `started` rather than sleeping keeps the
+        // test instant.
+        let started = Instant::now() - Duration::from_secs(120);
+        assert!(backend_task_is_wedged(started, Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn adopt_started_child_adopts_into_an_empty_slot() {
+        let mut bw_serve_child: Option<Child> = None;
+        let child = long_lived_command().spawn().unwrap();
+
+        assert!(adopt_started_child(&mut bw_serve_child, child));
+        assert!(backend_is_running(&mut bw_serve_child));
+        kill_and_reap(&mut bw_serve_child);
+    }
+
+    #[test]
+    fn adopt_started_child_stops_a_late_arrival_instead_of_replacing_a_live_one() {
+        // Regression test for the final review's lock-recovery Minor:
+        // `open_vault_window`'s lock-recovery path can give up waiting on a
+        // backend operation
+        // (`BACKEND_OP_TIMEOUT` expiry) and start its own fresh backend
+        // before the abandoned operation's own `Ok(child)` eventually arrives
+        // through `apply_backend_op`. That late arrival must not overwrite
+        // the handle to the backend actually in use -- doing so would orphan
+        // it (`Child::drop` does not kill its process) with nothing left able
+        // to stop or restart it on purpose.
+        let mut bw_serve_child = Some(long_lived_command().spawn().unwrap());
+        let current_pid = bw_serve_child.as_ref().unwrap().id();
+
+        let late_arrival = long_lived_command().spawn().unwrap();
+        let late_pid = late_arrival.id();
+        assert!(!adopt_started_child(&mut bw_serve_child, late_arrival));
+
+        // The originally tracked child must still be the one in place...
+        assert_eq!(
+            bw_serve_child.as_ref().unwrap().id(),
+            current_pid,
+            "the live, already-tracked child must not be replaced"
+        );
+        // ...and the redundant late arrival must actually have been stopped,
+        // not merely dropped (which would leave it running, untracked).
+        // `adopt_started_child` routes it through `stop_bw_serve`, which
+        // calls `wait()` after `kill()`, so the process is already reaped by
+        // the time this assertion runs.
+        assert!(
+            !is_pid_running(late_pid),
+            "the redundant late-arriving child must be stopped, not orphaned"
+        );
+
+        kill_and_reap(&mut bw_serve_child);
+    }
+
+    /// Whether a process with the given id still exists, via `tasklist` --
+    /// used only by the `adopt_started_child` regression test above to prove
+    /// the discarded child was actually killed rather than merely dropped
+    /// (dropping a `Child` does not kill its process, which is exactly the
+    /// failure mode this test guards against).
+    fn is_pid_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .expect("tasklist must run");
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
     }
 }

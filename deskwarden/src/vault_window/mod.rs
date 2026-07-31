@@ -11,7 +11,7 @@ pub mod folder_modal;
 pub mod item_list;
 pub mod sidebar;
 
-use crate::bw_serve;
+use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
@@ -180,8 +180,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // lets the window paint immediately; `vault_loading` drives a spinner
     // until then.
     let (vault_tx, vault_rx): (
-        mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>,
-        Receiver<(Vec<VaultItem>, Vec<Folder>)>,
+        mpsc::Sender<Result<(Vec<VaultItem>, Vec<Folder>), String>>,
+        Receiver<Result<(Vec<VaultItem>, Vec<Folder>), String>>,
     ) = mpsc::channel();
     // Cloned because the update closure below move-captures both, and needs
     // its own pair to re-issue a load after each sync. `false`: the snapshot
@@ -309,25 +309,56 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // the window stays responsive (draggable, closable) throughout.
         // Also where a post-sync reload lands, so both paths share this
         // handling rather than each keeping its own copy.
-        if let Ok((loaded_items, loaded_folders)) = vault_rx.try_recv() {
-            items = loaded_items;
-            folders = loaded_folders;
-            vault_loading = false;
-            match &selected_id {
-                // Nothing selected yet (the initial load): select the first
-                // item now that there is one. This makes `selected_id !=
-                // last_selected_id` true next frame, so the existing
-                // per-selection reset block recomputes `fill_count` and
-                // friends normally rather than needing its own copy here.
-                None => selected_id = items.first().map(|i| i.id.clone()),
-                // A reload where the selected item no longer exists (deleted
-                // on another device, say): drop the stale id. Left alone,
-                // `selected_id` would keep pointing at the vanished item and
-                // leave `mode`/`reveal_password`/`totp_code` stuck as they
-                // were; clearing it routes through that same reset block.
-                Some(id) => {
-                    if !items.iter().any(|i| &i.id == id) {
-                        selected_id = None;
+        if let Ok(load_result) = vault_rx.try_recv() {
+            match load_result {
+                Ok((loaded_items, loaded_folders)) => {
+                    items = loaded_items;
+                    folders = loaded_folders;
+                    vault_loading = false;
+                    match &selected_id {
+                        // Nothing selected yet (the initial load): select the
+                        // first item now that there is one. This makes
+                        // `selected_id != last_selected_id` true next frame,
+                        // so the existing per-selection reset block
+                        // recomputes `fill_count` and friends normally rather
+                        // than needing its own copy here.
+                        None => selected_id = items.first().map(|i| i.id.clone()),
+                        // A reload where the selected item no longer exists
+                        // (deleted on another device, say): drop the stale
+                        // id. Left alone, `selected_id` would keep pointing
+                        // at the vanished item and leave
+                        // `mode`/`reveal_password`/`totp_code` stuck as they
+                        // were; clearing it routes through that same reset
+                        // block.
+                        Some(id) => {
+                            if !items.iter().any(|i| &i.id == id) {
+                                selected_id = None;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // `spawn_vault_load` couldn't refresh the snapshot
+                    // (`bw serve` never came ready, or `populate()` itself
+                    // failed) -- see that function's doc for why this must
+                    // not be silently swallowed. Whatever was already in
+                    // `items`/`folders` (the pre-refresh snapshot) is left
+                    // alone rather than cleared: this is the same
+                    // never-propagate-a-failed-populate behaviour the doc
+                    // comment already describes, just no longer silent.
+                    vault_loading = false;
+                    log::warn!("vault refresh failed; showing the last known snapshot: {e}");
+                    // Only override `sync_status` when this refresh was
+                    // following up on a sync that had itself just reported
+                    // success (final review Important 1): that is the case
+                    // where the toolbar pill would otherwise say "Synced
+                    // just now" over data that was never actually refreshed.
+                    // An initial-load failure (before any sync has run) has
+                    // no such claim to correct -- `sync_status` is still
+                    // `None` and stays that way, showing the neutral "Sync"
+                    // label rather than a misleading "failed".
+                    if matches!(sync_status, Some(Ok(()))) {
+                        sync_status = Some(Err(e));
                     }
                 }
             }
@@ -884,15 +915,8 @@ fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bo
     }
 }
 
-/// Spawns a one-shot background thread that runs `bw sync` and reports the
-/// outcome over `tx`. Shared by both the Sync button's click handler and the
-/// window's own auto-sync-on-open (see `run`, right after the `styled`
-/// first-frame guard) so the actual thread-spawn logic exists in exactly one
-/// place instead of being duplicated between them; the caller is still
-/// responsible for setting `sync_in_progress` before calling this, same as
-/// before this was extracted.
 /// Reads the whole vault (items + folders) from the cache on a one-shot
-/// background thread and reports it over `tx`.
+/// background thread and reports the outcome over `tx`.
 ///
 /// Every vault read in this window goes through here rather than being
 /// called inline. Backgrounded even though `VaultCache`'s reads themselves
@@ -900,13 +924,24 @@ fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bo
 /// it's the one path that still hits `bw serve`, pulling the entire vault in
 /// one response -- measured at ~1.1s and 1.08 MB for 1657 items against a
 /// cold backend, before the cost of deserialising all of it -- which would
-/// stall the window outright on the UI thread. A failed populate leaves
-/// whatever was already in the cache (empty, on a first load) rather than
-/// propagating: the window is already open by then, and the next sync
-/// re-issues a load anyway.
+/// stall the window outright on the UI thread.
+///
+/// A populate failure is reported as `Err`, not silently mapped to whatever
+/// is already cached. Final review Important 1: this is the same bug class
+/// `spawn_sync` was fixed for (fix wave 2) -- `open_vault_window` may have
+/// just kicked off a background `bw serve` start (save-memory mode, backend
+/// stopped) in parallel with this thread and the window's own
+/// auto-sync-on-open, and `try_start_backend`/`bw sync` succeeding says
+/// nothing about whether `bw serve`'s HTTP listener is actually up yet --
+/// that cold start (a bundled Node process) routinely takes several seconds.
+/// Without waiting for it first, `populate()` below would very often race
+/// that gap, fail with a connection error, and -- if that failure were only
+/// logged, as it used to be -- silently ship the *pre-sync* snapshot while
+/// the caller's sync status still claims success. `run` (this function's
+/// caller) uses the `Err` to correct that claim rather than just logging.
 fn spawn_vault_load(
     cache: std::sync::Arc<VaultCache>,
-    tx: mpsc::Sender<(Vec<VaultItem>, Vec<Folder>)>,
+    tx: mpsc::Sender<Result<(Vec<VaultItem>, Vec<Folder>), String>>,
     // `true` after a sync, which changes the vault underneath us: the
     // snapshot is still marked populated but is now stale, so the
     // `is_populated` short-circuit below would serve pre-sync data and the
@@ -915,16 +950,49 @@ fn spawn_vault_load(
     // whole point of the cache.
     force_refresh: bool,
 ) {
+    spawn_vault_load_with_schedule(cache, tx, force_refresh, readiness_schedule(READINESS_DEADLINE));
+}
+
+/// `spawn_vault_load`'s actual body, with the readiness schedule taken as a
+/// parameter rather than hardcoded to `readiness_schedule(READINESS_DEADLINE)`
+/// -- same split `wait_for_vault_ready`/`readiness_schedule` already use, and
+/// for the same reason: it lets a test exhaust the schedule instantly (an
+/// empty one) instead of actually waiting out the real 30s deadline.
+fn spawn_vault_load_with_schedule(
+    cache: std::sync::Arc<VaultCache>,
+    tx: mpsc::Sender<Result<(Vec<VaultItem>, Vec<Folder>), String>>,
+    force_refresh: bool,
+    schedule: Vec<Duration>,
+) {
     std::thread::spawn(move || {
         if force_refresh || !cache.is_populated() {
+            // Same wait `spawn_sync` performs before its own `populate()`
+            // (see this function's doc) -- cheap when `bw serve` is already
+            // answering (the very first attempt succeeds), and the only
+            // thing standing between "backend mid-cold-start" and a bogus
+            // connection-refused failure otherwise.
+            if let Err(e) = wait_for_vault_ready(cache.bridge(), &schedule) {
+                log::warn!("could not populate the vault cache: bw serve never became ready: {e}");
+                let _ = tx.send(Err(e));
+                return;
+            }
             if let Err(e) = cache.populate() {
                 log::warn!("could not populate the vault cache: {e:?}");
+                let _ = tx.send(Err(format!("{e:?}")));
+                return;
             }
         }
-        let _ = tx.send((cache.items(), cache.folders()));
+        let _ = tx.send(Ok((cache.items(), cache.folders())));
     });
 }
 
+/// Spawns a one-shot background thread that runs `bw sync` and reports the
+/// outcome over `tx`. Shared by both the Sync button's click handler and the
+/// window's own auto-sync-on-open (see `run`, right after the `styled`
+/// first-frame guard) so the actual thread-spawn logic exists in exactly one
+/// place instead of being duplicated between them; the caller is still
+/// responsible for setting `sync_in_progress` before calling this, same as
+/// before this was extracted.
 fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String) {
     std::thread::spawn(move || {
         let _ = tx.send(bw_serve::run_bw_sync(&session_token));
@@ -1346,5 +1414,73 @@ mod delete_confirm_tests {
         assert!(!confirm_click_at(&mut pending, "f1", after_window));
         // Re-armed, not confirmed or empty.
         assert!(pending.is_some());
+    }
+}
+
+#[cfg(test)]
+mod spawn_vault_load_tests {
+    // Regression tests for final review Important 1: a forced refresh must
+    // wait for `bw serve` to be ready before `populate()`, and a populate
+    // that never becomes ready must be reported as `Err`, not silently
+    // swallowed into "send whatever's already cached as if it were fresh".
+    use super::spawn_vault_load_with_schedule;
+    use crate::vault_bridge::VaultBridge;
+    use crate::vault_cache::VaultCache;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    fn items_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[{"id":"1","name":"A","fields":[]}]}}"#
+    }
+
+    fn folders_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[]}}"#
+    }
+
+    #[test]
+    fn a_forced_refresh_populates_and_sends_ok_when_bw_serve_is_ready() {
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        let (tx, rx) = mpsc::channel();
+        // Empty schedule: the mock answers on the very first attempt, so
+        // there is nothing to retry regardless -- this only proves an empty
+        // schedule doesn't itself block a successful readiness check.
+        spawn_vault_load_with_schedule(cache, tx, true, vec![]);
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        let (items, folders) = result.expect("bw serve was ready; load must succeed");
+        assert_eq!(items.len(), 1);
+        assert!(folders.is_empty());
+    }
+
+    #[test]
+    fn a_forced_refresh_reports_err_instead_of_stale_data_when_bw_serve_never_answers() {
+        // Nothing is listening at this URL at all, so every readiness attempt
+        // fails immediately (connection refused) -- an empty schedule means
+        // that single failure is also the last one, so this resolves fast
+        // rather than waiting out the real READINESS_DEADLINE.
+        let cache = Arc::new(VaultCache::new(VaultBridge::new("http://127.0.0.1:1")));
+        let (tx, rx) = mpsc::channel();
+        spawn_vault_load_with_schedule(cache, tx, true, vec![]);
+
+        let result = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        assert!(
+            result.is_err(),
+            "a populate that never becomes ready must be reported as a failure, not silently \
+             mapped to whatever (if anything) was already cached"
+        );
     }
 }
