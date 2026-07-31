@@ -46,9 +46,11 @@ open.
   a password-strength indicator, real website favicons, and a manual/auto
   sync — everything short of full Bitwarden-client parity, scoped to what a
   tray app plausibly needs.
-- **Nothing here re-implements vault security.** Every credential read or
-  write goes through the official Bitwarden CLI's local `bw serve` bridge;
-  deskwarden never touches encryption, key derivation, or sync logic itself.
+- **Nothing here re-implements vault security.** Credentials originate only
+  from the official Bitwarden CLI's local `bw serve` bridge, and all writes
+  and sync go through it; reads are served from an in-memory snapshot of what
+  the CLI returned, held only while the vault is unlocked. deskwarden never
+  touches encryption, key derivation, or sync logic itself.
 
 ## Stack, and why
 

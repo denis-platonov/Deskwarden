@@ -13,9 +13,11 @@ runs quietly in the system tray, watches which window comes to the foreground,
 matches its process name against your vault items, and types the matching
 username and password into the app using UI Automation (with a simulated
 keystroke fallback for windows that don't expose a usable automation tree). It
-never touches your vault's encryption: all vault access goes through the
+never touches your vault's encryption: credentials originate only from the
 official Bitwarden CLI's local `bw serve` HTTP bridge, running as a separate
-process on your own machine.
+process on your own machine, and all writes and sync go through it; reads are
+served from an in-memory snapshot of what the CLI returned, held only while
+the vault is unlocked.
 
 ## Requirements
 
@@ -93,6 +95,11 @@ a previous run).
   visible to other processes), and its buffer is wiped after use.
 - The cached session token is encrypted at rest with DPAPI, and decrypted
   copies are wiped from memory after use.
+- While the vault is unlocked, deskwarden holds an in-memory snapshot of your
+  vault items, so it can serve reads without `bw serve` running. This
+  snapshot is dropped when the vault locks and when the app quits, but unlike
+  the master password and session token, it is not individually zeroized on
+  drop.
 - `bw serve` binds only to localhost and is placed in a Windows job object that
   terminates it if this app exits for any reason — including a crash — so an
   unlocked vault is never left served in the background.
