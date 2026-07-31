@@ -8,6 +8,7 @@ use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::match_engine::MatchEngine;
 use crate::overlay_ui;
 use crate::vault_bridge::{extract_app_match, VaultBridge, VaultError, VaultItem};
+use crate::vault_cache::VaultCache;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -112,16 +113,32 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 
 /// Fetches the item's credentials and injects them into `hwnd`.
 ///
-/// Fetches the *single* item by id rather than pulling and scanning the whole
-/// vault, which is what a fill used to do on every keystroke-worth of work.
+/// Reads from `VaultCache`'s in-memory snapshot rather than `bw serve`
+/// directly -- this is the path that makes autofill work with the backend
+/// fully stopped (see `backend_policy` and `vault_cache`'s module docs): a
+/// keystroke-triggered fill used to be an HTTP round-trip to a process this
+/// app might no longer even be running. An empty cache while the vault is
+/// genuinely unlocked should not happen (`main` populates it once per
+/// unlock), so a miss falls back to the bridge -- serving the fill rather
+/// than failing it outright -- and logs a warning, since a miss here is a
+/// bug signal worth noticing rather than silently swallowing.
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
-    vault: &VaultBridge,
+    cache: &VaultCache,
     injector: &Injector<A, B>,
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     hwnd: isize,
 ) {
-    match vault.get_item(item_id) {
+    let item = cache
+        .items()
+        .into_iter()
+        .find(|i| i.id == item_id)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            log::warn!("cache miss for item {item_id} during a fill; falling back to bw serve");
+            cache.bridge().get_item(item_id)
+        });
+    match item {
         Ok(item) => {
             let (username, password) = credentials_for(&item);
             if username.is_empty() && password.is_empty() {
@@ -144,7 +161,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
 /// returns it so the main loop's separate `fill_hotkey_pressed` check can
 /// fill it later, once the user actually presses the fill hotkey.
 pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
-    vault: &VaultBridge,
+    cache: &VaultCache,
     injector: &Injector<A, B>,
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
@@ -154,7 +171,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
 ) -> Option<(String, isize)> {
     match m.trigger {
         TriggerMode::Auto => {
-            fill_from_vault(vault, injector, fill_stats, item_id, hwnd);
+            fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
             None
         }
         TriggerMode::Prompt => {
@@ -164,12 +181,19 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // not fatal to the prompt -- the overlay just can't name the
             // credentials -- and the fill path re-fetches on its own anyway.
             //
+            // This one deliberately stays on `cache.bridge()` rather than
+            // `cache.items()`: it's cosmetic (the overlay's label), not the
+            // fill itself, so it isn't worth the same cache-miss fallback
+            // dance `fill_from_vault` does -- a failed read here just means a
+            // slightly less informative overlay, handled by the existing
+            // `.ok()`.
+            //
             // The username is read straight off the login object rather than
             // through `credentials_for`: that helper also clones the
             // plaintext password into a `String` this path has no use for,
             // and which would then be dropped without being zeroized. The
             // overlay never shows a password, so it should never hold one.
-            let matched = vault.get_item(item_id).ok().map(|item| {
+            let matched = cache.bridge().get_item(item_id).ok().map(|item| {
                 let username = item.login.as_ref().and_then(|l| l.username.clone());
                 overlay_ui::OverlayMatch {
                     item_name: item.name.clone(),
@@ -178,7 +202,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             });
             if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref(), overlay_position(hwnd))
             {
-                fill_from_vault(vault, injector, fill_stats, item_id, hwnd);
+                fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
             }
             None
         }

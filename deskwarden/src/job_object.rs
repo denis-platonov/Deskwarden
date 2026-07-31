@@ -36,6 +36,24 @@ pub struct KillOnCloseJob {
     handle: HANDLE,
 }
 
+// `HANDLE` wraps a `*mut c_void`, and raw pointers unconditionally opt out of
+// the auto-derived `Send`/`Sync` -- reasonably, since in general a raw
+// pointer might alias memory another thread could race on. That general
+// caution doesn't apply to a Win32 handle: it's an opaque kernel-object
+// token, not a pointer this process ever dereferences, and every operation
+// `KillOnCloseJob` performs with it (`AssignProcessToJobObject` in `assign`,
+// `CloseHandle` in `Drop`) is documented as safe to call from any thread, on
+// the same handle value, without external synchronization -- the kernel
+// serializes access to the job object itself. `assign` only ever takes
+// `&self`, so `Sync` is what's actually load-bearing; `Send` is added too
+// since a value that's safe to share is safe to hand to a single other
+// thread. This is what lets `main.rs`'s `open_vault_window` start `bw serve`
+// on a background thread -- borrowing this job object across the scoped
+// thread boundary -- without blocking the vault window's first paint on the
+// backend's cold start.
+unsafe impl Send for KillOnCloseJob {}
+unsafe impl Sync for KillOnCloseJob {}
+
 impl KillOnCloseJob {
     /// Creates an unnamed job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
     pub fn new() -> windows::core::Result<Self> {

@@ -23,6 +23,8 @@
 use deskwarden::overlay_ui::{show_prompt_overlay, OverlayMatch};
 use deskwarden::picker_ui::run_picker;
 use deskwarden::vault_bridge::VaultBridge;
+use deskwarden::vault_cache::VaultCache;
+use std::sync::Arc;
 
 fn main() {
     let search = std::env::args().nth(1);
@@ -31,6 +33,10 @@ fn main() {
     let items = vault
         .list_items()
         .expect("failed to list vault items -- is `bw serve --port 8087` running and unlocked?");
+    // `run_picker` now writes through the cache (Task 5), not the bridge
+    // directly -- see its doc comment for why -- so it needs one to exist.
+    let cache = Arc::new(VaultCache::new(vault.clone()));
+    cache.populate().expect("failed to populate the vault cache");
 
     let target = match &search {
         Some(term) => items
@@ -42,7 +48,7 @@ fn main() {
     println!("Using vault item: {} ({})", target.name, target.id);
 
     println!("Opening picker window...");
-    match run_picker(vault.clone(), target.clone(), None) {
+    match run_picker(cache.clone(), target.clone(), None) {
         Some(m) => println!(
             "Saved AppMatch: process={} trigger={:?}",
             m.process, m.trigger

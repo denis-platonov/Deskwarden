@@ -26,6 +26,7 @@
 use deskwarden::app::{
     fill_from_vault, handle_match, match_entries, pump_windows_messages, refresh_match_engine,
 };
+use deskwarden::backend_policy;
 use deskwarden::bw_serve::{
     self, readiness_schedule, wait_for_vault_ready, BW_SERVE_URL, READINESS_DEADLINE,
 };
@@ -240,17 +241,24 @@ fn main() {
     };
 
     let vault = VaultBridge::new(BW_SERVE_URL);
-    // The vault window's reads and writes go through this in-memory snapshot
-    // rather than straight to `bw serve` -- see `vault_cache`'s module doc.
-    // Built once, here, wrapping the same bridge everything else in `main`
-    // still uses directly (startup's readiness check, the picker, the match
-    // engine refresh) -- this task only moves the vault *window* onto the
-    // cache; those other call sites, and the cache's own lock/quit lifecycle,
-    // are for a later task.
+    // The vault window's reads and writes, and now autofill's own reads (see
+    // `app::fill_from_vault`), go through this in-memory snapshot rather than
+    // straight to `bw serve` -- see `vault_cache`'s module doc. Built once,
+    // here, wrapping the same bridge everything else in `main` still uses
+    // directly: startup's readiness check, the picker's item list, and the
+    // periodic match-engine refresh all still want the live server rather
+    // than a snapshot that's deliberately not re-fetched on every read.
     let cache = Arc::new(VaultCache::new(vault.clone()));
     let mut engine = MatchEngine::new();
 
-    let mut bw_serve_child = start_backend(&session_token, job.as_ref());
+    // `Option` rather than a plain `Child`: with `keep_backend_running`
+    // turned off, the backend is only up while the vault window is open (see
+    // `backend_policy::should_run`), so "not currently running" has to be
+    // representable. Always `Some` here at startup -- `start_backend` starts
+    // it unconditionally, since something has to answer the very first
+    // `wait_for_vault_ready_with_spinner` call below regardless of the
+    // setting.
+    let mut bw_serve_child: Option<Child> = Some(start_backend(&session_token, job.as_ref()));
 
     // `bw serve` is a bundled Node binary: its cold start regularly takes
     // several seconds, far longer than the fixed 500ms sleep this replaces.
@@ -265,7 +273,9 @@ fn main() {
             // before giving up rather than exiting on a recoverable problem.
             log::error!("{e}");
             log::warn!("retrying once after a fresh login, in case the session was rejected");
-            bw_serve::stop_bw_serve(&mut bw_serve_child);
+            if let Some(child) = bw_serve_child.as_mut() {
+                bw_serve::stop_bw_serve(child);
+            }
             session_token = reauthenticate(&store);
             // The longer grace: we just killed our own `bw serve`, and the
             // user just retyped their master password. Give the socket real
@@ -275,7 +285,7 @@ fn main() {
                 job.as_ref(),
                 bw_serve::PORT_RELEASE_GRACE_RESTART,
             ) {
-                Ok(child) => child,
+                Ok(child) => Some(child),
                 Err(e) => {
                     log::error!("{e}");
                     fatal_startup_error(&format!(
@@ -290,7 +300,9 @@ fn main() {
                 Ok(items) => items,
                 Err(e) => {
                     log::error!("{e}");
-                    bw_serve::stop_bw_serve(&mut bw_serve_child);
+                    if let Some(child) = bw_serve_child.as_mut() {
+                        bw_serve::stop_bw_serve(child);
+                    }
                     fatal_startup_error(&format!(
                         "Deskwarden's Bitwarden backend started but never became usable, so \
                          there is nothing to match your apps against.\n\n{e}\n\nFull details \
@@ -301,6 +313,17 @@ fn main() {
             }
         }
     };
+
+    // One fetch per unlock. Everything downstream -- the match engine, the
+    // vault window, autofill -- reads this snapshot rather than re-fetching.
+    // Separate from the `items` just resolved above (which only fed the
+    // match engine build below): this call also pulls folders, and keeping
+    // the readiness probe and the cache population as two distinct steps
+    // means a slow/failing populate can't be confused with a backend that
+    // never came up in the first place.
+    if let Err(e) = cache.populate() {
+        log::warn!("could not populate the vault cache at startup: {e:?}");
+    }
 
     let entries = match_entries(&items);
     log::info!("match engine loaded with {} app match(es)", entries.len());
@@ -452,7 +475,7 @@ fn main() {
         }
         process_foreground_event(
             &event,
-            &vault,
+            &cache,
             &injector,
             &fill_stats,
             &engine,
@@ -482,14 +505,21 @@ fn main() {
                 // process may already be gone (e.g. crashed, or killed
                 // externally), so a `kill()` error is expected and ignored
                 // rather than treated as fatal.
+                //
+                // The cache is cleared for the same reason, one level up:
+                // decrypted vault contents shouldn't outlive the moment the
+                // user asked to quit, even for the instant between here and
+                // `process::exit` actually tearing the process down.
                 log::info!("quit requested from tray; killing bw serve");
-                bw_serve::stop_bw_serve(&mut bw_serve_child);
+                cache.clear();
+                if let Some(child) = bw_serve_child.as_mut() {
+                    bw_serve::stop_bw_serve(child);
+                }
                 std::process::exit(0);
             }
 
             if event.id == tray.open_vault_id {
                 open_vault_window(
-                    &vault,
                     &cache,
                     &fill_stats,
                     &injector,
@@ -503,6 +533,7 @@ fn main() {
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
+                    settings.keep_backend_running,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -512,7 +543,7 @@ fn main() {
                 // from, then choose the process to attach to it.
                 if let Some(item) = picker_ui::pick_vault_item(&vault) {
                     log::info!("adding an app match to vault item {}", item.id);
-                    match picker_ui::run_picker(vault.clone(), item, last_active_pid) {
+                    match picker_ui::run_picker(cache.clone(), item, last_active_pid) {
                         Some(m) => {
                             log::info!("saved app match for {} ({:?})", m.process, m.trigger);
                             // Make the new match live immediately rather than
@@ -589,7 +620,6 @@ fn main() {
         if let Some(event) = tray::next_tray_icon_event() {
             if tray::is_left_click(&event) {
                 open_vault_window(
-                    &vault,
                     &cache,
                     &fill_stats,
                     &injector,
@@ -603,6 +633,7 @@ fn main() {
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
+                    settings.keep_backend_running,
                 );
                 last_dispatched_hwnd = None;
             }
@@ -618,7 +649,7 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    fill_from_vault(&vault, &injector, &fill_stats, &item_id, hwnd);
+                    fill_from_vault(&cache, &injector, &fill_stats, &item_id, hwnd);
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
@@ -669,7 +700,21 @@ fn main() {
                         _ => {
                             if action == bw_serve::RecoveryAction::Reauthenticate {
                                 log::warn!("session is now {status:?}; re-authenticating");
-                                bw_serve::stop_bw_serve(&mut bw_serve_child);
+                                // Same reasoning as the vault window's own
+                                // lock handling (see `open_vault_window`):
+                                // re-authenticating here can land on a
+                                // *different* account than the one this
+                                // snapshot was built from (another `bw lock`,
+                                // a password change, a different sign-in
+                                // entirely), and this path is reachable
+                                // without the vault window ever having been
+                                // opened. Left uncleared, the next fill or
+                                // window open would silently serve the
+                                // previous account's items.
+                                cache.clear();
+                                if let Some(child) = bw_serve_child.as_mut() {
+                                    bw_serve::stop_bw_serve(child);
+                                }
                                 session_token = reauthenticate(&store);
                                 // The login window we just showed stole and
                                 // released foreground, exactly like the tray
@@ -685,7 +730,9 @@ fn main() {
                                      backend",
                                     bw_serve::BW_SERVE_PORT
                                 );
-                                bw_serve::stop_bw_serve(&mut bw_serve_child);
+                                if let Some(child) = bw_serve_child.as_mut() {
+                                    bw_serve::stop_bw_serve(child);
+                                }
                             }
 
                             // Deliberately *not* fatal, and deliberately more
@@ -701,7 +748,7 @@ fn main() {
                                 bw_serve::PORT_RELEASE_GRACE_RESTART,
                             ) {
                                 Ok(child) => {
-                                    bw_serve_child = child;
+                                    bw_serve_child = Some(child);
                                     match wait_for_vault_ready(&vault, &schedule) {
                                         Ok(items) => {
                                             let entries = match_entries(&items);
@@ -786,12 +833,17 @@ fn main() {
             match outcome {
                 Ok(()) => {
                     // Same shutdown path as the Quit handler above: kill
-                    // `bw serve` explicitly before exiting so the installer
-                    // (which replaces and relaunches this binary) doesn't
-                    // leave an orphaned backend serving the unlocked vault
-                    // behind.
+                    // `bw serve` and clear the cache explicitly before
+                    // exiting so the installer (which replaces and
+                    // relaunches this binary) doesn't leave an orphaned
+                    // backend serving the unlocked vault, or decrypted vault
+                    // contents sitting in this process's memory a moment
+                    // longer than it takes to tear down.
                     log::info!("update installer launched; shutting down for update");
-                    bw_serve::stop_bw_serve(&mut bw_serve_child);
+                    cache.clear();
+                    if let Some(child) = bw_serve_child.as_mut() {
+                        bw_serve::stop_bw_serve(child);
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
@@ -813,7 +865,7 @@ fn main() {
             }
             process_foreground_event(
                 &event,
-                &vault,
+                &cache,
                 &injector,
                 &fill_stats,
                 &engine,
@@ -977,9 +1029,14 @@ fn describe_signer(subject_dn: Option<&str>) -> String {
 
 /// Applies the dispatch rules to one foreground event and, if it survives
 /// them, matches and dispatches it.
+///
+/// Takes the cache, not the bridge -- `handle_match` (and the `fill_from_vault`
+/// it may call) reads the vault from `VaultCache`'s snapshot rather than
+/// hitting `bw serve` directly, which is what lets autofill keep working with
+/// the backend stopped (see `backend_policy`).
 fn process_foreground_event(
     event: &window_watch::ForegroundEvent,
-    vault: &VaultBridge,
+    cache: &VaultCache,
     injector: &Injector<RealUiAutomation, RealSendInput>,
     fill_stats: &fill_stats::FillStats,
     engine: &MatchEngine,
@@ -1027,7 +1084,7 @@ fn process_foreground_event(
             m.trigger
         );
         if let Some(armed) =
-            handle_match(vault, injector, fill_stats, item_id, m, event.hwnd, &event.exe_name)
+            handle_match(cache, injector, fill_stats, item_id, m, event.hwnd, &event.exe_name)
         {
             *pending_hotkey_fill = Some(armed);
         }
@@ -1073,15 +1130,20 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
 /// the startup retry path: `stop_bw_serve` on the old child ->
 /// `reauthenticate` -> `try_start_backend` -> `wait_for_vault_ready_with_spinner`
-/// -> rebuild the match engine) exists in exactly one place.
+/// -> rebuild the match engine) exists in exactly one place. For the same
+/// reason, this is also where the `backend_policy` lifecycle around a window
+/// open/close is applied -- both callers need it, so it belongs here rather
+/// than being duplicated at each tray event handler.
+///
+/// Takes `cache`, not a separate `vault: &VaultBridge` -- `cache.bridge()` is
+/// that same bridge, so a second parameter would just be another name for it.
 #[allow(clippy::too_many_arguments)]
 fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
-    vault: &VaultBridge,
     cache: &Arc<VaultCache>,
     fill_stats: &deskwarden::fill_stats::FillStats,
     injector: &Injector<A, B>,
     session_token: &mut String,
-    bw_serve_child: &mut Child,
+    bw_serve_child: &mut Option<Child>,
     job: Option<&job_object::KillOnCloseJob>,
     store: &session_store::SessionStore,
     schedule: &[Duration],
@@ -1097,6 +1159,10 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // single open.
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
     auto_lock: Duration,
+    // `Settings::keep_backend_running`, passed by value rather than the
+    // whole `Settings` so this function doesn't need to know about anything
+    // else in it.
+    keep_backend_running: bool,
 ) {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
@@ -1106,34 +1172,79 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // common (already-cached) case, and what lets the *next* open skip the
     // spawn too when this call itself was the one that had to fall back.
     *cached_status_details = Some(status_details.clone());
-    let result = vault_window::run(
-        cache.clone(),
-        fill_stats.clone(),
-        injector,
-        status_details.server_url,
-        status_details.user_email,
-        session_token.clone(),
-        icon_cache_dir.to_path_buf(),
-        auto_lock,
-    );
+
+    // `backend_policy::should_run(_, vault_window_open = true)` is always
+    // `true` -- a window is about to be open -- so the only question is
+    // whether `bw serve` is already up. It won't be if save-memory mode tore
+    // it down after the previous window closed. Started on a scoped
+    // background thread rather than awaited here, so `vault_window::run`
+    // below -- which paints entirely from `cache` -- shows up immediately
+    // instead of making the click that opened it wait out `bw serve`'s ~8s
+    // cold start; that start overlaps with whatever the user does first
+    // (search, navigate) instead of blocking it. Scoped (not a bare
+    // `std::thread::spawn`) for the same reason `wait_for_vault_ready_with_
+    // spinner` above is: the worker only needs to borrow `session_token` and
+    // `job` for the length of this call, not `'static` ownership of them.
+    let result = std::thread::scope(|scope| {
+        let backend_handle = bw_serve_child.is_none().then(|| {
+            let token = session_token.clone();
+            scope.spawn(move || {
+                try_start_backend(&token, job, bw_serve::PORT_RELEASE_GRACE_RESTART)
+            })
+        });
+
+        let result = vault_window::run(
+            cache.clone(),
+            fill_stats.clone(),
+            injector,
+            status_details.server_url,
+            status_details.user_email,
+            session_token.clone(),
+            icon_cache_dir.to_path_buf(),
+            auto_lock,
+        );
+
+        if let Some(handle) = backend_handle {
+            match handle.join() {
+                Ok(Ok(child)) => *bw_serve_child = Some(child),
+                Ok(Err(e)) => log::error!(
+                    "could not start bw serve for the vault window (writes and TOTP will fail \
+                     until the next restart attempt; reads still work from the cache): {e}"
+                ),
+                Err(_) => log::error!("bw serve startup thread panicked"),
+            }
+        }
+
+        result
+    });
 
     if result.locked {
         // The vault window locked itself (manual Lock button or its own
         // auto-lock timer), which invalidates `bw serve`'s session exactly
         // the same way a rejected cached session does at startup.
         log::info!("vault window locked itself; re-authenticating");
-        bw_serve::stop_bw_serve(bw_serve_child);
+        // The account the *next* unlock lands on may not be this one (a
+        // "Log out" followed by a different sign-in), so the snapshot built
+        // from this account must not survive into that one. Left populated,
+        // the next window open -- or the next autofill, straight from
+        // `cache.items()` -- would silently serve this account's items and
+        // passwords under the new session, indefinitely if `bw sync` then
+        // fails offline.
+        cache.clear();
+        if let Some(child) = bw_serve_child.as_mut() {
+            bw_serve::stop_bw_serve(child);
+        }
         *session_token = reauthenticate(store);
-        // The account may have changed (a "Log out" followed by a different
-        // sign-in) -- drop the cached email/server so the *next* open
-        // re-fetches instead of showing a stale account in the toolbar.
+        // Drop the cached email/server too, for the same reason: the *next*
+        // open must re-fetch rather than show a stale account in the
+        // toolbar.
         *cached_status_details = None;
         *bw_serve_child = match try_start_backend(
             session_token,
             job,
             bw_serve::PORT_RELEASE_GRACE_RESTART,
         ) {
-            Ok(child) => child,
+            Ok(child) => Some(child),
             Err(e) => {
                 log::error!("{e}");
                 fatal_startup_error(&format!(
@@ -1143,8 +1254,8 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 ));
             }
         };
-        match wait_for_vault_ready_with_spinner(vault, schedule) {
-            Ok(_items) => match refresh_match_engine(vault, engine) {
+        match wait_for_vault_ready_with_spinner(cache.bridge(), schedule) {
+            Ok(_items) => match refresh_match_engine(cache.bridge(), engine) {
                 Ok(count) => {
                     log::info!("match engine refreshed after unlock: {count} app match(es)")
                 }
@@ -1152,7 +1263,9 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             },
             Err(e) => {
                 log::error!("{e}");
-                bw_serve::stop_bw_serve(bw_serve_child);
+                if let Some(child) = bw_serve_child.as_mut() {
+                    bw_serve::stop_bw_serve(child);
+                }
                 fatal_startup_error(&format!(
                     "Deskwarden's Bitwarden backend did not come back up after the vault \
                      window locked.\n\n{e}\n\nFull details are in:\n{}",
@@ -1160,6 +1273,15 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 ));
             }
         }
+    } else if !backend_policy::should_run(keep_backend_running, false) {
+        // The window closed normally (not locked), and the policy for "no
+        // vault window open" says the backend shouldn't be running -- i.e.
+        // save-memory mode. Tear it down now that nothing needs it; reads
+        // stay served from `cache` regardless.
+        if let Some(child) = bw_serve_child.as_mut() {
+            bw_serve::stop_bw_serve(child);
+        }
+        *bw_serve_child = None;
     }
 }
 

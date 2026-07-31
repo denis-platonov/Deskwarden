@@ -14,6 +14,20 @@ use std::time::Duration;
 /// until the 3e preferences window exists".
 const DEFAULT_AUTO_LOCK_MINUTES: u64 = 15;
 
+/// Floor applied to `auto_lock_minutes` by `auto_lock_timeout`, regardless of
+/// what's stored on disk.
+///
+/// `0` is the natural value to hand-write into `settings.json` for "never
+/// lock", but `auto_lock_timeout`'s result feeds `vault_window::run`'s
+/// `last_activity.elapsed() >= auto_lock` check, where a zero-length timeout
+/// is true on the very first frame -- the window would close itself with
+/// `locked = true` before the user can do anything, on every single open,
+/// forcing a fresh master-password re-auth each time. There's no "never
+/// lock" mode in this app (see the design spec), so a zero or corrupt value
+/// is clamped up to the shortest lock period that's still usable rather than
+/// being treated as meaningful.
+const MIN_AUTO_LOCK_MINUTES: u64 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -50,7 +64,16 @@ impl Settings {
     }
 
     pub fn auto_lock_timeout(&self) -> Duration {
-        Duration::from_secs(self.auto_lock_minutes * 60)
+        // `.max(MIN_AUTO_LOCK_MINUTES)` first, so the floor applies to the
+        // stored value itself rather than to a possibly-already-overflowed
+        // product. `saturating_mul` handles the separate case of an absurdly
+        // large stored value (a corrupt or hand-edited file): plain `* 60`
+        // would overflow `u64` and panic in a debug build (or silently wrap
+        // to a tiny duration in release), where saturating to
+        // `Duration::from_secs(u64::MAX)` -- effectively forever -- is a far
+        // safer failure mode for a *lock* timeout to have.
+        let minutes = self.auto_lock_minutes.max(MIN_AUTO_LOCK_MINUTES);
+        Duration::from_secs(minutes.saturating_mul(60))
     }
 }
 
@@ -108,5 +131,33 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(Settings::load(&path), Settings::default());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zero_minutes_clamps_to_the_minimum_instead_of_locking_instantly() {
+        // The regression this guards: `0 * 60 == 0`, and a zero-length
+        // timeout is already elapsed on the vault window's very first frame,
+        // closing it immediately with `locked = true` and forcing a fresh
+        // re-auth on every open.
+        let s = Settings { auto_lock_minutes: 0, ..Settings::default() };
+        assert_eq!(
+            s.auto_lock_timeout(),
+            Duration::from_secs(MIN_AUTO_LOCK_MINUTES * 60)
+        );
+    }
+
+    #[test]
+    fn a_normal_value_is_used_as_is() {
+        let s = Settings { auto_lock_minutes: 5, ..Settings::default() };
+        assert_eq!(s.auto_lock_timeout(), Duration::from_secs(5 * 60));
+    }
+
+    #[test]
+    fn an_absurd_value_saturates_instead_of_overflowing() {
+        // A hand-edited (or corrupted) settings.json could contain anything
+        // that fits in a u64; `* 60` on the largest of those would overflow
+        // rather than produce a meaningful timeout.
+        let s = Settings { auto_lock_minutes: u64::MAX, ..Settings::default() };
+        assert_eq!(s.auto_lock_timeout(), Duration::from_secs(u64::MAX));
     }
 }

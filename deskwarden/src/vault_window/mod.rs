@@ -666,10 +666,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                             let windows = crate::window_list::list_windows(std::process::id());
                                             match crate::app::find_window_for_process(&windows, &app_match.process) {
                                                 // fill_from_vault does its own credential lookup
-                                                // and the fill in one call -- nothing else here
-                                                // needs to touch `injector` directly.
+                                                // (from the cache, not `bw serve` -- see its doc
+                                                // comment) and the fill in one call -- nothing
+                                                // else here needs to touch `injector` directly.
                                                 Some(target) => crate::app::fill_from_vault(
-                                                    cache.bridge(),
+                                                    &cache,
                                                     &injector,
                                                     &fill_stats,
                                                     &item.id,

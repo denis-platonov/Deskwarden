@@ -2,11 +2,13 @@ use crate::app_match::{AppMatch, TriggerMode};
 use crate::icon;
 use crate::theme;
 use crate::vault_bridge::{VaultBridge, VaultItem};
+use crate::vault_cache::VaultCache;
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SPI_GETWORKAREA,
@@ -357,16 +359,27 @@ fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
 
 /// Opens a blocking egui window that lets the user search open windows, pick
 /// one, choose a trigger mode, and save the resulting `AppMatch` onto
-/// `target_item` via `vault.set_app_match`.
+/// `target_item` via `cache.set_app_match`.
 ///
 /// Returns `Some(AppMatch)` if the user clicked Save and the vault write
 /// succeeded, or `None` if the user cancelled (or Save was clicked without a
 /// selection, or the vault write failed).
 ///
-/// Takes ownership of `vault` and `target_item` (rather than borrowing) because
-/// `eframe::run_simple_native`'s update closure is `FnMut + 'static` and must
-/// `move`-capture everything it uses; callers clone a `VaultBridge` and
-/// `VaultItem` before calling this.
+/// Takes `Arc<VaultCache>` rather than a bare `VaultBridge` reference so the
+/// save updates the shared snapshot, not just the server: reads (the vault
+/// window's item list, and now autofill's `fill_from_vault`) are served from
+/// `VaultCache`, so writing straight to the bridge here would leave the
+/// snapshot holding the pre-match copy of `target_item`. The next edit made
+/// to that item from the vault window -- before any refresh -- would then
+/// read the stale cached copy, apply its change on top of it, and PUT that
+/// whole object back, silently deleting the app-match field this function
+/// just told the server to save. See `VaultCache::set_app_match`'s own doc
+/// comment for the general form of this hazard.
+///
+/// Takes ownership of `cache` and `target_item` (rather than borrowing)
+/// because `eframe::run_simple_native`'s update closure is `FnMut + 'static`
+/// and must `move`-capture everything it uses; callers clone the `Arc` and
+/// the `VaultItem` before calling this.
 ///
 /// `default_pid` is the process id of whatever window was active right
 /// before "Add app..." was invoked (see `main`'s `last_active_pid`
@@ -374,7 +387,7 @@ fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
 /// with it pre-selected *and* the search box pre-filled with its name -- the
 /// common case (matching the app you were just using) needs no typing at
 /// all, while the search box stays live to pick something else.
-pub fn run_picker(vault: VaultBridge, target_item: VaultItem, default_pid: Option<u32>) -> Option<AppMatch> {
+pub fn run_picker(cache: Arc<VaultCache>, target_item: VaultItem, default_pid: Option<u32>) -> Option<AppMatch> {
     let windows: Vec<WindowInfo> = window_list::list_windows(std::process::id());
 
     // The update closure must `move`-capture its state (it's FnMut + 'static
@@ -499,7 +512,7 @@ pub fn run_picker(vault: VaultBridge, target_item: VaultItem, default_pid: Optio
                                     process: w.exe_name.clone(),
                                     trigger,
                                 };
-                                match vault.set_app_match(&target_item, &m) {
+                                match cache.set_app_match(&target_item, &m) {
                                     Ok(()) => *result_for_closure.borrow_mut() = Some(m),
                                     Err(e) => {
                                         log::error!(
