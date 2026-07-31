@@ -1462,7 +1462,7 @@ fn backend_is_running(child: &mut Option<Child>) -> bool {
 /// ask for it explicitly instead; this function only ever tears it back
 /// down again afterwards once the policy says it's no longer needed.
 fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running: bool) {
-    if backend_policy::should_run(keep_backend_running, false) {
+    if backend_policy::should_run(keep_backend_running) {
         return;
     }
     if backend_is_running(bw_serve_child) {
