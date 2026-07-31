@@ -28,7 +28,10 @@ impl EditDraft {
         Self {
             name: item.name.clone(),
             username: login.and_then(|l| l.username.clone()).unwrap_or_default(),
-            password: login.and_then(|l| l.password.clone()).unwrap_or_default(),
+            password: login
+                .and_then(|l| l.password.as_deref())
+                .map(|p| p.to_owned())
+                .unwrap_or_default(),
             folder_id: item.folder_id.clone(),
             reveal_password: false,
         }
@@ -56,7 +59,11 @@ impl EditDraft {
         updated.folder_id = self.folder_id.clone();
         let mut login = updated.login.unwrap_or_default();
         login.username = if self.username.is_empty() { None } else { Some(self.username.clone()) };
-        login.password = if self.password.is_empty() { None } else { Some(self.password.clone()) };
+        login.password = if self.password.is_empty() {
+            None
+        } else {
+            Some(self.password.clone().into())
+        };
         updated.login = Some(login);
         updated
     }
@@ -167,7 +174,7 @@ mod tests {
             fields: vec![],
             login: Some(LoginData {
                 username: Some("a@b.com".into()),
-                password: Some("p".into()),
+                password: Some("p".to_string().into()),
                 totp: Some("SEED".into()),
                 uris: vec![UriEntry { uri: Some("https://ledgerline.example".into()), other: serde_json::Map::new() }],
                 other: login_other,

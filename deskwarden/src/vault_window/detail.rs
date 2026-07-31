@@ -101,7 +101,10 @@ pub fn draw_detail_read(
     let mut action = DetailAction::None;
     let login = item.login.as_ref();
     let username = login.and_then(|l| l.username.as_deref()).unwrap_or("");
-    let password = login.and_then(|l| l.password.as_deref()).unwrap_or("");
+    let password = login
+        .and_then(|l| l.password.as_deref())
+        .map(|p| p.as_str())
+        .unwrap_or("");
 
     ui.horizontal(|ui| {
         match icon {

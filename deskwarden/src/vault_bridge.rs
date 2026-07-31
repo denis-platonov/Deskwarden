@@ -1,6 +1,7 @@
 use crate::app_match::{AppMatch, APP_MATCH_FIELD_NAME};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultField {
@@ -24,8 +25,18 @@ pub struct VaultField {
 pub struct LoginData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// `Zeroizing<String>` rather than a plain `String`: `VaultCache::items`
+    /// hands callers a clone of the whole snapshot (the vault window keeps
+    /// one open, `app::fill_from_vault`/`handle_match` make short-lived
+    /// ones), so a plaintext password wrapped this way wipes itself on
+    /// *every* one of those clones' drops, not just `VaultCache::clear`'s
+    /// own copy -- zeroizing only `clear`'s copy would be a false sense of
+    /// security while the others are still resident. `Zeroizing<Z>`
+    /// (de)serializes exactly like `Z` (the `zeroize` crate's `serde`
+    /// feature, enabled in `Cargo.toml`), so this changes nothing about the
+    /// wire format `bw serve` sends or receives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
+    pub password: Option<Zeroizing<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub totp: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -518,7 +529,7 @@ mod tests {
         assert_eq!(item.id, "abc");
         let login = item.login.unwrap();
         assert_eq!(login.username.as_deref(), Some("u"));
-        assert_eq!(login.password.as_deref(), Some("p"));
+        assert_eq!(login.password.as_deref().map(|p| p.as_str()), Some("p"));
     }
 
     #[test]

@@ -64,7 +64,13 @@ eframe = { version = "0.35", default-features = false, features = [
 global-hotkey = "0.6"
 log = "0.4"
 env_logger = "0.11"
-zeroize = "1"
+# "serde" feature: LoginData.password is Zeroizing<String> (see
+# vault_bridge.rs), so every clone of it self-wipes on drop -- items()
+# hands out clones of the whole vault, so zeroizing only VaultCache::clear's
+# own copy would be a false sense of security. Zeroizing<T>'s Serialize/
+# Deserialize impls (this feature) delegate straight to T's, so the wire
+# format is unchanged.
+zeroize = { version = "1", features = ["serde"] }
 semver = "1"
 # Windows Hello quick unlock (src/hello.rs): the master password is sealed
 # with AES-256-GCM under a key derived (SHA-256) from a Windows Hello
