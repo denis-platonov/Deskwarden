@@ -70,7 +70,9 @@ figures, not estimates.
 deskwarden depends on the official Bitwarden CLI (`bw serve`, a bundled Node
 runtime) for all real vault work, spawned as its own subprocess. That
 process's footprint isn't something deskwarden's own code controls, so it's
-broken out separately below rather than hidden inside one number.
+broken out separately below rather than hidden inside one number. The `bw serve`
+backend's memory footprint grows as it serves — the figure below is steady-state
+after serving a real vault, not a fresh-startup reading.
 
 **RAM** — private working set (the same figure Windows Task Manager's
 "Memory" column shows: resident memory unique to that process, excluding
@@ -83,17 +85,21 @@ you can verify yourself in Task Manager:
 | | Tray only | Window open |
 | --- | --- | --- |
 | **deskwarden.exe** (own process) | 44 MB | 52 MB |
-| `bw serve` (bundled CLI, unavoidable) | 76 MB | 80 MB |
-| **deskwarden total** | **120 MB** | **132 MB** |
+| `bw serve` (bundled CLI, unavoidable) | ~111 MB | ~111 MB |
+| **deskwarden total** | **~155 MB** | **~163 MB** |
 | Bitwarden Desktop (all 4 of its processes) | 132 MB | 135 MB |
 
 deskwarden's *own* process alone is consistently smaller — roughly a third
 to two-fifths of Bitwarden Desktop's total. But once the `bw` CLI dependency
 is counted in (which it has to be — it's what does the real vault work),
 the **total is close to parity** with Bitwarden Desktop, not the dramatic
-gap a shared-memory-inflated number would suggest. Where deskwarden actually
-wins clearly is disk footprint and its own process's isolated cost; RAM
-parity mostly comes from a Node.js CLI dependency neither app's own UI code
+gap a shared-memory-inflated number would suggest. If idle RAM is a concern,
+the `bw serve` backend can be shut down via a setting in Preferences (tray →
+Preferences → General → "Keep the Bitwarden backend running"); autofill stays
+instant because vault data is served from an in-memory cache, and the backend
+is started again when needed. The default keeps it running. Where deskwarden
+actually wins clearly is disk footprint and its own process's isolated cost;
+RAM parity mostly comes from a Node.js CLI dependency neither app's own UI code
 controls.
 
 **Disk**:
