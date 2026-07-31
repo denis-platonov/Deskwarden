@@ -16,7 +16,7 @@ use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
 use crate::theme;
-use crate::vault_bridge::{Folder, VaultItem};
+use crate::vault_bridge::{Folder, VaultError, VaultItem};
 use crate::vault_cache::VaultCache;
 use detail::{draw_detail_read, DetailAction};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
@@ -67,6 +67,18 @@ const MIN_CONFIRM_DWELL: Duration = Duration::from_millis(300);
 
 pub struct VaultWindowResult {
     pub locked: bool,
+    /// True if a write in this window failed with `VaultError::Unauthorized`
+    /// -- the session backing `bw serve` was invalidated while the window
+    /// was open (a `bw lock` run elsewhere, a server-side vault timeout, a
+    /// password change on another device). `bw serve` itself stays alive and
+    /// keeps answering, so nothing else notices; left unhandled, every write
+    /// in this window would keep failing silently for the rest of the
+    /// session, with no re-auth prompt, until the app was restarted. The
+    /// caller (`open_vault_window`) treats this exactly like `locked`: close
+    /// the window, then run the same recovery sequence a manual Lock already
+    /// does (stop the stale backend, re-authenticate, restart with the fresh
+    /// token, repopulate the cache).
+    pub needs_reauth: bool,
 }
 
 enum DetailMode {
@@ -120,6 +132,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let injector = injector.clone();
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
+    // See `VaultWindowResult::needs_reauth`'s doc. Set from any write's
+    // error arm below via `flag_reauth_if_unauthorized`, the same
+    // `Rc<RefCell<_>>` handoff `locked` already uses -- the update closure
+    // is `FnMut + 'static` and can't return anything directly.
+    let needs_reauth = Rc::new(RefCell::new(false));
+    let needs_reauth_for_closure = needs_reauth.clone();
     let mut sync_status: Option<Result<(), String>> = None;
     // When the most recent successful sync completed, for the toolbar's
     // sync pill ("Synced N min ago" per design spec 4.8) -- set below
@@ -498,11 +516,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
             .show(ui, |ui| {
                 match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown) {
-                    SidebarAction::NewFolder => {
-                        if let Ok(folder) = cache.create_folder("New folder") {
-                            folders.push(folder);
+                    SidebarAction::NewFolder => match cache.create_folder("New folder") {
+                        Ok(folder) => folders.push(folder),
+                        Err(e) => {
+                            log::warn!("failed to create folder: {e:?}");
+                            flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                         }
-                    }
+                    },
                     // Opens the "Edit folder" modal (drawn once, after all
                     // three panels, further down) seeded with this folder's
                     // current name. Rename and delete both happen there.
@@ -727,10 +747,17 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                                 // next frame.
                                                 selected_id = items.first().map(|i| i.id.clone());
                                             }
-                                            Err(e) => log::warn!(
-                                                "failed to delete item {} ({}): {e:?}",
-                                                item.id, item.name
-                                            ),
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "failed to delete item {} ({}): {e:?}",
+                                                    item.id, item.name
+                                                );
+                                                flag_reauth_if_unauthorized(
+                                                    ui.ctx(),
+                                                    &needs_reauth_for_closure,
+                                                    &e,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -745,11 +772,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
-                                    if cache.update_item(&updated).is_ok() {
-                                        if let Some(pos) = items.iter().position(|i| i.id == item.id) {
-                                            items[pos] = updated;
+                                    match cache.update_item(&updated) {
+                                        Ok(()) => {
+                                            if let Some(pos) = items.iter().position(|i| i.id == item.id) {
+                                                items[pos] = updated;
+                                            }
+                                            mode = DetailMode::Read;
                                         }
-                                        mode = DetailMode::Read;
+                                        Err(e) => {
+                                            log::warn!("failed to save item {}: {e:?}", item.id);
+                                            flag_reauth_if_unauthorized(
+                                                ui.ctx(),
+                                                &needs_reauth_for_closure,
+                                                &e,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -759,13 +796,17 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     }
                     DetailMode::Create(draft) => {
                         match draw_detail_edit(ui, draft, &folders, true) {
-                            EditAction::Save => {
-                                if let Ok(created) = cache.create_item(&draft.to_new_item()) {
+                            EditAction::Save => match cache.create_item(&draft.to_new_item()) {
+                                Ok(created) => {
                                     selected_id = Some(created.id.clone());
                                     items.push(created);
                                     mode = DetailMode::Read;
                                 }
-                            }
+                                Err(e) => {
+                                    log::warn!("failed to create item: {e:?}");
+                                    flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                                }
+                            },
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -794,6 +835,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     Err(e) => {
                         log::warn!("failed to rename folder {}: {e:?}", state.folder_id);
                         state.error = Some("Could not rename this folder.".to_string());
+                        flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                     }
                 },
                 FolderEditAction::Delete => match cache.delete_folder(&state.folder_id) {
@@ -808,6 +850,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     Err(e) => {
                         log::warn!("failed to delete folder {}: {e:?}", state.folder_id);
                         state.error = Some("Could not delete this folder.".to_string());
+                        flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                     }
                 },
                 FolderEditAction::Cancel => folder_edit = None,
@@ -821,7 +864,24 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     });
 
     let locked = *locked.borrow();
-    VaultWindowResult { locked }
+    let needs_reauth = *needs_reauth.borrow();
+    VaultWindowResult { locked, needs_reauth }
+}
+
+/// If `e` is `VaultError::Unauthorized`, flags the window to close and
+/// re-authenticate (see `VaultWindowResult::needs_reauth`'s doc) exactly the
+/// same way the Lock button does, and closes it immediately rather than
+/// waiting for a future frame to notice the flag.
+///
+/// Called from every write's error arm in `run`'s update closure, so a
+/// session invalidated while this window is open is recovered from instead
+/// of leaving every subsequent write failing silently for the rest of the
+/// session (review Important 2).
+fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bool>>, e: &VaultError) {
+    if matches!(e, VaultError::Unauthorized) {
+        *needs_reauth.borrow_mut() = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
 }
 
 /// Spawns a one-shot background thread that runs `bw sync` and reports the
@@ -1080,6 +1140,45 @@ fn webbrowser_open(url: &str) {
             windows::core::PCWSTR::null(),
             windows::core::PCWSTR::null(),
             windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        );
+    }
+}
+
+#[cfg(test)]
+mod flag_reauth_if_unauthorized_tests {
+    use super::{egui, flag_reauth_if_unauthorized};
+    use crate::vault_bridge::VaultError;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn an_unauthorized_error_flags_reauth() {
+        let ctx = egui::Context::default();
+        let needs_reauth = Rc::new(RefCell::new(false));
+
+        flag_reauth_if_unauthorized(&ctx, &needs_reauth, &VaultError::Unauthorized);
+
+        assert!(
+            *needs_reauth.borrow(),
+            "a 401 from bw serve must flag the window to re-authenticate"
+        );
+    }
+
+    #[test]
+    fn a_non_unauthorized_error_does_not_flag_reauth() {
+        // Regression guard for the other half of the bug this fixes: an
+        // ordinary transient failure (a 500, a dropped connection) must not
+        // be treated the same as a stale session -- that would tear down and
+        // restart a perfectly healthy backend/session over an unrelated
+        // hiccup.
+        let ctx = egui::Context::default();
+        let needs_reauth = Rc::new(RefCell::new(false));
+
+        flag_reauth_if_unauthorized(&ctx, &needs_reauth, &VaultError::Http("boom".to_string()));
+
+        assert!(
+            !*needs_reauth.borrow(),
+            "a non-401 vault error must not trigger re-authentication"
         );
     }
 }

@@ -56,6 +56,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// on this cadence from the main loop, same pattern as `REFRESH_INTERVAL`.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Upper bound on how long `open_vault_window`'s lock-recovery path waits for
+/// an in-flight backend operation to report back over `backend_op_rx` before
+/// giving up on it and proceeding anyway.
+///
+/// `backend_op_tx` lives in `main` for the lifetime of the process, so the
+/// channel itself never disconnects -- an unbounded `recv()` here would block
+/// forever if the worker thread panicked (or otherwise returned) before
+/// sending, with no Windows message pump running on this thread to keep the
+/// tray, hotkey, or window-watching alive. Generous rather than tight: the
+/// operation being waited on can legitimately take up to
+/// `PORT_RELEASE_GRACE_RESTART` (30s) plus a real `bw sync` round-trip, and
+/// this timeout exists to catch "the worker will never answer", not to cut
+/// short a slow-but-healthy one.
+const BACKEND_OP_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Real GitHub REST API base, passed to `updater::check_for_update`. Not
 /// `github.com` itself -- that's the web UI host; `api.github.com` is the
 /// API host the releases endpoint actually lives on.
@@ -1178,11 +1193,26 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         auto_lock,
     );
 
-    if result.locked {
-        // The vault window locked itself (manual Lock button or its own
-        // auto-lock timer), which invalidates `bw serve`'s session exactly
-        // the same way a rejected cached session does at startup.
-        log::info!("vault window locked itself; re-authenticating");
+    if result.locked || result.needs_reauth {
+        // Two different triggers land here, both needing the exact same
+        // recovery: the vault window locked itself (manual Lock button or
+        // its own auto-lock timer), or a write inside it hit `bw serve`
+        // returning 401 -- the session was invalidated out from under a
+        // still-running backend (`bw lock` elsewhere, a server-side vault
+        // timeout, a password change on another device). `backend_is_running`
+        // only checks whether the *process* is alive, so that case would
+        // otherwise go unnoticed forever: `bw serve` keeps answering, just
+        // with 401s, and nothing before this fix ever re-authenticated (see
+        // review Important 2). Both invalidate `bw serve`'s session exactly
+        // the same way a rejected cached session does at startup, so both
+        // get the same fix.
+        if result.needs_reauth {
+            log::warn!(
+                "vault window write failed with an unauthorized session; re-authenticating"
+            );
+        } else {
+            log::info!("vault window locked itself; re-authenticating");
+        }
 
         // A backend operation kicked off above (or a tray Sync click that
         // landed while the window was open) may still be in flight. Unlike
@@ -1193,10 +1223,24 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // at a blocking re-authentication flow at this point, so a few more
         // seconds here is not a new freeze, just a longer instance of one
         // that was already happening.
+        //
+        // Bounded, not a plain `recv()`: `backend_op_tx` lives in `main` for
+        // the whole process, so the channel never disconnects on its own --
+        // if the worker thread that owns the other end ever panicked before
+        // sending, an unbounded `recv()` here would block this thread
+        // forever, with no message pump running to keep the tray, hotkey, or
+        // window-watching alive (review Minor). Giving up after
+        // `BACKEND_OP_TIMEOUT` and proceeding anyway is strictly safer: the
+        // worst case is racing a start/sync that eventually does land (see
+        // `apply_backend_op`'s callers), not an unkillable app.
         if *backend_task_in_progress {
             log::info!("waiting for an in-flight backend operation before handling the lock");
-            if let Ok(op) = backend_op_rx.recv() {
-                apply_backend_op(op, bw_serve_child, cache, engine, tray);
+            match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
+                Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
+                Err(_) => log::warn!(
+                    "in-flight backend operation did not report back within \
+                     {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway"
+                ),
             }
             *backend_task_in_progress = false;
         }
@@ -1459,9 +1503,24 @@ fn spawn_sync(
         } else if currently_running {
             bw_serve::run_bw_sync(&session_token)
         } else {
-            // `try_start_backend` above already ran `bw sync` as part of
-            // coming up.
-            Ok(())
+            // We just started `bw serve` ourselves. `try_start_backend`
+            // returns as soon as the child process is resumed -- it does
+            // *not* wait for `bw serve` (a bundled Node binary whose cold
+            // start regularly takes several seconds) to actually be
+            // listening. That gap is exactly why `wait_for_vault_ready`
+            // exists and why the startup path always calls it before its
+            // first `populate()`. Without the same wait here, `populate()`
+            // below would very often race a backend that isn't answering
+            // requests yet, fail with a connection error, and report "sync
+            // failed" even though `try_start_backend`'s own `bw sync` had
+            // completed successfully and the cache was never actually
+            // refreshed -- precisely the mode this tray item exists for
+            // (`keep_backend_running = false`, backend stopped at idle).
+            // The `currently_running` branch above needs no such wait: a
+            // backend that was already running before this click is, by
+            // definition, already past this race.
+            let schedule = readiness_schedule(READINESS_DEADLINE);
+            wait_for_vault_ready(cache.bridge(), &schedule).map(|_items| ())
         }
         .and_then(|()| cache.populate().map_err(|e| format!("{e:?}")));
 

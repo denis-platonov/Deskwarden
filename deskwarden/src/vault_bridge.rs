@@ -104,6 +104,24 @@ pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
 pub enum VaultError {
     Http(String),
     Parse(String),
+    /// `bw serve` answered with `401 Unauthorized`: the session token it was
+    /// started with (or handed per-request) is no longer valid. Distinct
+    /// from the catch-all `Http` because it is the one HTTP failure that
+    /// means "re-authenticate", not "retry" -- `bw serve` can stay alive and
+    /// keep answering every other request normally while every one of these
+    /// keeps failing, which a plain `Http(String)` gives callers no clean way
+    /// to detect without parsing the message.
+    Unauthorized,
+}
+
+/// Turns a failed `ureq` call into a [`VaultError`], distinguishing a
+/// `401 Unauthorized` response (see `VaultError::Unauthorized`'s doc) from
+/// every other transport/status failure.
+fn map_http_err(e: ureq::Error) -> VaultError {
+    match e {
+        ureq::Error::Status(401, _) => VaultError::Unauthorized,
+        e => VaultError::Http(e.to_string()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -171,7 +189,7 @@ impl VaultBridge {
             .agent
             .get(&url)
             .call()
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data.data)
@@ -187,7 +205,7 @@ impl VaultBridge {
             .agent
             .get(&url)
             .call()
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data)
@@ -199,7 +217,7 @@ impl VaultBridge {
             .agent
             .get(&url)
             .call()
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data.data)
@@ -215,7 +233,7 @@ impl VaultBridge {
             .agent
             .post(&url)
             .send_json(serde_json::json!({ "name": name }))
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data)
@@ -229,7 +247,7 @@ impl VaultBridge {
             .agent
             .put(&url)
             .send_json(serde_json::json!({ "name": name }))
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data)
@@ -240,7 +258,7 @@ impl VaultBridge {
         self.agent
             .delete(&url)
             .call()
-            .map_err(|e| VaultError::Http(e.to_string()))?;
+            .map_err(map_http_err)?;
         Ok(())
     }
 
@@ -270,7 +288,7 @@ impl VaultBridge {
             .agent
             .post(&url)
             .send_json(payload)
-            .map_err(|e| VaultError::Http(e.to_string()))?
+            .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
         Ok(body.data)
@@ -284,7 +302,7 @@ impl VaultBridge {
         self.agent
             .put(&url)
             .send_json(item)
-            .map_err(|e| VaultError::Http(e.to_string()))?;
+            .map_err(map_http_err)?;
         Ok(())
     }
 
@@ -293,7 +311,7 @@ impl VaultBridge {
         self.agent
             .delete(&url)
             .call()
-            .map_err(|e| VaultError::Http(e.to_string()))?;
+            .map_err(map_http_err)?;
         Ok(())
     }
 
@@ -463,6 +481,49 @@ mod tests {
 
         let bridge = VaultBridge::new(server.url());
         assert!(bridge.get_item("missing").is_err());
+    }
+
+    #[test]
+    fn a_401_response_maps_to_vault_error_unauthorized() {
+        // Regression test: a stale/invalidated session leaves `bw serve`
+        // alive but 401-ing, and callers need to be able to tell that apart
+        // from an ordinary transport/status failure in order to trigger
+        // re-authentication rather than just retrying. Checked against
+        // `list_items` (the call `VaultCache::populate` makes) as a
+        // representative read and `update_item` as a representative write --
+        // every other call site routes through the same `map_http_err`.
+        let mut server = mockito::Server::new();
+        let _items = server.mock("GET", "/list/object/items").with_status(401).create();
+        let _update = server.mock("PUT", "/object/item/1").with_status(401).create();
+
+        let bridge = VaultBridge::new(server.url());
+
+        assert!(matches!(bridge.list_items(), Err(VaultError::Unauthorized)));
+
+        let item = VaultItem {
+            id: "1".into(),
+            name: "A".into(),
+            fields: vec![],
+            login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        assert!(matches!(bridge.update_item(&item), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn a_non_401_status_stays_a_plain_http_error() {
+        // Only 401 means "re-authenticate"; every other status (a 500, a
+        // 404, ...) must keep surfacing as the catch-all `Http` variant so
+        // callers don't mistake an unrelated server error for a stale
+        // session.
+        let mut server = mockito::Server::new();
+        let _m = server.mock("GET", "/list/object/items").with_status(500).create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.list_items(), Err(VaultError::Http(_))));
     }
 
     #[test]

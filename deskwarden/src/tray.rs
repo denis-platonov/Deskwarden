@@ -191,14 +191,21 @@ pub fn set_sync_idle(tray: &AppTray) {
     set_tooltip(tray, IDLE_TOOLTIP.to_string());
 }
 
-/// Reports a failed tray-triggered sync. Re-enabled immediately (unlike the
-/// update item, which stays on a "click to retry" label): a sync failure is
-/// frequently transient (network, `bw serve` still coming up) and the item's
-/// label doubling as an error state for longer than the tooltip already
-/// shown here would be an odd asymmetry with the sync pill inside the vault
-/// window, which doesn't do that either.
+/// Reports a failed tray-triggered sync.
+///
+/// Re-enabled immediately (unlike the update item, which stays disabled while
+/// its "click to retry" label shows): a sync failure is frequently transient
+/// (network, `bw serve` still coming up) and there's no download in flight
+/// that a second click could collide with.
+///
+/// The label itself, though, follows `set_update_failed`'s pattern rather
+/// than the tooltip-only shape this used to have: a tray tooltip is only
+/// visible on hover, so a failure that landed while the user wasn't looking
+/// was otherwise invisible until they happened to hover the icon or went
+/// looking in the log file. The label is seen the moment the menu is opened,
+/// which is also the same click that retries.
 pub fn set_sync_failed(tray: &AppTray) {
-    tray.sync_item.set_text("Sync");
+    tray.sync_item.set_text("Sync failed - click to retry");
     tray.sync_item.set_enabled(true);
     set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
 }
