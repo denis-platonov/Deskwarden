@@ -17,12 +17,50 @@ pub struct ReleaseInfo {
 /// How long to wait for a TCP connection to establish before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait for the response body to finish arriving once connected.
-/// GitHub's API responses are tiny, and even a large installer download
-/// should comfortably stream within this window per read; ureq applies
-/// `timeout_read` per-read, not to the whole transfer, so this doesn't cap
-/// total download time for a slow-but-steady connection.
+/// How long to wait between successive reads of a response body.
+///
+/// This bounds a *stalled* transfer, not a slow one: ureq applies
+/// `timeout_read` per read, so a slow-but-steady download is never cut off by
+/// it. Read the caveat on [`API_DEADLINE`] before treating it as this agent's
+/// only protection -- on a reused keep-alive connection it is not applied at
+/// all.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Whole-request deadline for the releases-API check.
+///
+/// Needed because `timeout_read` is silently dropped on connection reuse in
+/// ureq 2.12.1: it is set on the socket only on the connect path
+/// (`stream.rs:436`) and `Stream::reset()` clears it again (`stream.rs:265`)
+/// before the connection is pooled, while `connect_socket` returns a pooled
+/// connection without re-entering that path (`unit.rs:361-364`). The response
+/// head is read under `unit.deadline` (`response.rs:574`), which comes only
+/// from `request.timeout.or(agent.config.timeout)` (`request.rs:122`). So an
+/// agent with `timeout_read` alone bounds its first request and nothing after
+/// it -- the same defect that hung the vault path in v0.3.0 (see
+/// `vault_bridge::REQUEST_DEADLINE`).
+///
+/// 30s: the response is a single small JSON document, so anything near this
+/// is already a broken path, and the update check runs on a background thread
+/// where a 30s wait costs the user nothing.
+const API_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whole-request deadline for the installer download.
+///
+/// Deliberately *not* the same number as [`API_DEADLINE`], and deliberately
+/// not left unset. A whole-request deadline caps the entire transfer, body
+/// included -- so the value that is right for a one-line JSON response would
+/// abort a legitimate ~6 MB installer download on a slow link and trade a hang
+/// for a broken updater. But leaving it unset is what caused the shipped hang,
+/// so the download gets its own, generous bound instead of none.
+///
+/// 10 minutes sustains a ~6 MB installer at roughly 80 kbit/s end to end,
+/// which is below any connection that could have reached GitHub to discover
+/// the release in the first place. It is a "this will never finish" bound, not
+/// a performance budget. `READ_TIMEOUT` still catches the common stall case
+/// much sooner on a fresh connection; this is the backstop that also holds on
+/// a pooled one. The download runs on a background thread, so the worst case
+/// is a background update attempt that gives up after 10 minutes.
+const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Builds a `ureq::Agent` with bounded connect/read timeouts, so a stalled
 /// `api.github.com` (or any host on the network path to it) can't hang a
@@ -30,6 +68,11 @@ const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// bounded-wait pattern `bw_serve::READINESS_DEADLINE` already uses for the
 /// local `bw serve` dependency -- just applied to an external host, which has
 /// strictly more failure modes than localhost.
+///
+/// The whole-request deadline is *not* set here: it is set per request by
+/// [`check_for_update`] and [`download_and_verify`], because one agent is
+/// shared by a tiny API response and a multi-megabyte download and no single
+/// number is correct for both.
 pub fn build_agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(CONNECT_TIMEOUT)
@@ -45,6 +88,7 @@ pub fn check_for_update(
     let url = format!("{base_url}/repos/denis-platonov/deskwarden/releases/latest");
     let body: serde_json::Value = agent
         .get(&url)
+        .timeout(API_DEADLINE)
         .call()
         .map_err(|e| format!("failed to reach GitHub releases API: {e}"))?
         .into_json()
@@ -143,6 +187,7 @@ pub fn download_and_verify(
 
     let response = agent
         .get(&release.installer_download_url)
+        .timeout(DOWNLOAD_DEADLINE)
         .call()
         .map_err(|e| format!("failed to download installer: {e}"))?;
     let mut reader = response.into_reader();
