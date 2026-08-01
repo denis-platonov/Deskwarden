@@ -297,8 +297,11 @@ pub enum VaultUnavailable {
 /// (as [`PopulateOutcome`]'s doc records, measured rather than assumed) the
 /// attribute buys almost nothing, and the existing `.unwrap();` statements in
 /// `main`'s tests would warn for a value they have no reason to inspect.
-/// What holds the distinction is the exhaustive `match` at the one production
-/// call site, in `picker_ui::run_picker`.
+/// What holds the distinction is that every production `match` on this enum is
+/// exhaustive, with no catch-all, so a third variant fails to compile at each
+/// of them rather than being swallowed at one. (No count and no list here --
+/// review 30's Important 2 was a prose caller-enumeration in this same file
+/// going stale within a commit; `grep` counts, a doc comment cannot.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMatchWrite {
     /// The server accepted the match AND the snapshot now holds the matched
@@ -536,28 +539,36 @@ impl VaultCache {
     /// single lock and checked against `era` in the same acquisition.
     ///
     /// **THE ONE CHECKED DOOR.** Every era-checked read in the crate comes
-    /// through here -- three production call sites as of review 28's
-    /// Important 1 (`main`'s "Add app..." rebuild, `main`'s
-    /// `settle_sync_outcome`, and `picker_ui`'s `load_items_for_picker`,
-    /// which asks twice). The items-only projection that used to sit above
-    /// this, `items_unless_superseded`, is GONE: it was introduced as a
-    /// two-line `.ok().map(|s| s.items)` with one caller and a recorded
-    /// tripwire ("if a third caller appears, the projection has become a door
-    /// again"), and the tripwire had already tripped when it was written.
-    /// What it cost was not a lock -- it delegated -- but the REFUSAL: it
-    /// folded `Superseded` and `Unpopulated` into one `None`, and
-    /// `settle_sync_outcome` then logged "after the vault was cleared" for a
-    /// refusal it had not distinguished. See that function.
+    /// through here; there is no second door. That is the invariant, and it is
+    /// deliberately stated WITHOUT enumerating the callers (review 30's
+    /// Important 2): this doc used to name them and give their count, the
+    /// count went stale within one commit of being written, and a prose caller
+    /// list going stale is the very defect review 28's Important 1 was about --
+    /// recurring inside its own fix. `grep` counts; a doc comment cannot.
     ///
-    /// **The price of having only this door**, weighed rather than waved
-    /// past: two of the three call sites run on the UI thread and discard the
-    /// `folders` half, so they clone a `Vec<Folder>` -- two `String`s per
-    /// folder -- under the mutex that `app::handle_match` blocks every
-    /// autofill on. That is two or three orders of magnitude below the
-    /// `Vec<VaultItem>` clone the same call already pays on the same line
-    /// (each item carries a name, a field vec, and a login with its uris), so
-    /// it does not change the shape of the critical section. If it ever does,
-    /// the answer is a borrow-based read under the guard, NOT a second door.
+    /// The items-only projection that used to sit above this,
+    /// `items_unless_superseded`, is GONE: it was introduced as a two-line
+    /// `.ok().map(|s| s.items)` with one caller and a recorded tripwire ("if a
+    /// third caller appears, the projection has become a door again"), and the
+    /// tripwire had already tripped when it was written. What it cost was not
+    /// a lock -- it delegated -- but the REFUSAL: it folded `Superseded` and
+    /// `Unpopulated` into one `None`, and `settle_sync_outcome` then logged
+    /// "after the vault was cleared" for a refusal it had not distinguished.
+    /// See that function.
+    ///
+    /// **The price of having only this door**, weighed rather than waved past:
+    /// a caller that wants only one half still clones both, under the mutex
+    /// that `app::handle_match` blocks every autofill on. The half that gets
+    /// discarded in practice is `folders`, and a `Vec<Folder>` clone is cheap
+    /// against the `Vec<VaultItem>` clone on the same line: a `Folder` is two
+    /// `String`s plus a `#[serde(flatten)]` map that a real folder does carry
+    /// entries in (at least `"object": "folder"`), where each item carries a
+    /// name, a field vec, and a login with its uris. Two to three orders of
+    /// magnitude apart even counting the flattened map, so it does not change
+    /// the shape of the critical section. If it ever does, the answer is a
+    /// borrow-based read under the guard, NOT a second door. (Not every caller
+    /// discards a half -- the vault window's loader runs off the UI thread and
+    /// uses both -- which is another reason not to describe the callers here.)
     ///
     /// **Why an era-checked read at all** (review 18's third finding).
     /// "Is a result computed back in `era` still applicable?" and "so what
@@ -1466,15 +1477,17 @@ mod tests {
         );
     }
 
-    // NAME KEPT ACROSS REVIEW 28'S DELETION OF `items_unless_superseded`, for
-    // this test and the two below it. The projection is gone and every call
-    // here now goes through `snapshot_unless_superseded`; what these three
-    // pin is the CONTRACT of the checked read ("items, unless superseded"),
-    // which is unchanged, and their assertions are untouched down to the
-    // message text. Renaming them would have silently broken the by-name
-    // verification the review briefs use.
+    // RENAMED IN REVIEW 30 (Minor 6), for this test and the two below it.
+    // Review 28 deleted `items_unless_superseded` and deliberately kept these
+    // three names so the by-name verification the review briefs run would not
+    // break. The cost turned out to be worse: a test name that names a deleted
+    // function is the same lie with a `#[test]` on it, and a grep for
+    // `snapshot_unless_superseded` found only three of its six tests. The
+    // contract wording after the prefix is preserved VERBATIM, so the mapping
+    // is mechanical (`items_unless_superseded_*` -> `snapshot_unless_superseded_*`)
+    // and any brief citing the old names can still find them.
     #[test]
-    fn items_unless_superseded_hands_back_a_write_that_landed_after_the_epoch_was_captured() {
+    fn snapshot_unless_superseded_hands_back_a_write_that_landed_after_the_epoch_was_captured() {
         // The contract in one test (review 18's third finding). A caller
         // captures the epoch, goes away for a while, and comes back to ask
         // whether its result still applies. A write landed meanwhile. The
@@ -1532,11 +1545,18 @@ mod tests {
     }
 
     #[test]
-    fn items_unless_superseded_refuses_once_a_clear_has_started_a_new_epoch() {
+    fn snapshot_unless_superseded_refuses_once_a_clear_has_started_a_new_epoch() {
         // The other half, so the test above cannot pass by never refusing.
         // A `clear` is a lock, a re-auth into a possibly different account,
         // or a quit: a result computed in the previous epoch must not be
         // acted on, and there is no snapshot to hand back either.
+        //
+        // WHICH refusal, not merely that one happened (review 30's Minor 6):
+        // the state right after a `clear` is BOTH superseded and unpopulated,
+        // which is exactly why the check order inside the door is load-bearing
+        // -- reporting `Unpopulated` here would invite the populate that
+        // cannot help. An `is_err` assertion passes under the swapped order
+        // and so pinned nothing about the thing this test is named for.
         let mut server = mockito::Server::new();
         let _i = server
             .mock("GET", "/list/object/items")
@@ -1556,13 +1576,19 @@ mod tests {
         let epoch = cache.epoch();
         cache.clear();
 
-        assert!(cache.snapshot_unless_superseded(epoch.era()).is_err());
+        assert_eq!(
+            cache.snapshot_unless_superseded(epoch.era()).unwrap_err(),
+            VaultUnavailable::Superseded,
+            "a cleared cache is superseded AND unpopulated; the stronger fact is the one the \
+             caller must be told, or it goes and fetches a vault that cannot help it"
+        );
         // ...and a *repopulate* for the new account does not make the old
         // era applicable again: this is the cross-account case, and the
         // era is what closes it.
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
-        assert!(
-            cache.snapshot_unless_superseded(epoch.era()).is_err(),
+        assert_eq!(
+            cache.snapshot_unless_superseded(epoch.era()).unwrap_err(),
+            VaultUnavailable::Superseded,
             "an era from before a clear must stay superseded even once the cache refills"
         );
         assert!(cache.snapshot_unless_superseded(cache.epoch().era()).is_ok());
@@ -1677,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn items_unless_superseded_refuses_an_unfilled_snapshot_in_its_own_era() {
+    fn snapshot_unless_superseded_refuses_an_unfilled_snapshot_in_its_own_era() {
         // THE HALF THAT IS NOT ABOUT ERAS AT ALL, and that review 25's Minor 3
         // made load-bearing when `items_if_populated` was retired into this
         // function. A brand-new process has era 0 and `populated == false`, so
@@ -1690,10 +1716,11 @@ mod tests {
         let server = populating_server_with_a_writable_item();
         let cache = cache_for(server.url());
         let era_before_any_populate = cache.epoch().era();
-        assert!(
+        assert_eq!(
             cache
                 .snapshot_unless_superseded(era_before_any_populate)
-                .is_err(),
+                .unwrap_err(),
+            VaultUnavailable::Unpopulated,
             "a snapshot that has never been filled is not a vault, however current its era"
         );
 
@@ -1709,11 +1736,13 @@ mod tests {
         );
 
         cache.clear();
-        assert!(
+        assert_eq!(
             cache
                 .snapshot_unless_superseded(era_before_any_populate)
-                .is_err(),
-            "a cleared snapshot is not a vault either"
+                .unwrap_err(),
+            VaultUnavailable::Superseded,
+            "a cleared snapshot is not a vault either -- and the era moved, so the refusal that \
+             reaches the caller is the supersession, not the emptiness underneath it"
         );
     }
 
@@ -2136,11 +2165,22 @@ mod tests {
         // REVIEW 26'S MINOR 2. Reachable with no `clear` at all: a tray Sync
         // is in flight (the "Add app..." handler does not gate on
         // `backend_task_in_progress`), its `populate_with` lands while the
-        // user is in `run_picker`, and its fetch legitimately lacks the item
-        // -- our PUT raced a remote delete. The server took the match; the
-        // snapshot did not, and no pending entry was recorded either, so no
-        // later populate replays it. Returning a bare `Ok(())` told the
-        // caller it had been written through.
+        // user is in `run_picker`, and its fetch legitimately lacks the item.
+        // The server took the match; the snapshot did not, and no pending
+        // entry was recorded either, so no later populate replays it.
+        // Returning a bare `Ok(())` told the caller it had been written
+        // through.
+        //
+        // THE PATH, CORRECTED IN REVIEW 30 (Important 2). This comment used to
+        // narrate the interleaving below as "our PUT raced a remote delete",
+        // which the same commit's `AppMatchWrite` doc proves cannot produce
+        // `ServerOnly`: a delete landing FIRST makes the PUT return `Err`. The
+        // delete has to come after the server accepted the write, and what
+        // this test actually scripts is the consequence -- a populate whose
+        // fetch no longer holds the id writing back BEFORE `set_app_match`'s
+        // own `self.lock()`, the statement immediately after the PUT returns.
+        // The whole window is that response-return latency. See
+        // `AppMatchWrite::ServerOnly`.
         let mut server = mockito::Server::new();
         let _f = server
             .mock("GET", "/list/object/folders")

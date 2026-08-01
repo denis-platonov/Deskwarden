@@ -1007,6 +1007,19 @@ pub fn run_picker(
     // saved match rather than a cancellation. See `server_only_notice`.
     let mut save_notice: Option<String> = None;
 
+    // Whether this window has already put a match on the server, and therefore
+    // whether Save may fire again -- review 30's Minor 4.
+    //
+    // Its own flag rather than `save_notice.is_some()`, which is what the gate
+    // used to be handed: the notice is set on the `ServerOnly` arm ONLY, so on
+    // a `WroteThrough` save the gate stayed OPEN. `done = true` merely queues a
+    // `ViewportCommand::Close`; frames still render before the window is
+    // actually destroyed, and in those frames Save was enabled and a second
+    // click re-PUT a match the server already has. That is the precise hazard
+    // `can_save_app_match_now` exists to prevent, and it was being applied to
+    // one of the two success arms. Set in BOTH.
+    let mut already_saved = false;
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 560.0])
@@ -1192,7 +1205,7 @@ pub fn run_picker(
                     // backend is confirmed to actually be answering --
                     // never both true is what let either bug happen before.
                     let can_save =
-                        can_save_app_match_now(selected_pid, &backend_ready, save_notice.is_some());
+                        can_save_app_match_now(selected_pid, &backend_ready, already_saved);
                     let save_clicked = ui
                         .add_enabled_ui(can_save, |ui| theme::primary_button(ui, "Save", None))
                         .inner
@@ -1240,8 +1253,12 @@ pub fn run_picker(
                                             write: written,
                                         });
                                         match written {
-                                            AppMatchWrite::WroteThrough => done = true,
+                                            AppMatchWrite::WroteThrough => {
+                                                already_saved = true;
+                                                done = true;
+                                            }
                                             AppMatchWrite::ServerOnly => {
+                                                already_saved = true;
                                                 log::warn!(
                                                     "saved the app match for vault item {} to the \
                                                      server, but the cache's snapshot does not \
@@ -1812,6 +1829,67 @@ mod tests {
         assert!(
             !notice.contains("next full sync") && !notice.contains("goes live at"),
             "a promise the crate cannot keep -- see this test's doc: {notice}"
+        );
+    }
+}
+
+/// Source-position guards for the Save gate's "this window has already saved
+/// something" input (review 30's Minor 4).
+///
+/// `can_save_app_match_now` is pure and directly tested above, but WHAT IS
+/// PASSED TO IT lives inside `run_picker`'s per-frame closure, which nothing
+/// can drive outside a real event loop. The defect was exactly there: the
+/// third argument was `save_notice.is_some()`, and the notice is set on the
+/// `ServerOnly` arm ONLY. On `WroteThrough` the arm sets `done`, which merely
+/// queues a `ViewportCommand::Close` -- frames still render before the window
+/// is destroyed, and in those frames Save was ENABLED and a second click
+/// re-PUT a match the server already has. That is the precise hazard
+/// `can_save_app_match_now` exists to prevent, applied to one of two success
+/// arms.
+///
+/// **What these guards can and cannot see**, in the idiom
+/// `vault_window::reveal_state_placement_tests` established: they pin the
+/// spelling and the COUNT of the flag's assignments and the gate's argument.
+/// They cannot see a flag that is set in both arms and then never read, nor
+/// one reset to false somewhere silly. Both of those are visible in a diff
+/// that touches these lines; what this guards is the third success arm added
+/// later that forgets one of them.
+#[cfg(test)]
+mod save_gate_placement_tests {
+    // SPLIT ACROSS TWO LITERALS, DELIBERATELY. `include_str!` pulls this module
+    // in too, so a needle written as one literal always matches -- inside the
+    // const that defines it -- which is what made the equivalent guards in
+    // `vault_window` pass with their regression live. `concat!` joins at
+    // compile time. The count assertions are what ENFORCE this, not the
+    // comment: re-joining a needle makes it appear one extra time and fails.
+    const FLAG_SET: &str = concat!("already_saved", " = true;");
+    const GATE_ARGUMENT: &str = concat!("already_saved", ")");
+
+    fn source() -> &'static str {
+        include_str!("picker_ui.rs")
+    }
+
+    #[test]
+    fn both_successful_save_arms_mark_the_window_as_having_saved() {
+        assert_eq!(
+            source().matches(FLAG_SET).count(),
+            2,
+            "expected {FLAG_SET:?} exactly twice -- once on each arm of the `AppMatchWrite` \
+             match. One occurrence means a success arm leaves Save clickable for the frames \
+             between `done` and the window actually closing, and a second click re-PUTs a \
+             match the server already has"
+        );
+    }
+
+    #[test]
+    fn the_save_gate_is_fed_that_flag_and_not_the_server_only_notice() {
+        assert_eq!(
+            source().matches(GATE_ARGUMENT).count(),
+            1,
+            "expected {GATE_ARGUMENT:?} exactly once, as `can_save_app_match_now`'s third \
+             argument. Zero means the gate went back to deriving \"already saved\" from \
+             something else -- `save_notice.is_some()` is the spelling that was wrong, because \
+             the notice exists on only one of the two success arms"
         );
     }
 }

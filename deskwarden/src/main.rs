@@ -662,12 +662,13 @@ fn main() {
                     spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
                 }
 
-                // The vault session this "Add app..." belongs to, captured
-                // before the first of its two windows opens -- review 25's
-                // Minor 3. The rebuild below is the only consumer; see there
-                // for why an era rather than a bare "is it populated?".
-                let add_app_era = cache.epoch().era();
-                if let Some(item) = picker_ui::pick_vault_item(&cache) {
+                // The vault session this "Add app..." belongs to is captured
+                // INSIDE `AddAppFlow::begin`, before the first of its two
+                // windows opens -- review 25's Minor 3 for why it is captured
+                // there, review 30's Minor 5 for why the capture is no longer
+                // a statement of its own that a later edit can slide below the
+                // window it guards.
+                if let Some((flow, item)) = AddAppFlow::begin(&cache) {
                     log::info!("adding an app match to vault item {}", item.id);
                     let target_item = item.clone();
                     match picker_ui::run_picker(cache.clone(), item, last_active_pid, backend_already_running) {
@@ -710,22 +711,23 @@ fn main() {
                             // AND ONE DOOR, not two (review 25's Minor 3, and
                             // for real since review 28's Important 1 deleted
                             // the items-only projection this used to go
-                            // through). The era `add_app_era` supplies is not
-                            // ceremony here, because the two windows this flow
-                            // opens are a long user interaction and a `clear`
-                            // -- the vault locking, or a re-auth into a
-                            // possibly different ACCOUNT -- can land inside
-                            // it. Arming the engine from whatever snapshot
-                            // happens to exist afterwards would be arming it
-                            // from a vault the user did not just edit.
+                            // through). The era `flow` carries is not ceremony
+                            // here, because the two windows this flow opens
+                            // are a long user interaction and a `clear` -- the
+                            // vault locking, or a re-auth into a possibly
+                            // different ACCOUNT -- can land inside it. Arming
+                            // the engine from whatever snapshot happens to
+                            // exist afterwards would be arming it from a vault
+                            // the user did not just edit.
                             //
                             // WHAT TO BUILD FROM is `add_app_rebuild_source`,
-                            // not this snapshot directly: on a `ServerOnly`
-                            // save the snapshot does not hold the match, and
-                            // rebuilding straight from it is review 28's
-                            // Important 2. See that function.
-                            let snapshot = cache.snapshot_unless_superseded(add_app_era);
-                            match add_app_rebuild_source(snapshot, &saved, &target_item) {
+                            // reached through `flow` so the era it checks is
+                            // the one captured before the FIRST window rather
+                            // than whatever a later edit leaves nearest: on a
+                            // `ServerOnly` save the snapshot does not hold the
+                            // match, and rebuilding straight from it is review
+                            // 28's Important 2. See both functions.
+                            match flow.rebuild_source(&cache, &saved, &target_item) {
                                 Some(items) => {
                                     let entries = match_entries(&items);
                                     log::info!(
@@ -745,12 +747,37 @@ fn main() {
                                     // empty or another account's snapshot would
                                     // DISARM autofill instead of merely failing to
                                     // arm the new match.
+                                    //
+                                    // WHAT THIS PROMISES IS CONDITIONED ON THE
+                                    // WRITE (review 30's Minor 2). It used to
+                                    // end "The match goes live at the next
+                                    // sync or unlock" unconditionally, which
+                                    // is the exact promise `server_only_notice`
+                                    // has a test FORBIDDING it from making and
+                                    // that both of `set_app_match`'s warns were
+                                    // edited to stop making: for a `ServerOnly`
+                                    // save's `position` miss the reachable path
+                                    // is the item having stopped existing, and
+                                    // no sync brings a deleted item's match
+                                    // back.
+                                    let outlook = match saved.write {
+                                        AppMatchWrite::WroteThrough => {
+                                            "The server has the match and so did this session's \
+                                             snapshot, so the next sync or unlock brings it back"
+                                        }
+                                        AppMatchWrite::ServerOnly => {
+                                            "The server has the match; whether this app picks it \
+                                             up depends on the item still existing (see \
+                                             AppMatchWrite::ServerOnly), so no sync is promised \
+                                             here"
+                                        }
+                                    };
                                     log::warn!(
                                         "an app match was saved against a vault cache that is no \
                                          longer the session it was saved in (unpopulated, or \
                                          cleared and refilled meanwhile); leaving the match \
                                          engine as it is rather than rebuilding it from the wrong \
-                                         snapshot. The match goes live at the next sync or unlock"
+                                         snapshot. {outlook}"
                                     );
                                 }
                             }
@@ -2332,6 +2359,22 @@ fn settle_sync_outcome(outcome: SyncOutcome, cache: &VaultCache) -> SettledSync 
 /// `Superseded` case it is where the era has got to by now, not necessarily
 /// the era that did the superseding; the line says "era X -> Y" rather than
 /// claiming Y is what cleared it.
+///
+/// **And the `Unpopulated` arm has to respect that too** (review 30's Minor
+/// 3). It used to say "in this sync's own era ({sync_era}) -- nothing started
+/// a new one" while discarding `current_era` entirely, which is a stronger,
+/// present-tense claim than the `Superseded` arm makes and one this function
+/// had not observed: a `clear` landing between the checked read and the
+/// caller's `cache.epoch().era()` falsifies it. It now splits on the parameter
+/// it already takes and, when the era HAS moved, says so and says explicitly
+/// that the move came after the check -- which is sound rather than a guess,
+/// because `Unpopulated` is only returned when the era still matched at the
+/// read.
+///
+/// This is NOT a second instance of the concurrent-read seam. The decision --
+/// which refusal happened -- comes entirely from the single checked read;
+/// `current_era` feeds a `format!` and nothing else, and the point of the
+/// split is precisely to stop the string asserting more than the read saw.
 fn sync_discard_reason(
     reason: VaultUnavailable,
     sync_era: VaultEra,
@@ -2343,10 +2386,17 @@ fn sync_discard_reason(
              (era {sync_era} -> {current_era}); discarding it rather than writing it over \
              whatever cleared it"
         ),
+        VaultUnavailable::Unpopulated if current_era == sync_era => format!(
+            "a completed sync's result reached the main thread with the cache holding no \
+             snapshot at all, in this sync's own era ({sync_era}) -- nothing has started a new \
+             one. Discarding the result rather than arming anything from an empty vault"
+        ),
         VaultUnavailable::Unpopulated => format!(
             "a completed sync's result reached the main thread with the cache holding no \
-             snapshot at all, in this sync's own era ({sync_era}) -- nothing started a new \
-             one. Discarding the result rather than arming anything from an empty vault"
+             snapshot at all, in this sync's own era ({sync_era}); the cache has since reached \
+             era {current_era}, which can only be a clear and which therefore landed AFTER the \
+             check -- so it is not what discarded this result. Discarding the result rather \
+             than arming anything from an empty vault"
         ),
     }
 }
@@ -2366,10 +2416,32 @@ fn sync_discard_reason(
 /// `refresh_match_engine`, whose three call sites three separate reviews
 /// removed for exactly that reason.)
 ///
-/// Applied by id, replacing rather than appending, because a populate landing
-/// between the save and here can perfectly well have brought the item back --
-/// and two entries for one vault item would make the engine's answer depend
-/// on iteration order.
+/// Applied by id, and ONLY by id: the match replaces the snapshot's copy of
+/// that item, and if the snapshot has no such item nothing is injected. It
+/// replaces rather than appends because a populate landing between the save
+/// and here can perfectly well have brought the item back, and two entries for
+/// one vault item would make the engine's answer depend on iteration order.
+///
+/// **Why the miss arms nothing, rather than pushing the matched item**
+/// (review 30's Important 1 -- it used to push). The push was justified with
+/// "the match is what autofill needs, not the item's existence". That is not
+/// how any consumer works: `app::handle_match` resolves the id against
+/// `cache.items()`, and `fill_from_vault` falls through to
+/// `bridge().get_item`. A pushed entry for an id nothing can resolve therefore
+/// arms a match that can only FAIL -- Prompt mode raises the anonymous "fill
+/// something?" overlay whose Fill button 404s into a `log::error!` with
+/// nothing on screen, Auto mode spends the same round-trip silently on every
+/// foregrounding (including in save-memory mode, against a dead port), and it
+/// repeats until the next sync or unlock.
+///
+/// And it fires exactly when the best available evidence says the item is
+/// GONE. `target_item` came from `pick_vault_item` -> `load_items_for_picker`
+/// -> the snapshot, in this same era, so the item WAS in the snapshot at pick
+/// time; for it to be absent from a POPULATED same-era snapshot now, a
+/// populate's fetch dropped it, which means it stopped existing server-side.
+/// A missing match is silent, correct and self-heals at the next sync that
+/// finds the item again. A firing match that never fills teaches the user to
+/// distrust autofill, and in Auto mode is invisible except in the log.
 ///
 /// **`Err` outranks all of that, for either refusal.** A `clear` inside the
 /// two picker windows means this snapshot belongs to a vault session the user
@@ -2393,11 +2465,78 @@ fn add_app_rebuild_source(
             let matched = deskwarden::vault_bridge::with_app_match(target_item, &saved.app_match);
             match items.iter().position(|i| i.id == matched.id) {
                 Some(at) => items[at] = matched,
-                None => items.push(matched),
+                None => log::warn!(
+                    "the app match was saved to the server for vault item {}, but that item is \
+                     absent from a populated snapshot of the same vault session -- the best \
+                     available evidence is that it no longer exists server-side. Arming the \
+                     engine with it anyway would arm a match that can only fail to fill, so the \
+                     engine is armed from the snapshot as it stands and this match is not in it",
+                    matched.id
+                ),
             }
         }
     }
     Some(items)
+}
+
+/// One "Add app..." click, from the era capture to the engine rebuild.
+///
+/// **This type exists to bind the era capture to the flow it guards** (review
+/// 30's Minor 5). Those were four unbound statements in `main`'s event loop --
+/// `let add_app_era = cache.epoch().era();`, `pick_vault_item`, `run_picker`,
+/// and the rebuild -- and moving the capture below `pick_vault_item` reads as
+/// an innocent tidy, since `pick_vault_item` captures its own era internally.
+/// It is not: it narrows the guard from "both windows" to "the second window",
+/// which is the half that matters least, because the long user interaction a
+/// `clear` can land inside starts with the FIRST one. No test noticed, and
+/// none could -- all four `add_app_rebuild_source` tests hand it a `Result`
+/// directly and never touch the capture site.
+///
+/// [`Self::begin`] captures the era and opens the item picker in one
+/// expression, above the `?`, so the two cannot be separated by an edit that
+/// looks local; and [`Self::rebuild_source`] is only reachable through a value
+/// only `begin` mints, so the rebuild cannot be reached having captured
+/// nothing. What is deliberately NOT here is `run_picker`: it takes an owned
+/// `VaultItem` and a couple of unrelated flags, and folding it in would make
+/// this a wrapper around the event loop rather than a binding of the two
+/// statements that actually drift.
+struct AddAppFlow {
+    /// The vault session this click belongs to -- see [`VaultEra`] for why an
+    /// era rather than a bare "is it populated?", and `add_app_rebuild_source`
+    /// for what it outranks.
+    era: VaultEra,
+}
+
+impl AddAppFlow {
+    /// Captures the era, THEN asks the user which vault item to attach a match
+    /// to. `None` means the user cancelled that first window.
+    ///
+    /// Not `#[cfg(test)]`-testable: `pick_vault_item` opens a real window.
+    /// What it buys is that the ordering is unrepresentable wrong rather than
+    /// tested -- see the type's doc.
+    fn begin(
+        cache: &std::sync::Arc<VaultCache>,
+    ) -> Option<(Self, deskwarden::vault_bridge::VaultItem)> {
+        let era = cache.epoch().era();
+        let item = picker_ui::pick_vault_item(cache)?;
+        Some((Self { era }, item))
+    }
+
+    /// The crate's one era-checked read, asked with THIS flow's era, handed to
+    /// `add_app_rebuild_source`. `None` leaves the match engine exactly as it
+    /// is.
+    fn rebuild_source(
+        &self,
+        cache: &VaultCache,
+        saved: &SavedAppMatch,
+        target_item: &deskwarden::vault_bridge::VaultItem,
+    ) -> Option<Vec<deskwarden::vault_bridge::VaultItem>> {
+        add_app_rebuild_source(
+            cache.snapshot_unless_superseded(self.era),
+            saved,
+            target_item,
+        )
+    }
 }
 
 /// Refreshes the cache from `bw serve` after a completed `bw sync` and says
@@ -3625,18 +3764,51 @@ mod tests {
             !unpopulated.contains("->"),
             "there is no era transition to report when the era never moved: {unpopulated}"
         );
+
+        // REVIEW 30'S MINOR 3. The `Unpopulated` line used to say "in this
+        // sync's own era (X) -- nothing started a new one" while DISCARDING
+        // `current_era` entirely, so it asserted in the present tense a fact it
+        // had not observed: a `clear` landing between the checked read and the
+        // caller's `cache.epoch().era()` makes "nothing started a new one"
+        // false, and the doc excuses exactly that staleness for the OTHER arm
+        // while the arm making the stronger claim went unmentioned. The
+        // decision is still made entirely by the single checked read -- this is
+        // not a second read seam -- so the fix is to stop claiming what was not
+        // observed, using the parameter the function already takes.
+        let raced = sync_discard_reason(VaultUnavailable::Unpopulated, before, after);
+        assert!(
+            raced.contains("(0)") && raced.contains("era 1"),
+            "when the era HAS moved on by the time the line is written, the line must report \
+             both rather than assert nothing started a new one: {raced}"
+        );
+        assert!(
+            !raced.contains("nothing"),
+            "and it must not keep the claim that nothing started a new era, which is the one \
+             thing this case disproves: {raced}"
+        );
     }
 
-    /// Review 28's Important 2, the half `picker_ui` cannot reach. A
-    /// `ServerOnly` save means the server has the match and the SNAPSHOT DOES
-    /// NOT, so rebuilding the engine from that snapshot arms it without the
-    /// match the user just spent two windows creating -- and (unlike the
-    /// unpopulated miss) no later sync can be relied on to cure it, because
-    /// the reachable path for the `position` miss is the item having been
-    /// deleted out from under the write. The match must therefore be applied
-    /// to the entries here, at the one place that holds both.
+    /// Review 30's Important 1. A `ServerOnly` whose id is absent from a
+    /// POPULATED, same-era snapshot must arm NOTHING for that item.
+    ///
+    /// This test used to assert the opposite -- that the match was pushed onto
+    /// the entries anyway -- on the ground that "the match is what autofill
+    /// needs, not the item's existence". Every consumer resolves the item BY
+    /// ID (`app::handle_match` looks it up in the cache; `fill_from_vault`
+    /// falls through to `bridge().get_item`), so an entry for an id nothing
+    /// can resolve arms a match that can only fail: Prompt mode shows an
+    /// anonymous "fill something?" overlay whose Fill button 404s into a
+    /// `log::error!`, and Auto mode does the same round-trip silently on every
+    /// foregrounding until the next sync or unlock.
+    ///
+    /// And it fires precisely when the evidence says the item is GONE: the
+    /// target came from `pick_vault_item` -> `load_items_for_picker` -> the
+    /// snapshot in this same era, so it WAS there at pick time; for a
+    /// populated same-era snapshot to lack it now, a populate's fetch dropped
+    /// it. A missing match is silent, correct and self-heals; a firing match
+    /// that never fills teaches the user to distrust autofill.
     #[test]
-    fn a_server_only_save_still_arms_the_engine_with_the_match_it_saved() {
+    fn a_server_only_save_arms_no_match_for_an_item_the_snapshot_has_lost() {
         let target: deskwarden::vault_bridge::VaultItem =
             serde_json::from_str(r#"{"id":"7","name":"Seven","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
@@ -3647,22 +3819,62 @@ mod tests {
             },
             write: deskwarden::vault_cache::AppMatchWrite::ServerOnly,
         };
-        // A populated, same-era snapshot that simply does not hold item 7 --
-        // exactly the state `main`'s `else` warn does NOT fire for.
+        // A populated, same-era snapshot that holds another item but not
+        // item 7 -- so "armed nothing at all" cannot pass this by accident.
         let snapshot = Ok(deskwarden::vault_cache::VaultSnapshot {
-            items: vec![],
+            items: probe_items(&[("1", "calc.exe")]),
             folders: vec![],
         });
 
         let items = add_app_rebuild_source(snapshot, &saved, &target)
-            .expect("a populated same-era snapshot must still arm the engine");
+            .expect("a populated same-era snapshot is still the right thing to arm from");
+        assert!(
+            items.iter().all(|i| i.id != "7"),
+            "an item the snapshot has lost must not be synthesised back into the engine's source"
+        );
         let entries = match_entries(&items);
         assert_eq!(
             entries.len(),
             1,
-            "the saved match must reach the engine even though the snapshot never took it"
+            "only the snapshot's own entries: {entries:?}"
         );
-        assert_eq!(entries[0].1.process, "notepad.exe");
+        assert_eq!(
+            entries[0].0, "1",
+            "the surviving entry is the snapshot's, not the phantom"
+        );
+    }
+
+    /// Review 30's Minor 5. The era capture, the two picker windows and the
+    /// rebuild used to be four unbound statements in `main`'s event loop, so
+    /// moving the capture below `pick_vault_item` -- an innocent-looking tidy,
+    /// since that call captures its own era internally -- silently narrowed
+    /// the guard to the second window and NO test noticed. `AddAppFlow` is
+    /// what binds them; this pins the half that can be tested without an event
+    /// loop, that the era it captured still outranks the rebuild.
+    #[test]
+    fn the_add_app_flows_captured_era_outranks_the_rebuild_after_a_clear() {
+        let target: deskwarden::vault_bridge::VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"One","type":1,"fields":[]}"#)
+                .expect("the fixture must deserialize");
+        let saved = deskwarden::picker_ui::SavedAppMatch {
+            app_match: deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+            write: deskwarden::vault_cache::AppMatchWrite::WroteThrough,
+        };
+        // No server needed: a `clear` supersedes without any request, which is
+        // the fact under test.
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+        let flow = AddAppFlow {
+            era: cache.epoch().era(),
+        };
+        cache.clear();
+
+        assert!(
+            flow.rebuild_source(&cache, &saved, &target).is_none(),
+            "a vault session the user did not just edit must arm nothing"
+        );
     }
 
     /// The ordinary case, so the test above cannot pass by unconditionally
