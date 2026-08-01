@@ -2490,33 +2490,129 @@ mod synced_ago_text_tests {
 /// no function below it can observe where its caller's binding lives.
 ///
 /// That is the bug `detail_edit.rs` shipped once already, and it is the only
-/// route back to it left open. So this asserts the one observable fact that
-/// distinguishes the two placements: the declaration comes *before* the
-/// closure in this file's own source. If either string below is renamed this
-/// test fails loudly rather than silently passing -- read the message, then
-/// update the needle.
+/// route back to it left open. So this asserts the two observable facts that
+/// distinguish the placements: the declaration exists exactly once and comes
+/// *before* the frame closure, and the reset assignment still sits inside the
+/// selection-change block. If any needle below stops matching, the test fails
+/// loudly rather than silently passing -- read the message, then update the
+/// needle.
+///
+/// **What these do NOT guarantee, stated so the doc does not imply coverage it
+/// does not have.** They pin source *positions* and the *spelling* of one
+/// condition. They cannot see behaviour: nothing here would notice the reset
+/// being moved out of the selection-change block into some other block whose
+/// condition happens to be spelled the same way, nor a `RevealState` whose
+/// `Default` stopped meaning "masked". Both of those are visible in a diff that
+/// touches these lines; what the guards exist for is the edit that touches
+/// neither and still re-creates the state per frame.
 #[cfg(test)]
 mod reveal_state_placement_tests {
-    const DECLARATION: &str = "let mut reveal = detail::RevealState::default();";
-    const FRAME_CLOSURE: &str = "run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {";
+    // EVERY NEEDLE IS SPLIT ACROSS TWO LITERALS, AND THAT IS LOAD-BEARING.
+    // `include_str!("mod.rs")` pulls in this test module too, so a needle
+    // written as one literal is always present in the source -- inside the very
+    // const that defines it. That made both `unwrap_or_else` panics below
+    // unreachable dead code, and it let the whole test pass with the regression
+    // live: rename the frame closure's second parameter and a long
+    // `FRAME_CLOSURE` matches nothing but its own definition down here at the
+    // bottom of the file, after which *any* declaration position at all
+    // compares "before" it. `concat!` joins the halves at compile time, so each
+    // needle exists in the binary but appears nowhere in this file's source
+    // except where the real code is. Do not re-join these into one literal --
+    // and note that the occurrence-count assertions below are what ENFORCE
+    // that, not this comment: re-joining any needle makes it appear one extra
+    // time, in its own const, and fails that needle's count.
+    const DECLARATION: &str = concat!("let mut reveal = detail::", "RevealState::default();");
+    // Deliberately stops before the closure's parameter list: a rename of
+    // `_frame` (that parameter will be used eventually) is an unrelated
+    // refactor and must not be able to invalidate this needle.
+    const FRAME_CLOSURE: &str = concat!("run_ui_native(", "WINDOW_TITLE, options,");
+    const RESET_GUARD: &str = concat!("if selected_id != ", "last_selected_id {");
+    // The bare assignment, which is also the tail of `DECLARATION` -- hence the
+    // "exactly two occurrences" shape in the reset test below.
+    const RESET: &str = concat!("reveal = detail::", "RevealState::default();");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
 
     #[test]
     fn the_reveal_state_is_declared_outside_the_per_frame_closure() {
-        let source = include_str!("mod.rs");
+        let source = source();
         let declaration = source.find(DECLARATION).unwrap_or_else(|| {
             panic!("no {DECLARATION:?} in this file -- if `run`'s RevealState was renamed, \
                     update this needle; if it was DELETED, the reveal toggle no longer has \
                     caller-owned state and that is the regression this guards")
         });
+        assert_eq!(
+            source.matches(DECLARATION).count(),
+            1,
+            "{DECLARATION:?} appears more than once in this file. A second declaration \
+             shadows the first, and the position check below would be satisfied by \
+             whichever came first while the pane read the other -- so this is a failure \
+             even though both may be outside the closure."
+        );
         let closure = source.find(FRAME_CLOSURE).unwrap_or_else(|| {
-            panic!("no {FRAME_CLOSURE:?} in this file -- the per-frame closure was renamed; \
-                    update this needle")
+            panic!("no {FRAME_CLOSURE:?} in this file -- `run`'s call to the frame runner was \
+                    renamed or its first two arguments changed; update this needle")
         });
+        assert_eq!(
+            source.matches(FRAME_CLOSURE).count(),
+            1,
+            "{FRAME_CLOSURE:?} appears more than once in this file, so 'before the closure' \
+             no longer names one position; update this needle to something unique."
+        );
         assert!(
             declaration < closure,
             "`run`'s RevealState is declared INSIDE the per-frame closure, so it is \
              re-created every frame and Reveal is a no-op in the shipped app -- see this \
              module's doc. Declare it in `run`'s per-selection state block instead."
+        );
+    }
+
+    /// The declaration being in the right place is only half of it: the reset
+    /// is what keeps a revealed value from following the user onto the next
+    /// item, and *widening or deleting its condition* re-creates the state on
+    /// every frame just as effectively as moving the declaration would --
+    /// identical user-visible regression, and the position test above stays
+    /// green through it.
+    #[test]
+    fn the_reveal_state_is_reset_only_when_the_selection_changes() {
+        let source = source();
+        let guard = source.find(RESET_GUARD).unwrap_or_else(|| {
+            panic!("no {RESET_GUARD:?} in this file -- the selection-change condition was \
+                    deleted or WIDENED. If it now holds on more than a selection change, the \
+                    reset below it runs on frames it should not: `reveal` is cleared while \
+                    the user is looking at it and Reveal becomes a no-op in the shipped app. \
+                    If the condition was merely reworded, update this needle.")
+        });
+        assert_eq!(
+            source.matches(RESET_GUARD).count(),
+            1,
+            "{RESET_GUARD:?} appears more than once in this file, so it no longer names one \
+             block; update this needle to something unique."
+        );
+        let occurrences: Vec<usize> = source.match_indices(RESET).map(|(i, _)| i).collect();
+        assert_eq!(
+            occurrences.len(),
+            2,
+            "expected exactly two {RESET:?} in this file -- `run`'s declaration and the \
+             single reset in the selection-change block -- found {}. FEWER means one of \
+             them was renamed or DELETED (a deleted reset lets a revealed card number \
+             follow the user onto the next item); MORE means something other than the \
+             selection-change block also clears `reveal`.",
+            occurrences.len()
+        );
+        assert_eq!(
+            occurrences[0],
+            source.find(DECLARATION).expect("checked by the placement test above") + "let mut ".len(),
+            "the first {RESET:?} is not the tail of `run`'s declaration, so these two \
+             occurrences are not the pair this test believes it is looking at"
+        );
+        assert!(
+            guard < occurrences[1],
+            "the reset assignment comes BEFORE the selection-change condition, so it is not \
+             inside that block -- it runs unconditionally, once per frame, and Reveal is a \
+             no-op in the shipped app."
         );
     }
 }

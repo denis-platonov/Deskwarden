@@ -391,7 +391,7 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 /// both shapes; anything that does not parse as a month (`"xx"`, `"13"`,
 /// `"0"`) is passed through untouched, because showing an unexpected value
 /// beats silently dropping it.
-pub fn card_expiry_text(month: Option<&str>, year: Option<&str>) -> Option<String> {
+fn card_expiry_text(month: Option<&str>, year: Option<&str>) -> Option<String> {
     let month = non_empty(month).map(|m| match m.parse::<u8>() {
         Ok(n) if (1..=12).contains(&n) => format!("{n:02}"),
         _ => m.to_string(),
@@ -479,7 +479,7 @@ pub fn card_fields(data: &CardData) -> CardFields {
 /// is modelled (see [`IdentityData`]'s doc); if a real item carries it, the
 /// pane shows it instead of hiding it in `other`. It costs one suppressed row
 /// on every item that does not.
-pub fn identity_groups(identity: &IdentityData) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+fn identity_groups(identity: &IdentityData) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     let f = |label: &'static str, value: &Option<String>| {
         non_empty(value.as_deref()).map(|v| (label, v.to_string()))
     };
@@ -711,7 +711,7 @@ pub fn draw_detail_read(
         DetailBody::NotesOnly => {}
         DetailBody::Card => {
             card(ui, "CARD DETAILS", |ui| {
-                card_rows(ui, item.card.as_ref(), reveal, &mut action);
+                card_rows(ui, item.card.as_ref().map(card_fields), reveal, &mut action);
             });
             ui.add_space(10.0);
         }
@@ -873,18 +873,28 @@ fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
 ///
 /// The number and the security code are the only masked values on either
 /// pane, and their reveal flags come from the caller (see [`RevealState`]).
+///
+/// **It takes [`CardFields`], never a [`CardData`], and that is structural.**
+/// [`CardFields`] is documented as the *only* producer of a card's displayed
+/// text, and while the raw `CardData` stayed in scope for the whole of this
+/// function that was a convention a sixth row could break without noticing: an
+/// `if let Some(v) = &data.new_field` drawn here compiles, renders, and is
+/// invisible to [`CardFields::is_empty`] -- the pane draws a row *and* says "No
+/// card details on this item.", the exact failure the type exists to prevent.
+/// The conversion happens at the call site instead, so there is no `data` here
+/// to reach for and a sixth field has to go through [`CardFields`] (where
+/// `is_empty`'s destructuring makes it a compile error) to reach the pane.
 fn card_rows(
     ui: &mut egui::Ui,
-    card_data: Option<&CardData>,
+    fields: Option<CardFields>,
     reveal: &mut RevealState,
     action: &mut DetailAction,
 ) {
-    let Some(data) = card_data else {
+    let Some(fields) = fields else {
         empty_pane_note(ui, "No card details on this item.");
         return;
     };
 
-    let fields = card_fields(data);
     if fields.is_empty() {
         empty_pane_note(ui, "No card details on this item.");
         return;
