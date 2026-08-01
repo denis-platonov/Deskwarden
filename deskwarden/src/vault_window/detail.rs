@@ -405,6 +405,67 @@ pub fn card_expiry_text(month: Option<&str>, year: Option<&str>) -> Option<Strin
     }
 }
 
+/// Every value the card pane shows, formatted and emptiness-suppressed once.
+///
+/// Pure, and the *only* producer of a card's displayed text. Two separate
+/// findings share that requirement.
+///
+/// **The emptiness rule.** `card_rows` used to open-code "is this card empty"
+/// as a five-way `is_none()` conjunction sitting next to five per-row `if let
+/// Some` checks. They agreed, but nothing made them: a sixth field added to
+/// the render list and not to the conjunction yields a pane that draws a row
+/// *and* says "No card details on this item." [`CardFields::is_empty`] is now
+/// that rule, expressed once over the same struct the rows are drawn from, and
+/// it destructures rather than reading fields by name so a sixth field is a
+/// compile error there rather than a silent omission.
+///
+/// **Displayed and copied must not diverge.** The number and the security code
+/// render through [`non_empty`], which *trims*, while `vault_window::mod`'s
+/// Copy handler used to read `card.number`/`card.code` raw off the item. A
+/// number stored as `" 4242… "` displayed trimmed and copied with the
+/// whitespace, which some payment forms reject. Both sides now come from here,
+/// so what is copied is exactly what is shown.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CardFields {
+    pub cardholder: Option<String>,
+    pub brand: Option<String>,
+    /// Masked until revealed. Plain `String` rather than `Zeroizing`: this is
+    /// the same already-formatted copy the pane paints, and the wrapped field
+    /// on the item is untouched (see the module's recorded "zeroize is leaky
+    /// beyond the wrapped fields" deferral).
+    pub number: Option<String>,
+    pub expiry: Option<String>,
+    /// Masked until revealed. See [`Self::number`].
+    pub code: Option<String>,
+}
+
+impl CardFields {
+    /// True when this card has nothing at all to draw -- the one rule, so the
+    /// "No card details on this item." note and the absence of every row are
+    /// the same decision rather than two that happen to agree.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            cardholder,
+            brand,
+            number,
+            expiry,
+            code,
+        } = self;
+        cardholder.is_none() && brand.is_none() && number.is_none() && expiry.is_none() && code.is_none()
+    }
+}
+
+/// See [`CardFields`].
+pub fn card_fields(data: &CardData) -> CardFields {
+    CardFields {
+        cardholder: non_empty(data.cardholder_name.as_deref()).map(str::to_string),
+        brand: non_empty(data.brand.as_deref()).map(str::to_string),
+        number: non_empty(data.number.as_deref().map(|n| n.as_str())).map(str::to_string),
+        expiry: card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref()),
+        code: non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string),
+    }
+}
+
 /// The identity pane's rows, grouped, with empty fields and empty groups
 /// removed.
 ///
@@ -823,16 +884,18 @@ fn card_rows(
         return;
     };
 
-    let cardholder = non_empty(data.cardholder_name.as_deref()).map(str::to_string);
-    let brand = non_empty(data.brand.as_deref()).map(str::to_string);
-    let number = non_empty(data.number.as_deref().map(|n| n.as_str())).map(str::to_string);
-    let expiry = card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref());
-    let code = non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string);
-
-    if cardholder.is_none() && brand.is_none() && number.is_none() && expiry.is_none() && code.is_none() {
+    let fields = card_fields(data);
+    if fields.is_empty() {
         empty_pane_note(ui, "No card details on this item.");
         return;
     }
+    let CardFields {
+        cardholder,
+        brand,
+        number,
+        expiry,
+        code,
+    } = fields;
 
     // `first` tracks whether a hairline is owed, so suppressing a row never
     // leaves a separator with nothing on one side of it.
@@ -1133,6 +1196,25 @@ mod tests {
             // a decision over a domain enum -- a new `egui::Shape` variant
             // carrying text would be egui's to tell us about, not something
             // an exhaustive match here could catch.
+            _ => {}
+        }
+    }
+
+    /// Same walk as [`collect_text`], but keeping the rectangle egui laid each
+    /// string out in -- the only way this file can find a *control* to click,
+    /// since `draw_detail_read` returns a `DetailAction` rather than the
+    /// widgets' `Response`s.
+    fn collect_text_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_rects(shape, out);
+                }
+            }
             _ => {}
         }
     }
@@ -1703,6 +1785,156 @@ mod tests {
         assert!(contains(&texts, "Hide"), "a revealed row still offers Reveal: {texts:?}");
     }
 
+    /// **The toggle survives the frame it was clicked in.** Everything else in
+    /// this file runs exactly one frame and never clicks anything, which
+    /// proves the pane *reads* the caller's state and nothing more. Two
+    /// distinct regressions live in that gap: `draw_detail_read` taking
+    /// `RevealState` by value (it is `Copy`, so that compiles and silently
+    /// drops every toggle), and the Reveal button writing to anything other
+    /// than the caller's struct.
+    ///
+    /// So: ONE `RevealState`, owned out here the way `vault_window::mod`'s
+    /// `run` owns it, across three frames. Frame 1 lays the pane out and is
+    /// read only to locate the control. Frame 2 delivers a real pointer press
+    /// and release on the *number's* Reveal button. Frame 3 is fed no input at
+    /// all -- so if the toggle did not outlive frame 2, frame 3 paints bullets.
+    #[test]
+    fn a_reveal_click_in_one_frame_is_still_revealed_in_the_next() {
+        let item = a_full_card();
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        // Same two throwaway frames `painted_text` runs, and for the same
+        // reason: `theme::apply`'s fonts only exist from the next frame on.
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+
+        let mut reveal = RevealState::default();
+        let frame = |events: Vec<egui::Event>, reveal: &mut RevealState| {
+            let output = ctx.run_ui(input(events), |ui| {
+                draw_detail_read(ui, &item, 3, &TotpState::NoSecret, false, reveal, None);
+            });
+            let mut rects = Vec::new();
+            for clipped in &output.shapes {
+                collect_text_rects(&clipped.shape, &mut rects);
+            }
+            rects
+        };
+
+        let laid_out = frame(Vec::new(), &mut reveal);
+        // The topmost "Reveal" is the Number row's: the security code's row is
+        // drawn below it, and both are inside the same card.
+        let reveal_button = laid_out
+            .iter()
+            .filter(|(text, _)| text == "Reveal")
+            .min_by(|a, b| a.1.top().total_cmp(&b.1.top()))
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| panic!("the card pane painted no Reveal control: {laid_out:?}"));
+
+        let click = |pos: egui::Pos2| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]
+        };
+        let _ = frame(click(reveal_button), &mut reveal);
+
+        // The click reached the caller's struct, and reached the field that
+        // belongs to the row it landed on.
+        assert_eq!(
+            reveal,
+            RevealState {
+                password: false,
+                card_number: true,
+                card_code: false,
+            },
+            "clicking the card number's Reveal did not write through to the caller's \
+             RevealState, or wrote through to the wrong field"
+        );
+
+        // And a frame with no input at all still paints the digits.
+        let after = frame(Vec::new(), &mut reveal);
+        let texts: Vec<String> = after.into_iter().map(|(text, _)| text).collect();
+        assert!(
+            contains(&texts, "4242424242424242"),
+            "the frame after the Reveal click painted the number masked again -- the \
+             toggle did not outlive the frame it happened in: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "123"),
+            "the security code was revealed by a click on the number's Reveal: {texts:?}"
+        );
+    }
+
+    /// **Which flag feeds which row.** `RevealState`'s doc claims the struct
+    /// stops two rows sharing one bool -- and it does stop them *sharing* one,
+    /// but nothing pinned which field reaches which row until this test. Every
+    /// other case in this file sets the two card flags to the same value, so
+    /// `&mut reveal.card_number` passed to the Security-code row -- a
+    /// one-token slip in `card_rows` -- left the whole suite green while a
+    /// click on the number's Reveal unmasked the CVV too.
+    ///
+    /// Both directions, because one alone only pins that *some* flag reaches
+    /// each row.
+    #[test]
+    fn each_card_secret_is_revealed_only_by_its_own_flag() {
+        let number_only = painted_with_reveal(
+            &a_full_card(),
+            &TotpState::NoSecret,
+            RevealState {
+                password: false,
+                card_number: true,
+                card_code: false,
+            },
+        );
+        assert!(
+            contains(&number_only, "4242424242424242"),
+            "card_number: true did not reveal the number: {number_only:?}"
+        );
+        assert!(
+            !contains(&number_only, "123"),
+            "revealing the card NUMBER also unmasked the security code -- the two rows \
+             are reading the same flag: {number_only:?}"
+        );
+
+        let code_only = painted_with_reveal(
+            &a_full_card(),
+            &TotpState::NoSecret,
+            RevealState {
+                password: false,
+                card_number: false,
+                card_code: true,
+            },
+        );
+        assert!(
+            contains(&code_only, "123"),
+            "card_code: true did not reveal the security code: {code_only:?}"
+        );
+        assert!(
+            !contains(&code_only, "4242"),
+            "revealing the SECURITY CODE also unmasked the number -- the two rows are \
+             reading the same flag: {code_only:?}"
+        );
+    }
+
     /// Nothing else on these panes is masked -- the requirement is exactly two
     /// fields, so a cardholder name behind bullets would be as wrong as a
     /// number in front of them.
@@ -1713,6 +1945,104 @@ mod tests {
             assert!(
                 contains(&texts, visible),
                 "{visible:?} was masked; only the number and the security code may be: {texts:?}"
+            );
+        }
+    }
+
+    fn a_card_data(number: &str, code: &str) -> CardData {
+        CardData {
+            cardholder_name: None,
+            brand: None,
+            number: Some(number.to_string().into()),
+            exp_month: None,
+            exp_year: None,
+            code: Some(code.to_string().into()),
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// **What is copied is what is shown.** The two card secrets render
+    /// through `non_empty`, which trims; `vault_window::mod`'s Copy handler
+    /// used to read `card.number`/`card.code` raw off the item, so a number
+    /// stored with stray whitespace displayed trimmed and copied untrimmed --
+    /// which some payment forms reject. There is now one producer,
+    /// [`card_fields`], and both sides take their value from it.
+    #[test]
+    fn card_fields_trims_the_secrets_the_copy_path_and_the_rows_share() {
+        let fields = card_fields(&a_card_data(" 4242424242424242 ", "\t123\n"));
+        assert_eq!(fields.number.as_deref(), Some("4242424242424242"));
+        assert_eq!(fields.code.as_deref(), Some("123"));
+    }
+
+    /// A field that is present but blank is the same as an absent one to a
+    /// reader, for the secrets as much as for the plain rows.
+    #[test]
+    fn card_fields_treats_a_whitespace_only_field_as_absent() {
+        let fields = card_fields(&a_card_data("   ", ""));
+        assert_eq!(fields.number, None);
+        assert_eq!(fields.code, None);
+        assert!(fields.is_empty(), "a card of only blanks is not empty: {fields:?}");
+    }
+
+    /// **The conjunction, tested rather than assumed.** `card_rows` used to
+    /// open-code "is this card empty" beside five per-row `if let Some`
+    /// checks; a sixth field added to the rows and not to the check gives a
+    /// pane that draws a row *and* says "No card details on this item." One
+    /// populated field at a time, each asserted to make the card non-empty:
+    /// a check that missed any one of them would call that card empty.
+    #[test]
+    fn a_card_is_empty_exactly_when_every_field_it_renders_is() {
+        assert!(card_fields(&CardData::default()).is_empty());
+        let one_field_at_a_time: [(&str, Box<dyn Fn(&mut CardData)>); 5] = [
+            ("cardholder", Box::new(|c: &mut CardData| c.cardholder_name = Some("John Doe".into()))),
+            ("brand", Box::new(|c: &mut CardData| c.brand = Some("visa".into()))),
+            ("number", Box::new(|c: &mut CardData| c.number = Some("4242".to_string().into()))),
+            ("expiry month", Box::new(|c: &mut CardData| c.exp_month = Some("04".into()))),
+            ("expiry year", Box::new(|c: &mut CardData| c.exp_year = Some("2023".into()))),
+            // The security code is the sixth setter and the fifth *field*:
+            // `exp_month`/`exp_year` render as one row. Covered below so the
+            // array stays a list of independent "this alone is enough" cases.
+        ];
+        for (name, populate) in one_field_at_a_time {
+            let mut data = CardData::default();
+            populate(&mut data);
+            let fields = card_fields(&data);
+            assert!(
+                !fields.is_empty(),
+                "a card carrying only its {name} was called empty, so that row renders \
+                 under a \"No card details on this item.\" note: {fields:?}"
+            );
+        }
+        let mut code_only = CardData::default();
+        code_only.code = Some("123".to_string().into());
+        assert!(
+            !card_fields(&code_only).is_empty(),
+            "a card carrying only its security code was called empty"
+        );
+    }
+
+    /// The render side takes its text from [`card_fields`] and nothing else,
+    /// so the trimmed value the copy path hands to the clipboard is character
+    /// for character the one on screen.
+    #[test]
+    fn the_pane_paints_exactly_what_card_fields_returns() {
+        let mut item = an_item(Some(3));
+        item.card = Some(a_card_data(" 4242424242424242 ", " 123 "));
+        let fields = card_fields(item.card.as_ref().expect("just set"));
+        let texts = painted_with_reveal(
+            &item,
+            &TotpState::NoSecret,
+            RevealState {
+                password: false,
+                card_number: true,
+                card_code: true,
+            },
+        );
+        for value in [fields.number.expect("number"), fields.code.expect("code")] {
+            assert!(
+                texts.iter().any(|t| *t == value),
+                "the pane painted something other than what card_fields returned for \
+                 {value:?}: {texts:?}"
             );
         }
     }

@@ -993,14 +993,26 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // it. (The clipboard is one of the escape
                                 // routes `deskwarden/README.md` already
                                 // documents; that is unchanged here.)
+                                //
+                                // Both go through `detail::card_fields`, the
+                                // pane's own formatter, rather than reading
+                                // the raw field: `card_fields` trims, the
+                                // rendered row is trimmed, and a number stored
+                                // as `" 4242… "` used to display trimmed and
+                                // copy with the whitespace some payment forms
+                                // reject. There is now exactly one producer of
+                                // a card's displayed text, so what is copied
+                                // is what is on screen.
                                 DetailAction::CopyCardNumber => {
-                                    if let Some(number) = item.card.as_ref().and_then(|c| c.number.as_deref()) {
-                                        ui.ctx().copy_text(number.to_string());
+                                    if let Some(number) =
+                                        item.card.as_ref().and_then(|c| detail::card_fields(c).number)
+                                    {
+                                        ui.ctx().copy_text(number);
                                     }
                                 }
                                 DetailAction::CopyCardCode => {
-                                    if let Some(code) = item.card.as_ref().and_then(|c| c.code.as_deref()) {
-                                        ui.ctx().copy_text(code.to_string());
+                                    if let Some(code) = item.card.as_ref().and_then(|c| detail::card_fields(c).code) {
+                                        ui.ctx().copy_text(code);
                                     }
                                 }
                                 // A non-secret row (the card's cardholder
@@ -2460,6 +2472,52 @@ mod synced_ago_text_tests {
     fn a_minute_or_more_reads_n_min_ago() {
         assert_eq!(synced_ago_text(Duration::from_secs(60)), "1 min ago");
         assert_eq!(synced_ago_text(Duration::from_secs(125)), "2 min ago");
+    }
+}
+
+/// Where `run`'s [`detail::RevealState`] is *declared*.
+///
+/// **A source-position assertion, deliberately, and the only kind that can
+/// reach this.** `detail.rs`'s
+/// `a_reveal_click_in_one_frame_is_still_revealed_in_the_next` proves the
+/// whole pane path -- the Reveal button writes through to the caller's struct
+/// and the next frame honours it -- but it supplies its own long-lived
+/// `RevealState`, exactly as `run` does. Moving `run`'s own `let mut reveal`
+/// from its per-selection state block *into* the `run_ui_native` frame
+/// closure re-creates it every frame, makes Reveal a visible no-op in the
+/// shipped app, and is invisible to every behavioural test in this crate:
+/// `run` opens a native window and cannot be called from a test at all, and
+/// no function below it can observe where its caller's binding lives.
+///
+/// That is the bug `detail_edit.rs` shipped once already, and it is the only
+/// route back to it left open. So this asserts the one observable fact that
+/// distinguishes the two placements: the declaration comes *before* the
+/// closure in this file's own source. If either string below is renamed this
+/// test fails loudly rather than silently passing -- read the message, then
+/// update the needle.
+#[cfg(test)]
+mod reveal_state_placement_tests {
+    const DECLARATION: &str = "let mut reveal = detail::RevealState::default();";
+    const FRAME_CLOSURE: &str = "run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {";
+
+    #[test]
+    fn the_reveal_state_is_declared_outside_the_per_frame_closure() {
+        let source = include_str!("mod.rs");
+        let declaration = source.find(DECLARATION).unwrap_or_else(|| {
+            panic!("no {DECLARATION:?} in this file -- if `run`'s RevealState was renamed, \
+                    update this needle; if it was DELETED, the reveal toggle no longer has \
+                    caller-owned state and that is the regression this guards")
+        });
+        let closure = source.find(FRAME_CLOSURE).unwrap_or_else(|| {
+            panic!("no {FRAME_CLOSURE:?} in this file -- the per-frame closure was renamed; \
+                    update this needle")
+        });
+        assert!(
+            declaration < closure,
+            "`run`'s RevealState is declared INSIDE the per-frame closure, so it is \
+             re-created every frame and Reveal is a no-op in the shipped app -- see this \
+             module's doc. Declare it in `run`'s per-selection state block instead."
+        );
     }
 }
 
