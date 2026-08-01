@@ -1301,6 +1301,135 @@ fn repopulate_and_refresh_after_unlock(
     }
 }
 
+/// Decides what the lock recovery does with the readiness probe's outcome:
+/// repopulate, retry once, or stand autofill down.
+///
+/// Split out of `open_vault_window` -- which takes seventeen parameters and
+/// blocks the main thread on real windows -- so the composition itself (first
+/// probe -> optional retry -> repopulate or stand down) is what the tests
+/// drive, rather than a reimplementation of it beside the live one. `probe`
+/// is the readiness wait, taking the message its spinner should show; the
+/// only caller passes `wait_for_vault_ready_with_spinner`.
+///
+/// **Review 17's Critical.** Before this, a `Dismissed` here went straight to
+/// `engine.clear()`, and the warn it logged advised the user to "open it
+/// again from the tray to retry" -- advice that is false. The engine is only
+/// ever rebuilt at four places (startup, this function's `Ready` path, a
+/// completed tray `Sync`, and `refresh_match_engine` from an "Add app..."
+/// save), and `open_vault_window` reaches the recovery ONLY when the window
+/// reports `locked || needs_reauth`. A normal open/close never touches the
+/// engine at all, so reopening the vault window repopulates the CACHE and
+/// leaves the ENGINE empty: the user sees all their items and autofill is
+/// still dead. The scenario is one impatient click -- the vault auto-locks,
+/// the master password is accepted, `bw serve` restarts fine, the spinner
+/// appears and the user closes it -- and review 12 already ruled that
+/// gesture must not be destructive.
+///
+/// So a dismissal now buys ONE free readiness probe before anything
+/// destructive happens, exactly as startup's own dismissal does
+/// (`SETUP_RETRY_MESSAGE`). That matters beyond politeness:
+/// `wait_for_vault_ready_with_spinner`'s worker is DETACHED and still
+/// running at that moment, so the vault is very likely ready a second later
+/// and the retry simply takes the ordinary `Ready` path -- engine armed from
+/// the probe's own items, cache seeded from the same ones. It is bounded the
+/// same way startup's is, and structurally rather than by a counter: two
+/// `probe` calls appear in this function and there is no loop.
+///
+/// A `Failed` -- the ~30s readiness deadline expiring -- does not retry. It
+/// has already spent that deadline, and startup's `Failed` arm does not
+/// retry either. It does now STAND DOWN rather than exit: see
+/// `stand_down_after_unlock`.
+fn settle_vault_after_unlock(
+    cache: &VaultCache,
+    engine: &mut MatchEngine,
+    epoch: u64,
+    mut probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+) {
+    match probe(SETUP_MESSAGE) {
+        VaultReadyOutcome::Ready(items) => {
+            repopulate_and_refresh_after_unlock(cache, engine, items, epoch)
+        }
+        VaultReadyOutcome::Dismissed => {
+            // Closing this window is not, on its own, evidence that anything
+            // is broken -- the same reasoning startup's dismissal retry is
+            // built on. Nothing is killed, nothing is re-authenticated: the
+            // still-running backend gets one more honest look.
+            log::info!(
+                "setup window closed before the vault backend was confirmed ready after \
+                 unlocking; probing readiness once more before standing autofill down"
+            );
+            match probe(SETUP_RETRY_MESSAGE) {
+                VaultReadyOutcome::Ready(items) => {
+                    repopulate_and_refresh_after_unlock(cache, engine, items, epoch)
+                }
+                VaultReadyOutcome::Dismissed => stand_down_after_unlock(
+                    engine,
+                    "the setup window was closed a second time without the vault backend \
+                     becoming ready after unlocking",
+                ),
+                VaultReadyOutcome::Failed(e) => stand_down_after_unlock(
+                    engine,
+                    &format!("the vault backend did not become ready after unlocking ({e})"),
+                ),
+            }
+        }
+        VaultReadyOutcome::Failed(e) => stand_down_after_unlock(
+            engine,
+            &format!("the vault backend did not become ready after unlocking ({e})"),
+        ),
+    }
+}
+
+/// Leaves the app running with the vault effectively still locked: cache
+/// empty (the recovery's own `cache.clear()` emptied it), engine empty, tray
+/// and hotkey and window-watching all still alive.
+///
+/// **Why the engine is cleared** (review 13's Minor 3, unchanged): nothing
+/// on this path confirmed that `bw serve` is answering under the new
+/// session, so nothing re-fetched, so the engine can only be holding the
+/// PRE-lock account's matches. Left armed beside an empty cache, a matched
+/// process still raises the autofill prompt and the fill then misses in the
+/// cache and falls through to a `get_item` with an id from an account this
+/// session is no longer signed into -- a prompt that can only ever end in an
+/// error log. This is deliberately NOT what the `Ready` path does, and the
+/// difference is the backend: there the probe itself listed the vault, so
+/// the engine is rebuilt from THOSE items and an empty cache beside them is
+/// a supported pairing (see `repopulate_and_refresh_after_unlock`).
+///
+/// **Why the message names Sync** (review 17's Critical): the warn this
+/// replaces told the user to "open it again from the tray to retry", and
+/// reopening the vault window provably does not rebuild the engine -- see
+/// `settle_vault_after_unlock`'s doc. The recoveries that actually do are
+/// the tray's "Sync", an "Add app..." save, and another lock/unlock cycle
+/// whose readiness probe is allowed to finish. A message that names a
+/// recovery which does not work is worse than no message: it costs the user
+/// the one chance they had of finding a working one.
+///
+/// **Why it does not exit** (review 17's Minor): this used to be two
+/// different answers to two transient conditions -- a dismissal survived,
+/// while a readiness TIMEOUT called `fatal_startup_error` and took the whole
+/// process down with it. Review 12's justification for making the dismissal
+/// survivable ("there is an already-running app to preserve") applies
+/// identically to a timeout, the error text came from a function named for
+/// STARTUP at a call site that is not startup, and a probe that timed out is
+/// weaker evidence of unrecoverable breakage than the all-requests-500 state
+/// the `Ready` path now deliberately survives. `fatal_startup_error` is
+/// reserved for the genuinely pre-tray path.
+///
+/// The freshly (re)started `bw serve` from just above is left running rather
+/// than killed: it may still come up on its own, in which case a tray Sync
+/// works immediately. `main`'s idle reconciliation tears it back down if
+/// `keep_backend_running` says to, exactly as it does after startup.
+fn stand_down_after_unlock(engine: &mut MatchEngine, reason: &str) {
+    engine.clear();
+    log::warn!(
+        "{reason}; leaving Deskwarden running with the vault effectively still locked. The app \
+         matches are cleared too, so nothing can prompt to autofill until they are rebuilt: use \
+         \"Sync\" in the tray menu to rebuild them. Reopening the vault window refills the item \
+         cache but does NOT rebuild the app matches."
+    );
+}
+
 /// Opens the vault window and handles it locking itself before returning.
 /// Shared by both ways of asking for it -- the tray menu's "Open Vault" item
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
@@ -1524,63 +1653,9 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // is inert; it is written this way so it stays correct if any of it
         // moves onto a background thread.
         let unlock_epoch = cache.epoch();
-        match wait_for_vault_ready_with_spinner(cache.bridge(), schedule, SETUP_MESSAGE) {
-            VaultReadyOutcome::Ready(items) => {
-                repopulate_and_refresh_after_unlock(cache, engine, items, unlock_epoch);
-            }
-            VaultReadyOutcome::Dismissed => {
-                // Review 12's Critical: closing this window must not be
-                // fatal -- same gesture, same blast radius as the bug review
-                // 11 already fixed for the picker, just at a call site that
-                // was still routing it into `fatal_startup_error`. The
-                // freshly (re)started `bw serve` from just above is left
-                // running rather than killed: it may well still come up fine
-                // on its own, and even if it doesn't, this same recovery
-                // runs again the next time the user locks or reopens the
-                // vault. Exiting the whole app -- tray, hotkey, autofill,
-                // all of it -- over an impatient click on a spinner is not
-                // an acceptable trade for a vault that was already locked.
-                //
-                // The engine has to be cleared alongside the cache that
-                // `clear()` emptied further up (review 13's Minor 3). This
-                // is deliberately NOT what the `Ready` arm does, and the
-                // difference is the backend: here nothing confirmed that
-                // `bw serve` is answering with the new session, so nothing
-                // re-fetched, so the engine can only be holding the PRE-lock
-                // account's matches -- clearing is the only correct answer.
-                // On `Ready` the probe itself listed the vault, so the engine
-                // is rebuilt from THOSE items: its entries are the current
-                // account's, and an empty cache beside them is a supported
-                // pairing (see `repopulate_and_refresh_after_unlock`). Only
-                // the `Ready` arm rebuilds the engine, so without this the app
-                // sits with an EMPTY cache and the PRE-reauth account's app
-                // matches: a matched process still raises the autofill
-                // prompt, and the fill then misses in the empty cache and
-                // falls through to a `get_item` with an id from an account
-                // this session is no longer signed into -- a prompt that can
-                // only ever end in an error log. An empty cache and a
-                // populated engine are simply not a consistent pair; a
-                // locked app should be inert.
-                engine.clear();
-                log::warn!(
-                    "setup window closed before the vault backend was confirmed ready after \
-                     unlocking; leaving Deskwarden running with the vault effectively still \
-                     locked (app matches cleared too, so nothing can prompt to autofill until \
-                     it is unlocked) -- open it again from the tray to retry"
-                );
-            }
-            VaultReadyOutcome::Failed(e) => {
-                log::error!("{e}");
-                if let Some(child) = bw_serve_child.as_mut() {
-                    bw_serve::stop_bw_serve(child);
-                }
-                fatal_startup_error(&format!(
-                    "Deskwarden's Bitwarden backend did not come back up after the vault \
-                     window locked.\n\n{e}\n\nFull details are in:\n{}",
-                    logging::log_file_path(config_dir).display()
-                ));
-            }
-        }
+        settle_vault_after_unlock(cache, engine, unlock_epoch, |message| {
+            wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message)
+        });
     }
 }
 
@@ -1729,10 +1804,22 @@ enum BackendOp {
 /// path -- logging "sync complete", rebuilding the match engine from an
 /// empty cache and returning the tray to its idle "Sync" label as though the
 /// vault were freshly in sync (review 14's Minor). Matched exhaustively in
-/// `apply_backend_op` with no catch-all.
+/// `apply_backend_op` with no catch-all. (`settle_sync_outcome` does have a
+/// catch-all, deliberately: it is a transformation that only ever downgrades
+/// `Refreshed`, not the place the outcomes are acted on.)
+#[derive(Debug)]
 enum SyncOutcome {
     /// `bw sync` succeeded and the refreshed vault landed in the cache.
-    Refreshed,
+    Refreshed {
+        /// The cache epoch this sync was written at. Checked again by
+        /// `settle_sync_outcome` when the outcome is finally applied on the
+        /// main thread -- see that function.
+        epoch: u64,
+        /// The match-engine entries derived from the item list THIS sync
+        /// fetched, rather than from a later re-read of the cache. See
+        /// `sync_outcome_from`.
+        entries: Vec<(String, deskwarden::app_match::AppMatch)>,
+    },
     /// `bw sync` succeeded, but the cache was cleared while the repopulate
     /// was in flight, so nothing local was refreshed. Not a failure of the
     /// sync and not a success for the user's purposes either.
@@ -1742,12 +1829,16 @@ enum SyncOutcome {
 }
 
 /// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
-/// `Sync`, rebuilds the match engine from the freshly repopulated cache and
-/// reflects the outcome on the tray.
+/// `Sync`, rebuilds the match engine from the entries that sync itself
+/// fetched and reflects the outcome on the tray.
+///
+/// The only thing it reads from `cache` is the epoch, for
+/// `settle_sync_outcome`; it no longer re-reads `cache.items()` (review 17
+/// -- see `sync_outcome_from`).
 fn apply_backend_op(
     op: BackendOp,
     bw_serve_child: &mut Option<Child>,
-    cache: &Arc<VaultCache>,
+    cache: &VaultCache,
     engine: &mut MatchEngine,
     tray: &tray::AppTray,
 ) {
@@ -1775,9 +1866,8 @@ fn apply_backend_op(
                 Some(Err(e)) => log::error!("sync could not start bw serve: {e}"),
                 None => {}
             }
-            match outcome {
-                SyncOutcome::Refreshed => {
-                    let entries = match_entries(&cache.items());
+            match settle_sync_outcome(outcome, cache.epoch()) {
+                SyncOutcome::Refreshed { entries, .. } => {
                     log::info!(
                         "sync complete; match engine refreshed: {} app match(es)",
                         entries.len()
@@ -1789,8 +1879,8 @@ fn apply_backend_op(
                     // Deliberately touches neither the engine nor the cache:
                     // whatever cleared the cache (lock, re-auth) owns both,
                     // and by now it may already have repopulated them for a
-                    // *different* account -- rebuilding from `cache.items()`
-                    // here could just as easily wipe a freshly correct engine
+                    // *different* account -- writing this sync's result here
+                    // could just as easily wipe a freshly correct engine
                     // as clear a stale one. What must not happen is the tray
                     // reporting a completed sync for a sync that refreshed
                     // nothing locally; "click to retry" is the honest label,
@@ -1882,6 +1972,13 @@ fn spawn_sync(
     tx: mpsc::Sender<BackendOp>,
 ) {
     std::thread::spawn(move || {
+        // Captured before ANY fetch below, for the reason
+        // `VaultCache::epoch`'s doc gives: the guard only covers the window
+        // it is handed. This is the one genuinely live `DiscardedStale`
+        // producer in the crate -- it runs on a background thread while the
+        // main thread can call `cache.clear()` -- so unlike the other epoch
+        // captures in this file it is not inert.
+        let sync_epoch = cache.epoch();
         let child = if currently_running {
             None
         } else {
@@ -1892,11 +1989,16 @@ fn spawn_sync(
             ))
         };
 
+        // `Ok(Some(items))` when the readiness wait below already listed the
+        // vault: `sync_outcome_from` reuses those rather than paying for a
+        // second full-vault `list_items` (~1.1s / 1.08 MB on a 1657-item
+        // vault, measured in this repo), the same reuse review 16 made on
+        // the unlock path. `Ok(None)` when nothing has listed it yet.
         let start_failed = matches!(&child, Some(Err(_)));
         let ready = if start_failed {
             Err("bw serve could not be started".to_string())
         } else if currently_running {
-            bw_serve::run_bw_sync(&session_token)
+            bw_serve::run_bw_sync(&session_token).map(|()| None)
         } else {
             // We just started `bw serve` ourselves. `try_start_backend`
             // returns as soon as the child process is resumed -- it does
@@ -1915,20 +2017,109 @@ fn spawn_sync(
             // backend that was already running before this click is, by
             // definition, already past this race.
             let schedule = readiness_schedule(READINESS_DEADLINE);
-            wait_for_vault_ready(cache.bridge(), &schedule).map(|_items| ())
+            wait_for_vault_ready(cache.bridge(), &schedule).map(Some)
         };
 
         let outcome = match ready {
             Err(e) => SyncOutcome::Failed(e),
-            Ok(()) => match cache.populate() {
-                Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed,
-                Ok(PopulateOutcome::DiscardedStale) => SyncOutcome::DiscardedStale,
-                Err(e) => SyncOutcome::Failed(format!("{e:?}")),
-            },
+            Ok(probe_items) => sync_outcome_from(&cache, sync_epoch, probe_items),
         };
 
         let _ = tx.send(BackendOp::Sync { child, outcome });
     });
+}
+
+/// Re-checks a completed sync's result against the cache as it stands NOW,
+/// on the main thread, and downgrades a `Refreshed` whose snapshot has been
+/// cleared out from under it to `DiscardedStale`.
+///
+/// [`VaultCache::populate_with`]'s own epoch guard covers the window between
+/// the worker's fetch and the worker's write. It cannot cover the window
+/// after that, between the worker sending its outcome and `main` draining
+/// it -- and that window is reachable, because `open_vault_window` abandons
+/// an in-flight backend operation after `BACKEND_OP_TIMEOUT` and carries on
+/// into a lock recovery that calls `cache.clear()`. Applied unguarded, such
+/// a late arrival writes the PREVIOUS account's app matches over an engine
+/// the recovery has just armed correctly for the new one -- the same
+/// cross-account pairing `stand_down_after_unlock` exists to prevent, from
+/// the other direction.
+///
+/// Comparing epochs answers exactly the right question: the epoch is bumped
+/// only by `clear`, so "unchanged since this sync captured it" means no lock,
+/// re-auth or quit has intervened and the snapshot in the cache is still the
+/// one this sync wrote. A downgrade lands in the `DiscardedStale` arm, which
+/// deliberately touches neither the engine nor the cache and reports the
+/// honest "click to retry" on the tray.
+fn settle_sync_outcome(outcome: SyncOutcome, cache_epoch: u64) -> SyncOutcome {
+    match outcome {
+        SyncOutcome::Refreshed { epoch, entries } if epoch == cache_epoch => {
+            SyncOutcome::Refreshed { epoch, entries }
+        }
+        SyncOutcome::Refreshed { epoch, .. } => {
+            log::info!(
+                "a completed sync's result reached the main thread after the vault was cleared \
+                 (epoch {epoch} -> {cache_epoch}); discarding it rather than writing it over \
+                 whatever cleared it"
+            );
+            SyncOutcome::DiscardedStale
+        }
+        other => other,
+    }
+}
+
+/// Refreshes the cache from `bw serve` after a completed `bw sync` and says
+/// what that achieved -- including, on success, the match-engine entries
+/// derived from the item list this call itself fetched.
+///
+/// **Review 17's third finding.** `SyncOutcome::Refreshed` used to be a unit
+/// variant, and `apply_backend_op` answered it with
+/// `engine.rebuild(&match_entries(&cache.items()))` -- an engine rebuild
+/// derived from a RE-READ of the cache on the main thread rather than from
+/// the fetch that produced the outcome. `Refreshed` does imply the cache was
+/// non-empty at write time, but not that it still is when the main thread
+/// gets round to applying it, and the gap is reachable: `open_vault_window`
+/// abandons an in-flight backend operation after `BACKEND_OP_TIMEOUT` and
+/// carries on into lock recovery, so a sync whose `populate` had already
+/// landed can arrive through `main`'s ordinary drain *after* that recovery's
+/// `cache.clear()`. If the recovery then went `Ready` with a failing
+/// `list_folders` -- engine armed from the probe's items, cache empty by
+/// design -- this rebuilt the engine from nothing and silently disarmed
+/// autofill for the rest of the session. That is review 15's finding
+/// resurrected through a different door.
+///
+/// Carrying the entries removes the failure mode rather than guarding
+/// against it, the same shape as review 16's fix: there is no longer a
+/// re-read to be stale. `probe_items` lets a caller that has already listed
+/// the vault (the readiness wait `spawn_sync` runs when it had to start the
+/// backend itself) hand those items over instead of paying for a second
+/// full-vault `list_items`.
+///
+/// `epoch` must be captured by the caller BEFORE the sync it is reporting on
+/// -- see [`VaultCache::epoch`]. This is the one genuinely live
+/// `DiscardedStale` producer in the crate.
+fn sync_outcome_from(
+    cache: &VaultCache,
+    epoch: u64,
+    probe_items: Option<Vec<deskwarden::vault_bridge::VaultItem>>,
+) -> SyncOutcome {
+    let items = match probe_items {
+        Some(items) => Ok(items),
+        None => cache.bridge().list_items(),
+    };
+    let items = match items {
+        Ok(items) => items,
+        Err(e) => return SyncOutcome::Failed(format!("{e:?}")),
+    };
+
+    // Derived before the move into `populate_with`, so nothing is cloned --
+    // and, incidentally, on this background thread rather than on the main
+    // one, where it used to run.
+    let entries = match_entries(&items);
+    match cache.populate_with(items, epoch) {
+        Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed { epoch, entries },
+        Ok(PopulateOutcome::DiscardedStale) => SyncOutcome::DiscardedStale,
+        Err(e) => SyncOutcome::Failed(format!("{e:?}")),
+    }
 }
 
 /// What the readiness spinner says the first time it is shown for a given
@@ -2540,6 +2731,239 @@ mod tests {
         assert!(cache.is_populated(), "the populate must have succeeded");
         assert_eq!(cache.items().len(), 1, "seeded from the probe's own items");
         items.assert();
+    }
+
+    /// A scripted stand-in for `wait_for_vault_ready_with_spinner`, recording
+    /// the message each probe was asked to show so a test can assert both
+    /// HOW MANY probes ran and that the retry looked different from the
+    /// window the user just closed.
+    fn scripted_probe<'a>(
+        script: Vec<VaultReadyOutcome>,
+        seen: &'a std::cell::RefCell<Vec<&'static str>>,
+    ) -> impl FnMut(&'static str) -> VaultReadyOutcome + 'a {
+        let mut remaining = script.into_iter();
+        move |message| {
+            seen.borrow_mut().push(message);
+            remaining
+                .next()
+                .expect("the lock recovery must not probe more times than the script allows")
+        }
+    }
+
+    /// Review 17's Critical: closing the post-unlock spinner is ONE CLICK,
+    /// the gesture review 12 already ruled must not be destructive, and it
+    /// used to disarm autofill for the rest of the session -- the detached
+    /// readiness worker was very likely about to answer `Ok(items)`, and
+    /// that answer was thrown away. Startup gives a dismissal one free probe
+    /// (`SETUP_RETRY_MESSAGE`); this site now gives the same one, and a
+    /// probe that then succeeds takes the ordinary `Ready` path.
+    #[test]
+    fn a_dismissed_spinner_after_unlock_gets_one_free_readiness_retry() {
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let epoch = cache.epoch();
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        settle_vault_after_unlock(
+            &cache,
+            &mut engine,
+            epoch,
+            scripted_probe(
+                vec![
+                    VaultReadyOutcome::Dismissed,
+                    VaultReadyOutcome::Ready(probe_items(&[("1", "notepad.exe")])),
+                ],
+                &seen,
+            ),
+        );
+
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "a dismissal followed by a successful retry must arm the engine exactly as a \
+             first-probe success does -- otherwise one impatient click kills autofill for the \
+             whole session with no recovery the user would ever think to try"
+        );
+        assert!(
+            cache.is_populated(),
+            "the retry's items must seed the cache too, i.e. the ordinary Ready path"
+        );
+        assert_eq!(
+            *seen.borrow(),
+            vec![SETUP_MESSAGE, SETUP_RETRY_MESSAGE],
+            "the retry has to look different from the window the user just closed \
+             (review 13's Minor 4)"
+        );
+    }
+
+    /// The retry is bounded exactly as startup's is: a dismissal buys one
+    /// more probe and nothing more. Two calls, structurally -- not a loop.
+    #[test]
+    fn a_second_dismissal_after_unlock_stands_autofill_down_without_looping() {
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+        )]);
+        let epoch = cache.epoch();
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        settle_vault_after_unlock(
+            &cache,
+            &mut engine,
+            epoch,
+            scripted_probe(
+                vec![VaultReadyOutcome::Dismissed, VaultReadyOutcome::Dismissed],
+                &seen,
+            ),
+        );
+
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "exactly one retry -- the scripted probe panics if a third is asked for"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "nothing confirmed the backend, so the engine can only be holding the PRE-lock \
+             account's matches and a locked app must be inert (review 13's Minor 3)"
+        );
+    }
+
+    /// Review 17's Minor: a readiness TIMEOUT is a transient condition, and
+    /// it used to call `fatal_startup_error` -- killing the tray, the
+    /// hotkey, autofill and window-watching over a ~30s probe that did not
+    /// answer, at a call site that is not startup and has an already-running
+    /// app to preserve. It now stands down exactly as a dismissal does. That
+    /// this test can run at all is the assertion: the old arm called
+    /// `std::process::exit(1)`.
+    #[test]
+    fn a_readiness_timeout_after_unlock_leaves_the_app_running() {
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+        )]);
+        let epoch = cache.epoch();
+        let seen = std::cell::RefCell::new(Vec::new());
+
+        settle_vault_after_unlock(
+            &cache,
+            &mut engine,
+            epoch,
+            scripted_probe(
+                vec![VaultReadyOutcome::Failed("timed out".to_string())],
+                &seen,
+            ),
+        );
+
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "a genuine timeout has already spent the whole readiness deadline; it does not buy \
+             another one (startup's Failed arm does not retry either)"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "same stand-down as a dismissal: empty cache, empty engine, app alive and locked"
+        );
+    }
+
+    /// A `bw serve` that answers one item carrying an app match, plus the
+    /// folders every populate also fetches.
+    fn sync_server() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":{{"data":[{}]}}}}"#,
+                vault_item_with_match("1", "notepad.exe")
+            ))
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        server
+    }
+
+    /// The ordinary case, so the guard below cannot pass by simply
+    /// discarding everything: nothing cleared the vault underneath this
+    /// sync, so its own entries arm the engine.
+    #[test]
+    fn a_completed_sync_arms_the_engine_from_the_entries_it_fetched() {
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let outcome = sync_outcome_from(&cache, cache.epoch(), None);
+
+        let mut engine = MatchEngine::new();
+        match settle_sync_outcome(outcome, cache.epoch()) {
+            SyncOutcome::Refreshed { entries, .. } => engine.rebuild(&entries),
+            other => panic!("expected a refreshed sync, got {other:?}"),
+        }
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "a sync nothing interfered with must still refresh the match engine"
+        );
+    }
+
+    /// Review 17's third finding. `SyncOutcome::Refreshed` used to be a unit
+    /// variant, and `apply_backend_op` answered it by rebuilding the engine
+    /// from a RE-READ of `cache.items()` on the main thread. That read
+    /// happens after the worker sent the outcome, and a lock recovery can
+    /// land in between -- reachable because `open_vault_window` abandons an
+    /// in-flight backend operation at `BACKEND_OP_TIMEOUT` and carries on
+    /// into a recovery that clears the cache. If that recovery then went
+    /// `Ready` with a failing `list_folders` (engine armed from the probe's
+    /// items, cache empty by design), the late sync rebuilt the engine from
+    /// nothing and disarmed autofill for the whole session -- review 15's
+    /// finding through a different door. The outcome now carries both the
+    /// entries it fetched and the epoch it was written at, so a clear in
+    /// that window downgrades it to `DiscardedStale`: the engine the
+    /// recovery armed is left exactly as it is.
+    #[test]
+    fn a_late_sync_result_cannot_disarm_an_engine_a_lock_recovery_just_armed() {
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let outcome = sync_outcome_from(&cache, cache.epoch(), None);
+
+        // The lock recovery: clears the cache, then arms the engine from its
+        // own readiness probe while `populate_with`'s folders request fails.
+        cache.clear();
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&match_entries(&probe_items(&[("2", "code.exe")])));
+
+        assert!(
+            matches!(
+                settle_sync_outcome(outcome, cache.epoch()),
+                SyncOutcome::DiscardedStale
+            ),
+            "a sync whose snapshot was cleared before its result reached the main thread must \
+             not be applied to anything"
+        );
+        assert!(
+            engine.lookup("code.exe").is_some(),
+            "the engine the recovery armed must survive the late arrival"
+        );
     }
 
     /// Whether a process with the given id still exists, via `tasklist` --
