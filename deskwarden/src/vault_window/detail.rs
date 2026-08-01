@@ -45,6 +45,42 @@ const TITLE_GAP: f32 = 3.0;
 /// The body below the strip: `padding: 18px 24px`.
 const BODY_PAD_X: i8 = 24;
 const BODY_PAD_Y: i8 = 18;
+/// `gap: 14px` between the body's cards.
+const CARD_GAP: f32 = 14.0;
+/// A card's `padding: 11px 16px` heading and `padding: 13px 16px` rows -- one
+/// horizontal padding, two vertical ones.
+const CARD_PAD_X: i8 = 16;
+const CARD_HEADING_PAD_Y: i8 = 11;
+const ROW_PAD_Y: i8 = 13;
+/// `font-size: 12px; font-weight: 700; letter-spacing: 0.06em` on a card's
+/// heading, in points (0.06em x 12px).
+const CARD_HEADING_SIZE: f32 = 12.0;
+const CARD_HEADING_TRACKING: f32 = 0.72;
+/// `gap: 16px` between a row's label column, its value and its controls.
+const ROW_GAP: f32 = 16.0;
+/// `gap: 8px` between two controls at one row's right-hand end.
+const CONTROL_GAP: f32 = 8.0;
+/// A row's content band -- the design's own `height: 28px` control, which is
+/// the tallest thing an ordinary row contains. See [`row`] for why the band
+/// has to be stated rather than left to grow.
+const ROW_CONTENT_HEIGHT: f32 = 28.0;
+/// The row label column's `width: 130px`, and its `font-size: 12px`.
+const ROW_LABEL_WIDTH: f32 = 130.0;
+const ROW_LABEL_SIZE: f32 = 12.0;
+/// `font-size: 14px` on a row's value.
+const ROW_VALUE_SIZE: f32 = 14.0;
+/// A masked value: `font-size: 15px; letter-spacing: 0.08em` in monospace.
+const MASKED_SIZE: f32 = 15.0;
+const MASKED_TRACKING: f32 = 1.2;
+/// A live one-time code: `font-size: 17px; letter-spacing: 0.12em`, then a
+/// `96x4` progress bar and the seconds remaining, `gap: 12px` apart.
+const TOTP_CODE_SIZE: f32 = 17.0;
+const TOTP_CODE_TRACKING: f32 = 2.04;
+const TOTP_GAP: f32 = 12.0;
+const TOTP_BAR_WIDTH: f32 = 96.0;
+const TOTP_BAR_HEIGHT: f32 = 4.0;
+/// The 11px runs the design uses for a row's secondary line (2b's `18s`).
+const ROW_HINT_SIZE: f32 = 11.0;
 
 /// The One-time code row's single source of truth. Replaces a bare
 /// `Option<String>` (`Some(code)` / `None`), which could not tell apart
@@ -758,7 +794,7 @@ pub fn draw_detail_read(
         DetailBody::LoginCredentials => {
             card(ui, "LOGIN CREDENTIALS", |ui| {
                 credential_row(ui, "Username", username, "Copy", &mut action, DetailAction::CopyUsername);
-                theme::hairline(ui);
+                theme::row_rule(ui);
                 password_row(ui, password, &mut reveal.password, &mut action);
                 // Whether there is a row at all is decided by `totp_row_for` and
                 // nowhere else (see its doc), so "this item looks like it has no
@@ -774,7 +810,7 @@ pub fn draw_detail_read(
                 // login data carries no seed, and a non-login has no login
                 // data at all.
                 if let Some(row) = totp_row_for(totp) {
-                    theme::hairline(ui);
+                    theme::row_rule(ui);
                     match row {
                         TotpRow::Fetching => totp_fetching_row(ui),
                         TotpRow::Code { code, seconds_left } => totp_code_row(ui, code, seconds_left, &mut action),
@@ -783,7 +819,7 @@ pub fn draw_detail_read(
                     }
                 }
             });
-            ui.add_space(10.0);
+            ui.add_space(CARD_GAP);
         }
         // The body is the NOTES card below, and that card is shared with
         // every other kind rather than duplicated here.
@@ -792,25 +828,25 @@ pub fn draw_detail_read(
             card(ui, "CARD DETAILS", |ui| {
                 card_rows(ui, item.card.as_ref().map(card_fields), reveal, &mut action);
             });
-            ui.add_space(10.0);
+            ui.add_space(CARD_GAP);
         }
         DetailBody::Identity => {
             card(ui, "IDENTITY", |ui| {
                 identity_rows(ui, item.identity.as_ref().map(identity_groups), &mut action);
             });
-            ui.add_space(10.0);
+            ui.add_space(CARD_GAP);
         }
         DetailBody::Unsupported(pane) => {
             unsupported_card(ui, &pane);
-            ui.add_space(10.0);
+            ui.add_space(CARD_GAP);
         }
     }
 
     if let Some(notes) = notes_text(item) {
         card(ui, "NOTES", |ui| {
-            ui.label(RichText::new(notes).size(13.0).color(theme::INK));
+            card_text(ui, RichText::new(notes).size(ROW_VALUE_SIZE).color(theme::INK));
         });
-        ui.add_space(10.0);
+        ui.add_space(CARD_GAP);
     }
 
     let website = login
@@ -822,16 +858,20 @@ pub fn draw_detail_read(
     // path will not fill is the same false promise the Fill button was.
     if kind_offers_fill(kind) && !website.is_empty() {
         card(ui, "AUTOFILL TARGETS", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(website).size(13.0).color(theme::TEXT_SECONDARY));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::secondary_button(ui, "Open").clicked() {
+            row(
+                ui,
+                "Website",
+                |ui| {
+                    ui.label(RichText::new(website).size(ROW_VALUE_SIZE).color(theme::INK));
+                },
+                |ui| {
+                    if theme::row_button(ui, "Open").clicked() {
                         action = DetailAction::OpenWebsite(website.to_string());
                     }
-                });
-            });
+                },
+            );
         });
-        ui.add_space(10.0);
+        ui.add_space(CARD_GAP);
     }
 
     let updated_days_ago = item
@@ -839,11 +879,23 @@ pub fn draw_detail_read(
         .get("revisionDate")
         .and_then(|v| v.as_str())
         .and_then(days_since);
-    ui.label(
-        RichText::new(metadata_line_for(kind, updated_days_ago, fill_count, password))
-            .size(11.0)
-            .color(theme::TEXT_GHOST),
-    );
+    // The design's last tile: a card like the others, `padding: 13px 16px;
+    // font-size: 12px; color: #7d7979`. It used to be a bare line of ghost text
+    // on the pane's grey -- the one part of the body that sat on no surface at
+    // all.
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            card_text(
+                ui,
+                RichText::new(metadata_line_for(kind, updated_days_ago, fill_count, password))
+                    .size(ROW_LABEL_SIZE)
+                    .color(theme::TEXT_FAINT),
+            );
+        });
 
     action
 }
@@ -856,25 +908,123 @@ pub fn draw_detail_read(
 /// which is what [`detail_body_for`] decides, and what the tests read.
 fn unsupported_card(ui: &mut egui::Ui, pane: &UnsupportedPane) {
     card(ui, pane.heading, |ui| {
-        ui.label(
+        card_text(
+            ui,
             RichText::new(pane.message.as_str())
-                .size(12.0)
+                .size(ROW_LABEL_SIZE)
                 .color(theme::TEXT_FAINT),
         );
     });
 }
 
+/// One of the body's tiles (design 2b: `background: #ffffff; border: 1px solid
+/// #eae7e7; border-radius: 10px; overflow: hidden`), with its heading rule
+/// (`padding: 11px 16px; border-bottom: 1px solid #eae7e7; 12px/700
+/// uppercase`) already drawn.
+///
+/// The card itself carries **no inner margin**: the design's row separators
+/// run edge to edge across the tile, so every padding is the heading's or a
+/// row's own and not the card's. `contents` therefore draws [`row`]s (or
+/// [`card_text`]), never bare labels.
 fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, theme::HAIRLINE))
-        .inner_margin(Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::letterspaced(title, 10.0, theme::SEMIBOLD, 1.2, theme::TEXT_GHOST));
-            ui.add_space(8.0);
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            egui::Frame::new()
+                .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(theme::letterspaced(
+                        title,
+                        CARD_HEADING_SIZE,
+                        theme::BOLD,
+                        CARD_HEADING_TRACKING,
+                        theme::TEXT_MUTED,
+                    ));
+                });
+            // The heading's `border-bottom`, which is the card's own `#eae7e7`
+            // and NOT the lighter rule that goes between rows.
+            theme::hairline(ui);
             contents(ui);
+        });
+}
+
+/// One row of a card (design 2b: `display: flex; align-items: center; gap:
+/// 16px; padding: 13px 16px`) -- a fixed `width: 130px` label column, the
+/// value taking whatever is left, and the row's controls right-aligned.
+///
+/// The two-column grid is the visible half of this task: every row on this
+/// pane used to stack its label *above* its value, which put nothing in
+/// register down the pane and left the values at four different left edges.
+fn row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // **`align-items: center` needs a band with a definite height.**
+            // In a plain `ui.horizontal`, egui places each child as the row
+            // grows, so the first child (a 13pt label) lands at the top and a
+            // later 28pt button sits 5pt lower -- two centre lines in one row.
+            // Allocating the row's own [`ROW_CONTENT_HEIGHT`] up front gives
+            // every child the same band to be centred in. A taller value (the
+            // two-line TOTP status rows) still overflows it and the frame
+            // grows to fit, exactly as the design's `align-items: center` row
+            // does.
+            let band = egui::vec2(ui.available_width(), ROW_CONTENT_HEIGHT);
+            ui.allocate_ui_with_layout(
+                band,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    label_cell(ui, label);
+                    ui.add_space(ROW_GAP);
+                    value(ui);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // `gap: 8px`, within the control group only.
+                        ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                        controls(ui);
+                    });
+                },
+            );
+        });
+}
+
+/// A row's label column: exactly [`ROW_LABEL_WIDTH`] wide whatever the label
+/// says, so the values beside it line up down the whole pane. Painted rather
+/// than `ui.label`ed because a label allocates its own text width.
+fn label_cell(ui: &mut egui::Ui, label: &str) {
+    let galley = ui.painter().layout(
+        label.to_string(),
+        egui::FontId::new(ROW_LABEL_SIZE, egui::FontFamily::Proportional),
+        theme::TEXT_FAINT,
+        ROW_LABEL_WIDTH,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ROW_LABEL_WIDTH, galley.size().y),
+        egui::Sense::hover(),
+    );
+    let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(pos, galley, theme::TEXT_FAINT);
+}
+
+/// A card whose body is a paragraph rather than rows -- the notes card, the
+/// two unsupported panes and the "nothing here" notes. Same `padding: 13px
+/// 16px` a row has, so its text sits on the same left edge as every label.
+fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(text);
         });
 }
 
@@ -886,18 +1036,18 @@ fn credential_row(
     action: &mut DetailAction,
     on_copy: DetailAction,
 ) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
-            ui.label(RichText::new(value).size(13.0).color(theme::INK));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::secondary_button(ui, copy_label).clicked() {
+    row(
+        ui,
+        label,
+        |ui| {
+            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
+        },
+        |ui| {
+            if theme::row_button(ui, copy_label).clicked() {
                 *action = on_copy;
             }
-        });
-    });
-    ui.add_space(6.0);
+        },
+    );
 }
 
 fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
@@ -918,22 +1068,34 @@ fn masked_row(
     action: &mut DetailAction,
     on_copy: DetailAction,
 ) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
-            let shown = if *revealed { value.to_string() } else { "•".repeat(value.chars().count().max(8)) };
-            ui.label(RichText::new(shown).size(13.0).color(theme::INK).family(egui::FontFamily::Monospace));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::secondary_button(ui, "Copy").clicked() {
+    let shown = if *revealed {
+        value.to_string()
+    } else {
+        "•".repeat(value.chars().count().max(8))
+    };
+    row(
+        ui,
+        label,
+        |ui| {
+            // `font-family: ui-monospace; font-size: 15px; letter-spacing:
+            // 0.08em` -- the tracking is what stops a bullet run reading as
+            // one solid blob.
+            ui.label(theme::letterspaced_mono(
+                &shown,
+                MASKED_SIZE,
+                MASKED_TRACKING,
+                theme::INK,
+            ));
+        },
+        |ui| {
+            if theme::row_button(ui, "Copy").clicked() {
                 *action = on_copy;
             }
-            if theme::secondary_button(ui, if *revealed { "Hide" } else { "Reveal" }).clicked() {
+            if theme::row_button(ui, if *revealed { "Hide" } else { "Reveal" }).clicked() {
                 *revealed = !*revealed;
             }
-        });
-    });
-    ui.add_space(6.0);
+        },
+    );
 }
 
 /// A short line of body text for a pane that has a heading and no rows.
@@ -943,7 +1105,12 @@ fn masked_row(
 /// with nothing in it. Reachable for real: the spec's rule is that a `type: 3`
 /// carrying no `card` object is an *empty card*, not an unsupported item.
 fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+    card_text(
+        ui,
+        RichText::new(text)
+            .size(ROW_LABEL_SIZE)
+            .color(theme::TEXT_FAINT),
+    );
 }
 
 /// The CARD DETAILS rows. Empty fields do not render, exactly as the identity
@@ -993,7 +1160,7 @@ fn card_rows(
         if *first {
             *first = false;
         } else {
-            theme::hairline(ui);
+            theme::row_rule(ui);
         }
     };
     if let Some(v) = &cardholder {
@@ -1039,42 +1206,100 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
         empty_pane_note(ui, "No identity details on this item.");
         return;
     }
-    for (index, (group_name, rows)) in groups.iter().enumerate() {
-        if index > 0 {
-            theme::hairline(ui);
-            ui.add_space(4.0);
-        }
-        ui.label(theme::semibold(*group_name, 11.0).color(theme::TEXT_SECONDARY));
-        ui.add_space(4.0);
-        for (label, value) in rows {
+    for (group_name, rows) in groups.iter() {
+        // A group boundary is the heavier rule -- the same one that sits under
+        // the card's own heading, because a group heading is what follows it.
+        // The lighter rule goes between the rows within a group.
+        theme::hairline(ui);
+        egui::Frame::new()
+            .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(theme::semibold(*group_name, ROW_LABEL_SIZE).color(theme::TEXT_SECONDARY));
+            });
+        for (row_index, (label, value)) in rows.iter().enumerate() {
+            if row_index > 0 {
+                theme::row_rule(ui);
+            }
             credential_row(ui, label, value, "Copy", action, DetailAction::CopyValue(value.clone()));
         }
     }
 }
 
 fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
-            ui.label(
-                RichText::new(code)
-                    .size(17.0)
-                    .family(egui::FontFamily::Monospace)
-                    .color(theme::INK),
+    row(
+        ui,
+        "One-time code",
+        |ui| {
+            // The design lays these three out along one centred line, `gap:
+            // 12px` apart: the code, a 96x4 track, then the seconds left.
+            ui.label(theme::letterspaced_mono(
+                code,
+                TOTP_CODE_SIZE,
+                TOTP_CODE_TRACKING,
+                theme::INK,
+            ));
+            ui.add_space(TOTP_GAP);
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(TOTP_BAR_WIDTH, TOTP_BAR_HEIGHT),
+                egui::Sense::hover(),
             );
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(96.0, 4.0), egui::Sense::hover());
-            ui.painter().rect_filled(rect, CornerRadius::same(2), theme::HAIRLINE);
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(2), theme::HAIRLINE);
             let fraction = (seconds_left as f32 / 30.0).clamp(0.0, 1.0);
-            let filled = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * fraction, rect.height()));
-            ui.painter().rect_filled(filled, CornerRadius::same(2), theme::BLUE);
-            ui.label(RichText::new(format!("{seconds_left}s left")).size(10.0).color(theme::TEXT_GHOST));
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if theme::secondary_button(ui, "Copy").clicked() {
+            let filled = egui::Rect::from_min_size(
+                rect.min,
+                egui::vec2(rect.width() * fraction, rect.height()),
+            );
+            ui.painter()
+                .rect_filled(filled, CornerRadius::same(2), theme::BLUE);
+            ui.add_space(TOTP_GAP);
+            ui.label(
+                RichText::new(format!("{seconds_left}s left"))
+                    .size(ROW_HINT_SIZE)
+                    .color(theme::TEXT_FAINT),
+            );
+        },
+        |ui| {
+            if theme::row_button(ui, "Copy").clicked() {
                 *action = DetailAction::CopyTotp;
             }
-        });
-    });
+        },
+    );
+}
+
+/// The shape the three *non-code* One-time code rows share: the row's label
+/// stays in its column, and the value column carries a plain status line with
+/// an optional second line of explanation under it.
+///
+/// Shared *rendering* only. Which [`TotpState`] reaches which of the three is
+/// unchanged and still lives in `totp_row_for` plus the one exhaustive match
+/// in `draw_detail_read`; each row keeps its own function, its own wording and
+/// its own doc comment, because the reasons they are three rows and not one
+/// are the whole point of them.
+fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
+    row(
+        ui,
+        "One-time code",
+        |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(
+                    RichText::new(status)
+                        .size(ROW_VALUE_SIZE)
+                        .color(theme::TEXT_SECONDARY),
+                );
+                if let Some(hint) = hint {
+                    ui.label(
+                        RichText::new(hint)
+                            .size(ROW_HINT_SIZE)
+                            .color(theme::TEXT_GHOST),
+                    );
+                }
+            });
+        },
+        |_ui| {},
+    );
 }
 
 /// The One-time code row for `TotpState::Fetching`: this item has a TOTP
@@ -1084,16 +1309,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
 /// problem -- this is the everyday, usually sub-second case right after
 /// selecting an item, not a backend issue.
 fn totp_fetching_row(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
-            ui.label(
-                RichText::new("Fetching\u{2026}")
-                    .size(13.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-        });
-    });
+    totp_status_row(ui, "Fetching\u{2026}", None);
 }
 
 /// The One-time code row for `TotpState::Unavailable`: this item has a TOTP
@@ -1105,21 +1321,11 @@ fn totp_fetching_row(ui: &mut egui::Ui) {
 /// not an alarm: this is very likely `bw serve` still starting up or a
 /// transient hiccup, not something the user needs to act on.
 fn totp_unavailable_row(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
-            ui.label(
-                RichText::new("Unavailable right now")
-                    .size(13.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-            ui.label(
-                RichText::new("Couldn't reach the vault to get the current code.")
-                    .size(10.0)
-                    .color(theme::TEXT_GHOST),
-            );
-        });
-    });
+    totp_status_row(
+        ui,
+        "Unavailable right now",
+        Some("Couldn't reach the vault to get the current code."),
+    );
 }
 
 /// The One-time code row for `TotpState::NoCodeReported`: this item's own
@@ -1140,24 +1346,14 @@ fn totp_unavailable_row(ui: &mut egui::Ui) {
 /// one action that resolves it, since -- unlike `Unavailable` -- this state
 /// deliberately stops polling.
 fn totp_no_code_row(ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
-            ui.label(
-                RichText::new("No code available for this item")
-                    .size(13.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-            ui.label(
-                RichText::new(
-                    "The vault has no current code for it. If its authenticator key was \
-                     changed on another device, Sync to pick that up.",
-                )
-                .size(10.0)
-                .color(theme::TEXT_GHOST),
-            );
-        });
-    });
+    totp_status_row(
+        ui,
+        "No code available for this item",
+        Some(
+            "The vault has no current code for it. If its authenticator key was changed \
+             on another device, Sync to pick that up.",
+        ),
+    );
 }
 
 /// Days between an RFC3339 `revisionDate` (as `bw serve` sends it) and now.
@@ -2548,5 +2744,140 @@ mod tests {
         let (_, hint) = only(&painted, "CTRL+SHIFT+F");
         assert_eq!(hint.size, 10.0, "the shortcut hint is not the design's 10px");
         assert_eq!(hint.family, egui::FontFamily::Monospace);
+    }
+
+    // -----------------------------------------------------------------
+    // Design 2b, the cards and their rows.
+    // -----------------------------------------------------------------
+
+    /// A login carrying the design's own sample values.
+    fn a_login() -> VaultItem {
+        let mut item = an_item(Some(1));
+        item.login = Some(crate::vault_bridge::LoginData {
+            username: Some("a.novak@ledgerline.com".to_string()),
+            password: Some("hunter2".to_string().into()),
+            totp: None,
+            uris: vec![crate::vault_bridge::UriEntry {
+                uri: Some("app.ledgerline.com".to_string()),
+                other: serde_json::Map::new(),
+            }],
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    /// A row is `display: flex; align-items: center; gap: 16px; padding: 13px
+    /// 16px` over a `width: 130px` label column. On this pane that puts the
+    /// label at 24 (body padding) + 1 (the card's own border, which the design
+    /// draws inside the box and egui likewise takes out of the content rect)
+    /// + 16 (row padding) = 41, and the value at 41 + 130 (label column) + 16
+    /// (gap) = 187. Both absolute: nothing here is computed from the constants
+    /// being checked.
+    #[test]
+    fn a_card_row_puts_its_label_and_value_on_the_designs_two_columns() {
+        let painted = painted_type(&a_login(), &TotpState::NoSecret, RevealState::default());
+
+        let (label, label_font) = only(&painted, "Username");
+        assert_eq!(
+            label.left(),
+            41.0,
+            "the label column does not start at 24 + 1 + 16"
+        );
+        assert_eq!(label_font.size, 12.0, "the label is not the design's 12px");
+
+        let (value, value_font) = only(&painted, "a.novak@ledgerline.com");
+        assert_eq!(
+            value.left(),
+            187.0,
+            "the value does not start at 41 + a 130px label column + a 16px gap"
+        );
+        assert_eq!(value_font.size, 14.0, "the value is not the design's 14px");
+        assert!(
+            (value.center().y - label.center().y).abs() <= 1.0,
+            "the label and the value are not on one centred line: {label:?} vs {value:?}"
+        );
+    }
+
+    /// The card's own heading rule: `padding: 11px 16px; font-size: 12px;
+    /// font-weight: 700; text-transform: uppercase`, over a card that is
+    /// white with a `#eae7e7` border.
+    #[test]
+    fn a_cards_heading_is_the_designs_tracked_uppercase_over_a_bordered_tile() {
+        let item = a_login();
+        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
+        let (heading, font) = only(&painted, "LOGIN CREDENTIALS");
+        assert_eq!(
+            heading.left(),
+            41.0,
+            "the heading is not at the card's 16px padding"
+        );
+        assert_eq!(font.size, 12.0, "the heading is not the design's 12px");
+        assert_eq!(
+            font.family,
+            egui::FontFamily::Name(theme::BOLD.into()),
+            "the heading is not the design's 700 weight"
+        );
+
+        let rects = painted_rects(&item, &TotpState::NoSecret);
+        assert!(
+            rects
+                .iter()
+                .any(|(r, fill)| *fill == theme::CARD && r.left() == 24.0 && r.right() == 876.0),
+            "no white card spanning the body's 24px padding on both sides: {rects:?}"
+        );
+    }
+
+    /// Every copyable row carries its own control, on that row's own centred
+    /// line -- not one Copy for the card. 28px tall, per the design.
+    #[test]
+    fn every_copyable_row_has_a_28px_copy_control_on_its_own_line() {
+        let item = a_full_card();
+        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
+        for label in [
+            "Cardholder name",
+            "Brand",
+            "Number",
+            "Expiry",
+            "Security code",
+        ] {
+            let (row, _) = only(&painted, label);
+            assert!(
+                painted
+                    .iter()
+                    .any(|(t, r, _)| t == "Copy" && (r.center().y - row.center().y).abs() <= 2.0),
+                "the {label:?} row has no Copy control on its own line: {painted:?}"
+            );
+        }
+        let rects = painted_rects(&item, &TotpState::NoSecret);
+        assert!(
+            rects
+                .iter()
+                .any(|(r, fill)| r.height() == 28.0 && *fill == theme::CARD),
+            "no 28px row control anywhere on the card pane: {rects:?}"
+        );
+    }
+
+    /// The design's last card is the metadata strip -- a white tile like the
+    /// others, `padding: 13px 16px; font-size: 12px`, not a bare line of 11px
+    /// ghost text sitting on the pane's grey.
+    #[test]
+    fn the_metadata_strip_is_a_card_of_its_own_rather_than_bare_text_on_the_pane() {
+        let item = a_login();
+        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
+        let (strip, font) = painted
+            .iter()
+            .find(|(t, _, _)| t.contains("Filled 3 times"))
+            .map(|(_, r, f)| (*r, f.clone()))
+            .unwrap_or_else(|| panic!("no metadata strip painted: {painted:?}"));
+        assert_eq!(font.size, 12.0, "the metadata strip is not the design's 12px");
+        assert_eq!(strip.left(), 41.0, "the strip's text is not at 24 + 1 + 16");
+
+        let rects = painted_rects(&item, &TotpState::NoSecret);
+        assert!(
+            rects
+                .iter()
+                .any(|(r, fill)| *fill == theme::CARD && r.contains_rect(strip) && r.left() == 24.0),
+            "the metadata strip is not inside a card of its own: {rects:?}"
+        );
     }
 }
