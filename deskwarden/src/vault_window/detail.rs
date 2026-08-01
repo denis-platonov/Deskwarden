@@ -466,14 +466,13 @@ pub fn card_fields(data: &CardData) -> CardFields {
     }
 }
 
-/// The identity pane's rows, grouped, with empty fields and empty groups
-/// The identity pane's displayed text, and the ONLY producer of it: named
-/// groups, each with its surviving label/value rows, empty fields and whole
-/// empty groups already suppressed. See [`identity_groups`], and
-/// [`identity_rows`] for why the pane takes this rather than an
-/// [`IdentityData`].
+/// The identity pane's displayed text: named groups, each with its surviving
+/// label/value rows, empty fields and whole empty groups already suppressed.
+/// See [`identity_groups`], its only producer, and [`identity_rows`] for why
+/// the pane takes this rather than an [`IdentityData`].
 type IdentityGroups = Vec<(&'static str, Vec<(&'static str, String)>)>;
 
+/// The identity pane's rows, grouped, with empty fields and empty groups
 /// removed.
 ///
 /// Pure so the suppression rule is tested directly rather than inferred from a

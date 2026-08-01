@@ -211,9 +211,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // original stale-data-under-green-pill bug, just inverted. See
     // `load_generation`'s declaration below for how a result is matched
     // against the latest spawn before being applied.
+    //
+    // The payload is ONE `VaultSnapshot`, not a `(Vec<VaultItem>,
+    // Vec<Folder>)` pair, and that is where the "items and folders cannot
+    // come from two eras" guarantee actually lives (review 29's Important
+    // 1). It used to be a pair, so both send sites hand-assembled
+    // `Ok((snapshot.items, snapshot.folders))` -- and `Ok((snapshot.items,
+    // cache.folders()))` compiled at exactly that spot, which is the
+    // spelling this crate has now written by accident fourteen times. The
+    // guarantee was being claimed one layer too early, inside
+    // `vault_load_step`, which is the one place nobody was going to write
+    // it. A snapshot arrives here as the single value
+    // `snapshot_unless_superseded` built under one lock acquisition.
     let (vault_tx, vault_rx): (
-        mpsc::Sender<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
-        Receiver<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
+        mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+        Receiver<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
     ) = mpsc::channel();
     // The generation of the most recently spawned `spawn_vault_load` call.
     // Incremented immediately before every spawn (both below and at the
@@ -223,30 +235,71 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // rather than applied -- see the drain below.
     let mut load_generation: u64 = 0;
     load_generation += 1;
-    // Cloned because the update closure below move-captures both, and needs
-    // its own pair to re-issue a load after each sync. `false`: the snapshot
-    // from unlock (if any) is current, so this only actually hits the
-    // backend the first time the window is opened after unlock -- see
-    // `spawn_vault_load`'s doc comment. `backend_already_running`: see that
-    // parameter's own doc -- skips the readiness wait when the caller
-    // already knows `bw serve` is up.
+    // THE VAULT SESSION THIS WINDOW IS SHOWING. Captured ONCE, here, on the
+    // main thread, before anything is painted -- and it is the era every
+    // load this window ever spawns is checked against, including the
+    // post-sync reload further down (review 29's Important 2).
     //
-    // `cache.epoch().era()` is read HERE, on the main thread, and handed in.
-    // That is load-bearing: read inside the worker it would be compared
-    // against itself and could never detect a `clear`. See
-    // `spawn_vault_load`'s `era` parameter.
+    // It used to be re-read at each spawn, which made it answer a strictly
+    // weaker question: "is this still the session that existed when I
+    // spawned?". Re-read at spawn time it equals the current era BY
+    // CONSTRUCTION, so it could only ever detect a `clear` landing after its
+    // own capture -- and the call site below claimed it answered "is this
+    // still the vault session the window is showing?", which it did not. The
+    // gap was real, not rhetorical: window opens on account A and paints it,
+    // a `clear` plus a re-populate under account B lands, the user clicks
+    // Sync, the reload re-captures B's era, compares equal, and paints
+    // ACCOUNT B'S VAULT INTO A WINDOW SHOWING ACCOUNT A -- no `Superseded`,
+    // no `Err`, nothing on screen. It is unreachable today only because
+    // every production `cache.clear()` runs on the main thread this function
+    // occupies, and thread affinity is precisely the argument this project
+    // keeps having to un-write (see `spawn_vault_load_with_schedule`'s
+    // `DiscardedStale` arm, which deliberately no longer rests on it).
+    //
+    // Captured once, the era binds this window to ONE vault session for its
+    // whole lifetime, which is what the window's contents already claim. A
+    // window whose session ended has nothing true left to show, and the
+    // paths that end one (lock, re-auth) close it and return anyway -- so
+    // this costs nothing in the reachable world and refuses in the one the
+    // reviewer described. `window_era_placement_tests` pins the single
+    // capture in the source, because nothing in the type system stops a
+    // future edit from re-reading the cache at a spawn site.
+    let window_era = cache.epoch().era();
+    // Cloned because the update closure below move-captures both, and needs
+    // its own pair to re-issue a load after each sync. `force_refresh:
+    // false`: the snapshot from unlock (if any) is current, so this only
+    // actually hits the backend the first time the window is opened after
+    // unlock -- see `spawn_vault_load`'s doc comment. `skip_readiness_wait`:
+    // see `backend_already_running`'s own doc -- skips the readiness wait
+    // when the caller already knows `bw serve` is up.
     spawn_vault_load(
         cache.clone(),
         vault_tx.clone(),
-        false,
-        cache.epoch().era(),
-        load_generation,
-        backend_already_running,
+        VaultLoadRequest {
+            force_refresh: false,
+            era: window_era,
+            generation: load_generation,
+            skip_readiness_wait: backend_already_running,
+        },
     );
     let mut items: Vec<VaultItem> = Vec::new();
     let mut folders: Vec<Folder> = Vec::new();
     // True until the background load above reports back.
     let mut vault_loading = true;
+    // Why the most recent applied load produced nothing to paint, or `None`
+    // if it produced something (review 29's Minor 3). Two things read it,
+    // and neither could be answered from `sync_status`:
+    //
+    //  * `vault_body_state` -- a give-up at the INITIAL load used to leave a
+    //    blank window under a neutral "Sync" pill, because the `Err` arm's
+    //    "keep whatever is on screen" is vacuous when nothing is on screen
+    //    yet.
+    //  * `sync_pill` -- a give-up after a SUCCESSFUL sync used to paint a red
+    //    "Sync failed", which is a different untruth about the same event.
+    //
+    // Cleared by any load that does paint, so it never outlives the state it
+    // describes.
+    let mut vault_load_error: Option<String> = None;
     let mut filter = SidebarFilter::All;
     let mut search = String::new();
     // Nothing to select yet -- set from the first item once the load lands.
@@ -420,6 +473,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 &mut items,
                 &mut folders,
                 &mut vault_loading,
+                &mut vault_load_error,
                 &mut selected_id,
                 &mut sync_status,
                 &mut totp_state,
@@ -457,21 +511,28 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // re-checked here, since nothing in this window's lifetime
                 // stops or restarts the backend out from under it.
                 //
-                // The era is captured here, on the main thread, for the same
-                // reason the initial spawn above captures it there -- and it
-                // is a genuinely different question from `load_generation`
-                // one line up: that counter says "has this window spawned a
-                // newer load?", the era says "is this still the vault
-                // session the window is showing?". A lock or a re-auth moves
-                // the era and no generation at all.
+                // `window_era` -- the era captured ONCE before this loop, not
+                // re-read here (review 29's Important 2). That is what makes
+                // the sentence this comment used to end on actually true: it
+                // asks "is this still the vault session the window is
+                // SHOWING?", which is a genuinely different question from
+                // `load_generation` one line up ("has this window spawned a
+                // newer load?"). A lock or a re-auth moves the era and no
+                // generation at all. Re-read here it would instead ask "is
+                // this still the session that existed one instruction ago",
+                // which is answered "yes" by construction. See `window_era`'s
+                // declaration for the account-A/account-B scenario that
+                // distinguishes them.
                 load_generation += 1;
                 spawn_vault_load(
                     cache.clone(),
                     vault_tx.clone(),
-                    true,
-                    cache.epoch().era(),
-                    load_generation,
-                    backend_already_running,
+                    VaultLoadRequest {
+                        force_refresh: true,
+                        era: window_era,
+                        generation: load_generation,
+                        skip_readiness_wait: backend_already_running,
+                    },
                 );
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
@@ -612,18 +673,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // "good" here), the design's error red for failure, and a
             // neutral ghost dot both while in flight and before the first
             // sync has reported anything.
-            let (dot, label) = if sync_in_progress {
-                (theme::TEXT_GHOST, "Syncing…".to_string())
-            } else {
-                match &sync_status {
-                    Some(Ok(())) => {
-                        let ago = synced_ago_text(last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()));
-                        (theme::BLUE, format!("Synced {ago}"))
-                    }
-                    Some(Err(_)) => (theme::ERROR, "Sync failed".to_string()),
-                    None => (theme::TEXT_GHOST, "Sync".to_string()),
-                }
-            };
+            //
+            // The wording decision itself lives in `sync_pill` so it can be
+            // asserted (review 29's Minor 3) -- this pill is the only place
+            // any of these states is spelled for the user.
+            let (dot, label) = sync_pill(
+                sync_in_progress,
+                sync_status.as_ref(),
+                vault_load_error.as_deref(),
+                last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
+            );
             if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                 sync_in_progress = true;
                 spawn_vault_sync(sync_tx.clone(), session_token.clone());
@@ -668,28 +727,66 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // `vault_loading` is already up to date for this frame and Ctrl+L
         // still locks while loading; the titlebar is drawn either way, so
         // the window stays draggable and closable throughout.
-        if vault_loading {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(theme::CANVAS))
-                .show(ui, |ui| {
-                    let available = ui.available_height();
-                    ui.vertical_centered(|ui| {
-                        // Roughly half the spinner-plus-label block, so the
-                        // pair sits centred rather than the spinner alone.
-                        ui.add_space((available / 2.0 - 30.0).max(0.0));
-                        ui.add(egui::Spinner::new().size(28.0).color(theme::BLUE));
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new("Loading your vault…")
-                                .size(13.0)
-                                .color(theme::TEXT_FAINT),
-                        );
+        //
+        // The same slot also carries the case where the load gave up with
+        // nothing on screen to keep (review 29's Minor 3) -- see
+        // `vault_body_state`, which decides between the two.
+        match vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref()) {
+            VaultBodyState::Loading => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme::CANVAS))
+                    .show(ui, |ui| {
+                        let available = ui.available_height();
+                        ui.vertical_centered(|ui| {
+                            // Roughly half the spinner-plus-label block, so
+                            // the pair sits centred rather than the spinner
+                            // alone.
+                            ui.add_space((available / 2.0 - 30.0).max(0.0));
+                            ui.add(egui::Spinner::new().size(28.0).color(theme::BLUE));
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("Loading your vault…")
+                                    .size(13.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        });
                     });
-                });
-            // Same fast cadence as the tail of this closure: drives the
-            // spinner's animation and how promptly the load is noticed.
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
-            return;
+                // Same fast cadence as the tail of this closure: drives the
+                // spinner's animation and how promptly the load is noticed.
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            // No spinner and no repaint request: nothing is in flight, and
+            // the way out is the toolbar's Sync button, which is drawn above
+            // this and stays clickable. The reason is the loader's own words
+            // (`VAULT_SUPERSEDED_BEFORE_LOAD` and friends), not a rewrite of
+            // them here -- a second wording would be a second thing to keep
+            // true.
+            VaultBodyState::Unavailable(reason) => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(theme::CANVAS))
+                    .show(ui, |ui| {
+                        let available = ui.available_height();
+                        ui.vertical_centered(|ui| {
+                            ui.add_space((available / 2.0 - 30.0).max(0.0));
+                            ui.label(
+                                egui::RichText::new("Your vault could not be loaded")
+                                    .size(15.0)
+                                    .color(theme::INK),
+                            );
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new(reason).size(13.0).color(theme::TEXT_FAINT));
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Click Sync to try again.")
+                                    .size(13.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        });
+                    });
+                return;
+            }
+            VaultBodyState::Vault => {}
         }
 
         // No `.stroke(...)` on this frame: `egui::Panel` already paints its
@@ -1614,10 +1711,16 @@ fn totp_poll_result_is_current(
 fn apply_vault_load_result(
     generation: u64,
     latest_generation: u64,
-    load_result: Result<(Vec<VaultItem>, Vec<Folder>), String>,
+    // ONE `VaultSnapshot`, destructured here rather than assembled by the
+    // worker (review 29's Important 1) -- see `run`'s `vault_tx` declaration
+    // for why the pair this used to be put the guarantee in the wrong place.
+    load_result: Result<VaultSnapshot, VaultLoadFailure>,
     items: &mut Vec<VaultItem>,
     folders: &mut Vec<Folder>,
     vault_loading: &mut bool,
+    // See `run`'s declaration: what the body and the pill say when a load
+    // produced nothing to paint (review 29's Minor 3).
+    vault_load_error: &mut Option<String>,
     selected_id: &mut Option<String>,
     sync_status: &mut Option<Result<(), String>>,
     totp_state: &mut TotpState,
@@ -1629,10 +1732,14 @@ fn apply_vault_load_result(
         return;
     }
     match load_result {
-        Ok((loaded_items, loaded_folders)) => {
-            *items = loaded_items;
-            *folders = loaded_folders;
+        Ok(snapshot) => {
+            *items = snapshot.items;
+            *folders = snapshot.folders;
             *vault_loading = false;
+            // A load that painted answers the question the notice existed to
+            // answer, so the notice goes with it -- otherwise a stale reason
+            // would sit under a pill describing a vault that did load.
+            *vault_load_error = None;
             // Fresh item data deserves a fresh poll (review 14's Important,
             // part b). `totp_state` was otherwise reset *only* on a selection
             // change, and `NoCodeReported` deliberately stops polling -- so a
@@ -1677,7 +1784,7 @@ fn apply_vault_load_result(
                 }
             }
         }
-        Err(e) => {
+        Err(failure) => {
             // `spawn_vault_load` couldn't refresh the snapshot (`bw serve`
             // never came ready, or `populate()` itself failed) -- see that
             // function's doc for why this must not be silently swallowed.
@@ -1686,21 +1793,45 @@ fn apply_vault_load_result(
             // never-propagate-a-failed-populate behaviour the doc comment
             // already describes, just no longer silent.
             *vault_loading = false;
-            log::warn!("vault refresh failed; showing the last known snapshot: {e}");
-            // Only override `sync_status` when this refresh was following up
-            // on a sync that had itself just reported success (final review
-            // Important 1): that is the case where the toolbar pill would
-            // otherwise say "Synced just now" over data that was never
-            // actually refreshed. An initial-load failure (before any sync
-            // has run) has no such claim to correct -- `sync_status` is
-            // still `None` and stays that way, showing the neutral "Sync"
-            // label rather than a misleading "failed". The generation check
-            // above is what keeps this from also firing on a *stale*
-            // failure after a newer, already-applied load already reported
-            // success (this review's Important 2) -- by the time a stale
-            // result reaches here, it has already been dropped.
-            if matches!(sync_status, Some(Ok(()))) {
-                *sync_status = Some(Err(e));
+            let reason = failure.reason().to_string();
+            log::warn!("vault refresh failed; showing the last known snapshot: {reason}");
+            // "Keep whatever is on screen" is VACUOUS at the initial load,
+            // where nothing is on screen yet (review 29's Minor 3): that used
+            // to leave an empty window under a neutral "Sync" pill and no
+            // statement anywhere that a load had failed at all. The reason is
+            // recorded unconditionally, and `vault_body_state`/`sync_pill`
+            // decide what the user actually sees from it.
+            *vault_load_error = Some(reason.clone());
+            match failure {
+                // The vault session this load was spawned for is gone. Any
+                // sync that preceded it SUCCEEDED -- `bw sync` really did
+                // run, and the cache really did refill; it refilled for a
+                // different session. Reporting that as "Sync failed" is the
+                // mirror image of the bug the override below exists to fix:
+                // a red pill over an operation that worked (review 29's Minor
+                // 3). `sync_status` is left exactly as it was and the pill
+                // says the true thing instead -- the vault was not
+                // refreshed -- via `vault_load_error` above.
+                VaultLoadFailure::Superseded(_) => {}
+                // A refresh that genuinely did not happen. Override
+                // `sync_status` only when this refresh was following up on a
+                // sync that had itself just reported success (review 12's
+                // Important 1): that is the case where the toolbar pill would
+                // otherwise say "Synced just now" over data that was never
+                // actually refreshed. An initial-load failure (before any
+                // sync has run) has no such claim to correct -- `sync_status`
+                // is still `None` and stays that way; the pill's "vault not
+                // refreshed" state, not a fabricated sync failure, is what
+                // reports it. The generation check above is what keeps this
+                // from also firing on a *stale* failure after a newer,
+                // already-applied load already reported success -- by the
+                // time a stale result reaches here, it has already been
+                // dropped.
+                VaultLoadFailure::Refresh(_) => {
+                    if matches!(sync_status, Some(Ok(()))) {
+                        *sync_status = Some(Err(reason));
+                    }
+                }
             }
         }
     }
@@ -1732,48 +1863,97 @@ fn apply_vault_load_result(
 /// caller) uses the `Err` to correct that claim rather than just logging.
 fn spawn_vault_load(
     cache: std::sync::Arc<VaultCache>,
-    tx: mpsc::Sender<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
-    // `true` after a sync, which changes the vault underneath us: the
-    // snapshot is still marked populated but is now stale, so the
-    // short-circuit below would serve pre-sync data and the sync would
-    // appear to do nothing. `false` on window open, where the snapshot from
-    // unlock is current and re-fetching would throw away the whole point of
-    // the cache.
-    force_refresh: bool,
-    // Which vault SESSION this load is for, captured by the caller on the
-    // MAIN THREAD before the spawn below (review 26's recorded producer).
-    //
-    // It is a parameter and not something the worker reads for itself, and
-    // that is the entire guard: an era captured inside the worker would be
-    // compared against itself, so a `clear` landing between the user's
-    // action and the worker's first instruction would be invisible. This is
-    // the same shape `picker_ui::pick_vault_item` already uses.
-    //
-    // Distinct from `generation`, which sits right below it and answers a
-    // different question: `generation` is WINDOW-REFRESH staleness (has this
-    // window spawned a newer load?), `era` is VAULT staleness (is the vault
-    // session this load was spawned for still the one the cache holds?). A
-    // lock or a re-auth advances the era and touches no generation at all.
-    era: VaultEra,
-    // Tags the message sent over `tx` so `run`'s drain can tell a stale,
-    // superseded result apart from the one it's actually still waiting on --
-    // see `run`'s `load_generation` doc (review Important 2).
-    generation: u64,
-    // Whether `bw serve` is already known to be up -- see `run`'s
-    // `backend_already_running` parameter doc (review Minor 3). Skips the
-    // `wait_for_vault_ready` probe below when true, the same exemption
-    // `spawn_sync` in `main.rs` already makes for the same reason.
-    skip_readiness_wait: bool,
+    tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+    request: VaultLoadRequest,
 ) {
-    spawn_vault_load_with_schedule(
-        cache,
-        tx,
-        force_refresh,
-        era,
-        generation,
-        skip_readiness_wait,
-        readiness_schedule(READINESS_DEADLINE),
-    );
+    spawn_vault_load_with_schedule(cache, tx, request, readiness_schedule(READINESS_DEADLINE));
+}
+
+/// What one vault load is being asked for.
+///
+/// A STRUCT AND NOT A POSITIONAL ARGUMENT LIST, for one reason (review 29's
+/// Minor 4): `force_refresh` and `skip_readiness_wait` are both `bool` and sat
+/// two apart in a seven-argument call, so swapping them compiled silently and
+/// turned a forced post-sync reload into an unforced one that also skips the
+/// readiness wait -- i.e. Sync appearing to do nothing, which is the exact
+/// failure `force_refresh` exists to prevent. Named fields make that a
+/// compile error at every call site, and the fields cannot be mis-ordered
+/// because field-init order does not matter.
+///
+/// `era` and `generation` were never the hazard here -- [`VaultEra`] is a
+/// newtype, so swapping those two is already a type error -- but they are
+/// carried together because they are the same kind of answer about the same
+/// load, and their difference is the thing every reader gets wrong (see
+/// `era`'s doc below).
+struct VaultLoadRequest {
+    /// `true` after a sync, which changes the vault underneath us: the
+    /// snapshot is still marked populated but is now stale, so the
+    /// short-circuit in the worker would serve pre-sync data and the sync
+    /// would appear to do nothing. `false` on window open, where the snapshot
+    /// from unlock is current and re-fetching would throw away the whole
+    /// point of the cache.
+    force_refresh: bool,
+    /// Which vault SESSION this load is for, captured by the caller on the
+    /// MAIN THREAD before the spawn (review 26's recorded producer).
+    ///
+    /// It is a parameter and not something the worker reads for itself, and
+    /// that is the entire guard: an era captured inside the worker would be
+    /// compared against itself, so a `clear` landing between the user's
+    /// action and the worker's first instruction would be invisible. This is
+    /// the same shape `picker_ui::pick_vault_item` already uses. `run`
+    /// captures it ONCE per window session rather than once per spawn -- see
+    /// `window_era`'s declaration for why per-spawn was a weaker question
+    /// than the call site claimed (review 29's Important 2).
+    ///
+    /// Distinct from `generation`, which answers a different question:
+    /// `generation` is WINDOW-REFRESH staleness (has this window spawned a
+    /// newer load?), `era` is VAULT staleness (is the vault session this load
+    /// was spawned for still the one the cache holds?). A lock or a re-auth
+    /// advances the era and touches no generation at all.
+    era: VaultEra,
+    /// Tags the message sent over `tx` so `run`'s drain can tell a stale,
+    /// superseded result apart from the one it's actually still waiting on --
+    /// see `run`'s `load_generation` doc.
+    generation: u64,
+    /// Whether `bw serve` is already known to be up -- see `run`'s
+    /// `backend_already_running` parameter doc. Skips the
+    /// `wait_for_vault_ready` probe in the worker when true, the same
+    /// exemption `spawn_sync` in `main.rs` already makes for the same reason.
+    skip_readiness_wait: bool,
+}
+
+/// Why a vault load produced nothing to paint.
+///
+/// The two variants exist because they demand DIFFERENT things of the toolbar
+/// pill, which is the only place either is spelled for the user (review 29's
+/// Minor 3):
+///
+///  * `Superseded` -- the vault session this load was spawned for is gone. If
+///    a sync preceded it, that sync SUCCEEDED: `bw sync` ran and the cache
+///    refilled, for a different session. Painting "Sync failed" over that is
+///    a red pill on an operation that worked.
+///  * `Refresh` -- the refresh itself did not produce a readable vault (the
+///    backend never came ready, `populate()` failed, or it reported success
+///    and left nothing behind). A sync claim standing over that IS wrong and
+///    is corrected.
+///
+/// Both carry the reason the loader logged, so nothing downstream re-words a
+/// failure it did not observe.
+#[derive(Debug)]
+enum VaultLoadFailure {
+    Superseded(&'static str),
+    Refresh(String),
+}
+
+impl VaultLoadFailure {
+    /// The loader's own words for this failure, for the log and for the
+    /// on-screen notice.
+    fn reason(&self) -> &str {
+        match self {
+            VaultLoadFailure::Superseded(reason) => reason,
+            VaultLoadFailure::Refresh(reason) => reason,
+        }
+    }
 }
 
 /// What the load worker should do next, decided from ONE era-checked
@@ -1793,8 +1973,8 @@ enum VaultLoadStep {
     /// the caller forced a refresh because a `bw sync` just changed the vault
     /// underneath the snapshot.
     Populate,
-    /// Neither fetch nor paint; report this reason as an `Err`.
-    GiveUp(&'static str),
+    /// Neither fetch nor paint; report this failure as an `Err`.
+    GiveUp(VaultLoadFailure),
 }
 
 /// A `clear` -- a lock, or a re-auth into a possibly different account --
@@ -1832,7 +2012,9 @@ const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show"
 /// price of being able to see a `clear` at all before spending a round-trip.
 fn vault_load_step(force_refresh: bool, read: Result<VaultSnapshot, VaultUnavailable>) -> VaultLoadStep {
     match read {
-        Err(VaultUnavailable::Superseded) => VaultLoadStep::GiveUp(VAULT_SUPERSEDED_BEFORE_LOAD),
+        Err(VaultUnavailable::Superseded) => {
+            VaultLoadStep::GiveUp(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD))
+        }
         Err(VaultUnavailable::Unpopulated) => VaultLoadStep::Populate,
         Ok(_) if force_refresh => VaultLoadStep::Populate,
         Ok(snapshot) => VaultLoadStep::Paint(snapshot),
@@ -1854,11 +2036,19 @@ fn vault_load_step(force_refresh: bool, read: Result<VaultSnapshot, VaultUnavail
 /// snapshot is empty because nothing filled it, not because a different vault
 /// session began. Different situations, different reasons in the log; neither
 /// may be reported as `Ok`.
-fn vault_read_after_populate(read: Result<VaultSnapshot, VaultUnavailable>) -> Result<VaultSnapshot, &'static str> {
+///
+/// They are also classified differently for the toolbar (review 29's Minor
+/// 3): a `clear` mid-refresh is `Superseded` -- whatever sync triggered this
+/// still succeeded -- while a populate that reported success and left nothing
+/// readable is a `Refresh` failure, and a standing "Synced just now" claim
+/// over that one is wrong and gets corrected.
+fn vault_read_after_populate(
+    read: Result<VaultSnapshot, VaultUnavailable>,
+) -> Result<VaultSnapshot, VaultLoadFailure> {
     match read {
         Ok(snapshot) => Ok(snapshot),
-        Err(VaultUnavailable::Superseded) => Err(VAULT_CLEARED_WHILE_REFRESHING),
-        Err(VaultUnavailable::Unpopulated) => Err(VAULT_EMPTY_AFTER_REFRESH),
+        Err(VaultUnavailable::Superseded) => Err(VaultLoadFailure::Superseded(VAULT_CLEARED_WHILE_REFRESHING)),
+        Err(VaultUnavailable::Unpopulated) => Err(VaultLoadFailure::Refresh(VAULT_EMPTY_AFTER_REFRESH.to_string())),
     }
 }
 
@@ -1869,13 +2059,16 @@ fn vault_read_after_populate(read: Result<VaultSnapshot, VaultUnavailable>) -> R
 /// empty one) instead of actually waiting out the real 30s deadline.
 fn spawn_vault_load_with_schedule(
     cache: std::sync::Arc<VaultCache>,
-    tx: mpsc::Sender<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
-    force_refresh: bool,
-    era: VaultEra,
-    generation: u64,
-    skip_readiness_wait: bool,
+    tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+    request: VaultLoadRequest,
     schedule: Vec<Duration>,
 ) {
+    let VaultLoadRequest {
+        force_refresh,
+        era,
+        generation,
+        skip_readiness_wait,
+    } = request;
     std::thread::spawn(move || {
         // ONE lock acquisition, and the era check is inside it. This used to
         // be `force_refresh || !cache.is_populated()` here and
@@ -1887,13 +2080,17 @@ fn spawn_vault_load_with_schedule(
         // landing between the gate and the reads paint an EMPTY VAULT as
         // data. See `vault_load_step`.
         match vault_load_step(force_refresh, cache.snapshot_unless_superseded(era)) {
+            // Sent AS THE SNAPSHOT, not as `(snapshot.items,
+            // snapshot.folders)` -- see `run`'s `vault_tx` declaration
+            // (review 29's Important 1). The pair spelling is what let
+            // `Ok((snapshot.items, cache.folders()))` compile right here.
             VaultLoadStep::Paint(snapshot) => {
-                let _ = tx.send((generation, Ok((snapshot.items, snapshot.folders))));
+                let _ = tx.send((generation, Ok(snapshot)));
                 return;
             }
-            VaultLoadStep::GiveUp(reason) => {
-                log::warn!("not loading the vault for era {era}: {reason}");
-                let _ = tx.send((generation, Err(reason.to_string())));
+            VaultLoadStep::GiveUp(failure) => {
+                log::warn!("not loading the vault for era {era}: {}", failure.reason());
+                let _ = tx.send((generation, Err(failure)));
                 return;
             }
             VaultLoadStep::Populate => {}
@@ -1912,7 +2109,7 @@ fn spawn_vault_load_with_schedule(
         if !skip_readiness_wait {
             if let Err(e) = wait_for_vault_ready(cache.bridge(), &schedule) {
                 log::warn!("could not populate the vault cache: bw serve never became ready: {e}");
-                let _ = tx.send((generation, Err(e)));
+                let _ = tx.send((generation, Err(VaultLoadFailure::Refresh(e))));
                 return;
             }
         }
@@ -1943,12 +2140,15 @@ fn spawn_vault_load_with_schedule(
             // not what keeps any of these three refusals correct.
             Ok(PopulateOutcome::DiscardedStale) => {
                 log::warn!("the vault was cleared while this refresh was in flight");
-                let _ = tx.send((generation, Err(VAULT_CLEARED_WHILE_REFRESHING.to_string())));
+                let _ = tx.send((
+                    generation,
+                    Err(VaultLoadFailure::Superseded(VAULT_CLEARED_WHILE_REFRESHING)),
+                ));
                 return;
             }
             Err(e) => {
                 log::warn!("could not populate the vault cache: {e:?}");
-                let _ = tx.send((generation, Err(format!("{e:?}"))));
+                let _ = tx.send((generation, Err(VaultLoadFailure::Refresh(format!("{e:?}")))));
                 return;
             }
         }
@@ -1959,11 +2159,14 @@ fn spawn_vault_load_with_schedule(
         // out under an `Ok`. See `vault_read_after_populate`.
         match vault_read_after_populate(cache.snapshot_unless_superseded(era)) {
             Ok(snapshot) => {
-                let _ = tx.send((generation, Ok((snapshot.items, snapshot.folders))));
+                let _ = tx.send((generation, Ok(snapshot)));
             }
-            Err(reason) => {
-                log::warn!("the refreshed vault is not readable for era {era}: {reason}");
-                let _ = tx.send((generation, Err(reason.to_string())));
+            Err(failure) => {
+                log::warn!(
+                    "the refreshed vault is not readable for era {era}: {}",
+                    failure.reason()
+                );
+                let _ = tx.send((generation, Err(failure)));
             }
         }
     });
@@ -2015,6 +2218,87 @@ fn synced_ago_text(elapsed: Duration) -> String {
         "just now".to_string()
     } else {
         format!("{minutes} min ago")
+    }
+}
+
+/// What the toolbar pill says when the most recent load produced nothing to
+/// paint but the sync that triggered it worked. Deliberately NOT "Sync
+/// failed": the sync is not what failed.
+const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
+
+/// The toolbar sync pill's dot colour and label -- the ONLY place any of
+/// these states is spelled for the user, which is why it is a function with
+/// tests rather than an `if` chain inside the closure (review 29's Minor 3).
+///
+/// Precedence, and why each step outranks the one below it:
+///
+///  1. `sync_in_progress` -- something is happening right now; anything else
+///     would be describing a finished operation while a newer one runs.
+///  2. A failed sync -- the operation the user started did not work, which is
+///     the strongest claim available and the only one that should be able to
+///     say "Sync failed".
+///  3. A load that produced nothing (`vault_load_error`) -- this OUTRANKS a
+///     successful sync, and that is the point: a `Superseded` give-up after a
+///     sync used to leave "Synced just now" standing over a window that was
+///     never refreshed, and the old code's alternative was to forge a
+///     `sync_status` failure for a sync that succeeded. Both are untrue; this
+///     says the true thing about the vault instead of a false thing about the
+///     sync.
+///  4. A successful sync, then nothing at all.
+fn sync_pill(
+    sync_in_progress: bool,
+    sync_status: Option<&Result<(), String>>,
+    vault_load_error: Option<&str>,
+    since_last_sync: Duration,
+) -> (egui::Color32, String) {
+    if sync_in_progress {
+        return (theme::TEXT_GHOST, "Syncing…".to_string());
+    }
+    // Blue for success (there's no dedicated "success" green in this app's
+    // palette -- see `theme.rs`'s module doc on "one blue hue... red reserved
+    // for actual errors"), the design's error red for failure, and a neutral
+    // ghost dot before the first sync has reported anything.
+    match (sync_status, vault_load_error) {
+        (Some(Err(_)), _) => (theme::ERROR, "Sync failed".to_string()),
+        (_, Some(_)) => (theme::ERROR, VAULT_NOT_REFRESHED_PILL.to_string()),
+        (Some(Ok(())), None) => (theme::BLUE, format!("Synced {}", synced_ago_text(since_last_sync))),
+        (None, None) => (theme::TEXT_GHOST, "Sync".to_string()),
+    }
+}
+
+/// What the window body shows this frame.
+#[derive(Debug, PartialEq, Eq)]
+enum VaultBodyState<'a> {
+    /// A load is in flight and nothing has landed yet: one centred spinner.
+    Loading,
+    /// A load finished, produced nothing, and there was nothing already on
+    /// screen for the `Err` arm's "keep what you have" to keep -- so say what
+    /// happened instead of drawing an empty vault (review 29's Minor 3). The
+    /// payload is the loader's own reason string.
+    Unavailable(&'a str),
+    /// Draw the vault: sidebar, list, detail pane.
+    Vault,
+}
+
+/// Decides between the three (see [`VaultBodyState`]).
+///
+/// The two conditions on `Unavailable` are both load-bearing:
+///
+///  * `items.is_empty()` -- a failed refresh over a vault that IS on screen
+///    must keep showing it. That is the whole "keep the last known snapshot"
+///    behaviour, and replacing a populated window with an error page because
+///    a background refresh failed would be a much worse regression than the
+///    blank window this fixes. The pill still reports it.
+///  * `vault_load_error.is_some()` -- an empty vault with no failure is a
+///    genuinely empty vault, and it gets the normal chrome (sidebar counts at
+///    zero, the list's own empty state), not an error page.
+fn vault_body_state(vault_loading: bool, items_empty: bool, vault_load_error: Option<&str>) -> VaultBodyState<'_> {
+    if vault_loading {
+        return VaultBodyState::Loading;
+    }
+    match vault_load_error {
+        Some(reason) if items_empty => VaultBodyState::Unavailable(reason),
+        Some(_) | None => VaultBodyState::Vault,
     }
 }
 
@@ -2940,7 +3224,7 @@ mod spawn_vault_load_tests {
     // wait for `bw serve` to be ready before `populate()`, and a populate
     // that never becomes ready must be reported as `Err`, not silently
     // swallowed into "send whatever's already cached as if it were fresh".
-    use super::spawn_vault_load_with_schedule;
+    use super::{spawn_vault_load_with_schedule, VaultLoadRequest};
     use crate::vault_bridge::VaultBridge;
     use crate::vault_cache::{PopulateOutcome, VaultCache};
     use std::sync::{mpsc, Arc};
@@ -2977,13 +3261,23 @@ mod spawn_vault_load_tests {
         // Empty schedule: the mock answers on the very first attempt, so
         // there is nothing to retry regardless -- this only proves an empty
         // schedule doesn't itself block a successful readiness check.
-        spawn_vault_load_with_schedule(cache, tx, true, era, 1, false, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 1,
+                skip_readiness_wait: false,
+            },
+            vec![],
+        );
 
         let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert_eq!(generation, 1, "the result must be tagged with the generation it was spawned with");
-        let (items, folders) = result.expect("bw serve was ready; load must succeed");
-        assert_eq!(items.len(), 1);
-        assert!(folders.is_empty());
+        let snapshot = result.expect("bw serve was ready; load must succeed");
+        assert_eq!(snapshot.items.len(), 1);
+        assert!(snapshot.folders.is_empty());
     }
 
     #[test]
@@ -2995,7 +3289,17 @@ mod spawn_vault_load_tests {
         let cache = Arc::new(VaultCache::new(VaultBridge::new("http://127.0.0.1:1")));
         let (tx, rx) = mpsc::channel();
         let era = cache.epoch().era();
-        spawn_vault_load_with_schedule(cache, tx, true, era, 7, false, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 7,
+                skip_readiness_wait: false,
+            },
+            vec![],
+        );
 
         let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert_eq!(generation, 7);
@@ -3032,7 +3336,17 @@ mod spawn_vault_load_tests {
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let (tx, rx) = mpsc::channel();
         let era = cache.epoch().era();
-        spawn_vault_load_with_schedule(cache, tx, true, era, 1, true, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 1,
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
 
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_ok(), "populate() must still run and succeed even with the wait skipped");
@@ -3065,7 +3379,17 @@ mod spawn_vault_load_tests {
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let (tx, rx) = mpsc::channel();
         let era = cache.epoch().era();
-        spawn_vault_load_with_schedule(cache, tx, true, era, 1, false, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 1,
+                skip_readiness_wait: false,
+            },
+            vec![],
+        );
 
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_ok());
@@ -3109,7 +3433,17 @@ mod spawn_vault_load_tests {
         // vault changed under me", not "fetch me some other account's
         // vault"; the era it was spawned for is gone either way.
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache.clone(), tx, true, era, 4, true, vec![]);
+        spawn_vault_load_with_schedule(
+            cache.clone(),
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 4,
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
         let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert_eq!(generation, 4);
         assert!(
@@ -3119,7 +3453,17 @@ mod spawn_vault_load_tests {
         );
 
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, false, era, 5, true, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: false,
+                era,
+                generation: 5,
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_err(), "and neither may the unforced path");
 
@@ -3157,11 +3501,27 @@ mod spawn_vault_load_tests {
         let era = cache.epoch().era();
 
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, false, era, 1, true, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: false,
+                era,
+                generation: 1,
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
-        let (loaded_items, loaded_folders) = result.expect("the snapshot is readable for this era");
-        assert_eq!(loaded_items.len(), 1);
-        assert_eq!(loaded_folders.len(), 1, "the folders half must arrive with the items half");
+        // ONE value off the channel, destructured HERE and nowhere in the
+        // worker (review 29's Important 1).
+        let snapshot = result.expect("the snapshot is readable for this era");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(
+            snapshot.folders.len(),
+            1,
+            "the folders half must arrive with the items half"
+        );
 
         items.assert();
         folders.assert();
@@ -3196,7 +3556,17 @@ mod spawn_vault_load_tests {
 
         let era = cache.epoch().era();
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, true, era, 1, true, vec![]);
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 1,
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(
             result.is_err(),
@@ -3213,7 +3583,7 @@ mod vault_load_step_tests {
     // separate lock acquisitions (review 26's recorded producer). Hoisted out
     // of the closure so each arm is pinned directly instead of being inferred
     // from a thread's observable behaviour.
-    use super::{vault_load_step, vault_read_after_populate, VaultLoadStep};
+    use super::{vault_load_step, vault_read_after_populate, VaultLoadFailure, VaultLoadStep};
     use crate::vault_cache::{VaultSnapshot, VaultUnavailable};
 
     fn a_snapshot() -> VaultSnapshot {
@@ -3272,22 +3642,47 @@ mod vault_load_step_tests {
         );
     }
 
+    // DELETED, NOT MOVED: `the_only_way_to_paint_is_a_snapshot_that_arrived_
+    // as_one_value` used to sit here, asserting
+    // `matches!(vault_load_step(false, Ok(a_snapshot())),
+    // VaultLoadStep::Paint(VaultSnapshot { .. }))`. That cannot fail for any
+    // implementation that COMPILES -- `Paint`'s payload type IS
+    // `VaultSnapshot` -- so it was a tautology labelled as structural
+    // coverage, and its other half duplicated
+    // `a_readable_snapshot_is_painted_unforced_and_refetched_when_forced`
+    // above (review 29's Minor 2). The claim it was standing in for now lives
+    // where the data actually crosses the thread boundary: the channel
+    // carries `Result<VaultSnapshot, VaultLoadFailure>`, so the tearing
+    // spelling is not writable at either send site (review 29's Important 1).
+    // That is a TYPE fact, and re-asserting a type fact from a test would be
+    // the same tautology one layer out. The behavioural half is
+    // `the_common_path_paints_both_halves_from_one_checked_read_without_fetching`,
+    // which asserts a non-empty folders half end to end.
+
     #[test]
-    fn the_only_way_to_paint_is_a_snapshot_that_arrived_as_one_value() {
-        // The structural half of "items and folders cannot come from
-        // different eras": `Paint` carries a `VaultSnapshot`, which
-        // `VaultCache::snapshot_unless_superseded` only ever builds under a
-        // single lock acquisition. There is no arm that composes `items()`
-        // with `folders()`, so the tearing spelling is unrepresentable here
-        // rather than merely unattempted.
+    fn a_superseded_give_up_is_not_classified_as_a_refresh_failure() {
+        // The classification the toolbar rests on (review 29's Minor 3), and
+        // the reason `VaultLoadFailure` has two variants at all: a sync that
+        // was followed by a `clear` SUCCEEDED, so nothing downstream may
+        // report it as a failed sync. Anything the populate itself got wrong
+        // is a `Refresh` failure, and a standing "Synced just now" claim over
+        // one of those IS wrong and gets corrected.
         assert!(matches!(
-            vault_load_step(false, Ok(a_snapshot())),
-            VaultLoadStep::Paint(VaultSnapshot { .. })
+            vault_load_step(false, Err(VaultUnavailable::Superseded)),
+            VaultLoadStep::GiveUp(VaultLoadFailure::Superseded(_))
         ));
         assert!(matches!(
-            vault_read_after_populate(Ok(a_snapshot())),
-            Ok(VaultSnapshot { .. })
+            vault_read_after_populate(Err(VaultUnavailable::Superseded)),
+            Err(VaultLoadFailure::Superseded(_))
         ));
+        assert!(
+            matches!(
+                vault_read_after_populate(Err(VaultUnavailable::Unpopulated)),
+                Err(VaultLoadFailure::Refresh(_))
+            ),
+            "a populate that reported success and left nothing readable is the refresh's own \
+             failure, not a different vault session"
+        );
     }
 
     #[test]
@@ -3316,8 +3711,12 @@ mod apply_vault_load_result_tests {
     // (fresh, correct data shown under a "Sync failed" pill because a
     // slower, superseded load's failure arrived after a faster, newer
     // load's success already landed).
-    use super::apply_vault_load_result;
+    use super::{
+        apply_vault_load_result, vault_body_state, VaultBodyState, VaultLoadFailure,
+        VAULT_SUPERSEDED_BEFORE_LOAD,
+    };
     use crate::vault_bridge::VaultItem;
+    use crate::vault_cache::VaultSnapshot;
     use crate::vault_window::detail::TotpState;
 
     fn item(id: &str) -> VaultItem {
@@ -3345,6 +3744,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("2")];
         let mut folders = Vec::new();
         let mut vault_loading = false;
+        let mut vault_load_error = None;
         let mut selected_id = Some("2".to_string());
         let mut sync_status = Some(Ok(()));
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3352,10 +3752,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1, // this result's generation
             2, // the latest generation actually spawned
-            Err("connection refused".to_string()),
+            Err(VaultLoadFailure::Refresh("connection refused".to_string())),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3377,6 +3778,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("stale")];
         let mut folders = Vec::new();
         let mut vault_loading = false;
+        let mut vault_load_error = None;
         let mut selected_id = Some("stale".to_string());
         let mut sync_status = Some(Err("bw serve never became ready".to_string()));
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3384,10 +3786,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             2,
-            Ok((vec![item("late")], Vec::new())),
+            Ok(VaultSnapshot { items: vec![item("late")], folders: Vec::new() }),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3411,6 +3814,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("pre-sync")];
         let mut folders = Vec::new();
         let mut vault_loading = false;
+        let mut vault_load_error = None;
         let mut selected_id = Some("pre-sync".to_string());
         let mut sync_status = Some(Ok(()));
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3418,10 +3822,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             2,
             2,
-            Err("bw serve never became ready".to_string()),
+            Err(VaultLoadFailure::Refresh("bw serve never became ready".to_string())),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3435,6 +3840,7 @@ mod apply_vault_load_result_tests {
         let mut items = Vec::new();
         let mut folders = Vec::new();
         let mut vault_loading = true;
+        let mut vault_load_error = None;
         let mut selected_id = None;
         let mut sync_status = None;
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3442,10 +3848,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             1,
-            Ok((vec![item("a"), item("b")], Vec::new())),
+            Ok(VaultSnapshot { items: vec![item("a"), item("b")], folders: Vec::new() }),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3468,6 +3875,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("a")];
         let mut folders = Vec::new();
         let mut vault_loading = true;
+        let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = Some(Ok(()));
         let mut totp_state = TotpState::NoCodeReported;
@@ -3475,10 +3883,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             1,
-            Ok((vec![item("a")], Vec::new())),
+            Ok(VaultSnapshot { items: vec![item("a")], folders: Vec::new() }),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3510,6 +3919,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("a")];
         let mut folders = Vec::new();
         let mut vault_loading = true;
+        let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3517,10 +3927,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             1,
-            Ok((vec![item("a")], Vec::new())),
+            Ok(VaultSnapshot { items: vec![item("a")], folders: Vec::new() }),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3542,6 +3953,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("a")];
         let mut folders = Vec::new();
         let mut vault_loading = false;
+        let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3549,10 +3961,11 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             2,
-            Ok((vec![item("late")], Vec::new())),
+            Ok(VaultSnapshot { items: vec![item("late")], folders: Vec::new() }),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
@@ -3569,6 +3982,7 @@ mod apply_vault_load_result_tests {
         let mut items = vec![item("a")];
         let mut folders = Vec::new();
         let mut vault_loading = true;
+        let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
         let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
@@ -3576,16 +3990,292 @@ mod apply_vault_load_result_tests {
         apply_vault_load_result(
             1,
             1,
-            Err("connection refused".to_string()),
+            Err(VaultLoadFailure::Refresh("connection refused".to_string())),
             &mut items,
             &mut folders,
             &mut vault_loading,
+            &mut vault_load_error,
             &mut selected_id,
             &mut sync_status,
             &mut totp_state,
         );
 
         assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+    }
+
+    /// Review 29's Minor 3, first half. A `Superseded` give-up at the INITIAL
+    /// load left an EMPTY window under a neutral "Sync" pill: the `Err` arm's
+    /// "keep whatever is on screen" is vacuous when nothing is on screen yet,
+    /// and `sync_status` is `None` at window open so the override never
+    /// fired. The failure now leaves its reason behind, and the body renders
+    /// it instead of a blank vault.
+    #[test]
+    fn an_initial_load_that_gives_up_leaves_a_reason_for_the_empty_window() {
+        let mut items: Vec<VaultItem> = Vec::new();
+        let mut folders = Vec::new();
+        let mut vault_loading = true;
+        let mut vault_load_error = None;
+        let mut selected_id = None;
+        let mut sync_status = None;
+        let mut totp_state = TotpState::NoSecret;
+
+        apply_vault_load_result(
+            1,
+            1,
+            Err(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD)),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut vault_load_error,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert!(!vault_loading, "the spinner must stop -- nothing else is coming");
+        assert_eq!(
+            vault_load_error.as_deref(),
+            Some(VAULT_SUPERSEDED_BEFORE_LOAD),
+            "the loader's own reason must survive the hand-off, or the window has nothing true \
+             to say about why it is empty"
+        );
+        assert_eq!(
+            vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref()),
+            VaultBodyState::Unavailable(VAULT_SUPERSEDED_BEFORE_LOAD),
+            "an empty window after a give-up must SAY so rather than drawing an empty vault"
+        );
+    }
+
+    /// Review 29's Minor 3, second half. On the ordinary post-sync path a
+    /// `Superseded` give-up used to render a red "Sync failed" pill for a
+    /// sync that actually SUCCEEDED -- `bw sync` ran, the cache refilled, for
+    /// a different vault session. The sync claim is left alone and the true
+    /// statement is made about the vault instead.
+    #[test]
+    fn a_superseded_give_up_does_not_report_a_successful_sync_as_failed() {
+        let mut items = vec![item("a")];
+        let mut folders = Vec::new();
+        let mut vault_loading = false;
+        let mut vault_load_error = None;
+        let mut selected_id = Some("a".to_string());
+        let mut sync_status = Some(Ok(()));
+        let mut totp_state = TotpState::NoSecret;
+
+        apply_vault_load_result(
+            2,
+            2,
+            Err(VaultLoadFailure::Superseded(VAULT_SUPERSEDED_BEFORE_LOAD)),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut vault_load_error,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(
+            sync_status,
+            Some(Ok(())),
+            "the sync succeeded; a vault session that ended afterwards is not a sync failure"
+        );
+        assert_eq!(vault_load_error.as_deref(), Some(VAULT_SUPERSEDED_BEFORE_LOAD));
+        assert_eq!(
+            ids(&items),
+            vec!["a"],
+            "and the last known snapshot stays on screen, as the Err arm has always promised"
+        );
+    }
+
+    /// The notice describes the LAST load. A load that painted has nothing
+    /// left to explain, so leaving the reason behind would put a red pill
+    /// over a vault that is on screen and current.
+    #[test]
+    fn a_load_that_paints_clears_the_previous_failure_notice() {
+        let mut items = Vec::new();
+        let mut folders = Vec::new();
+        let mut vault_loading = false;
+        let mut vault_load_error = Some(VAULT_SUPERSEDED_BEFORE_LOAD.to_string());
+        let mut selected_id = None;
+        let mut sync_status = None;
+        let mut totp_state = TotpState::NoSecret;
+
+        apply_vault_load_result(
+            1,
+            1,
+            Ok(VaultSnapshot { items: vec![item("a")], folders: Vec::new() }),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut vault_load_error,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(vault_load_error, None);
+        assert_eq!(ids(&items), vec!["a"]);
+    }
+}
+
+#[cfg(test)]
+mod sync_pill_tests {
+    // Review 29's Minor 3. The pill is the ONLY place any of these states is
+    // spelled for the user, and until this function existed the wording was
+    // an `if` chain inside a 3000-line `eframe` closure that nothing could
+    // call.
+    use super::{sync_pill, theme, VAULT_NOT_REFRESHED_PILL};
+    use std::time::Duration;
+
+    #[test]
+    fn a_give_up_after_a_successful_sync_reads_as_neither_success_nor_a_failed_sync() {
+        let (dot, label) = sync_pill(
+            false,
+            Some(&Ok(())),
+            Some("the vault was locked before this load could read it"),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            label, VAULT_NOT_REFRESHED_PILL,
+            "\"Sync failed\" would be a red pill on a sync that worked; \"Synced just now\" \
+             would claim a refresh that never landed"
+        );
+        assert_eq!(dot, theme::ERROR, "it is still something the user has to act on");
+    }
+
+    #[test]
+    fn a_real_sync_failure_still_says_so() {
+        let (dot, label) = sync_pill(false, Some(&Err("boom".to_string())), None, Duration::ZERO);
+        assert_eq!(label, "Sync failed");
+        assert_eq!(dot, theme::ERROR);
+    }
+
+    #[test]
+    fn a_sync_failure_outranks_a_load_failure_that_followed_it() {
+        // The sync is the thing the user started, and its failure is the
+        // stronger and more actionable statement.
+        let (_, label) = sync_pill(false, Some(&Err("boom".to_string())), Some("also this"), Duration::ZERO);
+        assert_eq!(label, "Sync failed");
+    }
+
+    #[test]
+    fn an_in_flight_sync_outranks_every_finished_one() {
+        let (dot, label) = sync_pill(true, Some(&Err("boom".to_string())), Some("also this"), Duration::ZERO);
+        assert_eq!(label, "Syncing…");
+        assert_eq!(dot, theme::TEXT_GHOST);
+    }
+
+    #[test]
+    fn a_clean_success_still_reads_as_one() {
+        let (dot, label) = sync_pill(false, Some(&Ok(())), None, Duration::from_secs(120));
+        assert_eq!(label, "Synced 2 min ago");
+        assert_eq!(dot, theme::BLUE);
+    }
+
+    #[test]
+    fn nothing_reported_yet_is_neutral() {
+        let (dot, label) = sync_pill(false, None, None, Duration::ZERO);
+        assert_eq!(label, "Sync");
+        assert_eq!(dot, theme::TEXT_GHOST);
+    }
+}
+
+#[cfg(test)]
+mod vault_body_state_tests {
+    use super::{vault_body_state, VaultBodyState};
+
+    #[test]
+    fn a_load_in_flight_is_the_spinner_whatever_else_is_true() {
+        assert_eq!(vault_body_state(true, true, Some("stale reason")), VaultBodyState::Loading);
+    }
+
+    #[test]
+    fn an_empty_window_after_a_failure_says_what_happened() {
+        assert_eq!(
+            vault_body_state(false, true, Some("the vault was locked before this load could read it")),
+            VaultBodyState::Unavailable("the vault was locked before this load could read it")
+        );
+    }
+
+    #[test]
+    fn an_empty_vault_that_simply_has_no_items_is_not_an_error() {
+        // A real empty vault gets the normal chrome -- sidebar, list, empty
+        // state -- not an error page.
+        assert_eq!(vault_body_state(false, true, None), VaultBodyState::Vault);
+    }
+
+    #[test]
+    fn a_failed_refresh_over_a_populated_window_keeps_showing_the_vault() {
+        // The whole "keep the last known snapshot" behaviour. Replacing a
+        // populated window with an error page because a background refresh
+        // failed would be a worse regression than the blank window this
+        // fixes; the pill reports it instead.
+        assert_eq!(vault_body_state(false, false, Some("connection refused")), VaultBodyState::Vault);
+    }
+}
+
+#[cfg(test)]
+mod window_era_placement_tests {
+    // Review 29's Important 2. `run` must capture `cache.epoch().era()` ONCE,
+    // before its loop, and hand that ONE value to every load it spawns.
+    // Re-read at each spawn it answers "is this still the session that
+    // existed one instruction ago?" -- yes, by construction -- while the call
+    // site claims it answers "is this still the vault session the window is
+    // SHOWING?". Nothing in the type system distinguishes the two: both are
+    // a `VaultEra`, and a future edit that writes `era: cache.epoch().era()`
+    // at a spawn site compiles, passes every other test in this file, and
+    // silently restores the account-A/account-B hole. This is the same
+    // source-text guard `reveal_state_placement_tests` uses, for the same
+    // reason, and the same split-literal rule applies -- see that module's
+    // comment. Do not re-join these.
+    const ERA_READ: &str = concat!("cache.epoch()", ".era()");
+    const CAPTURE: &str = concat!("let window_era = cache.epoch()", ".era();");
+    const SPAWN_USE: &str = concat!("era: window", "_era,");
+    // The first `#[cfg(test)]` in the file: everything after it is test code,
+    // where reading the era per call is normal and expected.
+    const TESTS_BEGIN: &str = concat!("#[cfg(", "test)]");
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source.find(TESTS_BEGIN).unwrap_or_else(|| {
+            panic!("no {TESTS_BEGIN:?} in this file -- this guard needs a marker for where \
+                    production code ends; if the test modules moved, update it")
+        });
+        &source[..end]
+    }
+
+    #[test]
+    fn the_era_is_read_exactly_once_in_production_code() {
+        let production = production();
+        assert_eq!(
+            production.matches(ERA_READ).count(),
+            1,
+            "{ERA_READ:?} appears more than once outside the tests. A second read is a \
+             per-spawn capture: it equals the current era BY CONSTRUCTION, so the load it \
+             tags can only detect a `clear` that lands after its own capture -- which is \
+             exactly the guarantee `window_era`'s doc says this window does NOT rest on. \
+             Capture once, before the loop, and hand that value to every spawn."
+        );
+        assert_eq!(
+            production.matches(CAPTURE).count(),
+            1,
+            "{CAPTURE:?} is not the single read above -- `window_era` was renamed or the \
+             capture was moved; update this needle if so, and check it is still before the \
+             frame closure"
+        );
+    }
+
+    #[test]
+    fn both_spawns_are_checked_against_that_one_era() {
+        // The initial load and the post-sync forced reload. If a third spawn
+        // is ever added it must join them, and this count is what says so.
+        assert_eq!(
+            production().matches(SPAWN_USE).count(),
+            2,
+            "{SPAWN_USE:?} must appear once per `spawn_vault_load` call in `run` (the initial \
+             load and the post-sync reload). Fewer means a spawn is checked against something \
+             other than the window's own vault session."
+        );
     }
 }
 
