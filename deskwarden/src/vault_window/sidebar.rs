@@ -5,7 +5,7 @@
 
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
-use eframe::egui::{self, CornerRadius, RichText};
+use eframe::egui::{self, CornerRadius};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarFilter {
@@ -256,8 +256,14 @@ pub fn draw_sidebar(
         ui.spacing_mut().item_spacing.y = 0.0;
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            // The bottom half of the design's `padding: 10px` on the
+            // countdown div -- the same 10px on all four sides that
+            // `countdown_label` takes its horizontal inset from. Left as a
+            // literal rather than folded into `ROW_INSET_X`: that constant
+            // names a *horizontal* text inset, and the two only coincide
+            // because this one element's padding happens to be uniform.
             ui.add_space(10.0);
-            ui.label(RichText::new(lock_countdown).size(11.0).color(theme::TEXT_GHOST));
+            countdown_label(ui, lock_countdown);
         });
     });
 
@@ -285,6 +291,39 @@ fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     );
     ui.painter().galley(pos, galley, theme::TEXT_GHOST);
     rect
+}
+
+/// The auto-lock countdown pinned to the sidebar's bottom.
+///
+/// Design 4.8 spells it out as
+/// `<div style="padding: 10px; font-size: 11px; color: #9b9797">Locks in
+/// 11:42</div>`, a sibling of the rows inside the same padded sidebar
+/// column. That uniform `padding: 10px` puts its text 10px in from exactly
+/// the edge the rows' own `padding: 8px 10px` puts their labels 10px in
+/// from -- so this is [`ROW_INSET_X`], deliberately *not* the two-pixels-
+/// tighter [`SECTION_LABEL_INSET`] the "VAULT"/"FOLDERS" headers use.
+///
+/// Painted into one explicitly-allocated band, like [`section_label`] and
+/// [`sidebar_row`], rather than added as a `ui.label`: a label inside the
+/// enclosing bottom-up layout is placed by that layout against the panel's
+/// content edge and has nowhere to take a horizontal inset from, which is
+/// precisely how the countdown came to sit 10px left of every label above
+/// it.
+fn countdown_label(ui: &mut egui::Ui, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        theme::TEXT_GHOST,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), galley.size().y),
+        egui::Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::Pos2::new(rect.left() + ROW_INSET_X, rect.top()),
+        galley,
+        theme::TEXT_GHOST,
+    );
 }
 
 /// A hairline inset `inset` from both sides of the available width.
@@ -567,6 +606,129 @@ mod tests {
         assert!(is_virtual_folder(&virtual_bucket));
         assert!(!is_virtual_folder(&real_folder_same_name));
         assert!(!is_virtual_folder(&ordinary));
+    }
+
+    /// Same walk `detail.rs`'s `collect_text_rects` does: every painted
+    /// string plus the rectangle egui laid it out in. This file paints its
+    /// labels straight onto `ui.painter()` rather than adding widgets, so
+    /// the paint list is the only place their positions exist -- there are
+    /// no `Response`s to read them off.
+    fn collect_text_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_rects(shape, out);
+                }
+            }
+            // Every other shape is geometry, and this is a test helper, not
+            // a decision over a domain enum.
+            _ => {}
+        }
+    }
+
+    /// Draws a whole sidebar headlessly and returns every painted string
+    /// with its laid-out rect.
+    ///
+    /// The two throwaway frames before the real one are the same ones
+    /// `detail.rs`'s `painted_text` runs, for the same reason:
+    /// `theme::apply`'s font families only exist from the *next* frame on,
+    /// so a selected row's `FontFamily::Name(BOLD)` would otherwise resolve
+    /// against a family that does not exist yet.
+    fn painted_sidebar(lock_countdown: &str) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(212.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let items = vec![item(Some(1), false, Some("f1"))];
+        let folders = vec![Folder {
+            id: "f1".into(),
+            name: "Engineering".into(),
+            other: serde_json::Map::new(),
+        }];
+        let mut selected = SidebarFilter::All;
+
+        let output = ctx.run_ui(input(), |ui| {
+            draw_sidebar(ui, &items, &folders, &mut selected, lock_countdown);
+        });
+
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_rects(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    fn left_edge_of(painted: &[(String, egui::Rect)], needle: &str) -> f32 {
+        painted
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect.left())
+            .unwrap_or_else(|| panic!("the sidebar painted no {needle:?}: {painted:?}"))
+    }
+
+    /// The user-reported defect: the auto-lock countdown sat flush against
+    /// the panel's content edge while every row label above it was inset
+    /// `ROW_INSET_X`, so it hung ~10px further left than everything else.
+    ///
+    /// Design 4.8 gives the countdown `padding: 10px` and each row
+    /// `padding: 8px 10px`, both inside the same padded sidebar column --
+    /// i.e. the same 10px horizontal inset, so their text must start on the
+    /// same x. That is what this asserts, against the real painted galleys,
+    /// because a pixel offset is invisible to any test that only checks
+    /// which strings were drawn.
+    #[test]
+    fn the_lock_countdown_starts_on_the_same_x_as_the_row_labels() {
+        let painted = painted_sidebar("Locks in 11:42");
+
+        let countdown = left_edge_of(&painted, "Locks in 11:42");
+        let vault_row = left_edge_of(&painted, "All items");
+        let folder_row = left_edge_of(&painted, "Engineering");
+
+        assert!(
+            (countdown - vault_row).abs() < 0.5,
+            "the countdown starts at x={countdown} but the VAULT rows' labels start at x={vault_row}"
+        );
+        assert!(
+            (countdown - folder_row).abs() < 0.5,
+            "the countdown starts at x={countdown} but the FOLDERS rows' labels start at x={folder_row}"
+        );
+    }
+
+    /// ...and that shared x really is `ROW_INSET_X` in from the sidebar's
+    /// own left edge, not merely equal to whatever the rows happen to do.
+    /// Without this, insetting *both* by the wrong amount would still pass
+    /// the test above -- which is not hypothetical: a probe that moved both
+    /// `countdown_label` and `sidebar_row` to `SECTION_LABEL_INSET` left the
+    /// test above green and was caught only here.
+    #[test]
+    fn the_countdown_and_the_rows_are_both_row_inset_from_the_panel_edge() {
+        let painted = painted_sidebar("Locks in 11:42");
+
+        // The section headers are the design's 8px `SECTION_LABEL_INSET`
+        // from that same edge, which is how this test locates the edge
+        // without depending on egui's panel margins.
+        let header = left_edge_of(&painted, "VAULT");
+        let expected = header - SECTION_LABEL_INSET + ROW_INSET_X;
+
+        let countdown = left_edge_of(&painted, "Locks in 11:42");
+        assert!(
+            (countdown - expected).abs() < 0.5,
+            "the countdown starts at x={countdown}, expected {expected} \
+             ({ROW_INSET_X} in from the panel edge the VAULT header sits \
+             {SECTION_LABEL_INSET} in from, at x={header})"
+        );
     }
 
     #[test]
