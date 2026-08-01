@@ -119,7 +119,149 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
         png::ColorType::Indexed => return None,
     };
 
-    Some((width, height, rgba))
+    Some(resample_for_display(width, height, rgba))
+}
+
+/// The longest edge, in pixels, a decoded icon is reduced to fit inside.
+///
+/// The item list draws icons at 32 *logical* px. Windows commonly runs at
+/// 125%-200% display scaling, so 32 logical px is up to 64 physical px, and
+/// 64 is therefore the smallest target that never asks the renderer to
+/// magnify on a real monitor. It is deliberately a FIXED constant rather
+/// than something derived from the live DPI: the decoded result is shared
+/// across every monitor the window can be dragged to, and this module has no
+/// `egui` context to read a scale factor from anyway.
+const ICON_TARGET_PX: usize = 64;
+
+/// Brings a decoded icon close to the size it is actually drawn at, so the
+/// texture the GPU samples is not wildly larger (or smaller) than its
+/// on-screen footprint.
+///
+/// Three rules, each deliberate:
+///
+/// * **Downscale only.** Sources longer than [`ICON_TARGET_PX`] are reduced
+///   by area-averaging ([`box_downscale`]). The real icon cache holds
+///   512x512 and 548x548 files drawn at 32 logical px; minifying that far in
+///   the renderer's single bilinear tap, with no mipmaps, samples a sparse
+///   scattering of source pixels and aliases -- which is what "not sharp"
+///   looks like.
+/// * **Never upscale.** A 16x16 or 21x21 source is returned byte-for-byte
+///   unchanged. Magnifying it here would invent detail and bake in a blur
+///   that the renderer would then resample a second time; letting the draw
+///   site scale it once is strictly better.
+/// * **Pad, do not stretch.** Non-square sources (the cache has a 1121x256
+///   and a 32x34) keep their aspect ratio and are centred on a transparent
+///   square canvas. Letterboxing is chosen over returning a non-square
+///   texture because the draw site fits icons to an exact square: a
+///   non-square texture handed to it is *stretched*, and staying correct
+///   would require the draw site to cooperate. A square canvas cannot look
+///   wrong under either a square fit or an aspect-preserving one.
+///
+/// Returns straight (non-premultiplied) RGBA, matching what
+/// `egui::ColorImage::from_rgba_unmultiplied` expects at every call site.
+fn resample_for_display(width: usize, height: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+    if width == 0 || height == 0 {
+        return (width, height, rgba);
+    }
+
+    let longest = width.max(height);
+    let (dst_w, dst_h) = if longest > ICON_TARGET_PX {
+        let scale = ICON_TARGET_PX as f64 / longest as f64;
+        (
+            ((width as f64 * scale).round() as usize).max(1),
+            ((height as f64 * scale).round() as usize).max(1),
+        )
+    } else {
+        (width, height)
+    };
+
+    // A square source at or below the target takes this branch with the
+    // original buffer moved straight through: no filtering, no copy.
+    let scaled = if (dst_w, dst_h) == (width, height) {
+        rgba
+    } else {
+        box_downscale(&rgba, width, height, dst_w, dst_h)
+    };
+    if dst_w == dst_h {
+        return (dst_w, dst_h, scaled);
+    }
+
+    let side = dst_w.max(dst_h);
+    (side, side, letterbox(&scaled, dst_w, dst_h, side))
+}
+
+/// Area-averaging (box) reduction: every destination pixel is the mean of
+/// the whole source rectangle it covers, each source pixel weighted by how
+/// much of it falls inside that rectangle. Unlike nearest-neighbour or a
+/// single bilinear tap, this reads *every* source pixel exactly once, which
+/// is what removes the aliasing on a 512 -> 64 reduction.
+///
+/// **The averaging is done premultiplied.** A fully transparent pixel still
+/// carries RGB bytes -- almost always black -- and averaging straight RGBA
+/// across a transparent edge folds that black into the neighbouring opaque
+/// colour, ringing the artwork with a dark fringe. Favicons are mostly
+/// transparent edge, so this is the failure mode that matters. Colour is
+/// therefore accumulated weighted by alpha and divided back out by the alpha
+/// sum, which makes transparent pixels contribute to the result's *alpha*
+/// and to nothing else. The output is un-premultiplied again on the way out,
+/// because that is what the `from_rgba_unmultiplied` call sites want.
+///
+/// Callers guarantee `dst_w <= src_w` and `dst_h <= src_h`.
+fn box_downscale(src: &[u8], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dst_w * dst_h * 4];
+    let x_ratio = src_w as f64 / dst_w as f64;
+    let y_ratio = src_h as f64 / dst_h as f64;
+
+    for dy in 0..dst_h {
+        let (y0, y1) = (dy as f64 * y_ratio, (dy as f64 + 1.0) * y_ratio);
+        for dx in 0..dst_w {
+            let (x0, x1) = (dx as f64 * x_ratio, (dx as f64 + 1.0) * x_ratio);
+            let (mut weight, mut alpha) = (0.0f64, 0.0f64);
+            let (mut red, mut green, mut blue) = (0.0f64, 0.0f64, 0.0f64);
+
+            for sy in y0 as usize..(y1.ceil() as usize).min(src_h) {
+                let cover_y = (y1.min(sy as f64 + 1.0) - y0.max(sy as f64)).max(0.0);
+                for sx in x0 as usize..(x1.ceil() as usize).min(src_w) {
+                    let cover = cover_y * (x1.min(sx as f64 + 1.0) - x0.max(sx as f64)).max(0.0);
+                    let i = (sy * src_w + sx) * 4;
+                    let a = cover * (src[i + 3] as f64 / 255.0);
+                    weight += cover;
+                    alpha += a;
+                    red += a * src[i] as f64;
+                    green += a * src[i + 1] as f64;
+                    blue += a * src[i + 2] as f64;
+                }
+            }
+
+            // An entirely transparent destination pixel has no colour to
+            // recover -- leaving the quad at zero is the honest answer, and
+            // dividing by `alpha` there would be a division by zero.
+            if alpha > 0.0 && weight > 0.0 {
+                let o = (dy * dst_w + dx) * 4;
+                out[o] = (red / alpha).round().clamp(0.0, 255.0) as u8;
+                out[o + 1] = (green / alpha).round().clamp(0.0, 255.0) as u8;
+                out[o + 2] = (blue / alpha).round().clamp(0.0, 255.0) as u8;
+                out[o + 3] = (alpha / weight * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// Centres a `width` x `height` image on a fully transparent `side` x `side`
+/// canvas. The padding is `[0, 0, 0, 0]` and is never averaged with the
+/// content -- it is written around an already-resampled image, not filtered
+/// across -- so it cannot introduce the dark fringe `box_downscale` guards
+/// against.
+fn letterbox(content: &[u8], width: usize, height: usize, side: usize) -> Vec<u8> {
+    let mut out = vec![0u8; side * side * 4];
+    let (off_x, off_y) = ((side - width) / 2, (side - height) / 2);
+    for y in 0..height {
+        let from = y * width * 4;
+        let to = ((y + off_y) * side + off_x) * 4;
+        out[to..to + width * 4].copy_from_slice(&content[from..from + width * 4]);
+    }
+    out
 }
 
 /// Reads a previously-cached icon for `domain` from disk, if one exists.
@@ -210,6 +352,121 @@ mod tests {
     fn domain_rejects_uris_with_no_dotted_host() {
         assert_eq!(domain_from_uri("localhost"), None);
         assert_eq!(domain_from_uri(""), None);
+    }
+
+    /// Encodes straight (non-premultiplied) RGBA8 pixels as a PNG, so the
+    /// resampling tests below can drive the real `decode_rgba` entry point
+    /// rather than reaching into a private helper.
+    fn rgba_png(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(rgba).expect("png pixel data");
+        }
+        out
+    }
+
+    /// The RGBA quad at `(x, y)` of a `width`-wide straight-RGBA buffer.
+    fn pixel_at(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        let i = (y * width + x) * 4;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    #[test]
+    fn a_large_icon_is_reduced_to_the_display_target() {
+        // The real cache holds 512x512, 548x548 and 540x540 sources, all
+        // drawn at 32 logical px. Minifying that far in one bilinear tap at
+        // draw time is what makes them shimmer; the reduction happens here.
+        let src = vec![200u8; 512 * 512 * 4];
+        let (w, h, out) = decode_rgba(&rgba_png(512, 512, &src)).expect("decodes");
+
+        assert_eq!((w, h), (64, 64));
+        assert_eq!(out.len(), 64 * 64 * 4);
+    }
+
+    #[test]
+    fn a_square_icon_at_or_below_the_target_is_left_completely_untouched() {
+        // Upscaling invents detail. A 32x32 or 16x16 source is handed to the
+        // renderer exactly as decoded, byte for byte.
+        let src: Vec<u8> = (0..32 * 32 * 4).map(|i| (i % 251) as u8).collect();
+        let (w, h, out) = decode_rgba(&rgba_png(32, 32, &src)).expect("decodes");
+        assert_eq!((w, h), (32, 32));
+        assert_eq!(out, src, "a 32x32 source must survive decode unchanged");
+
+        let small: Vec<u8> = (0..16 * 16 * 4).map(|i| (i % 253) as u8).collect();
+        let (w, h, out) = decode_rgba(&rgba_png(16, 16, &small)).expect("decodes");
+        assert_eq!((w, h), (16, 16));
+        assert_eq!(out, small, "a 16x16 source must not be magnified here");
+    }
+
+    #[test]
+    fn a_wide_icon_is_letterboxed_into_a_square_rather_than_stretched() {
+        // 1121x256 is a real file in the user's cache. The draw site fits the
+        // texture to an exact square, so anything non-square arriving there
+        // is stretched -- padding to a square here makes that fit correct
+        // without the draw site having to change.
+        let src = vec![255u8; 1121 * 256 * 4];
+        let (w, h, out) = decode_rgba(&rgba_png(1121, 256, &src)).expect("decodes");
+
+        assert_eq!((w, h), (64, 64), "a wide source must land on a square canvas");
+        // 256 * 64/1121 rounds to 15 content rows, centred at offset 24.
+        assert_eq!(pixel_at(&out, 64, 32, 0)[3], 0, "top padding must be transparent");
+        assert_eq!(pixel_at(&out, 64, 32, 63)[3], 0, "bottom padding must be transparent");
+        assert_eq!(pixel_at(&out, 64, 32, 31)[3], 255, "the content band must survive");
+    }
+
+    #[test]
+    fn a_non_square_icon_below_the_target_is_padded_rather_than_stretched() {
+        // 32x34 is also a real cache file: too small to downscale, but still
+        // non-square, so it still needs the square canvas.
+        let src = vec![255u8; 32 * 34 * 4];
+        let (w, h, out) = decode_rgba(&rgba_png(32, 34, &src)).expect("decodes");
+
+        assert_eq!((w, h), (34, 34), "the canvas is the longer side, not the target");
+        assert_eq!(pixel_at(&out, 34, 0, 17)[3], 0, "left padding must be transparent");
+        assert_eq!(pixel_at(&out, 34, 17, 17)[3], 255, "the content must survive");
+    }
+
+    #[test]
+    fn averaging_across_a_transparent_edge_does_not_tint_the_opaque_pixels() {
+        // Favicons are full of transparent edges. Averaging STRAIGHT RGBA
+        // across such an edge pulls in the colour stored under fully
+        // transparent pixels -- usually black -- and rings the artwork with a
+        // dark fringe. The average has to happen premultiplied.
+        //
+        // 128 -> 64 halves exactly, so each destination pixel covers two
+        // source columns. Making the split 63 columns wide (not 64) puts the
+        // edge INSIDE destination column 31, which therefore averages one
+        // opaque red pixel with one fully transparent black one.
+        let mut src = vec![0u8; 128 * 128 * 4];
+        for y in 0..128 {
+            for x in 0..63 {
+                let i = (y * 128 + x) * 4;
+                src[i] = 255;
+                src[i + 3] = 255;
+            }
+        }
+        let (w, h, out) = decode_rgba(&rgba_png(128, 128, &src)).expect("decodes");
+        assert_eq!((w, h), (64, 64));
+
+        let interior = pixel_at(&out, 64, 0, 32);
+        assert_eq!(interior, [255, 0, 0, 255], "a fully covered pixel must stay pure red");
+
+        let edge = pixel_at(&out, 64, 31, 32);
+        assert_eq!(
+            [edge[0], edge[1], edge[2]],
+            [255, 0, 0],
+            "the edge pixel's colour was pulled toward the transparent side: {edge:?} -- \
+             this is the straight-RGBA average mistake; average premultiplied instead"
+        );
+        assert!(
+            (100..=155).contains(&edge[3]),
+            "the edge pixel should be about half transparent, got alpha {}",
+            edge[3]
+        );
     }
 
     fn unique_cache_dir(label: &str) -> std::path::PathBuf {
