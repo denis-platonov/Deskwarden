@@ -214,6 +214,13 @@ fn main() {
     // in the idle reconciliation below) actually consults. Reassigning it in
     // the tray handler is what makes a change take effect immediately rather
     // than only on next launch.
+    //
+    // It is loaded once and never refreshed, so its `vault_window` goes stale
+    // as soon as the vault window is closed (that geometry is written to the
+    // file by `vault_window::run`, which this loop never hears about). Nothing
+    // here reads that field -- `vault_window` re-reads the file when it opens
+    // -- and the preferences save below goes through `persist_preferences`
+    // precisely so a stale copy of it can never be written back.
     let settings_path = config_dir.join("settings.json");
     let mut settings = settings::Settings::load(&settings_path);
 
@@ -617,7 +624,14 @@ fn main() {
                 let edited = prefs_ui::run(settings.clone());
                 if edited != settings {
                     settings = edited;
-                    if let Err(e) = settings.save(&settings_path) {
+                    // `persist_preferences`, never a whole-struct save: this
+                    // binding's `vault_window` is whatever was on disk at
+                    // startup, and `vault_window::run` has been writing a
+                    // fresh geometry straight to the file every time the
+                    // window closed. Saving the struct here wrote that stale
+                    // value back and silently reverted the saved geometry;
+                    // see `Settings::persist_preferences`.
+                    if let Err(e) = settings.persist_preferences(&settings_path) {
                         log::warn!("could not save settings: {e}");
                     }
                 }

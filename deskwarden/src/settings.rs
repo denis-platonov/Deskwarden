@@ -90,9 +90,32 @@ pub struct WindowPlacement {
 
 /// Area of the overlap between a stored window rect and a monitor, in
 /// square points. `i64` because two `i32` extents multiply out of `i32`.
+///
+/// `saturating_add` on the *stored* rect's far edges: `WindowGeometry`
+/// deserializes whatever `i32`s a hand-edited or corrupt `settings.json`
+/// contains, and `x + width` on two large ones panics in a debug build and
+/// wraps in a release one -- wrapping being the worse of the two, since a
+/// far edge that has wrapped negative silently changes which monitor the
+/// window is judged to be on. Saturating instead makes such a rect overlap
+/// everything to its right, which the clamp then handles like any other
+/// oversized rect. `saturating_sub` for the same reason and not merely for
+/// symmetry: a far edge that has saturated to `i32::MIN` (`x: i32::MAX`,
+/// `width: i32::MIN`) minus a near edge at `i32::MAX` is itself out of range,
+/// and saturating leaves it hugely negative, i.e. "no overlap", which is the
+/// right answer for a rect that degenerate. The monitor rects come from the
+/// OS enumeration rather than from disk, so they are left as plain
+/// arithmetic.
 fn overlap_area(saved: WindowGeometry, area: WorkArea) -> i64 {
-    let w = (saved.x + saved.width).min(area.x + area.width) - saved.x.max(area.x);
-    let h = (saved.y + saved.height).min(area.y + area.height) - saved.y.max(area.y);
+    let w = saved
+        .x
+        .saturating_add(saved.width)
+        .min(area.x + area.width)
+        .saturating_sub(saved.x.max(area.x));
+    let h = saved
+        .y
+        .saturating_add(saved.height)
+        .min(area.y + area.height)
+        .saturating_sub(saved.y.max(area.y));
     if w <= 0 || h <= 0 {
         0
     } else {
@@ -209,6 +232,13 @@ pub struct Settings {
     /// meantime) and read back through [`clamp_window_geometry`], never
     /// directly: everything in it is a claim about a screen layout that may
     /// no longer exist.
+    ///
+    /// **This field is only ever authoritative on disk.** `main.rs` holds a
+    /// `Settings` loaded once at startup and never refreshed, so its copy of
+    /// this field is stale the moment the vault window is first closed. That
+    /// is harmless because nothing reads it from memory -- `vault_window`
+    /// re-reads the file when it opens -- but it is why
+    /// [`Self::persist_preferences`] exists and why [`Self::save`] is private.
     pub vault_window: Option<WindowGeometry>,
 }
 
@@ -230,7 +260,18 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    /// Writes this whole struct out, field for field.
+    ///
+    /// Private, and that is the point: this file has two writers with
+    /// *disjoint* fields -- the vault window owns [`Self::vault_window`], the
+    /// preferences window owns everything else -- and neither holds a
+    /// `Settings` that is fresh in the other's fields. Every write therefore
+    /// goes through [`Self::persist_vault_window_geometry`] or
+    /// [`Self::persist_preferences`], each of which re-reads the file and
+    /// overwrites only what it owns. A whole-struct save reachable from
+    /// outside this module is exactly how the geometry came to be reverted by
+    /// an unrelated preferences edit.
+    fn save(&self, path: &Path) -> std::io::Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?)
     }
 
@@ -243,6 +284,16 @@ impl Settings {
     /// one it invented, and that would silently revert every preference the
     /// user has ever set. Re-reading also means a preference changed while
     /// the vault window was open survives this write.
+    ///
+    /// That reasoning only ever covered *this* direction, and the opposite
+    /// one was the live defect: the preferences window used to save its whole
+    /// struct, geometry included, from a copy `main.rs` had loaded at startup
+    /// and never refreshed -- so an unrelated auto-lock change wrote `null`
+    /// over whatever this function had just persisted. Both writers are now
+    /// read-modify-writes over disjoint fields (see
+    /// [`Self::persist_preferences`]), which is what makes the close-then-edit
+    /// ordering -- the normal one, since opening the vault window blocks the
+    /// tray loop -- safe in either order.
     pub fn persist_vault_window_geometry(
         path: &Path,
         geometry: WindowGeometry,
@@ -250,6 +301,33 @@ impl Settings {
         let mut settings = Self::load(path);
         settings.vault_window = Some(geometry);
         settings.save(path)
+    }
+
+    /// Writes the user's *preferences* back, without disturbing anything else
+    /// in the file -- the mirror image of
+    /// [`Self::persist_vault_window_geometry`].
+    ///
+    /// A read-modify-write for the same reason that one is, pointed the other
+    /// way. `main.rs` loads `Settings` once at startup and keeps that binding
+    /// for the process lifetime; the vault window writes a new geometry
+    /// straight to the file whenever it closes, so main's copy of
+    /// [`Self::vault_window`] is stale from the first close onwards. Saving
+    /// the whole struct when the preferences window returns would write that
+    /// stale value back over the geometry on disk, and the next launch would
+    /// open at the default size wherever the OS chose to put it. Re-reading
+    /// here means the two writers own disjoint fields and cannot clobber each
+    /// other in *either* direction.
+    ///
+    /// The destructuring is deliberate rather than a list of field accesses:
+    /// a field added to [`Settings`] becomes a compile error here, forcing
+    /// whoever adds it to say which of the two writers owns it, instead of
+    /// silently joining the set this one drops.
+    pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
+        let Settings { keep_backend_running, auto_lock_minutes, vault_window: _ } = self;
+        let mut on_disk = Self::load(path);
+        on_disk.keep_backend_running = *keep_backend_running;
+        on_disk.auto_lock_minutes = *auto_lock_minutes;
+        on_disk.save(path)
     }
 
     pub fn auto_lock_timeout(&self) -> Duration {
@@ -390,6 +468,58 @@ mod tests {
         let loaded = Settings::load(&path);
         assert_eq!(loaded.vault_window, None, "an absent geometry is 'never been closed yet'");
         assert_eq!(loaded.auto_lock_minutes, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_preferences_save_from_a_stale_copy_keeps_the_geometry_on_disk() {
+        // The regression this guards, in the order the app actually performs
+        // it: `main.rs` loads `Settings` ONCE at startup and holds that value
+        // for the whole process, so its `vault_window` is frozen at whatever
+        // was on disk then. The vault window is opened, moved and closed --
+        // `persist_vault_window_geometry` writes the new geometry to the file,
+        // and nothing refreshes main's copy. The user then opens Preferences
+        // and changes the auto-lock. Saving the whole struct at that point
+        // writes main's stale `vault_window` (here: `None`) over the geometry
+        // that is on disk, and the next launch opens at the default size
+        // wherever the OS puts it -- with no error anywhere.
+        let path = temp_path("prefs-preserve-geometry");
+        let at_startup = Settings::load(&path);
+        assert_eq!(at_startup.vault_window, None, "first run: no geometry yet");
+
+        let geometry = WindowGeometry { x: 240, y: 120, width: 1500, height: 950 };
+        Settings::persist_vault_window_geometry(&path, geometry).unwrap();
+
+        // Preferences, edited from the copy loaded at startup.
+        let edited = Settings { auto_lock_minutes: 10, ..at_startup };
+        edited.persist_preferences(&path).unwrap();
+
+        let loaded = Settings::load(&path);
+        assert_eq!(
+            loaded.vault_window,
+            Some(geometry),
+            "a preferences save reverted the saved window geometry"
+        );
+        assert_eq!(loaded.auto_lock_minutes, 10, "and the preference itself must still land");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_preferences_save_wins_over_a_stale_preference_in_the_file() {
+        // The other direction, so the read-modify-write above cannot be
+        // "fixed" into merely ignoring the preferences: whatever the file
+        // says about a preference, the value the user just chose is the one
+        // that must survive.
+        let path = temp_path("prefs-win");
+        Settings { keep_backend_running: true, auto_lock_minutes: 15, vault_window: None }
+            .save(&path)
+            .unwrap();
+        Settings { keep_backend_running: false, auto_lock_minutes: 30, vault_window: None }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.keep_backend_running);
+        assert_eq!(loaded.auto_lock_minutes, 30);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -570,6 +700,34 @@ mod clamp_window_geometry_tests {
         assert_eq!(placement.position, None);
         assert_eq!(placement.width, 900, "the floor still applies -- it needs no monitor");
         assert_eq!(placement.height, 600);
+    }
+
+    #[test]
+    fn an_extreme_stored_rect_saturates_instead_of_overflowing() {
+        // `WindowGeometry` deserializes any four `i32`s, so a hand-edited or
+        // corrupt settings.json reaches `overlap_area`'s `x + width`
+        // unvalidated: this input panicked with "attempt to add with
+        // overflow" in a debug build, and wrapped in a release one -- a
+        // wrapped far edge quietly changes which monitor the rect is judged
+        // to be on. Same class as `an_absurd_value_saturates_instead_of_
+        // overflowing` for the auto-lock timeout.
+        let placement = clamp_window_geometry(
+            geometry(i32::MAX, i32::MAX, i32::MAX, i32::MAX),
+            &[PRIMARY],
+        );
+        assert_inside(placement, PRIMARY);
+        // The mirror image, where the *far* edge saturates negative.
+        let flipped = clamp_window_geometry(
+            geometry(i32::MAX, i32::MAX, i32::MIN, i32::MIN),
+            &[PRIMARY],
+        );
+        assert_inside(flipped, PRIMARY);
+        // And the all-negative corner.
+        let negative = clamp_window_geometry(
+            geometry(i32::MIN, i32::MIN, i32::MIN, i32::MIN),
+            &[PRIMARY],
+        );
+        assert_inside(negative, PRIMARY);
     }
 
     #[test]
