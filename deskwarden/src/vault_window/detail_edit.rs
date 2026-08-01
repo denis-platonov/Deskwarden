@@ -4,7 +4,7 @@
 //! from read mode.
 
 use crate::theme;
-use crate::vault_bridge::{Folder, ItemKind, NewItem, VaultItem};
+use crate::vault_bridge::{CardData, Folder, IdentityData, ItemKind, NewItem, VaultItem};
 #[cfg(test)]
 use crate::vault_bridge::{LoginData, UriEntry};
 use crate::vault_window::sidebar;
@@ -63,6 +63,33 @@ pub struct IdentityDraft {
     pub license_number: String,
 }
 
+/// The SSH-key-specific half of a draft (`type: 5`).
+///
+/// The three field names are the wire keys captured from a real type-5 item on
+/// 2026-08-01 (`.superpowers/sdd/item-shapes-capture.md`): `privateKey`,
+/// `publicKey`, `keyFingerprint`. There is no `SshKeyData` to mirror yet --
+/// the struct lands with the `ssh-key-type` branch and
+/// [`NewItem::ssh_key`] takes the three strings directly in the meantime --
+/// so this draft is written against that constructor.
+///
+/// **Create only.** [`EditDraft::apply_to`] never writes these back, because
+/// [`VaultItem`] has no `sshKey` field in this build: an existing key's object
+/// rides the `other` catch-all and is preserved precisely *because* nothing
+/// touches it. [`form_body`] is where that asymmetry is decided, so the edit
+/// form cannot offer boxes whose contents would be silently dropped.
+#[derive(Debug, Clone, Default)]
+pub struct SshKeyDraft {
+    pub private_key: String,
+    pub public_key: String,
+    pub key_fingerprint: String,
+    /// Persistent reveal state for the private key, for the same reason
+    /// [`EditDraft::reveal_password`] and [`CardDraft::reveal_number`] exist:
+    /// a frame-local `bool` resets every frame, which is a toggle that
+    /// visibly does nothing. The public key and the fingerprint are not
+    /// secrets and get no flag.
+    pub reveal_private_key: bool,
+}
+
 /// The edit form's state, for **one kind of item**.
 ///
 /// [`Self::kind`] is what makes this safe. Before it existed, `apply_to`
@@ -75,10 +102,18 @@ pub struct IdentityDraft {
 /// across frames.
 #[derive(Debug, Clone)]
 pub struct EditDraft {
-    /// Which kind this draft edits. Set from the item by [`Self::from_item`]
-    /// and fixed thereafter -- an item's type cannot be changed after
-    /// creation. [`Self::apply_to`] writes back **only** this kind's object.
-    pub kind: ItemKind,
+    /// Which kind this draft is for. Set from the item by [`Self::from_item`]
+    /// (and then fixed -- an existing item's type cannot be changed), or
+    /// chosen by the "+ New" type menu through [`Self::empty_of`] and
+    /// [`Self::set_kind`]. [`Self::apply_to`] writes back **only** this kind's
+    /// object, and [`Self::to_new_item`] builds **only** this kind's payload.
+    ///
+    /// **Private, with [`Self::kind`] to read it.** A caller that could assign
+    /// this field directly would change the kind while leaving the previous
+    /// kind's fields in place, which is how the abandoned kind's data ends up
+    /// on the wire under the chosen one -- the same defect class as the
+    /// login-grafting bug. `set_kind` is the only way in, and it clears.
+    kind: ItemKind,
     pub name: String,
     pub folder_id: Option<String>,
     /// What the item's folder was when the form opened.
@@ -99,6 +134,7 @@ pub struct EditDraft {
     pub reveal_password: bool,
     pub card: CardDraft,
     pub identity: IdentityDraft,
+    pub ssh_key: SshKeyDraft,
     /// Item-level `notes`, which is where a secure note's entire body lives.
     /// Populated for every kind but written back only for
     /// [`ItemKind::SecureNote`], because that is the only kind this form
@@ -122,8 +158,41 @@ impl Default for EditDraft {
             reveal_password: false,
             card: CardDraft::default(),
             identity: IdentityDraft::default(),
+            ssh_key: SshKeyDraft::default(),
             note_body: String::new(),
         }
+    }
+}
+
+/// The kinds the "+ New" type menu may offer, in the order it should offer
+/// them.
+///
+/// `ItemKind::Unknown(_)` is absent and cannot be added: it means "a type this
+/// build does not understand", [`NewItem`] has no variant for it, and there is
+/// no form that could fill one in. The menu builds its rows from this array so
+/// that the un-creatable kind is not merely rejected on save -- it is never
+/// offered. See [`is_creatable`] for the same fact as a predicate.
+pub const CREATABLE_KINDS: [ItemKind; 5] = [
+    ItemKind::Login,
+    ItemKind::SecureNote,
+    ItemKind::Card,
+    ItemKind::Identity,
+    ItemKind::SshKey,
+];
+
+/// Whether an item of `kind` can be created by this form.
+///
+/// Exhaustive with no catch-all, as [`ItemKind`]'s own doc requires: a `_ =>`
+/// here would quietly declare whatever Bitwarden ships next to be creatable
+/// through a form that has no fields for it.
+pub fn is_creatable(kind: ItemKind) -> bool {
+    match kind {
+        ItemKind::Login
+        | ItemKind::SecureNote
+        | ItemKind::Card
+        | ItemKind::Identity
+        | ItemKind::SshKey => true,
+        ItemKind::Unknown(_) => false,
     }
 }
 
@@ -149,6 +218,30 @@ fn edited(current: Option<&str>, draft: &str) -> Option<String> {
 /// the wipe-on-drop guarantee the draft's plain `String` does not have.
 fn edited_secret(current: Option<&str>, draft: &str) -> Option<Zeroizing<String>> {
     edited(current, draft).map(Zeroizing::new)
+}
+
+/// How one draft field becomes one modelled value: given what the item
+/// currently holds (`None` when there is no item yet) and what the user typed,
+/// what should be written.
+///
+/// A parameter rather than two copies of the conversion, because a *create*
+/// and a *save* answer that question differently while walking exactly the
+/// same fields. Two hand-written walks would be two places to add a field to,
+/// and the one that got forgotten would fail silently -- a card whose brand
+/// the edit form saves and the create form drops.
+type FieldRule = fn(Option<&str>, &str) -> Option<String>;
+
+/// The [`FieldRule`] for a **create**: whatever the user typed, verbatim,
+/// including a blank.
+///
+/// There is no `current` to consult -- nothing exists yet -- and blank
+/// handling is deliberately not this form's job: [`NewItem::to_payload`]
+/// prunes empty values by one shared rule for every kind. Deciding it here as
+/// well would put a second opinion in the codebase, and only the model's is on
+/// the wire. Contrast [`edited`], which needs `current` precisely because a
+/// save can tell "left blank" from "was already an empty string".
+fn stated(_current: Option<&str>, draft: &str) -> Option<String> {
+    Some(draft.to_string())
 }
 
 /// The other direction: a modelled `Option` becomes the draft's `String`.
@@ -203,12 +296,74 @@ impl EditDraft {
                 passport_number: drafted(identity.and_then(|i| i.passport_number.as_deref())),
                 license_number: drafted(identity.and_then(|i| i.license_number.as_deref())),
             },
+            // Blank, deliberately, and NOT read out of `item.other["sshKey"]`.
+            // `apply_to` cannot write those keys back in this build (see
+            // `SshKeyDraft`), so populating them would put a real private key
+            // in a box whose contents are discarded on save -- the loudest
+            // possible version of the silent-data-loss failure this file keeps
+            // guarding against. `form_body` withholds the fields on an edit
+            // for the same reason.
+            ssh_key: SshKeyDraft::default(),
             note_body: drafted(item.notes.as_deref().map(|n| n.as_str())),
         }
     }
 
+    /// A blank draft of the default kind (a login -- see [`Self::default`]).
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// A blank draft of a **chosen** kind, for the "+ New" type menu.
+    ///
+    /// Accepts any [`ItemKind`], including `Unknown`, rather than a narrower
+    /// "creatable kind" type: the menu offers only [`CREATABLE_KINDS`], and a
+    /// draft that somehow held an un-creatable kind is already handled where
+    /// it matters -- [`Self::to_new_item`] returns `None` and the form
+    /// withholds Save. Adding a second kind enum to prevent a state the UI
+    /// cannot reach would buy nothing and would have to be kept in step with
+    /// `ItemKind` forever.
+    pub fn empty_of(kind: ItemKind) -> Self {
+        Self { kind, ..Self::default() }
+    }
+
+    /// Which kind this draft is for.
+    pub fn kind(&self) -> ItemKind {
+        self.kind
+    }
+
+    /// Switches the draft to another kind, **keeping the item-level fields**
+    /// (name and folder, plus the recorded original folder) and clearing every
+    /// kind-specific one.
+    ///
+    /// Name and folder survive because they belong to the item, not to its
+    /// type: a user who has typed a name and picked a folder and then realises
+    /// this is a card, not a login, has not changed their mind about either.
+    /// Everything else is dropped because it belonged to a kind they are no
+    /// longer creating, and carrying it forward is how the abandoned kind's
+    /// data reaches the wire under the chosen one. The reveal flags go with
+    /// it, so a form the user has just switched into is never already showing
+    /// a secret.
+    ///
+    /// **A no-op when the kind is unchanged**, which is not an optimisation:
+    /// an egui type menu re-states its current selection on every frame, so an
+    /// unconditional clear would wipe the form as fast as it could be typed
+    /// into.
+    pub fn set_kind(&mut self, kind: ItemKind) {
+        if self.kind == kind {
+            return;
+        }
+        // Spelled out field by field rather than `..Self::empty_of(kind)`,
+        // which would also reset `original_folder_id` -- and would keep
+        // compiling, silently, if a new item-level field were added that
+        // ought to have survived.
+        self.kind = kind;
+        self.username = String::new();
+        self.password = String::new();
+        self.reveal_password = false;
+        self.card = CardDraft::default();
+        self.identity = IdentityDraft::default();
+        self.ssh_key = SshKeyDraft::default();
+        self.note_body = String::new();
     }
 
     /// A name is the one thing `bw serve`'s create/edit endpoints reject an
@@ -283,41 +438,12 @@ impl EditDraft {
                 updated.login = Some(login);
             }
             ItemKind::Card => {
-                let d = &self.card;
-                let mut card = updated.card.take().unwrap_or_default();
-                card.cardholder_name = edited(card.cardholder_name.as_deref(), &d.cardholder_name);
-                card.brand = edited(card.brand.as_deref(), &d.brand);
-                card.number =
-                    edited_secret(card.number.as_deref().map(|n| n.as_str()), &d.number);
-                card.exp_month = edited(card.exp_month.as_deref(), &d.exp_month);
-                card.exp_year = edited(card.exp_year.as_deref(), &d.exp_year);
-                card.code = edited_secret(card.code.as_deref().map(|c| c.as_str()), &d.code);
-                updated.card = Some(card);
+                let base = updated.card.take().unwrap_or_default();
+                updated.card = Some(self.card_data(base, edited));
             }
             ItemKind::Identity => {
-                let d = &self.identity;
-                let mut identity = updated.identity.take().unwrap_or_default();
-                identity.title = edited(identity.title.as_deref(), &d.title);
-                identity.first_name = edited(identity.first_name.as_deref(), &d.first_name);
-                identity.middle_name = edited(identity.middle_name.as_deref(), &d.middle_name);
-                identity.last_name = edited(identity.last_name.as_deref(), &d.last_name);
-                identity.address1 = edited(identity.address1.as_deref(), &d.address1);
-                identity.address2 = edited(identity.address2.as_deref(), &d.address2);
-                identity.address3 = edited(identity.address3.as_deref(), &d.address3);
-                identity.city = edited(identity.city.as_deref(), &d.city);
-                identity.state = edited(identity.state.as_deref(), &d.state);
-                identity.postal_code = edited(identity.postal_code.as_deref(), &d.postal_code);
-                identity.country = edited(identity.country.as_deref(), &d.country);
-                identity.company = edited(identity.company.as_deref(), &d.company);
-                identity.email = edited(identity.email.as_deref(), &d.email);
-                identity.phone = edited(identity.phone.as_deref(), &d.phone);
-                identity.ssn = edited(identity.ssn.as_deref(), &d.ssn);
-                identity.username = edited(identity.username.as_deref(), &d.username);
-                identity.passport_number =
-                    edited(identity.passport_number.as_deref(), &d.passport_number);
-                identity.license_number =
-                    edited(identity.license_number.as_deref(), &d.license_number);
-                updated.identity = Some(identity);
+                let base = updated.identity.take().unwrap_or_default();
+                updated.identity = Some(self.identity_data(base, edited));
             }
             ItemKind::SecureNote => {
                 // A secure note has no object of its own to write: its
@@ -350,18 +476,108 @@ impl EditDraft {
         updated
     }
 
-    /// The create payload. **Login-shaped**, because the create form has no
-    /// type selector yet: that is the UI half of the plan's Task 5, and this
-    /// draft therefore always comes from [`Self::empty`], whose kind is
-    /// `Login`. [`NewItem`] itself can now express every kind, so adding the
-    /// selector is a change here and not in `vault_bridge`.
-    pub fn to_new_item(&self) -> NewItem {
-        NewItem::login(
-            self.name.clone(),
-            self.username.clone(),
-            self.password.clone(),
-            self.folder_id.clone(),
-        )
+    /// This draft's card fields as a [`CardData`], built on top of `base`
+    /// (what the item already holds; `CardData::default()` when there is no
+    /// item yet) by `rule`.
+    ///
+    /// The **one** draft->`CardData` conversion in this file: both
+    /// [`Self::apply_to`] and [`Self::to_new_item`] go through it, differing
+    /// only in the [`FieldRule`] they pass. A struct literal rather than
+    /// field-by-field mutation, so the compiler -- not a reviewer -- notices a
+    /// field added to `CardData` and never wired to the form.
+    ///
+    /// `base.other` moves through untouched: [`VaultItem`]'s own catch-all
+    /// cannot reach inside the card object, so this is the only thing keeping
+    /// an unmodelled key Bitwarden puts there.
+    fn card_data(&self, base: CardData, rule: FieldRule) -> CardData {
+        let d = &self.card;
+        CardData {
+            cardholder_name: rule(base.cardholder_name.as_deref(), &d.cardholder_name),
+            brand: rule(base.brand.as_deref(), &d.brand),
+            // Re-wrapped in `Zeroizing` for the reason `edited_secret` exists:
+            // the draft's plain `String` has no wipe-on-drop guarantee and the
+            // model side keeps one.
+            number: rule(base.number.as_deref().map(|n| n.as_str()), &d.number)
+                .map(Zeroizing::new),
+            exp_month: rule(base.exp_month.as_deref(), &d.exp_month),
+            exp_year: rule(base.exp_year.as_deref(), &d.exp_year),
+            code: rule(base.code.as_deref().map(|c| c.as_str()), &d.code).map(Zeroizing::new),
+            other: base.other,
+        }
+    }
+
+    /// This draft's identity fields as an [`IdentityData`]. See
+    /// [`Self::card_data`] -- same contract, same reasons.
+    fn identity_data(&self, base: IdentityData, rule: FieldRule) -> IdentityData {
+        let d = &self.identity;
+        IdentityData {
+            title: rule(base.title.as_deref(), &d.title),
+            first_name: rule(base.first_name.as_deref(), &d.first_name),
+            middle_name: rule(base.middle_name.as_deref(), &d.middle_name),
+            last_name: rule(base.last_name.as_deref(), &d.last_name),
+            address1: rule(base.address1.as_deref(), &d.address1),
+            address2: rule(base.address2.as_deref(), &d.address2),
+            address3: rule(base.address3.as_deref(), &d.address3),
+            city: rule(base.city.as_deref(), &d.city),
+            state: rule(base.state.as_deref(), &d.state),
+            postal_code: rule(base.postal_code.as_deref(), &d.postal_code),
+            country: rule(base.country.as_deref(), &d.country),
+            company: rule(base.company.as_deref(), &d.company),
+            email: rule(base.email.as_deref(), &d.email),
+            phone: rule(base.phone.as_deref(), &d.phone),
+            ssn: rule(base.ssn.as_deref(), &d.ssn),
+            username: rule(base.username.as_deref(), &d.username),
+            passport_number: rule(base.passport_number.as_deref(), &d.passport_number),
+            license_number: rule(base.license_number.as_deref(), &d.license_number),
+            other: base.other,
+        }
+    }
+
+    /// The create payload for this draft's kind, or `None` for the one kind
+    /// that cannot be created.
+    ///
+    /// Exactly one type object, chosen by [`Self::kind`] and built from that
+    /// kind's fields only -- the create-side counterpart of `apply_to`'s
+    /// refusal to write more than one object. The draft holds every kind's
+    /// fields (it is one struct so that the kind can change without losing the
+    /// name and folder), so "build only this kind's" is a property of this
+    /// match, and `changing_a_drafts_kind_keeps_the_shared_fields_and_leaks_no_others`
+    /// is what holds it to that.
+    ///
+    /// **`Unknown` returns `None`, and that is the whole handling.** There is
+    /// no `NewItem` variant for a type this build does not understand, and
+    /// there is no honest substitute: returning a login or a note would create
+    /// an item of the wrong type out of a form the user filled in for
+    /// something else, silently and irreversibly-ish. The kind is not offered
+    /// by the menu ([`CREATABLE_KINDS`]) and Save is withheld for it
+    /// ([`is_creatable`]), so this is the third of three doors, not the first.
+    ///
+    /// Blanks are passed through verbatim -- see [`stated`].
+    pub fn to_new_item(&self) -> Option<NewItem> {
+        let name = self.name.clone();
+        let folder_id = self.folder_id.clone();
+        Some(match self.kind {
+            ItemKind::Login => {
+                NewItem::login(name, self.username.clone(), self.password.clone(), folder_id)
+            }
+            ItemKind::SecureNote => NewItem::secure_note(name, self.note_body.clone(), folder_id),
+            ItemKind::Card => {
+                let card = self.card_data(CardData::default(), stated);
+                NewItem::card(name, card, folder_id)
+            }
+            ItemKind::Identity => {
+                let identity = self.identity_data(IdentityData::default(), stated);
+                NewItem::identity(name, identity, folder_id)
+            }
+            ItemKind::SshKey => NewItem::ssh_key(
+                name,
+                self.ssh_key.private_key.clone(),
+                self.ssh_key.public_key.clone(),
+                self.ssh_key.key_fingerprint.clone(),
+                folder_id,
+            ),
+            ItemKind::Unknown(_) => return None,
+        })
     }
 }
 
@@ -380,6 +596,48 @@ fn form_title(kind: ItemKind, creating: bool) -> String {
         ItemKind::Unknown(_) => "item",
     };
     format!("{} {noun}", if creating { "New" } else { "Edit" })
+}
+
+/// Which set of fields the form's body shows.
+///
+/// A pure decision, separate from drawing it, because the interesting case is
+/// not "which fields" but *when*: an SSH key's three fields can be **created**
+/// and cannot be **edited**, and nothing in this crate can click a widget to
+/// check that (`draw_detail_edit` needs an egui context). Deciding it here
+/// makes it assertable -- the same device `assignable_folders` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FormBody {
+    Login,
+    Card,
+    Identity,
+    Note,
+    SshKey,
+    /// "Name and folder only." Shown for a kind whose contents this build
+    /// cannot write back.
+    UneditableNotice,
+}
+
+/// See [`FormBody`]. Exhaustive with no catch-all, as [`ItemKind`] requires.
+fn form_body(kind: ItemKind, creating: bool) -> FormBody {
+    match kind {
+        ItemKind::Login => FormBody::Login,
+        ItemKind::Card => FormBody::Card,
+        ItemKind::Identity => FormBody::Identity,
+        ItemKind::SecureNote => FormBody::Note,
+        // The asymmetry, and the reason this function takes `creating`:
+        // `NewItem::ssh_key` can POST all three keys, but `VaultItem` has no
+        // `sshKey` field in this build, so an existing key's object rides the
+        // `other` catch-all and `apply_to` deliberately leaves it alone.
+        // Offering the fields on an edit would show three boxes whose
+        // contents are silently discarded on save. When the `ssh-key-type`
+        // branch lands and `apply_to` grows an arm that writes them, this
+        // becomes `FormBody::SshKey` unconditionally -- and not before.
+        ItemKind::SshKey if creating => FormBody::SshKey,
+        ItemKind::SshKey => FormBody::UneditableNotice,
+        // Nothing is known about this type, so there is nothing to offer in
+        // either mode; `is_creatable` also withholds Save.
+        ItemKind::Unknown(_) => FormBody::UneditableNotice,
+    }
 }
 
 /// The identity form's rows, in the same order and grouping the read pane
@@ -472,8 +730,8 @@ pub fn draw_detail_edit(
             // Exhaustive, no catch-all: `ItemKind`'s doc forbids one, and a
             // `_ =>` here would render a login's username and password box
             // over whatever kind Bitwarden ships next.
-            match draft.kind {
-                ItemKind::Login => {
+            match form_body(draft.kind, creating) {
+                FormBody::Login => {
                     theme::field_label(ui, "Username");
                     theme::text_field(ui, &mut draft.username, false);
                     ui.add_space(10.0);
@@ -482,7 +740,7 @@ pub fn draw_detail_edit(
                     theme::password_field(ui, &mut draft.password, &mut draft.reveal_password);
                     ui.add_space(10.0);
                 }
-                ItemKind::Card => {
+                FormBody::Card => {
                     let card = &mut draft.card;
                     theme::field_label(ui, "Cardholder name");
                     theme::text_field(ui, &mut card.cardholder_name, false);
@@ -508,14 +766,14 @@ pub fn draw_detail_edit(
                     theme::password_field(ui, &mut card.code, &mut card.reveal_code);
                     ui.add_space(10.0);
                 }
-                ItemKind::Identity => {
+                FormBody::Identity => {
                     for (label, value) in identity_rows(&mut draft.identity) {
                         theme::field_label(ui, label);
                         theme::text_field(ui, value, false);
                         ui.add_space(10.0);
                     }
                 }
-                ItemKind::SecureNote => {
+                FormBody::Note => {
                     theme::field_label(ui, "Note");
                     // A multiline box rather than `theme::text_field`: a
                     // secure note's body is the whole item and is routinely
@@ -527,7 +785,27 @@ pub fn draw_detail_edit(
                     );
                     ui.add_space(10.0);
                 }
-                ItemKind::SshKey | ItemKind::Unknown(_) => {
+                FormBody::SshKey => {
+                    let ssh = &mut draft.ssh_key;
+                    // Wire keys `privateKey`, `publicKey`, `keyFingerprint`,
+                    // captured from a real type-5 item -- see `SshKeyDraft`.
+                    theme::field_label(ui, "Private key");
+                    // The one secret of the three, so the one with a reveal.
+                    // Multiline would suit a PEM block better, but
+                    // `theme` has no masked multiline box and an unmasked one
+                    // would show the key by default.
+                    theme::password_field(ui, &mut ssh.private_key, &mut ssh.reveal_private_key);
+                    ui.add_space(10.0);
+
+                    theme::field_label(ui, "Public key");
+                    theme::text_field(ui, &mut ssh.public_key, false);
+                    ui.add_space(10.0);
+
+                    theme::field_label(ui, "Fingerprint");
+                    theme::text_field(ui, &mut ssh.key_fingerprint, false);
+                    ui.add_space(10.0);
+                }
+                FormBody::UneditableNotice => {
                     ui.label(
                         RichText::new(
                             "Deskwarden can change only the name and folder of this item. Its \
@@ -589,6 +867,24 @@ pub fn draw_detail_edit(
             }
         });
 
+    // A create of a kind `NewItem` cannot express has no payload at all (see
+    // `EditDraft::to_new_item`), so Save is withheld rather than left to
+    // produce nothing when clicked. Unreachable through the "+ New" menu,
+    // which offers only `CREATABLE_KINDS` -- this is the backstop, and it says
+    // why instead of doing nothing quietly. An *edit* of such an item is
+    // fine: the name and folder still save.
+    let creatable = !creating || is_creatable(draft.kind);
+    if !creatable {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "Deskwarden does not know this item type and cannot create one. Create it in \
+                 the Bitwarden web vault or app.",
+            )
+            .size(12.0)
+            .color(theme::ERROR),
+        );
+    }
     if !draft.is_valid() {
         ui.add_space(6.0);
         ui.label(RichText::new("Name is required.").size(12.0).color(theme::ERROR));
@@ -597,7 +893,7 @@ pub fn draw_detail_edit(
     ui.add_space(12.0);
     ui.horizontal(|ui| {
         let save = egui::Button::new(if draft.is_valid() { "Save" } else { "Save (needs a name)" });
-        if ui.add_enabled(draft.is_valid(), save).clicked() {
+        if ui.add_enabled(draft.is_valid() && creatable, save).clicked() {
             action = EditAction::Save;
         }
         if theme::secondary_button(ui, "Cancel").clicked() {
@@ -1140,6 +1436,349 @@ mod tests {
         }
     }
 
+    /// A draft of `kind` with every kind's fields filled in with a
+    /// recognisable value, so a payload that carries the wrong kind's data --
+    /// the login-grafting defect class -- shows up as a value that does not
+    /// belong rather than as an absence.
+    fn stuffed_draft(kind: ItemKind) -> EditDraft {
+        let mut draft = EditDraft::empty_of(kind);
+        draft.name = "Everything".into();
+        draft.folder_id = Some("f2".into());
+        draft.username = "login-user".into();
+        draft.password = "login-pass".into();
+        draft.note_body = "note-body".into();
+        draft.card.cardholder_name = "card-holder".into();
+        draft.card.brand = "card-brand".into();
+        draft.card.number = "card-number".into();
+        draft.card.exp_month = "04".into();
+        draft.card.exp_year = "2028".into();
+        draft.card.code = "card-code".into();
+        for (i, (_, value)) in identity_rows(&mut draft.identity).into_iter().enumerate() {
+            *value = format!("identity-{i}");
+        }
+        draft.ssh_key.private_key = "ssh-private".into();
+        draft.ssh_key.public_key = "ssh-public".into();
+        draft.ssh_key.key_fingerprint = "ssh-fingerprint".into();
+        draft
+    }
+
+    /// The type object of a create payload, as a map -- **never** by indexing.
+    /// `Value["missing"]` is `Null`, so `assert_eq!(body["x"], Value::Null)`
+    /// passes whether the key is absent or explicitly null, and an assertion
+    /// that cannot fail is worse than none.
+    fn type_object<'a>(
+        payload: &'a serde_json::Value,
+        key: &str,
+    ) -> &'a serde_json::Map<String, serde_json::Value> {
+        payload
+            .as_object()
+            .expect("a create payload is an object")
+            .get(key)
+            .unwrap_or_else(|| panic!("the payload has no `{key}` object"))
+            .as_object()
+            .expect("a type object is an object")
+    }
+
+    #[test]
+    fn a_draft_can_start_at_a_chosen_kind() {
+        for kind in CREATABLE_KINDS {
+            assert_eq!(EditDraft::empty_of(kind).kind(), kind);
+        }
+        // The no-argument constructor keeps its documented default.
+        assert_eq!(EditDraft::empty().kind(), ItemKind::Login);
+    }
+
+    #[test]
+    fn the_five_creatable_kinds_are_offered_and_unknown_is_not() {
+        assert_eq!(
+            CREATABLE_KINDS.to_vec(),
+            vec![
+                ItemKind::Login,
+                ItemKind::SecureNote,
+                ItemKind::Card,
+                ItemKind::Identity,
+                ItemKind::SshKey,
+            ]
+        );
+        assert!(!CREATABLE_KINDS.iter().any(|k| matches!(k, ItemKind::Unknown(_))));
+    }
+
+    #[test]
+    fn an_unknown_kind_has_no_create_payload() {
+        // `NewItem` has no variant for a type this build does not understand,
+        // and inventing one (a login, a note) would create an item of the
+        // WRONG TYPE from a form the user filled in for something else.
+        let mut draft = stuffed_draft(ItemKind::Login);
+        draft.set_kind(ItemKind::Unknown(9));
+        assert!(draft.to_new_item().is_none());
+        assert!(!is_creatable(ItemKind::Unknown(9)));
+        for kind in CREATABLE_KINDS {
+            assert!(is_creatable(kind), "{kind:?} is offered by the menu but cannot be created");
+            assert!(
+                stuffed_draft(kind).to_new_item().is_some(),
+                "{kind:?} is creatable but produced no payload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_draft_creates_a_login() {
+        let payload = stuffed_draft(ItemKind::Login).to_new_item().unwrap().to_payload();
+        assert_eq!(payload["type"], serde_json::json!(1));
+        assert_eq!(payload["name"], serde_json::json!("Everything"));
+        assert_eq!(payload["folderId"], serde_json::json!("f2"));
+        let login = type_object(&payload, "login");
+        assert_eq!(login.get("username"), Some(&serde_json::json!("login-user")));
+        assert_eq!(login.get("password"), Some(&serde_json::json!("login-pass")));
+        let keys: Vec<&str> = payload.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["folderId", "login", "name", "type"]);
+    }
+
+    #[test]
+    fn a_secure_note_draft_creates_a_note_whose_body_is_item_level() {
+        let payload = stuffed_draft(ItemKind::SecureNote).to_new_item().unwrap().to_payload();
+        assert_eq!(payload["type"], serde_json::json!(2));
+        assert_eq!(
+            payload.as_object().unwrap().get("notes"),
+            Some(&serde_json::json!("note-body")),
+            "a note's body is item-level `notes`, not a field of its type object"
+        );
+        assert_eq!(type_object(&payload, "secureNote").get("type"), Some(&serde_json::json!(0)));
+        assert!(
+            payload.as_object().unwrap().get("login").is_none(),
+            "a note draft carried the login fields the form also holds"
+        );
+    }
+
+    #[test]
+    fn a_card_draft_creates_a_card_with_the_six_captured_keys() {
+        let payload = stuffed_draft(ItemKind::Card).to_new_item().unwrap().to_payload();
+        assert_eq!(payload["type"], serde_json::json!(3));
+        let card = type_object(&payload, "card");
+        assert_eq!(card.get("cardholderName"), Some(&serde_json::json!("card-holder")));
+        assert_eq!(card.get("brand"), Some(&serde_json::json!("card-brand")));
+        assert_eq!(card.get("number"), Some(&serde_json::json!("card-number")));
+        // Zero-padded and still a string: `item.card`'s captured template
+        // sends `expMonth: "04"`, so a create must not turn it into 4.
+        assert_eq!(card.get("expMonth"), Some(&serde_json::json!("04")));
+        assert_eq!(card.get("expYear"), Some(&serde_json::json!("2028")));
+        assert_eq!(card.get("code"), Some(&serde_json::json!("card-code")));
+        assert_eq!(card.len(), 6);
+    }
+
+    #[test]
+    fn an_identity_draft_creates_an_identity_with_every_modelled_key() {
+        let payload = stuffed_draft(ItemKind::Identity).to_new_item().unwrap().to_payload();
+        assert_eq!(payload["type"], serde_json::json!(4));
+        let identity = type_object(&payload, "identity");
+        // The row order `identity_rows` renders, so a mis-wired row shows up
+        // as a value in the wrong key rather than as a missing one.
+        for (key, value) in [
+            ("title", "identity-0"),
+            ("firstName", "identity-1"),
+            ("middleName", "identity-2"),
+            ("lastName", "identity-3"),
+            ("email", "identity-4"),
+            ("phone", "identity-5"),
+            ("username", "identity-6"),
+            ("company", "identity-7"),
+            ("address1", "identity-8"),
+            ("address2", "identity-9"),
+            ("address3", "identity-10"),
+            ("city", "identity-11"),
+            ("state", "identity-12"),
+            ("postalCode", "identity-13"),
+            ("country", "identity-14"),
+            ("ssn", "identity-15"),
+            ("passportNumber", "identity-16"),
+            ("licenseNumber", "identity-17"),
+        ] {
+            assert_eq!(
+                identity.get(key),
+                Some(&serde_json::json!(value)),
+                "`{key}` did not carry the value its form row holds"
+            );
+        }
+        assert_eq!(identity.len(), 18);
+    }
+
+    #[test]
+    fn an_ssh_draft_creates_the_three_captured_ssh_keys() {
+        // Key names from `.superpowers/sdd/item-shapes-capture.md`'s
+        // 2026-08-01 capture of a real type-5 item, not from memory.
+        let payload = stuffed_draft(ItemKind::SshKey).to_new_item().unwrap().to_payload();
+        assert_eq!(payload["type"], serde_json::json!(5));
+        let ssh = type_object(&payload, "sshKey");
+        assert_eq!(ssh.get("privateKey"), Some(&serde_json::json!("ssh-private")));
+        assert_eq!(ssh.get("publicKey"), Some(&serde_json::json!("ssh-public")));
+        assert_eq!(ssh.get("keyFingerprint"), Some(&serde_json::json!("ssh-fingerprint")));
+        assert_eq!(ssh.len(), 3);
+    }
+
+    #[test]
+    fn a_blank_field_reaches_the_model_blank_and_the_model_prunes_it() {
+        // Blank handling belongs to `NewItem::to_payload` (one rule, applied
+        // to every kind). The form must not second-guess it by dropping or
+        // defaulting a field on the way in -- if the two ever disagree about
+        // what blank means, only the model's answer is on the wire.
+        for (kind, type_key) in [
+            (ItemKind::Login, "login"),
+            (ItemKind::Card, "card"),
+            (ItemKind::Identity, "identity"),
+            (ItemKind::SshKey, "sshKey"),
+        ] {
+            let mut draft = EditDraft::empty_of(kind);
+            draft.name = "Only a name".into();
+            let payload = draft.to_new_item().unwrap().to_payload();
+            assert!(
+                type_object(&payload, type_key).is_empty(),
+                "{kind:?}'s create payload invented a value for a field the user left blank"
+            );
+            assert_eq!(payload["name"], serde_json::json!("Only a name"));
+            assert_eq!(payload["folderId"], serde_json::Value::Null);
+        }
+        // A blank note keeps its discriminator (0 is a real value) and gains
+        // no `notes` key.
+        let mut note = EditDraft::empty_of(ItemKind::SecureNote);
+        note.name = "Only a name".into();
+        let payload = note.to_new_item().unwrap().to_payload();
+        assert_eq!(type_object(&payload, "secureNote").get("type"), Some(&serde_json::json!(0)));
+        assert_eq!(payload.as_object().unwrap().get("notes"), None);
+    }
+
+    #[test]
+    fn changing_a_drafts_kind_keeps_the_shared_fields_and_leaks_no_others() {
+        // The same defect class as the login-grafting bug: a form that
+        // remembers the kind the user abandoned puts that kind's data on the
+        // wire under the kind they chose. Name and folder are item-level and
+        // must survive; everything else must not follow.
+        for kind in CREATABLE_KINDS {
+            let mut draft = stuffed_draft(ItemKind::Login);
+            draft.set_kind(kind);
+
+            assert_eq!(draft.kind(), kind);
+            assert_eq!(draft.name, "Everything", "{kind:?} lost the name the user typed");
+            assert_eq!(
+                draft.folder_id.as_deref(),
+                Some("f2"),
+                "{kind:?} lost the folder the user chose"
+            );
+
+            let payload = draft.to_new_item().unwrap().to_payload();
+            if kind == ItemKind::Login {
+                // Switching to the kind it already is changes nothing; that
+                // is `re_selecting_the_kind_a_draft_already_has_changes_nothing`.
+                continue;
+            }
+
+            // Nothing survives the switch, so the new kind's object is empty
+            // even though the draft arrived with every kind's fields filled
+            // in. Written as "empty", not "does not contain the login's two
+            // values": a card that kept `card-holder` from before the switch
+            // is the same defect and would slip past a string search for the
+            // login's values.
+            let type_key = match kind {
+                ItemKind::SecureNote => "secureNote",
+                ItemKind::Card => "card",
+                ItemKind::Identity => "identity",
+                ItemKind::SshKey => "sshKey",
+                ItemKind::Login | ItemKind::Unknown(_) => unreachable!("handled above"),
+            };
+            let body = type_object(&payload, type_key);
+            if kind == ItemKind::SecureNote {
+                // Its one key is the `{"type": 0}` discriminator, which is
+                // not user data.
+                assert_eq!(body.get("type"), Some(&serde_json::json!(0)));
+                assert_eq!(body.len(), 1);
+            } else {
+                assert!(
+                    body.is_empty(),
+                    "a {kind:?} create payload carried {body:?} over the switch"
+                );
+            }
+
+            let serialised = serde_json::to_string(&payload).unwrap();
+            for leaked in ["login-user", "login-pass", "note-body", "card-number", "identity-0"] {
+                assert!(
+                    !serialised.contains(leaked),
+                    "a {kind:?} create payload carried `{leaked}`: {serialised}"
+                );
+            }
+            assert!(
+                payload.as_object().unwrap().get("login").is_none(),
+                "a {kind:?} create payload carried a login object"
+            );
+        }
+
+        // And the other direction: leaving a kind wipes the fields it owned,
+        // so switching back does not resurrect them.
+        let mut draft = stuffed_draft(ItemKind::Card);
+        draft.set_kind(ItemKind::Login);
+        draft.set_kind(ItemKind::Card);
+        assert!(type_object(&draft.to_new_item().unwrap().to_payload(), "card").is_empty());
+    }
+
+    #[test]
+    fn re_selecting_the_kind_a_draft_already_has_changes_nothing() {
+        // The trap this pins: the type menu re-states its selection on every
+        // frame. If `set_kind` cleared unconditionally, the create form would
+        // erase itself as fast as the user could type into it.
+        let mut draft = stuffed_draft(ItemKind::Card);
+        for _ in 0..3 {
+            draft.set_kind(ItemKind::Card);
+        }
+        let card = type_object(&draft.to_new_item().unwrap().to_payload(), "card").clone();
+        assert_eq!(card.get("number"), Some(&serde_json::json!("card-number")));
+        assert_eq!(card.len(), 6);
+    }
+
+    #[test]
+    fn a_new_kinds_secret_starts_masked() {
+        // Same rule as `reveal_password`: the toggle must be persistent draft
+        // state, and a form the user has just switched into must not be
+        // showing the previous kind's reveal decision.
+        let mut draft = EditDraft::empty_of(ItemKind::SshKey);
+        assert!(!draft.ssh_key.reveal_private_key);
+        draft.ssh_key.reveal_private_key = true;
+        draft.set_kind(ItemKind::Card);
+        draft.set_kind(ItemKind::SshKey);
+        assert!(!draft.ssh_key.reveal_private_key, "a reveal survived a trip through another kind");
+    }
+
+    #[test]
+    fn the_ssh_form_offers_its_fields_only_where_they_can_be_saved() {
+        // Creating an SSH key posts all three keys (`NewItem::ssh_key`), but
+        // EDITING one cannot touch them: `VaultItem` has no `sshKey` field in
+        // this build, so the object rides the `other` catch-all and
+        // `apply_to` deliberately leaves it alone. Offering the fields in
+        // edit mode would show boxes whose contents are silently discarded.
+        assert_eq!(form_body(ItemKind::SshKey, true), FormBody::SshKey);
+        assert_eq!(form_body(ItemKind::SshKey, false), FormBody::UneditableNotice);
+        // An unknown type has no form either way, and cannot be created.
+        assert_eq!(form_body(ItemKind::Unknown(9), true), FormBody::UneditableNotice);
+        assert_eq!(form_body(ItemKind::Unknown(9), false), FormBody::UneditableNotice);
+        for kind in [ItemKind::Login, ItemKind::SecureNote, ItemKind::Card, ItemKind::Identity] {
+            assert_eq!(
+                form_body(kind, true),
+                form_body(kind, false),
+                "{kind:?}'s form must not depend on whether the item exists yet"
+            );
+        }
+    }
+
+    #[test]
+    fn creating_an_ssh_key_does_not_disturb_editing_one() {
+        // The SSH draft fields are new; `apply_to` must still be the no-op it
+        // was for a type-5 item, whatever they contain.
+        let item = parse(SSH_WITH_EXTRAS);
+        let mut draft = EditDraft::from_item(&item);
+        draft.ssh_key.private_key = "leak".into();
+        draft.ssh_key.public_key = "leak".into();
+        draft.ssh_key.key_fingerprint = "leak".into();
+        let before: serde_json::Value = serde_json::from_str(SSH_WITH_EXTRAS).unwrap();
+        assert_eq!(before, serde_json::to_value(draft.apply_to(&item)).unwrap());
+    }
+
     #[test]
     fn to_new_item_carries_the_drafts_fields() {
         let draft = EditDraft {
@@ -1153,7 +1792,10 @@ mod tests {
         // read, so the same two facts are asserted one step further along, on
         // the payload those fields produce. If anything, this is the stronger
         // form of the original assertion.
-        let payload = draft.to_new_item().to_payload();
+        // `.expect` is the only edit this test needed when `to_new_item`
+        // became fallible: a login IS creatable, so `None` here is itself a
+        // failure. Every assertion below is unchanged.
+        let payload = draft.to_new_item().expect("a login draft has a create payload").to_payload();
         assert_eq!(payload["name"], serde_json::json!("New"));
         assert_eq!(payload["folderId"], serde_json::json!("f2"));
         assert_eq!(payload["type"], serde_json::json!(1));
