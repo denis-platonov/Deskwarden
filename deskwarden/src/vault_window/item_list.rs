@@ -57,9 +57,10 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
 /// grammar breaks on: 1 (no plural "s") and 0 (which takes the plural, as
 /// English does).
 ///
-/// `Trash` and `Folder` deliberately keep the neutral "item": both hold a
-/// mixture of kinds, so any specific noun would be wrong for most of their
-/// contents, and the sidebar already shows which scope is selected.
+/// `Trash`, `Folder` and `Unfiled` deliberately keep the neutral "item": all
+/// three hold a mixture of kinds, so any specific noun would be wrong for
+/// most of their contents, and the sidebar already shows which scope is
+/// selected.
 pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
     let (singular, plural) = match filter {
         SidebarFilter::All => ("item", "items"),
@@ -72,6 +73,7 @@ pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
         SidebarFilter::SshKeys => ("SSH key", "SSH keys"),
         SidebarFilter::Trash => ("item", "items"),
         SidebarFilter::Folder(_) => ("item", "items"),
+        SidebarFilter::Unfiled => ("item", "items"),
     };
     format!("Search {count} {}", if count == 1 { singular } else { plural })
 }

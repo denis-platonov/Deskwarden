@@ -1,7 +1,9 @@
 //! The vault window's left pane (design 4.8 "Sidebar"): the VAULT section
 //! (All items / Favorites / Logins / Cards / Secure notes / Trash, each with
-//! a live count) and the FOLDERS section (one row per real vault folder,
-//! also counted), plus the auto-lock countdown pinned to the bottom.
+//! a live count) and the FOLDERS section (one row per vault folder, also
+//! counted -- including `bw serve`'s virtual "No Folder" bucket, which is
+//! reported as a folder but scoped by [`SidebarFilter::Unfiled`] rather than
+//! by an id), plus the auto-lock countdown pinned to the bottom.
 
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
@@ -18,7 +20,26 @@ pub enum SidebarFilter {
     SecureNotes,
     SshKeys,
     Trash,
+    /// A real, server-side folder, by id.
     Folder(String),
+    /// The items that are in no folder at all -- `bw serve`'s virtual "No
+    /// Folder" bucket.
+    ///
+    /// Its own variant rather than `Folder("")`, and that distinction is the
+    /// whole point. The CLI reports the bucket *as a folder with an empty
+    /// id* (see [`is_virtual_folder`]), so the empty string was doing double
+    /// duty: it was the marker for "this row is the virtual bucket" and, at
+    /// the same time, a folder id to compare items against. The FOLDERS loop
+    /// built `Folder("")` for that row, which matches items whose
+    /// `folder_id` is `Some("")` -- and unfiled items have `folder_id:
+    /// None`. So the row matched nothing and its badge read 0 while 94% of a
+    /// real 1654-item vault sat unfiled behind it.
+    ///
+    /// Splitting the variant, rather than special-casing the empty string
+    /// inside the `Folder` arm, is deliberate: the latter leaves `Folder("")`
+    /// constructible and meaning something other than what it says, which is
+    /// the defect rather than the fix.
+    Unfiled,
 }
 
 impl SidebarFilter {
@@ -81,6 +102,17 @@ impl SidebarFilter {
             // that without a different endpoint.
             SidebarFilter::Trash => false,
             SidebarFilter::Folder(id) => item.folder_id.as_deref() == Some(id.as_str()),
+            // `None`, and *only* `None`. `Some("")` is deliberately not
+            // treated as unfiled: nothing produces it. `bw serve` sends
+            // `folderId: null` for unfiled items (measured against the real
+            // vault -- 1559 nulls, zero empty strings out of 1654), and this
+            // app's own unfile path writes an explicit JSON null too (see
+            // `vault_bridge::folder_move_body` and
+            // `the_unfile_body_carries_a_folder_id_key_that_is_present_and_null`).
+            // Accepting `Some("")` here would mean inventing a third state
+            // to paper over a case that does not exist -- which is how the
+            // empty string came to mean two things in the first place.
+            SidebarFilter::Unfiled => item.folder_id.is_none(),
         }
     }
 }
@@ -251,7 +283,16 @@ pub fn draw_sidebar(
         ui.add_space(SECTION_LABEL_INSET);
         ui.spacing_mut().item_spacing.y = ROW_GAP;
         for folder in folders {
-            let filter = SidebarFilter::Folder(folder.id.clone());
+            // The virtual "No Folder" bucket gets the filter that says what
+            // it means. Building `Folder(folder.id.clone())` here for *every*
+            // row is what gave that row `Folder("")`, a filter for a folder
+            // whose id is the empty string -- which no item has. See
+            // `SidebarFilter::Unfiled`.
+            let filter = if is_virtual_folder(folder) {
+                SidebarFilter::Unfiled
+            } else {
+                SidebarFilter::Folder(folder.id.clone())
+            };
             let count = count_for(items, &filter);
             // Reserve the edit icon's width *before* the row claims the
             // rest of the available width -- see `FOLDER_EDIT_BUTTON_WIDTH`.
@@ -691,6 +732,25 @@ mod tests {
     fn painted_sidebar_and_bounds(
         lock_countdown: &str,
     ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
+        let items = vec![item(Some(1), false, Some("f1"))];
+        let folders = vec![Folder {
+            id: "f1".into(),
+            name: "Engineering".into(),
+            other: serde_json::Map::new(),
+        }];
+        painted_sidebar_fixture(lock_countdown, items, folders)
+    }
+
+    /// [`painted_sidebar_and_bounds`] over a caller-supplied vault, so a test
+    /// about the virtual "No Folder" row can hand in one that actually has
+    /// unfiled items and that row in it. The default fixture above is left
+    /// byte-for-byte as it was, so every test already written against it is
+    /// still looking at the same sidebar.
+    fn painted_sidebar_fixture(
+        lock_countdown: &str,
+        items: Vec<VaultItem>,
+        folders: Vec<Folder>,
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -703,12 +763,6 @@ mod tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
 
-        let items = vec![item(Some(1), false, Some("f1"))];
-        let folders = vec![Folder {
-            id: "f1".into(),
-            name: "Engineering".into(),
-            other: serde_json::Map::new(),
-        }];
         let mut selected = SidebarFilter::All;
 
         let mut bounds = egui::Rect::NOTHING;
@@ -884,6 +938,84 @@ mod tests {
         );
     }
 
+    /// A vault of known composition: three items in no folder at all, two in
+    /// the real folder `f1`. Used by the tests below so their expected
+    /// numbers are absolute (3 and 2), not restatements of whatever the code
+    /// under test happens to compute.
+    fn three_unfiled_and_two_filed() -> Vec<VaultItem> {
+        vec![
+            item(Some(1), false, None),
+            item(Some(1), false, None),
+            item(Some(2), false, None),
+            item(Some(1), false, Some("f1")),
+            item(Some(3), false, Some("f1")),
+        ]
+    }
+
+    /// The real folder plus `bw serve`'s virtual "No Folder" bucket, which it
+    /// reports as a folder with an empty id.
+    fn one_real_folder_and_the_virtual_bucket() -> Vec<Folder> {
+        vec![
+            Folder {
+                id: "f1".into(),
+                name: "Engineering".into(),
+                other: serde_json::Map::new(),
+            },
+            Folder {
+                id: String::new(),
+                name: "No Folder".into(),
+                other: serde_json::Map::new(),
+            },
+        ]
+    }
+
+    /// The one painted string sitting on the same row as `label` but not the
+    /// label itself -- i.e. that row's right-aligned count badge.
+    fn badge_beside(painted: &[(String, egui::Rect)], label: &str) -> String {
+        let row_y = painted
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| rect.center().y)
+            .unwrap_or_else(|| panic!("the sidebar painted no {label:?}: {painted:?}"));
+        // Half a row: consecutive rows are ROW_HEIGHT + ROW_GAP apart, so
+        // nothing from a neighbouring row can fall inside this window.
+        let same_row: Vec<&(String, egui::Rect)> = painted
+            .iter()
+            .filter(|(text, rect)| {
+                text != label && (rect.center().y - row_y).abs() < ROW_HEIGHT / 2.0
+            })
+            .collect();
+        match same_row.as_slice() {
+            [(badge, _)] => badge.clone(),
+            other => panic!("expected exactly one badge beside {label:?}, got {other:?}"),
+        }
+    }
+
+    /// The user-reported defect, at the level the user reported it: "No
+    /// folder should show all records that are not in Folders". Against a
+    /// vault where 3 of 5 items are unfiled, that row's badge read **0** --
+    /// because the row's filter was `Folder("")` (the virtual bucket's empty
+    /// id used as if it were a real folder id) and unfiled items carry
+    /// `folder_id: None`, which is not `Some("")`.
+    #[test]
+    fn the_virtual_no_folder_rows_badge_shows_the_unfiled_count() {
+        let (painted, _, _) = painted_sidebar_fixture(
+            "Locks in 11:42",
+            three_unfiled_and_two_filed(),
+            one_real_folder_and_the_virtual_bucket(),
+        );
+
+        assert_eq!(
+            badge_beside(&painted, "No Folder"),
+            "3",
+            "3 of the 5 fixture items are in no folder, so the virtual row's \
+             badge must read 3"
+        );
+        // The real folder's badge is asserted too, so a change that made
+        // *every* folder row count the unfiled items could not pass.
+        assert_eq!(badge_beside(&painted, "Engineering"), "2");
+    }
+
     #[test]
     fn folder_counts_only_items_in_that_folder() {
         let items = vec![
@@ -892,5 +1024,45 @@ mod tests {
             item(Some(1), false, None),
         ];
         assert_eq!(count_for(&items, &SidebarFilter::Folder("f1".to_string())), 1);
+    }
+
+    /// `Unfiled` means `folder_id: None`, and nothing else.
+    #[test]
+    fn unfiled_contains_exactly_the_items_in_no_folder() {
+        assert!(SidebarFilter::Unfiled.scope_contains(&item(Some(1), false, None)));
+        assert!(!SidebarFilter::Unfiled.scope_contains(&item(Some(1), false, Some("f1"))));
+    }
+
+    /// The regression that would have caught the original defect: an unfiled
+    /// item is not in `Folder(_)` for *any* id -- least of all the empty one
+    /// the virtual bucket is reported with, which is precisely what the
+    /// FOLDERS loop used to hand it.
+    #[test]
+    fn an_unfiled_item_is_in_no_folder_filter_including_the_empty_id() {
+        let unfiled = item(Some(1), false, None);
+        assert!(!SidebarFilter::Folder(String::new()).scope_contains(&unfiled));
+        assert!(!SidebarFilter::Folder("f1".to_string()).scope_contains(&unfiled));
+    }
+
+    /// ...and the converse: `Unfiled` is not a synonym for "the empty-id
+    /// folder". An item that somehow carried `folder_id: Some("")` belongs to
+    /// `Folder("")`, not here -- see the arm's comment for why that case is
+    /// left alone rather than folded in.
+    #[test]
+    fn an_empty_string_folder_id_is_not_unfiled() {
+        let empty_id = item(Some(1), false, Some(""));
+        assert!(!SidebarFilter::Unfiled.scope_contains(&empty_id));
+        assert!(SidebarFilter::Folder(String::new()).scope_contains(&empty_id));
+    }
+
+    /// The count behind the badge, over a fixture of known composition:
+    /// 3 unfiled and 2 filed. The old `Folder("")` returned 0 here.
+    #[test]
+    fn unfiled_counts_the_items_in_no_folder_rather_than_none() {
+        let items = three_unfiled_and_two_filed();
+        assert_eq!(count_for(&items, &SidebarFilter::Unfiled), 3);
+        assert_eq!(count_for(&items, &SidebarFilter::Folder("f1".to_string())), 2);
+        assert_eq!(count_for(&items, &SidebarFilter::Folder(String::new())), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::All), 5);
     }
 }
