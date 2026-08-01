@@ -30,6 +30,17 @@ pub enum TotpState {
     /// This item has no TOTP secret configured -- the row is omitted
     /// entirely, same as before TOTP existed in this pane at all.
     NoSecret,
+    /// This item *does* have a TOTP secret, but the poll for its current
+    /// code is a background thread now (see `totp_poll_in_flight`'s doc in
+    /// `vault_window::mod`) and hasn't reported back yet -- typically just
+    /// the first frame or two after selecting this item, but as long as
+    /// ~10s (`ureq`'s read timeout) if a *different* item's poll is still
+    /// outstanding and holding the one-poll-at-a-time gate. Distinct from
+    /// `NoSecret` for the same reason `Unavailable` is (review 12's
+    /// Important 3): rendering no row at all here is pixel-identical to "no
+    /// TOTP configured", when this item plainly has one -- the code just
+    /// hasn't arrived yet.
+    Fetching,
     /// A live code, fetched from `bw serve` on the last successful poll.
     /// `seconds_left` is derived from the wall clock (the 30s TOTP window),
     /// not from the fetch, and is refreshed every frame regardless of
@@ -169,6 +180,10 @@ pub fn draw_detail_read(
         // here" even when it was, just unreachable right now.
         match totp {
             TotpState::NoSecret => {}
+            TotpState::Fetching => {
+                theme::hairline(ui);
+                totp_fetching_row(ui);
+            }
             TotpState::Code { code, seconds_left } => {
                 theme::hairline(ui);
                 totp_row(ui, code, *seconds_left, &mut action);
@@ -289,6 +304,25 @@ fn totp_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut Detail
             if theme::secondary_button(ui, "Copy").clicked() {
                 *action = DetailAction::CopyTotp;
             }
+        });
+    });
+}
+
+/// The One-time code row for `TotpState::Fetching`: this item has a TOTP
+/// secret and a poll for its current code is already on its way, just not
+/// back yet. Keeps the row's label in place, the same shape `Unavailable`'s
+/// row does, but reads as an ordinary in-progress state rather than a
+/// problem -- this is the everyday, usually sub-second case right after
+/// selecting an item, not a backend issue.
+fn totp_fetching_row(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
+            ui.label(
+                RichText::new("Fetching\u{2026}")
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
         });
     });
 }

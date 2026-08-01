@@ -286,52 +286,53 @@ fn main() {
     // no diagnostic, so the app silently did nothing forever.
     let schedule = readiness_schedule(READINESS_DEADLINE);
     let items = match wait_for_vault_ready_with_spinner(&vault, &schedule) {
-        Ok(items) => items,
-        Err(e) => {
-            // A rejected session is indistinguishable from a slow start at
-            // this level, so give the user one chance to re-authenticate
-            // before giving up rather than exiting on a recoverable problem.
-            log::error!("{e}");
-            log::warn!("retrying once after a fresh login, in case the session was rejected");
-            if let Some(child) = bw_serve_child.as_mut() {
-                bw_serve::stop_bw_serve(child);
-            }
-            session_token = reauthenticate(&store);
-            // The longer grace: we just killed our own `bw serve`, and the
-            // user just retyped their master password. Give the socket real
-            // time to come free rather than aborting on them.
-            bw_serve_child = match try_start_backend(
-                &session_token,
-                job_ref(&job),
-                bw_serve::PORT_RELEASE_GRACE_RESTART,
-            ) {
-                Ok(child) => Some(child),
-                Err(e) => {
-                    log::error!("{e}");
-                    fatal_startup_error(&format!(
-                        "Deskwarden could not start its Bitwarden backend after you signed \
-                         in.\n\n{e}\n\nFull details are in:\n{}",
-                        logging::log_file_path(&config_dir).display()
-                    ));
-                }
-            };
-
+        VaultReadyOutcome::Ready(items) => items,
+        VaultReadyOutcome::Dismissed => {
+            // Closing the "setting up" window is not, on its own, evidence
+            // that the backend or session is broken -- unlike a genuine
+            // timeout (the `Failed` arm below), there's no "maybe the
+            // session was rejected" signal to act on here (review 12's
+            // Important 2). Give the same, still-running backend one more
+            // honest readiness probe -- no kill, no reauth -- before falling
+            // back to the heavier recovery a real failure gets.
+            log::info!(
+                "setup window closed before the vault backend was confirmed ready; trying the \
+                 readiness probe again before treating anything as actually broken"
+            );
             match wait_for_vault_ready_with_spinner(&vault, &schedule) {
-                Ok(items) => items,
-                Err(e) => {
-                    log::error!("{e}");
-                    if let Some(child) = bw_serve_child.as_mut() {
-                        bw_serve::stop_bw_serve(child);
-                    }
-                    fatal_startup_error(&format!(
-                        "Deskwarden's Bitwarden backend started but never became usable, so \
-                         there is nothing to match your apps against.\n\n{e}\n\nFull details \
-                         are in:\n{}",
-                        logging::log_file_path(&config_dir).display()
-                    ));
-                }
+                VaultReadyOutcome::Ready(items) => items,
+                VaultReadyOutcome::Dismissed => recover_from_failed_vault_wait(
+                    "setup window closed a second time without the vault backend becoming ready",
+                    &vault,
+                    &schedule,
+                    &mut bw_serve_child,
+                    &mut session_token,
+                    &job,
+                    &store,
+                    &config_dir,
+                ),
+                VaultReadyOutcome::Failed(e) => recover_from_failed_vault_wait(
+                    &e,
+                    &vault,
+                    &schedule,
+                    &mut bw_serve_child,
+                    &mut session_token,
+                    &job,
+                    &store,
+                    &config_dir,
+                ),
             }
         }
+        VaultReadyOutcome::Failed(e) => recover_from_failed_vault_wait(
+            &e,
+            &vault,
+            &schedule,
+            &mut bw_serve_child,
+            &mut session_token,
+            &job,
+            &store,
+            &config_dir,
+        ),
     };
 
     let entries = match_entries(&items);
@@ -1429,7 +1430,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             }
         };
         match wait_for_vault_ready_with_spinner(cache.bridge(), schedule) {
-            Ok(_items) => {
+            VaultReadyOutcome::Ready(_items) => {
                 if let Err(e) = cache.populate() {
                     log::warn!("could not repopulate the vault cache after unlock: {e:?}");
                 }
@@ -1440,7 +1441,25 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                     Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
                 }
             }
-            Err(e) => {
+            VaultReadyOutcome::Dismissed => {
+                // Review 12's Critical: closing this window must not be
+                // fatal -- same gesture, same blast radius as the bug review
+                // 11 already fixed for the picker, just at a call site that
+                // was still routing it into `fatal_startup_error`. The
+                // freshly (re)started `bw serve` from just above is left
+                // running rather than killed: it may well still come up fine
+                // on its own, and even if it doesn't, this same recovery
+                // runs again the next time the user locks or reopens the
+                // vault. Exiting the whole app -- tray, hotkey, autofill,
+                // all of it -- over an impatient click on a spinner is not
+                // an acceptable trade for a vault that was already locked.
+                log::warn!(
+                    "setup window closed before the vault backend was confirmed ready after \
+                     unlocking; leaving Deskwarden running with the vault effectively still \
+                     locked -- open it again from the tray to retry"
+                );
+            }
+            VaultReadyOutcome::Failed(e) => {
                 log::error!("{e}");
                 if let Some(child) = bw_serve_child.as_mut() {
                     bw_serve::stop_bw_serve(child);
@@ -1758,26 +1777,128 @@ fn spawn_sync(
     });
 }
 
-fn wait_for_vault_ready_with_spinner(
+/// Outcome of [`wait_for_vault_ready_with_spinner`].
+///
+/// Review 12's Critical: a user closing the "setting up" window and the
+/// readiness probe itself genuinely failing used to both collapse into the
+/// same `Err`, even though they call for very different responses --
+/// dismissal is not evidence that anything is actually broken, while a
+/// failure is. Kept as its own enum, not a sentinel string stuffed inside
+/// `Err`, so that distinction is enforced by the compiler at every call site
+/// (an exhaustive `match`, same discipline `TotpState` uses) rather than by
+/// whoever remembers to check the message text.
+enum VaultReadyOutcome {
+    /// The vault became ready in time.
+    Ready(Vec<deskwarden::vault_bridge::VaultItem>),
+    /// The user closed the spinner (title-bar X / Alt+F4) before the probe
+    /// reported back.
+    Dismissed,
+    /// The readiness probe itself failed or timed out.
+    Failed(String),
+}
+
+/// Same as `wait_for_vault_ready`, but shows a spinner window for the
+/// duration instead of blocking with nothing on screen.
+///
+/// The worker runs fully detached (`std::thread::spawn`, not a
+/// `thread::scope`d one this function has to join before returning) --
+/// review 12's Important 2. With a `thread::scope`d worker, closing the
+/// spinner early (`show_while` returning `None`) still left this function's
+/// caller blocked -- with no window on screen at all, the exact silence this
+/// module's spinner exists to prevent -- until the probe finished on its
+/// own, up to the rest of `schedule`'s ~30s deadline; the probe's own
+/// eventual result then had nowhere to go (the receiver had already been
+/// dropped) and was thrown away regardless of whether it was actually `Ok`.
+/// `vault`/`schedule` are cloned into the worker rather than borrowed for
+/// the same reason: a detached thread can't borrow the caller's stack.
+fn wait_for_vault_ready_with_spinner(vault: &VaultBridge, schedule: &[Duration]) -> VaultReadyOutcome {
+    let (tx, rx) = mpsc::channel();
+    let worker_vault = vault.clone();
+    let worker_schedule = schedule.to_vec();
+    std::thread::spawn(move || {
+        let _ = tx.send(wait_for_vault_ready(&worker_vault, &worker_schedule));
+    });
+    match loading_ui::show_while("Setting up your vault...", rx) {
+        Some(Ok(items)) => VaultReadyOutcome::Ready(items),
+        Some(Err(e)) => VaultReadyOutcome::Failed(e),
+        None => VaultReadyOutcome::Dismissed,
+    }
+}
+
+/// Recovers from a vault-readiness wait that didn't produce a ready vault at
+/// startup -- either the probe genuinely failed, or the user dismissed the
+/// spinner a second time in a row (see `main`'s own call sites for the free
+/// first retry a mere dismissal gets before landing here). Kills the current
+/// `bw serve`, sends the user through the login flow again (a rejected
+/// session is indistinguishable from a slow start at this level, so this is
+/// a reasonable guess even when the real cause turns out to be something
+/// else), restarts the backend, and waits for it once more -- exiting
+/// fatally if that second wait also doesn't produce a ready vault. There is
+/// nothing left to fall back to at this point: the tray, hotkey, and
+/// window-watch thread don't exist yet, so unlike the lock-recovery path in
+/// `open_vault_window` (review 12's Critical), there is no already-running
+/// app for a further dismissal here to preserve.
+#[allow(clippy::too_many_arguments)]
+fn recover_from_failed_vault_wait(
+    reason: &str,
     vault: &VaultBridge,
     schedule: &[Duration],
-) -> Result<Vec<deskwarden::vault_bridge::VaultItem>, String> {
-    std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = tx.send(wait_for_vault_ready(vault, schedule));
-        });
-        // `show_while` returns `None` if the user closes the spinner (title
-        // bar X / Alt+F4) before the probe reports back (review 11's
-        // Critical). There is no useful "quietly abandon" here the way
-        // there is in the picker -- every caller of this function needs a
-        // ready vault to make progress at all -- so this folds into an
-        // ordinary `Err`, which every call site already knows how to handle
-        // (retry once at startup, or a fatal, user-visible error dialog).
-        loading_ui::show_while("Setting up your vault...", rx).unwrap_or_else(|| {
-            Err("closed the setup window before the vault backend became ready".to_string())
-        })
-    })
+    bw_serve_child: &mut Option<Child>,
+    session_token: &mut String,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    store: &session_store::SessionStore,
+    config_dir: &std::path::Path,
+) -> Vec<deskwarden::vault_bridge::VaultItem> {
+    log::error!("{reason}");
+    log::warn!("retrying once after a fresh login, in case the session was rejected");
+    if let Some(child) = bw_serve_child.as_mut() {
+        bw_serve::stop_bw_serve(child);
+    }
+    *session_token = reauthenticate(store);
+    // The longer grace: we just killed our own `bw serve`, and the user just
+    // retyped their master password. Give the socket real time to come free
+    // rather than aborting on them.
+    *bw_serve_child = match try_start_backend(
+        session_token.as_str(),
+        job_ref(job),
+        bw_serve::PORT_RELEASE_GRACE_RESTART,
+    ) {
+        Ok(child) => Some(child),
+        Err(e) => {
+            log::error!("{e}");
+            fatal_startup_error(&format!(
+                "Deskwarden could not start its Bitwarden backend after you signed \
+                 in.\n\n{e}\n\nFull details are in:\n{}",
+                logging::log_file_path(config_dir).display()
+            ));
+        }
+    };
+
+    match wait_for_vault_ready_with_spinner(vault, schedule) {
+        VaultReadyOutcome::Ready(items) => items,
+        VaultReadyOutcome::Dismissed => {
+            if let Some(child) = bw_serve_child.as_mut() {
+                bw_serve::stop_bw_serve(child);
+            }
+            fatal_startup_error(
+                "Deskwarden's Bitwarden backend restarted after you signed back in, but the \
+                 setup window was closed again before it was confirmed ready.\n\nRelaunch \
+                 Deskwarden and give the setup window a little longer to finish.",
+            );
+        }
+        VaultReadyOutcome::Failed(e) => {
+            log::error!("{e}");
+            if let Some(child) = bw_serve_child.as_mut() {
+                bw_serve::stop_bw_serve(child);
+            }
+            fatal_startup_error(&format!(
+                "Deskwarden's Bitwarden backend started but never became usable, so \
+                 there is nothing to match your apps against.\n\n{e}\n\nFull details \
+                 are in:\n{}",
+                logging::log_file_path(config_dir).display()
+            ));
+        }
+    }
 }
 
 /// Runs the login/unlock UI and persists the resulting session token.

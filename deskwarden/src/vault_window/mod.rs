@@ -793,7 +793,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // very first poll happens to succeed.
                                 totp_poll_failing = false;
                             } else if should_start_totp_poll(
-                                has_totp_secret,
                                 totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
                                 totp_poll_in_flight,
                             ) {
@@ -1101,21 +1100,42 @@ fn current_totp_seconds_left() -> u8 {
 }
 
 /// Forces `previous` back to `TotpState::NoSecret` the instant
-/// `has_totp_secret` is false, leaving it untouched otherwise. Called
-/// unconditionally, every frame, before the poll-gated branch in `run` --
-/// this is the fix for review Important 1 (independent review of a7b33cb):
-/// `totp_state` used to only reset on *selection change*, so an item with
-/// TOTP selected and fetched, whose secret was then removed elsewhere (a
-/// sync reload landing mid-session, say), kept rendering the last-fetched
-/// code under a live-looking countdown forever -- the poll that would have
-/// cleared it was gated off by the very same `has_totp_secret` that had gone
-/// false. Pulled out on its own, the same way `apply_totp_poll_result` is,
-/// so this transition is directly unit-testable.
+/// `has_totp_secret` is false, leaving it untouched otherwise -- except for
+/// promoting a bare `NoSecret` to `Fetching` when a secret *is* present
+/// (review 12's Important 3). Called unconditionally, every frame, before
+/// the poll-gated branch in `run`.
+///
+/// The false-branch behaviour is the fix for review Important 1 (independent
+/// review of a7b33cb): `totp_state` used to only reset on *selection
+/// change*, so an item with TOTP selected and fetched, whose secret was then
+/// removed elsewhere (a sync reload landing mid-session, say), kept
+/// rendering the last-fetched code under a live-looking countdown forever --
+/// the poll that would have cleared it was gated off by the very same
+/// `has_totp_secret` that had gone false.
+///
+/// The `NoSecret` -> `Fetching` promotion closes a gap the TOTP poll's move
+/// to a background thread opened: `run`'s selection-change reset
+/// unconditionally sets `totp_state` to `NoSecret` (a neutral "haven't
+/// looked yet" placeholder its own comment says this function overwrites
+/// "before render"), which was true only while the poll itself ran inline,
+/// synchronously, within the same per-frame block that comment refers to.
+/// Now the poll is a one-shot background thread whose result lands later,
+/// over `totp_rx` -- so without this promotion, a freshly selected item with
+/// a real secret rendered no row at all (`NoSecret` draws nothing, see
+/// `detail::draw_detail_read`) for as long as the fetch took, up to the
+/// ~10s `ureq` read timeout if a *different*, since-deselected item's poll
+/// was still outstanding and holding `totp_poll_in_flight`. A `Code` or
+/// `Unavailable` previous state is left untouched either way -- there is
+/// already something honest to show, and a fresh poll (once one starts) is
+/// what should replace it, not this presence check.
+///
+/// Pulled out on its own, the same way `apply_totp_poll_result` is, so this
+/// transition is directly unit-testable.
 fn totp_state_for_secret_presence(has_totp_secret: bool, previous: TotpState) -> TotpState {
-    if has_totp_secret {
-        previous
-    } else {
-        TotpState::NoSecret
+    match (has_totp_secret, previous) {
+        (false, _) => TotpState::NoSecret,
+        (true, TotpState::NoSecret) => TotpState::Fetching,
+        (true, other) => other,
     }
 }
 
@@ -1165,19 +1185,24 @@ fn apply_totp_poll_result(
 
 /// Whether `run`'s per-frame TOTP block should spawn a new background poll
 /// this frame. Pulled out into its own function, the same way
-/// `totp_state_for_secret_presence`/`apply_totp_poll_result` are, so the
-/// three conditions -- a secret worth polling for, the interval having
-/// actually elapsed, and no poll already outstanding -- are unit-testable
-/// together without an `eframe` context.
+/// `totp_state_for_secret_presence`/`apply_totp_poll_result` are, so the two
+/// conditions -- the interval having actually elapsed, and no poll already
+/// outstanding -- are unit-testable together without an `eframe` context.
 ///
-/// `poll_in_flight` is the one new condition here (see `totp_poll_in_flight`'s
-/// declaration in `run`): without it, a `bw serve` that never answers would
-/// still only ever have one real HTTP call blocking on it -- the call itself
-/// moved to a background thread -- but `run`'s loop would spawn a *new* such
-/// thread every `TOTP_POLL_INTERVAL` for as long as it stayed hung, one more
-/// piling up on top of the last with nothing to bound how many accumulate.
-fn should_start_totp_poll(has_totp_secret: bool, poll_due: bool, poll_in_flight: bool) -> bool {
-    has_totp_secret && poll_due && !poll_in_flight
+/// Takes no `has_totp_secret` parameter (review 12's Minor 4): its one call
+/// site only ever reaches this function inside the `else` of `if
+/// !has_totp_secret`, so the argument was always `true` there and checking
+/// it again here was dead weight.
+///
+/// `poll_in_flight` is the one condition here that isn't just "is it time
+/// yet" (see `totp_poll_in_flight`'s declaration in `run`): without it, a
+/// `bw serve` that never answers would still only ever have one real HTTP
+/// call blocking on it -- the call itself moved to a background thread --
+/// but `run`'s loop would spawn a *new* such thread every
+/// `TOTP_POLL_INTERVAL` for as long as it stayed hung, one more piling up on
+/// top of the last with nothing to bound how many accumulate.
+fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool) -> bool {
+    poll_due && !poll_in_flight
 }
 
 /// Whether a `totp_rx` message fetched for `item_id` should still be applied
@@ -1711,26 +1736,23 @@ mod should_start_totp_poll_tests {
     // `ureq`'s read timeout bounds one read syscall, not `get_totp`'s
     // response as a whole -- a trickling or stalled `bw serve` could freeze
     // this window for well past that timeout, once per `TOTP_POLL_INTERVAL`.
-    // These pin the three-way gate that replaced the old unconditional call:
-    // a poll only starts when there's a secret to poll for, the interval has
-    // actually elapsed, and -- the new condition -- no poll is already
-    // outstanding, so a hung backend accumulates at most one background
-    // thread instead of one more every second for as long as it stays hung.
+    // These pin the two-way gate that replaced the old unconditional call:
+    // a poll only starts when the interval has actually elapsed, and --
+    // the new condition -- no poll is already outstanding, so a hung backend
+    // accumulates at most one background thread instead of one more every
+    // second for as long as it stays hung. Whether there's a secret to poll
+    // for at all is checked by this function's one call site, not here
+    // (review 12's Minor 4) -- see `should_start_totp_poll`'s own doc.
     use super::should_start_totp_poll;
 
     #[test]
-    fn starts_when_due_with_a_secret_and_nothing_in_flight() {
-        assert!(should_start_totp_poll(true, true, false));
-    }
-
-    #[test]
-    fn does_not_start_without_a_totp_secret() {
-        assert!(!should_start_totp_poll(false, true, false));
+    fn starts_when_due_with_nothing_in_flight() {
+        assert!(should_start_totp_poll(true, false));
     }
 
     #[test]
     fn does_not_start_before_the_interval_elapses() {
-        assert!(!should_start_totp_poll(true, false, false));
+        assert!(!should_start_totp_poll(false, false));
     }
 
     #[test]
@@ -1740,7 +1762,7 @@ mod should_start_totp_poll_tests {
         // would still spawn a fresh background thread every
         // `TOTP_POLL_INTERVAL`, piling up indefinitely instead of the single
         // outstanding poll this is meant to bound it to.
-        assert!(!should_start_totp_poll(true, true, true));
+        assert!(!should_start_totp_poll(true, true));
     }
 }
 
@@ -1772,7 +1794,7 @@ mod totp_poll_result_is_current_tests {
 }
 
 #[cfg(test)]
-mod totp_state_removed_secret_tests {
+mod totp_state_for_secret_presence_tests {
     // Regression tests for review Important 1 on the independent review of
     // a7b33cb: an item with TOTP selected and fetched, whose secret is then
     // removed elsewhere (edited on another device, a sync reload lands),
@@ -1817,6 +1839,33 @@ mod totp_state_removed_secret_tests {
         let next = totp_state_for_secret_presence(true, previous.clone());
 
         assert_eq!(next, previous);
+    }
+
+    #[test]
+    fn an_unavailable_state_is_left_untouched_while_the_secret_is_still_present() {
+        // Same reasoning as the live-code case: a failed poll's honest
+        // "unavailable" state must stand until a fresh poll replaces it, not
+        // be silently reset back to `Fetching` (which would misleadingly
+        // suggest a poll is about to arrive when none has been started).
+        let next = totp_state_for_secret_presence(true, TotpState::Unavailable);
+
+        assert_eq!(next, TotpState::Unavailable);
+    }
+
+    #[test]
+    fn no_secret_is_promoted_to_fetching_once_a_secret_is_present() {
+        // Regression test for review 12's Important 3: the TOTP poll now
+        // runs on a background thread and reports back later over
+        // `totp_rx`, so a freshly selected item (or one whose secret just
+        // reappeared) must not render as `NoSecret` -- which draws no row at
+        // all (`detail::draw_detail_read`) and reads as "this item has no
+        // TOTP" -- for however long the fetch takes. `NoSecret` is only ever
+        // the correct answer once a poll actually confirms there is nothing
+        // to fetch (`apply_totp_poll_result`'s `Ok(None)` arm); before that,
+        // it must read as "fetching", not "not set up here".
+        let next = totp_state_for_secret_presence(true, TotpState::NoSecret);
+
+        assert_eq!(next, TotpState::Fetching);
     }
 }
 

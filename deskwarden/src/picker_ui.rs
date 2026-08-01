@@ -273,17 +273,27 @@ fn load_items_for_picker(cache: &VaultCache) -> PickerItemsResult {
 /// leave "Add app..." looking completely inert -- no window, no feedback --
 /// for as long as the populate attempt took.
 ///
-/// Takes `&VaultCache` rather than owning it because it's only used *before*
-/// the (`FnMut + 'static`) update closure is built; the items already read
-/// out of it are what gets moved in.
-pub fn pick_vault_item(cache: &VaultCache) -> Option<VaultItem> {
-    let result = std::thread::scope(|scope| {
-        let (tx, rx) = mpsc::channel();
-        scope.spawn(move || {
-            let _ = tx.send(load_items_for_picker(cache));
-        });
-        loading_ui::show_while("Loading your vault...", rx)
+/// Takes `&Arc<VaultCache>` rather than `&VaultCache` so the populate can run
+/// on a fully detached thread (see below) rather than one `thread::scope`
+/// has to join before this function can return.
+pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
+    let (tx, rx) = mpsc::channel();
+    // Detached (`std::thread::spawn`, not `thread::scope`'d), and handed its
+    // own clone of the `Arc` rather than borrowing `cache` -- review 12's
+    // Minor 5. A `thread::scope`d worker forces this function to block until
+    // that worker actually finishes, even after `show_while` has already
+    // returned `None` because the user closed the spinner: on the bridge
+    // fallback (`load_items_for_picker`'s live `populate()`, up to ~13s) that
+    // meant "quietly abandon" from the comment below was a lie -- the click
+    // still froze the app, invisibly, for however long the populate had left
+    // to run. Detaching means this function returns as soon as `show_while`
+    // does; the worker simply finishes on its own and its result (nobody is
+    // listening any more) is dropped.
+    let cache_for_thread = cache.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(load_items_for_picker(&cache_for_thread));
     });
+    let result = loading_ui::show_while("Loading your vault...", rx);
 
     // The user closed the spinner (title-bar X or Alt+F4) before the
     // populate finished, rather than waiting it out -- review 11's Critical.
