@@ -781,6 +781,29 @@ pub const BUTTON_HEIGHT: f32 = 32.0;
 /// neither Archivo nor egui's fallback fonts carry U+21B5, so as text it
 /// renders as a tofu box.
 pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
+    primary_button_with_metrics(ui, label, kbd, BUTTON_HEIGHT, 7)
+}
+
+/// Design 2b's item-pane `+ New`, which is the only primary button in the app
+/// that is NOT [`BUTTON_HEIGHT`]: `height: 34px; border-radius: 8px`, matching
+/// the search box it sits beside rather than the 3h/3f action buttons.
+///
+/// A parameterised variant rather than a second copy of the body, and rather
+/// than changing [`primary_button`]'s own constants: every other primary
+/// button in this app is 32px with a 7px radius (3h's Continue, the detail
+/// pane's Save and "Fill in app"), and moving them all to match one button in
+/// one pane would be a redesign of five screens to fix one.
+pub fn primary_button_matching_field(ui: &mut Ui, label: &str) -> Response {
+    primary_button_with_metrics(ui, label, None, SEARCH_FIELD_HEIGHT, 8)
+}
+
+fn primary_button_with_metrics(
+    ui: &mut Ui,
+    label: &str,
+    kbd: Option<&str>,
+    height: f32,
+    radius: u8,
+) -> Response {
     let paint_return = kbd == Some("↵");
     let text = match kbd {
         // Trailing spaces reserve room for the painted arrow and the gap
@@ -793,10 +816,10 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
         egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
             .fill(BLUE)
             .stroke(Stroke::NONE)
-            .corner_radius(CornerRadius::same(7))
+            .corner_radius(CornerRadius::same(radius))
             // The design's action buttons are 32px tall (3h Continue, 2b/3f
             // toolbar); text + padding alone comes up short.
-            .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
+            .min_size(Vec2::new(0.0, height)),
     );
     if paint_return {
         paint_return_arrow(
@@ -1039,6 +1062,134 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 /// A muted field label ("User name", "Master password").
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
+}
+
+/// Height of design 2b's search box (`height: 34px`), which is shorter than
+/// the form fields' [`FIELD_HEIGHT`] and is its own value for that reason.
+pub const SEARCH_FIELD_HEIGHT: f32 = 34.0;
+
+/// Paints the design's magnifier into `rect`.
+///
+/// STROKED, NOT TYPED, and not an SVG either. The design draws it as inline
+/// SVG (`<circle cx=11 cy=11 r=7>` plus a `16.5,16.5 -> 21,21` line in a 24
+/// viewBox, `stroke-width: 2.2`); this crate has no SVG pipeline and adding
+/// one for a two-shape icon would be a dependency for a circle and a line.
+/// Every other glyph here is already drawn the same way and for a related
+/// reason -- see [`close_glyph`] and [`pencil_glyph_at`], which are strokes
+/// because the codepoints are not in any bundled face.
+///
+/// The design's viewBox numbers are kept as ratios rather than baked into
+/// pixel constants so the glyph is correct at whatever size it is given, and
+/// so it can be read straight off the mock.
+fn paint_magnifier(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let s = rect.width() / 24.0;
+    let centre = rect.min + Vec2::splat(11.0 * s);
+    let stroke = Stroke::new(2.2 * s, color);
+    painter.circle_stroke(centre, 7.0 * s, stroke);
+    painter.line_segment(
+        [rect.min + Vec2::splat(16.5 * s), rect.min + Vec2::splat(21.0 * s)],
+        stroke,
+    );
+}
+
+/// Design 2b's search box: a full-width bordered field with the magnifier on
+/// the left and a keyboard-shortcut hint on the right.
+///
+/// `hint` is shown while the field is empty (the mock's "Search 180 logins"),
+/// `shortcut` is always shown (its "CTRL+K"). `id` is the caller's, because
+/// the vault window focuses this field from outside it.
+///
+/// Full width, not the fixed 300px of design **3f**: 3f is the macOS vault
+/// window, whose search sits in a unified toolbar; 2b -- the window this crate
+/// actually draws -- has `flex: 1` inside the item pane's header, which is
+/// also the behaviour that survives the window now being resizable.
+///
+/// Shares [`field_box`]'s treatment (border at rest, blue border plus a flush
+/// 3px halo when focused) rather than re-deriving it, so the one focused-field
+/// look in this app stays one look.
+pub fn search_field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    shortcut: &str,
+    id: egui::Id,
+) -> Response {
+    // Placeholder so the box paints *under* the text, same reason as
+    // `field_box`'s.
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), SEARCH_FIELD_HEIGHT),
+        Sense::hover(),
+    );
+
+    // Design 2b: `padding: 0 10px`, `gap: 8px`, a 14px icon, and the
+    // shortcut's own run at the far right.
+    const PAD_X: f32 = 10.0;
+    const GAP: f32 = 8.0;
+    const ICON: f32 = 14.0;
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(outer.min.x + PAD_X + ICON / 2.0, outer.center().y),
+        Vec2::splat(ICON),
+    );
+    paint_magnifier(ui.painter(), icon_rect, TEXT_GHOST);
+
+    let shortcut_galley = ui.painter().layout_no_wrap(
+        shortcut.to_string(),
+        FontId::new(10.0, FontFamily::Monospace),
+        TEXT_GHOST,
+    );
+    let shortcut_width = shortcut_galley.size().x;
+    ui.painter().galley(
+        Pos2::new(
+            outer.max.x - PAD_X - shortcut_width,
+            outer.center().y - shortcut_galley.size().y / 2.0,
+        ),
+        shortcut_galley,
+        TEXT_GHOST,
+    );
+
+    // The text row sits between the icon and the shortcut, centred on the
+    // glyphs rather than the box for the same optical reason `field_box`
+    // documents.
+    let font = FontId::new(13.0, FontFamily::Proportional);
+    let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
+    let text_left = icon_rect.right() + GAP;
+    let text_right = outer.max.x - PAD_X - shortcut_width - GAP;
+    let inner = Rect::from_center_size(
+        Pos2::new(
+            (text_left + text_right) / 2.0,
+            outer.center().y + row_height * 0.09,
+        ),
+        Vec2::new((text_right - text_left).max(0.0), row_height),
+    );
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .hint_text(RichText::new(hint).size(13.0).color(TEXT_GHOST))
+            .frame(egui::Frame::new())
+            .font(font)
+            .margin(Margin::ZERO)
+            .desired_width(inner.width()),
+    );
+
+    let rounding = CornerRadius::same(8);
+    let border = if response.has_focus() {
+        ui.painter().rect_stroke(
+            outer.expand(2.0),
+            rounding,
+            Stroke::new(3.0, FOCUS_RING),
+            StrokeKind::Middle,
+        );
+        Stroke::new(1.0, BLUE)
+    } else {
+        Stroke::new(1.0, BORDER_STRONG)
+    };
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(outer, rounding, CARD, border, StrokeKind::Middle),
+    );
+    response
 }
 
 /// The design's input-box height (sections 2a/3a/3b/3h).

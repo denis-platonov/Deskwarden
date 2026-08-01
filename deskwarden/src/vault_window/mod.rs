@@ -946,10 +946,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
         // Same reasoning as `vault-sidebar` above: no own stroke, `Panel`'s
         // built-in separator already draws the right-edge divider.
+        // NO INNER MARGIN, unlike the sidebar's. Design 2b gives this pane a
+        // white toolbar strip that spans its full width and a list area with
+        // its own, different padding beneath -- one panel margin cannot be
+        // both, and a margin here would inset the strip so it read as a card
+        // floating on grey rather than the tile the design draws. Both
+        // paddings live in `draw_item_list` instead; see its header comment.
         egui::Panel::left("vault-item-list")
             .exact_size(LIST_WIDTH)
             .resizable(false)
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(14, 12)))
+            .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
                 match draw_item_list(ui, &items, &filter, &mut search, &mut selected_id, &icons, &mut visible_ids) {
                     ItemListAction::NewItem => mode = DetailMode::Create(EditDraft::empty()),
@@ -4344,6 +4350,44 @@ mod vault_body_state_tests {
         // failed would be a worse regression than the blank window this
         // fixes; the pill reports it instead.
         assert_eq!(vault_body_state(false, false, Some("connection refused")), VaultBodyState::Vault);
+    }
+}
+
+#[cfg(test)]
+mod item_pane_frame_placement_tests {
+    //! The item pane's panel frame must carry NO inner margin.
+    //!
+    //! Design 2b's white toolbar strip spans that pane edge to edge, and
+    //! `item_list::draw_item_list` applies the design's two different
+    //! paddings (12 for the strip, 10 for the list) itself. A margin here
+    //! insets the strip, so it reads as a card floating on grey -- which is
+    //! exactly the "search field should be on white tile" report, reopened.
+    //!
+    //! A SOURCE-TEXT GUARD, and stated plainly, because
+    //! `item_list::toolbar_strip_tests` CANNOT catch this: those tests call
+    //! `draw_item_list` directly with the full pane width, so a margin
+    //! applied by this caller is invisible to them. Restoring the margin was
+    //! probed and left all six of them green. Same idiom, and same
+    //! split-literal rule, as `reveal_state_placement_tests` -- do not
+    //! re-join these.
+    const PANE: &str = concat!("egui::Panel::left(\"vault-item", "-list\")");
+    const FRAME: &str = concat!("egui::Frame::new().fill(theme::CANVAS", "))");
+
+    #[test]
+    fn the_item_pane_panel_has_no_inner_margin() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find(PANE)
+            .unwrap_or_else(|| panic!("no {PANE:?} in this file -- the panel was renamed"));
+        // Just the panel's own builder chain, not the whole file.
+        let chain = &source[start..start + 400];
+        assert!(
+            chain.contains(FRAME),
+            "the item pane's frame is no longer exactly {FRAME:?}. If an `inner_margin` was \
+             added back, design 2b's white toolbar strip stops reaching the pane's edges and \
+             the search field is on a floating card again; `item_list`'s own tests cannot see \
+             this, because they hand `draw_item_list` the full pane width themselves"
+        );
     }
 }
 
