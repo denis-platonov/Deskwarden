@@ -252,7 +252,6 @@ pub struct RevealState {
     /// A card's security-code row.
     pub card_code: bool,
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailAction {
     None,
@@ -284,6 +283,23 @@ pub enum DetailAction {
     /// `delete_pending` (see that param's doc comment) for which label/state
     /// to show.
     Delete,
+    /// The header's favourite control was clicked, carrying **the state the
+    /// item should end up in**, not "it was clicked".
+    ///
+    /// Carrying the target rather than a bare toggle is what keeps the pane
+    /// and the caller from disagreeing: the pane already read
+    /// `item.favorite` to decide which label to draw, so it is the one that
+    /// knows what the other state is. A bare `ToggleFavorite` would have
+    /// `vault_window::mod` re-derive `!item.favorite` from its own copy of
+    /// the item, and the two copies are not guaranteed equal -- that is the
+    /// same re-derivation `move_item_to_folder`'s doc rejects one field over.
+    ///
+    /// It is deliberately **not** routed through the edit draft:
+    /// `detail_edit::EditDraft::apply_to` clones the item and overwrites only
+    /// the fields the form owns, and `favorite` is not one of them, so a
+    /// favourite that went through a draft would be silently dropped on save.
+    /// See `vault_bridge::with_favorite`.
+    ToggleFavorite(bool),
 }
 
 /// Whether this kind can be filled into an application.
@@ -730,6 +746,52 @@ pub fn draw_detail_read(
                     ui.spacing_mut().item_spacing.x = HEADER_GAP;
                     if kind_offers_edit(kind) && theme::header_button(ui, "Edit").clicked() {
                         action = DetailAction::Edit;
+                    }
+                    // **In the header, and gated on no kind at all.** Every
+                    // other control in this strip is per-kind because it acts
+                    // on the item's *contents* -- Fill needs a username and a
+                    // password, Edit needs a form that can honestly save the
+                    // type. A favourite is not a content field: it is a
+                    // property of the item as a row in a list, like its name
+                    // and its folder, and the sidebar's Favorites filter
+                    // applies it to every kind (`SidebarFilter::Favorites` is
+                    // `item.favorite` and nothing else). So a card can be a
+                    // favourite, and gating this the way Fill is gated would
+                    // make a filter the sidebar offers unreachable for four
+                    // of the five kinds.
+                    //
+                    // The header rather than a body row for the same reason:
+                    // the body is `detail_body_for`'s per-kind dispatch and a
+                    // row there would have to be repeated into every arm, and
+                    // would read as a field of the login/card/identity rather
+                    // than of the item.
+                    //
+                    // WORDS, NOT A STAR GLYPH: this app installs its own font
+                    // set (`theme::apply`) and a missing glyph renders as
+                    // tofu, so the one control whose entire meaning is its
+                    // icon would be the one control that could come out
+                    // blank. The label states the resulting state, and the
+                    // hover text states the action.
+                    let (favourite_label, favourite_hover) = if item.favorite {
+                        ("Favourited", "Remove this item from Favorites")
+                    } else {
+                        ("Favourite", "Add this item to Favorites")
+                    };
+                    let favourite = if item.favorite {
+                        // The design's primary blue, which is the palette's
+                        // "this is on" colour (`theme::BLUE` is the primary
+                        // button's fill and the focus border). Delete's armed
+                        // state uses `ERROR` the same way, and red is
+                        // reserved for failures, so the ON state cannot
+                        // borrow it.
+                        theme::header_button_tinted(ui, favourite_label, theme::BLUE, theme::BLUE)
+                    } else {
+                        theme::header_button(ui, favourite_label)
+                    };
+                    if favourite.on_hover_text(favourite_hover).clicked() {
+                        // The TARGET state, computed here from the item this
+                        // pane actually drew -- see `DetailAction::ToggleFavorite`.
+                        action = DetailAction::ToggleFavorite(!item.favorite);
                     }
                     // Not drawn for a kind that cannot be filled: the fill
                     // path resolves exactly a username and a password, so this
@@ -2912,4 +2974,130 @@ mod tests {
             "the metadata strip is not inside a card of its own: {rects:?}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Favourites
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_header_offers_a_favourite_control_whose_label_states_the_current_state() {
+        // Both directions. One alone would pass against a control hardcoded
+        // to whichever label the test happened to expect.
+        let mut item = a_login();
+
+        item.favorite = false;
+        let off = painted(&item, &TotpState::NoSecret);
+        assert!(
+            off.iter().any(|t| t == "Favourite"),
+            "an un-favourited item's header offers no Favourite control: {off:?}"
+        );
+        assert!(
+            !off.iter().any(|t| t == "Favourited"),
+            "an un-favourited item's header claims it is already a favourite: {off:?}"
+        );
+
+        item.favorite = true;
+        let on = painted(&item, &TotpState::NoSecret);
+        assert!(
+            on.iter().any(|t| t == "Favourited"),
+            "a favourited item's header does not say so: {on:?}"
+        );
+    }
+
+    #[test]
+    fn every_kind_gets_the_favourite_control_even_the_ones_it_cannot_fill_or_edit() {
+        // The gating decision, asserted as behaviour rather than read off
+        // `kind_offers_fill`. A favourite is a property of the item as a ROW,
+        // not of its contents, and `SidebarFilter::Favorites` applies to every
+        // kind -- so gating this the way Fill is gated would make a filter the
+        // sidebar offers unreachable for four of the five kinds.
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let texts = painted(&item, &TotpState::NoSecret);
+            assert!(
+                texts.iter().any(|t| t == "Favourite"),
+                "{kind:?} has no favourite control: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_the_favourite_control_asks_for_the_opposite_state_not_a_bare_toggle() {
+        // A real pointer press on the control, twice: once from each starting
+        // state. What is pinned is the PAYLOAD -- the action carries the state
+        // the item should end up in, computed from the item this pane drew,
+        // so `vault_window::mod` never re-derives `!favorite` from a copy that
+        // could differ. A bare `ToggleFavorite` would pass a weaker version of
+        // this test and reintroduce that gap.
+        for starting_state in [false, true] {
+            let mut item = a_login();
+            item.favorite = starting_state;
+
+            let ctx = egui::Context::default();
+            let input = |events: Vec<egui::Event>| egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(PANE, PANE),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+
+            let mut reveal = RevealState::default();
+            let mut frame = |events: Vec<egui::Event>| {
+                let mut seen = DetailAction::None;
+                let output = ctx.run_ui(input(events), |ui| {
+                    seen = draw_detail_read(
+                        ui,
+                        &item,
+                        3,
+                        &TotpState::NoSecret,
+                        false,
+                        &mut reveal,
+                        None,
+                    );
+                });
+                let mut rects = Vec::new();
+                for clipped in &output.shapes {
+                    collect_text_rects(&clipped.shape, &mut rects);
+                }
+                (seen, rects)
+            };
+
+            let label = if starting_state { "Favourited" } else { "Favourite" };
+            let (_, laid_out) = frame(Vec::new());
+            let control = laid_out
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| rect.center())
+                .unwrap_or_else(|| panic!("no {label:?} control painted: {laid_out:?}"));
+
+            let (action, _) = frame(vec![
+                egui::Event::PointerMoved(control),
+                egui::Event::PointerButton {
+                    pos: control,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: control,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ]);
+            assert_eq!(
+                action,
+                DetailAction::ToggleFavorite(!starting_state),
+                "clicking the favourite control on an item whose favorite is \
+                 {starting_state} did not ask for {}",
+                !starting_state
+            );
+        }
+    }
+
 }

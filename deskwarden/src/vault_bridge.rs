@@ -354,6 +354,31 @@ pub fn with_folder(item: &VaultItem, folder_id: Option<&str>) -> VaultItem {
     moved.folder_id = folder_id.map(str::to_string);
     moved
 }
+
+/// Pure helper: a copy of `item` marked (or unmarked) as a favourite, built
+/// exactly the way [`with_folder`] and [`with_app_match`] build theirs --
+/// clone, change one field, leave everything else including the catch-all
+/// untouched.
+///
+/// **This deliberately does not go through the edit form.**
+/// `detail_edit::EditDraft::apply_to` clones the item and overwrites the
+/// fields the form owns; `favorite` is not one of them, so routing a
+/// favourite through a draft would either need the draft to carry a field no
+/// box on the form edits, or would silently discard the flag. It is a direct
+/// one-field write on the item, and this is that write.
+///
+/// No `folderId`-style wire trap here: [`VaultItem::favorite`] carries no
+/// `skip_serializing_if`, so it is stated on **every** write this app makes
+/// and an ordinary `update_item` of the value below really does send
+/// `"favorite": false` rather than omitting the key for the server to merge.
+/// `un_favouriting_an_item_states_favorite_false_on_the_wire` pins that,
+/// because the omitted-key failure is the one that silently does nothing --
+/// it is precisely what `folder_move_body` exists to prevent one field over.
+pub fn with_favorite(item: &VaultItem, favorite: bool) -> VaultItem {
+    let mut updated = item.clone();
+    updated.favorite = favorite;
+    updated
+}
 /// The key `bw serve` puts on an item that is in the trash, and on no other
 /// item.
 ///
@@ -3083,6 +3108,55 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&item).unwrap(),
             serde_json::to_value(without_deleted_date(&item)).unwrap()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Favourites
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_favorite_changes_that_one_field_and_nothing_else() {
+        // The same property `without_deleted_date` is held to: one field
+        // moves, and everything else -- including every key riding the
+        // catch-all -- is byte-identical. An item's favourite flag is written
+        // by a full-state PUT, so anything this helper dropped would be
+        // dropped from the user's vault.
+        let raw = r#"{"id":"1","object":"item","type":1,"name":"A","favorite":false,
+            "fields":[],"reprompt":0,"key":"K","passwordHistory":[],
+            "collectionIds":[],"attachments":[],
+            "login":{"username":"u","password":"p","passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let favourited = with_favorite(&item, true);
+
+        assert!(favourited.favorite, "with_favorite(.., true) did not set the flag");
+
+        let mut expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        expected.as_object_mut().unwrap().insert("favorite".into(), serde_json::json!(true));
+        assert_eq!(
+            expected,
+            serde_json::to_value(&favourited).unwrap(),
+            "favouriting an item changed something other than its favourite flag"
+        );
+    }
+
+    #[test]
+    fn un_favouriting_an_item_states_favorite_false_on_the_wire() {
+        // THE SILENT-NO-OP GUARD, and it is the `folderId` trap one field
+        // over: `.superpowers/sdd/put-semantics-capture.md` records that this
+        // backend MERGES omitted keys. If `VaultItem::favorite` ever gained a
+        // `skip_serializing_if`, un-favouriting would send a body with no
+        // `favorite` key at all, the server would keep the old value, and the
+        // star would come back on the next sync while the app reported
+        // success. `favorite` carries no such attribute today and this asserts
+        // the consequence rather than the attribute.
+        let item: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"favorite":true}"#).unwrap();
+        let body = serde_json::to_value(with_favorite(&item, false)).unwrap();
+        assert_eq!(
+            body.get("favorite"),
+            Some(&serde_json::json!(false)),
+            "un-favouriting produced a body that does not state favorite=false: {body}"
         );
     }
 

@@ -22,8 +22,8 @@
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{
-    with_app_match, with_folder, without_deleted_date, Folder, NewItem, VaultBridge, VaultError,
-    VaultItem,
+    with_app_match, with_favorite, with_folder, without_deleted_date, Folder, NewItem, VaultBridge,
+    VaultError, VaultItem,
 };
 use std::sync::Mutex;
 
@@ -1106,6 +1106,68 @@ impl VaultCache {
         Ok(())
     }
 
+    /// Marks `item` as a favourite, or clears the mark, and writes the change
+    /// through to the snapshot.
+    ///
+    /// **Returns the item as it was written**, rather than `Ok(())`. That is
+    /// the point of the signature: the vault window keeps its own local `Vec`
+    /// of items and paints the detail pane from it, so on success it needs
+    /// the exact value that went to the server -- not a locally toggled guess
+    /// that could diverge from it. And because the return is a `Result`, the
+    /// only way to obtain the new item is for the write to have succeeded:
+    /// a UI cannot flip its star and *then* discover the PUT failed, because
+    /// it has nothing to flip to until the PUT has landed. A failed write
+    /// leaves the caller holding its original item and an error to show.
+    ///
+    /// Bridge call BEFORE `self.lock()`, like every other write on this type:
+    /// no lock may be held across HTTP.
+    ///
+    /// A separate method rather than "build it with [`with_favorite`] and
+    /// call [`Self::update_item`]" for the same reason
+    /// [`Self::move_item_to_folder`] is separate: one door per operation, so
+    /// the rule about what gets written lives in one place. Unlike the folder
+    /// move there is no wire trap to dodge here --
+    /// [`crate::vault_bridge::VaultItem::favorite`] is stated on every write
+    /// (see [`with_favorite`]) -- so this one really is `update_item`'s body
+    /// with a named front door, and it is the front door that is worth
+    /// having.
+    pub fn set_favorite(&self, item: &VaultItem, favorite: bool) -> Result<VaultItem, VaultError> {
+        let updated = with_favorite(item, favorite);
+        self.bridge.update_item(&updated)?;
+        let mut snapshot = self.lock();
+        if !snapshot.populated {
+            drop(snapshot);
+            log::warn!(
+                "set favourite={} on vault item {} but the cache holds no snapshot to write it \
+                 through to; the vault has it and any populate will bring it in",
+                favorite,
+                updated.id
+            );
+            return Ok(updated);
+        }
+        match snapshot.items.iter().position(|i| i.id == updated.id) {
+            Some(at) => {
+                snapshot.items[at] = updated.clone();
+                // Recorded only when the snapshot actually changed, so the
+                // replay log can never name an id the snapshot cannot supply
+                // -- see `replay_writes`. This is what stops an in-flight
+                // populate from putting the old flag back.
+                snapshot.note_item_write(&updated.id, false);
+            }
+            None => {
+                drop(snapshot);
+                log::warn!(
+                    "set favourite={} on vault item {} but the snapshot no longer holds that id \
+                     -- a populate's fetch dropped it, which needs the item to have stopped \
+                     existing AFTER the server accepted this write",
+                    favorite,
+                    updated.id
+                );
+            }
+        }
+        Ok(updated)
+    }
+
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_item(id)?;
         let mut snapshot = self.lock();
@@ -1802,6 +1864,154 @@ mod tests {
             unchanged.folder_id.as_deref(),
             Some("f1"),
             "a failed move un-filed the cached item anyway"
+        );
+    }
+
+    #[test]
+    fn favouriting_an_item_writes_through_to_the_snapshot() {
+        // The sidebar's Favorites row counts and filters on `item.favorite`
+        // read from THIS snapshot (`sidebar::SidebarFilter::Favorites`), so a
+        // write the server took and the cache did not means the star lights
+        // up and the row the user just favourited is not in Favorites.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        // The mock matches only a body that STATES `favorite: true`, so this
+        // also pins the wire shape and not merely the in-memory result.
+        let _u = server
+            .mock("PUT", "/object/item/2")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "2",
+                "name": "Beta",
+                "type": 1,
+                "fields": [],
+                "favorite": true,
+            })))
+            .with_status(200)
+            .create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert!(!item.favorite, "the premise: item 2 starts un-favourited");
+
+        let written = cache.set_favorite(&item, true).unwrap();
+        assert!(written.favorite, "the item handed back does not carry the new flag");
+
+        let cached = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert!(
+            cached.favorite,
+            "the server took the favourite but the snapshot did not, so the sidebar's \
+             Favorites row still excludes it"
+        );
+    }
+
+    #[test]
+    fn un_favouriting_an_item_writes_through_too() {
+        // Both directions, so the write-through cannot rot into "always sets".
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"data":{"data":[
+                    {"id":"1","name":"Alpha","fields":[],"type":1,"favorite":true}
+                ]}}"#,
+            )
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let _u = server
+            .mock("PUT", "/object/item/1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "1",
+                "name": "Alpha",
+                "type": 1,
+                "fields": [],
+                "favorite": false,
+            })))
+            .with_status(200)
+            .create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(item.favorite, "the premise: item 1 starts favourited");
+
+        let written = cache.set_favorite(&item, false).unwrap();
+        assert!(!written.favorite);
+        assert!(!cache.items().into_iter().find(|i| i.id == "1").unwrap().favorite);
+    }
+
+    #[test]
+    fn a_failed_favourite_write_leaves_the_cache_untouched_and_hands_back_no_item() {
+        // THE "DOES NOT CLAIM SUCCESS" GUARD, and the reason `set_favorite`
+        // returns the written item rather than `()`: on a rejected PUT there
+        // is no new item to hand back at all, so a caller physically cannot
+        // paint a filled star from a failed write -- it holds only its
+        // original item and an error. The snapshot must be untouched too, or
+        // the sidebar would count a favourite the vault does not have.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/2").with_status(500).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert!(!item.favorite, "the premise");
+
+        let result = cache.set_favorite(&item, true);
+        assert!(result.is_err(), "a rejected favourite write must come back Err");
+
+        assert!(
+            !cache.items().into_iter().find(|i| i.id == "2").unwrap().favorite,
+            "a failed favourite write marked the cached item anyway"
+        );
+    }
+
+    #[test]
+    fn a_401_on_a_favourite_write_arrives_as_unauthorized() {
+        // The re-auth path keys off this variant. A locked vault behind a
+        // star click must not read as a generic failure.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/2").with_status(401).create();
+        let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert!(matches!(cache.set_favorite(&item, true), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn a_favourite_that_lands_while_a_populate_is_fetching_is_not_reverted_by_it() {
+        // The same interleaving `a_move_that_lands_while_a_populate_is_fetching`
+        // pins, for this write: without the `note_item_write` in
+        // `set_favorite`, a populate whose fetch predates the click silently
+        // un-stars the item on the next sync.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/2").with_status(200).create();
+
+        let mark = cache.epoch();
+        let fetched = cache.bridge().list_items().unwrap();
+        assert!(
+            !fetched.iter().find(|i| i.id == "2").unwrap().favorite,
+            "the fetch must predate the write"
+        );
+
+        let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        cache.set_favorite(&item, true).unwrap();
+        assert_eq!(
+            cache.epoch().era(),
+            mark.era(),
+            "a favourite write must not start a new era"
+        );
+
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+        assert!(
+            cache.items().into_iter().find(|i| i.id == "2").unwrap().favorite,
+            "a populate holding a pre-click fetch un-starred the item"
         );
     }
 
