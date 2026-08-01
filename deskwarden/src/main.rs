@@ -1218,14 +1218,89 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
     }
 }
 
-/// Same as `wait_for_vault_ready`, but shows a spinner window for the
-/// duration instead of blocking with nothing on screen.
+/// Rebuilds both halves of the post-unlock state -- the vault cache and the
+/// match engine -- once the readiness wait has confirmed `bw serve` is
+/// answering with the *new* session.
 ///
-/// `wait_for_vault_ready` itself never touches a window -- it's a plain
-/// network retry loop -- so it runs on a scoped background thread while the
-/// main thread shows `loading_ui::show_while`'s spinner. Scoped rather than
-/// a bare `std::thread::spawn`: the worker only needs `&vault`/`&schedule`
-/// for the length of this call, not `'static` ownership of them.
+/// Takes `cache`, not a separate `vault: &VaultBridge`: `cache.bridge()` is
+/// that same bridge, so a second parameter would just be another name for it,
+/// and since review 16 nothing in here needs the bridge directly anyway.
+///
+/// Both halves are rebuilt from `items` -- the vault the readiness probe
+/// ITSELF listed, a fetch already known to have succeeded -- exactly as
+/// startup does (`match_entries` + `engine.rebuild`, then `populate_with`).
+/// Nothing here re-fetches the item list, and that is the whole point.
+///
+/// The history is worth keeping, because the same defect was fixed twice at
+/// the wrong depth. Between 128000c and review 15's Important, the engine's
+/// refresh was tied to `cache.populate()`'s outcome and the engine cleared
+/// otherwise; `populate()` is two requests (`list_items` then `list_folders`)
+/// and atomic over both, so a 500 on the folders half -- a failure
+/// `picker_ui::load_items_for_picker`'s doc records as something that
+/// actually happens -- cleared the engine even though the vault read fine.
+/// e83ef03 made the two independent, which fixed the folders case and left
+/// the engine depending on `refresh_match_engine`'s own, THIRD `list_items`
+/// (review 16's Important): a transient 500 or a connection reset on that one
+/// request cleared the engine just the same. With no periodic match-engine
+/// refresh left in this app, either version disarmed autofill silently for
+/// the whole session -- nothing matches, nothing prompts, nothing arms the
+/// hotkey, and the app looks perfectly alive.
+///
+/// Building from `items` removes the failure mode rather than moving it: the
+/// engine's arming now depends on a fetch that has ALREADY SUCCEEDED, so
+/// there is no request left whose failure could disarm it. It also drops two
+/// full-vault round-trips (~1.1s / 1.08 MB each on a 1657-item vault, measured
+/// in this repo) from a recovery that blocks the main thread.
+///
+/// There is consequently no `engine.clear()` here at all, and there must not
+/// be one. The invariant that motivated the old coupling -- "an empty cache
+/// beside a populated engine is inconsistent" -- is only true when the
+/// ENGINE'S CONTENTS might belong to a different account. That is the
+/// `Dismissed` arm's situation (no usable backend, nothing re-fetched, the
+/// entries are whatever the pre-lock account left behind), and clearing there
+/// is right and stays. Here the engine is rebuilt outright from the CURRENT
+/// account's items, so pre-lock entries cannot survive even when the new
+/// account has no app matches at all (`rebuild` replaces, it does not merge);
+/// and an empty cache paired with those entries is a pairing this codebase
+/// deliberately supports -- `app::fill_from_vault` falls back to the bridge on
+/// a cache miss precisely so a fill still works in it.
+fn repopulate_and_refresh_after_unlock(
+    cache: &VaultCache,
+    engine: &mut MatchEngine,
+    items: Vec<deskwarden::vault_bridge::VaultItem>,
+    // Captured by the caller BEFORE the readiness probe that produced
+    // `items`, for the reason `VaultCache::epoch`'s doc gives: the guard can
+    // only cover the window it is handed, and a `clear` landing between that
+    // probe's fetch and this write is invisible to an epoch captured any
+    // later. Same contract, and the same reason, as startup's
+    // `startup_epoch`.
+    epoch: u64,
+) {
+    // Engine first, and unconditionally: it is pure, it cannot fail, and
+    // doing it before the move into `populate_with` is what lets `items` be
+    // handed to the cache rather than cloned.
+    let entries = match_entries(&items);
+    engine.rebuild(&entries);
+    log::info!(
+        "match engine rebuilt after unlock: {} app match(es)",
+        entries.len()
+    );
+
+    // Seeds the cache with the same already-fetched items instead of listing
+    // them again; still fetches folders, since nothing has. A failure here
+    // leaves the engine armed on purpose (see this function's doc).
+    match cache.populate_with(items, epoch) {
+        Ok(PopulateOutcome::Populated) => {}
+        Ok(PopulateOutcome::DiscardedStale) => log::warn!(
+            "the vault cache was cleared again while repopulating after unlock; it stays empty"
+        ),
+        Err(e) => log::warn!(
+            "could not repopulate the vault cache after unlock ({e:?}); autofill will fall back \
+             to bw serve per fill until the next successful populate"
+        ),
+    }
+}
+
 /// Opens the vault window and handles it locking itself before returning.
 /// Shared by both ways of asking for it -- the tray menu's "Open Vault" item
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
@@ -1258,63 +1333,6 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 /// for, if the policy said to. It's now a detached background operation
 /// reported back through `backend_op_tx`/`backend_op_rx` and applied by
 /// `main`'s own loop, same non-blocking shape as the update-download flow.
-///
-/// Takes `cache`, not a separate `vault: &VaultBridge` -- `cache.bridge()` is
-/// that same bridge, so a second parameter would just be another name for it.
-/// Rebuilds both halves of the post-unlock state -- the vault cache and the
-/// match engine -- once the readiness wait has confirmed `bw serve` is
-/// answering with the *new* session.
-///
-/// The two are refreshed INDEPENDENTLY, and that is the whole point.
-/// `cache.populate()` makes two requests (`list_items` then `list_folders`)
-/// and is atomic over both, so a 500 on the folders half -- a failure
-/// `picker_ui::load_items_for_picker`'s doc records as something that
-/// actually happens -- fails the populate even though the vault reads fine.
-/// Tying the engine's refresh to that outcome (as this code did between
-/// 128000c and review 15's Important) meant one transient folders failure
-/// cleared the engine and, with no periodic match-engine refresh left in
-/// this app, disarmed autofill silently for the whole session: nothing
-/// matches, nothing prompts, nothing arms the hotkey, and the app looks
-/// perfectly alive.
-///
-/// The invariant that motivated the coupling -- "an empty cache beside a
-/// populated engine is inconsistent" -- is only true when the ENGINE'S
-/// CONTENTS might belong to a different account. That is the `Dismissed`
-/// arm's situation (no usable backend, nothing re-fetched, the entries are
-/// whatever the pre-lock account left behind), and clearing there is right.
-/// Here the backend has just been restarted and authenticated with the new
-/// session, and `refresh_match_engine` reads the BRIDGE rather than the
-/// cache, so anything it loads is the current account's by construction. An
-/// empty cache paired with a freshly-fetched engine is a pairing this
-/// codebase deliberately supports: `app::fill_from_vault` falls back to the
-/// bridge on a cache miss precisely so a fill still works in it.
-///
-/// So the engine is cleared only when its OWN refresh fails, which is the
-/// case where its entries can only be the pre-lock account's.
-fn repopulate_and_refresh_after_unlock(cache: &VaultCache, engine: &mut MatchEngine) {
-    match cache.populate() {
-        Ok(PopulateOutcome::Populated) => {}
-        Ok(PopulateOutcome::DiscardedStale) => log::warn!(
-            "the vault cache was cleared again while repopulating after unlock; it stays empty"
-        ),
-        Err(e) => log::warn!(
-            "could not repopulate the vault cache after unlock ({e:?}); autofill will fall back \
-             to bw serve per fill until the next successful populate"
-        ),
-    }
-    match refresh_match_engine(cache.bridge(), engine) {
-        Ok(count) => log::info!("match engine refreshed after unlock: {count} app match(es)"),
-        Err(e) => {
-            engine.clear();
-            log::warn!(
-                "match engine refresh after unlock failed ({e:?}); cleared it rather than \
-                 keeping the pre-lock account's app matches, which are the only thing it could \
-                 still be holding"
-            );
-        }
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     cache: &Arc<VaultCache>,
@@ -1494,9 +1512,21 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 ));
             }
         };
+        // Captured here, *before* the readiness probe below, for the same
+        // reason startup captures `startup_epoch` before its own probe: that
+        // probe's `list_items()` is the fetch whose result seeds the cache
+        // via `populate_with`, and the epoch guard can only cover the window
+        // it is handed (review 14's Minor 3). It has to be taken after the
+        // `cache.clear()` further up -- that clear is the one this recovery
+        // is repopulating from, not one to discard against. Nothing between
+        // here and there clears the cache today (every `clear` site in the
+        // crate runs on this same, currently blocked, main thread), so this
+        // is inert; it is written this way so it stays correct if any of it
+        // moves onto a background thread.
+        let unlock_epoch = cache.epoch();
         match wait_for_vault_ready_with_spinner(cache.bridge(), schedule, SETUP_MESSAGE) {
-            VaultReadyOutcome::Ready(_items) => {
-                repopulate_and_refresh_after_unlock(cache, engine);
+            VaultReadyOutcome::Ready(items) => {
+                repopulate_and_refresh_after_unlock(cache, engine, items, unlock_epoch);
             }
             VaultReadyOutcome::Dismissed => {
                 // Review 12's Critical: closing this window must not be
@@ -1518,12 +1548,11 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 // `bw serve` is answering with the new session, so nothing
                 // re-fetched, so the engine can only be holding the PRE-lock
                 // account's matches -- clearing is the only correct answer.
-                // On `Ready` the backend is freshly authenticated and
-                // `refresh_match_engine` re-reads it, so its entries are the
-                // current account's and an empty cache beside them is a
-                // supported pairing (see
-                // `repopulate_and_refresh_after_unlock`). Only the `Ready`
-                // arm rebuilds the engine, so without this the app
+                // On `Ready` the probe itself listed the vault, so the engine
+                // is rebuilt from THOSE items: its entries are the current
+                // account's, and an empty cache beside them is a supported
+                // pairing (see `repopulate_and_refresh_after_unlock`). Only
+                // the `Ready` arm rebuilds the engine, so without this the app
                 // sits with an EMPTY cache and the PRE-reauth account's app
                 // matches: a matched process still raises the autofill
                 // prompt, and the fill then misses in the empty cache and
@@ -2352,26 +2381,29 @@ mod tests {
         )
     }
 
+    /// The items a readiness probe would have handed back.
+    fn probe_items(specs: &[(&str, &str)]) -> Vec<deskwarden::vault_bridge::VaultItem> {
+        specs
+            .iter()
+            .map(|(id, process)| {
+                serde_json::from_str(&vault_item_with_match(id, process))
+                    .expect("the test fixture must deserialize as a vault item")
+            })
+            .collect()
+    }
+
     /// Review 15's Important: a transient `list_folders` failure on the
     /// post-unlock repopulate must NOT disarm autofill for the rest of the
-    /// session. `populate()` fetches items and *then* folders, so a 500 on
-    /// the second request fails the whole populate -- but the match engine
-    /// is rebuilt from the BRIDGE, against a backend that has just been
-    /// restarted with the new session, so its entries are the current
-    /// account's by construction and `fill_from_vault`'s documented bridge
-    /// fallback serves the fill from an empty cache.
+    /// session. `populate_with` still fetches folders, so a 500 on that
+    /// request fails the whole populate -- but the match engine is built
+    /// from the readiness probe's OWN items, a fetch already known to have
+    /// succeeded against a backend just restarted with the new session, so
+    /// its entries are the current account's by construction and
+    /// `fill_from_vault`'s documented bridge fallback serves the fill from
+    /// an empty cache.
     #[test]
     fn a_folders_failure_after_unlock_leaves_the_match_engine_armed() {
         let mut server = mockito::Server::new();
-        let _items = server
-            .mock("GET", "/list/object/items")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"success":true,"data":{{"data":[{}]}}}}"#,
-                vault_item_with_match("1", "notepad.exe")
-            ))
-            .create();
         let _folders = server
             .mock("GET", "/list/object/folders")
             .with_status(500)
@@ -2380,8 +2412,14 @@ mod tests {
 
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         let mut engine = MatchEngine::new();
+        let epoch = cache.epoch();
 
-        repopulate_and_refresh_after_unlock(&cache, &mut engine);
+        repopulate_and_refresh_after_unlock(
+            &cache,
+            &mut engine,
+            probe_items(&[("1", "notepad.exe")]),
+            epoch,
+        );
 
         assert!(
             !cache.is_populated(),
@@ -2394,14 +2432,57 @@ mod tests {
         );
     }
 
-    /// The other half of the same invariant: if the *engine's own* refresh
-    /// fails, its entries can only be the pre-lock account's, and those must
-    /// not survive into a session that may be a different account.
+    /// Review 16's Important: the engine must be armed from the readiness
+    /// probe's own items even if the backend answers 500 to absolutely
+    /// everything afterwards. Before this fix the engine was rebuilt by
+    /// `refresh_match_engine`, i.e. by a THIRD `list_items` after the
+    /// probe's and the populate's, and a transient failure of that one
+    /// request cleared the engine and silently disarmed autofill for the
+    /// whole session -- the exact blast radius of review 15's finding, one
+    /// request over.
     #[test]
-    fn a_failed_engine_refresh_after_unlock_clears_the_pre_lock_matches() {
+    fn the_engine_is_armed_from_the_probes_items_even_if_every_later_request_fails() {
         let mut server = mockito::Server::new();
         let _items = server
             .mock("GET", "/list/object/items")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let epoch = cache.epoch();
+
+        repopulate_and_refresh_after_unlock(
+            &cache,
+            &mut engine,
+            probe_items(&[("1", "notepad.exe")]),
+            epoch,
+        );
+
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "the engine's arming must depend only on the fetch already known to have succeeded, \
+             so no later backend failure can disarm autofill for the rest of the session"
+        );
+    }
+
+    /// The other half of the same invariant: entries the engine is holding
+    /// from the account this app was signed into BEFORE the unlock must not
+    /// survive into a session that may be a different account. The probe's
+    /// items are the new account's, so rebuilding from them replaces the old
+    /// ones outright -- including when the new account has no app matches at
+    /// all, which is the case that would otherwise leave stale ones armed.
+    #[test]
+    fn matches_from_the_pre_lock_account_do_not_survive_the_unlock() {
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
             .with_status(500)
             .with_body("nope")
             .create();
@@ -2415,14 +2496,50 @@ mod tests {
                 trigger: deskwarden::app_match::TriggerMode::Auto,
             },
         )]);
+        let epoch = cache.epoch();
 
-        repopulate_and_refresh_after_unlock(&cache, &mut engine);
+        repopulate_and_refresh_after_unlock(&cache, &mut engine, probe_items(&[]), epoch);
 
         assert!(
             engine.lookup("notepad.exe").is_none(),
             "matches from the account this app was signed into before the unlock must not \
-             survive a refresh that could not confirm them"
+             survive an unlock whose own vault does not have them"
         );
+    }
+
+    /// The cache seeding reuses the probe's items too, so a successful
+    /// populate needs only the folders request -- no second `list_items`.
+    #[test]
+    fn the_cache_is_seeded_from_the_probes_items_without_listing_them_again() {
+        let mut server = mockito::Server::new();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .expect(0)
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let epoch = cache.epoch();
+
+        repopulate_and_refresh_after_unlock(
+            &cache,
+            &mut engine,
+            probe_items(&[("1", "notepad.exe")]),
+            epoch,
+        );
+
+        assert!(cache.is_populated(), "the populate must have succeeded");
+        assert_eq!(cache.items().len(), 1, "seeded from the probe's own items");
+        items.assert();
     }
 
     /// Whether a process with the given id still exists, via `tasklist` --
