@@ -548,15 +548,233 @@ struct FolderList {
     data: Vec<Folder>,
 }
 
-/// The minimal payload to create a new Login item. `bw serve`'s create
-/// endpoint wants a full item shape (like the edit endpoint), but a brand
-/// new item has nothing else to preserve, unlike `update_item`.
+/// The payload to create one new item, of any kind `bw serve` understands.
+///
+/// `bw serve`'s create endpoint wants a full item shape (like the edit
+/// endpoint), but a brand new item has nothing else to preserve, unlike
+/// `update_item`.
+///
+/// **An enum, not a struct with four optional sub-objects**, because a create
+/// payload must carry EXACTLY ONE type object. A struct of optionals makes "a
+/// card that also posts an empty `login: {}`" representable, and that is
+/// precisely how an item ends up with two type objects -- the same defect
+/// class as `EditDraft::apply_to`'s unconditional `login.unwrap_or_default()`,
+/// which was a live bug. Here it is not a rule to remember; it is unsayable.
+///
+/// Every variant carries `name` and `folder_id` because those are item-level,
+/// not part of any type object. The kind-specific payload reuses the SAME
+/// structs the read path deserializes into ([`CardData`], [`IdentityData`]),
+/// so the wire key names have exactly one definition and the create and edit
+/// paths cannot drift apart.
 #[derive(Debug, Clone)]
-pub struct NewLoginItem {
-    pub name: String,
-    pub username: String,
-    pub password: String,
-    pub folder_id: Option<String>,
+pub enum NewItem {
+    Login {
+        name: String,
+        folder_id: Option<String>,
+        username: String,
+        password: String,
+    },
+    /// A secure note's body is **item-level `notes`**, not a field of its type
+    /// object: `secureNote` carries only a `{"type": 0}` discriminator
+    /// (verified, `.superpowers/sdd/item-shapes-capture.md`).
+    SecureNote {
+        name: String,
+        folder_id: Option<String>,
+        body: String,
+    },
+    Card {
+        name: String,
+        folder_id: Option<String>,
+        card: CardData,
+    },
+    Identity {
+        name: String,
+        folder_id: Option<String>,
+        identity: IdentityData,
+    },
+    /// Spelled out field by field rather than carrying an `SshKeyData`,
+    /// because that struct does not exist in this file yet -- `type: 5`'s
+    /// shape was verified separately and the struct lands on its own branch.
+    /// The three names below are the captured wire keys, so switching this
+    /// variant to `ssh_key: SshKeyData` once that branch merges is a local
+    /// change with no change to the bytes.
+    SshKey {
+        name: String,
+        folder_id: Option<String>,
+        private_key: Zeroizing<String>,
+        public_key: String,
+        key_fingerprint: String,
+    },
+}
+
+impl NewItem {
+    pub fn login(
+        name: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+        folder_id: Option<String>,
+    ) -> Self {
+        NewItem::Login {
+            name: name.into(),
+            folder_id,
+            username: username.into(),
+            password: password.into(),
+        }
+    }
+
+    pub fn secure_note(
+        name: impl Into<String>,
+        body: impl Into<String>,
+        folder_id: Option<String>,
+    ) -> Self {
+        NewItem::SecureNote { name: name.into(), folder_id, body: body.into() }
+    }
+
+    pub fn card(name: impl Into<String>, card: CardData, folder_id: Option<String>) -> Self {
+        NewItem::Card { name: name.into(), folder_id, card }
+    }
+
+    pub fn identity(
+        name: impl Into<String>,
+        identity: IdentityData,
+        folder_id: Option<String>,
+    ) -> Self {
+        NewItem::Identity { name: name.into(), folder_id, identity }
+    }
+
+    pub fn ssh_key(
+        name: impl Into<String>,
+        private_key: impl Into<String>,
+        public_key: impl Into<String>,
+        key_fingerprint: impl Into<String>,
+        folder_id: Option<String>,
+    ) -> Self {
+        NewItem::SshKey {
+            name: name.into(),
+            folder_id,
+            private_key: Zeroizing::new(private_key.into()),
+            public_key: public_key.into(),
+            key_fingerprint: key_fingerprint.into(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            NewItem::Login { name, .. }
+            | NewItem::SecureNote { name, .. }
+            | NewItem::Card { name, .. }
+            | NewItem::Identity { name, .. }
+            | NewItem::SshKey { name, .. } => name,
+        }
+    }
+
+    fn folder_id(&self) -> Option<&str> {
+        match self {
+            NewItem::Login { folder_id, .. }
+            | NewItem::SecureNote { folder_id, .. }
+            | NewItem::Card { folder_id, .. }
+            | NewItem::Identity { folder_id, .. }
+            | NewItem::SshKey { folder_id, .. } => folder_id.as_deref(),
+        }
+    }
+
+    /// The exact JSON `create_item` POSTs.
+    ///
+    /// Pure, so the wire shape is asserted directly by unit tests rather than
+    /// inferred from a mock's return value.
+    ///
+    /// **Blank means absent, not an empty string** -- the convention
+    /// [`VaultBridge::create_item`] has always followed, now applied to every
+    /// kind by one shared rule (see [`without_blank_values`]) instead of one
+    /// hand-written `if` per field. The edit path maps blank to an absent key,
+    /// so a create that sent `""` would make the item silently change shape
+    /// server-side between its first and second save.
+    ///
+    /// **`folderId` is stated explicitly, `null` when the item is unfiled.**
+    /// This is deliberately NOT what the update path does, and the two must
+    /// not be "tidied" into agreement: `.superpowers/sdd/put-semantics-capture.md`
+    /// records that on a PUT this backend silently IGNORES a null `folderId`,
+    /// so a null there means "keep the old folder" and cannot clear one. On a
+    /// CREATE there is no previous value to preserve, so the null is
+    /// unambiguous -- and it is the shape this app has always POSTed and
+    /// `bw serve` has always accepted, so keeping it is also the option that
+    /// changes nothing about a request the server is known to like.
+    pub fn to_payload(&self) -> serde_json::Value {
+        let (type_number, type_key, type_object, notes) = match self {
+            NewItem::Login { username, password, .. } => {
+                let mut login = serde_json::Map::new();
+                login.insert("username".to_string(), serde_json::json!(username));
+                login.insert("password".to_string(), serde_json::json!(password));
+                (1, "login", login, None)
+            }
+            NewItem::SecureNote { body, .. } => (
+                2,
+                "secureNote",
+                // Not pruned: `{"type": 0}` is the discriminator that makes
+                // this a secure note, and 0 is its real value, not a blank.
+                serde_json::Map::from_iter([("type".to_string(), serde_json::json!(0))]),
+                Some(body.as_str()),
+            ),
+            NewItem::Card { card, .. } => (3, "card", as_object(card), None),
+            NewItem::Identity { identity, .. } => (4, "identity", as_object(identity), None),
+            NewItem::SshKey { private_key, public_key, key_fingerprint, .. } => {
+                let mut ssh = serde_json::Map::new();
+                ssh.insert("privateKey".to_string(), serde_json::json!(private_key.as_str()));
+                ssh.insert("publicKey".to_string(), serde_json::json!(public_key));
+                ssh.insert("keyFingerprint".to_string(), serde_json::json!(key_fingerprint));
+                (5, "sshKey", ssh, None)
+            }
+        };
+
+        let mut payload = serde_json::Map::new();
+        payload.insert("name".to_string(), serde_json::json!(self.name()));
+        payload.insert("type".to_string(), serde_json::json!(type_number));
+        payload.insert(
+            "folderId".to_string(),
+            match self.folder_id() {
+                Some(id) => serde_json::json!(id),
+                None => serde_json::Value::Null,
+            },
+        );
+        if let Some(body) = notes.filter(|b| !b.is_empty()) {
+            payload.insert("notes".to_string(), serde_json::json!(body));
+        }
+        payload.insert(
+            type_key.to_string(),
+            serde_json::Value::Object(without_blank_values(type_object)),
+        );
+        serde_json::Value::Object(payload)
+    }
+}
+
+/// Serializes one of the typed item sub-objects into a JSON map.
+///
+/// The `unwrap_or_default` arm is unreachable: every caller passes a struct,
+/// so `to_value` yields an object and cannot fail. An empty map is the right
+/// fallback anyway -- it produces a payload with a present-but-empty type
+/// object, which is exactly what a create with no fields filled in sends.
+fn as_object<T: Serialize>(value: &T) -> serde_json::Map<String, serde_json::Value> {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// Drops every key whose value is the empty string -- the one place the
+/// "blank means absent" convention is implemented for a create payload.
+///
+/// Applied to the whole type object rather than per field, so a field added to
+/// [`CardData`] or [`IdentityData`] later inherits the convention instead of
+/// needing a new `if` that someone has to remember to write. `None` fields
+/// never reach here at all: every field on those structs carries
+/// `skip_serializing_if = "Option::is_none"`.
+///
+/// Shallow on purpose. These objects are flat maps of strings; recursing would
+/// mean guessing at a nesting that does not exist.
+fn without_blank_values(
+    object: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    object.into_iter().filter(|(_, v)| v.as_str() != Some("")).collect()
 }
 
 /// `GET /object/totp/{id}` wraps its answer the same way `list_items` and
@@ -686,32 +904,15 @@ impl VaultBridge {
         Ok(())
     }
 
-    pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
+    /// Creates an item of any kind. The body is [`NewItem::to_payload`]'s,
+    /// which is where the "blank means absent" and explicit-`folderId`
+    /// conventions live and where they are tested.
+    pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item", self.base_url);
-        // Blank means absent, not an empty string -- matching
-        // `EditDraft::apply_to`'s convention (and `LoginData`'s own
-        // `skip_serializing_if = "Option::is_none"`) for the edit path. A
-        // newly-created item with a blank username, saved verbatim here as
-        // `"username": ""` and then immediately re-saved once through the
-        // edit form (which maps blank to an absent key), would otherwise
-        // silently change shape server-side between the two saves.
-        let mut login = serde_json::Map::new();
-        if !new_item.username.is_empty() {
-            login.insert("username".to_string(), serde_json::json!(new_item.username));
-        }
-        if !new_item.password.is_empty() {
-            login.insert("password".to_string(), serde_json::json!(new_item.password));
-        }
-        let payload = serde_json::json!({
-            "name": new_item.name,
-            "type": 1,
-            "folderId": new_item.folder_id,
-            "login": login,
-        });
         let body: Envelope<VaultItem> = self
             .agent
             .post(&url)
-            .send_json(payload)
+            .send_json(new_item.to_payload())
             .map_err(map_http_err)?
             .into_json()
             .map_err(|e| VaultError::Parse(e.to_string()))?;
@@ -1849,11 +2050,188 @@ mod tests {
         assert!(bridge.delete_folder("f3").is_ok());
     }
 
+    /// The five type keys `bw serve` recognises. A create payload must carry
+    /// EXACTLY ONE of them; the tests below assert on the four that must be
+    /// absent, not merely on the one that must be present, because an item
+    /// with two type objects is what the enum shape exists to prevent.
+    const TYPE_KEYS: [&str; 5] = ["login", "secureNote", "card", "identity", "sshKey"];
+
+    /// A filled card, so a payload test can tell "pruned because blank" from
+    /// "never modelled".
+    fn a_filled_card() -> CardData {
+        CardData {
+            cardholder_name: Some("A Holder".into()),
+            brand: Some("Visa".into()),
+            number: Some(Zeroizing::new("4111111111111111".into())),
+            exp_month: Some("04".into()),
+            exp_year: Some("2031".into()),
+            code: Some(Zeroizing::new("123".into())),
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn a_filled_identity() -> IdentityData {
+        IdentityData {
+            first_name: Some("Ada".into()),
+            last_name: Some("Lovelace".into()),
+            email: Some("ada@example.com".into()),
+            ..IdentityData::default()
+        }
+    }
+
+    /// Every kind, each built with real values, for the shared structural
+    /// assertions. Blank-field behaviour is pinned separately below.
+    fn one_of_each_kind() -> Vec<(NewItem, i64, &'static str)> {
+        vec![
+            (NewItem::login("n", "u", "p", None), 1, "login"),
+            (NewItem::secure_note("n", "body", None), 2, "secureNote"),
+            (NewItem::card("n", a_filled_card(), None), 3, "card"),
+            (NewItem::identity("n", a_filled_identity(), None), 4, "identity"),
+            (NewItem::ssh_key("n", "PRIV", "PUB", "FP", None), 5, "sshKey"),
+        ]
+    }
+
+    #[test]
+    fn each_create_payload_carries_exactly_one_type_object() {
+        for (new_item, expected_type, expected_key) in one_of_each_kind() {
+            let payload = new_item.to_payload();
+            let map = payload.as_object().expect("a create payload is a JSON object");
+            assert_eq!(map.get("type"), Some(&serde_json::json!(expected_type)));
+            assert!(map.get(expected_key).is_some(), "{expected_key} missing");
+            for other in TYPE_KEYS {
+                if other != expected_key {
+                    // `.get`, not `payload[other]`: indexing a Value with a
+                    // MISSING key yields Value::Null, so `== Null` passes for
+                    // an absent key and proves nothing.
+                    assert!(
+                        map.get(other).is_none(),
+                        "a {expected_key} payload also carried {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_create_payload_states_folder_id_explicitly() {
+        // Deliberately different from the UPDATE path, which must never send
+        // a null folderId (`bw serve` ignores it -- see
+        // `.superpowers/sdd/put-semantics-capture.md`). On a CREATE there is
+        // no previous value to preserve, so an explicit null is unambiguous
+        // and this is the shape already shipped and accepted.
+        for (new_item, _, _) in one_of_each_kind() {
+            let payload = new_item.to_payload();
+            let map = payload.as_object().unwrap();
+            assert_eq!(
+                map.get("folderId"),
+                Some(&serde_json::Value::Null),
+                "an unfiled create payload dropped its explicit null folderId"
+            );
+        }
+        let filed = NewItem::card("n", a_filled_card(), Some("f1".to_string())).to_payload();
+        assert_eq!(filed["folderId"], serde_json::json!("f1"));
+    }
+
+    #[test]
+    fn a_secure_note_posts_its_body_as_item_level_notes() {
+        // The body is item-level `notes`; `secureNote` is only a `{"type":0}`
+        // discriminator (verified, `.superpowers/sdd/item-shapes-capture.md`).
+        let payload = NewItem::secure_note("Wifi", "the passphrase", None).to_payload();
+        assert_eq!(payload["notes"], serde_json::json!("the passphrase"));
+        assert_eq!(payload["secureNote"], serde_json::json!({ "type": 0 }));
+    }
+
+    #[test]
+    fn a_blank_field_is_absent_rather_than_an_empty_string_for_every_kind() {
+        // The convention `create_item` has always followed, now pinned per
+        // kind: blank means ABSENT. The edit path maps blank to an absent
+        // key, so a create that sent `""` would make the item silently change
+        // shape between its first and second save.
+        // A secure note is the one kind whose type object is NOT empty when
+        // everything is blank: `{"type": 0}` is the discriminator that makes
+        // it a secure note at all, and 0 is a real value, not a blank. Its
+        // body is item-level `notes`, asserted below with the others.
+        let blank_of_each = [
+            (NewItem::login("n", "", "", None), "login", serde_json::json!({})),
+            (
+                NewItem::secure_note("n", "", None),
+                "secureNote",
+                serde_json::json!({ "type": 0 }),
+            ),
+            (
+                NewItem::card(
+                    "n",
+                    CardData {
+                        cardholder_name: Some(String::new()),
+                        brand: Some(String::new()),
+                        number: Some(Zeroizing::new(String::new())),
+                        exp_month: Some(String::new()),
+                        exp_year: Some(String::new()),
+                        code: Some(Zeroizing::new(String::new())),
+                        other: serde_json::Map::new(),
+                    },
+                    None,
+                ),
+                "card",
+                serde_json::json!({}),
+            ),
+            (
+                NewItem::identity(
+                    "n",
+                    IdentityData {
+                        first_name: Some(String::new()),
+                        last_name: Some(String::new()),
+                        email: Some(String::new()),
+                        ..IdentityData::default()
+                    },
+                    None,
+                ),
+                "identity",
+                serde_json::json!({}),
+            ),
+            (NewItem::ssh_key("n", "", "", "", None), "sshKey", serde_json::json!({})),
+        ];
+        for (new_item, key, expected_object) in blank_of_each {
+            let payload = new_item.to_payload();
+            assert_eq!(
+                payload[key], expected_object,
+                "a blank {key} payload sent empty strings instead of omitting keys"
+            );
+            // And the secure note's body, which is item-level rather than
+            // inside the type object.
+            assert!(
+                payload.as_object().unwrap().get("notes").is_none(),
+                "a blank body became an empty `notes` string on a {key} payload"
+            );
+        }
+    }
+
+    #[test]
+    fn a_partly_filled_payload_keeps_what_was_filled_in() {
+        // The mirror of the test above: pruning blanks must not prune values.
+        let payload = NewItem::ssh_key("n", "PRIV", "", "FP", None).to_payload();
+        assert_eq!(
+            payload["sshKey"],
+            serde_json::json!({ "privateKey": "PRIV", "keyFingerprint": "FP" })
+        );
+    }
+
+    /// Answers a create with a minimal item so the tests below can assert on
+    /// the REQUEST body -- which is the whole point -- rather than on what the
+    /// mock was told to return.
+    const CREATED_BODY: &str = r#"{"success":true,"data":{"id":"9","name":"New","fields":[]}}"#;
+
     #[test]
     fn create_item_posts_a_login_shaped_payload() {
         let mut server = mockito::Server::new();
         let _m = server
             .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "New",
+                "type": 1,
+                "folderId": null,
+                "login": { "username": "u", "password": "p" },
+            })))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"id":"9","name":"New","type":1,"fields":[],
@@ -1861,13 +2239,7 @@ mod tests {
             .create();
 
         let bridge = VaultBridge::new(server.url());
-        let new_item = NewLoginItem {
-            name: "New".into(),
-            username: "u".into(),
-            password: "p".into(),
-            folder_id: None,
-        };
-        let created = bridge.create_item(&new_item).unwrap();
+        let created = bridge.create_item(&NewItem::login("New", "u", "p", None)).unwrap();
         assert_eq!(created.id, "9");
         assert_eq!(created.login.unwrap().username.as_deref(), Some("u"));
     }
@@ -1894,14 +2266,112 @@ mod tests {
             .create();
 
         let bridge = VaultBridge::new(server.url());
-        let new_item = NewLoginItem {
-            name: "New".into(),
-            username: "".into(),
-            password: "".into(),
-            folder_id: None,
-        };
-        let created = bridge.create_item(&new_item).unwrap();
+        let created = bridge.create_item(&NewItem::login("New", "", "", None)).unwrap();
         assert_eq!(created.id, "9");
+    }
+
+    #[test]
+    fn create_item_posts_a_secure_note_shaped_payload() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "Wifi",
+                "type": 2,
+                "folderId": null,
+                "notes": "the passphrase",
+                "secureNote": { "type": 0 },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(CREATED_BODY)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewItem::secure_note("Wifi", "the passphrase", None);
+        assert_eq!(bridge.create_item(&new_item).unwrap().id, "9");
+    }
+
+    #[test]
+    fn create_item_posts_a_card_shaped_payload() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "Visa",
+                "type": 3,
+                "folderId": "f1",
+                "card": {
+                    "cardholderName": "A Holder",
+                    "brand": "Visa",
+                    "number": "4111111111111111",
+                    "expMonth": "04",
+                    "expYear": "2031",
+                    "code": "123",
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(CREATED_BODY)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewItem::card("Visa", a_filled_card(), Some("f1".to_string()));
+        assert_eq!(bridge.create_item(&new_item).unwrap().id, "9");
+    }
+
+    #[test]
+    fn create_item_posts_an_identity_shaped_payload() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "Me",
+                "type": 4,
+                "folderId": null,
+                "identity": {
+                    "firstName": "Ada",
+                    "lastName": "Lovelace",
+                    "email": "ada@example.com",
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(CREATED_BODY)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewItem::identity("Me", a_filled_identity(), None);
+        assert_eq!(bridge.create_item(&new_item).unwrap().id, "9");
+    }
+
+    #[test]
+    fn create_item_posts_an_ssh_key_shaped_payload() {
+        // The one kind whose shape came from a live POST rather than a
+        // template endpoint: `{"type":5,"name":...,"sshKey":{privateKey,
+        // publicKey, keyFingerprint}}` returned 200 (see
+        // `.superpowers/sdd/item-shapes-capture.md`).
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/object/item")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "name": "deploy",
+                "type": 5,
+                "folderId": null,
+                "sshKey": {
+                    "privateKey": "PRIV",
+                    "publicKey": "PUB",
+                    "keyFingerprint": "FP",
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(CREATED_BODY)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let new_item = NewItem::ssh_key("deploy", "PRIV", "PUB", "FP", None);
+        assert_eq!(bridge.create_item(&new_item).unwrap().id, "9");
     }
 
     #[test]

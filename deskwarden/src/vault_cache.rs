@@ -22,8 +22,8 @@
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{
-    with_app_match, with_folder, without_deleted_date, Folder, NewLoginItem, VaultBridge,
-    VaultError, VaultItem,
+    with_app_match, with_folder, without_deleted_date, Folder, NewItem, VaultBridge, VaultError,
+    VaultItem,
 };
 use std::sync::Mutex;
 
@@ -894,7 +894,7 @@ impl VaultCache {
         snapshot.era = snapshot.era.wrapping_add(1);
     }
 
-    pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
+    pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
         let created = self.bridge.create_item(new_item)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
@@ -1297,6 +1297,7 @@ impl VaultCache {
 mod tests {
     use super::*;
     use crate::app_match::TriggerMode;
+    use crate::vault_bridge::{CardData, IdentityData};
 
     fn cache_for(url: String) -> VaultCache {
         VaultCache::new(VaultBridge::new(url))
@@ -2357,16 +2358,74 @@ mod tests {
         let cache = cache_for(server.url());
         assert!(!cache.is_populated());
 
-        let new_item = NewLoginItem {
-            name: "Gamma".to_string(),
-            username: String::new(),
-            password: String::new(),
-            folder_id: None,
-        };
-        cache.create_item(&new_item).unwrap();
+        cache.create_item(&NewItem::login("Gamma", "", "", None)).unwrap();
 
         assert!(cache.items().is_empty(), "a write on a cleared cache resurrected a snapshot");
         assert!(!cache.is_populated());
+    }
+
+    /// Populates `cache` from the two standard mock lists, so a write test can
+    /// assert on how the snapshot changed rather than on whether it exists.
+    fn a_populated_cache(server: &mut mockito::ServerGuard) -> VaultCache {
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        cache
+    }
+
+    #[test]
+    fn creating_each_kind_lands_in_the_snapshot() {
+        // Every kind routes through the cache, so the vault window's list
+        // shows the new item without a re-fetch -- and so no caller has a
+        // reason to reach around to `VaultBridge` and leave the snapshot
+        // behind.
+        for (new_item, id, name) in [
+            (NewItem::login("Gamma", "u", "p", None), "3", "Gamma"),
+            (NewItem::secure_note("Wifi", "body", None), "4", "Wifi"),
+            (NewItem::card("Visa", CardData::default(), None), "5", "Visa"),
+            (NewItem::identity("Me", IdentityData::default(), None), "6", "Me"),
+            (NewItem::ssh_key("deploy", "PRIV", "PUB", "FP", None), "7", "deploy"),
+        ] {
+            let mut server = mockito::Server::new();
+            let cache = a_populated_cache(&mut server);
+            let _c = server
+                .mock("POST", "/object/item")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(format!(
+                    r#"{{"success":true,"data":{{"id":"{id}","name":"{name}","fields":[]}}}}"#
+                ))
+                .create();
+
+            let created = cache.create_item(&new_item).unwrap();
+            assert_eq!(created.id, id);
+            let names: Vec<String> = cache.items().into_iter().map(|i| i.name).collect();
+            assert_eq!(names, vec!["Alpha".to_string(), "Beta".to_string(), name.to_string()]);
+        }
+    }
+
+    #[test]
+    fn a_failed_create_leaves_the_snapshot_alone() {
+        // The other half of the test above: the snapshot must reflect a
+        // create that SUCCEEDED, and only that one. A 500 leaves the list as
+        // it was, so the window never shows an item the server does not have.
+        let mut server = mockito::Server::new();
+        let cache = a_populated_cache(&mut server);
+        let _c = server.mock("POST", "/object/item").with_status(500).create();
+
+        assert!(cache.create_item(&NewItem::card("Visa", CardData::default(), None)).is_err());
+        assert_eq!(cache.items().len(), 2, "a failed create was pushed into the snapshot");
     }
 
     #[test]

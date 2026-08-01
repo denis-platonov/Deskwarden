@@ -4,7 +4,7 @@
 //! from read mode.
 
 use crate::theme;
-use crate::vault_bridge::{Folder, ItemKind, NewLoginItem, VaultItem};
+use crate::vault_bridge::{Folder, ItemKind, NewItem, VaultItem};
 #[cfg(test)]
 use crate::vault_bridge::{LoginData, UriEntry};
 use crate::vault_window::sidebar;
@@ -350,17 +350,18 @@ impl EditDraft {
         updated
     }
 
-    /// The create payload. **Login-shaped**, because creating a non-login is
-    /// the plan's Task 5 and `NewLoginItem` is still the only create payload
-    /// `vault_bridge` offers; the create form therefore always runs against a
-    /// [`Self::empty`] draft, whose kind is `Login`.
-    pub fn to_new_item(&self) -> NewLoginItem {
-        NewLoginItem {
-            name: self.name.clone(),
-            username: self.username.clone(),
-            password: self.password.clone(),
-            folder_id: self.folder_id.clone(),
-        }
+    /// The create payload. **Login-shaped**, because the create form has no
+    /// type selector yet: that is the UI half of the plan's Task 5, and this
+    /// draft therefore always comes from [`Self::empty`], whose kind is
+    /// `Login`. [`NewItem`] itself can now express every kind, so adding the
+    /// selector is a change here and not in `vault_bridge`.
+    pub fn to_new_item(&self) -> NewItem {
+        NewItem::login(
+            self.name.clone(),
+            self.username.clone(),
+            self.password.clone(),
+            self.folder_id.clone(),
+        )
     }
 }
 
@@ -1148,8 +1149,13 @@ mod tests {
             folder_id: Some("f2".into()),
             ..EditDraft::empty()
         };
-        let new_item = draft.to_new_item();
-        assert_eq!(new_item.name, "New");
-        assert_eq!(new_item.folder_id.as_deref(), Some("f2"));
+        // `NewItem` is an enum with no shared `name`/`folder_id` fields to
+        // read, so the same two facts are asserted one step further along, on
+        // the payload those fields produce. If anything, this is the stronger
+        // form of the original assertion.
+        let payload = draft.to_new_item().to_payload();
+        assert_eq!(payload["name"], serde_json::json!("New"));
+        assert_eq!(payload["folderId"], serde_json::json!("f2"));
+        assert_eq!(payload["type"], serde_json::json!(1));
     }
 }
