@@ -727,7 +727,7 @@ fn main() {
                             // `ServerOnly` save the snapshot does not hold the
                             // match, and rebuilding straight from it is review
                             // 28's Important 2. See both functions.
-                            match flow.rebuild_source(&cache, &saved, &target_item) {
+                            match flow.rebuild_source(&saved, &target_item) {
                                 Some(items) => {
                                     let entries = match_entries(&items);
                                     log::info!(
@@ -765,11 +765,28 @@ fn main() {
                                             "The server has the match and so did this session's \
                                              snapshot, so the next sync or unlock brings it back"
                                         }
+                                        // REVIEW 31'S MINOR 3. This used to end
+                                        // flatly "so no sync is promised here",
+                                        // which over-claims in the other
+                                        // direction: `ServerOnly` has TWO
+                                        // producers and its own doc says the
+                                        // unpopulated-cache one IS cured by any
+                                        // populate. Only the second -- an id
+                                        // absent from a POPULATED snapshot,
+                                        // i.e. the item is gone -- is beyond a
+                                        // sync. Saying "no sync" for both is
+                                        // the same class of over-claim that
+                                        // review 30's claims 3 and 4 existed to
+                                        // remove, merely inverted, and this
+                                        // line cannot tell the two apart.
                                         AppMatchWrite::ServerOnly => {
-                                            "The server has the match; whether this app picks it \
-                                             up depends on the item still existing (see \
-                                             AppMatchWrite::ServerOnly), so no sync is promised \
-                                             here"
+                                            "The server has the match; which of \
+                                             AppMatchWrite::ServerOnly's two misses this was \
+                                             decides what follows -- an unpopulated cache is \
+                                             cured by any populate, while an id missing from a \
+                                             populated snapshot means the item is gone and no \
+                                             sync brings it back. This line cannot tell them \
+                                             apart, so it promises neither"
                                         }
                                     };
                                     log::warn!(
@@ -2479,65 +2496,119 @@ fn add_app_rebuild_source(
     Some(items)
 }
 
-/// One "Add app..." click, from the era capture to the engine rebuild.
+/// [`AddAppFlow`]'s privacy boundary, and the whole reason it is a module.
 ///
-/// **This type exists to bind the era capture to the flow it guards** (review
-/// 30's Minor 5). Those were four unbound statements in `main`'s event loop --
-/// `let add_app_era = cache.epoch().era();`, `pick_vault_item`, `run_picker`,
-/// and the rebuild -- and moving the capture below `pick_vault_item` reads as
-/// an innocent tidy, since `pick_vault_item` captures its own era internally.
-/// It is not: it narrows the guard from "both windows" to "the second window",
-/// which is the half that matters least, because the long user interaction a
-/// `clear` can land inside starts with the FIRST one. No test noticed, and
-/// none could -- all four `add_app_rebuild_source` tests hand it a `Result`
-/// directly and never touch the capture site.
+/// A `struct` at this file's top level has FILE-VISIBLE fields: `AddAppFlow {
+/// era: cache.epoch().era() }` compiles anywhere in these ~4000 lines, so a
+/// future edit could re-introduce the late capture the type exists to forbid
+/// (review 30's Minor 5) and still compile. Review 31's Important 2. Inside a
+/// module, `era` and `cache` are private to these few lines and there is no
+/// spelling of this type outside them except [`AddAppFlow::begin`].
 ///
-/// [`Self::begin`] captures the era and opens the item picker in one
-/// expression, above the `?`, so the two cannot be separated by an edit that
-/// looks local; and [`Self::rebuild_source`] is only reachable through a value
-/// only `begin` mints, so the rebuild cannot be reached having captured
-/// nothing. What is deliberately NOT here is `run_picker`: it takes an owned
-/// `VaultItem` and a couple of unrelated flags, and folding it in would make
-/// this a wrapper around the event loop rather than a binding of the two
-/// statements that actually drift.
-struct AddAppFlow {
-    /// The vault session this click belongs to -- see [`VaultEra`] for why an
-    /// era rather than a bare "is it populated?", and `add_app_rebuild_source`
-    /// for what it outranks.
-    era: VaultEra,
-}
+/// That is a COMPILER guarantee rather than a test, which is why this finding
+/// has no test of its own: nothing in a `#[test]` can observe code that does
+/// not compile. It replaces the source-text guard that the identical
+/// `window_era` hazard needed in `vault_window`, where the value being
+/// protected is a local rather than a field.
+mod add_app {
+    use super::{add_app_rebuild_source, picker_ui, SavedAppMatch};
+    use deskwarden::vault_bridge::VaultItem;
+    use deskwarden::vault_cache::{VaultCache, VaultEra};
+    use std::sync::Arc;
 
-impl AddAppFlow {
-    /// Captures the era, THEN asks the user which vault item to attach a match
-    /// to. `None` means the user cancelled that first window.
+    /// One "Add app..." click, from the era capture to the engine rebuild.
+    /// **Not** the save: `run_picker`'s Save fires in between, goes to the
+    /// server through `cache.set_app_match`, and is not era-checked at all --
+    /// see the paragraph on `run_picker` below.
     ///
-    /// Not `#[cfg(test)]`-testable: `pick_vault_item` opens a real window.
-    /// What it buys is that the ordering is unrepresentable wrong rather than
-    /// tested -- see the type's doc.
-    fn begin(
-        cache: &std::sync::Arc<VaultCache>,
-    ) -> Option<(Self, deskwarden::vault_bridge::VaultItem)> {
-        let era = cache.epoch().era();
-        let item = picker_ui::pick_vault_item(cache)?;
-        Some((Self { era }, item))
+    /// **This type exists to bind the era capture to the flow it guards**
+    /// (review 30's Minor 5). Those were four unbound statements in `main`'s
+    /// event loop -- `let add_app_era = cache.epoch().era();`,
+    /// `pick_vault_item`, `run_picker`, and the rebuild -- and moving the
+    /// capture below `pick_vault_item` reads as an innocent tidy, since
+    /// `pick_vault_item` captures its own era internally. It is not: it narrows
+    /// the guard from "both windows" to "the second window", which is the half
+    /// that matters least, because the long user interaction a `clear` can land
+    /// inside starts with the FIRST one. No test noticed, and none could -- all
+    /// four `add_app_rebuild_source` tests hand it a `Result` directly and never
+    /// touch the capture site.
+    ///
+    /// **What is actually enforced, and by what.** Three things, all by the
+    /// compiler:
+    ///
+    ///  * The fields are private to this module, so the only way to obtain an
+    ///    `AddAppFlow` in `main.rs` is [`Self::begin`] -- which captures the
+    ///    era ABOVE the `?` that opens the first window, in one expression.
+    ///  * [`Self::rebuild_source`] takes no cache. It reads the `Arc` the
+    ///    capture was taken from, so the era and the cache it describes cannot
+    ///    be a mismatched pair; before review 31 the method re-accepted a
+    ///    `&VaultCache` and `flow.rebuild_source(&some_other_cache, ..)`
+    ///    type-checked.
+    ///  * Holding that `Arc` also means the flow keeps the cache alive for its
+    ///    own lifetime, so "the era's cache" cannot be dropped mid-flow.
+    ///
+    /// What is deliberately NOT here is `run_picker`: it takes an owned
+    /// `VaultItem` and a couple of unrelated flags, and folding it in would make
+    /// this a wrapper around the event loop rather than a binding of the two
+    /// statements that actually drift. The consequence is stated plainly above:
+    /// the PUT this flow's save performs is outside the era check.
+    pub(super) struct AddAppFlow {
+        /// The vault session this click belongs to -- see `VaultEra` for why an
+        /// era rather than a bare "is it populated?", and
+        /// `add_app_rebuild_source` for what it outranks.
+        era: VaultEra,
+        /// The cache that era was read from, and the only one this flow will
+        /// ever ask. See the type doc's second bullet.
+        cache: Arc<VaultCache>,
     }
 
-    /// The crate's one era-checked read, asked with THIS flow's era, handed to
-    /// `add_app_rebuild_source`. `None` leaves the match engine exactly as it
-    /// is.
-    fn rebuild_source(
-        &self,
-        cache: &VaultCache,
-        saved: &SavedAppMatch,
-        target_item: &deskwarden::vault_bridge::VaultItem,
-    ) -> Option<Vec<deskwarden::vault_bridge::VaultItem>> {
-        add_app_rebuild_source(
-            cache.snapshot_unless_superseded(self.era),
-            saved,
-            target_item,
-        )
+    impl AddAppFlow {
+        /// Captures the era, THEN asks the user which vault item to attach a
+        /// match to. `None` means the user cancelled that first window.
+        ///
+        /// Not `#[cfg(test)]`-testable: `pick_vault_item` opens a real window.
+        /// What it buys is that the ordering is unrepresentable wrong rather
+        /// than tested -- see the type's doc.
+        pub(super) fn begin(cache: &Arc<VaultCache>) -> Option<(Self, VaultItem)> {
+            let flow = Self::capture(cache.clone());
+            let item = picker_ui::pick_vault_item(&flow.cache)?;
+            Some((flow, item))
+        }
+
+        /// The capture itself, in ONE place: the era is read from the very
+        /// `Arc` that is stored beside it, so no caller can pair an era with a
+        /// cache it did not come from. `begin` is its only production caller.
+        fn capture(cache: Arc<VaultCache>) -> Self {
+            Self { era: cache.epoch().era(), cache }
+        }
+
+        /// `begin` minus the window, for the one test that needs a flow and
+        /// cannot open a picker. It goes through `capture`, so the test
+        /// exercises the same binding production does rather than assembling
+        /// its own -- which is precisely the hole this module closed.
+        #[cfg(test)]
+        pub(super) fn begin_without_the_picker(cache: Arc<VaultCache>) -> Self {
+            Self::capture(cache)
+        }
+
+        /// The crate's one era-checked read, asked with THIS flow's era against
+        /// THIS flow's cache, handed to `add_app_rebuild_source`. `None` leaves
+        /// the match engine exactly as it is.
+        pub(super) fn rebuild_source(
+            &self,
+            saved: &SavedAppMatch,
+            target_item: &VaultItem,
+        ) -> Option<Vec<VaultItem>> {
+            add_app_rebuild_source(
+                self.cache.snapshot_unless_superseded(self.era),
+                saved,
+                target_item,
+            )
+        }
     }
 }
+
+use add_app::AddAppFlow;
 
 /// Refreshes the cache from `bw serve` after a completed `bw sync` and says
 /// what that achieved.
@@ -3865,14 +3936,21 @@ mod tests {
         };
         // No server needed: a `clear` supersedes without any request, which is
         // the fact under test.
-        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
-        let flow = AddAppFlow {
-            era: cache.epoch().era(),
-        };
+        //
+        // REVIEW 31'S IMPORTANT 2. This used to read `AddAppFlow { era:
+        // cache.epoch().era() }` -- a literal that proved the type did NOT make
+        // the wrong ordering unrepresentable, since the same literal compiles
+        // anywhere in this file. The fields are now private to `mod add_app`
+        // and this goes through `begin_without_the_picker`, which shares
+        // `begin`'s own capture.
+        let cache = std::sync::Arc::new(VaultCache::new(VaultBridge::new(
+            "http://127.0.0.1:1".to_string(),
+        )));
+        let flow = AddAppFlow::begin_without_the_picker(cache.clone());
         cache.clear();
 
         assert!(
-            flow.rebuild_source(&cache, &saved, &target).is_none(),
+            flow.rebuild_source(&saved, &target).is_none(),
             "a vault session the user did not just edit must arm nothing"
         );
     }

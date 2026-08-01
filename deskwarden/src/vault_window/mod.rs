@@ -45,6 +45,23 @@ const LIST_WIDTH: f32 = 390.0;
 /// already exposes the current code directly.
 const TOTP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the vault window wakes itself when nothing is animating.
+///
+/// This is NOT a frame rate: egui repaints on input regardless. It is the
+/// deadline by which a window that nobody is touching must run a frame anyway,
+/// and everything in `run`'s closure that is time-driven rather than
+/// input-driven depends on it -- the AUTO-LOCK check, the "Synced N min ago"
+/// pill, and the drains of the four background channels (`sync_rx`,
+/// `vault_rx`, `favicon_rx`, `totp_rx`), none of which can be noticed on a
+/// frame that never runs. Requested UNCONDITIONALLY at the top of the frame
+/// closure, above every early return; see the call site.
+const FRAME_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The tighter cadence the loading body asks for on top of [`FRAME_INTERVAL`],
+/// so the spinner animates smoothly and a landed load is painted promptly.
+/// Roughly one 60Hz refresh.
+const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
 /// How long a click-to-delete button (the sidebar's per-folder × button, or
 /// the detail pane's item Delete button) stays armed waiting for a
 /// confirming second click before reverting to its normal state. Chosen
@@ -526,6 +543,34 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // whole of how they stay fixed-size.
         crate::login_ui::draw_resize_handles(ui.ctx());
 
+        // EVERY frame schedules the next one, and it is done HERE -- above the
+        // body match, next to `draw_resize_handles`, for the same structural
+        // reason that call is here (review 31's Important 1).
+        //
+        // This used to sit at the TAIL of the closure, which was true only
+        // while the loading branch was the sole early return: `Loading` asked
+        // for its own faster cadence before returning, and everything else
+        // fell through to the tail. Then `Unavailable` was added as a second
+        // early return and got NEITHER -- so a window whose initial load had
+        // failed rendered its error page and then stopped repainting
+        // altogether. Nothing below this line is what needs the frame:
+        // `last_activity`/AUTO-LOCK, the `sync_rx` drain that spawns the
+        // post-sync reload, the `vault_rx` drain, `favicon_rx` and `totp_rx`
+        // all sit above the body match, so a Sync click from the error page
+        // spawned a thread whose result no frame ever drained, the pill sat on
+        // "Syncing..." until the pointer moved, and the vault stayed unlocked
+        // indefinitely with `bw serve` up -- while `run` held the main thread,
+        // blocking the tray, the global hotkey and the window watcher too.
+        //
+        // Hoisted rather than repeated in the `Unavailable` arm: three call
+        // sites agreeing is what failed once already. Here, "every frame
+        // schedules its successor" is true by construction, and a branch that
+        // wants a tighter cadence (the spinner's 16ms) simply asks for one --
+        // egui keeps the smallest request of the frame, which
+        // `frame_schedule_placement_tests::the_tightest_request_in_a_frame_wins`
+        // asserts against the real `egui::Context` rather than assuming.
+        ui.ctx().request_repaint_after(FRAME_INTERVAL);
+
         // Where the window is right now, kept for the write that happens
         // after the event loop returns. `None` on the frames that describe
         // no restorable geometry (maximized/minimized) LEAVES THE PREVIOUS
@@ -870,14 +915,28 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             );
                         });
                     });
-                // Same fast cadence as the tail of this closure: drives the
-                // spinner's animation and how promptly the load is noticed.
-                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                // A REFINEMENT of the unconditional request at the top of this
+                // closure, not a replacement for it: egui keeps the smallest
+                // request made during a frame, so this tightens `FRAME_INTERVAL`
+                // to roughly one display refresh for as long as the load is in
+                // flight. It drives the spinner's animation and how promptly
+                // the landed load is noticed. If this line is ever deleted, the
+                // window still repaints -- just at the slower idle cadence.
+                ui.ctx().request_repaint_after(LOADING_FRAME_INTERVAL);
                 return;
             }
-            // No spinner and no repaint request: nothing is in flight, and
-            // the way out is the toolbar's Sync button, which is drawn above
-            // this and stays clickable. The reason is the loader's own words
+            // No spinner: nothing is in flight, and the way out is the
+            // toolbar's Sync button, which is drawn above this and stays
+            // clickable. It does NOT follow that this state needs no frames --
+            // the older comment here said exactly that, and it was wrong
+            // (review 31's Important 1): the Sync button spawns a background
+            // thread whose result needs a frame to be drained, and the
+            // auto-lock deadline needs one to be evaluated at all. The
+            // unconditional `request_repaint_after` at the top of this closure
+            // covers this arm; this arm deliberately adds nothing of its own,
+            // because there is no animation here to drive.
+            //
+            // The reason shown is the loader's own words
             // (`VAULT_SUPERSEDED_BEFORE_LOAD` and friends), not a rewrite of
             // them here -- a second wording would be a second thing to keep
             // true.
@@ -1419,9 +1478,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             }
         }
 
-        // Only reached once loaded -- the loading branch above returns with
-        // its own, much faster, cadence.
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        // NOTHING SCHEDULES THE NEXT FRAME HERE ANY MORE. The
+        // `request_repaint_after` that used to close this closure was reachable
+        // only in the `Vault` state, because two branches of the body match
+        // return before it -- see the hoisted call at the TOP of the closure,
+        // next to `draw_resize_handles`, and review 31's Important 1.
     });
 
     // One write, here, after the window is gone -- not per frame, which
@@ -2123,6 +2184,14 @@ const VAULT_SUPERSEDED_BEFORE_LOAD: &str = "the vault was locked before this loa
 const VAULT_CLEARED_WHILE_REFRESHING: &str = "the vault was locked while refreshing";
 /// A populate reported success and yet left nothing readable for this era.
 const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show";
+/// The populate itself failed: `bw serve` refused, errored, or could not be
+/// reached. PROSE, like its three neighbours, and for a concrete reason
+/// (review 31's Minor 2) -- every one of these strings is painted verbatim
+/// under "Your vault could not be loaded", and this one used to be
+/// `format!("{e:?}")`, i.e. a `VaultError` Debug rendering shown to a user as
+/// if it were an explanation. The Debug detail is not lost: `spawn_vault_load_
+/// with_schedule` logs it immediately before sending this.
+const VAULT_REFRESH_FAILED: &str = "the vault could not be read from the local backend";
 
 /// The load worker's first decision, from one call to
 /// [`VaultCache::snapshot_unless_superseded`].
@@ -2286,8 +2355,15 @@ fn spawn_vault_load_with_schedule(
                 return;
             }
             Err(e) => {
+                // The Debug rendering goes to the LOG, where a developer reads
+                // it; the channel carries prose, because whatever it carries is
+                // painted verbatim to the user (review 31's Minor 2). See
+                // `VAULT_REFRESH_FAILED`.
                 log::warn!("could not populate the vault cache: {e:?}");
-                let _ = tx.send((generation, Err(VaultLoadFailure::Refresh(format!("{e:?}")))));
+                let _ = tx.send((
+                    generation,
+                    Err(VaultLoadFailure::Refresh(VAULT_REFRESH_FAILED.to_string())),
+                ));
                 return;
             }
         }
@@ -2384,6 +2460,16 @@ const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
 ///     says the true thing about the vault instead of a false thing about the
 ///     sync.
 ///  4. A successful sync, then nothing at all.
+///
+/// **What step 3 deliberately does NOT distinguish** (review 31's Minor 4).
+/// Both `VaultLoadFailure` variants land on the same
+/// `(ERROR, VAULT_NOT_REFRESHED_PILL)`: at pill size there is no useful copy
+/// that separates "a different vault session began" from "the refresh
+/// failed", and the two are told apart on screen only by the reason string the
+/// `Unavailable` body paints beneath. That body is gated on `items.is_empty()`
+/// -- so if that condition is ever relaxed, the pill becomes the only thing
+/// the user sees and the distinction collapses SILENTLY. Anyone loosening that
+/// gate owes this function a second label.
 fn sync_pill(
     sync_in_progress: bool,
     sync_status: Option<&Result<(), String>>,
@@ -3417,6 +3503,54 @@ mod spawn_vault_load_tests {
         let snapshot = result.expect("bw serve was ready; load must succeed");
         assert_eq!(snapshot.items.len(), 1);
         assert!(snapshot.folders.is_empty());
+    }
+
+    /// Review 31's Minor 2. The reason a `VaultLoadFailure` carries is PAINTED,
+    /// verbatim, under "Your vault could not be loaded" by the `Unavailable`
+    /// body. This arm used to send `format!("{e:?}")`, so a user whose backend
+    /// answered 500 read a Rust `VaultError` Debug rendering -- `Http("...")`
+    /// -- where the other three reasons are hand-written prose. The detail is
+    /// not lost: it is logged one line above the send.
+    #[test]
+    fn a_failed_populate_reports_prose_rather_than_a_debug_rendering() {
+        let mut server = mockito::Server::new();
+        // Answers, so the readiness probe passes, but fails the actual list --
+        // which is what reaches `cache.populate()`'s `Err` arm rather than any
+        // of the era-checked refusals around it.
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(500)
+            .with_body("boom")
+            .create();
+
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        let (tx, rx) = mpsc::channel();
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: true,
+                era,
+                generation: 3,
+                // The readiness probe would also fail against a 500, and its
+                // own message is already prose; skipping it is what puts this
+                // test on the populate arm specifically.
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
+
+        let (_, result) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("load thread must report back");
+        let reason = result.expect_err("a 500 from bw serve is not a vault").reason().to_string();
+        assert!(
+            !reason.contains('"') && !reason.contains('('),
+            "this string is painted to the user under \"Your vault could not be loaded\" -- a \
+             Rust Debug rendering is not an explanation: {reason:?}"
+        );
+        assert_eq!(reason, super::VAULT_REFRESH_FAILED);
     }
 
     #[test]
@@ -4532,6 +4666,214 @@ mod window_era_placement_tests {
             "{SPAWN_USE:?} must appear once per `spawn_vault_load` call in `run` (the initial \
              load and the post-sync reload). Fewer means a spawn is checked against something \
              other than the window's own vault session."
+        );
+    }
+
+    #[test]
+    fn the_production_slice_is_not_quietly_shrinking() {
+        // Review 31's Minor 5. `production()` slices at the FIRST `#[cfg(test)]`
+        // and nothing said that no production item follows it -- true today,
+        // but this file is ~4900 lines and a new `impl` appended below the test
+        // modules would be invisible to every guard above. Two cheap checks:
+        //
+        //  * the WHOLE file holds exactly the two spawn uses the slice found,
+        //    so a third spawn added after the marker cannot hide from
+        //    `both_spawns_are_checked_against_that_one_era`;
+        //  * the slice still covers most of the file, so if the marker ever
+        //    moves to the top (a `#[cfg(test)] use` at the head, say) the
+        //    guards fail loudly instead of passing over an empty string.
+        let source = include_str!("mod.rs");
+        assert_eq!(
+            source.matches(SPAWN_USE).count(),
+            2,
+            "the whole file holds {} of {SPAWN_USE:?} but the production slice holds {}. If the \
+             file has MORE, a spawn was added below the first `#[cfg(test)]` where the count \
+             above cannot see it; if it has FEWER, a spawn stopped being checked against the \
+             window's own era entirely",
+            source.matches(SPAWN_USE).count(),
+            production().matches(SPAWN_USE).count()
+        );
+        let covered = production().len() as f64 / source.len() as f64;
+        assert!(
+            covered > 0.5,
+            "the production slice is only {:.0}% of the file: the first {TESTS_BEGIN:?} has \
+             moved up, so every guard in this module is now inspecting a fraction of the \
+             production code and passing for the wrong reason",
+            covered * 100.0
+        );
+    }
+}
+
+#[cfg(test)]
+mod frame_schedule_placement_tests {
+    //! Review 31's Important 1. `run`'s frame closure must schedule the NEXT
+    //! frame on EVERY path, including the ones that return early.
+    //!
+    //! The regression this pins: the `VaultBodyState::Unavailable` arm drew its
+    //! error page and returned, skipping the `request_repaint_after` that used
+    //! to sit only at the tail. Everything that needs a frame to happen at all
+    //! -- the auto-lock deadline, the `sync_rx`/`vault_rx`/`favicon_rx`/
+    //! `totp_rx` drains -- sits ABOVE the body match, so a window parked in
+    //! that state stopped draining its channels and, far worse, STOPPED
+    //! AUTO-LOCKING: `last_activity.elapsed()` is never evaluated on a frame
+    //! that never runs, and `run` holds the main thread, so the tray, the
+    //! global hotkey and the window watcher stay blocked the whole time.
+    //!
+    //! WHAT THIS MODULE CAN AND CANNOT SEE, PLAINLY. The frame closure lives
+    //! inside `eframe::run_ui_native` and opens a real OS window; no test in
+    //! this crate can call it, so no test can watch a real `Unavailable` frame
+    //! and read its `repaint_delay` back. What IS observable is (a) the egui
+    //! semantics the single hoisted call rests on -- see
+    //! `the_tightest_request_in_a_frame_wins` below, which runs a real
+    //! `egui::Context` -- and (b) the source-level fact that the call precedes
+    //! every early return, which is what makes "every frame schedules the next
+    //! one" true by construction rather than by three call sites agreeing.
+    //! (b) is the same source-text guard idiom as `window_era_placement_tests`
+    //! and `reveal_state_placement_tests`, and the same split-literal rule
+    //! applies: do not re-join these needles, or they match themselves.
+    use eframe::egui;
+    use std::time::Duration;
+
+    const SCHEDULE: &str = concat!("ui.ctx().request_repaint", "_after(FRAME_INTERVAL);");
+    const BODY_MATCH: &str = concat!("match vault_body", "_state(");
+    const ANY_SCHEDULE: &str = concat!("request_repaint", "_after(");
+    const TESTS_BEGIN: &str = concat!("#[cfg(", "test)]");
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(TESTS_BEGIN)
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    #[test]
+    fn the_frame_schedules_its_successor_before_any_early_return() {
+        let production = production();
+        let schedule = production.find(SCHEDULE).unwrap_or_else(|| {
+            panic!(
+                "{SCHEDULE:?} is not in the production code. The frame closure must schedule the \
+                 next frame in exactly one place, above the body match -- if it was renamed, \
+                 update this needle; if it was moved back to the tail, the `Unavailable` body's \
+                 early return silently stops the auto-lock timer again"
+            )
+        });
+        let body = production.find(BODY_MATCH).unwrap_or_else(|| {
+            panic!("{BODY_MATCH:?} is not in the production code -- update this needle")
+        });
+        assert!(
+            schedule < body,
+            "the repaint request is at byte {schedule}, below the body match at {body}. Both the \
+             loading branch and the unavailable branch return from inside that match, so anything \
+             below it runs only in the `Vault` state"
+        );
+        // Only the font-setup guard at the very top of the closure returns
+        // before the schedule, and that one calls `request_repaint()` itself.
+        assert_eq!(
+            production[..schedule].matches("\n            return;").count(),
+            1,
+            "a second early return was added above the repaint request. Every path out of the \
+             frame closure must have scheduled the next frame first"
+        );
+    }
+
+    #[test]
+    fn nothing_else_schedules_a_frame_behind_its_back() {
+        // Exactly two: the one hoisted call, and the loading branch's tighter
+        // refinement of it. A third would mean the cadence is back to being a
+        // property of which branch you happen to be in.
+        assert_eq!(
+            production().matches(ANY_SCHEDULE).count(),
+            2,
+            "{ANY_SCHEDULE:?} must appear exactly twice in production: the unconditional \
+             per-frame schedule and the loading branch's faster one"
+        );
+    }
+
+    /// Runs `frame` on a SETTLED `egui::Context` and returns the delay egui
+    /// scheduled for the next frame.
+    ///
+    /// MEASURED, NOT ASSUMED, and the reason this helper exists: a fresh
+    /// `Context` reports `0ns` no matter what the frame asks for, because egui
+    /// zeroes `repaint_delay` while any repaint is still outstanding (fonts,
+    /// first layout). The first draft of this test read `0ns` where it expected
+    /// `16ms` and would have "passed" against any production code at all had it
+    /// been written the other way round. So: idle frames first, until egui
+    /// reports `Duration::MAX` ("nothing pending, sleep until input") -- only
+    /// then does the delay measure the frame rather than the warm-up.
+    fn scheduled_delay(frame: impl FnMut(&mut egui::Ui)) -> Duration {
+        fn delay_of(output: eframe::egui::FullOutput) -> Duration {
+            output
+                .viewport_output
+                .values()
+                .map(|v| v.repaint_delay)
+                .min()
+                .expect("a frame always produces one viewport")
+        }
+        let ctx = egui::Context::default();
+        let mut settled = false;
+        for _ in 0..16 {
+            if delay_of(ctx.run_ui(Default::default(), |_| {})) == Duration::MAX {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "the context never went idle -- this measurement would be of the warm-up");
+        delay_of(ctx.run_ui(Default::default(), frame))
+    }
+
+    #[test]
+    fn the_tightest_request_in_a_frame_wins() {
+        // The fact the hoist rests on, asserted against the real egui rather
+        // than assumed from its docs: calling the slow schedule first and the
+        // spinner's fast one afterwards must leave the FAST one standing, or
+        // hoisting would have slowed the loading spinner from 16ms to 500ms.
+        //
+        // Compared RELATIVELY, not against the literals passed in: egui
+        // subtracts its predicted frame time from every request (so a 16ms ask
+        // comes back as 0ns at the default 60fps). Pinning the arithmetic would
+        // be pinning egui's internals; the property the production code needs
+        // is only that the second, tighter call is the one that survives.
+        let slow = scheduled_delay(|ui| {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        });
+        let fast = scheduled_delay(|ui| {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        });
+        let both = scheduled_delay(|ui| {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        });
+        assert!(fast < slow, "the fixture is wrong if 16ms is not tighter than 500ms");
+        assert_eq!(
+            both, fast,
+            "egui must keep the tightest request of the frame ({both:?} vs {fast:?}), or hoisting \
+             the 500ms schedule above the loading branch would have slowed the spinner to 2fps"
+        );
+    }
+
+    #[test]
+    fn a_frame_that_only_makes_the_hoisted_request_is_still_scheduled() {
+        // The `Unavailable` shape: no branch of its own adds anything, so the
+        // hoisted call is the only one that runs, and it must still leave a
+        // finite deadline behind.
+        let hoisted_only = scheduled_delay(|ui| {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        });
+        assert!(
+            hoisted_only < Duration::from_millis(600),
+            "a frame that makes only the unconditional request must be scheduled roughly at that \
+             cadence, not {hoisted_only:?}"
+        );
+        // And the regression itself: a frame that requests nothing sleeps until
+        // an input event wakes it, which is exactly how the auto-lock deadline
+        // stopped being evaluated and the `sync_rx` drain stopped running.
+        assert_eq!(
+            scheduled_delay(|_| {}),
+            Duration::MAX,
+            "if this ever stops being MAX, egui has started polling on its own and this whole \
+             finding changes shape -- do not weaken the production fix on that basis without \
+             re-reading it"
         );
     }
 }
