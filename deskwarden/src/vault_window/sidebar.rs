@@ -125,6 +125,16 @@ pub enum SidebarAction {
     /// `vault_window::mod` opens the "Edit folder" modal in response (see
     /// `folder_modal`), which is where rename and delete actually happen.
     EditFolder(String),
+    /// An item row was dragged out of the item list and dropped on a folder
+    /// row that will take it. Both ids are carried; the caller resolves the
+    /// item itself.
+    MoveItemToFolder { item_id: String, folder_id: String },
+    /// An item row was dropped on a folder row that will NOT take it,
+    /// carrying the reason for the caller to show inline.
+    ///
+    /// Its own variant, and not simply `None`, because the whole point of the
+    /// refusal is that it is not silent -- see [`DropOutcome`].
+    RefusedMove(&'static str),
 }
 
 /// Whether `folder` is `bw serve`'s virtual "No Folder" bucket rather than
@@ -282,7 +292,16 @@ pub fn draw_sidebar(
         }
         ui.add_space(SECTION_LABEL_INSET);
         ui.spacing_mut().item_spacing.y = ROW_GAP;
-        for folder in folders {
+        // What is being dragged over this window right now, if anything, and
+        // what each folder row would do with it. Both read ONCE, before the
+        // loop: `drop_outcomes` returns one verdict per folder in this exact
+        // order, and it is the single place that decision is made -- see its
+        // doc for why it cannot live inside the loop.
+        let dragged = egui::DragAndDrop::payload::<crate::vault_window::item_list::DraggedItem>(
+            ui.ctx(),
+        );
+        let outcomes = dragged.as_ref().map(|item| drop_outcomes(folders, item));
+        for (index, folder) in folders.iter().enumerate() {
             // The virtual "No Folder" bucket gets the filter that says what
             // it means. Building `Folder(folder.id.clone())` here for *every*
             // row is what gave that row `Folder("")`, a filter for a folder
@@ -300,6 +319,61 @@ pub fn draw_sidebar(
             let response = sidebar_row(ui, &folder.name, count, *selected == filter, row_width);
             if response.clicked() {
                 *selected = filter.clone();
+            }
+            // The drop half of the row. Painted AFTER `sidebar_row` and as an
+            // OUTLINE rather than a fill, deliberately: the row has already
+            // painted its own label and count, and a filled wash here would
+            // cover them. Nothing is allocated -- the outline goes onto the
+            // rect the row already claimed -- so this cannot change the
+            // sidebar's row pitch.
+            if let Some(outcome) = outcomes.as_ref().map(|o| &o[index]) {
+                let (color, width) = match outcome {
+                    // Every folder that would take the item says so for the
+                    // whole drag, not only under the pointer: a target the
+                    // user has to guess at is a target they will drop next
+                    // to. The one under the pointer is drawn heavier.
+                    DropOutcome::Accept => {
+                        (theme::BLUE, if response.contains_pointer() { 2.0 } else { 1.0 })
+                    }
+                    // REFUSED, VISIBLY -- not inert. A row that looked
+                    // identical to its neighbours and quietly swallowed the
+                    // gesture is the silent no-op this window keeps having to
+                    // un-write; see `CANNOT_UNFILE`.
+                    DropOutcome::Refuse(_) => {
+                        (theme::ERROR, if response.contains_pointer() { 2.0 } else { 1.0 })
+                    }
+                };
+                ui.painter().rect_stroke(
+                    response.rect,
+                    CornerRadius::same(8),
+                    egui::Stroke::new(width, color),
+                    egui::StrokeKind::Inside,
+                );
+                if response.contains_pointer() {
+                    ui.ctx().set_cursor_icon(match outcome {
+                        DropOutcome::Accept => egui::CursorIcon::Grabbing,
+                        DropOutcome::Refuse(_) => egui::CursorIcon::NotAllowed,
+                    });
+                }
+            }
+            // Consumed on EVERY folder row, accepting or not: the gesture
+            // ended here, and leaving the payload on the clipboard for a
+            // refused drop would let it be picked up by whatever the pointer
+            // crossed next.
+            if let Some(item) =
+                response.dnd_release_payload::<crate::vault_window::item_list::DraggedItem>()
+            {
+                // Re-read rather than reused from `outcomes` above, which was
+                // computed from the payload as it stood at the top of this
+                // function; they agree, and that is exactly why neither has to
+                // be trusted to.
+                action = match drop_outcomes(folders, &item)[index] {
+                    DropOutcome::Accept => SidebarAction::MoveItemToFolder {
+                        item_id: item.id.clone(),
+                        folder_id: folder.id.clone(),
+                    },
+                    DropOutcome::Refuse(reason) => SidebarAction::RefusedMove(reason),
+                };
             }
             // Vertically, the row's own returned rect (same span, same
             // height) -- not a nested `ui.horizontal`, which is what caused
@@ -339,6 +413,76 @@ pub fn draw_sidebar(
     });
 
     action
+}
+
+/// What a folder row does when an item is released on it.
+///
+/// Two variants, and a refusal that carries its reason, because "nothing
+/// happened" and "this cannot happen, here is why" are different states and
+/// collapsing them is the failure this window keeps having to un-write. There
+/// is deliberately no third "silently ignore" variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropOutcome {
+    /// The move will be attempted.
+    Accept,
+    /// The drop is refused, out loud. The string is shown to the user.
+    Refuse(&'static str),
+}
+
+/// Why the virtual "No Folder" row refuses every drop.
+///
+/// **Not a UI decision and not fixable in this crate.** `bw serve` (CLI
+/// 2026.7.0) cannot clear a folder assignment: omitting `folderId`, sending
+/// `null`, sending `""` and sending a fully round-tripped object were each
+/// measured against a control field that DID change in the same request
+/// (`.superpowers/sdd/put-semantics-capture.md`). A drop here would return
+/// success and leave the item exactly where it was. The row therefore refuses
+/// visibly rather than being made inert: an inert row that looks like every
+/// other folder row is the same silent no-op with the explanation removed.
+///
+/// Worth re-testing after a CLI upgrade -- current `bitwarden/clients` main
+/// assigns `folderId` unconditionally, so this looks like a version
+/// difference rather than a permanent property of the API.
+pub const CANNOT_UNFILE: &str =
+    "\"No Folder\" isn't a place an item can be moved to -- the Bitwarden CLI this build talks \
+     to cannot take an item out of a folder, so the drop was refused rather than looking like \
+     it worked.";
+
+/// Why the folder an item already lives in refuses it. The same fact the
+/// row menu's "Move to folder" submenu greys that destination for.
+pub const ALREADY_IN_THIS_FOLDER: &str = "That item is already in this folder.";
+
+/// What each of `folders` does when `dragged` is released on it -- **one
+/// entry per folder, in the order the sidebar draws them**, which is what
+/// lets the FOLDERS loop zip this against itself.
+///
+/// Built on [`assignable_folders`], the EXISTING predicate for "folders an
+/// item can be moved into", rather than on a second copy of the same
+/// `is_virtual_folder` filter: one definition of "virtual" is what keeps this,
+/// the row menu's submenu and the edit form's dropdown from drifting apart.
+///
+/// Pure, and the single source of what a drop does, because nothing in this
+/// crate can call [`draw_sidebar`] with a live drag in flight without a real
+/// egui context -- a per-folder decision made inside that loop would be one
+/// no unit test could reach.
+///
+/// [`assignable_folders`]: super::detail_edit::assignable_folders
+pub fn drop_outcomes(folders: &[Folder], dragged: &crate::vault_window::item_list::DraggedItem) -> Vec<DropOutcome> {
+    let assignable = super::detail_edit::assignable_folders(folders);
+    folders
+        .iter()
+        .map(|folder| {
+            if !assignable.iter().any(|f| f.id == folder.id) {
+                // The only way `assignable_folders` drops a row is
+                // `is_virtual_folder`, so this is the un-file case.
+                return DropOutcome::Refuse(CANNOT_UNFILE);
+            }
+            if dragged.folder_id.as_deref() == Some(folder.id.as_str()) {
+                return DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER);
+            }
+            DropOutcome::Accept
+        })
+        .collect()
 }
 
 /// A section header ("VAULT"/"FOLDERS"): 11px Bold, letterspaced, ghost
@@ -482,6 +626,474 @@ fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool, wid
     );
 
     response
+}
+
+#[cfg(test)]
+mod drop_outcome_tests {
+    //! What each folder row does when an item is dragged onto it.
+    //!
+    //! Every assertion reads the WHOLE outcome list, one entry per folder in
+    //! the order the sidebar draws them -- not "is Work an accepting
+    //! target". A test that probed only for what it expected would pass just
+    //! as happily against a sidebar that ALSO accepted the virtual bucket,
+    //! which is the one outcome here that cannot be allowed.
+    use super::*;
+    use crate::vault_window::item_list::DraggedItem;
+
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder { id: id.into(), name: name.into(), other: serde_json::Map::new() }
+    }
+
+    fn dragged(folder_id: Option<&str>) -> DraggedItem {
+        DraggedItem { id: "i1".into(), folder_id: folder_id.map(str::to_string) }
+    }
+
+    /// The list `bw serve` really returns: its virtual "No Folder" bucket
+    /// (empty id) alongside real folders.
+    fn a_real_looking_vault() -> Vec<Folder> {
+        vec![folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")]
+    }
+
+    #[test]
+    fn an_unfiled_item_may_go_into_any_real_folder_and_nowhere_else() {
+        assert_eq!(
+            drop_outcomes(&a_real_looking_vault(), &dragged(None)),
+            vec![
+                DropOutcome::Refuse(CANNOT_UNFILE),
+                DropOutcome::Accept,
+                DropOutcome::Accept,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_virtual_no_folder_bucket_is_never_a_working_target() {
+        // The measured fact this whole feature is shaped around: `bw serve`
+        // (CLI 2026.7.0) cannot clear a folder assignment. Omitting the key,
+        // `null`, `""` and a fully round-tripped object were each proven
+        // against a control field that DID change in the same request. A drop
+        // there would write successfully and do nothing, which is the exact
+        // silent no-op this project keeps finding -- so it is refused, out
+        // loud, with a reason.
+        for from in [None, Some("f1"), Some("f2")] {
+            assert_eq!(
+                drop_outcomes(&a_real_looking_vault(), &dragged(from))[0],
+                DropOutcome::Refuse(CANNOT_UNFILE),
+                "the virtual bucket accepted an item dragged from {from:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_folder_the_item_already_lives_in_is_refused_for_its_own_reason() {
+        // A write that achieves nothing, and a different refusal from the
+        // un-file one -- the user needs to be told which of the two happened.
+        assert_eq!(
+            drop_outcomes(&a_real_looking_vault(), &dragged(Some("f1"))),
+            vec![
+                DropOutcome::Refuse(CANNOT_UNFILE),
+                DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER),
+                DropOutcome::Accept,
+            ]
+        );
+    }
+
+    #[test]
+    fn there_is_exactly_one_outcome_per_folder_in_the_order_they_are_drawn() {
+        // The sidebar zips this list against its own FOLDERS loop, so a
+        // shorter or reordered result would attach one folder's verdict to
+        // another folder's row.
+        let folders = a_real_looking_vault();
+        let outcomes = drop_outcomes(&folders, &dragged(Some("f2")));
+        assert_eq!(outcomes.len(), folders.len());
+        assert_eq!(outcomes[2], DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER));
+    }
+
+    #[test]
+    fn a_vault_with_no_real_folders_accepts_nothing() {
+        assert_eq!(
+            drop_outcomes(&[folder("", "No Folder")], &dragged(None)),
+            vec![DropOutcome::Refuse(CANNOT_UNFILE)]
+        );
+        assert_eq!(drop_outcomes(&[], &dragged(None)), Vec::<DropOutcome>::new());
+    }
+
+    #[test]
+    fn the_accepting_targets_are_exactly_the_assignable_folders_minus_the_current_one() {
+        // Tied to `detail_edit::assignable_folders`, the EXISTING predicate
+        // for "folders an item can be moved into", rather than to a second
+        // copy of the same filter -- one definition of "virtual" is what
+        // keeps this, the row menu's submenu and the edit form's dropdown
+        // from drifting apart.
+        let folders = a_real_looking_vault();
+        let accepting: Vec<&str> = drop_outcomes(&folders, &dragged(Some("f1")))
+            .iter()
+            .zip(&folders)
+            .filter(|(outcome, _)| **outcome == DropOutcome::Accept)
+            .map(|(_, folder)| folder.id.as_str())
+            .collect();
+        assert_eq!(accepting, vec!["f2"]);
+    }
+}
+
+#[cfg(test)]
+mod drag_and_drop_tests {
+    //! Dragging an item row onto a folder row, driven end to end.
+    //!
+    //! WHAT THIS HARNESS IS AND IS NOT. It draws the REAL [`draw_sidebar`]
+    //! and the REAL `item_list::draw_item_list` side by side in ONE
+    //! `egui::Context`, and pushes real pointer events through them, so the
+    //! drag payload, the drop detection and the refusals are all exercised as
+    //! they ship. What it is not is `vault_window::run` -- that opens an OS
+    //! window inside `eframe` and no test in this crate can call it -- so the
+    //! two panes are laid out by this module rather than by `Panel::left`.
+    //! The thing that could differ is the panes' geometry, and nothing here
+    //! depends on it beyond "the sidebar is left of the item list".
+    use super::*;
+    use crate::vault_window::item_list::{draw_item_list, IconCache};
+    use crate::theme;
+
+    const SIDEBAR_WIDTH: f32 = 212.0;
+    const LIST_WIDTH: f32 = 390.0;
+    const HEIGHT: f32 = 700.0;
+
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder { id: id.into(), name: name.into(), other: serde_json::Map::new() }
+    }
+
+    fn login(name: &str, folder_id: Option<&str>) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: folder_id.map(str::to_string),
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// What one run of the harness observed.
+    struct Run {
+        action: SidebarAction,
+        /// Every string painted on the measured frame, with its rect.
+        texts: Vec<(String, egui::Rect)>,
+        /// Every rect painted with a visible stroke, on the measured frame.
+        strokes: Vec<(egui::Rect, egui::Stroke)>,
+        /// What the item list left `selected_id` at.
+        selected: Option<String>,
+    }
+
+    fn walk(shape: &egui::Shape, run: &mut Run) {
+        match shape {
+            egui::Shape::Text(text) => run
+                .texts
+                .push((text.galley.text().to_string(), egui::Rect::from_min_size(text.pos, text.galley.size()))),
+            egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                run.strokes.push((rect.rect, rect.stroke))
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, run);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Draws both panes for `frames` frames of events and returns what the
+    /// LAST one produced -- the same "measure the frame the gesture resolves
+    /// on" rule `item_list`'s menu harness follows.
+    fn run_frames(
+        items: &[VaultItem],
+        folders: &[Folder],
+        frames: Vec<Vec<egui::Event>>,
+    ) -> Run {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(SIDEBAR_WIDTH + LIST_WIDTH, HEIGHT),
+        );
+        let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        // Two throwaway frames so `theme::apply`'s font set is live.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut filter = SidebarFilter::All;
+        let mut search = String::new();
+        let mut selected_id: Option<String> = None;
+        let icons = IconCache::default();
+        let mut visible = Vec::new();
+        let mut action = SidebarAction::None;
+        let mut draw = |ctx: &egui::Context, raw: egui::RawInput| {
+            ctx.run_ui(raw, |ui| {
+                ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(SIDEBAR_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            action = draw_sidebar(ui, items, folders, &mut filter, "Locks in 11:42");
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(LIST_WIDTH, HEIGHT),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            draw_item_list(
+                                ui,
+                                items,
+                                folders,
+                                &SidebarFilter::All,
+                                &mut search,
+                                &mut selected_id,
+                                None,
+                                &icons,
+                                &mut visible,
+                                None,
+                            );
+                        },
+                    );
+                });
+            })
+        };
+        let _ = draw(&ctx, input());
+        let mut output = None;
+        for events in frames {
+            output = Some(draw(&ctx, egui::RawInput { events, ..input() }));
+        }
+        let output = output.unwrap_or_else(|| draw(&ctx, input()));
+
+        let mut run = Run {
+            action,
+            texts: Vec::new(),
+            strokes: Vec::new(),
+            selected: selected_id,
+        };
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut run);
+        }
+        run
+    }
+
+    /// The centre of whatever painted `label` -- an item row's title or a
+    /// folder row's name. Read off a real frame rather than computed from the
+    /// row-height constants, so a test cannot aim at the wrong place in
+    /// exactly the case (a row whose height changed) it exists to catch.
+    fn centre_of(items: &[VaultItem], folders: &[Folder], label: &str) -> egui::Pos2 {
+        let run = run_frames(items, folders, Vec::new());
+        run.texts
+            .iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| {
+                panic!("{label:?} was never painted; the frame drew {:?}",
+                    run.texts.iter().map(|(t, _)| t).collect::<Vec<_>>())
+            })
+            .1
+            .center()
+    }
+
+    /// The event frames for picking a row up and letting go over `to`.
+    ///
+    /// The intermediate moves are not padding: egui only decides a press is a
+    /// DRAG once the pointer has travelled past its threshold, and
+    /// `dnd_set_drag_payload` puts the payload on the clipboard on the frame
+    /// `drag_started` fires. A press-then-release with no travel is a CLICK,
+    /// which is the other half of what these tests pin.
+    fn drag_frames(from: egui::Pos2, to: egui::Pos2) -> Vec<Vec<egui::Event>> {
+        let button = |pos: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut frames = vec![
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerMoved(from), button(from, true)],
+        ];
+        // Travel in a few steps, so the drag is decided well before the
+        // pointer arrives.
+        for step in 1..=4 {
+            let t = step as f32 / 4.0;
+            frames.push(vec![egui::Event::PointerMoved(from + (to - from) * t)]);
+        }
+        frames.push(vec![egui::Event::PointerMoved(to), button(to, false)]);
+        frames
+    }
+
+    fn a_vault() -> (Vec<VaultItem>, Vec<Folder>) {
+        (
+            vec![login("Ledgerline", None), login("Vantage", Some("f1"))],
+            vec![folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")],
+        )
+    }
+
+    #[test]
+    fn dropping_an_item_on_a_real_folder_asks_for_that_move() {
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Ledgerline");
+        let to = centre_of(&items, &folders, "Personal");
+        let run = run_frames(&items, &folders, drag_frames(from, to));
+        assert_eq!(
+            run.action,
+            SidebarAction::MoveItemToFolder {
+                item_id: "Ledgerline".to_string(),
+                folder_id: "f2".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn dropping_an_item_on_the_virtual_no_folder_row_is_refused_out_loud() {
+        // THE DECISION THIS FEATURE TURNS ON. `bw serve` cannot un-file an
+        // item, so the choice was between an inert row and a visibly refused
+        // one. Inert loses: a row that looks exactly like the two below it
+        // and swallows the gesture is the silent no-op this project keeps
+        // finding. The drop is consumed, refused, and the reason is handed
+        // back for the caller to show.
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Vantage");
+        let to = centre_of(&items, &folders, "No Folder");
+        let run = run_frames(&items, &folders, drag_frames(from, to));
+        assert_eq!(run.action, SidebarAction::RefusedMove(CANNOT_UNFILE));
+    }
+
+    #[test]
+    fn dropping_an_item_on_the_folder_it_already_lives_in_is_refused_for_its_own_reason() {
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Vantage"); // already in "f1"
+        let to = centre_of(&items, &folders, "Work");
+        let run = run_frames(&items, &folders, drag_frames(from, to));
+        assert_eq!(run.action, SidebarAction::RefusedMove(ALREADY_IN_THIS_FOLDER));
+    }
+
+    #[test]
+    fn a_drag_that_ends_on_a_vault_row_moves_nothing() {
+        // "All items" is not a folder and must not behave like one. Nothing
+        // there paints a drop highlight, so this is not the silent-no-op
+        // case: there is no affordance offered and none taken away.
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Ledgerline");
+        let to = centre_of(&items, &folders, "All items");
+        let run = run_frames(&items, &folders, drag_frames(from, to));
+        assert_eq!(run.action, SidebarAction::None);
+    }
+
+    #[test]
+    fn dragging_a_row_does_not_select_it() {
+        // How drag sensing coexists with row selection: a press that travels
+        // is a drag and NOT a click, so the selection (and everything
+        // `vault_window::run` resets off it -- the open draft, the revealed
+        // password, the TOTP poll) is left alone by a gesture that was only
+        // ever about moving the item.
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Ledgerline");
+        let to = centre_of(&items, &folders, "Personal");
+        let run = run_frames(&items, &folders, drag_frames(from, to));
+        // The move is asserted in the same breath, deliberately: "nothing was
+        // selected" is also true of a build where the drag never happened, so
+        // on its own this would be a test that cannot fail. Pinned together,
+        // it can only pass when the gesture WAS a drag and was NOT a click.
+        assert_eq!(
+            run.action,
+            SidebarAction::MoveItemToFolder {
+                item_id: "Ledgerline".to_string(),
+                folder_id: "f2".to_string(),
+            }
+        );
+        assert_eq!(run.selected, None, "the drag selected the row it picked up");
+    }
+
+    #[test]
+    fn a_press_that_does_not_travel_still_selects_the_row() {
+        // The other half of the same rule, and the pre-existing behaviour:
+        // `Sense::click_and_drag` must not have quietly turned every click
+        // into a drag.
+        let (items, folders) = a_vault();
+        let at = centre_of(&items, &folders, "Ledgerline");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let run = run_frames(
+            &items,
+            &folders,
+            vec![
+                vec![egui::Event::PointerMoved(at), button(true)],
+                vec![button(false)],
+            ],
+        );
+        assert_eq!(run.selected.as_deref(), Some("Ledgerline"));
+    }
+
+    /// The rect of the folder row whose name is `label`, found from that
+    /// name's own galley -- the row is a painted band, not a widget with a
+    /// rect this harness can ask for.
+    fn row_band(run: &Run, label: &str) -> egui::Rect {
+        let text = run
+            .texts
+            .iter()
+            .find(|(t, _)| t == label)
+            .unwrap_or_else(|| panic!("{label:?} was never painted"))
+            .1;
+        run.strokes
+            .iter()
+            .map(|(rect, _)| *rect)
+            .find(|rect| rect.contains_rect(text) && rect.width() < SIDEBAR_WIDTH)
+            .unwrap_or_else(|| panic!("no outlined row band around {label:?}"))
+    }
+
+    #[test]
+    fn a_drag_in_flight_outlines_the_folders_that_would_take_it_and_the_one_that_would_not() {
+        // The visible half of "refused, not inert". Mid-drag, every folder
+        // row states its verdict: the two that would accept are outlined in
+        // the accent colour, the virtual bucket in the error colour. A test
+        // that only checked the drop's RESULT would pass against a sidebar
+        // that looked completely dead while the item was in the air.
+        let (items, folders) = a_vault();
+        let from = centre_of(&items, &folders, "Vantage"); // in "f1"
+        let to = centre_of(&items, &folders, "Personal");
+        // Stop one frame short of the release, so this reads the drag in
+        // flight rather than its outcome.
+        let mut frames = drag_frames(from, to);
+        frames.pop();
+        frames.push(vec![egui::Event::PointerMoved(to)]);
+        let run = run_frames(&items, &folders, frames);
+
+        let stroke_of = |label: &str| {
+            let band = row_band(&run, label);
+            run.strokes
+                .iter()
+                .find(|(rect, _)| *rect == band)
+                .expect("band vanished")
+                .1
+                .color
+        };
+        assert_eq!(stroke_of("No Folder"), theme::ERROR, "the virtual bucket did not refuse visibly");
+        assert_eq!(stroke_of("Work"), theme::ERROR, "the item's own folder did not refuse visibly");
+        assert_eq!(stroke_of("Personal"), theme::BLUE, "an accepting folder was not offered");
+    }
+
+    #[test]
+    fn nothing_is_outlined_when_no_drag_is_in_flight() {
+        // Otherwise the assertion above would be about permanent decoration.
+        let (items, folders) = a_vault();
+        let run = run_frames(&items, &folders, Vec::new());
+        for label in ["No Folder", "Work", "Personal"] {
+            let text = run.texts.iter().find(|(t, _)| t == label).expect("row missing").1;
+            assert!(
+                !run.strokes.iter().any(|(rect, _)| rect.contains_rect(text) && rect.width() < SIDEBAR_WIDTH),
+                "{label:?} is outlined with no drag in flight"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

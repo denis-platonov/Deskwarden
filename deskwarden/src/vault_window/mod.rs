@@ -471,6 +471,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
     let mut folder_edit: Option<FolderEditState> = None;
+    // The inline "that move did not happen" message, shown under the item
+    // list's toolbar. Set by a drag-to-folder that the sidebar refused (the
+    // virtual "No Folder" bucket, or the folder the item is already in) or
+    // that the backend rejected; cleared when the user clicks it away, and
+    // whenever a new drag begins -- an explanation of the last gesture must
+    // not still be sitting there describing the next one.
+    let mut move_error: Option<String> = None;
 
     let mut styled = false;
     // Where this window was when it was last closed, re-homed onto the
@@ -975,6 +982,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // duplicate the chrome bar's own bottom hairline on the *top* edge
         // -- the two sat flush against each other and read as one doubled
         // line right under the titlebar.
+        // A drag begun this frame supersedes whatever the LAST one had to
+        // say, so the stale explanation goes before the sidebar can post a
+        // new one. Read before the panels draw: the payload is on egui's
+        // clipboard from the frame the drag starts until the frame it is
+        // released on, and on that release frame this clear runs first and
+        // the refusal below runs second, so a refusal is never wiped by the
+        // gesture that produced it.
+        if egui::DragAndDrop::has_payload_of_type::<item_list::DraggedItem>(ui.ctx()) {
+            move_error = None;
+        }
+        // Set by a drop on a folder row below: `Ok` is a move to attempt,
+        // `Err` a refusal the sidebar already decided. Drained after the
+        // panel, for the same reason `row_command` is.
+        let mut folder_drop: Option<Result<(String, String), &'static str>> = None;
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -999,9 +1020,36 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             folder_edit = Some(FolderEditState::new(folder.id.clone(), folder.name.clone()));
                         }
                     }
+                    // An item row was dragged onto a folder row. Not acted on
+                    // here: this closure holds `items` borrowed for the
+                    // sidebar's own counts, and the write has to be able to
+                    // rewrite the entry it moves.
+                    SidebarAction::MoveItemToFolder { item_id, folder_id } => {
+                        folder_drop = Some(Ok((item_id, folder_id)))
+                    }
+                    // A drop the sidebar refused -- the virtual "No Folder"
+                    // bucket, or the folder the item is already in. Carried
+                    // out rather than swallowed: see `sidebar::CANNOT_UNFILE`.
+                    SidebarAction::RefusedMove(reason) => folder_drop = Some(Err(reason)),
                     SidebarAction::None => {}
                 }
             });
+
+        // The drop the sidebar reported, acted on now that `items` is free.
+        match folder_drop.take() {
+            Some(Ok((item_id, folder_id))) => {
+                move_error = move_item_into_folder(
+                    ui.ctx(),
+                    &cache,
+                    &needs_reauth_for_closure,
+                    &mut items,
+                    &item_id,
+                    &folder_id,
+                );
+            }
+            Some(Err(reason)) => move_error = Some(reason.to_string()),
+            None => {}
+        }
 
         // Same reasoning as `vault-sidebar` above: no own stroke, `Panel`'s
         // built-in separator already draws the right-edge divider.
@@ -1014,6 +1062,9 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // Set by an item row's right-click menu below, and drained further
         // down once the selection that right-click made has been reacted to.
         let mut row_command: Option<(String, item_list::RowCommand)> = None;
+        // The inline move-error band was clicked away. Applied after the
+        // closure for the same reason: `move_error` is borrowed by it.
+        let mut dismiss_move_error = false;
         egui::Panel::left("vault-item-list")
             .exact_size(LIST_WIDTH)
             .resizable(false)
@@ -1029,6 +1080,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
                     &icons,
                     &mut visible_ids,
+                    move_error.as_deref(),
                 ) {
                     // The kind the `+ New` menu was clicked on -- `empty_of`,
                     // not `empty`, which would open a login form whatever row
@@ -1043,9 +1095,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     // reacted to yet -- see where `row_command` is handled,
                     // below the reset block.
                     ItemListAction::Row { id, command } => row_command = Some((id, command)),
+                    ItemListAction::DismissMoveError => dismiss_move_error = true,
                     ItemListAction::None => {}
                 }
             });
+
+        if dismiss_move_error {
+            move_error = None;
+        }
 
         // Load favicons for whatever `draw_item_list` actually drew this
         // frame, matching official Bitwarden clients ("visible items get
@@ -1706,6 +1763,69 @@ fn delete_vault_item(
             flag_reauth_if_unauthorized(ctx, needs_reauth, &e);
         }
     }
+}
+
+/// Moves `item_id` into `folder_id`, **reverting the window's own list if the
+/// write fails**, and returns the inline message to show (`None` on success).
+///
+/// The optimistic write and the revert are not theatre, and they are not an
+/// animation: `VaultCache::move_item_to_folder` is synchronous, so the whole
+/// sequence happens inside one frame and nothing half-moved is ever painted.
+/// What they buy is that the row's folder is written in exactly one place and
+/// unwritten in exactly one place, so "a failed move leaves the item where it
+/// was" is a property of this function rather than of a `match` arm that
+/// happens not to have touched anything yet. That was the user's explicit
+/// choice over leaving the row looking moved.
+///
+/// Through `VaultCache`, never `cache.bridge()`: the cache's snapshot is what
+/// the rest of the app reads, and its replay log is what stops an in-flight
+/// populate from filing the item back where it was.
+fn move_item_into_folder(
+    ctx: &egui::Context,
+    cache: &VaultCache,
+    needs_reauth: &Rc<RefCell<bool>>,
+    items: &mut [VaultItem],
+    item_id: &str,
+    folder_id: &str,
+) -> Option<String> {
+    let Some(at) = items.iter().position(|i| i.id == item_id) else {
+        // The vault reloaded out from under the gesture. Nothing to move and
+        // nothing to say -- the row the user dragged is not on screen either.
+        log::warn!("dropped item {item_id} onto folder {folder_id}, but it is no longer listed");
+        return None;
+    };
+    let before = items[at].clone();
+    // The same value the cache writes into its own snapshot, built the same
+    // way, so this window's copy cannot say something different from it.
+    items[at] = crate::vault_bridge::with_folder(&before, Some(folder_id));
+    match cache.move_item_to_folder(&before, Some(folder_id)) {
+        Ok(()) => None,
+        Err(e) => {
+            items[at] = before;
+            log::warn!("failed to move item {item_id} into folder {folder_id}: {e:?}");
+            flag_reauth_if_unauthorized(ctx, needs_reauth, &e);
+            Some(move_failure_message(&items[at].name, &e))
+        }
+    }
+}
+
+/// The inline message a refused write shows, per failure.
+///
+/// Exhaustively matched with no catch-all: a new `VaultError` variant must be
+/// given its own wording rather than silently inheriting someone else's.
+///
+/// The error's own payload -- a `ureq` transport string, a serde message -- is
+/// deliberately NOT interpolated. It is a developer's sentence in the middle
+/// of a user's, and the log line at the call site already carries the whole
+/// thing for anyone who needs it. What the band has to say is what happened
+/// and what state the item is in, and both halves are here.
+fn move_failure_message(name: &str, e: &VaultError) -> String {
+    let because = match e {
+        VaultError::Unauthorized => "the vault backend no longer accepts this session",
+        VaultError::Http(_) => "the vault backend refused the write",
+        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+    };
+    format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
 }
 
 fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bool>>, e: &VaultError) {
@@ -3635,6 +3755,173 @@ mod delete_confirm_tests {
         assert!(!confirm_click_at(&mut pending, "f1", after_window));
         // Re-armed, not confirmed or empty.
         assert!(pending.is_some());
+    }
+}
+
+#[cfg(test)]
+mod folder_drop_tests {
+    //! What a drag-to-folder does to the window's own item list.
+    //!
+    //! The user's explicit choice was that a FAILED move **reverts in the UI
+    //! and shows an inline error** rather than leaving the row looking moved.
+    //! Both halves are here: the list's entry and the returned message.
+    //!
+    //! These drive `move_item_into_folder` against a real `VaultCache` over a
+    //! real HTTP server (mockito), so the success path is a write that
+    //! actually reached a backend and the failure path is a backend that
+    //! actually refused -- not a stubbed `Result`.
+    use super::*;
+    use crate::vault_bridge::{VaultBridge, VaultItem};
+    use crate::vault_cache::VaultCache;
+
+    fn item(id: &str, folder_id: Option<&str>) -> VaultItem {
+        VaultItem {
+            id: id.into(),
+            name: "Ledgerline".into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: folder_id.map(str::to_string),
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// The pieces `move_item_into_folder` needs beyond the list.
+    fn ctx_and_reauth() -> (egui::Context, Rc<RefCell<bool>>) {
+        (egui::Context::default(), Rc::new(RefCell::new(false)))
+    }
+
+    #[test]
+    fn a_move_the_backend_accepts_files_the_item_and_says_nothing() {
+        let mut server = mockito::Server::new();
+        let put = server
+            .mock("PUT", "/object/item/i1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{}}"#)
+            .create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let (ctx, reauth) = ctx_and_reauth();
+        let mut items = vec![item("i1", None)];
+
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+
+        put.assert();
+        assert_eq!(message, None, "a successful move should have nothing to say");
+        assert_eq!(items[0].folder_id.as_deref(), Some("f2"));
+    }
+
+    #[test]
+    fn a_move_the_backend_refuses_leaves_the_item_exactly_where_it_was() {
+        // THE REVERT. The optimistic write happens first and unconditionally,
+        // so this is not "the failure arm forgot to touch anything" -- the
+        // entry really is rewritten and really is put back. Asserted on the
+        // FOLDER, which is the only thing a move may change.
+        let mut server = mockito::Server::new();
+        let _put = server.mock("PUT", "/object/item/i1").with_status(500).create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let (ctx, reauth) = ctx_and_reauth();
+        let mut items = vec![item("i1", Some("f1"))];
+
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+
+        assert_eq!(
+            items[0].folder_id.as_deref(),
+            Some("f1"),
+            "a refused move left the row looking moved"
+        );
+        let message = message.expect("a refused move said nothing at all");
+        assert!(
+            message.contains("Ledgerline"),
+            "the message does not name the item: {message:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_move_leaves_the_rest_of_the_item_untouched_too() {
+        // The revert restores the whole entry, not a patched folder: anything
+        // `with_folder` normalises on the way through must come back as well.
+        let mut server = mockito::Server::new();
+        let _put = server.mock("PUT", "/object/item/i1").with_status(500).create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let (ctx, reauth) = ctx_and_reauth();
+        let before = item("i1", Some("f1"));
+        let mut items = vec![before.clone()];
+
+        let _ = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+
+        // `VaultItem` is not `PartialEq` (it carries a `Zeroizing` password),
+        // so the whole entry is compared through its own serialization --
+        // which also covers everything riding the `#[serde(flatten)] other`
+        // catch-alls, the fields a field-by-field comparison would miss.
+        assert_eq!(
+            serde_json::to_value(&items[0]).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_drop_on_an_item_that_is_no_longer_listed_changes_nothing_and_says_nothing() {
+        // The vault reloaded out from under the gesture. There is no row on
+        // screen to explain anything about, so an inline error here would be
+        // about an item the user can no longer see.
+        let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+        let (ctx, reauth) = ctx_and_reauth();
+        let mut items = vec![item("i1", None)];
+
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "gone", "f2");
+
+        assert_eq!(message, None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "i1");
+        assert_eq!(items[0].folder_id, None);
+    }
+
+    #[test]
+    fn a_401_during_a_move_still_reverts_and_flags_reauth() {
+        // `Unauthorized` is the one failure that closes the window and
+        // re-authenticates. The revert must not be skipped on the way out --
+        // the snapshot survives a re-auth, and a row left looking moved would
+        // still be wrong when the window came back.
+        let mut server = mockito::Server::new();
+        let _put = server.mock("PUT", "/object/item/i1").with_status(401).create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let (ctx, reauth) = ctx_and_reauth();
+        let mut items = vec![item("i1", Some("f1"))];
+
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+
+        assert_eq!(items[0].folder_id.as_deref(), Some("f1"));
+        assert!(*reauth.borrow(), "a 401 did not flag re-authentication");
+        assert!(message.is_some());
+    }
+
+    #[test]
+    fn every_failure_gets_its_own_wording_and_all_of_them_say_where_the_item_is() {
+        // Exhaustive over `VaultError`, spelled out: a new variant must be
+        // given its own sentence rather than inheriting one, and every
+        // sentence has to answer the question the user actually has.
+        let messages = [
+            move_failure_message("Ledgerline", &VaultError::Unauthorized),
+            move_failure_message("Ledgerline", &VaultError::Http("500".into())),
+            move_failure_message("Ledgerline", &VaultError::Parse("bad json".into())),
+        ];
+        for message in &messages {
+            assert!(message.contains("Ledgerline"), "{message:?} does not name the item");
+            assert!(
+                message.contains("old folder"),
+                "{message:?} does not say the item did not move"
+            );
+        }
+        let unique: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(unique.len(), messages.len(), "two failures share one wording: {messages:?}");
+        // The developer-facing payload stays in the log, not in the band.
+        assert!(!messages[1].contains("500"));
+        assert!(!messages[2].contains("bad json"));
     }
 }
 

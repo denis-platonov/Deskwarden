@@ -33,6 +33,8 @@ pub enum ItemListAction {
     ///
     /// [`detail_edit::CREATABLE_KINDS`]: super::detail_edit::CREATABLE_KINDS
     NewItem(ItemKind),
+    /// The inline "that move did not happen" band was clicked away.
+    DismissMoveError,
     /// An entry of some row's right-click menu was chosen.
     ///
     /// The item's id is carried rather than left to `selected_id`, even
@@ -64,6 +66,25 @@ pub enum RowCommand {
     /// see [`move_menu`].
     MoveToFolder(String),
     Delete,
+}
+
+/// What an item row puts on egui's drag-and-drop clipboard while it is being
+/// dragged, and what the sidebar's folder rows read back.
+///
+/// A named type, not a bare `String`: egui's payload store is keyed by type
+/// (`DragAndDrop::payload::<T>`), so this is what makes "is the thing being
+/// dragged an item row" answerable at all. A `String` payload would collide
+/// with any other string-shaped drag this window ever grows.
+///
+/// It carries the item's CURRENT folder as well as its id so that a drop
+/// target can refuse the folder the item already lives in without looking the
+/// item up -- the sidebar has the vault's items but has no business
+/// re-deriving which one is under the pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DraggedItem {
+    pub id: String,
+    /// `None` for an unfiled item, matching `VaultItem::folder_id`.
+    pub folder_id: Option<String>,
 }
 
 /// One clickable line of the menu.
@@ -379,6 +400,7 @@ pub fn draw_item_list(
     delete_pending_id: Option<&str>,
     icons: &IconCache,
     visible_ids: &mut Vec<String>,
+    move_error: Option<&str>,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -485,6 +507,22 @@ pub fn draw_item_list(
         CornerRadius::ZERO,
         theme::HAIRLINE,
     );
+
+    // A drag-to-folder that did not happen, said out loud. Drawn here --
+    // between the toolbar strip and the list -- because this is the pane the
+    // item lives in and the pane the gesture started from; the sidebar, where
+    // it ENDED, has a bottom-anchored countdown and no band to put this in.
+    //
+    // ABOVE the list frame, so it takes its height off the scroll area rather
+    // than out of it. `show_rows` reads `item_spacing.y` from the ui the list
+    // frame gives it, which is set inside that frame, so a band added here
+    // cannot reach the scroll pitch -- only how many rows fit. Pinned by
+    // `an_inline_move_error_does_not_change_the_row_pitch_beneath_it`.
+    if let Some(message) = move_error {
+        if move_error_band(ui, message) {
+            action = ItemListAction::DismissMoveError;
+        }
+    }
 
     let search_lower = search.to_lowercase();
     let filtered: Vec<&VaultItem> = items
@@ -805,9 +843,36 @@ fn item_row(
                 });
             });
         });
-    let response = frame.response.interact(Sense::click());
+    // `click_and_drag`, not `click`: the row is both the selection control it
+    // has always been AND the handle for dragging the item onto a folder.
+    //
+    // `Response::interact` re-registers the rect the frame ALREADY allocated
+    // with a wider sense -- it allocates nothing of its own. That is why the
+    // drag source is added here rather than by wrapping the row in
+    // `Ui::dnd_drag_source`, which opens a `scope` and would put a second
+    // allocation inside the `push_id` the context menu depends on. The row's
+    // height, and therefore the fixed pitch `show_rows` virtualizes against,
+    // is untouched; `a_drag_in_flight_does_not_move_the_rows_underneath_it`
+    // asserts that from painted output rather than from this comment.
+    //
+    // egui distinguishes the two gestures by travel: a press that does not
+    // move is `clicked()`, a press that does is `dragged()` and never
+    // `clicked()`. So dragging an item does NOT select it, and the
+    // right-click that opens the context menu is untouched -- dragging is
+    // primary-button only, and `secondary_clicked()` is read below exactly as
+    // before.
+    let response = frame.response.interact(Sense::click_and_drag());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // Only acts on the frame the drag actually starts (see
+    // `Response::dnd_set_drag_payload`), so this is not a per-frame write.
+    response.dnd_set_drag_payload(DraggedItem {
+        id: item.id.clone(),
+        folder_id: item.folder_id.clone(),
+    });
+    if response.dragged() {
+        drag_ghost(ui, &item.name);
     }
     // The menu is rendered into egui's own popup layer (a separate `Area`),
     // so nothing here allocates in the row's ui and the fixed row pitch
@@ -849,6 +914,112 @@ fn item_row(
         select: response.clicked() || response.secondary_clicked(),
         command,
     }
+}
+
+/// The inline "that move did not happen" band. Returns whether it was
+/// clicked, which dismisses it.
+///
+/// Wrapped rather than truncated: every message this shows is a sentence
+/// explaining a refusal or a failure, and a truncated explanation is worse
+/// than none. It is outside the virtualized list, so its height is free to
+/// vary -- the rows' fixed pitch is not.
+fn move_error_band(ui: &mut egui::Ui, message: &str) -> bool {
+    const PAD: i8 = 10;
+    /// The dismiss glyph's lane, taken off the width before the message is
+    /// laid out.
+    const GLYPH_LANE: f32 = 14.0;
+    const GAP: f32 = 8.0;
+    let band = egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::same(PAD))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // LEFT TO RIGHT, deliberately -- NOT the `right_to_left`
+                // trick the toolbar strip above uses to give `+ New` its
+                // width first. In a right-to-left row a `Label` is handed an
+                // effectively unbounded width and never wraps: this sentence
+                // was painted COMPLETE and entirely off the right edge of a
+                // 390pt pane, and the test that read the painted text agreed
+                // it was fine. `the_band_paints_the_whole_message_inside_the_
+                // pane` is what actually catches that, and it fails on that
+                // layout today.
+                //
+                // The explicit width reserves the dismiss glyph's lane. It
+                // can only ever SHRINK the label (`set_max_width` cannot
+                // widen a ui past its parent), which is exactly what is
+                // wanted here.
+                let text_width = (ui.available_width() - GLYPH_LANE - GAP).max(0.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(text_width);
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(message).size(11.0).color(theme::ERROR),
+                        )
+                        .wrap(),
+                    );
+                });
+                ui.add_space(GAP);
+                ui.label(RichText::new("✕").size(11.0).color(theme::TEXT_GHOST));
+            });
+        })
+        .response;
+    // A fresh interaction over the band's rect, with an id of its own, rather
+    // than `band.interact(Sense::click())`: the `Frame`'s own response id
+    // belongs to the labels' container, and widening ITS sense makes the
+    // whole band's clickability depend on which child happened to claim the
+    // pointer first. This claims the band as one control.
+    let response = ui.interact(band.rect, ui.id().with("move-error-band"), Sense::click());
+    // The design has no dedicated error tile, so this borrows the pane's own
+    // card surface and marks it with a full-width rule in the error colour
+    // along its bottom edge -- the same "hairline under a strip" device the
+    // toolbar above uses, recoloured.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::Pos2::new(response.rect.left(), response.rect.bottom() - 1.0),
+            egui::Pos2::new(response.rect.right(), response.rect.bottom()),
+        ),
+        CornerRadius::ZERO,
+        theme::ERROR,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+/// The chip that follows the pointer while an item is being dragged, naming
+/// the item so the user can see what is in the air.
+///
+/// Painted into a `Tooltip`-order layer through `layer_painter`, which
+/// allocates NOTHING in the calling ui -- the alternative,
+/// `Ui::dnd_drag_source`, re-parents the row's own widgets into a floating
+/// layer and would fight both the `push_id` the context menu is anchored to
+/// and the fixed row pitch `show_rows` scrolls by.
+fn drag_ghost(ui: &egui::Ui, name: &str) {
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else {
+        return;
+    };
+    const PAD_X: f32 = 8.0;
+    const PAD_Y: f32 = 5.0;
+    /// Offset from the cursor's hot spot, so the chip does not sit under the
+    /// pointer and hide the row it is about to be dropped on.
+    const CURSOR_OFFSET: egui::Vec2 = egui::Vec2::new(14.0, 10.0);
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("vault-drag-ghost")));
+    let galley = painter.layout_no_wrap(
+        name.to_string(),
+        egui::FontId::new(TITLE_SIZE, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::CARD,
+    );
+    let rect = egui::Rect::from_min_size(
+        pointer + CURSOR_OFFSET,
+        galley.size() + egui::Vec2::new(PAD_X * 2.0, PAD_Y * 2.0),
+    );
+    painter.rect_filled(rect, CornerRadius::same(8), theme::BLUE);
+    painter.galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, theme::CARD);
 }
 
 /// One line of a row's context menu, drawn from [`MenuCommand`] and deciding
@@ -1538,6 +1709,10 @@ mod row_tile_tests {
                     delete_pending.as_deref(),
                     &icons,
                     visible,
+                    // This harness predates the inline move-error band and
+                    // has no business growing a parameter for it; the band
+                    // has its own module below.
+                    None,
                 );
             })
         };
@@ -2707,6 +2882,84 @@ mod row_tile_tests {
         }
     }
 
+    #[test]
+    fn a_drag_in_flight_does_not_move_the_rows_underneath_it() {
+        // VIRTUALIZATION, for the drag source. `show_rows` reads
+        // `item_spacing.y` off the ui it is GIVEN, before its closure runs,
+        // and scrolls by `row_height + that spacing`; anything the drag
+        // source allocated inside a row would put the list out of register
+        // with its own scrollbar. `Response::interact` re-registers the rect
+        // the row already claimed and the ghost is painted into a `Tooltip`
+        // layer, so neither allocates -- asserted here from painted output
+        // rather than from the comment at the call site.
+        let items: Vec<VaultItem> = (0..100).map(|i| full_login(&format!("Item {i:03}"))).collect();
+        let still = paint(&items, None);
+        let from = row_centre(&items, 3);
+        let to = from + egui::vec2(0.0, 180.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut frames = vec![
+            vec![egui::Event::PointerMoved(from)],
+            vec![egui::Event::PointerMoved(from), button(true)],
+        ];
+        // Measured mid-flight: the button is never released, so the payload
+        // is on egui's clipboard on the frame this reads back.
+        for step in 1..=4 {
+            frames.push(vec![egui::Event::PointerMoved(from + (to - from) * (step as f32 / 4.0))]);
+        }
+        let dragging = paint_core(
+            &items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu { folders: vec![], delete_pending: None, frames },
+        );
+
+        assert_eq!(dragging.visible, still.visible, "the laid-out row range changed mid-drag");
+        let still_tiles: Vec<egui::Rect> = row_tiles(&still).iter().map(|t| t.rect).collect();
+        let dragging_tiles: Vec<egui::Rect> = row_tiles(&dragging).iter().map(|t| t.rect).collect();
+        assert_eq!(
+            dragging_tiles.len(),
+            still_tiles.len(),
+            "a row stopped being exactly one ROW_TILE_HEIGHT tall mid-drag"
+        );
+        for (moving, still) in dragging_tiles.iter().zip(&still_tiles) {
+            assert!(
+                (moving.top() - still.top()).abs() < 0.5
+                    && (moving.height() - still.height()).abs() < 0.5,
+                "a row tile moved or resized mid-drag: {moving:?} vs {still:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_right_click_still_opens_the_menu_now_that_rows_also_sense_drags() {
+        // The interaction the drag source could most plausibly have broken:
+        // the row's sense went from `click` to `click_and_drag`, and the
+        // context menu hangs off the SAME response, anchored per item by
+        // `push_id`. Dragging is primary-button only, so the two do not
+        // overlap -- asserted, because "they shouldn't" is not evidence.
+        let items = [full_login("Ledgerline")];
+        assert_eq!(
+            menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                "Fill in app",
+                "Open website",
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                DELETE_LABEL,
+            ]
+        );
+    }
+
     // ---- The "+ New" type menu ------------------------------------------
     //
     // `+ New` no longer creates a login on the spot: it opens a menu of the
@@ -2961,6 +3214,7 @@ mod toolbar_strip_tests {
                     None,
                     &icons,
                     &mut visible,
+                    None,
                 );
             })
         };
@@ -3299,5 +3553,263 @@ mod toolbar_strip_tests {
             row.min.y >= tile.max.y,
             "the first item row at {row:?} overlaps the toolbar tile {tile:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod move_error_band_tests {
+    //! The inline "that move did not happen" band.
+    //!
+    //! The user's explicit choice for a failed drag-to-folder was "revert in
+    //! the UI and show an inline error", the alternative being a row left
+    //! looking moved. The revert is `vault_window::mod`'s
+    //! `move_item_into_folder`, tested there; this is the "show" half.
+    //!
+    //! It has its own harness rather than a tenth field on `row_tile_tests`'
+    //! `Menu`, so that no pre-existing test's setup had to be touched to add
+    //! it.
+    use super::*;
+    use crate::theme;
+
+    const PANE_WIDTH: f32 = 390.0;
+    const PANE_HEIGHT: f32 = 700.0;
+    /// Deliberately names an item that is NOT in the list below it: the
+    /// assertions find the band's text by matching against this string, and a
+    /// row title that was also a substring of it would be counted as part of
+    /// the message.
+    /// The message under test. It names an item that is deliberately NOT in
+    /// the list below it: the assertions recover the band's text by matching
+    /// painted galleys against this string, and a row title that was also a
+    /// substring of it would be counted as part of the message.
+    const MESSAGE: &str = "Couldn't move \"Ledgerline\" -- the vault backend refused the write.";
+    /// The one item the list holds, named so it cannot collide with
+    /// [`MESSAGE`].
+    const ROW: &str = "Vantage";
+
+    fn login(name: &str) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    struct Painted {
+        texts: Vec<(String, egui::Rect)>,
+        rects: Vec<(egui::Rect, egui::Color32)>,
+        action: ItemListAction,
+    }
+
+    fn walk(shape: &egui::Shape, p: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => p.texts.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Rect(rect) => p.rects.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Real frames of `draw_item_list` with `move_error` set, returning what
+    /// the last one painted and returned.
+    fn paint(
+        items: &[VaultItem],
+        move_error: Option<&str>,
+        frames: Vec<Vec<egui::Event>>,
+    ) -> Painted {
+        let ctx = egui::Context::default();
+        let screen =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(PANE_WIDTH, PANE_HEIGHT));
+        let input = || egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        // Two throwaway frames so `theme::apply`'s font set is live.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut selected = None;
+        let mut search = String::new();
+        let icons = IconCache::default();
+        let mut visible = Vec::new();
+        let mut action = ItemListAction::None;
+        let mut draw = |ctx: &egui::Context, raw: egui::RawInput| {
+            ctx.run_ui(raw, |ui| {
+                action = draw_item_list(
+                    ui,
+                    items,
+                    &[],
+                    &SidebarFilter::All,
+                    &mut search,
+                    &mut selected,
+                    None,
+                    &icons,
+                    &mut visible,
+                    move_error,
+                );
+            })
+        };
+        let _ = draw(&ctx, input());
+        let mut output = None;
+        for events in frames {
+            output = Some(draw(&ctx, egui::RawInput { events, ..input() }));
+        }
+        let output = output.unwrap_or_else(|| draw(&ctx, input()));
+
+        let mut painted = Painted { texts: Vec::new(), rects: Vec::new(), action };
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// The message as it was actually painted, joined back together -- egui
+    /// may lay a wrapped sentence out as several galleys.
+    fn painted_message(p: &Painted) -> String {
+        p.texts
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .filter(|text| MESSAGE.contains(*text) && !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn the_band_paints_the_whole_message_and_nothing_shorter() {
+        // WRAPPED, NOT TRUNCATED. Every message this shows is a sentence
+        // explaining a refusal or a failure; a truncated explanation is worse
+        // than none, and truncation is exactly what the rows below it
+        // deliberately do.
+        let p = paint(&[login(ROW)], Some(MESSAGE), Vec::new());
+        assert_eq!(
+            painted_message(&p).split_whitespace().collect::<Vec<_>>(),
+            MESSAGE.split_whitespace().collect::<Vec<_>>(),
+            "the band did not paint the message it was given"
+        );
+        assert!(
+            !p.texts.iter().any(|(text, _)| text.contains('…')),
+            "the message was truncated: {:?}",
+            p.texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_band_paints_the_whole_message_inside_the_pane() {
+        // The defect the assertion above could not see, and did not: laid out
+        // in a right-to-left row a `Label` is handed an unbounded width and
+        // never wraps, so the sentence was painted COMPLETE and entirely off
+        // the right edge of a 390pt pane. Checking the text alone said it was
+        // fine. This checks where it landed.
+        let p = paint(&[login(ROW)], Some(MESSAGE), Vec::new());
+        let mut lines = 0;
+        for (text, rect) in &p.texts {
+            if !MESSAGE.contains(text.as_str()) || text.trim().is_empty() {
+                continue;
+            }
+            lines += 1;
+            assert!(
+                rect.right() <= PANE_WIDTH + 0.5,
+                "{text:?} was painted out to x={} on a {PANE_WIDTH}pt pane",
+                rect.right()
+            );
+        }
+        assert!(lines > 0, "no part of the message was painted at all");
+        // The dismiss glyph rides the same layout and is placed AFTER the
+        // message, so a message that took the whole width would push it off
+        // the edge -- which is what `GLYPH_LANE` is subtracted for.
+        let dismiss = p
+            .texts
+            .iter()
+            .find(|(text, _)| text == "✕")
+            .expect("the dismiss glyph was never painted")
+            .1;
+        assert!(
+            dismiss.right() <= PANE_WIDTH + 0.5,
+            "the dismiss glyph was pushed out to x={} on a {PANE_WIDTH}pt pane",
+            dismiss.right()
+        );
+    }
+
+    #[test]
+    fn no_band_is_painted_when_there_is_nothing_to_say() {
+        let p = paint(&[login(ROW)], None, Vec::new());
+        assert!(
+            !p.texts.iter().any(|(text, _)| text.contains("Couldn't move")),
+            "a band was painted with no error set"
+        );
+        assert_eq!(p.action, ItemListAction::None);
+    }
+
+    #[test]
+    fn clicking_the_band_dismisses_it() {
+        // An explanation the user cannot get rid of ends up sitting over the
+        // list describing a gesture three gestures ago.
+        let items = [login(ROW)];
+        let opened = paint(&items, Some(MESSAGE), Vec::new());
+        let at = opened
+            .texts
+            .iter()
+            .find(|(text, _)| MESSAGE.contains(text.as_str()) && text.len() > 5)
+            .expect("the message was never painted")
+            .1
+            .center();
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let p = paint(
+            &items,
+            Some(MESSAGE),
+            vec![
+                vec![egui::Event::PointerMoved(at), button(true)],
+                // egui resolves a click on the frame the button is released.
+                vec![button(false)],
+            ],
+        );
+        assert_eq!(p.action, ItemListAction::DismissMoveError);
+    }
+
+    #[test]
+    fn an_inline_move_error_does_not_change_the_row_pitch_beneath_it() {
+        // VIRTUALIZATION. The band is allocated ABOVE the list frame, so it
+        // takes its height off the scroll area rather than out of it:
+        // `show_rows` still reads `item_spacing.y` from the ui that frame
+        // gives it. What the band may change is how many rows fit; what it
+        // may not change is the PITCH they sit at, because that is what
+        // `show_rows` scrolls by.
+        let items: Vec<VaultItem> = (0..100).map(|i| login(&format!("Item {i:03}"))).collect();
+        let with_band = paint(&items, Some(MESSAGE), Vec::new());
+        let tiles: Vec<egui::Rect> = with_band
+            .rects
+            .iter()
+            .filter(|(rect, _)| {
+                (rect.width() - (PANE_WIDTH - 2.0 * LIST_PADDING)).abs() < 0.5
+                    && (rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
+            })
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert!(tiles.len() > 3, "expected a list of rows under the band, got {}", tiles.len());
+        for pair in tiles.windows(2) {
+            let gap = pair[1].top() - pair[0].bottom();
+            assert!(
+                (gap - ROW_GAP).abs() < 0.5,
+                "rows sit {gap}pt apart under the band, expected {ROW_GAP} -- the virtualized \
+                 pitch and the painted pitch have diverged"
+            );
+        }
     }
 }
