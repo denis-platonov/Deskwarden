@@ -4,7 +4,7 @@ use crate::icon;
 use crate::loading_ui;
 use crate::theme;
 use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
-use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra};
+use crate::vault_cache::{AppMatchWrite, PopulateOutcome, VaultCache, VaultEra, VaultUnavailable};
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
@@ -293,10 +293,47 @@ fn can_pick_next(selected_id: &Option<String>) -> bool {
 /// anything captured on entry, and the populate below would then succeed
 /// against the NEW session (it takes its own, newer epoch) and hand this
 /// click a list belonging to a vault session the user never asked about.
+/// **The two refusals are handled differently, and that distinction lives in
+/// the return type rather than being re-derived here** -- review 26's Minor 3.
+/// While `items_unless_superseded` answered a bare `Option`, a cleared cache
+/// and a never-filled one were the same answer, so this function ran a full
+/// vault populate -- seconds of HTTP under the spinner -- for a `VaultLocked`
+/// that was already knowable, only to fail the re-check below. Correct answer,
+/// pointless latency.
 fn load_items_for_picker(cache: &VaultCache, era: VaultEra) -> PickerItemsResult {
-    let items = match cache.items_unless_superseded(era) {
-        Some(items) => items,
-        None => {
+    let items = match cache.snapshot_unless_superseded(era) {
+        // Folders are read here and dropped: this door takes both halves
+        // under one lock deliberately (see its own doc), and the picker
+        // paying for a `Vec<Folder>` clone -- an id and a name apiece -- is
+        // the price of not having a second, items-only era-checked read that
+        // a folder-needing caller could later compose with `folders()`.
+        Ok(snapshot) => snapshot.items,
+        Err(VaultUnavailable::Superseded) => {
+            // No fetch: a populate takes its OWN, newer epoch, so it would
+            // refill the cache for the session that exists now and the
+            // re-check below would still refuse. There is no vault for this
+            // click's era and no request can produce one.
+            log::warn!(
+                "the vault was cleared between the picker's click and this read; there is no \
+                 vault for that era and populating one cannot produce it"
+            );
+            return PickerItemsResult::VaultLocked;
+        }
+        Err(VaultUnavailable::Unpopulated) => {
+            // NOT HANDLED HERE, AND SAYING SO BECAUSE THE ERA ABOVE MAKES
+            // THIS SITE READ AS THOUGH IT WERE (review 26's Minor 4,
+            // pre-existing). The read above proves the era was still this
+            // click's AT THAT MOMENT; a `clear` landing between it and the
+            // `populate()` below is invisible to it, and the populate then
+            // captures its own, newer epoch and fills the cache with
+            // `populated = true` under the NEW era -- work done for a session
+            // this click does not serve. It is not reachable today only
+            // because every `clear` site runs on the main thread, which is
+            // parked in `loading_ui::show_while` while this detached worker
+            // runs; that is an argument about thread affinity, not about this
+            // code, and this crate has had to un-write that argument more
+            // than once. What keeps it CORRECT rather than merely unreachable
+            // is the re-check below, which refuses the refilled snapshot.
             log::warn!("no vault snapshot for the picker's era; populating it now");
             match cache.populate() {
                 Ok(PopulateOutcome::Populated) => {}
@@ -317,6 +354,11 @@ fn load_items_for_picker(cache: &VaultCache, era: VaultEra) -> PickerItemsResult
             // the cache for whatever session is current now. Asking again
             // under the same era is what distinguishes "the vault is here"
             // from "a vault is here, but not yours".
+            //
+            // The items-only door on purpose: this is the one read here for
+            // which both refusals really do mean the same thing. The populate
+            // above returned `Populated`, so `Unpopulated` in this era is not
+            // reachable from it, and either way the answer is `VaultLocked`.
             match cache.items_unless_superseded(era) {
                 Some(items) => items,
                 None => {
@@ -1073,7 +1115,36 @@ pub fn run_picker(
                                     trigger,
                                 };
                                 match cache.set_app_match(&target_item, &m) {
-                                    Ok(()) => {
+                                    Ok(written) => {
+                                        // Matched exhaustively rather than
+                                        // ignored: review 26's Minor 2 is
+                                        // that this used to be `Ok(())` for
+                                        // BOTH of these, and the second one
+                                        // means the match is saved in the
+                                        // vault but absent from the snapshot
+                                        // `main` immediately rebuilds the
+                                        // engine from -- so the match the
+                                        // user just spent two windows on
+                                        // does nothing until the next full
+                                        // sync. Save still SUCCEEDED (the
+                                        // server has it), so this window
+                                        // still closes with `Some(m)`:
+                                        // returning `None` would tell `main`
+                                        // the user cancelled, which is a
+                                        // different and false statement. See
+                                        // the ledger for the `main.rs` half
+                                        // this cannot reach from here.
+                                        match written {
+                                            AppMatchWrite::WroteThrough => {}
+                                            AppMatchWrite::ServerOnly => log::warn!(
+                                                "saved the app match for vault item {} to the \
+                                                 server, but the cache's snapshot does not hold \
+                                                 that item, so a match engine rebuilt from the \
+                                                 cache will NOT have it; it goes live at the \
+                                                 next full sync",
+                                                target_item.id
+                                            ),
+                                        }
                                         *result_for_closure.borrow_mut() = Some(m);
                                         done = true;
                                     }
@@ -1467,6 +1538,47 @@ mod tests {
             "a vault that locked mid-populate must not be reported as an empty vault"
         );
         assert!(!cache.is_populated());
+    }
+
+    #[test]
+    fn load_items_for_picker_does_not_fetch_a_vault_it_has_already_been_told_is_gone() {
+        // REVIEW 26'S MINOR 3. Correct answer, wrong cost. Once the era has
+        // moved, no populate can produce a vault for THIS click -- the
+        // populate takes its own, newer epoch, refills the cache for the new
+        // session, and the re-check below it then fails exactly as it must.
+        // The user paid seconds of HTTP under the spinner for a `VaultLocked`
+        // that was already knowable. `expect(0)` is the assertion: the fix is
+        // a return type that separates "superseded" from "never fetched", not
+        // a faster populate.
+        let mut server = mockito::Server::new();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(0)
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(
+            cache.populate_with(vec![item("Alpha")], cache.epoch()).unwrap(),
+            PopulateOutcome::Populated
+        );
+        let era = cache.epoch().era();
+        cache.clear();
+
+        let result = load_items_for_picker(&cache, era);
+
+        assert!(
+            matches!(result, PickerItemsResult::VaultLocked),
+            "a cleared vault must still be reported as locked"
+        );
+        items.assert();
     }
 
     #[test]
