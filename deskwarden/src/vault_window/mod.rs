@@ -17,7 +17,7 @@ use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultError, VaultItem};
-use crate::vault_cache::{PopulateOutcome, VaultCache};
+use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra, VaultSnapshot, VaultUnavailable};
 use detail::{draw_detail_read, DetailAction, TotpState};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
 use eframe::egui::{self, Margin};
@@ -230,7 +230,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // `spawn_vault_load`'s doc comment. `backend_already_running`: see that
     // parameter's own doc -- skips the readiness wait when the caller
     // already knows `bw serve` is up.
-    spawn_vault_load(cache.clone(), vault_tx.clone(), false, load_generation, backend_already_running);
+    //
+    // `cache.epoch().era()` is read HERE, on the main thread, and handed in.
+    // That is load-bearing: read inside the worker it would be compared
+    // against itself and could never detect a `clear`. See
+    // `spawn_vault_load`'s `era` parameter.
+    spawn_vault_load(
+        cache.clone(),
+        vault_tx.clone(),
+        false,
+        cache.epoch().era(),
+        load_generation,
+        backend_already_running,
+    );
     let mut items: Vec<VaultItem> = Vec::new();
     let mut folders: Vec<Folder> = Vec::new();
     // True until the background load above reports back.
@@ -444,8 +456,23 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // Minor 3) -- carried for this whole window session, not
                 // re-checked here, since nothing in this window's lifetime
                 // stops or restarts the backend out from under it.
+                //
+                // The era is captured here, on the main thread, for the same
+                // reason the initial spawn above captures it there -- and it
+                // is a genuinely different question from `load_generation`
+                // one line up: that counter says "has this window spawned a
+                // newer load?", the era says "is this still the vault
+                // session the window is showing?". A lock or a re-auth moves
+                // the era and no generation at all.
                 load_generation += 1;
-                spawn_vault_load(cache.clone(), vault_tx.clone(), true, load_generation, backend_already_running);
+                spawn_vault_load(
+                    cache.clone(),
+                    vault_tx.clone(),
+                    true,
+                    cache.epoch().era(),
+                    load_generation,
+                    backend_already_running,
+                );
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
             }
@@ -1708,11 +1735,26 @@ fn spawn_vault_load(
     tx: mpsc::Sender<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
     // `true` after a sync, which changes the vault underneath us: the
     // snapshot is still marked populated but is now stale, so the
-    // `is_populated` short-circuit below would serve pre-sync data and the
-    // sync would appear to do nothing. `false` on window open, where the
-    // snapshot from unlock is current and re-fetching would throw away the
-    // whole point of the cache.
+    // short-circuit below would serve pre-sync data and the sync would
+    // appear to do nothing. `false` on window open, where the snapshot from
+    // unlock is current and re-fetching would throw away the whole point of
+    // the cache.
     force_refresh: bool,
+    // Which vault SESSION this load is for, captured by the caller on the
+    // MAIN THREAD before the spawn below (review 26's recorded producer).
+    //
+    // It is a parameter and not something the worker reads for itself, and
+    // that is the entire guard: an era captured inside the worker would be
+    // compared against itself, so a `clear` landing between the user's
+    // action and the worker's first instruction would be invisible. This is
+    // the same shape `picker_ui::pick_vault_item` already uses.
+    //
+    // Distinct from `generation`, which sits right below it and answers a
+    // different question: `generation` is WINDOW-REFRESH staleness (has this
+    // window spawned a newer load?), `era` is VAULT staleness (is the vault
+    // session this load was spawned for still the one the cache holds?). A
+    // lock or a re-auth advances the era and touches no generation at all.
+    era: VaultEra,
     // Tags the message sent over `tx` so `run`'s drain can tell a stale,
     // superseded result apart from the one it's actually still waiting on --
     // see `run`'s `load_generation` doc (review Important 2).
@@ -1727,10 +1769,97 @@ fn spawn_vault_load(
         cache,
         tx,
         force_refresh,
+        era,
         generation,
         skip_readiness_wait,
         readiness_schedule(READINESS_DEADLINE),
     );
+}
+
+/// What the load worker should do next, decided from ONE era-checked
+/// observation of the cache.
+///
+/// Hoisted out of the detached `std::thread::spawn` below so each arm is
+/// pinned by a test directly instead of being inferred from a thread's
+/// observable behaviour -- `vault_load_step_tests`.
+#[derive(Debug)]
+enum VaultLoadStep {
+    /// The cache already holds a vault for the caller's era: send it. The
+    /// payload is a whole [`VaultSnapshot`], never a pair the worker
+    /// assembled, so the items and folders it paints provably come from one
+    /// lock acquisition in one era.
+    Paint(VaultSnapshot),
+    /// Go and fetch. Either nothing has ever been fetched into this era, or
+    /// the caller forced a refresh because a `bw sync` just changed the vault
+    /// underneath the snapshot.
+    Populate,
+    /// Neither fetch nor paint; report this reason as an `Err`.
+    GiveUp(&'static str),
+}
+
+/// A `clear` -- a lock, or a re-auth into a possibly different account --
+/// began a new vault session before this load could read anything.
+const VAULT_SUPERSEDED_BEFORE_LOAD: &str = "the vault was locked before this load could read it";
+/// The same thing, but the `clear` landed after the fetch had started.
+const VAULT_CLEARED_WHILE_REFRESHING: &str = "the vault was locked while refreshing";
+/// A populate reported success and yet left nothing readable for this era.
+const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show";
+
+/// The load worker's first decision, from one call to
+/// [`VaultCache::snapshot_unless_superseded`].
+///
+/// **Why the two [`VaultUnavailable`] variants are handled apart.** They are
+/// opposite situations wearing one word ("no vault"), which is what this
+/// crate's defect history is made of:
+///
+///  * `Unpopulated` -- same vault session, nothing fetched into it yet. A
+///    populate is exactly the cure, and this is what every window open on a
+///    fresh process sees (era 0 compares EQUAL to an era captured before the
+///    first populate), so refusing here would leave the window permanently
+///    empty.
+///  * `Superseded` -- a different vault session. A populate CANNOT cure it:
+///    `populate` takes its own, newer epoch and fills the cache for the
+///    session that exists now, so the fetch would spend a full vault
+///    round-trip and hand this window another account's data. The window's
+///    result is meaningless, so it neither fetches nor paints, and reports an
+///    `Err` -- which `apply_vault_load_result` turns into "keep whatever
+///    snapshot is already on screen", the only honest thing to draw.
+///
+/// A FORCED refresh gives up on `Superseded` too. "Forced" means "a sync
+/// changed the vault under me", not "fetch me some other account's vault";
+/// the era it was spawned for is gone either way. It costs one snapshot clone
+/// on the ordinary forced path (the `Ok` arm below discards it), which is the
+/// price of being able to see a `clear` at all before spending a round-trip.
+fn vault_load_step(force_refresh: bool, read: Result<VaultSnapshot, VaultUnavailable>) -> VaultLoadStep {
+    match read {
+        Err(VaultUnavailable::Superseded) => VaultLoadStep::GiveUp(VAULT_SUPERSEDED_BEFORE_LOAD),
+        Err(VaultUnavailable::Unpopulated) => VaultLoadStep::Populate,
+        Ok(_) if force_refresh => VaultLoadStep::Populate,
+        Ok(snapshot) => VaultLoadStep::Paint(snapshot),
+    }
+}
+
+/// The load worker's second decision: the read that follows a successful
+/// `populate()`, also era-checked and also one lock acquisition.
+///
+/// This is the window the old code could not see at all. `populate()` would
+/// report `Populated`, a `clear` would land, and the separate `cache.items()`
+/// / `cache.folders()` reads underneath it then handed back the empty vault
+/// that clear left -- an empty list painted as data, under an `Ok`, with the
+/// `DiscardedStale` arm above (which exists precisely to stop that) never
+/// consulted because the populate had already succeeded.
+///
+/// `Unpopulated` is unreachable after a populate that returned `Populated` in
+/// this era, and is still not folded into the arm above: it would mean the
+/// snapshot is empty because nothing filled it, not because a different vault
+/// session began. Different situations, different reasons in the log; neither
+/// may be reported as `Ok`.
+fn vault_read_after_populate(read: Result<VaultSnapshot, VaultUnavailable>) -> Result<VaultSnapshot, &'static str> {
+    match read {
+        Ok(snapshot) => Ok(snapshot),
+        Err(VaultUnavailable::Superseded) => Err(VAULT_CLEARED_WHILE_REFRESHING),
+        Err(VaultUnavailable::Unpopulated) => Err(VAULT_EMPTY_AFTER_REFRESH),
+    }
 }
 
 /// `spawn_vault_load`'s actual body, with the readiness schedule taken as a
@@ -1742,61 +1871,101 @@ fn spawn_vault_load_with_schedule(
     cache: std::sync::Arc<VaultCache>,
     tx: mpsc::Sender<(u64, Result<(Vec<VaultItem>, Vec<Folder>), String>)>,
     force_refresh: bool,
+    era: VaultEra,
     generation: u64,
     skip_readiness_wait: bool,
     schedule: Vec<Duration>,
 ) {
     std::thread::spawn(move || {
-        if force_refresh || !cache.is_populated() {
-            // Same wait `spawn_sync` performs before its own `populate()`
-            // (see this function's doc) -- cheap when `bw serve` is already
-            // answering (the very first attempt succeeds), and the only
-            // thing standing between "backend mid-cold-start" and a bogus
-            // connection-refused failure otherwise. Skipped when the caller
-            // already knows the backend was running before this window
-            // session started (`skip_readiness_wait`, review Minor 3):
-            // `populate()` right below still runs, and still fails loudly if
-            // the backend somehow isn't answering after all, so skipping the
-            // probe costs nothing but a redundant `list_items()` call in the
-            // case it's meant to skip -- not the safety net itself.
-            if !skip_readiness_wait {
-                if let Err(e) = wait_for_vault_ready(cache.bridge(), &schedule) {
-                    log::warn!("could not populate the vault cache: bw serve never became ready: {e}");
-                    let _ = tx.send((generation, Err(e)));
-                    return;
-                }
+        // ONE lock acquisition, and the era check is inside it. This used to
+        // be `force_refresh || !cache.is_populated()` here and
+        // `cache.items(), cache.folders()` at the bottom -- three separate
+        // acquisitions, so items and folders could come from different
+        // populates (account A's items filed under account B's folders) and
+        // the common path skipped the populate entirely, which took the
+        // `DiscardedStale` arm below out of the picture and let a `clear`
+        // landing between the gate and the reads paint an EMPTY VAULT as
+        // data. See `vault_load_step`.
+        match vault_load_step(force_refresh, cache.snapshot_unless_superseded(era)) {
+            VaultLoadStep::Paint(snapshot) => {
+                let _ = tx.send((generation, Ok((snapshot.items, snapshot.folders))));
+                return;
             }
-            match cache.populate() {
-                Ok(PopulateOutcome::Populated) => {}
-                // The cache was cleared underneath this populate (a lock, or
-                // a re-auth into a possibly different account), so it is
-                // deliberately empty. Reporting `Ok((empty, empty))` here
-                // would paint an empty vault list -- data, drawn from the
-                // absence of data (review 14's Minor). The `Err` arm in
-                // `apply_vault_load_result` instead keeps whatever snapshot
-                // was already on screen and says so in the log.
-                //
-                // Not reachable as the app is wired today (review 15's
-                // Minor 1): every `VaultCache::clear` runs on the main
-                // thread, and `vault_window::run` owns that thread for this
-                // window's whole lifetime, so nothing can clear the cache
-                // while this background populate is in flight. Kept, and
-                // recorded as unreachable rather than presented as a fix to
-                // live misbehaviour -- the planned encrypted disk cache adds
-                // the background-thread `clear` callers that make it real.
-                Ok(PopulateOutcome::DiscardedStale) => {
-                    log::warn!("the vault was cleared while this refresh was in flight");
-                    let _ = tx.send((generation, Err("the vault was locked while refreshing".to_string())));
-                    return;
-                }
-                Err(e) => {
-                    log::warn!("could not populate the vault cache: {e:?}");
-                    let _ = tx.send((generation, Err(format!("{e:?}"))));
-                    return;
-                }
+            VaultLoadStep::GiveUp(reason) => {
+                log::warn!("not loading the vault for era {era}: {reason}");
+                let _ = tx.send((generation, Err(reason.to_string())));
+                return;
+            }
+            VaultLoadStep::Populate => {}
+        }
+        // Same wait `spawn_sync` performs before its own `populate()` (see
+        // this function's doc) -- cheap when `bw serve` is already answering
+        // (the very first attempt succeeds), and the only thing standing
+        // between "backend mid-cold-start" and a bogus connection-refused
+        // failure otherwise. Skipped when the caller already knows the
+        // backend was running before this window session started
+        // (`skip_readiness_wait`, review Minor 3): `populate()` right below
+        // still runs, and still fails loudly if the backend somehow isn't
+        // answering after all, so skipping the probe costs nothing but a
+        // redundant `list_items()` call in the case it's meant to skip --
+        // not the safety net itself.
+        if !skip_readiness_wait {
+            if let Err(e) = wait_for_vault_ready(cache.bridge(), &schedule) {
+                log::warn!("could not populate the vault cache: bw serve never became ready: {e}");
+                let _ = tx.send((generation, Err(e)));
+                return;
             }
         }
-        let _ = tx.send((generation, Ok((cache.items(), cache.folders()))));
+        match cache.populate() {
+            Ok(PopulateOutcome::Populated) => {}
+            // The cache was cleared underneath this populate (a lock, or a
+            // re-auth into a possibly different account), so it is
+            // deliberately empty. Reporting `Ok((empty, empty))` here would
+            // paint an empty vault list -- data, drawn from the absence of
+            // data (review 14's Minor). The `Err` arm in
+            // `apply_vault_load_result` instead keeps whatever snapshot was
+            // already on screen and says so in the log.
+            //
+            // This arm is no longer the only thing standing between a
+            // mid-flight `clear` and a painted empty vault, and it is no
+            // longer bypassable: the gate above is an era-checked read rather
+            // than an `is_populated()` short-circuit, and the read below is
+            // era-checked too, so the same `clear` is refused at whichever of
+            // the three points it lands. It is kept because it is the more
+            // specific report -- the populate itself knows it was discarded,
+            // where the read below can only observe that the era moved.
+            //
+            // The old note here said this was unreachable because every
+            // `VaultCache::clear` runs on the main thread and
+            // `vault_window::run` owns that thread. That is an argument about
+            // thread affinity, not about this code, and it is the argument
+            // this project has had to un-write repeatedly; it is deliberately
+            // not what keeps any of these three refusals correct.
+            Ok(PopulateOutcome::DiscardedStale) => {
+                log::warn!("the vault was cleared while this refresh was in flight");
+                let _ = tx.send((generation, Err(VAULT_CLEARED_WHILE_REFRESHING.to_string())));
+                return;
+            }
+            Err(e) => {
+                log::warn!("could not populate the vault cache: {e:?}");
+                let _ = tx.send((generation, Err(format!("{e:?}"))));
+                return;
+            }
+        }
+        // The second era-checked read, and the second thing the old code got
+        // wrong: `cache.items(), cache.folders()` here was two more lock
+        // acquisitions with no era check at all, so a `clear` landing after
+        // the populate wrote back was invisible and its empty snapshot went
+        // out under an `Ok`. See `vault_read_after_populate`.
+        match vault_read_after_populate(cache.snapshot_unless_superseded(era)) {
+            Ok(snapshot) => {
+                let _ = tx.send((generation, Ok((snapshot.items, snapshot.folders))));
+            }
+            Err(reason) => {
+                log::warn!("the refreshed vault is not readable for era {era}: {reason}");
+                let _ = tx.send((generation, Err(reason.to_string())));
+            }
+        }
     });
 }
 
@@ -2773,7 +2942,7 @@ mod spawn_vault_load_tests {
     // swallowed into "send whatever's already cached as if it were fresh".
     use super::spawn_vault_load_with_schedule;
     use crate::vault_bridge::VaultBridge;
-    use crate::vault_cache::VaultCache;
+    use crate::vault_cache::{PopulateOutcome, VaultCache};
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
@@ -2803,10 +2972,12 @@ mod spawn_vault_load_tests {
 
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let (tx, rx) = mpsc::channel();
+        // The era is captured before the spawn, exactly as `run` does it.
+        let era = cache.epoch().era();
         // Empty schedule: the mock answers on the very first attempt, so
         // there is nothing to retry regardless -- this only proves an empty
         // schedule doesn't itself block a successful readiness check.
-        spawn_vault_load_with_schedule(cache, tx, true, 1, false, vec![]);
+        spawn_vault_load_with_schedule(cache, tx, true, era, 1, false, vec![]);
 
         let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert_eq!(generation, 1, "the result must be tagged with the generation it was spawned with");
@@ -2823,7 +2994,8 @@ mod spawn_vault_load_tests {
         // rather than waiting out the real READINESS_DEADLINE.
         let cache = Arc::new(VaultCache::new(VaultBridge::new("http://127.0.0.1:1")));
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, true, 7, false, vec![]);
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(cache, tx, true, era, 7, false, vec![]);
 
         let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert_eq!(generation, 7);
@@ -2859,7 +3031,8 @@ mod spawn_vault_load_tests {
 
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, true, 1, true, vec![]);
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(cache, tx, true, era, 1, true, vec![]);
 
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_ok(), "populate() must still run and succeed even with the wait skipped");
@@ -2891,11 +3064,246 @@ mod spawn_vault_load_tests {
 
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let (tx, rx) = mpsc::channel();
-        spawn_vault_load_with_schedule(cache, tx, true, 1, false, vec![]);
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(cache, tx, true, era, 1, false, vec![]);
 
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_ok());
         items.assert();
+    }
+
+    #[test]
+    fn a_superseded_era_neither_fetches_nor_paints() {
+        // REVIEW 26'S RECORDED PRODUCER, the whole point of the `era`
+        // parameter. The era is captured on the main thread; a `clear` lands
+        // before the worker gets to read. The window's result is meaningless
+        // for the session that asked, so nothing is fetched (the mocks are
+        // `.expect(1)`, satisfied by the manual populate below and nothing
+        // else) and nothing is painted -- `Err`, so
+        // `apply_vault_load_result` keeps whatever is already on screen.
+        let mut server = mockito::Server::new();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(1)
+            .create();
+        let folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .expect(1)
+            .create();
+
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        assert_eq!(
+            cache.populate().expect("the mocks answer"),
+            PopulateOutcome::Populated
+        );
+        let era = cache.epoch().era();
+        cache.clear();
+
+        // `true` -- a FORCED refresh must give up too. Forcing says "the
+        // vault changed under me", not "fetch me some other account's
+        // vault"; the era it was spawned for is gone either way.
+        let (tx, rx) = mpsc::channel();
+        spawn_vault_load_with_schedule(cache.clone(), tx, true, era, 4, true, vec![]);
+        let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        assert_eq!(generation, 4);
+        assert!(
+            result.is_err(),
+            "a load whose era was superseded must not paint -- an Ok here is another account's \
+             vault, or an empty one presented as data"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        spawn_vault_load_with_schedule(cache, tx, false, era, 5, true, vec![]);
+        let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        assert!(result.is_err(), "and neither may the unforced path");
+
+        items.assert();
+        folders.assert();
+    }
+
+    #[test]
+    fn the_common_path_paints_both_halves_from_one_checked_read_without_fetching() {
+        // The `!force_refresh && already populated` path: no HTTP at all
+        // (both mocks are `.expect(1)`, spent by the manual populate), and
+        // the items and folders it sends come from ONE
+        // `snapshot_unless_superseded` call, so they cannot be from two eras.
+        let mut server = mockito::Server::new();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(1)
+            .create();
+        let folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[{"id":"f1","name":"F"}]}}"#)
+            .expect(1)
+            .create();
+
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        assert_eq!(
+            cache.populate().expect("the mocks answer"),
+            PopulateOutcome::Populated
+        );
+        let era = cache.epoch().era();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_vault_load_with_schedule(cache, tx, false, era, 1, true, vec![]);
+        let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        let (loaded_items, loaded_folders) = result.expect("the snapshot is readable for this era");
+        assert_eq!(loaded_items.len(), 1);
+        assert_eq!(loaded_folders.len(), 1, "the folders half must arrive with the items half");
+
+        items.assert();
+        folders.assert();
+    }
+
+    #[test]
+    fn a_clear_from_inside_a_response_handler_paints_neither_half() {
+        // `vault_cache.rs`'s deterministic-interleaving technique rather than
+        // a sleep: the `clear()` fires from inside the mocked folders
+        // response handler, so it lands strictly after the populate began
+        // fetching and strictly before it writes back. The forced refresh
+        // must report a failure, not the pre-clear items, and not the empty
+        // vault the clear left behind.
+        let mut server = mockito::Server::new();
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let cache_for_handler = cache.clone();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                cache_for_handler.clear();
+                folders_body().as_bytes().to_vec()
+            })
+            .create();
+
+        let era = cache.epoch().era();
+        let (tx, rx) = mpsc::channel();
+        spawn_vault_load_with_schedule(cache, tx, true, era, 1, true, vec![]);
+        let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
+        assert!(
+            result.is_err(),
+            "a refresh cleared mid-flight must report a failure -- painting its Ok would draw \
+             either a stale account's items or an empty vault as data"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vault_load_step_tests {
+    // The decision `spawn_vault_load_with_schedule`'s detached worker used to
+    // make inline as `force_refresh || !cache.is_populated()` across three
+    // separate lock acquisitions (review 26's recorded producer). Hoisted out
+    // of the closure so each arm is pinned directly instead of being inferred
+    // from a thread's observable behaviour.
+    use super::{vault_load_step, vault_read_after_populate, VaultLoadStep};
+    use crate::vault_cache::{VaultSnapshot, VaultUnavailable};
+
+    fn a_snapshot() -> VaultSnapshot {
+        VaultSnapshot {
+            items: vec![serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).expect("valid item")],
+            folders: vec![serde_json::from_str(r#"{"id":"f1","name":"F"}"#).expect("valid folder")],
+        }
+    }
+
+    #[test]
+    fn a_superseded_era_gives_up_rather_than_fetching_a_vault_it_cannot_use() {
+        // `Superseded` and `Unpopulated` are NOT the same situation, which is
+        // this codebase's whole defect history in one sentence. A populate
+        // cannot cure `Superseded`: it takes its own, newer epoch and fills
+        // the cache for the session that exists NOW, which is not the one
+        // this window session captured its era in. Fetching would spend a
+        // full vault round-trip to produce another account's data.
+        for force_refresh in [false, true] {
+            assert!(
+                matches!(
+                    vault_load_step(force_refresh, Err(VaultUnavailable::Superseded)),
+                    VaultLoadStep::GiveUp(_)
+                ),
+                "force_refresh = {force_refresh}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpopulated_snapshot_in_the_same_era_is_exactly_what_a_populate_cures() {
+        // The everyday first-open path: a fresh process is era 0 and
+        // unpopulated, so an era captured before the first populate compares
+        // EQUAL. Refusing here would leave the window permanently empty.
+        for force_refresh in [false, true] {
+            assert!(
+                matches!(
+                    vault_load_step(force_refresh, Err(VaultUnavailable::Unpopulated)),
+                    VaultLoadStep::Populate
+                ),
+                "force_refresh = {force_refresh}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_readable_snapshot_is_painted_unforced_and_refetched_when_forced() {
+        let VaultLoadStep::Paint(snapshot) = vault_load_step(false, Ok(a_snapshot())) else {
+            panic!("an unforced load over a readable snapshot must paint it, not re-fetch");
+        };
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.folders.len(), 1);
+
+        assert!(
+            matches!(vault_load_step(true, Ok(a_snapshot())), VaultLoadStep::Populate),
+            "a forced refresh follows a sync that changed the vault underneath the snapshot"
+        );
+    }
+
+    #[test]
+    fn the_only_way_to_paint_is_a_snapshot_that_arrived_as_one_value() {
+        // The structural half of "items and folders cannot come from
+        // different eras": `Paint` carries a `VaultSnapshot`, which
+        // `VaultCache::snapshot_unless_superseded` only ever builds under a
+        // single lock acquisition. There is no arm that composes `items()`
+        // with `folders()`, so the tearing spelling is unrepresentable here
+        // rather than merely unattempted.
+        assert!(matches!(
+            vault_load_step(false, Ok(a_snapshot())),
+            VaultLoadStep::Paint(VaultSnapshot { .. })
+        ));
+        assert!(matches!(
+            vault_read_after_populate(Ok(a_snapshot())),
+            Ok(VaultSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn a_clear_landing_after_the_populate_wrote_back_is_still_refused() {
+        // The read AFTER the populate is era-checked too, and this is the
+        // window the old code could not see at all: `populate()` reports
+        // `Populated`, a `clear` lands, and the separate `cache.items()` /
+        // `cache.folders()` reads then hand back the empty vault the clear
+        // left -- data drawn from the absence of data, with a green result.
+        assert!(vault_read_after_populate(Err(VaultUnavailable::Superseded)).is_err());
+        // Unreachable after a successful populate in the same era, but a
+        // distinct situation and not folded into the one above: it means the
+        // snapshot is empty because nothing filled it, not because a
+        // different vault session began. Either way there is nothing to
+        // paint, so neither may be reported as `Ok`.
+        assert!(vault_read_after_populate(Err(VaultUnavailable::Unpopulated)).is_err());
     }
 }
 

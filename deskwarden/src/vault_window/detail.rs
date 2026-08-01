@@ -467,6 +467,13 @@ pub fn card_fields(data: &CardData) -> CardFields {
 }
 
 /// The identity pane's rows, grouped, with empty fields and empty groups
+/// The identity pane's displayed text, and the ONLY producer of it: named
+/// groups, each with its surviving label/value rows, empty fields and whole
+/// empty groups already suppressed. See [`identity_groups`], and
+/// [`identity_rows`] for why the pane takes this rather than an
+/// [`IdentityData`].
+type IdentityGroups = Vec<(&'static str, Vec<(&'static str, String)>)>;
+
 /// removed.
 ///
 /// Pure so the suppression rule is tested directly rather than inferred from a
@@ -479,7 +486,7 @@ pub fn card_fields(data: &CardData) -> CardFields {
 /// is modelled (see [`IdentityData`]'s doc); if a real item carries it, the
 /// pane shows it instead of hiding it in `other`. It costs one suppressed row
 /// on every item that does not.
-fn identity_groups(identity: &IdentityData) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+fn identity_groups(identity: &IdentityData) -> IdentityGroups {
     let f = |label: &'static str, value: &Option<String>| {
         non_empty(value.as_deref()).map(|v| (label, v.to_string()))
     };
@@ -717,7 +724,7 @@ pub fn draw_detail_read(
         }
         DetailBody::Identity => {
             card(ui, "IDENTITY", |ui| {
-                identity_rows(ui, item.identity.as_ref(), &mut action);
+                identity_rows(ui, item.identity.as_ref().map(identity_groups), &mut action);
             });
             ui.add_space(10.0);
         }
@@ -942,8 +949,20 @@ fn card_rows(
 /// The IDENTITY rows, grouped by [`identity_groups`] and nothing else -- the
 /// suppression of empty fields *and* of whole empty groups is that function's
 /// decision, tested directly, and this only draws what it hands back.
-fn identity_rows(ui: &mut egui::Ui, identity: Option<&IdentityData>, action: &mut DetailAction) {
-    let groups = identity.map(identity_groups).unwrap_or_default();
+///
+/// **It takes [`IdentityGroups`], never an [`IdentityData`], and that is
+/// structural** -- the same restructuring `card_rows` got, for the identical
+/// hazard one pane over. While the raw `identity` stayed in scope here, "every
+/// displayed row comes from `identity_groups`" was a convention a new row could
+/// break without noticing: a `credential_row(ui, "Website", &identity.website,
+/// ..)` written directly off it compiles and renders, and is invisible to the
+/// emptiness check below -- so the pane draws a row *and* says "No identity
+/// details on this item.", and is invisible to the group suppression too, so it
+/// lands outside every heading. The conversion happens at the call site
+/// instead, so there is no `identity` here to reach for and a nineteenth field
+/// has to go through [`identity_groups`] to reach the pane.
+fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut DetailAction) {
+    let groups = groups.unwrap_or_default();
     if groups.is_empty() {
         empty_pane_note(ui, "No identity details on this item.");
         return;
