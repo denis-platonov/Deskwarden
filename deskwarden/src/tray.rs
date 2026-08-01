@@ -183,17 +183,26 @@ pub fn set_update_failed(tray: &AppTray, version: &Version) {
 /// label says what's happening -- the work runs off the main thread, so
 /// without this the item would just appear to do nothing while it's running.
 pub fn set_sync_in_progress(tray: &AppTray) {
-    tray.sync_item.set_text("Syncing...");
-    tray.sync_item.set_enabled(false);
+    sync_item_to_in_progress(&tray.sync_item);
     set_tooltip(tray, "Deskwarden - syncing...".to_string());
 }
 
-/// Reverts the "Sync" item to normal after a sync completes (successfully
-/// or not) and restores the idle tooltip -- called once the outcome, whatever
-/// it was, has been applied.
+/// Returns the "Sync" item to its resting state: label, enabled state and
+/// tooltip together.
+///
+/// This is the **only** way anything re-enables the item (review 18's Minor).
+/// It used to share that job with a `set_sync_item_enabled(tray, true)` that
+/// restored the enabled state and nothing else, and the two disagreed in a
+/// reachable state: `open_vault_window` abandons a wedged backend operation
+/// at `BACKEND_OP_TIMEOUT` and re-enabled the item there, so a wedged *sync*
+/// left the menu reading "Syncing..." -- with the "Deskwarden - syncing..."
+/// tooltip -- on an item that was idle and clickable. That label says "busy,
+/// do not click" at exactly the moment `stand_down_after_unlock`'s message
+/// tells the user to click "Sync", which is then not a name anything in the
+/// menu has. It could persist for the whole session, because the thread that
+/// would have relabelled it is the one that never reported back.
 pub fn set_sync_idle(tray: &AppTray) {
-    tray.sync_item.set_text("Sync");
-    tray.sync_item.set_enabled(true);
+    sync_item_to_idle(&tray.sync_item);
     set_tooltip(tray, IDLE_TOOLTIP.to_string());
 }
 
@@ -211,15 +220,13 @@ pub fn set_sync_idle(tray: &AppTray) {
 /// looking in the log file. The label is seen the moment the menu is opened,
 /// which is also the same click that retries.
 pub fn set_sync_failed(tray: &AppTray) {
-    tray.sync_item.set_text("Sync failed - click to retry");
-    tray.sync_item.set_enabled(true);
+    sync_item_to_failed(&tray.sync_item);
     set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
 }
 
-/// Disables (or re-enables) the "Sync" item without touching its label, for
-/// an in-flight backend operation that needs `bw serve` up but isn't itself
-/// a sync -- the tray's "Add app..." handler starting the backend so the
-/// picker can save.
+/// Disables the "Sync" item without touching its label, for an in-flight
+/// backend operation that needs `bw serve` up but isn't itself a sync -- the
+/// tray's "Add app..." handler starting the backend so the picker can save.
 ///
 /// Without this, a Sync click landing while that start is still in flight
 /// used to be silently dropped by `main`'s `backend_task_in_progress` guard
@@ -228,8 +235,40 @@ pub fn set_sync_failed(tray: &AppTray) {
 /// deliberately: that label says "Syncing...", which would be untrue for a
 /// plain backend start with no `bw sync` attached -- this only changes
 /// whether the item can be clicked, not what it claims is happening.
-pub fn set_sync_item_enabled(tray: &AppTray, enabled: bool) {
-    tray.sync_item.set_enabled(enabled);
+///
+/// **One direction only** (review 18's Minor): this used to take a bool, and
+/// its `true` half was how four call sites re-enabled the item, leaving
+/// whatever busy label was showing in place. Undoing this is
+/// [`set_sync_idle`], which restores label, enabled state and tooltip
+/// together, so "enabled" and "idle" cannot disagree. Preserving the label
+/// while DISABLING is safe in a way preserving it while enabling is not: a
+/// disabled item cannot invite a click it will then refuse, and the label it
+/// preserves ("Sync failed - click to retry", say) is still true.
+pub fn set_sync_busy_with_backend_op(tray: &AppTray) {
+    tray.sync_item.set_enabled(false);
+}
+
+// The four appearances of the "Sync" item, applied to the `MenuItem` alone.
+//
+// Split out from the `set_sync_*` functions above purely so they can be
+// tested: an `AppTray` cannot be constructed in a test (it owns a real
+// `TrayIcon`, which needs a window and a message pump), but a bare
+// `MenuItem` can. The tooltip stays with the public functions, since that
+// genuinely does need the icon.
+
+fn sync_item_to_in_progress(item: &MenuItem) {
+    item.set_text("Syncing...");
+    item.set_enabled(false);
+}
+
+fn sync_item_to_idle(item: &MenuItem) {
+    item.set_text("Sync");
+    item.set_enabled(true);
+}
+
+fn sync_item_to_failed(item: &MenuItem) {
+    item.set_text("Sync failed - click to retry");
+    item.set_enabled(true);
 }
 
 /// Best-effort tooltip update: a tooltip that won't set is a cosmetic
@@ -243,6 +282,60 @@ fn set_tooltip(tray: &AppTray, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 18's Minor. Every path that lets the user click "Sync" again
+    /// has to leave it *saying* "Sync" -- there is no state in which enabled
+    /// and busy-labelled is what anyone wanted.
+    ///
+    /// The reachable instance: a tray Sync wedges, `open_vault_window` gives
+    /// up on it after `BACKEND_OP_TIMEOUT` and releases the item, and before
+    /// this fix that release restored only the enabled state. The menu then
+    /// read "Syncing..." on an idle item, for as long as the wedged thread
+    /// never reported -- i.e. possibly the whole session, since review 17
+    /// made that state outlive the process. `stand_down_after_unlock`, which
+    /// runs moments later on that same path, tells the user to click "Sync";
+    /// there is then no such item, and the one that is there says "busy".
+    ///
+    /// HONEST NOTE ON THE RED: this test cannot fail in its final form,
+    /// because the defect was the CALL SITE picking an enable-only API and
+    /// no test can build an `AppTray` to drive that call site. It was
+    /// watched failing (`"Syncing..." != "Sync"`) against a
+    /// `set_enabled(true)`-only release helper standing in for the deleted
+    /// `set_sync_item_enabled(tray, true)`; the fix deletes that helper, so
+    /// no call site can choose it again and the compiler enforces it.
+    #[test]
+    fn releasing_the_sync_item_leaves_it_labelled_idle_not_busy() {
+        let item = MenuItem::new("Sync", true, None);
+
+        sync_item_to_in_progress(&item);
+        assert_eq!(item.text(), "Syncing...");
+        assert!(!item.is_enabled());
+
+        sync_item_to_idle(&item);
+        assert!(
+            item.is_enabled(),
+            "the whole point of the release is that the item is clickable again"
+        );
+        assert_eq!(
+            item.text(),
+            "Sync",
+            "an enabled item still reading \"Syncing...\" tells the user not to click the one \
+             affordance the stand-down message names"
+        );
+    }
+
+    /// The other releasing state has to hold the same invariant: it is
+    /// enabled, so its label must describe something the user can act on
+    /// rather than something in flight.
+    #[test]
+    fn the_failed_sync_label_is_enabled_and_says_what_to_do() {
+        let item = MenuItem::new("Sync", true, None);
+        sync_item_to_in_progress(&item);
+        sync_item_to_failed(&item);
+
+        assert!(item.is_enabled());
+        assert_eq!(item.text(), "Sync failed - click to retry");
+    }
 
     #[test]
     fn the_embedded_application_icon_loads_by_ordinal() {

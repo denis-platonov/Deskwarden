@@ -594,7 +594,6 @@ fn main() {
                     &store,
                     &schedule,
                     &mut engine,
-                    &config_dir,
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
@@ -657,7 +656,7 @@ fn main() {
                     // means the click can't be issued in the first place;
                     // `apply_backend_op`'s `EnsureRunning` arms re-enable it
                     // once this completes.
-                    tray::set_sync_item_enabled(&tray, false);
+                    tray::set_sync_busy_with_backend_op(&tray);
                     spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
                 }
 
@@ -779,7 +778,6 @@ fn main() {
                     &store,
                     &schedule,
                     &mut engine,
-                    &config_dir,
                     &icon_cache_dir,
                     &mut cached_status_details,
                     settings.auto_lock_timeout(),
@@ -861,11 +859,16 @@ fn main() {
                              treating it as failed so the backend lifecycle doesn't stay wedged \
                              on it forever"
                         );
-                        // A no-op unless the `tray.add_app_id` handler
-                        // disabled it before kicking this off; harmless
-                        // either way (same reasoning as `apply_backend_op`'s
-                        // `EnsureRunning` arms).
-                        tray::set_sync_item_enabled(&tray, true);
+                        // Nothing is in flight any more, so the item goes all
+                        // the way back to idle -- label, enabled state and
+                        // tooltip together (review 18's Minor). Re-enabling
+                        // alone used to be enough here only because the
+                        // `tray.add_app_id` handler never changes the label;
+                        // a wedged *sync* reaching a release like this one is
+                        // what left the menu reading "Syncing..." on an idle
+                        // item. Not `set_sync_failed`: no sync was requested,
+                        // and claiming one failed would be untrue.
+                        tray::set_sync_idle(&tray);
                     }
                 }
             }
@@ -1003,6 +1006,18 @@ fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
 /// The failure paths this replaces logged a line to a file nobody has open and
 /// then called `exit(1)`: from the user's side, a double-clicked app that
 /// simply never appeared, with no clue as to why.
+///
+/// **RESERVED FOR THE GENUINELY PRE-TRAY STARTUP PATH -- do not call it from
+/// anywhere the tray already exists.** Every caller left is above `main`'s
+/// loop, where there is no running app to preserve and no affordance the user
+/// could recover through, so refusing to start is both true and the only
+/// option. Past the tray it is neither: the text says "Deskwarden cannot
+/// start" about an app that has been running for hours, and the exit takes
+/// the tray, the global hotkey, autofill and window-watching down with it
+/// over conditions that are usually transient. Three consecutive reviews
+/// (12, 17, 18) each removed one such call from `open_vault_window`'s lock
+/// recovery; the answer there is [`stand_down_after_unlock`], which leaves
+/// the app running and locked and names a recovery that works.
 fn fatal_startup_error(message: &str) -> ! {
     log::error!("refusing to start: {}", message.replace('\n', " "));
     message_box("Deskwarden cannot start", message, MB_ICONERROR | MB_OK);
@@ -1301,6 +1316,60 @@ fn repopulate_and_refresh_after_unlock(
     }
 }
 
+/// Restarts `bw serve` for the lock recovery, standing autofill down instead
+/// of exiting when it cannot be started. `None` means the recovery is over:
+/// the caller has no child to track and nothing left to probe.
+///
+/// **Why it does not exit** (review 18's Important). This was the last
+/// `fatal_startup_error` left in `open_vault_window`, and every sibling arm
+/// around it had already been made survivable -- `Ready` survives an
+/// all-500 backend, `Dismissed` survives by review 12's design, and review
+/// 17 made the readiness TIMEOUT stand down for the reason that applies here
+/// with a higher base rate still: there is an already-running app -- tray,
+/// hotkey, autofill, window-watching -- to preserve, and killing it costs
+/// the user far more than the transient it is reacting to.
+///
+/// Transient is the operative word. The dominant failure here is
+/// [`BackendStartError::PortHeld`], and this call site killed *its own*
+/// `bw serve` a few lines earlier, so a socket that has not been released
+/// yet is the EXPECTED case rather than an exceptional one -- which is what
+/// [`bw_serve::PORT_RELEASE_GRACE_RESTART`] exists for, and what
+/// `try_start_backend`'s own doc already said in as many words ("returns the
+/// failure instead of exiting, because on the restart paths ... killing the
+/// whole app over a socket that needs another second to close is far
+/// worse"). Only the caller disagreed, and it fired immediately after the
+/// user had retyped their master password.
+///
+/// Standing down reuses [`stand_down_after_unlock`] rather than inventing a
+/// second mechanism, so ONE place decides what "we could not get the vault
+/// back" looks like and says so to the user. The state the caller is left in
+/// is the one the `Dismissed` path already produces and has been shipping:
+/// cache cleared, `bw_serve_child` `None` (the old child was stopped and the
+/// new one never existed, so nothing is orphaned that this process was
+/// tracking), a freshly re-authenticated `session_token`,
+/// `cached_status_details` `None` so the next open re-fetches,
+/// `backend_task_in_progress` `None`, the engine cleared, and the tray's
+/// "Sync" item idle and clickable -- the recovery `stand_down_after_unlock`'s
+/// message names. The one difference from the readiness-timeout stand-down is
+/// that no backend is left running to come up on its own; a tray Sync starts
+/// one itself (`spawn_sync` takes `currently_running: false`), so the named
+/// recovery still works.
+fn restart_backend_after_unlock(
+    engine: &mut MatchEngine,
+    start: impl FnOnce() -> Result<Child, BackendStartError>,
+) -> Option<Child> {
+    match start() {
+        Ok(child) => Some(child),
+        Err(e) => {
+            stand_down_after_unlock(
+                engine,
+                &format!("the Bitwarden backend could not be restarted after unlocking ({e})"),
+            );
+            None
+        }
+    }
+}
+
 /// Decides what the lock recovery does with the readiness probe's outcome:
 /// repopulate, retry once, or stand autofill down.
 ///
@@ -1419,7 +1488,11 @@ fn settle_vault_after_unlock(
 /// The freshly (re)started `bw serve` from just above is left running rather
 /// than killed: it may still come up on its own, in which case a tray Sync
 /// works immediately. `main`'s idle reconciliation tears it back down if
-/// `keep_backend_running` says to, exactly as it does after startup.
+/// `keep_backend_running` says to, exactly as it does after startup. The
+/// third caller ([`restart_backend_after_unlock`], review 18) is the one case
+/// where no backend is running at all, because starting it is what failed --
+/// `bw_serve_child` is `None` there and a tray Sync starts one itself, so the
+/// recovery this message names still works.
 fn stand_down_after_unlock(engine: &mut MatchEngine, reason: &str) {
     engine.clear();
     log::warn!(
@@ -1473,7 +1546,6 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     store: &session_store::SessionStore,
     schedule: &[Duration],
     engine: &mut MatchEngine,
-    config_dir: &std::path::Path,
     icon_cache_dir: &std::path::Path,
     // Warmed by a background thread at startup (see `main`'s
     // `status_details_rx`) and reused across opens, so the common case pays
@@ -1594,7 +1666,17 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                     // instead of receiving. Left disabled, a hung `bw sync`
                     // right here permanently kills Sync for the rest of the
                     // session. A no-op if nothing had disabled it.
-                    tray::set_sync_item_enabled(tray, true);
+                    //
+                    // Review 18's Minor: all the way back to idle, not just
+                    // re-enabled. THIS is the site where the two disagreed --
+                    // the operation being abandoned here is very often the
+                    // tray `Sync` that set the label to "Syncing...", and its
+                    // thread is by definition never going to report back and
+                    // relabel it. The stand-down message a few lines below
+                    // names "Sync"; leaving the item saying "Syncing..."
+                    // means the menu contains no item by that name, and the
+                    // one that is there reads as busy.
+                    tray::set_sync_idle(tray);
                 }
             }
             *backend_task_in_progress = None;
@@ -1626,21 +1708,22 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // back down afterwards if the policy says to, exactly as it does
         // after startup's own unconditional start; this function no longer
         // needs to know or care what the policy says.
-        *bw_serve_child = match try_start_backend(
-            session_token,
-            job_ref(job),
-            bw_serve::PORT_RELEASE_GRACE_RESTART,
-        ) {
-            Ok(child) => Some(child),
-            Err(e) => {
-                log::error!("{e}");
-                fatal_startup_error(&format!(
-                    "Deskwarden could not restart its Bitwarden backend after the vault \
-                     window locked.\n\n{e}\n\nFull details are in:\n{}",
-                    logging::log_file_path(config_dir).display()
-                ));
-            }
+        //
+        // A failure to start it is survivable here, and standing down is the
+        // whole of the recovery: see `restart_backend_after_unlock`. There is
+        // nothing left to probe once no backend came up, so this returns
+        // rather than spending the ~30s readiness deadline on a port nothing
+        // is listening on.
+        let Some(child) = restart_backend_after_unlock(engine, || {
+            try_start_backend(
+                session_token,
+                job_ref(job),
+                bw_serve::PORT_RELEASE_GRACE_RESTART,
+            )
+        }) else {
+            return;
         };
+        *bw_serve_child = Some(child);
         // Captured here, *before* the readiness probe below, for the same
         // reason startup captures `startup_epoch` before its own probe: that
         // probe's `list_items()` is the fetch whose result seeds the cache
@@ -1847,16 +1930,19 @@ fn apply_backend_op(
             if adopt_started_child(bw_serve_child, child) {
                 log::info!("bw serve started for the vault window");
             }
-            // A no-op unless the "Add app..." handler disabled it before
-            // kicking this off (see that call site); harmless either way.
-            tray::set_sync_item_enabled(tray, true);
+            // Back to idle rather than merely re-enabled (review 18's
+            // Minor): the "Add app..." handler that disabled it leaves the
+            // label alone, but this arm also runs for an `EnsureRunning`
+            // that a lock recovery abandoned, by which point the label may
+            // be a stale "Syncing..." from an earlier wedged sync.
+            tray::set_sync_idle(tray);
         }
         BackendOp::EnsureRunning(Err(e)) => {
             log::error!(
                 "could not start bw serve for the vault window (writes and TOTP will fail until \
                  the next attempt; reads still work from the cache): {e}"
             );
-            tray::set_sync_item_enabled(tray, true);
+            tray::set_sync_idle(tray);
         }
         BackendOp::Sync { child, outcome } => {
             match child {
@@ -2881,6 +2967,84 @@ mod tests {
         assert!(
             engine.lookup("notepad.exe").is_none(),
             "same stand-down as a dismissal: empty cache, empty engine, app alive and locked"
+        );
+    }
+
+    /// Review 18's Important, and the twin of the test above. Commit 7041360
+    /// made the readiness TIMEOUT survivable on the argument that a transient
+    /// failure must not kill tray, hotkey, autofill and window-watching when
+    /// there is a running app to preserve -- and then left the
+    /// `try_start_backend` failure twenty lines earlier calling
+    /// `fatal_startup_error`. That failure is *more* likely to be transient,
+    /// not less: its dominant shape is `PortHeld`, and this very call site
+    /// killed its own `bw serve` moments before, so a port that has not been
+    /// released yet is the EXPECTED case -- which is exactly why
+    /// `PORT_RELEASE_GRACE_RESTART` exists and why `try_start_backend`'s own
+    /// doc says it returns the failure "instead of exiting, because on the
+    /// restart paths (and especially the one right after the user retyped
+    /// their master password) killing the whole app over a socket that needs
+    /// another second to close is far worse". Only the caller disagreed.
+    ///
+    /// It now stands down through the same `stand_down_after_unlock` the
+    /// readiness arms use, so there is one place that decides what "we could
+    /// not get the vault back" looks like. That this test runs at all is
+    /// again part of the assertion: the old arm called `std::process::exit(1)`
+    /// and would have taken the test runner with it.
+    #[test]
+    fn a_backend_that_cannot_be_restarted_after_unlock_leaves_the_app_running() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+        )]);
+
+        let child = restart_backend_after_unlock(&mut engine, || {
+            Err(BackendStartError::PortHeld(Duration::from_secs(1)))
+        });
+
+        assert!(
+            child.is_none(),
+            "there is no child to track -- and `bw_serve_child` must stay None so the next open \
+             starts one rather than talking to a process nothing owns"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "nothing confirmed the backend under the NEW session, so the engine can only hold \
+             the pre-lock account's matches: same stand-down the readiness arms produce, not an \
+             exit and not a silently armed engine"
+        );
+    }
+
+    /// The other half, so the fix above cannot pass by standing down
+    /// unconditionally: a start that succeeds hands the child straight back
+    /// and touches nothing. The engine it leaves alone is about to be rebuilt
+    /// by the readiness probe on the ordinary path.
+    #[test]
+    fn a_backend_that_does_restart_after_unlock_is_handed_back_untouched() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+        )]);
+
+        let started = restart_backend_after_unlock(&mut engine, || {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit"])
+                .spawn()
+                .map_err(BackendStartError::Spawn)
+        });
+
+        let mut child = started.expect("a successful start must hand its child back");
+        let _ = child.wait();
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "a successful restart must not stand autofill down"
         );
     }
 
