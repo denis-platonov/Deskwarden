@@ -1,5 +1,5 @@
 use crate::app_match::{AppMatch, TriggerMode};
-use crate::bw_serve::{readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
+use crate::bw_serve::{readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEOUT};
 use crate::icon;
 use crate::loading_ui;
 use crate::theme;
@@ -196,6 +196,19 @@ enum PickerItemsResult {
     BackendUnreachable(String),
 }
 
+/// Whether `pick_vault_item`'s "Next" button should be clickable: only once
+/// an item is selected.
+///
+/// Extracted as its own pure, directly-tested predicate for the same reason
+/// `can_save_app_match` (below, `run_picker`'s equivalent gate) is: without
+/// it, clicking "Next" with nothing selected was a silent no-op rather than
+/// unreachable (review 11's Minor) -- the exact "enabled with nothing to do"
+/// shape `can_save_app_match`'s own doc says was eliminated one window
+/// later in the same "Add app..." flow.
+fn can_pick_next(selected_id: &Option<String>) -> bool {
+    selected_id.is_some()
+}
+
 /// The items the picker should list: the cache's own snapshot if it has one,
 /// otherwise a live populate as a fallback.
 ///
@@ -271,6 +284,17 @@ pub fn pick_vault_item(cache: &VaultCache) -> Option<VaultItem> {
         });
         loading_ui::show_while("Loading your vault...", rx)
     });
+
+    // The user closed the spinner (title-bar X or Alt+F4) before the
+    // populate finished, rather than waiting it out -- review 11's Critical.
+    // Treated exactly like Cancel at the very next step: quietly abandon
+    // "Add app..." for this click. There is nothing to fall back to (no
+    // items were ever read), and re-panicking here would be the bug this
+    // fix exists to remove.
+    let Some(result) = result else {
+        log::info!("\"Add app...\" cancelled: the vault-loading window was closed early");
+        return None;
+    };
 
     let items = match result {
         PickerItemsResult::Items(items) => items,
@@ -391,7 +415,18 @@ pub fn pick_vault_item(cache: &VaultCache) -> Option<VaultItem> {
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if theme::primary_button(ui, "Next", None).clicked() {
+                    // Review 11's Minor: unclickable with nothing selected,
+                    // rather than a silent no-op -- the same "enabled with
+                    // nothing to do" shape `run_picker`'s own Save gate
+                    // (`can_save_app_match`) exists to avoid, one window
+                    // earlier in the same "Add app..." flow.
+                    let next_clicked = ui
+                        .add_enabled_ui(can_pick_next(&selected_id), |ui| {
+                            theme::primary_button(ui, "Next", None)
+                        })
+                        .inner
+                        .clicked();
+                    if next_clicked {
                         if let Some(id) = &selected_id {
                             if let Some(item) = items.iter().find(|i| &i.id == id) {
                                 *result_for_closure.borrow_mut() = Some(item.clone());
@@ -482,7 +517,14 @@ enum BackendReadiness {
     Preparing,
     /// Confirmed reachable: a `wait_for_vault_ready` probe succeeded.
     Ready,
-    /// The readiness probe never succeeded within its deadline.
+    /// The readiness probe didn't succeed within its deadline.
+    ///
+    /// Not terminal (review 11's Important 2): a save-memory start can
+    /// legitimately still be landing when the probe gives up (see
+    /// `BACKEND_OP_TIMEOUT`'s doc for why), so this is rendered with a
+    /// "Retry" button that spawns a fresh probe and returns to `Preparing`,
+    /// rather than permanently disabling Save for the rest of this window's
+    /// life over a start that may finish moments later.
     Unavailable(String),
 }
 
@@ -569,6 +611,26 @@ fn save_error_message(e: &VaultError) -> String {
 /// This probe doesn't care who is starting `bw serve` (this flow's own kick,
 /// a concurrent tray Sync, or it was simply already up) -- it only waits for
 /// the port to answer, so it self-heals regardless of which of those it was.
+///
+/// Uses `BACKEND_OP_TIMEOUT` (90s) as the probe's deadline, not the shorter
+/// `READINESS_DEADLINE` (30s) `wait_for_vault_ready_with_spinner` uses at
+/// startup -- review 11's Important 2. A save-memory start goes through
+/// `wait_for_port_free` (up to 30s) *then* an unbounded `bw sync` *then*
+/// node's own cold start (10-20s more) before it can answer at all, which is
+/// exactly why `BACKEND_OP_TIMEOUT` is 90s in the first place; a 30s probe
+/// here used to report `Unavailable` for a start that was still healthy and
+/// ~20s from landing.
+fn spawn_readiness_probe(cache: &VaultCache) -> mpsc::Receiver<Result<(), String>> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let vault = cache.bridge().clone();
+    std::thread::spawn(move || {
+        let schedule = readiness_schedule(BACKEND_OP_TIMEOUT);
+        let result = wait_for_vault_ready(&vault, &schedule).map(|_items| ());
+        let _ = ready_tx.send(result);
+    });
+    ready_rx
+}
+
 pub fn run_picker(
     cache: Arc<VaultCache>,
     target_item: VaultItem,
@@ -610,16 +672,21 @@ pub fn run_picker(
     // running before this flow started -- default mode is unaffected down
     // to the frame, matching `spawn_sync`/`spawn_vault_load`'s identical
     // `skip_readiness_wait` exemption elsewhere in this app.
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    //
+    // `ready_rx` is `None` whenever no probe is currently in flight -- either
+    // this flow never needed one (`backend_already_running`), or the last
+    // one already resolved to `Ready`/`Unavailable`. Re-set to `Some` by the
+    // "Retry" button in the `Unavailable` render arm below (review 11's
+    // Important 2): a fresh `Unavailable` isn't a dead end, just another
+    // `Preparing`.
+    let mut ready_rx = if backend_already_running {
+        None
+    } else {
+        Some(spawn_readiness_probe(&cache))
+    };
     let mut backend_ready = if backend_already_running {
         BackendReadiness::Ready
     } else {
-        let vault = cache.bridge().clone();
-        std::thread::spawn(move || {
-            let schedule = readiness_schedule(READINESS_DEADLINE);
-            let result = wait_for_vault_ready(&vault, &schedule).map(|_items| ());
-            let _ = ready_tx.send(result);
-        });
         BackendReadiness::Preparing
     };
 
@@ -655,14 +722,19 @@ pub fn run_picker(
 
         // Non-blocking, like every other background-thread drain in this
         // app (favicon loads, vault loads, the TOTP poll): whenever the
-        // readiness thread spawned above reports back, apply it. Once
-        // resolved (`Ready` or `Unavailable`) there's nothing left to
-        // receive, so this is a no-op for the rest of the window's life.
-        if let Ok(result) = ready_rx.try_recv() {
-            backend_ready = match result {
-                Ok(()) => BackendReadiness::Ready,
-                Err(e) => BackendReadiness::Unavailable(e),
-            };
+        // readiness thread spawned above reports back, apply it and drop the
+        // receiver -- the probe that sent it is done either way. A fresh one
+        // only exists again if the user clicks "Retry" from the
+        // `Unavailable` arm below (review 11's Important 2), so this is a
+        // no-op between that click and the new probe's own result.
+        if let Some(rx) = &ready_rx {
+            if let Ok(result) = rx.try_recv() {
+                backend_ready = match result {
+                    Ok(()) => BackendReadiness::Ready,
+                    Err(e) => BackendReadiness::Unavailable(e),
+                };
+                ready_rx = None;
+            }
         }
         // Keep polling the channel above at a steady cadence while still
         // waiting -- without an explicit repaint request, a window with no
@@ -730,6 +802,11 @@ pub fn run_picker(
                             .as_ref();
                         if list_row(ui, &w.title, &secondary, selected, texture) {
                             selected_pid = Some(w.pid);
+                            // Review 11's Minor: a previous attempt's failure
+                            // message otherwise persisted even after the
+                            // user picked a different process, reading like
+                            // it was still about *this* choice.
+                            save_error = None;
                         }
                     },
                 );
@@ -757,16 +834,33 @@ pub fn run_picker(
                         ui.add_space(6.0);
                     }
                     BackendReadiness::Unavailable(reason) => {
+                        // Review 11's Minor: the old wording pointed at
+                        // "Sync from the tray menu", which this very flow
+                        // has disabled (see `main`'s `tray.add_app_id`
+                        // handler) and which the user couldn't reach anyway
+                        // -- this window blocks the main loop like every
+                        // other blocking window in this app. "Retry" below
+                        // is the actual way forward.
                         ui.label(
                             RichText::new(format!(
-                                "Deskwarden\u{2019}s Bitwarden backend isn\u{2019}t reachable, so \
-                                 Save is unavailable right now. Open the vault (which starts it) \
-                                 or try Sync from the tray menu, then use \u{201c}Add \
-                                 app\u{2026}\u{201d} again.\n\n{reason}"
+                                "Deskwarden\u{2019}s Bitwarden backend hasn\u{2019}t answered yet, \
+                                 so Save is unavailable right now. It may still be starting up \
+                                 -- click Retry to keep waiting, or Cancel and use \u{201c}Add \
+                                 app\u{2026}\u{201d} again in a moment.\n\n{reason}"
                             ))
                             .size(11.0)
                             .color(theme::ERROR),
                         );
+                        ui.add_space(4.0);
+                        if theme::secondary_button(ui, "Retry").clicked() {
+                            // Not terminal (review 11's Important 2): a
+                            // save-memory start can still land after this
+                            // probe's own deadline, so give the user a way
+                            // to wait again rather than making this window
+                            // permanently unusable until Cancel.
+                            ready_rx = Some(spawn_readiness_probe(&cache));
+                            backend_ready = BackendReadiness::Preparing;
+                        }
                         ui.add_space(6.0);
                     }
                     BackendReadiness::Ready => {}
@@ -1011,6 +1105,20 @@ mod tests {
             matches!(result, PickerItemsResult::EmptyVault),
             "a populated-but-empty cache must be reported as EmptyVault, not BackendUnreachable"
         );
+    }
+
+    #[test]
+    fn next_is_disabled_with_nothing_selected() {
+        // Review 11's Minor: `selected_id` is `None` on a fresh open of the
+        // vault-item picker, and "Next" must be unclickable until something
+        // is chosen -- the same shape `can_save_app_match` already
+        // guarantees one window later.
+        assert!(!can_pick_next(&None));
+    }
+
+    #[test]
+    fn next_is_enabled_once_an_item_is_selected() {
+        assert!(can_pick_next(&Some("1".to_string())));
     }
 
     #[test]

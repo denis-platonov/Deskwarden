@@ -43,6 +43,23 @@ pub fn readiness_schedule(deadline: Duration) -> Vec<Duration> {
 /// Default deadline for `bw serve` to come up and answer a real vault query.
 pub const READINESS_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Upper bound on how long a legitimate backend start or sync may take
+/// before something is treated as having gone wrong: `wait_for_port_free`
+/// (up to `PORT_RELEASE_GRACE_RESTART`, 30s) can run first, then an
+/// unbounded `bw sync` `.output()`, then node's own cold start (10-20s more)
+/// before `bw serve` answers at all.
+///
+/// Lives here, not `main.rs`, so it can be the *one* number both sides of
+/// review 11's Important 2 agree on: `main`'s own backend-op bookkeeping
+/// (`backend_task_in_progress`'s wedge deadline, `open_vault_window`'s
+/// lock-recovery wait) and the picker's own readiness probe
+/// (`picker_ui::run_picker`). Before this, the picker used the much shorter
+/// `READINESS_DEADLINE` (30s) for the same wait `main` budgets 90s for --
+/// so a normal-but-slow save-memory start resolved the probe to
+/// `BackendReadiness::Unavailable` while the start was still healthy and
+/// ~20s from landing.
+pub const BACKEND_OP_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Returns true if something is already listening on `port` on localhost.
 ///
 /// Used to detect an orphaned `bw serve` from a previous, unclean exit: if one
@@ -269,6 +286,18 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         assert!(!wait_for_port_free(port, Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn backend_op_timeout_is_more_patient_than_the_plain_readiness_deadline() {
+        // Review 11's Important 2: `picker_ui::run_picker`'s readiness probe
+        // used to use `READINESS_DEADLINE` (30s), shorter than a
+        // save-memory `bw serve` start can legitimately take (up to
+        // `PORT_RELEASE_GRACE_RESTART` plus an unbounded `bw sync` plus
+        // node's own cold start) -- which is exactly why `BACKEND_OP_TIMEOUT`
+        // exists as a longer, separate number in the first place. Guards
+        // against the two silently drifting back into disagreement.
+        assert!(BACKEND_OP_TIMEOUT > READINESS_DEADLINE);
     }
 
     #[test]

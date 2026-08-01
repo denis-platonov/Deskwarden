@@ -27,8 +27,16 @@ use deskwarden::app::{
     fill_from_vault, handle_match, match_entries, pump_windows_messages, refresh_match_engine,
 };
 use deskwarden::backend_policy;
+// `BACKEND_OP_TIMEOUT`: the upper bound on how long a legitimate backend
+// start or sync may take before something is treated as having gone wrong.
+// Used both by this file's own backend-op bookkeeping
+// (`backend_task_in_progress`'s wedge deadline, `open_vault_window`'s
+// lock-recovery wait) and by `picker_ui::run_picker`'s readiness probe (see
+// its own doc for review 11's Important 2) -- defined in `bw_serve`, not
+// here, so both sides share the exact same number rather than disagreeing.
 use deskwarden::bw_serve::{
-    self, readiness_schedule, wait_for_vault_ready, BW_SERVE_URL, READINESS_DEADLINE,
+    self, readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEOUT, BW_SERVE_URL,
+    READINESS_DEADLINE,
 };
 use deskwarden::dispatch;
 use deskwarden::injector::{
@@ -55,26 +63,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// How often to poll GitHub for a newer release. Checked on startup and then
 /// on this cadence from the main loop, same pattern as `REFRESH_INTERVAL`.
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Upper bound on how long a background backend operation may legitimately
-/// stay outstanding before something is treated as having gone wrong. Used
-/// two ways: `open_vault_window`'s lock-recovery path waits this long for an
-/// in-flight operation to report back over `backend_op_rx` before giving up
-/// on it and proceeding anyway; `main`'s own loop uses the same bound as a
-/// deadline on `backend_task_in_progress` itself (see that variable's doc),
-/// clearing it and surfacing a tray failure if nothing has reported back in
-/// this long.
-///
-/// `backend_op_tx` lives in `main` for the lifetime of the process, so the
-/// channel itself never disconnects -- an unbounded `recv()` here would block
-/// forever if the worker thread panicked (or otherwise returned) before
-/// sending, with no Windows message pump running on this thread to keep the
-/// tray, hotkey, or window-watching alive. Generous rather than tight: the
-/// operation being waited on can legitimately take up to
-/// `PORT_RELEASE_GRACE_RESTART` (30s) plus a real `bw sync` round-trip, and
-/// this timeout exists to catch "the worker will never answer", not to cut
-/// short a slow-but-healthy one.
-const BACKEND_OP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Real GitHub REST API base, passed to `updater::check_for_update`. Not
 /// `github.com` itself -- that's the web UI host; `api.github.com` is the
@@ -830,13 +818,21 @@ fn main() {
         if let Some((started, kind)) = backend_task_in_progress {
             if backend_task_is_wedged(started, BACKEND_OP_TIMEOUT) {
                 backend_task_in_progress = None;
-                // Report -- and, on the tray, only claim -- what actually
-                // stalled (review Minor 4). An `EnsureRunning` wedge never
-                // touched the tray's "Sync" item in the first place (only
-                // the click handler above calls `set_sync_in_progress`), so
-                // there's nothing on it to revert; unconditionally calling
-                // `set_sync_failed` here used to show "Sync failed - click
-                // to retry" for a stall that was never a sync at all.
+                // Report -- and, on the tray, only claim to have synced --
+                // what actually stalled (review Minor 4). But *both* kinds
+                // must still re-enable the tray's "Sync" item here (review
+                // 11's Important 3): the comment this used to carry --
+                // "an `EnsureRunning` wedge never touched the tray's Sync
+                // item in the first place" -- stopped being true as soon as
+                // the `tray.add_app_id` handler started disabling it before
+                // kicking off its own `EnsureRunning` (see that call site).
+                // Leaving it disabled here means a stalled "Add app..."
+                // backend start (a hung `bw sync`, exactly the case this
+                // wedge-deadline check exists for) permanently kills Sync
+                // for the rest of the session: nothing else can re-enable
+                // it, since `set_sync_idle`/`set_sync_failed` are only
+                // reachable through paths that themselves require the item
+                // to already be clickable.
                 match kind {
                     BackendOpKind::Sync => {
                         log::error!(
@@ -853,6 +849,11 @@ fn main() {
                              treating it as failed so the backend lifecycle doesn't stay wedged \
                              on it forever"
                         );
+                        // A no-op unless the `tray.add_app_id` handler
+                        // disabled it before kicking this off; harmless
+                        // either way (same reasoning as `apply_backend_op`'s
+                        // `EnsureRunning` arms).
+                        tray::set_sync_item_enabled(&tray, true);
                     }
                 }
             }
@@ -1363,13 +1364,25 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             log::info!("waiting for an in-flight backend operation before handling the lock");
             match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
                 Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
-                Err(_) => log::warn!(
-                    "in-flight backend operation did not report back within \
-                     {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway. If it later \
-                     reports back late (see `apply_backend_op`'s child-adoption guard), its \
-                     child is stopped rather than allowed to overwrite the one this recovery is \
-                     about to start."
-                ),
+                Err(_) => {
+                    log::warn!(
+                        "in-flight backend operation did not report back within \
+                         {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway. If it \
+                         later reports back late (see `apply_backend_op`'s child-adoption \
+                         guard), its child is stopped rather than allowed to overwrite the one \
+                         this recovery is about to start."
+                    );
+                    // Review 11's Important 3: whatever operation was in
+                    // flight may have disabled the tray's "Sync" item before
+                    // stalling (the `tray.add_app_id` handler does, for its
+                    // own `EnsureRunning`), and `apply_backend_op` -- the
+                    // only other place that re-enables it -- is never going
+                    // to run for an operation that gave up waiting on
+                    // instead of receiving. Left disabled, a hung `bw sync`
+                    // right here permanently kills Sync for the rest of the
+                    // session. A no-op if nothing had disabled it.
+                    tray::set_sync_item_enabled(tray, true);
+                }
             }
             *backend_task_in_progress = None;
         }
@@ -1754,7 +1767,16 @@ fn wait_for_vault_ready_with_spinner(
         scope.spawn(move || {
             let _ = tx.send(wait_for_vault_ready(vault, schedule));
         });
-        loading_ui::show_while("Setting up your vault...", rx)
+        // `show_while` returns `None` if the user closes the spinner (title
+        // bar X / Alt+F4) before the probe reports back (review 11's
+        // Critical). There is no useful "quietly abandon" here the way
+        // there is in the picker -- every caller of this function needs a
+        // ready vault to make progress at all -- so this folds into an
+        // ordinary `Err`, which every call site already knows how to handle
+        // (retry once at startup, or a fatal, user-visible error dialog).
+        loading_ui::show_while("Setting up your vault...", rx).unwrap_or_else(|| {
+            Err("closed the setup window before the vault backend became ready".to_string())
+        })
     })
 }
 

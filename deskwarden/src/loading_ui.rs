@@ -15,7 +15,7 @@ use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
 /// Shows a "Deskwarden" window with a spinner and `message` until `rx`
-/// yields a value, then closes and returns it.
+/// yields a value, then closes and returns `Some(value)`.
 ///
 /// `rx` is expected to be the receiving half of a channel whose sending half
 /// was handed to a `std::thread::scope`d worker thread computing `T` --
@@ -25,9 +25,19 @@ use std::sync::mpsc::Receiver;
 /// self-contained), so it's fine to move into this window's own `'static`
 /// closure regardless of where it was created.
 ///
-/// Panics if `rx` disconnects without ever sending a value -- that means the
-/// worker thread panicked, which is a bug to surface loudly, not paper over.
-pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> T {
+/// Returns `None` if the window closed without `rx` ever yielding a value --
+/// either the user closed it via the title bar's X or Alt+F4 (this is a
+/// normal decorated window; nothing about "loading" makes it modal or
+/// un-closable), or the worker thread disconnected the channel without
+/// sending (e.g. it panicked). Review 11's Critical: this used to
+/// `.expect()` on exactly that case, which meant a user closing this spinner
+/// while `pick_vault_item`'s populate ran panicked the main thread, and
+/// `main.rs`'s panic hook only logs -- so the process unwound out of `main`
+/// and the tray icon, hotkey, and autofill all vanished with it. Every
+/// caller must now decide for itself what "the user closed this" means
+/// (abandon quietly, treat as a failure, etc.) rather than that decision
+/// being made for it by a crash.
+pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T> {
     let result: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
     let result_for_closure = result.clone();
     let message = message.to_string();
@@ -89,5 +99,5 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> T {
     });
 
     let value = result.borrow_mut().take();
-    value.expect("loading window closed without a result from its background worker")
+    value
 }
