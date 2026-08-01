@@ -286,6 +286,39 @@ fn row_badge(ui: &mut egui::Ui, text: &str, selected: bool) {
         .galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, fg);
 }
 
+/// Design 2b's row title (`font-size: 13px`) and subtitle
+/// (`font-size: 11px`), and the `gap: 2px` between them. Named because
+/// [`text_column_height`] has to measure exactly what [`item_row`] then
+/// draws; a size stated twice would drift.
+const TITLE_SIZE: f32 = 13.0;
+const SUBTITLE_SIZE: f32 = 11.0;
+const TITLE_GAP_Y: f32 = 2.0;
+
+/// The exact height the row's one- or two-line text column will lay out to,
+/// measured from the fonts it is about to be drawn with.
+///
+/// Needed because that column has to be ALLOCATED at its own height for
+/// design 2b's `align-items: center` to have anything to centre against the
+/// avatar -- an allocation that took the row's available height would
+/// top-align its content inside it instead, which is the reported defect.
+///
+/// The two font FAMILIES are restated here rather than shared with the draw
+/// below (which builds `RichText` through `theme::bold`/`theme::semibold`,
+/// not `FontId`s). What keeps the two in step is
+/// `the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top`
+/// and its single-line sibling: a family here that did not match the one
+/// drawn would mis-measure the column and shift it off centre.
+fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
+    let family = if selected { theme::BOLD } else { theme::SEMIBOLD };
+    let title = egui::FontId::new(TITLE_SIZE, egui::FontFamily::Name(family.into()));
+    let mut height = ui.ctx().fonts_mut(|f| f.row_height(&title));
+    if !username.is_empty() {
+        let subtitle = egui::FontId::new(SUBTITLE_SIZE, egui::FontFamily::Proportional);
+        height += TITLE_GAP_Y + ui.ctx().fonts_mut(|f| f.row_height(&subtitle));
+    }
+    height
+}
+
 fn item_row(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -318,36 +351,70 @@ fn item_row(
                 ui.spacing_mut().item_spacing.x = ROW_GAP_X;
                 match icon {
                     Some(tex) => {
-                        // Rounded to match `theme::avatar`'s initials-tile
-                        // treatment (same `size * 0.25` formula) -- a sharp-
-                        // cornered square in the identical box read as
-                        // visually heavier/bigger than the monogram fallback
-                        // even at the same pixel dimensions.
-                        ui.add(
-                            egui::Image::new((tex.id(), tex.size_vec2()))
-                                .fit_to_exact_size(egui::Vec2::splat(AVATAR_SIZE))
-                                .corner_radius(CornerRadius::same((AVATAR_SIZE * 0.25) as u8)),
-                        );
+                        // The SAME box the monogram fallback draws -- filled,
+                        // bordered, 8px radius -- with the artwork INSET
+                        // inside it rather than filling it. Drawn edge to edge
+                        // (which is what `fit_to_exact_size(32)` did) a
+                        // favicon covers the whole tile while a monogram's
+                        // letters cover about a third of it, so favicons read
+                        // as heavier and bigger than every row beside them.
+                        // That was the report; `theme::AVATAR_ICON_INSET`
+                        // carries the reasoning for the value.
+                        let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
+                        let art = tile.shrink(theme::AVATAR_ICON_INSET);
+                        // Concentric with the tile: an 8px outer radius with a
+                        // 4px inset leaves 4px inside, so the two curves stay
+                        // parallel instead of the inner one looking too sharp.
+                        egui::Image::new((tex.id(), tex.size_vec2()))
+                            .corner_radius(theme::avatar_corner_radius(art.width()))
+                            .paint_at(ui, art);
                     }
                     None => theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected),
                 }
-                // The design's title column is `flex: 1` with the badge
-                // trailing it. Laid out right-to-left so the badge takes its
+                // The design's title column is `flex: 1` with the chips
+                // trailing it. Laid out right-to-left so the chips take their
                 // own width off the right edge and the column gets the
                 // remainder -- the same trick the toolbar strip above uses
                 // for `+ New` and the search field, and the reason neither
                 // needs a guessed width.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                //
+                // Allocated at EXACTLY the avatar's height, which is what
+                // makes design 2b's `align-items: center` work. Left to take
+                // the row's available height (which `with_layout` does) the
+                // cross-axis extent is unbounded, egui falls back to placing
+                // at the top, and the `Align::Center` below has nothing to
+                // centre within -- the two-line column then hung 2pt high
+                // against the avatar and a single-line row 9pt high. Bounding
+                // it here is also free: `ROW_TILE_HEIGHT` is already defined
+                // as the avatar plus the row's padding, because `show_rows`
+                // has to virtualize against a fixed row height.
+                let column = egui::Vec2::new(ui.available_width(), AVATAR_SIZE);
+                ui.allocate_ui_with_layout(
+                    column,
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
                     if badged {
                         row_badge(ui, "app", selected);
                     }
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
+                    // Sized to its OWN content height, not to the available
+                    // height: `ui.vertical` would take the full 32 and
+                    // top-align inside it, which is the same defect one level
+                    // down. With an exact height the parent's `Align::Center`
+                    // centres the whole column against the avatar.
+                    let text_column = egui::Vec2::new(
+                        ui.available_width(),
+                        text_column_height(ui, username, selected),
+                    );
+                    ui.allocate_ui_with_layout(
+                        text_column,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                        ui.spacing_mut().item_spacing.y = TITLE_GAP_Y;
                         let title = if selected {
                             // `font-weight: 700; color: #14307a`.
-                            theme::bold(&item.name, 13.0).color(theme::BLUE_DEEP)
+                            theme::bold(&item.name, TITLE_SIZE).color(theme::BLUE_DEEP)
                         } else {
-                            theme::semibold(&item.name, 13.0).color(theme::INK)
+                            theme::semibold(&item.name, TITLE_SIZE).color(theme::INK)
                         };
                         // Truncated, not wrapped: a name long enough to wrap
                         // ("Remote Desktop — Bastion" is already close) would
@@ -358,7 +425,9 @@ fn item_row(
                         if !username.is_empty() {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(username).size(11.0).color(theme::TEXT_FAINT),
+                                    RichText::new(username)
+                                        .size(SUBTITLE_SIZE)
+                                        .color(theme::TEXT_FAINT),
                                 )
                                 .truncate(),
                             );
@@ -607,6 +676,36 @@ mod row_tile_tests {
     /// then settled), which is how the scrolled test drives the list to its
     /// end without reaching into `ScrollArea`'s private state.
     fn paint_with(items: &[VaultItem], selected: Option<&str>, wheel_frames: usize) -> Painted {
+        paint_core(items, selected, wheel_frames, |_| IconCache::default())
+    }
+
+    /// One real frame with a favicon TEXTURE loaded for every id in `ids` --
+    /// the branch `IconCache::default()` can never reach, and the one the
+    /// "the favicon fills its tile" report is about.
+    fn paint_with_icons(items: &[VaultItem], selected: Option<&str>, ids: &[&str]) -> Painted {
+        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        paint_core(items, selected, 0, |ctx| {
+            let mut icons = IconCache::default();
+            for id in &ids {
+                icons.textures.insert(
+                    id.clone(),
+                    ctx.load_texture(
+                        format!("favicon-{id}"),
+                        egui::ColorImage::filled([16, 16], egui::Color32::RED),
+                        egui::TextureOptions::LINEAR,
+                    ),
+                );
+            }
+            icons
+        })
+    }
+
+    fn paint_core(
+        items: &[VaultItem],
+        selected: Option<&str>,
+        wheel_frames: usize,
+        make_icons: impl FnOnce(&egui::Context) -> IconCache,
+    ) -> Painted {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
@@ -624,7 +723,7 @@ mod row_tile_tests {
 
         let mut selected_id = selected.map(str::to_string);
         let mut search = String::new();
-        let icons = IconCache::default();
+        let icons = make_icons(&ctx);
         let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
             ctx.run_ui(input, |ui| {
                 draw_item_list(
@@ -934,6 +1033,143 @@ mod row_tile_tests {
         let selected = square(&paint(&items, Some("Ledgerline")), 32.0);
         assert_eq!(selected.fill, theme::BLUE_WASH);
         assert_ne!(selected.fill, egui::Color32::TRANSPARENT);
+    }
+
+    /// The vertical centre of the 32px avatar tile in the FIRST row, absolute
+    /// at this pane: the tile's top edge (68) plus its 1px border and 10px
+    /// padding (79), plus half the avatar (16).
+    const FIRST_ROW_AVATAR_CENTRE_Y: f32 = 95.0;
+
+    #[test]
+    fn the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top() {
+        // THE REPORT: "title/email are top-aligned against the 32px image".
+        // Design 2b's row is `align-items: center`.
+        //
+        // The two-line column is SHORTER than the 32px avatar (a 13px line, a
+        // 2px gap and an 11px line), so top-aligning it leaves it sitting ~2pt
+        // high. Asserted as the column's own mid-line, which is independent of
+        // the font metrics that set the two line heights -- and against an
+        // ABSOLUTE y, as well as against the avatar's, so this cannot stay
+        // green by both moving together.
+        let p = paint(&[login("Ledgerline", "a.novak@ledgerline.com")], None);
+        let avatar = square(&p, AVATAR_SIZE);
+        assert!(
+            (avatar.rect.center().y - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.01,
+            "the harness's geometry moved: the avatar's centre is at y={}, expected \
+             {FIRST_ROW_AVATAR_CENTRE_Y}",
+            avatar.rect.center().y
+        );
+        let title = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "Ledgerline")
+            .expect("the title")
+            .1;
+        let email = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "a.novak@ledgerline.com")
+            .expect("the subtitle")
+            .1;
+        let column_centre = (title.top() + email.bottom()) / 2.0;
+        assert!(
+            (column_centre - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.51,
+            "the title/subtitle column runs {}..{}, so its centre is at y={column_centre}, but \
+             the avatar's is at y={FIRST_ROW_AVATAR_CENTRE_Y} -- the column is hung from the top \
+             of the avatar rather than centred against it",
+            title.top(),
+            email.bottom()
+        );
+    }
+
+    #[test]
+    fn a_row_with_no_username_centres_its_single_line_too() {
+        // The positive control's other half: one line, not two. A fix that
+        // only centred the two-line case (say, by nudging it down a fixed 2pt)
+        // would push a single-line row 2pt BELOW centre, and the two-line
+        // assertion above could not tell.
+        let mut it = login("Vantage VPN", "");
+        it.login = None;
+        let p = paint(&[it], None);
+        let title = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == "Vantage VPN")
+            .expect("the title")
+            .1;
+        assert!(
+            (title.center().y - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.51,
+            "a single-line row's title is centred at y={}, expected the avatar's \
+             {FIRST_ROW_AVATAR_CENTRE_Y}",
+            title.center().y
+        );
+    }
+
+    #[test]
+    fn a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_to_edge() {
+        // THE REPORT: "the favicon fills its tile edge-to-edge and feels too
+        // big". The monogram fallback draws a bordered 32px tile with its
+        // letters INSIDE it; a favicon drawn at the full 32 fills that same
+        // box completely and reads heavier than every monogram beside it.
+        //
+        // Two things are asserted, and the first is what makes the second mean
+        // anything: the 32px TILE is still drawn (filled and bordered, exactly
+        // as the monogram's is), and the image sits strictly inside it, inset
+        // by `theme::AVATAR_ICON_INSET` on every side.
+        let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
+        let tile = square(&p, AVATAR_SIZE);
+        assert_eq!(
+            tile.fill,
+            theme::CANVAS,
+            "the favicon's tile must be drawn the same way the monogram's is -- filled"
+        );
+        let image = p
+            .rects
+            .iter()
+            .find(|r| r.brush.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no textured rect was painted at all, so no favicon was drawn; painted: {:?}",
+                    p.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
+                )
+            })
+            .clone();
+        let inset = theme::AVATAR_ICON_INSET;
+        let expected = tile.rect.shrink(inset);
+        assert!(
+            (image.rect.min - expected.min).length() < 0.01
+                && (image.rect.max - expected.max).length() < 0.01,
+            "the favicon was painted at {:?}, expected {expected:?} -- the {inset}pt inset inside \
+             the {:?} tile",
+            image.rect,
+            tile.rect
+        );
+        // And, said the other way, so this fails loudly if the inset is ever
+        // set to zero rather than merely changed: strictly inside.
+        assert!(
+            image.rect.width() < tile.rect.width() && tile.rect.contains_rect(image.rect),
+            "the favicon at {:?} is not strictly inside its {:?} tile",
+            image.rect,
+            tile.rect
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_favicon_still_gets_the_monogram_and_no_texture() {
+        // The positive control for the test above: `paint_with_icons` really
+        // is the thing that puts a texture on the row, so "a textured rect was
+        // painted, and here is where" is a statement about the favicon branch
+        // and not about something egui draws anyway.
+        let p = paint(&[login("Ledgerline", "a@b.c")], None);
+        assert!(
+            !p.rects.iter().any(|r| r.brush.is_some()),
+            "an item with no cached favicon must paint no texture at all"
+        );
+        assert!(
+            p.texts.iter().any(|(t, _, _)| t == "LE"),
+            "...and must fall back to the monogram; painted: {:?}",
+            p.texts
+        );
     }
 
     #[test]

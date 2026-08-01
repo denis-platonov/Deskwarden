@@ -634,19 +634,59 @@ pub fn initials(name: &str) -> String {
     }
 }
 
-/// A rounded initials tile, `size` square. `emphasized` renders the selected
-/// treatment (blue on a blue wash) versus the neutral grey one.
-pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
+/// How far a favicon is inset inside its [`avatar_tile`], per side.
+///
+/// A JUDGEMENT CALL: the design document has no favicon example anywhere, so
+/// there is no value to read off it. It is set against the MONOGRAM, which is
+/// the thing a favicon sits beside in a list and has to weigh the same as.
+/// [`avatar`] draws its letters at `size * 0.38` -- ~12pt of ink centred in a
+/// 32pt tile -- so a monogram's ink covers roughly a third of the tile, while
+/// an edge-to-edge favicon covers all of it. 4pt a side puts the artwork in a
+/// 24pt box: still clearly the largest thing in the row (a favicon is detail,
+/// not a letterform, and shrinking it further starts costing legibility) but
+/// no longer heavier than every monogram next to it. That was the report.
+///
+/// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
+/// resamples every icon to a 64px longest edge, a number chosen for a 32pt
+/// draw at 200% scaling. Nothing in the code links that constant to this one.
+/// 64 still covers a 24pt draw comfortably (48 physical px at 200%), so this
+/// inset is safe, but a tile that ever grows past 32pt needs `decode_rgba`'s
+/// constant raised with it.
+pub const AVATAR_ICON_INSET: f32 = 4.0;
+
+/// The avatar tile's BOX -- allocated, filled, bordered and rounded -- with
+/// nothing drawn in it, returning the rect so the caller can place its own
+/// content inside.
+///
+/// Split out of [`avatar`] so a favicon can be drawn into the very same box
+/// the monogram fallback draws, rather than replacing the box entirely: a
+/// bare full-bleed image in place of a bordered tile is what made favicons
+/// read as bigger and heavier than the monograms beside them.
+pub fn avatar_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
-    let (bg, border, fg) = if emphasized {
-        (BLUE_WASH, BLUE_EDGE, BLUE)
+    let (bg, border) = if emphasized {
+        (BLUE_WASH, BLUE_EDGE)
     } else {
-        (CANVAS, HAIRLINE, TEXT_MUTED)
+        (CANVAS, HAIRLINE)
     };
-    let rounding = CornerRadius::same((size * 0.25) as u8);
+    let rounding = avatar_corner_radius(size);
     ui.painter().rect_filled(rect, rounding, bg);
     ui.painter()
         .rect_stroke(rect, rounding, Stroke::new(1.0, border), StrokeKind::Middle);
+    rect
+}
+
+/// The avatar tile's `border-radius: 8px` at the design's 32px size, as a
+/// ratio so it stays right at any size the tile is drawn at.
+pub fn avatar_corner_radius(size: f32) -> CornerRadius {
+    CornerRadius::same((size * 0.25) as u8)
+}
+
+/// A rounded initials tile, `size` square. `emphasized` renders the selected
+/// treatment (blue on a blue wash) versus the neutral grey one.
+pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
+    let rect = avatar_tile(ui, size, emphasized);
+    let fg = if emphasized { BLUE } else { TEXT_MUTED };
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
