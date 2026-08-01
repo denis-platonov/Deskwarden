@@ -23,9 +23,7 @@
 //! Declares no modules of its own: every module lives in `lib.rs` (see the
 //! note there). This file is only `fn main()` and the startup sequence.
 
-use deskwarden::app::{
-    fill_from_vault, handle_match, match_entries, pump_windows_messages, refresh_match_engine,
-};
+use deskwarden::app::{fill_from_vault, handle_match, match_entries, pump_windows_messages};
 use deskwarden::backend_policy;
 // `BACKEND_OP_TIMEOUT`: the upper bound on how long a legitimate backend
 // start or sync may take before something is treated as having gone wrong.
@@ -45,7 +43,7 @@ use deskwarden::injector::{
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
-use deskwarden::vault_cache::{PopulateOutcome, VaultCache, VaultEpoch};
+use deskwarden::vault_cache::{PopulateOutcome, VaultCache, VaultEpoch, VaultEra};
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, prefs_ui,
     session_store, settings, tray, vault_window, window_watch,
@@ -666,14 +664,46 @@ fn main() {
                         Some(m) => {
                             log::info!("saved app match for {} ({:?})", m.process, m.trigger);
                             // Make the new match live immediately rather than
-                            // waiting for the user to trigger a sync.
-                            match refresh_match_engine(&vault, &mut engine) {
-                                Ok(count) => {
-                                    log::info!("match engine refreshed: {count} app match(es)")
-                                }
-                                Err(e) => {
-                                    log::warn!("refresh after saving app match failed: {e:?}")
-                                }
+                            // waiting for the user to trigger a sync -- from
+                            // the CACHE, which already holds the save
+                            // (`run_picker`'s Save goes through
+                            // `cache.set_app_match`, which updates the
+                            // snapshot on success precisely so nothing has to
+                            // re-fetch it).
+                            //
+                            // This used to be `refresh_match_engine`, a THIRD
+                            // live `list_items` against `bw serve` after the
+                            // picker's own populate and the save's PUT
+                            // (review 21's Minor). A transient 500 or a reset
+                            // connection on that one request logged a warn and
+                            // left the engine unarmed, so the match the user
+                            // had just spent two windows creating did not go
+                            // live until some later sync -- the exact failure
+                            // mode review 16 removed from the unlock path, and
+                            // the reason nothing in this app arms the engine
+                            // from a request that has not already succeeded.
+                            if cache.is_populated() {
+                                let entries = match_entries(&cache.items());
+                                log::info!(
+                                    "match engine refreshed: {} app match(es)",
+                                    entries.len()
+                                );
+                                engine.rebuild(&entries);
+                            } else {
+                                // Not reachable from here today --
+                                // `pick_vault_item` populates the cache and
+                                // returns nothing to pick if that fails, so a
+                                // save implies a populated snapshot -- and
+                                // checked rather than assumed, because
+                                // rebuilding from an empty snapshot would
+                                // DISARM autofill instead of merely failing to
+                                // arm the new match.
+                                log::warn!(
+                                    "an app match was saved against an unpopulated vault cache; \
+                                     leaving the match engine as it is rather than rebuilding it \
+                                     from an empty snapshot. The match goes live at the next sync \
+                                     or unlock"
+                                );
                             }
                         }
                         None => log::info!("app-match picker cancelled (or save failed)"),
@@ -1895,15 +1925,22 @@ enum BackendOp {
 enum SyncOutcome {
     /// `bw sync` succeeded and the refreshed vault landed in the cache.
     Refreshed {
-        /// The vault epoch this sync was written at, captured by the worker
+        /// The vault era this sync was written in, captured by the worker
         /// BEFORE its own fetch. Re-checked by `settle_sync_outcome` when the
         /// outcome is finally applied on the main thread -- see that function
-        /// and [`deskwarden::vault_cache::VaultEpoch`].
+        /// and [`deskwarden::vault_cache::VaultEra`].
+        ///
+        /// The ERA, not the whole [`deskwarden::vault_cache::VaultEpoch`] the
+        /// worker captured: the write half of that epoch is a writer's
+        /// concern and was consumed by `populate_with` on the worker thread.
+        /// What is left to decide here is only "is this still the same vault
+        /// session?", and carrying a write position into it would invite
+        /// exactly the "something changed, give up" reading review 18 removed.
         ///
         /// Deliberately the ONLY thing this variant carries. It used to carry
         /// the match entries this sync's own `list_items` produced as well,
         /// which is review 18's third finding: see `settle_sync_outcome`.
-        epoch: VaultEpoch,
+        era: VaultEra,
     },
     /// `bw sync` succeeded, but the cache was cleared while the repopulate
     /// was in flight, so nothing local was refreshed. Not a failure of the
@@ -2202,14 +2239,14 @@ fn spawn_sync(
 /// answer it under a single lock: [`VaultCache::items_unless_superseded`].
 fn settle_sync_outcome(outcome: SyncOutcome, cache: &VaultCache) -> SettledSync {
     match outcome {
-        SyncOutcome::Refreshed { epoch } => match cache.items_unless_superseded(epoch) {
+        SyncOutcome::Refreshed { era } => match cache.items_unless_superseded(era) {
             Some(items) => SettledSync::Applicable { items },
             None => {
                 log::info!(
                     "a completed sync's result reached the main thread after the vault was \
-                     cleared (epoch {epoch} -> {}); discarding it rather than writing it over \
+                     cleared (era {era} -> {}); discarding it rather than writing it over \
                      whatever cleared it",
-                    cache.epoch()
+                    cache.epoch().era()
                 );
                 SettledSync::NothingToApply
             }
@@ -2258,7 +2295,7 @@ fn sync_outcome_from(
     };
 
     match cache.populate_with(items, epoch) {
-        Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed { epoch },
+        Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed { era: epoch.era() },
         Ok(PopulateOutcome::DiscardedStale) => SyncOutcome::DiscardedStale,
         Err(e) => SyncOutcome::Failed(format!("{e:?}")),
     }
@@ -3307,6 +3344,105 @@ mod tests {
             engine.lookup("notepad.exe").is_some(),
             "the app match the user saved while the sync was in flight was silently dropped by \
              the sync's own, older item list"
+        );
+    }
+
+    /// REVIEW 21'S CRITICAL, composed, and the ORDERING THE SUITE ABOVE DOES
+    /// NOT COVER. `an_app_match_saved_while_a_sync_was_in_flight_survives_that
+    /// _sync` runs `sync_outcome_from` to completion *before* the save, so the
+    /// save always lands on top of a populate that has already finished -- the
+    /// one ordering that worked. Here the save lands INSIDE the sync's fetch
+    /// window, which is `spawn_sync`'s `!currently_running` branch exactly:
+    /// mark captured before anything, the readiness probe's `list_items`
+    /// handed to `sync_outcome_from` as `probe_items`, and `populate_with`
+    /// writing that fetch back afterwards. That fetch predates the save, and
+    /// before the fix it was assigned to the snapshot wholesale.
+    ///
+    /// It asserts the survival TWICE, because the two consequences are
+    /// different in kind: in what reaches the match engine (autofill dead
+    /// until the next sync -- session-scoped) and in the CACHE (a later
+    /// vault-window edit PUTs the stale item back, and the item's `fields`
+    /// array is always present in that body, so `bw serve`'s
+    /// merge-on-omitted-keys behaviour cannot save it -- permanent).
+    #[test]
+    fn an_app_match_saved_while_a_syncs_fetch_was_in_flight_survives_that_sync() {
+        const ONE_ITEM_NO_MATCH: &str =
+            r#"{"success":true,"data":{"data":[{"id":"1","name":"1","type":1,"fields":[]}]}}"#;
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(ONE_ITEM_NO_MATCH)
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        server
+            .mock("PUT", "/object/item/1")
+            .with_status(200)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        // Startup, so the cache is populated exactly as it is when the tray
+        // Sync item can be clicked at all.
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        // The tray Sync worker, up to the point its fetch has happened and
+        // nothing has been written back yet.
+        let sync_epoch = cache.epoch();
+        let probe = cache.bridge().list_items().unwrap();
+
+        // "Add app...": two picker windows, then a save through the cache --
+        // all of it inside the window above, because the handler does not
+        // block on `backend_task_in_progress`.
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache
+            .set_app_match(
+                &item,
+                &deskwarden::app_match::AppMatch {
+                    process: "notepad.exe".into(),
+                    trigger: deskwarden::app_match::TriggerMode::Auto,
+                },
+            )
+            .unwrap();
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&match_entries(&cache.items()));
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "the save itself must arm the engine"
+        );
+
+        // Only now does the worker write its (older) fetch back and report.
+        let outcome = sync_outcome_from(&cache, sync_epoch, Some(probe));
+        match settle_sync_outcome(outcome, &cache) {
+            SettledSync::Applicable { items } => engine.rebuild(&match_entries(&items)),
+            SettledSync::NothingToApply => panic!(
+                "a write is not a supersession: the vault session is the same one, so this sync \
+                 is still applicable"
+            ),
+            SettledSync::Failed(e) => panic!("expected a refreshed sync, got Failed({e})"),
+        }
+
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "the app match the user saved while the sync was FETCHING was reverted by the \
+             sync's populate, so the engine was rebuilt without it"
+        );
+        assert!(
+            cache
+                .items()
+                .iter()
+                .find(|i| i.id == "1")
+                .unwrap()
+                .fields
+                .iter()
+                .any(|f| f.name.as_deref() == Some(deskwarden::app_match::APP_MATCH_FIELD_NAME)),
+            "the CACHE lost the app match, which is the worse half: the next edit of this item \
+             PUTs the stale copy back and the loss stops being session-scoped"
         );
     }
 

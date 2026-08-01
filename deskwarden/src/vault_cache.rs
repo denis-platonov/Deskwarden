@@ -15,7 +15,10 @@
 //!
 //! **All writes go through here.** Each write updates the snapshot on
 //! success, so there is exactly one place that can leave the cache stale
-//! rather than one per call site.
+//! rather than one per call site -- and, since review 21's Critical, exactly
+//! one place that knows which ids have been written but not yet re-fetched,
+//! so a populate whose fetch predates a write can no longer undo it (see
+//! `populate_with_at_epoch`).
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{with_app_match, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
@@ -23,9 +26,9 @@ use std::sync::Mutex;
 
 /// Which *era* of the snapshot a caller is talking about.
 ///
-/// A new epoch begins at every [`VaultCache::clear`] -- lock, re-authentication
+/// A new era begins at every [`VaultCache::clear`] -- lock, re-authentication
 /// (possibly into a different account), quit -- and at nothing else. Two equal
-/// `VaultEpoch`s therefore prove exactly one thing, and it is worth stating
+/// `VaultEra`s therefore prove exactly one thing, and it is worth stating
 /// both halves, because reading more into it is review 18's third finding:
 ///
 ///  * **What equality DOES prove:** the snapshot has not been dropped and
@@ -35,24 +38,136 @@ use std::sync::Mutex;
 ///    `populated` back to `false`) it is still populated.
 ///  * **What equality does NOT prove:** that the snapshot's CONTENTS are
 ///    unchanged. `set_app_match`, `update_item`, `create_item` and
-///    `delete_item` all mutate it in place and deliberately do not bump the
-///    epoch. That is not an oversight to be fixed with a second counter: a
-///    write is *newer truth* than any fetch that predates it, so a consumer
-///    holding a stale epoch-tagged fetch does not want to be told "something
-///    changed, give up" -- it wants the snapshot as it stands now.
+///    `delete_item` all mutate it in place and deliberately do not begin a new
+///    era. That is not an oversight: a write is *newer truth* than any fetch
+///    that predates it, so a consumer holding a stale era-tagged fetch does
+///    not want to be told "something changed, give up" -- it wants the
+///    snapshot as it stands now.
 ///
-/// So an epoch answers "may I still act on the vault session I saw?", never
-/// "is what I fetched still current?". A consumer that needs items should ask
+/// So an era answers "may I still act on the vault session I saw?", never "is
+/// what I fetched still current?". A consumer that needs items should ask
 /// [`VaultCache::items_unless_superseded`], which answers the first question
 /// and hands back the answer to the second in one step, under one lock,
-/// rather than comparing epochs and then re-deriving data itself.
+/// rather than comparing eras and then re-deriving data itself.
+///
+/// A *writer* -- a populate about to overwrite the snapshot wholesale -- needs
+/// a strictly stronger fact than this one, and takes a whole [`VaultEpoch`]
+/// instead. See there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VaultEpoch(u64);
+pub struct VaultEra(u64);
 
-impl std::fmt::Display for VaultEpoch {
+impl std::fmt::Display for VaultEra {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
+}
+
+/// A point in the snapshot's history, captured **before** a fetch starts and
+/// handed back to the populate that fetch feeds: which [`VaultEra`] the
+/// snapshot was in, and how many local writes had landed by then.
+///
+/// Two facts, two fields, deliberately not one number -- this crate's
+/// repeatedly-relearnt lesson (review 21's Critical). They are asked opposite
+/// questions and get opposite answers:
+///
+///  * the **era** decides whether the fetch may be written back AT ALL. A
+///    `clear` in between means a different vault session, so the fetch is
+///    discarded outright ([`PopulateOutcome::DiscardedStale`]).
+///  * the **write position** decides which parts of the fetch are already
+///    out of date. Everything the cache has written locally since this mark
+///    was taken is newer truth than the fetch, and is re-applied over it
+///    rather than either clobbering it or throwing the whole fetch away --
+///    see [`VaultCache::populate_with`].
+///
+/// The write position is private and is NOT an identity: `VaultEpoch`'s
+/// `PartialEq` is "the same point in history", which two marks taken either
+/// side of a write correctly fail. A consumer asking "same vault session?"
+/// wants [`Self::era`], which is the question [`VaultEra`] exists to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultEpoch {
+    era: VaultEra,
+    writes: u64,
+}
+
+impl VaultEpoch {
+    /// Just the vault-session half -- what [`VaultCache::items_unless_superseded`]
+    /// takes, and all a *reader* of the snapshot ever needs.
+    pub fn era(&self) -> VaultEra {
+        self.era
+    }
+}
+
+/// One local write the snapshot has applied that no completed fetch is known
+/// to reflect yet.
+///
+/// Only the id, never a copy of the item: the write has already been applied
+/// to the snapshot, so the snapshot itself holds the data and re-reading it at
+/// replay time is both cheaper and impossible to get out of step. (It also
+/// keeps this log from becoming a second, longer-lived home for decrypted
+/// vault contents.)
+struct PendingWrite {
+    /// The value of `Snapshot::writes` when this write landed. A populate
+    /// replays exactly those entries whose `seq` is *after* the mark it
+    /// captured before fetching.
+    seq: u64,
+    id: String,
+    /// `true` for a delete -- the id must be removed from whatever a fetch
+    /// brings back, rather than copied out of the snapshot (it isn't there).
+    deleted: bool,
+}
+
+/// Records a write against `log`, replacing any earlier entry for the same id.
+///
+/// Last-write-wins per id is exactly right and is what bounds this log: replay
+/// only ever needs the snapshot's CURRENT copy of an id (or the fact that it
+/// is gone), so an id can never need two entries, and the log can never grow
+/// past the number of distinct ids written since the last fetch that covered
+/// them. Ordering between different ids does not matter, since replaying them
+/// touches disjoint entries.
+fn record_write(log: &mut Vec<PendingWrite>, seq: u64, id: &str, deleted: bool) {
+    log.retain(|w| w.id != id);
+    log.push(PendingWrite {
+        seq,
+        id: id.to_string(),
+        deleted,
+    });
+}
+
+/// Overlays the writes in `pending` that landed after `since` onto `fetched`,
+/// taking each written value from `current` -- the snapshot as it stands now.
+/// Returns how many were replayed, for the log line.
+///
+/// Generic over items and folders because the rule is identical for both and
+/// having it once means it cannot be right for one and wrong for the other.
+fn replay_writes<T: Clone>(
+    fetched: &mut Vec<T>,
+    current: &[T],
+    pending: &[PendingWrite],
+    since: u64,
+    id_of: impl Fn(&T) -> &str,
+) -> usize {
+    let mut replayed = 0;
+    for write in pending.iter().filter(|w| w.seq > since) {
+        if write.deleted {
+            fetched.retain(|t| id_of(t) != write.id);
+        } else if let Some(local) = current.iter().find(|t| id_of(t) == write.id) {
+            match fetched.iter_mut().find(|t| id_of(t) == write.id) {
+                // In place, so a fetch's ordering survives an edit.
+                Some(slot) => *slot = local.clone(),
+                None => fetched.push(local.clone()),
+            }
+        } else {
+            // Recorded as written but no longer in the snapshot, without a
+            // delete having replaced the entry. Not reachable -- every write
+            // below records only what it actually applied, and a delete
+            // replaces the id's entry (see `record_write`) -- and skipped
+            // rather than unwrapped, because the cost of being wrong is a
+            // panic on the UI thread.
+            continue;
+        }
+        replayed += 1;
+    }
+    replayed
 }
 
 #[derive(Default)]
@@ -63,12 +178,43 @@ struct Snapshot {
     /// Bumped by [`VaultCache::clear`]. Every populate captures this before
     /// it starts fetching and refuses to write its result back if the value
     /// has moved on since -- see [`VaultCache::populate`].
-    epoch: u64,
+    era: u64,
+    /// Monotonic count of local writes applied to this snapshot. Never reset
+    /// (not even by `clear`, which resets the logs below instead): its only
+    /// job is to order writes against a mark taken earlier.
+    writes: u64,
+    /// The writes no completed fetch is known to reflect yet, one entry per
+    /// id. Emptied of everything a populate's own fetch covered, and entirely
+    /// by `clear`.
+    pending_items: Vec<PendingWrite>,
+    pending_folders: Vec<PendingWrite>,
 }
 
 impl Snapshot {
     fn epoch(&self) -> VaultEpoch {
-        VaultEpoch(self.epoch)
+        VaultEpoch {
+            era: VaultEra(self.era),
+            writes: self.writes,
+        }
+    }
+
+    /// Allocates the next write sequence number. `saturating_add` rather than
+    /// `+`: an overflow would need ~1.8e19 writes and is not worth a panic on
+    /// a write path, and saturating leaves the counter merely unable to order
+    /// two writes rather than wrapping and ordering them backwards.
+    fn next_write_seq(&mut self) -> u64 {
+        self.writes = self.writes.saturating_add(1);
+        self.writes
+    }
+
+    fn note_item_write(&mut self, id: &str, deleted: bool) {
+        let seq = self.next_write_seq();
+        record_write(&mut self.pending_items, seq, id, deleted);
+    }
+
+    fn note_folder_write(&mut self, id: &str, deleted: bool) {
+        let seq = self.next_write_seq();
+        record_write(&mut self.pending_folders, seq, id, deleted);
     }
 }
 
@@ -145,6 +291,11 @@ impl VaultCache {
     /// nothing *failed*: the answer simply stopped being wanted. It is
     /// reported at all because an empty cache is not a vault with no items;
     /// see [`PopulateOutcome`].
+    ///
+    /// **Write-guarded too**, and for a window this one opens itself: the
+    /// `list_items` below and the `list_folders` inside are both real HTTP
+    /// round-trips, and a write can land in between. See
+    /// [`Self::populate_with`] for what happens to it.
     pub fn populate(&self) -> Result<PopulateOutcome, VaultError> {
         let epoch = self.epoch();
         let items = self.bridge.list_items()?;
@@ -154,25 +305,28 @@ impl VaultCache {
     /// The snapshot's current epoch, for a caller that fetches the vault
     /// itself and then hands the result to [`Self::populate_with`].
     ///
-    /// Capture it **before** starting that fetch: the guard can only cover
-    /// the window it is given, and a `clear` that lands between a caller's
-    /// own `list_items` and its `populate_with` is invisible to an epoch
-    /// captured inside `populate_with` (review 14's Minor).
+    /// Capture it **before** starting that fetch: both guards it carries can
+    /// only cover the window they are given. A `clear` that lands between a
+    /// caller's own `list_items` and its `populate_with` is invisible to an
+    /// epoch captured inside `populate_with` (review 14's Minor), and so is a
+    /// write (review 21's Critical) -- with the difference that the write
+    /// window is *always* open, because `populate_with` fetches folders after
+    /// the caller has already fetched items.
     pub fn epoch(&self) -> VaultEpoch {
         self.lock().epoch()
     }
 
     /// The snapshot's items **as they stand now**, or `None` if a
-    /// [`Self::clear`] has started a new epoch since `epoch` was captured.
+    /// [`Self::clear`] has started a new era since `era` was captured.
     ///
-    /// This is the one place that answers "is a result computed back at
-    /// `epoch` still applicable, and if so what should I act on?". It exists
+    /// This is the one place that answers "is a result computed back in
+    /// `era` still applicable, and if so what should I act on?". It exists
     /// because those are two questions that were being answered by two
     /// different mechanisms, and the pairing was wrong (review 18's third
-    /// finding): callers compared epochs to decide applicability and then
+    /// finding): callers compared eras to decide applicability and then
     /// acted on a `Vec` frozen at their own, earlier fetch. Since a write
-    /// mutates the snapshot without touching the epoch (see [`VaultEpoch`]),
-    /// "the epoch still matches" was read as "so my frozen copy is still the
+    /// mutates the snapshot without starting a new era (see [`VaultEra`]),
+    /// "the era still matches" was read as "so my frozen copy is still the
     /// snapshot", which it never was -- and an app match saved while a sync
     /// was in flight was silently overwritten by that sync's older list.
     ///
@@ -181,15 +335,15 @@ impl VaultCache {
     /// splitting them is what let them drift apart. Both facts are read under
     /// a single lock, so no `clear` can land between the check and the read.
     ///
-    /// `None` also covers an unpopulated snapshot at the same epoch. That is
+    /// `None` also covers an unpopulated snapshot in the same era. That is
     /// unreachable today -- `clear` is the only thing that unpopulates and it
-    /// bumps the epoch -- but this function's job is to hand back a vault, and
+    /// begins a new era -- but this function's job is to hand back a vault, and
     /// an empty unpopulated snapshot is not one (see [`PopulateOutcome`]);
-    /// deriving that fact from the epoch instead of checking it is exactly the
+    /// deriving that fact from the era instead of checking it is exactly the
     /// inference this whole type exists to stop people making.
-    pub fn items_unless_superseded(&self, epoch: VaultEpoch) -> Option<Vec<VaultItem>> {
+    pub fn items_unless_superseded(&self, era: VaultEra) -> Option<Vec<VaultItem>> {
         let snapshot = self.lock();
-        if snapshot.epoch() != epoch || !snapshot.populated {
+        if snapshot.epoch().era() != era || !snapshot.populated {
             return None;
         }
         Some(snapshot.items.clone())
@@ -210,15 +364,20 @@ impl VaultCache {
     /// Epoch-guarded exactly like [`Self::populate`] -- see its doc for what
     /// the guard is for -- but the epoch is the caller's, taken from
     /// [`Self::epoch`], not one captured on entry here. What the guard
-    /// actually promises is "no `clear` landed between that capture and the
-    /// write", so the capture has to happen before the *caller's own fetch*
-    /// for the caller's fetch to be covered at all. Capturing on entry, after
-    /// the caller had already listed items, left exactly the hole the epoch
-    /// exists to close: a `clear` in that window was invisible and the
-    /// pre-clear account's items were written with `populated = true`
-    /// (review 14's Minor -- inert at the only caller today, which runs on
-    /// the main thread before any `clear` site exists, but not inert for the
-    /// background-thread callers the encrypted-disk-cache work will add).
+    /// actually promises is "no `clear`, and no write, landed between that
+    /// capture and the write-back", so the capture has to happen before the
+    /// *caller's own fetch* for the caller's fetch to be covered at all.
+    /// Capturing on entry, after the caller had already listed items, left
+    /// exactly the hole the epoch exists to close: a `clear` in that window
+    /// was invisible and the pre-clear account's items were written with
+    /// `populated = true` (review 14's Minor -- inert at the only caller
+    /// today, which runs on the main thread before any `clear` site exists,
+    /// but not inert for the background-thread callers the
+    /// encrypted-disk-cache work will add).
+    ///
+    /// **Local writes made since `epoch` survive** -- review 21's Critical.
+    /// See [`Self::populate_with_at_epoch`] for the mechanism and for why it
+    /// re-applies rather than refuses.
     pub fn populate_with(
         &self,
         items: Vec<VaultItem>,
@@ -227,24 +386,105 @@ impl VaultCache {
         self.populate_with_at_epoch(items, epoch)
     }
 
+    /// The one place a fetch is written back over the snapshot, and therefore
+    /// the one place that can silently undo a local write.
+    ///
+    /// **Review 21's Critical, reproduced live against the real helpers.**
+    /// Everything between the caller's own `list_items` and the lock below --
+    /// which includes the `list_folders` round-trip on the line below, so the
+    /// window is *never* empty -- is time in which `set_app_match`,
+    /// `update_item`, `create_item`, `delete_item` or any of the folder
+    /// writes can land. A write is newer truth than a fetch that predates it
+    /// (see [`VaultEra`]), so overwriting `items` wholesale reverted it *in
+    /// the cache*, which is worse than losing it in the match engine: a later
+    /// vault-window edit of that item PUTs the cached copy back as the item's
+    /// new state, and the item's `fields` array is always present in that body
+    /// (`VaultItem::fields` has no `skip_serializing_if`, so `bw serve`'s
+    /// merge-on-omitted-keys behaviour cannot save it -- see
+    /// `.superpowers/sdd/put-semantics-capture.md`). Session-scoped loss
+    /// becomes permanent loss.
+    ///
+    /// **What it does instead: re-apply, not refuse.** The snapshot keeps a
+    /// small log of the ids it has written locally ([`PendingWrite`]); every
+    /// entry newer than the caller's mark is replayed over the fetched data,
+    /// taking the value from the snapshot itself. The result is the fetch as
+    /// the server would have answered it *after* those writes, which is the
+    /// truth both halves are trying to describe.
+    ///
+    /// Three alternatives were weighed and rejected:
+    ///
+    ///  * **Refusing the populate** (returning a new [`PopulateOutcome`]
+    ///    variant) is safe but wasteful and gets worse the longer the fetch
+    ///    takes: one saved app match would throw away a whole-vault refresh
+    ///    that succeeded, leave the cache stale until some later populate got
+    ///    lucky, and force every caller -- the tray's Sync item above all --
+    ///    to describe a refresh that did not happen. A user editing steadily
+    ///    in the vault window during a slow `bw sync` could starve the refresh
+    ///    indefinitely. Replaying keeps the refresh AND the write, so
+    ///    [`PopulateOutcome`] gains nothing to distinguish and deliberately
+    ///    does not grow a variant; the replay is reported in the log line
+    ///    instead.
+    ///  * **Fetching folders before items** narrows the window but cannot
+    ///    close it: the caller's fetch is outside this function either way,
+    ///    and `sync_outcome_from`'s `list_items` is where the reviewer's
+    ///    reproduction actually landed its write.
+    ///  * **Holding the lock across the fetch** closes it and is forbidden --
+    ///    the fetch is HTTP and can take seconds, and every read in the app
+    ///    (autofill included) would block on it.
+    ///
+    /// The lock ordering is what makes this airtight rather than merely
+    /// likely. Every write does its HTTP first and takes the lock afterwards,
+    /// so at the moment this function holds the lock a concurrent write has
+    /// either already recorded itself (and is replayed here) or has not yet
+    /// touched the snapshot at all (and applies immediately after this
+    /// returns, on top of the fetch). There is no third case.
     fn populate_with_at_epoch(
         &self,
-        items: Vec<VaultItem>,
+        mut items: Vec<VaultItem>,
         epoch: VaultEpoch,
     ) -> Result<PopulateOutcome, VaultError> {
-        let folders = self.bridge.list_folders()?;
+        let mut folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
-        if snapshot.epoch() != epoch {
+        if snapshot.epoch().era() != epoch.era() {
             log::info!(
                 "discarding a vault populate that finished after the cache was cleared \
-                 (epoch {epoch} -> {}); the snapshot stays empty",
-                snapshot.epoch()
+                 (era {} -> {}); the snapshot stays empty",
+                epoch.era(),
+                snapshot.epoch().era()
             );
             return Ok(PopulateOutcome::DiscardedStale);
         }
+
+        let replayed = replay_writes(
+            &mut items,
+            &snapshot.items,
+            &snapshot.pending_items,
+            epoch.writes,
+            |i| &i.id,
+        ) + replay_writes(
+            &mut folders,
+            &snapshot.folders,
+            &snapshot.pending_folders,
+            epoch.writes,
+            |f| &f.id,
+        );
+        if replayed > 0 {
+            log::info!(
+                "a vault populate finished after {replayed} local write(s) it could not have \
+                 fetched; re-applying them over it so the newer local truth survives"
+            );
+        }
+
         snapshot.items = items;
         snapshot.folders = folders;
         snapshot.populated = true;
+        // What this fetch covered is now confirmed by it; what it did not is
+        // still unconfirmed by any fetch, and another populate with an older
+        // mark (there is more than one producer -- see the ledger) must still
+        // replay it. Retaining exactly the un-covered entries is also what
+        // keeps these logs from growing across a session.
+        snapshot.pending_items.retain(|w| w.seq > epoch.writes);
+        snapshot.pending_folders.retain(|w| w.seq > epoch.writes);
         Ok(PopulateOutcome::Populated)
     }
 
@@ -262,19 +502,30 @@ impl VaultCache {
 
     /// Drops everything. Called on lock and on quit.
     ///
-    /// Also bumps the epoch, which is what makes this actually stick against
+    /// Also begins a new era, which is what makes this actually stick against
     /// a populate that is already in flight -- see [`Self::populate`]. It is
-    /// the ONLY thing that bumps it, deliberately: see [`VaultEpoch`] for why
+    /// the ONLY thing that begins one, deliberately: see [`VaultEra`] for why
     /// the writes below must not, and [`Self::items_unless_superseded`] for
-    /// what consumers should ask instead of comparing epochs themselves.
+    /// what consumers should ask instead of comparing eras themselves.
+    ///
+    /// The pending-write logs go with the data they describe: there is no
+    /// snapshot left to replay them onto, and an in-flight populate from the
+    /// previous era is discarded outright rather than replayed. The write
+    /// COUNTER is deliberately not reset -- it only ever has to order writes
+    /// against a mark, and restarting it would let a mark from the previous
+    /// era compare as newer than a write in this one.
     pub fn clear(&self) {
         let mut snapshot = self.lock();
         snapshot.items.clear();
         snapshot.items.shrink_to_fit();
         snapshot.folders.clear();
         snapshot.folders.shrink_to_fit();
+        snapshot.pending_items.clear();
+        snapshot.pending_items.shrink_to_fit();
+        snapshot.pending_folders.clear();
+        snapshot.pending_folders.shrink_to_fit();
         snapshot.populated = false;
-        snapshot.epoch = snapshot.epoch.wrapping_add(1);
+        snapshot.era = snapshot.era.wrapping_add(1);
     }
 
     pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
@@ -282,6 +533,7 @@ impl VaultCache {
         let mut snapshot = self.lock();
         if snapshot.populated {
             snapshot.items.push(created.clone());
+            snapshot.note_item_write(&created.id, false);
         }
         Ok(created)
     }
@@ -290,8 +542,15 @@ impl VaultCache {
         self.bridge.update_item(item)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
-            if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
-                *existing = item.clone();
+            // By index rather than `iter_mut().find()`: the write has to be
+            // recorded on the same snapshot, and an outstanding `&mut` into
+            // its items would still be alive inside an `if let`.
+            if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
+                snapshot.items[at] = item.clone();
+                // Recorded only when the snapshot actually changed, so the
+                // log can never name an id the snapshot cannot supply at
+                // replay time -- see `replay_writes`.
+                snapshot.note_item_write(&item.id, false);
             }
         }
         Ok(())
@@ -311,8 +570,9 @@ impl VaultCache {
         self.bridge.set_app_match(item, m)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
-            if let Some(existing) = snapshot.items.iter_mut().find(|i| i.id == item.id) {
-                *existing = with_app_match(item, m);
+            if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
+                snapshot.items[at] = with_app_match(item, m);
+                snapshot.note_item_write(&item.id, false);
             }
         }
         Ok(())
@@ -323,6 +583,10 @@ impl VaultCache {
         let mut snapshot = self.lock();
         if snapshot.populated {
             snapshot.items.retain(|i| i.id != id);
+            // Unconditional, unlike the edits above: a delete has to be
+            // recorded even when the snapshot did not hold the item, because
+            // what it has to survive is a fetch that DOES hold it.
+            snapshot.note_item_write(id, true);
         }
         Ok(())
     }
@@ -332,6 +596,7 @@ impl VaultCache {
         let mut snapshot = self.lock();
         if snapshot.populated {
             snapshot.folders.push(created.clone());
+            snapshot.note_folder_write(&created.id, false);
         }
         Ok(created)
     }
@@ -340,8 +605,9 @@ impl VaultCache {
         let updated = self.bridge.update_folder(id, name)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
-            if let Some(existing) = snapshot.folders.iter_mut().find(|f| f.id == updated.id) {
-                existing.name = updated.name.clone();
+            if let Some(at) = snapshot.folders.iter().position(|f| f.id == updated.id) {
+                snapshot.folders[at].name = updated.name.clone();
+                snapshot.note_folder_write(&updated.id, false);
             }
         }
         Ok(updated)
@@ -352,6 +618,7 @@ impl VaultCache {
         let mut snapshot = self.lock();
         if snapshot.populated {
             snapshot.folders.retain(|f| f.id != id);
+            snapshot.note_folder_write(id, true);
         }
         Ok(())
     }
@@ -804,10 +1071,20 @@ mod tests {
 
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
         cache.set_app_match(&item, &an_app_match()).unwrap();
-        assert_eq!(cache.epoch(), epoch, "a write must not start a new epoch");
+        // Mechanically adapted for review 21's split of `VaultEpoch` into
+        // "which era" plus "how many writes", with its meaning intact: what
+        // it always asserted is that a write does not supersede a reader,
+        // and the era is exactly the half that decides that. (The whole
+        // epoch DOES move, and must -- that is what stops a populate from
+        // reverting this write.)
+        assert_eq!(
+            cache.epoch().era(),
+            epoch.era(),
+            "a write must not start a new era"
+        );
 
         let items = cache
-            .items_unless_superseded(epoch)
+            .items_unless_superseded(epoch.era())
             .expect("a write is not a supersession -- the vault session is the same one");
         let updated = items.into_iter().find(|i| i.id == "1").unwrap();
         assert!(
@@ -845,16 +1122,170 @@ mod tests {
         let epoch = cache.epoch();
         cache.clear();
 
-        assert!(cache.items_unless_superseded(epoch).is_none());
+        assert!(cache.items_unless_superseded(epoch.era()).is_none());
         // ...and a *repopulate* for the new account does not make the old
-        // epoch applicable again: this is the cross-account case, and the
-        // epoch is what closes it.
+        // era applicable again: this is the cross-account case, and the
+        // era is what closes it.
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         assert!(
-            cache.items_unless_superseded(epoch).is_none(),
-            "an epoch from before a clear must stay superseded even once the cache refills"
+            cache.items_unless_superseded(epoch.era()).is_none(),
+            "an era from before a clear must stay superseded even once the cache refills"
         );
-        assert!(cache.items_unless_superseded(cache.epoch()).is_some());
+        assert!(cache.items_unless_superseded(cache.epoch().era()).is_some());
+    }
+
+    /// Every mock a populate plus a write to item 1 needs.
+    fn populating_server_with_a_writable_item() -> mockito::ServerGuard {
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        server
+            .mock("PUT", "/object/item/1")
+            .with_status(200)
+            .create();
+        server
+            .mock("DELETE", "/object/item/1")
+            .with_status(200)
+            .create();
+        server
+    }
+
+    fn has_app_match(item: &VaultItem) -> bool {
+        item.fields
+            .iter()
+            .any(|f| f.name.as_deref() == Some(crate::app_match::APP_MATCH_FIELD_NAME))
+    }
+
+    #[test]
+    fn a_write_that_lands_while_a_populate_is_fetching_is_not_reverted_by_it() {
+        // REVIEW 21'S CRITICAL, at the cache level, in the ordering the suite
+        // did not cover. Everything between a populate's mark and the lock it
+        // finally takes is a window: the caller's own `list_items` (a tray
+        // sync's, here) and then `populate_with`'s `list_folders`, both real
+        // HTTP round-trips. A write landing in it is newer truth than the
+        // fetch -- and before this fix the fetch was assigned wholesale, so
+        // the write was reverted IN THE CACHE. That is worse than losing it in
+        // the match engine: the next vault-window edit of that item PUTs the
+        // cached copy back as the item's new state, and the `fields` array is
+        // always present in that body, so the loss becomes permanent.
+        let server = populating_server_with_a_writable_item();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        // The sync worker: mark first (before ANY fetch), then its fetch.
+        let mark = cache.epoch();
+        let fetched = cache.bridge().list_items().unwrap();
+
+        // "Add app...": the user's save lands while that fetch is in flight.
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache.set_app_match(&item, &an_app_match()).unwrap();
+
+        // ...and only now does the populate write its older fetch back.
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated,
+            "the refresh itself must still land: the write is a reason to re-apply it, not a \
+             reason to throw a whole-vault fetch away"
+        );
+
+        let after = cache.items();
+        assert!(
+            has_app_match(after.iter().find(|i| i.id == "1").unwrap()),
+            "the app match saved while the populate was fetching was reverted by the populate"
+        );
+        assert_eq!(
+            after.len(),
+            2,
+            "the rest of the fetch must still have landed"
+        );
+    }
+
+    #[test]
+    fn a_delete_that_lands_while_a_populate_is_fetching_is_not_undone_by_it() {
+        // The other direction, and the one a "keep the local copy" rule gets
+        // wrong if it only knows how to copy: the snapshot has no item 1 to
+        // put back, so the fetch's own copy has to be REMOVED instead.
+        // Without that, a deleted item reappears in the vault window and in
+        // the match engine, and re-deleting it 404s.
+        let server = populating_server_with_a_writable_item();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        let mark = cache.epoch();
+        let fetched = cache.bridge().list_items().unwrap();
+        assert!(
+            fetched.iter().any(|i| i.id == "1"),
+            "the fetch must predate the delete"
+        );
+
+        cache.delete_item("1").unwrap();
+
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+        let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            vec!["2".to_string()],
+            "an item deleted while the populate was fetching came back with the fetch"
+        );
+    }
+
+    #[test]
+    fn a_populate_whose_own_fetch_already_covers_a_write_replaces_it_wholesale() {
+        // THE MIRROR, and the reason the write position is a sequence rather
+        // than a "has anything been written?" flag. Once a fetch has been
+        // taken that is NEWER than a write, that write is no longer newer
+        // truth about anything: the fetch is. So a populate whose mark was
+        // captured after the save must adopt what it fetched -- here a copy
+        // with no app-match field on it, the shape the server would answer
+        // with once that field had been removed from another client --
+        // exactly as it did before this fix.
+        //
+        // It is also what keeps this bounded: if a replayed write were never
+        // retired, every populate for the rest of the session would keep
+        // re-applying it over fresher server data, and the pending log would
+        // never shrink.
+        let server = populating_server_with_a_writable_item();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache.set_app_match(&item, &an_app_match()).unwrap();
+        let saved = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(has_app_match(&saved));
+
+        // A later populate: mark captured AFTER the save, so whatever it
+        // fetches is by definition at least as new as the save.
+        let mark = cache.epoch();
+        let fetched = cache.bridge().list_items().unwrap();
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+
+        let after = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(
+            !has_app_match(&after),
+            "a write the populate's own fetch already covers must not be replayed over it -- \
+             the fetch is the newer truth by then"
+        );
+        assert_eq!(
+            after.name, "Alpha",
+            "the fetched item must be adopted as it stands"
+        );
+        assert_eq!(cache.items().len(), 2);
     }
 
     #[test]
