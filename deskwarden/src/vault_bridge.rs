@@ -691,6 +691,80 @@ mod tests {
     }
 
     #[test]
+    fn every_key_of_bitwardens_card_template_is_modelled() {
+        // The six keys `GET /object/template/item.card` returns, transcribed
+        // from `.superpowers/sdd/item-shapes-capture.md` -- deliberately NOT
+        // from `CardData`'s own `rename` attributes, which would reproduce any
+        // typo in the struct and defeat the entire point of this test.
+        //
+        // `other.is_empty()` is the whole mechanism. A misspelt rename (say
+        // `cardHolderName` for `cardholderName`) deserializes to `None`, the
+        // real key rides the catch-all, the item still round-trips
+        // byte-identically, and the field is silently missing from the UI
+        // forever. Nothing else in the suite would fail -- verified by doing
+        // exactly that misspelling and watching this test, and only this test,
+        // go red. The per-field assertions below then name each key, so
+        // `cardholder_name` in particular -- asserted nowhere else -- cannot
+        // rot unnoticed.
+        let raw = r#"{"id":"1","name":"Visa","type":3,"favorite":false,"fields":[],
+            "card":{"cardholderName":"John Doe","brand":"visa",
+                    "number":"4242424242424242","expMonth":"04","expYear":"2023",
+                    "code":"123"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let card = item.card.as_ref().unwrap();
+        assert!(
+            card.other.is_empty(),
+            "a template key fell through to the catch-all: {:?}",
+            card.other
+        );
+        assert_eq!(card.cardholder_name.as_deref(), Some("John Doe"));
+        assert_eq!(card.brand.as_deref(), Some("visa"));
+        assert_eq!(card.number.as_deref().map(|n| n.as_str()), Some("4242424242424242"));
+        assert_eq!(card.exp_month.as_deref(), Some("04"));
+        assert_eq!(card.exp_year.as_deref(), Some("2023"));
+        assert_eq!(card.code.as_deref().map(|c| c.as_str()), Some("123"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn every_observed_login_key_is_either_modelled_or_rides_the_catch_all() {
+        // The same teeth as the card/identity tests, for the one struct whose
+        // key list the capture took from REAL items rather than a template:
+        // `login` on the user's 1656-item vault carries exactly
+        // fido2Credentials, password, passwordRevisionDate, totp, uris and
+        // username.
+        //
+        // `LoginData` models four of those and leaves two on purpose, so a
+        // bare `other.is_empty()` would be wrong here. Asserting the catch-all
+        // holds EXACTLY the two unmodelled keys is the equivalent check: a
+        // misspelt rename on any of the four would push a third key into
+        // `other` and fail this, while still round-tripping byte-identically
+        // everywhere else.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[],
+            "login":{"username":"u","password":"p","totp":"seed",
+                     "uris":[{"uri":"https://example.com"}],
+                     "fido2Credentials":[],"passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let login = item.login.as_ref().unwrap();
+        assert_eq!(login.username.as_deref(), Some("u"));
+        assert_eq!(login.password.as_deref().map(|p| p.as_str()), Some("p"));
+        assert_eq!(login.totp.as_deref().map(|t| t.as_str()), Some("seed"));
+        assert_eq!(login.uris.len(), 1);
+        assert_eq!(login.uris[0].uri.as_deref(), Some("https://example.com"));
+        let mut unmodelled: Vec<&str> = login.other.keys().map(|k| k.as_str()).collect();
+        unmodelled.sort_unstable();
+        assert_eq!(
+            unmodelled,
+            ["fido2Credentials", "passwordRevisionDate"],
+            "a modelled login key fell through to the catch-all: {:?}",
+            login.other
+        );
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
     fn an_identity_round_trips_including_unmodelled_keys() {
         let raw = r#"{"id":"1","name":"Me","type":4,"favorite":false,"fields":[],
             "identity":{"firstName":"A","lastName":"B","futureField":7}}"#;
@@ -753,6 +827,49 @@ mod tests {
         assert!(after.get("notes").is_none(), "an absent notes key became null");
         assert!(after.get("card").is_none(), "an absent card key became null");
         assert!(after.get("identity").is_none(), "an absent identity key became null");
+    }
+
+    #[test]
+    fn an_explicitly_null_notes_key_is_dropped_rather_than_echoed() {
+        // Real items from `bw serve` carry `"notes": null` when they have no
+        // note -- the capture shows `notes` present on every one of a
+        // 1656-item vault. Modelling it as Option + skip_serializing_if means
+        // that key now VANISHES on write instead of round-tripping as null.
+        // Deliberate and consistent with how `folderId` and every optional
+        // login field already behave (see
+        // `an_explicitly_null_login_field_is_still_dropped_rather_than_echoed`);
+        // pinned here because it silently changed the write shape of nearly
+        // every item in a real vault.
+        //
+        // WHETHER THAT IS HARMLESS IS AN OPEN QUESTION, and this test does not
+        // answer it: it depends on whether `bw serve`'s state-replacing PUT
+        // reads an absent key as "no change" or as "clear", which needs an
+        // experiment against a live backend. This pins the current behaviour
+        // so that answer can be acted on deliberately rather than discovered.
+        let raw = r#"{"id":"1","name":"Site","type":1,"fields":[],"notes":null}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert!(item.notes.is_none());
+        let after = serde_json::to_value(&item).unwrap();
+        assert!(after.get("notes").is_none(), "an explicitly null notes key was echoed back");
+    }
+
+    #[test]
+    fn an_ssh_key_object_rides_the_catch_all_untouched() {
+        // `type: 5` is the one shape the capture could not verify, so
+        // `SshKeyData` deliberately does not exist and the whole `sshKey`
+        // object rides `VaultItem::other`. That deferral is only safe if the
+        // object survives a full-state PUT byte-identically -- which follows
+        // by isomorphism from the secure note's unmodelled `secureNote`, but
+        // is worth stating outright since it is the guarantee the deferral
+        // rests on. Field names here are illustrative and NOT a claim about
+        // the real shape; the test asserts only that whatever arrives is
+        // echoed back unchanged.
+        let raw = r#"{"id":"1","name":"Deploy key","type":5,"favorite":false,"fields":[],
+            "sshKey":{"privateKey":"PRIV","publicKey":"PUB","keyFingerprint":"FP"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(ItemKind::of(&item), ItemKind::SshKey);
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap(), "an sshKey object was altered");
     }
 
     #[test]
