@@ -66,6 +66,101 @@ pub struct UriEntry {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A payment card (`type: 3`).
+///
+/// Field names and value types are transcribed from a live capture of
+/// `GET /object/template/item.card` (recorded in
+/// `.superpowers/sdd/item-shapes-capture.md`), not from memory.
+///
+/// **All six values are strings, including the expiry.** Bitwarden's own
+/// template sends `expMonth: "04"` -- zero-padded -- so modelling either half
+/// as a number would rewrite `"04"` as `4` on the next full-state PUT and
+/// fail to parse an empty string at all.
+///
+/// Its own `#[serde(flatten)] other` for the same reason [`UriEntry`] has
+/// one: [`VaultItem`]'s catch-all cannot reach inside a nested object, so
+/// without this any key Bitwarden adds here would be silently dropped on the
+/// next full-state PUT.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CardData {
+    #[serde(rename = "cardholderName", default, skip_serializing_if = "Option::is_none")]
+    pub cardholder_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brand: Option<String>,
+    /// `Zeroizing` for the same reason [`LoginData::password`] is: a card
+    /// number is a long-lived secret, and `VaultCache::items` hands out
+    /// clones, so wiping only one copy would be a false sense of security.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<Zeroizing<String>>,
+    #[serde(rename = "expMonth", default, skip_serializing_if = "Option::is_none")]
+    pub exp_month: Option<String>,
+    #[serde(rename = "expYear", default, skip_serializing_if = "Option::is_none")]
+    pub exp_year: Option<String>,
+    /// The security code (CVV/CVC). `Zeroizing`, as above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<Zeroizing<String>>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
+/// An identity (`type: 4`). Eighteen fields, of which a real item populates a
+/// handful.
+///
+/// Seventeen of them are the exact keys of `GET
+/// /object/template/item.identity`, captured live (see
+/// `.superpowers/sdd/item-shapes-capture.md`).
+///
+/// **`address3` is the eighteenth, and it is deliberate, not a stray.** It is
+/// absent from the template but present in Bitwarden's documented item
+/// schema. Because every field here carries
+/// `skip_serializing_if = "Option::is_none"`, modelling a key that does not
+/// exist costs exactly nothing: it never appears on write. If real items do
+/// carry it, modelling it means the detail pane shows it instead of hiding it
+/// in `other`. Do not "clean this up" -- deleting it can only lose data.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct IdentityData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(rename = "firstName", default, skip_serializing_if = "Option::is_none")]
+    pub first_name: Option<String>,
+    #[serde(rename = "middleName", default, skip_serializing_if = "Option::is_none")]
+    pub middle_name: Option<String>,
+    #[serde(rename = "lastName", default, skip_serializing_if = "Option::is_none")]
+    pub last_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address1: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address2: Option<String>,
+    /// See the struct doc: modelled on purpose despite being absent from the
+    /// captured template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address3: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(rename = "postalCode", default, skip_serializing_if = "Option::is_none")]
+    pub postal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssn: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(rename = "passportNumber", default, skip_serializing_if = "Option::is_none")]
+    pub passport_number: Option<String>,
+    #[serde(rename = "licenseNumber", default, skip_serializing_if = "Option::is_none")]
+    pub license_number: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultItem {
     pub id: String,
@@ -77,7 +172,33 @@ pub struct VaultItem {
     /// endpoint would treat as new state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<LoginData>,
-    /// Raw `bw` item type: 1=Login, 2=SecureNote, 3=Card, 4=Identity.
+    /// The `card` object on a `type: 3` item. `skip_serializing_if` for the
+    /// same reason [`Self::login`] has it: an item that gains `"card": null`
+    /// on a full-state PUT has been told its card is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardData>,
+    /// The `identity` object on a `type: 4` item. See [`Self::card`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityData>,
+    /// Item-level free text. A secure note's entire body lives here, which is
+    /// why that type needs no struct of its own -- its `secureNote` object
+    /// carries only a `{"type": 0}` discriminator, which rides
+    /// [`Self::other`] untouched -- and why notes on an ordinary login were
+    /// invisible until this field existed.
+    ///
+    /// `Zeroizing` because a secure note *is* the secret, exactly as
+    /// [`LoginData::password`] is.
+    ///
+    /// There is deliberately **no `ssh_key` field yet**: `type: 5`'s wire
+    /// shape is the one this repo could not verify (the CLI's
+    /// `item.sshKey` template endpoint 400s and no real sample exists), and
+    /// modelling it from memory is how a modelled field and its `other` copy
+    /// start disagreeing. A type-5 item's `sshKey` object rides
+    /// [`Self::other`] intact in the meantime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<Zeroizing<String>>,
+    /// Raw `bw` item type: 1=Login, 2=SecureNote, 3=Card, 4=Identity,
+    /// 5=SshKey.
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub item_type: Option<i64>,
     #[serde(rename = "folderId", default, skip_serializing_if = "Option::is_none")]
@@ -462,6 +583,9 @@ mod tests {
             name: "x".into(),
             fields: vec![],
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,
@@ -511,6 +635,185 @@ mod tests {
     }
 
     #[test]
+    fn a_card_round_trips_with_absent_fields_still_absent() {
+        // The property that has broken twice in this file already: a key the
+        // server never sent must not appear on write.
+        let raw = r#"{"id":"1","name":"Visa","type":3,"favorite":false,"fields":[],
+            "card":{"number":"4111111111111111","brand":"Visa"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.card.as_ref().unwrap().brand.as_deref(), Some("Visa"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let after = serde_json::to_value(&item).unwrap();
+        assert_eq!(before, after, "a card round trip changed the item's shape");
+    }
+
+    #[test]
+    fn a_card_round_trips_with_empty_strings_still_empty() {
+        // Empty is not absent. Collapsing the two is the mirror of the bug
+        // above and just as silent.
+        let raw = r#"{"id":"1","name":"Visa","type":3,"favorite":false,"fields":[],
+            "card":{"number":"","brand":"","code":""}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let after = serde_json::to_value(&item).unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn unknown_keys_inside_a_card_survive_a_round_trip() {
+        // VaultItem's own flatten cannot reach inside a nested object --
+        // this is why UriEntry exists. Same rule, two more structs.
+        let raw = r#"{"id":"1","name":"Visa","type":3,"favorite":false,"fields":[],
+            "card":{"number":"4111","somethingNew":{"deep":true}}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let after = serde_json::to_value(&item).unwrap();
+        assert_eq!(before, after, "an unmodelled key inside `card` was dropped");
+    }
+
+    #[test]
+    fn a_cards_expiry_stays_a_string_including_its_zero_padding() {
+        // Bitwarden's own `item.card` template sends `expMonth: "04"` -- a
+        // zero-padded *string*. Modelling either half as a number would turn
+        // "04" into 4 on write and "" into a parse error.
+        let raw = r#"{"id":"1","name":"Visa","type":3,"favorite":false,"fields":[],
+            "card":{"cardholderName":"John Doe","brand":"visa",
+                    "number":"4242424242424242","expMonth":"04","expYear":"2023",
+                    "code":"123"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let card = item.card.as_ref().unwrap();
+        assert_eq!(card.exp_month.as_deref(), Some("04"));
+        assert_eq!(card.exp_year.as_deref(), Some("2023"));
+        assert_eq!(card.number.as_deref().map(|n| n.as_str()), Some("4242424242424242"));
+        assert_eq!(card.code.as_deref().map(|c| c.as_str()), Some("123"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn an_identity_round_trips_including_unmodelled_keys() {
+        let raw = r#"{"id":"1","name":"Me","type":4,"favorite":false,"fields":[],
+            "identity":{"firstName":"A","lastName":"B","futureField":7}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.identity.as_ref().unwrap().first_name.as_deref(), Some("A"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn every_key_of_bitwardens_identity_template_is_modelled() {
+        // The seventeen keys `GET /object/template/item.identity` returns.
+        // If one is missing from `IdentityData` it rides `other` instead, the
+        // detail pane never shows it, and nothing fails loudly.
+        let raw = r#"{"id":"1","name":"Me","type":4,"favorite":false,"fields":[],
+            "identity":{"title":"Mr","firstName":"A","middleName":"B","lastName":"C",
+                "address1":"1","address2":"2","city":"D","state":"E","postalCode":"F",
+                "country":"G","company":"H","email":"I","phone":"J","ssn":"K",
+                "username":"L","passportNumber":"M","licenseNumber":"N"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let identity = item.identity.as_ref().unwrap();
+        assert!(
+            identity.other.is_empty(),
+            "a template key fell through to the catch-all: {:?}",
+            identity.other
+        );
+        assert_eq!(identity.postal_code.as_deref(), Some("F"));
+        assert_eq!(identity.license_number.as_deref(), Some("N"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn a_secure_note_round_trips_with_its_body_in_item_level_notes() {
+        let raw = r#"{"id":"1","name":"Wifi","type":2,"favorite":false,"fields":[],
+            "notes":"the passphrase","secureNote":{"type":0}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(item.notes.as_deref().map(|n| n.as_str()), Some("the passphrase"));
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn notes_on_a_login_are_now_modelled_and_still_round_trip() {
+        // Regression guard for the existing type: `notes` used to ride the
+        // `other` catch-all, so moving it into a typed field must not change
+        // any login's wire shape.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[],
+            "notes":"a note","login":{"username":"u"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn an_item_with_no_notes_does_not_gain_a_null_notes_key() {
+        let raw = r#"{"id":"1","name":"Site","type":1,"fields":[]}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let after = serde_json::to_value(&item).unwrap();
+        assert!(after.get("notes").is_none(), "an absent notes key became null");
+        assert!(after.get("card").is_none(), "an absent card key became null");
+        assert!(after.get("identity").is_none(), "an absent identity key became null");
+    }
+
+    #[test]
+    fn a_present_but_null_key_survives_a_round_trip() {
+        // Real items from `bw serve` carry `login.passwordRevisionDate: null`
+        // -- a key that is PRESENT with a null value. It rides LoginData's
+        // catch-all, and a careless skip_serializing_if change would drop it
+        // silently.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[],
+            "login":{"username":"u","passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn a_real_shaped_item_round_trips_with_every_observed_key() {
+        // Every item-level key observed on the user's real vault. All but
+        // the modelled ones must ride `other` untouched.
+        let raw = r#"{"id":"1","object":"item","type":1,"name":"Site",
+            "notes":"a note","favorite":false,"fields":[],"folderId":null,
+            "collectionIds":[],"attachments":[],"key":"K","reprompt":0,
+            "passwordHistory":[{"password":"old","lastUsedDate":"2020-01-01T00:00:00.000Z"}],
+            "creationDate":"2020-01-01T00:00:00.000Z",
+            "revisionDate":"2021-01-01T00:00:00.000Z",
+            "login":{"username":"u","password":"p","totp":"seed","uris":[],
+                     "fido2Credentials":[],"passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let after = serde_json::to_value(&item).unwrap();
+
+        // A real item round-trips through exactly TWO normalisations, both of
+        // which predate this task, are already pinned by their own tests, and
+        // are named here rather than papered over by a looser assertion:
+        //
+        //   * `folderId: null` is dropped, because null and absent mean the
+        //     same thing to `bw` -- the rule
+        //     `an_explicitly_null_login_field_is_still_dropped_rather_than_echoed`
+        //     records for `login`, applied by `folder_id`'s own
+        //     `skip_serializing_if`;
+        //   * an empty `login.uris` is dropped, by `LoginData::uris`'s
+        //     `skip_serializing_if = "Vec::is_empty"`.
+        //
+        // Removing them from `before` and demanding exact equality afterwards
+        // is a stronger check than skipping those keys would be: it asserts
+        // that these two, and nothing else, differ. Every unmodelled
+        // item-level key the capture found -- attachments, collectionIds,
+        // creationDate, key, object, passwordHistory, reprompt, revisionDate
+        // -- must survive byte-identically.
+        let mut expected = before;
+        let root = expected.as_object_mut().unwrap();
+        assert_eq!(root.remove("folderId"), Some(serde_json::Value::Null));
+        assert_eq!(
+            root["login"].as_object_mut().unwrap().remove("uris"),
+            Some(serde_json::json!([]))
+        );
+
+        assert_eq!(expected, after, "a real-shaped item changed shape across a round trip");
+    }
+
+    #[test]
     fn extract_app_match_finds_matching_field() {
         let item = VaultItem {
             id: "1".into(),
@@ -520,6 +823,9 @@ mod tests {
                 value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
             }],
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,
@@ -537,6 +843,9 @@ mod tests {
             name: "Other".into(),
             fields: vec![],
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,
@@ -555,6 +864,9 @@ mod tests {
                 value: Some("not json".into()),
             }],
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,
@@ -675,6 +987,9 @@ mod tests {
             name: "A".into(),
             fields: vec![],
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,

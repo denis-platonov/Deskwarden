@@ -267,6 +267,9 @@ mod tests {
                 })
                 .unwrap_or_default(),
             login: None,
+            card: None,
+            identity: None,
+            notes: None,
             item_type: None,
             folder_id: None,
             favorite: false,
