@@ -21,7 +21,9 @@
 //! `populate_with_at_epoch`).
 
 use crate::app_match::AppMatch;
-use crate::vault_bridge::{with_app_match, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
+use crate::vault_bridge::{
+    with_app_match, with_folder, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem,
+};
 use std::sync::Mutex;
 
 /// Which *era* of the snapshot a caller is talking about.
@@ -1015,6 +1017,94 @@ impl VaultCache {
         }
     }
 
+    /// Files `item` under `folder_id`, or un-files it when that is `None`,
+    /// via [`VaultBridge::move_item_to_folder`], and moves the snapshot's copy
+    /// with it.
+    ///
+    /// **This is the only way a move may be made.** Reaching
+    /// [`Self::bridge`]`.move_item_to_folder` directly would leave the
+    /// snapshot filing the item where it used to be, and the snapshot is what
+    /// the vault window reads when it opens and when it re-reads without a
+    /// forced refresh -- so the move would appear to undo itself.
+    ///
+    /// **Returns `Result<(), VaultError>` -- deliberately NOT an
+    /// [`AppMatchWrite`]-style outcome, and this is the judgement most worth
+    /// challenging in this change.** The UX the user chose is: a failed move
+    /// reverts the dragged row and shows an inline error. That is `Err`, which
+    /// this type gives. The question is whether the SUCCESS case needs
+    /// splitting the way `set_app_match`'s does, and both of that split's
+    /// misses were traced here rather than assumed:
+    ///
+    ///  * **Cache unpopulated.** The write-through is skipped, but the next
+    ///    populate fetches from the server, which HAS the move. Self-curing.
+    ///  * **Populated, id absent.** For a populate's fetch to lack the id, the
+    ///    item must have stopped existing after the server accepted this write
+    ///    (see [`AppMatchWrite::ServerOnly`], which works the window out in
+    ///    full). The item is gone, so there is no row to show in either
+    ///    folder, and no notice about folders would be true.
+    ///
+    /// Neither leaves a UI that claims a move the vault does not have, and
+    /// neither is cured by anything the caller could do differently -- so the
+    /// two cases demand IDENTICAL caller behaviour, which is exactly the test
+    /// [`AppMatchWrite`]'s own doc sets for whether a distinction earns a type
+    /// ("PopulateOutcome's split exists because ITS two cases demand opposite
+    /// caller behaviour"). What `set_app_match` has that this does not is a
+    /// consumer that ARMS from the snapshot moments later, making a silent
+    /// miss a feature that visibly does nothing; folder assignment is not read
+    /// by the match engine at all. So the distinction lives in the two
+    /// `log::warn!` lines below, as that doc prescribes.
+    ///
+    /// If the UI half finds a consumer this trace missed -- an inline "this
+    /// window's copy is behind" notice, say -- the change is an enum and one
+    /// `match` at one call site.
+    pub fn move_item_to_folder(
+        &self,
+        item: &VaultItem,
+        folder_id: Option<&str>,
+    ) -> Result<(), VaultError> {
+        // Bridge call BEFORE `self.lock()`, like every other write here: no
+        // lock may be held across HTTP.
+        self.bridge.move_item_to_folder(item, folder_id)?;
+        // Built from the caller's item rather than reconstructed from the
+        // snapshot's copy, so the snapshot holds exactly what was sent -- the
+        // same rule `set_app_match` follows with `with_app_match`.
+        let moved = with_folder(item, folder_id);
+        let mut snapshot = self.lock();
+        if !snapshot.populated {
+            drop(snapshot);
+            log::warn!(
+                "moved vault item {} to folder {:?} but the cache holds no snapshot to write it \
+                 through to; the vault has it and any populate will bring it in",
+                item.id,
+                folder_id
+            );
+            return Ok(());
+        }
+        match snapshot.items.iter().position(|i| i.id == item.id) {
+            Some(at) => {
+                snapshot.items[at] = moved;
+                // Recorded only when the snapshot actually changed, so the
+                // replay log can never name an id the snapshot cannot supply
+                // -- see `replay_writes`. This is what stops a populate that
+                // was already in flight from filing the item back where it
+                // was.
+                snapshot.note_item_write(&item.id, false);
+            }
+            None => {
+                drop(snapshot);
+                log::warn!(
+                    "moved vault item {} to folder {:?} but the snapshot no longer holds that id \
+                     -- a populate's fetch dropped it, which needs the item to have stopped \
+                     existing AFTER the server accepted this move, so there is no row left to \
+                     file anywhere",
+                    item.id,
+                    folder_id
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.delete_item(id)?;
         let mut snapshot = self.lock();
@@ -1474,6 +1564,155 @@ mod tests {
         assert!(
             unchanged.fields.is_empty(),
             "a failed set_app_match modified the cached item anyway"
+        );
+    }
+
+    /// The two-item vault of `items_body`, with item 1 filed under `f1` so a
+    /// move OUT of a folder has somewhere to move out of.
+    fn items_body_with_one_filed_item() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1,"folderId":"f1"},
+            {"id":"2","name":"Beta","fields":[],"type":1}
+        ]}}"#
+    }
+
+    fn populated_cache_with_a_filed_item(server: &mut mockito::Server) -> VaultCache {
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body_with_one_filed_item())
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        cache
+    }
+
+    #[test]
+    fn moving_an_item_into_a_folder_updates_the_cached_item() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/2").with_status(200).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert_eq!(item.folder_id, None, "the premise: item 2 starts unfiled");
+
+        cache.move_item_to_folder(&item, Some("f1")).unwrap();
+
+        let moved = cache.items().into_iter().find(|i| i.id == "2").unwrap();
+        assert_eq!(
+            moved.folder_id.as_deref(),
+            Some("f1"),
+            "the server took the move but the snapshot did not, so the next read from the \
+             cache still files the item where it was"
+        );
+    }
+
+    #[test]
+    fn unfiling_an_item_clears_the_cached_folder_id() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        // The mock matches ONLY a body that states `folderId` as present and
+        // null, so this also pins that the cache routes through
+        // `VaultBridge::move_item_to_folder` and not through `update_item` --
+        // the latter omits the key and would get a 501 here.
+        let _u = server
+            .mock("PUT", "/object/item/1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "1",
+                "name": "Alpha",
+                "type": 1,
+                "fields": [],
+                "favorite": false,
+                "folderId": null,
+            })))
+            .with_status(200)
+            .create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert_eq!(item.folder_id.as_deref(), Some("f1"), "the premise: item 1 starts in f1");
+
+        cache.move_item_to_folder(&item, None).unwrap();
+
+        let moved = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert_eq!(
+            moved.folder_id, None,
+            "the un-file did not reach the snapshot, so the sidebar's folder counts and the \
+             next window open still show the item under its old folder"
+        );
+    }
+
+    #[test]
+    fn a_failed_move_leaves_the_cache_untouched() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/1").with_status(500).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(
+            cache.move_item_to_folder(&item, None).is_err(),
+            "a rejected move must come back Err -- the vault window reverts the dragged row \
+             on exactly that"
+        );
+
+        let unchanged = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert_eq!(
+            unchanged.folder_id.as_deref(),
+            Some("f1"),
+            "a failed move un-filed the cached item anyway"
+        );
+    }
+
+    #[test]
+    fn a_move_that_lands_while_a_populate_is_fetching_is_not_reverted_by_it() {
+        // The same interleaving as
+        // `a_write_that_lands_while_a_populate_is_fetching_is_not_reverted_by_it`,
+        // for the move: mark, fetch, move, and only then let the populate
+        // write its older fetch back. A move is a write like any other here,
+        // so it must not start a new era and must be replayed over a fetch
+        // that predates it. Without the `note_item_write` in
+        // `move_item_to_folder` the item is silently filed back under `f1`,
+        // and the user's drag undoes itself on the next sync.
+        //
+        // NOTE the ordering this test had to be corrected to. Written first as
+        // "move, then populate", it failed -- correctly: a populate whose
+        // fetch STARTS after the write is entitled to that fetch, and only a
+        // mock could return pre-move data from it. The replay covers the
+        // window between a populate's mark and its lock, and nothing else.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache_with_a_filed_item(&mut server);
+        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+
+        let mark = cache.epoch();
+        let fetched = cache.bridge().list_items().unwrap();
+        assert_eq!(
+            fetched.iter().find(|i| i.id == "1").unwrap().folder_id.as_deref(),
+            Some("f1"),
+            "the fetch must predate the move"
+        );
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache.move_item_to_folder(&item, None).unwrap();
+        assert_eq!(
+            cache.epoch().era(),
+            mark.era(),
+            "a move must not start a new era -- that would supersede every reader holding one"
+        );
+
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+        let after = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert_eq!(
+            after.folder_id, None,
+            "a populate reverted a move that was newer than its own fetch"
         );
     }
 

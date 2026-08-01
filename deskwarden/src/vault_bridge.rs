@@ -340,6 +340,87 @@ pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
     updated
 }
 
+/// Pure helper: returns a copy of `item` filed under `folder_id` (or filed
+/// nowhere, when that is `None`). Everything else -- including anything
+/// unmodelled riding [`VaultItem::other`] -- is cloned untouched, exactly as
+/// [`with_app_match`] does for the field it changes.
+///
+/// This is the *snapshot* half of a move. The *wire* half is
+/// [`folder_move_body`], and the two are deliberately separate: the wire body
+/// cannot be derived from this value alone, because serializing it drops the
+/// `folderId` key entirely when the item is unfiled -- see that function.
+pub fn with_folder(item: &VaultItem, folder_id: Option<&str>) -> VaultItem {
+    let mut moved = item.clone();
+    moved.folder_id = folder_id.map(str::to_string);
+    moved
+}
+
+/// The request body for a move: the item's ordinary write shape, with
+/// `folderId` **stated explicitly** -- present, and `null` when the item is
+/// being un-filed.
+///
+/// The explicit statement is the whole point of this function, and of the move
+/// path existing separately from [`VaultBridge::update_item`] at all.
+/// `.superpowers/sdd/put-semantics-capture.md` records a live experiment
+/// against the user's `bw serve`: **omitted keys are MERGED, not cleared.**
+/// Three keys (`notes`, `login.uris`, `fields`) were each dropped from a PUT
+/// and all three survived it. `VaultItem::folder_id` carries
+/// `skip_serializing_if = "Option::is_none"`, so the obvious implementation --
+/// set `folder_id = None` and hand the item to `update_item` -- produces a body
+/// with **no `folderId` key**, which that server merges: the item stays in its
+/// old folder while the app believes it moved. That is the recorded
+/// `login.uris` empty-vec defect, except reachable.
+///
+/// The key is inserted UNCONDITIONALLY rather than only when un-filing, so
+/// there is no branch that can be got wrong, and so a move to a folder and a
+/// move out of one produce the same shape with different values. An item that
+/// was already unfiled and stays unfiled therefore gains a `"folderId": null`
+/// where an ordinary write would have had no key at all. That is deliberate,
+/// and it is harmless on this backend for a reason already shipped and tested:
+/// [`VaultBridge::create_item`] has always POSTed `"folderId": null` for an
+/// item with no folder (see
+/// `create_item_omits_blank_username_and_password_instead_of_sending_empty_strings`),
+/// so `bw serve` accepting explicit null as "no folder" is not an inference.
+/// The alternative -- skipping the write when the item's local `folder_id`
+/// already equals the target -- was rejected: that local copy comes from the
+/// vault window's own `Vec`, which can be behind the server, so a stale field
+/// would turn a real move into a silent no-op. That is the same class of
+/// failure this function exists to prevent, moved one layer up.
+///
+/// Nothing else about the body is touched, so every OTHER write in this app is
+/// byte-identical to what it sent before this path existed -- pinned by
+/// `an_ordinary_update_of_an_unfiled_item_still_omits_folder_id_entirely`.
+fn folder_move_body(
+    item: &VaultItem,
+    folder_id: Option<&str>,
+) -> Result<serde_json::Value, VaultError> {
+    let moved = with_folder(item, folder_id);
+    let value = serde_json::to_value(&moved).map_err(|e| VaultError::Parse(e.to_string()))?;
+    match value {
+        serde_json::Value::Object(mut map) => {
+            map.insert(
+                "folderId".to_string(),
+                match folder_id {
+                    Some(id) => serde_json::Value::String(id.to_string()),
+                    None => serde_json::Value::Null,
+                },
+            );
+            Ok(serde_json::Value::Object(map))
+        }
+        // Unreachable: `VaultItem` is a struct, so `to_value` yields an
+        // object. It is an error rather than a `expect`/`unwrap` because the
+        // alternative to panicking here is NOT "send it anyway" -- a body
+        // without the key is precisely the silent no-op above, so there is
+        // nothing safe to fall through to. No test covers this arm; it cannot
+        // be reached without changing `VaultItem` into something that is not a
+        // struct.
+        other => Err(VaultError::Parse(format!(
+            "a vault item serialized to {other} rather than a JSON object, so its folderId \
+             could not be stated explicitly"
+        ))),
+    }
+}
+
 pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
     item.fields
         .iter()
@@ -594,6 +675,32 @@ impl VaultBridge {
         self.agent
             .put(&url)
             .send_json(item)
+            .map_err(map_http_err)?;
+        Ok(())
+    }
+
+    /// Files `item` under `folder_id`, or un-files it when that is `None`.
+    ///
+    /// A dedicated path rather than `update_item(&with_folder(..))`, and the
+    /// difference is one key: `VaultItem::folder_id` is skipped when absent,
+    /// so the `update_item` spelling PUTs a body with no `folderId` at all,
+    /// which `bw serve` MERGES -- the item keeps its old folder and the
+    /// un-file silently does nothing. [`folder_move_body`] states the key
+    /// explicitly and carries the full reasoning; the failure it prevents was
+    /// watched, as a 501 from a mockito matcher that rejects the omitting
+    /// body.
+    ///
+    /// Callers should reach this through [`crate::vault_cache::VaultCache`],
+    /// not here, so the snapshot moves with the server.
+    pub fn move_item_to_folder(
+        &self,
+        item: &VaultItem,
+        folder_id: Option<&str>,
+    ) -> Result<(), VaultError> {
+        let url = format!("{}/object/item/{}", self.base_url, item.id);
+        self.agent
+            .put(&url)
+            .send_json(folder_move_body(item, folder_id)?)
             .map_err(map_http_err)?;
         Ok(())
     }
@@ -1674,6 +1781,213 @@ mod tests {
         let bridge = VaultBridge::new(server.url());
         let item: VaultItem = serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
         assert!(bridge.update_item(&item).is_ok());
+    }
+
+    /// The item every move test below starts from, unfiled unless the test
+    /// files it. Parsed from JSON rather than built with a struct literal so
+    /// the expected bodies further down can be read against a real wire shape.
+    fn an_item_in_folder(folder: Option<&str>) -> VaultItem {
+        let raw = match folder {
+            Some(f) => format!(r#"{{"id":"1","name":"A","fields":[],"folderId":"{f}"}}"#),
+            None => r#"{"id":"1","name":"A","fields":[]}"#.to_string(),
+        };
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn moving_an_item_into_a_folder_puts_that_folders_id() {
+        // `Matcher::Json` compares parsed `serde_json::Value`s, so this is an
+        // assertion on the ACTUAL request body and not on the returned value:
+        // a body that differs in any key makes mockito answer 501, which
+        // `unwrap` turns into a failure, and `assert` then reports the miss.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("PUT", "/object/item/1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "1",
+                "name": "A",
+                "fields": [],
+                "favorite": false,
+                "folderId": "f1",
+            })))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.move_item_to_folder(&an_item_in_folder(None), Some("f1")).unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn unfiling_an_item_puts_an_explicit_null_folder_id_rather_than_omitting_the_key() {
+        // THE TRAP THIS PATH EXISTS FOR. `bw serve` MERGES omitted keys (see
+        // `.superpowers/sdd/put-semantics-capture.md`), so a body without a
+        // `folderId` key leaves the item in `f1` while the app believes it was
+        // un-filed. `serde_json::Value` equality distinguishes an absent key
+        // from a null one -- `{"a":1}` != `{"a":1,"folderId":null}` -- so this
+        // matcher rejects the omitting body rather than accepting it as
+        // equivalent. `the_unfile_body_carries_a_folder_id_key_that_is_present_and_null`
+        // asserts the same property structurally, with a message that says
+        // which of the two failed.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("PUT", "/object/item/1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "1",
+                "name": "A",
+                "fields": [],
+                "favorite": false,
+                "folderId": null,
+            })))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.move_item_to_folder(&an_item_in_folder(Some("f1")), None).unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn the_unfile_body_carries_a_folder_id_key_that_is_present_and_null() {
+        // The structural half of the test above, kept separate because the
+        // two failures a reader needs to tell apart -- "the key is absent"
+        // and "the key is present with the wrong value" -- are one 501 from
+        // mockito and two different messages here.
+        let body = folder_move_body(&an_item_in_folder(Some("f1")), None).unwrap();
+        let map = body.as_object().expect("an item body is a JSON object");
+        assert!(
+            map.contains_key("folderId"),
+            "the un-file body has NO folderId key at all: {body}. `bw serve` merges omitted \
+             keys, so this body leaves the item in its old folder and the un-file silently \
+             does nothing"
+        );
+        assert_eq!(
+            map["folderId"],
+            serde_json::Value::Null,
+            "the un-file body states a folderId that is not null: {body}"
+        );
+    }
+
+    #[test]
+    fn an_already_unfiled_item_still_states_folder_id_null_when_moved_to_no_folder() {
+        // DELIBERATE, and the one case where the move body carries a key an
+        // ordinary write of the same item would not have. `folder_move_body`'s
+        // doc records why: the key is inserted unconditionally so there is no
+        // branch to get wrong, `create_item` already POSTs `"folderId": null`
+        // for a folderless item so the value is known-good on this backend,
+        // and the alternative (skip the write when the local `folder_id`
+        // already matches) trusts a possibly-stale local copy to decide
+        // whether a real move happens.
+        //
+        // `get`, NOT `body["folderId"]`: indexing a `serde_json::Value` with a
+        // missing key yields `Value::Null`, so the obvious spelling
+        // `assert_eq!(body["folderId"], Value::Null)` passes just as happily
+        // when the key is ABSENT -- which is the one thing this whole path
+        // exists to rule out. That spelling was written here first and caught
+        // by a bite check; it is recorded so nobody reintroduces it.
+        let body = folder_move_body(&an_item_in_folder(None), None).unwrap();
+        assert_eq!(
+            body.as_object().expect("an item body is a JSON object").get("folderId"),
+            Some(&serde_json::Value::Null),
+            "an already-unfiled item's move body does not state folderId as present-and-null: \
+             {body}"
+        );
+        assert_eq!(
+            serde_json::to_value(&an_item_in_folder(None)).unwrap().get("folderId"),
+            None,
+            "the premise: an ordinary write of this same item omits the key entirely"
+        );
+    }
+
+    #[test]
+    fn a_move_states_the_folder_and_changes_nothing_else_about_a_real_shaped_item() {
+        // The same real item as
+        // `a_real_shaped_item_round_trips_with_every_observed_key`, so a move
+        // is held to that test's standard: every unmodelled key observed on
+        // the user's vault -- attachments, collectionIds, creationDate, key,
+        // object, passwordHistory, reprompt, revisionDate -- must survive the
+        // move byte-identically.
+        let raw = r#"{"id":"1","object":"item","type":1,"name":"Site",
+            "notes":"a note","favorite":false,"fields":[],"folderId":null,
+            "collectionIds":[],"attachments":[],"key":"K","reprompt":0,
+            "passwordHistory":[{"password":"old","lastUsedDate":"2020-01-01T00:00:00.000Z"}],
+            "creationDate":"2020-01-01T00:00:00.000Z",
+            "revisionDate":"2021-01-01T00:00:00.000Z",
+            "login":{"username":"u","password":"p","totp":"seed","uris":[],
+                     "fido2Credentials":[],"passwordRevisionDate":null}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let body = folder_move_body(&item, Some("f9")).unwrap();
+
+        // Exactly TWO differences from the item as it arrived, both named
+        // rather than papered over by a looser assertion: the folder the move
+        // is setting, and `LoginData::uris`'s pre-existing empty-vec
+        // omission. Demanding equality after applying only those two is a
+        // stronger check than skipping the keys would be.
+        let mut expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let root = expected.as_object_mut().unwrap();
+        root.insert("folderId".to_string(), serde_json::json!("f9"));
+        assert_eq!(
+            root["login"].as_object_mut().unwrap().remove("uris"),
+            Some(serde_json::json!([]))
+        );
+        assert_eq!(expected, body, "a move altered something other than the item's folder");
+    }
+
+    #[test]
+    fn an_ordinary_update_of_an_unfiled_item_still_omits_folder_id_entirely() {
+        // THE GUARD ON THE CHOICE, not a test of the move path. The move is a
+        // dedicated path precisely so no other write's bytes change; removing
+        // `skip_serializing_if` from `VaultItem::folder_id` instead would put
+        // `"folderId": null` on EVERY item PUT this app makes. This test fails
+        // if anyone does that, and so does
+        // `a_real_shaped_item_round_trips_with_every_observed_key`.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("PUT", "/object/item/1")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "id": "1",
+                "name": "A",
+                "fields": [],
+                "favorite": false,
+            })))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.update_item(&an_item_in_folder(None)).unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn a_failed_move_is_reported_rather_than_swallowed() {
+        // The vault window reverts the dragged row on `Err`, so a move that
+        // the server rejected must not come back `Ok`.
+        let mut server = mockito::Server::new();
+        let _m = server.mock("PUT", "/object/item/1").with_status(500).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(bridge.move_item_to_folder(&an_item_in_folder(Some("f1")), None).is_err());
+    }
+
+    #[test]
+    fn with_folder_changes_the_folder_and_leaves_the_rest_of_the_item_alone() {
+        let raw = r#"{"id":"1","name":"A","type":1,"favorite":true,"fields":[],
+            "folderId":"f1","reprompt":0,"login":{"username":"u"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+
+        let moved = with_folder(&item, Some("f2"));
+        assert_eq!(moved.folder_id.as_deref(), Some("f2"));
+        assert_eq!(with_folder(&item, None).folder_id, None);
+
+        // Everything but `folderId` is untouched, including the unmodelled
+        // `reprompt` riding `other`.
+        let mut before = serde_json::to_value(&item).unwrap();
+        let mut after = serde_json::to_value(&moved).unwrap();
+        before.as_object_mut().unwrap().remove("folderId");
+        after.as_object_mut().unwrap().remove("folderId");
+        assert_eq!(before, after);
     }
 
     #[test]
