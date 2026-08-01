@@ -326,12 +326,29 @@ fn item_row(
     icon: Option<&egui::TextureHandle>,
 ) -> bool {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
-    // The design's "app" chip. It is not decorative and it is not invented:
-    // `deskwarden:app-match` is the custom field that makes an item fillable
-    // into a native window, and `extract_app_match` answers it from the item
-    // already in hand -- no extra lookup, and only for the handful of rows
-    // `show_rows` actually hands us.
-    let badged = crate::vault_bridge::extract_app_match(item).is_some();
+    // Design 2b's two trailing chips. Neither is decorative and neither is
+    // invented: "app" is `deskwarden:app-match`, the custom field that makes
+    // an item fillable into a native window, and "2FA" is the item's own TOTP
+    // seed. Both are answered from the item already in hand -- no extra
+    // lookup, and only for the handful of rows `show_rows` hands us.
+    //
+    // BOTH MAY APPEAR AT ONCE. The design never draws two chips on a row and
+    // gives no precedence rule, which is why the "2FA" chip was left out
+    // originally; the user has since decided they may sit side by side, "app"
+    // first. A fixed-size array rather than a `Vec` because this runs per
+    // visible row, per frame.
+    //
+    // Ordered for a RIGHT-TO-LEFT layout below, so the array is walked in
+    // reverse: the last chip pushed is the leftmost drawn, and "app first"
+    // means app is the leftmost of the pair in reading order.
+    let chips: [Option<&str>; 2] = [
+        crate::vault_bridge::extract_app_match(item).is_some().then_some("app"),
+        item.login
+            .as_ref()
+            .and_then(|l| l.totp.as_ref())
+            .is_some()
+            .then_some("2FA"),
+    ];
     let frame = egui::Frame::new()
         // Design 2b: EVERY row is `background: #ffffff`, selected or not.
         // Filling unselected rows with the pane's own `CANVAS` is what made
@@ -393,8 +410,27 @@ fn item_row(
                     column,
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                    if badged {
-                        row_badge(ui, "app", selected);
+                    // Reversed: this ui runs right-to-left, so the FIRST chip
+                    // drawn lands furthest right. Walking the array backwards
+                    // puts "app" to the left of "2FA".
+                    //
+                    // The chips are allocated before the title column, so on a
+                    // pane too narrow for everything they keep their full size
+                    // and the title/subtitle absorb the squeeze by truncating
+                    // (both are `Label::truncate`). That is deliberate: a chip
+                    // that wrapped, or a title that did, would make one row
+                    // taller than `ROW_TILE_HEIGHT` and slide the virtualized
+                    // list out of register with the pitch `show_rows` scrolls
+                    // by. `two_chips_on_a_narrow_pane_stay_inside_the_tile_
+                    // and_squeeze_the_title_instead` pins that at 170pt, a
+                    // pane less than half the real one: both chips still sit
+                    // inside the tile and the row is still exactly one
+                    // `ROW_TILE_HEIGHT` tall. Narrower than the chips plus the
+                    // avatar the chips would start to overlap it, but this
+                    // pane is `Panel::exact_size(LIST_WIDTH).resizable(false)`
+                    // in `vault_window::mod` and cannot get there.
+                    for chip in chips.iter().rev().flatten() {
+                        row_badge(ui, chip, selected);
                     }
                     // Sized to its OWN content height, not to the available
                     // height: `ui.vertical` would take the full 32 and
@@ -676,7 +712,16 @@ mod row_tile_tests {
     /// then settled), which is how the scrolled test drives the list to its
     /// end without reaching into `ScrollArea`'s private state.
     fn paint_with(items: &[VaultItem], selected: Option<&str>, wheel_frames: usize) -> Painted {
-        paint_core(items, selected, wheel_frames, |_| IconCache::default())
+        paint_core(items, selected, wheel_frames, PANE_WIDTH, |_| IconCache::default())
+    }
+
+    /// One real frame at an arbitrary pane width. The real pane is fixed at
+    /// `LIST_WIDTH` and not resizable, so this exists to squeeze the row well
+    /// past anything it can actually meet -- two chips plus an avatar plus a
+    /// title is the tightest it ever gets, and what it does when it runs out
+    /// of room should be a decision, not an accident.
+    fn paint_at_width(items: &[VaultItem], selected: Option<&str>, width: f32) -> Painted {
+        paint_core(items, selected, 0, width, |_| IconCache::default())
     }
 
     /// One real frame with a favicon TEXTURE loaded for every id in `ids` --
@@ -684,7 +729,7 @@ mod row_tile_tests {
     /// "the favicon fills its tile" report is about.
     fn paint_with_icons(items: &[VaultItem], selected: Option<&str>, ids: &[&str]) -> Painted {
         let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        paint_core(items, selected, 0, |ctx| {
+        paint_core(items, selected, 0, PANE_WIDTH, |ctx| {
             let mut icons = IconCache::default();
             for id in &ids {
                 icons.textures.insert(
@@ -704,12 +749,13 @@ mod row_tile_tests {
         items: &[VaultItem],
         selected: Option<&str>,
         wheel_frames: usize,
+        pane_width: f32,
         make_icons: impl FnOnce(&egui::Context) -> IconCache,
     ) -> Painted {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            egui::vec2(pane_width, PANE_HEIGHT),
         );
         let input = || egui::RawInput {
             screen_rect: Some(screen),
@@ -788,13 +834,42 @@ mod row_tile_tests {
             .collect()
     }
 
+    /// A chip's own filled box, found from the label it contains -- the small
+    /// rect wrapping the text, never the row tile.
+    fn chip_rect(p: &Painted, label: &str) -> egui::Rect {
+        let text = p
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == label)
+            .unwrap_or_else(|| panic!("the {label:?} chip was never painted; painted: {:?}", p.texts))
+            .1;
+        p.rects
+            .iter()
+            .find(|r| r.rect.contains_rect(text) && r.rect.width() < 60.0)
+            .unwrap_or_else(|| panic!("the {label:?} chip's own filled box was never painted"))
+            .rect
+    }
+
     fn one_tile(p: &Painted) -> RectShape {
-        let tiles = row_tiles(p);
+        one_tile_of_width(p, TILE_WIDTH)
+    }
+
+    fn one_tile_of_width(p: &Painted, width: f32) -> RectShape {
+        let tiles: Vec<RectShape> = p
+            .rects
+            .iter()
+            .filter(|r| {
+                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
+                    && r.blur_width == 0.0
+                    && (r.rect.width() - width).abs() < 0.5
+                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
+            })
+            .cloned()
+            .collect();
         assert_eq!(
             tiles.len(),
             1,
-            "expected exactly one {TILE_WIDTH}x{ROW_TILE_HEIGHT} row tile; every painted rect \
-             was: {:?}",
+            "expected exactly one {width}x{ROW_TILE_HEIGHT} row tile; every painted rect was: {:?}",
             p.rects.iter().map(|r| (r.rect, r.fill)).collect::<Vec<_>>()
         );
         tiles[0].clone()
@@ -1233,6 +1308,125 @@ mod row_tile_tests {
             "an item with no app match must NOT be badged -- a badge that means nothing is worse \
              than no badge; painted: {:?}",
             without.texts
+        );
+    }
+
+    /// A login carrying a TOTP seed -- design 2b's "2FA" chip.
+    fn with_totp(mut item: VaultItem) -> VaultItem {
+        item.login
+            .as_mut()
+            .expect("with_totp is only meaningful on a login")
+            .totp = Some(zeroize::Zeroizing::new(
+            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".to_string(),
+        ));
+        item
+    }
+
+    #[test]
+    fn an_item_with_both_an_app_match_and_a_totp_paints_both_chips_side_by_side() {
+        // The user's decision, recorded: design 2b shows an "app" chip and a
+        // "2FA" chip but never two on one row, and gives no precedence rule.
+        // Both may now appear, "app" first.
+        let items = [with_totp(with_app_match(login("Ledgerline", "a@b.c")))];
+        let p = paint(&items, None);
+        let app = chip_rect(&p, "app");
+        let totp = chip_rect(&p, "2FA");
+        assert!(
+            app.right() <= totp.left() + 0.01,
+            "both chips paint, but \"app\" at {app:?} is not before \"2FA\" at {totp:?}"
+        );
+        // Side by side on ONE line, not stacked: a row is a fixed
+        // `ROW_TILE_HEIGHT` because `show_rows` virtualizes against it, so a
+        // second chip wrapping onto its own line would overflow the tile.
+        assert!(
+            (app.center().y - totp.center().y).abs() < 0.51,
+            "the chips are on different lines: \"app\" at {app:?}, \"2FA\" at {totp:?}"
+        );
+        let tile = one_tile(&p);
+        for (name, chip) in [("app", app), ("2FA", totp)] {
+            assert!(
+                tile.rect.contains_rect(chip),
+                "the {name:?} chip at {chip:?} is outside its row tile {:?}",
+                tile.rect
+            );
+        }
+    }
+
+    #[test]
+    fn each_chip_appears_exactly_when_its_own_condition_holds() {
+        // Four states, all four asserted, so neither chip can be the other's
+        // shadow. Every negative here has its positive control in the same
+        // table -- an "absent" assertion alone would also pass against a row
+        // that painted nothing at all.
+        let plain = login("Vantage VPN", "a@b.c");
+        for (label, item, want_app, want_totp) in [
+            ("neither", plain.clone(), false, false),
+            ("app only", with_app_match(plain.clone()), true, false),
+            ("totp only", with_totp(plain.clone()), false, true),
+            (
+                "both",
+                with_totp(with_app_match(plain.clone())),
+                true,
+                true,
+            ),
+        ] {
+            let p = paint(&[item], None);
+            let has = |needle: &str| p.texts.iter().any(|(t, _, _)| t == needle);
+            assert_eq!(
+                has("app"),
+                want_app,
+                "{label}: expected the \"app\" chip to be present={want_app}; painted: {:?}",
+                p.texts
+            );
+            assert_eq!(
+                has("2FA"),
+                want_totp,
+                "{label}: expected the \"2FA\" chip to be present={want_totp}; painted: {:?}",
+                p.texts
+            );
+        }
+    }
+
+    #[test]
+    fn the_2fa_chip_takes_the_same_two_colour_treatments_the_app_chip_does() {
+        // Design 2b draws the "2FA" chip with the identical metrics and
+        // colours as the "app" one -- `font-size: 10px; border-radius: 5px;
+        // padding: 2px 6px`, `#605d5d on #f3f2f2` unselected.
+        let items = [with_totp(login("Git Host", "anovak"))];
+        let unselected = paint(&items, None);
+        assert_eq!(text_color(&unselected, "2FA"), theme::TEXT_MUTED);
+        assert_eq!(text_font(&unselected, "2FA").size, 10.0);
+        let selected = paint(&items, Some("Git Host"));
+        assert_eq!(text_color(&selected, "2FA"), theme::BLUE_DEEP);
+    }
+
+    #[test]
+    fn two_chips_on_a_narrow_pane_stay_inside_the_tile_and_squeeze_the_title_instead() {
+        // What happens when the row is too tight. The chips are allocated
+        // first (right-to-left), so they keep their full size and the title
+        // column absorbs the squeeze by truncating -- which is the behaviour
+        // that keeps every row exactly `ROW_TILE_HEIGHT` tall and the
+        // virtualized list in register. Asserted at a pane less than half the
+        // real one, where the two chips plus the avatar leave almost nothing.
+        let items = [with_totp(with_app_match(login(
+            "A Very Long Item Name Indeed",
+            "someone@example.com",
+        )))];
+        let p = paint_at_width(&items, None, 170.0);
+        let tile = one_tile_of_width(&p, 170.0 - 2.0 * LIST_PADDING);
+        for name in ["app", "2FA"] {
+            let chip = chip_rect(&p, name);
+            assert!(
+                tile.rect.contains_rect(chip),
+                "on a 170pt pane the {name:?} chip at {chip:?} has escaped its row tile {:?}",
+                tile.rect
+            );
+        }
+        assert!(
+            (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
+            "the row grew to {} tall on a narrow pane, which would slide the virtualized list \
+             out of register with the pitch `show_rows` scrolls by",
+            tile.rect.height()
         );
     }
 
