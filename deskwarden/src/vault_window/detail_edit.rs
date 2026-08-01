@@ -181,6 +181,7 @@ mod tests {
             }),
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: Some(1),
             folder_id: Some("f1".into()),

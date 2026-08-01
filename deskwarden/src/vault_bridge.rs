@@ -202,6 +202,42 @@ pub struct IdentityData {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+/// An SSH key (`type: 5`).
+///
+/// Field names are transcribed from a live capture (recorded in
+/// `.superpowers/sdd/item-shapes-capture.md`, "SSH key (type 5) -- VERIFIED
+/// 2026-08-01"), not from memory. This type was deliberately left unmodelled
+/// until that capture existed: `GET /object/template/item.sshKey` returns 400
+/// on this CLI (2026.7.0) and the user's vault held no type-5 item, so the
+/// only way to get the shape was to create one. `POST /object/item` with
+/// `{"type": 5, ...}` was accepted, so this CLI does support the type despite
+/// having no template for it.
+///
+/// Its own `#[serde(flatten)] other` for the same reason [`UriEntry`] and
+/// [`CardData`] have one: [`VaultItem`]'s catch-all cannot reach inside a
+/// nested object, so without this any key Bitwarden adds here would be
+/// silently dropped on the next full-state PUT.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SshKeyData {
+    /// `Zeroizing`: this is the secret the whole item exists to hold, so it
+    /// gets exactly the treatment [`CardData::number`], [`CardData::code`],
+    /// [`LoginData::password`], `LoginData::totp` and [`VaultItem::notes`]
+    /// have.
+    #[serde(rename = "privateKey", default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<Zeroizing<String>>,
+    /// Plain `String`: a public key is public by construction. Wrapping it
+    /// would widen the zeroize guarantee for nothing (see `deskwarden`'s
+    /// README on what that guarantee does and does not cover).
+    #[serde(rename = "publicKey", default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    /// Plain `String`, as [`Self::public_key`]: a fingerprint is a digest of
+    /// the public half and is designed to be shown.
+    #[serde(rename = "keyFingerprint", default, skip_serializing_if = "Option::is_none")]
+    pub key_fingerprint: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultItem {
     pub id: String,
@@ -221,6 +257,13 @@ pub struct VaultItem {
     /// The `identity` object on a `type: 4` item. See [`Self::card`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<IdentityData>,
+    /// The `sshKey` object on a `type: 5` item. See [`Self::card`].
+    ///
+    /// This was the last unmodelled type, and it was unmodelled on purpose
+    /// rather than by omission: its wire shape could not be verified until a
+    /// throwaway key was created in the user's vault. See [`SshKeyData`].
+    #[serde(rename = "sshKey", default, skip_serializing_if = "Option::is_none")]
+    pub ssh_key: Option<SshKeyData>,
     /// Item-level free text. A secure note's entire body lives here, which is
     /// why that type needs no struct of its own -- its `secureNote` object
     /// carries only a `{"type": 0}` discriminator, which rides
@@ -229,13 +272,6 @@ pub struct VaultItem {
     ///
     /// `Zeroizing` because a secure note *is* the secret, exactly as
     /// [`LoginData::password`] is.
-    ///
-    /// There is deliberately **no `ssh_key` field yet**: `type: 5`'s wire
-    /// shape is the one this repo could not verify (the CLI's
-    /// `item.sshKey` template endpoint 400s and no real sample exists), and
-    /// modelling it from memory is how a modelled field and its `other` copy
-    /// start disagreeing. A type-5 item's `sshKey` object rides
-    /// [`Self::other`] intact in the meantime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<Zeroizing<String>>,
     /// Raw `bw` item type: 1=Login, 2=SecureNote, 3=Card, 4=Identity,
@@ -774,6 +810,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,
@@ -1043,22 +1080,119 @@ mod tests {
     }
 
     #[test]
-    fn an_ssh_key_object_rides_the_catch_all_untouched() {
-        // `type: 5` is the one shape the capture could not verify, so
-        // `SshKeyData` deliberately does not exist and the whole `sshKey`
-        // object rides `VaultItem::other`. That deferral is only safe if the
-        // object survives a full-state PUT byte-identically -- which follows
-        // by isomorphism from the secure note's unmodelled `secureNote`, but
-        // is worth stating outright since it is the guarantee the deferral
-        // rests on. Field names here are illustrative and NOT a claim about
-        // the real shape; the test asserts only that whatever arrives is
-        // echoed back unchanged.
+    fn an_ssh_key_round_trips_including_unmodelled_keys() {
+        // Was `an_ssh_key_object_rides_the_catch_all_untouched`, back when
+        // `type: 5` was the one shape the capture could not verify and the
+        // whole `sshKey` object rode `VaultItem::other`. The shape is now
+        // captured (see `.superpowers/sdd/item-shapes-capture.md`) and
+        // modelled, so the object travels through `SshKeyData` -- and the
+        // guarantee the assertions state is unchanged and is now the harder
+        // one: a modelled struct has to reassemble byte-identically, which
+        // the catch-all got for free. `x` is the key nothing models, and it
+        // is what proves `SshKeyData` carries its own flatten.
         let raw = r#"{"id":"1","name":"Deploy key","type":5,"favorite":false,"fields":[],
-            "sshKey":{"privateKey":"PRIV","publicKey":"PUB","keyFingerprint":"FP"}}"#;
+            "sshKey":{"privateKey":"PRIV","publicKey":"PUB","keyFingerprint":"FP","x":1}}"#;
         let item: VaultItem = serde_json::from_str(raw).unwrap();
         assert_eq!(ItemKind::of(&item), ItemKind::SshKey);
+        let ssh = item.ssh_key.as_ref().unwrap();
+        assert_eq!(ssh.private_key.as_deref().map(|k| k.as_str()), Some("PRIV"));
+        assert_eq!(ssh.public_key.as_deref(), Some("PUB"));
+        assert_eq!(ssh.key_fingerprint.as_deref(), Some("FP"));
         let before: serde_json::Value = serde_json::from_str(raw).unwrap();
         assert_eq!(before, serde_json::to_value(&item).unwrap(), "an sshKey object was altered");
+    }
+
+    #[test]
+    fn an_ssh_key_round_trips_with_absent_fields_still_absent() {
+        // The property that has broken twice in this file already: a key the
+        // server never sent must not appear on write. A `"publicKey": null`
+        // arriving at `bw serve`'s full-state PUT says the public key is
+        // gone.
+        let raw = r#"{"id":"1","name":"Deploy key","type":5,"favorite":false,"fields":[],
+            "sshKey":{"privateKey":"PRIV"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let ssh = item.ssh_key.as_ref().unwrap();
+        assert!(ssh.public_key.is_none());
+        assert!(ssh.key_fingerprint.is_none());
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap(), "an ssh key round trip changed the item's shape");
+    }
+
+    #[test]
+    fn an_ssh_key_round_trips_with_empty_strings_still_empty() {
+        // Empty is not absent. Collapsing the two is the mirror of the bug
+        // above and just as silent.
+        let raw = r#"{"id":"1","name":"Deploy key","type":5,"favorite":false,"fields":[],
+            "sshKey":{"privateKey":"","publicKey":"","keyFingerprint":""}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn unknown_keys_inside_an_ssh_key_survive_a_round_trip() {
+        // `VaultItem`'s own flatten cannot reach inside a nested object --
+        // this is why `UriEntry` exists, and this repo has shipped that bug
+        // three times.
+        let raw = r#"{"id":"1","name":"Deploy key","type":5,"favorite":false,"fields":[],
+            "sshKey":{"privateKey":"PRIV","somethingNew":{"deep":true}}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap(), "an unmodelled key inside `sshKey` was dropped");
+    }
+
+    /// **The only test in this file that catches a misspelled `rename`.**
+    ///
+    /// A round-trip test structurally cannot: the catch-all absorbs the
+    /// difference, so a field renamed `"publickey"` deserializes to `None`,
+    /// the real `publicKey` rides `other`, and the item is written back
+    /// looking correct while the pane shows nothing. This was demonstrated
+    /// live earlier in this project -- misspelling `cardholderName` failed
+    /// exactly one test out of 330, the identity/card equivalent of this one.
+    ///
+    /// The fixture is built from the CAPTURE FILE
+    /// (`.superpowers/sdd/item-shapes-capture.md`, "SSH key (type 5) --
+    /// VERIFIED 2026-08-01"), not from `SshKeyData`, so it is an independent
+    /// statement of the wire shape rather than a restatement of the struct.
+    #[test]
+    fn every_key_of_the_captured_ssh_shape_is_modelled() {
+        // The three keys the create response returned, in the capture's own
+        // alphabetical order.
+        let raw = r#"{"id":"1","name":"SSH test key (deskwarden)","type":5,"favorite":false,"fields":[],
+            "sshKey":{"keyFingerprint":"SHA256:AAAA","privateKey":"-----BEGIN OPENSSH PRIVATE KEY-----",
+                "publicKey":"ssh-ed25519 AAAAC3Nz deskwarden-ssh-test"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let ssh = item.ssh_key.as_ref().unwrap();
+        assert!(
+            ssh.other.is_empty(),
+            "a captured key fell through to the catch-all, so it is misspelled or unmodelled \
+             in SshKeyData and the pane will never show it: {:?}",
+            ssh.other
+        );
+        assert_eq!(ssh.key_fingerprint.as_deref(), Some("SHA256:AAAA"));
+        assert_eq!(
+            ssh.private_key.as_deref().map(|k| k.as_str()),
+            Some("-----BEGIN OPENSSH PRIVATE KEY-----")
+        );
+        assert_eq!(
+            ssh.public_key.as_deref(),
+            Some("ssh-ed25519 AAAAC3Nz deskwarden-ssh-test")
+        );
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(before, serde_json::to_value(&item).unwrap());
+    }
+
+    #[test]
+    fn an_item_with_no_ssh_key_does_not_gain_a_null_ssh_key_key() {
+        // `skip_serializing_if` on the field itself: every login in the
+        // user's 1656-item vault goes through this path, and a
+        // `"sshKey": null` on each of them is what the two shipped
+        // instances of this bug looked like.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,"fields":[]}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert!(item.ssh_key.is_none());
+        let after = serde_json::to_value(&item).unwrap();
+        assert!(after.get("sshKey").is_none(), "an absent sshKey key became null");
     }
 
     #[test]
@@ -1132,6 +1266,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,
@@ -1152,6 +1287,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,
@@ -1174,6 +1310,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,
@@ -1467,6 +1604,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,
