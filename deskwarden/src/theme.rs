@@ -30,7 +30,9 @@ pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x7d, 0x79, 0x79);
 /// Ghost text (counts, placeholders).
 pub const TEXT_GHOST: Color32 = Color32::from_rgb(0x9b, 0x97, 0x97);
 
-/// Window/canvas background (warm grey).
+/// Window/canvas background (warm grey). The design also uses this exact grey
+/// as the divider *between rows inside a card* (2b's detail rows), rather than
+/// introducing a sixth grey for it -- see [`row_rule`].
 pub const CANVAS: Color32 = Color32::from_rgb(0xf3, 0xf2, 0xf2);
 /// App-window body background — one step warmer than `CANVAS`. Every window
 /// mock in the design (3h login, 3e preferences, 2b/3f vault) fills its body
@@ -81,9 +83,11 @@ pub const SEMIBOLD: &str = "Archivo-SemiBold";
 /// Named font family for Archivo Bold (the design's 700 weight: headings,
 /// section labels). Use via [`bold`].
 pub const BOLD: &str = "Archivo-Bold";
-/// Named font family for Archivo ExtraBold — the design's 800 weight, used
+/// Named font family for Archivo ExtraBold — the design's 800 weight. Used
 /// for the wordmark ("Deskwarden" at 25px in the login window, 14px in the
-/// vault titlebar) and nothing else. Use via [`extrabold`].
+/// vault titlebar) and for the detail pane's item title (2b: `font-size:
+/// 22px; font-weight: 800`), which is the design's only other 800.
+/// Use via [`extrabold`].
 ///
 /// Bundled as its own face because Archivo's 800 is genuinely a different
 /// cut, not a synthesised one: it is both heavier *and* slightly wider per
@@ -224,14 +228,71 @@ pub fn letterspaced(
     tracking: f32,
     color: Color32,
 ) -> egui::text::LayoutJob {
+    letterspaced_in(
+        text,
+        FontId::new(size, FontFamily::Name(family.into())),
+        tracking,
+        color,
+        None,
+    )
+}
+
+/// [`letterspaced`] for the monospace face, which has no *named* family and so
+/// cannot be asked for through that function's `&str`.
+///
+/// The design tracks two monospace runs in the detail pane and nowhere else: a
+/// masked value's bullets (`letter-spacing: 0.08em` at 15px) and a live
+/// one-time code (`0.12em` at 17px). Both read as one dense blob without it.
+pub fn letterspaced_mono(
+    text: &str,
+    size: f32,
+    tracking: f32,
+    color: Color32,
+) -> egui::text::LayoutJob {
+    letterspaced_in(
+        text,
+        FontId::new(size, FontFamily::Monospace),
+        tracking,
+        color,
+        None,
+    )
+}
+
+/// The detail pane's item title (design 2b: `font-size: 22px; font-weight:
+/// 800; letter-spacing: -0.02em; line-height: 1.1`).
+///
+/// The tight line height is not decoration: the title sits in a flex row that
+/// is `align-items: center` against a 44px avatar, so a title box taller than
+/// 44px pushes the avatar off the strip's own 20px top padding and the strip
+/// grows with it. egui lays 22px text out at roughly 1.3 line heights by
+/// default, which is exactly that case.
+pub fn pane_title(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
+    letterspaced_in(
+        text,
+        FontId::new(size, FontFamily::Name(EXTRABOLD.into())),
+        // `letter-spacing: -0.02em`, in points.
+        size * -0.02,
+        color,
+        Some(size * 1.1),
+    )
+}
+
+fn letterspaced_in(
+    text: &str,
+    font_id: FontId,
+    tracking: f32,
+    color: Color32,
+    line_height: Option<f32>,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.append(
         text,
         0.0,
         egui::TextFormat {
-            font_id: FontId::new(size, FontFamily::Name(family.into())),
+            font_id,
             color,
             extra_letter_spacing: tracking,
+            line_height,
             ..Default::default()
         },
     );
@@ -909,6 +970,115 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     )
 }
 
+/// Height of the detail pane's header-strip controls (design 2b: `height:
+/// 34px` on both "Fill in app" and "Edit").
+///
+/// Not [`BUTTON_HEIGHT`], and deliberately not [`SEARCH_FIELD_HEIGHT`] either,
+/// which happens to be the same 34 for an unrelated reason (2b's `+ New` has
+/// to line up with the search box beside it). Two things the same size today
+/// for different reasons are two constants; folding them together is how one
+/// silently follows the other when the design moves.
+const HEADER_BUTTON_HEIGHT: f32 = 34.0;
+
+/// The detail pane's outlined header button (design 2b's "Edit": `height:
+/// 34px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px;
+/// font-size: 13px; font-weight: 600`, with no fill of its own).
+///
+/// A near-miss for [`secondary_button`], and kept separate for the reason
+/// [`primary_button_matching_field`] is: that one is 32px tall with a 7px
+/// radius, which is right everywhere it is already used and wrong beside a
+/// 34px primary.
+pub fn header_button(ui: &mut Ui, label: &str) -> Response {
+    header_button_tinted(ui, label, INK, BORDER_STRONG)
+}
+
+/// [`header_button`] in a colour of its own -- the detail pane's Delete turns
+/// [`ERROR`] once a first click has armed it.
+pub fn header_button_tinted(ui: &mut Ui, label: &str, fg: Color32, border: Color32) -> Response {
+    ui.scope(|ui| {
+        // `padding: 0 14px`; the vertical half is whatever `min_size` needs.
+        ui.spacing_mut().button_padding = Vec2::new(14.0, 6.0);
+        ui.add(
+            egui::Button::new(semibold(label, 13.0).color(fg))
+                .fill(CARD)
+                .stroke(Stroke::new(1.0, border))
+                .corner_radius(CornerRadius::same(8))
+                .min_size(Vec2::new(0.0, HEADER_BUTTON_HEIGHT)),
+        )
+    })
+    .inner
+}
+
+/// The detail pane's filled header button (design 2b's "Fill in app":
+/// `height: 34px; padding: 0 14px; border-radius: 8px; background: #1b3fa0;
+/// color: #ffffff; font-size: 13px; font-weight: 600`) with its shortcut hint
+/// nested inside the same pill at `font-size: 10px; opacity: 0.85`.
+///
+/// [`primary_button`] renders a hint by *appending it to the label*, so it
+/// comes out at the label's own 13px in the label's own weight -- the design
+/// draws a distinctly smaller, softer monospace run. Same two-galley
+/// construction as [`toolbar_button_with_shortcut`], which had the identical
+/// requirement one pane over.
+pub fn header_primary_button(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
+    const PAD_X: f32 = 14.0;
+    const GAP: f32 = 8.0;
+    // `opacity: 0.85`, over the blue fill.
+    let hint_color = Color32::from_white_alpha(217);
+
+    let label_galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
+        Color32::WHITE,
+    );
+    let hint_galley = ui.painter().layout_no_wrap(
+        shortcut.to_string(),
+        FontId::new(10.0, FontFamily::Monospace),
+        hint_color,
+    );
+
+    let content_width = label_galley.size().x + GAP + hint_galley.size().x;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(content_width + PAD_X * 2.0, HEADER_BUTTON_HEIGHT),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect_filled(rect, CornerRadius::same(8), BLUE);
+
+    let label_pos = Pos2::new(
+        rect.min.x + PAD_X,
+        rect.center().y - label_galley.size().y / 2.0,
+    );
+    let hint_pos = Pos2::new(
+        label_pos.x + label_galley.size().x + GAP,
+        rect.center().y - hint_galley.size().y / 2.0,
+    );
+    ui.painter().galley(label_pos, label_galley, Color32::WHITE);
+    ui.painter().galley(hint_pos, hint_galley, hint_color);
+    response
+}
+
+/// The small outlined control at the right-hand end of a detail-pane row
+/// (design 2b's "Copy" / "Reveal" / "Open": `height: 28px; padding: 0 10px;
+/// border: 1px solid #d7d3d3; border-radius: 7px; font-size: 12px`).
+///
+/// Regular weight, not [`semibold`]: the design gives these no `font-weight`,
+/// unlike the 600 it sets explicitly on the header pair.
+pub fn row_button(ui: &mut Ui, label: &str) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = Vec2::new(10.0, 4.0);
+        ui.add(
+            egui::Button::new(RichText::new(label).size(12.0).color(INK))
+                .fill(CARD)
+                .stroke(Stroke::new(1.0, BORDER_STRONG))
+                .corner_radius(CornerRadius::same(7))
+                .min_size(Vec2::new(0.0, 28.0)),
+        )
+    })
+    .inner
+}
+
 /// The vault window titlebar's Lock control (design 2b: `height: 28px;
 /// padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 8px;`), with
 /// its keyboard shortcut nested *inside* the same bordered pill -- "Lock"
@@ -1471,8 +1641,24 @@ pub fn toggle_pill(ui: &mut Ui, on: bool) {
 /// A full-width hairline separator in the card hairline color (egui's
 /// default separator is darker than the design's).
 pub fn hairline(ui: &mut Ui) {
+    rule(ui, HAIRLINE);
+}
+
+/// The *lighter* separator the design draws **between rows inside a card**
+/// (2b's detail rows: `border-bottom: 1px solid #f3f2f2`), as against
+/// [`hairline`]'s `#eae7e7`, which is the card's own border and the rule under
+/// its heading. Two weights of divider, one nested inside the other.
+///
+/// `#f3f2f2` is [`CANVAS`] -- the design reuses its warm grey here rather than
+/// introducing a sixth grey, and this reuses the constant rather than
+/// declaring a same-valued `ROW_RULE` beside it.
+pub fn row_rule(ui: &mut Ui) {
+    rule(ui, CANVAS);
+}
+
+fn rule(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, HAIRLINE);
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, color);
 }
 
 #[cfg(test)]

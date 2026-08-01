@@ -25,6 +25,27 @@ use crate::theme;
 use crate::vault_bridge::{CardData, IdentityData, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
+// ---------------------------------------------------------------------------
+// Design 2b's detail-pane metrics, read off the block marked `2b` in
+// `docs/design/Deskwarden.dc.html`. NOT `3f`, which is the macOS variant of
+// the same pane and differs in its shortcut glyphs.
+// ---------------------------------------------------------------------------
+
+/// The white header strip's `padding: 20px 24px`.
+const HEADER_PAD_X: i8 = 24;
+const HEADER_PAD_Y: i8 = 20;
+/// `gap: 14px` between the strip's avatar, title column and buttons.
+const HEADER_GAP: f32 = 14.0;
+/// The strip's `width: 44px; height: 44px` avatar tile.
+const HEADER_AVATAR: f32 = 44.0;
+/// `font-size: 22px` on the item title.
+const TITLE_SIZE: f32 = 22.0;
+/// `gap: 3px` between the title and its subtitle.
+const TITLE_GAP: f32 = 3.0;
+/// The body below the strip: `padding: 18px 24px`.
+const BODY_PAD_X: i8 = 24;
+const BODY_PAD_Y: i8 = 18;
+
 /// The One-time code row's single source of truth. Replaces a bare
 /// `Option<String>` (`Some(code)` / `None`), which could not tell apart
 /// three genuinely different situations: no TOTP secret configured on this
@@ -620,61 +641,113 @@ pub fn draw_detail_read(
         .map(|p| p.as_str())
         .unwrap_or("");
 
-    ui.horizontal(|ui| {
-        match icon {
-            Some(tex) => {
-                // Rounded to match `theme::avatar`'s initials-tile treatment
-                // (same `size * 0.25` formula) -- see `item_list.rs`'s
-                // matching fix for why an unrounded favicon in an identical
-                // box reads as visually heavier than the monogram fallback.
-                const SIZE: f32 = 44.0;
-                ui.add(
-                    egui::Image::new((tex.id(), tex.size_vec2()))
-                        .fit_to_exact_size(egui::Vec2::splat(SIZE))
-                        .corner_radius(CornerRadius::same((SIZE * 0.25) as u8)),
-                );
-            }
-            None => theme::avatar(ui, &theme::initials(&item.name), 44.0, true),
-        }
-        ui.add_space(6.0);
-        ui.vertical(|ui| {
-            ui.label(theme::bold(&item.name, 22.0).color(theme::INK));
-            ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT));
+    // Whatever stacking the container handed us, kept for the body below --
+    // the cards there still lay themselves out with it.
+    let card_spacing = ui.spacing().item_spacing;
+
+    // **The pane owns its own surface.** Design 2b fills the detail column
+    // with `#f7f6f5` and puts exactly one white element on it: the header
+    // strip across the top, edge to edge. `ui.clip_rect()` is that column --
+    // `vault_window::mod`'s `CentralPanel` hands this function a `max_rect`
+    // already inset by the panel's own margin, and a strip drawn inside that
+    // inset reads as a card floating on grey rather than as the pane's own
+    // header. Laying out in a child over the clip rect also makes every
+    // number below independent of whatever padding the container supplies,
+    // which is what lets the tests pin absolute geometry.
+    let pane = ui.clip_rect();
+    ui.painter()
+        .rect_filled(pane, CornerRadius::ZERO, theme::WINDOW_BG);
+    let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane));
+    let ui = &mut pane_ui;
+    // Every gap in the strip and the body below is stated, not inherited.
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                match icon {
+                    Some(tex) => {
+                        // Rounded to match `theme::avatar`'s initials-tile
+                        // treatment (same `size * 0.25` formula) -- see
+                        // `item_list.rs`'s matching fix for why an unrounded
+                        // favicon in an identical box reads as visually
+                        // heavier than the monogram fallback.
+                        ui.add(
+                            egui::Image::new((tex.id(), tex.size_vec2()))
+                                .fit_to_exact_size(egui::Vec2::splat(HEADER_AVATAR))
+                                .corner_radius(CornerRadius::same((HEADER_AVATAR * 0.25) as u8)),
+                        );
+                    }
+                    None => theme::avatar(ui, &theme::initials(&item.name), HEADER_AVATAR, true),
+                }
+                ui.add_space(HEADER_GAP);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = TITLE_GAP;
+                    ui.label(theme::pane_title(&item.name, TITLE_SIZE, theme::INK));
+                    ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = HEADER_GAP;
+                    if kind_offers_edit(kind) && theme::header_button(ui, "Edit").clicked() {
+                        action = DetailAction::Edit;
+                    }
+                    // Not drawn for a kind that cannot be filled: the fill
+                    // path resolves exactly a username and a password, so this
+                    // button on a card would type two empty strings into
+                    // whatever window happens to be focused. See
+                    // `kind_offers_fill`.
+                    if kind_offers_fill(kind)
+                        && theme::header_primary_button(ui, "Fill in app", "CTRL+SHIFT+F").clicked()
+                    {
+                        action = DetailAction::Fill;
+                    }
+                    // Design 2b's strip carries no Delete. This app's does, so
+                    // it keeps its established place (leftmost of the three)
+                    // and its two-click arming, and is drawn in the strip's own
+                    // button shape rather than given a shape of its own.
+                    let (delete_label, delete_hover) = if delete_pending {
+                        (
+                            "Delete? Click to confirm",
+                            "Click again to delete this item. It may still be recoverable from \
+                             bitwarden.com or another Bitwarden client afterward.",
+                        )
+                    } else {
+                        ("Delete", "Delete this item")
+                    };
+                    let delete = if delete_pending {
+                        theme::header_button_tinted(ui, delete_label, theme::ERROR, theme::ERROR)
+                    } else {
+                        theme::header_button(ui, delete_label)
+                    };
+                    if delete.on_hover_text(delete_hover).clicked() {
+                        action = DetailAction::Delete;
+                    }
+                });
+            });
         });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if kind_offers_edit(kind) && theme::secondary_button(ui, "Edit").clicked() {
-                action = DetailAction::Edit;
-            }
-            // Not drawn for a kind that cannot be filled: the fill path
-            // resolves exactly a username and a password, so this button on a
-            // card would type two empty strings into whatever window happens
-            // to be focused. See `kind_offers_fill`.
-            if kind_offers_fill(kind)
-                && theme::primary_button(ui, "Fill in app", Some("CTRL+SHIFT+F")).clicked()
-            {
-                action = DetailAction::Fill;
-            }
-            let (delete_label, delete_hover, delete_color) = if delete_pending {
-                (
-                    "Delete? Click to confirm",
-                    "Click again to delete this item. It may still be recoverable from \
-                     bitwarden.com or another Bitwarden client afterward.",
-                    theme::ERROR,
-                )
-            } else {
-                ("Delete", "Delete this item", theme::INK)
-            };
-            let delete_button = egui::Button::new(theme::semibold(delete_label, 13.0).color(delete_color))
-                .fill(theme::CARD)
-                .stroke(Stroke::new(1.0, if delete_pending { theme::ERROR } else { theme::BORDER_STRONG }))
-                .corner_radius(CornerRadius::same(7))
-                .min_size(egui::Vec2::new(0.0, 32.0));
-            if ui.add(delete_button).on_hover_text(delete_hover).clicked() {
-                action = DetailAction::Delete;
-            }
-        });
-    });
-    ui.add_space(14.0);
+    // The strip's `border-bottom: 1px solid #eae7e7`.
+    theme::hairline(ui);
+
+    // The body's `padding: 18px 24px`, applied by placing the rest of the pane
+    // in a child over the padded remainder rather than by a `Frame`, so
+    // everything below keeps laying itself out exactly where it did.
+    let body = egui::Rect::from_min_max(
+        egui::pos2(
+            pane.left() + f32::from(BODY_PAD_X),
+            ui.cursor().top() + f32::from(BODY_PAD_Y),
+        ),
+        egui::pos2(
+            pane.right() - f32::from(BODY_PAD_X),
+            pane.bottom() - f32::from(BODY_PAD_Y),
+        ),
+    );
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    let ui = &mut body_ui;
+    ui.spacing_mut().item_spacing = card_spacing;
 
     // Which body this item gets is decided by `detail_body_for` and nowhere
     // else, so "what does a type-5 item render" is a question a unit test
@@ -1245,6 +1318,122 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    /// The width and height `painted_*` lays the pane out at. Every geometry
+    /// assertion below is an ABSOLUTE number measured against this pane, never
+    /// one re-derived from the constant under test -- a review found four
+    /// tests in this codebase that could not fail because they computed their
+    /// expectation from the very value they were checking.
+    const PANE: f32 = 900.0;
+
+    /// One frame of `draw_detail_read`, as the filled rectangles it painted.
+    ///
+    /// The counterpart to [`painted_text`]: the pane surface, the header
+    /// strip, the cards, the avatar tile and every button body are *fills*,
+    /// and the report this work came from ("top is white") is a statement
+    /// about exactly those. Nothing that walks galleys can see them.
+    fn painted_rects(item: &VaultItem, totp: &TotpState) -> Vec<(egui::Rect, egui::Color32)> {
+        let mut rects = Vec::new();
+        for clipped in &frame_shapes(item, totp, RevealState::default()) {
+            collect_rects(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    fn collect_rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every painted string with the rectangle it landed in *and the font it
+    /// was laid out with* -- the only way to assert a size or a weight, which
+    /// [`collect_text_rects`] throws away.
+    fn painted_type(
+        item: &VaultItem,
+        totp: &TotpState,
+        reveal: RevealState,
+    ) -> Vec<(String, egui::Rect, egui::FontId)> {
+        let mut out = Vec::new();
+        for clipped in &frame_shapes(item, totp, reveal) {
+            collect_type(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn collect_type(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect, egui::FontId)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let font = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| s.format.font_id.clone())
+                    .unwrap_or_default();
+                out.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    font,
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_type(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The one painted run with this exact text, with its rect and its font.
+    /// Panics rather than returning an `Option` so a row that stopped being
+    /// drawn names itself, and rejects a second match so no assertion here can
+    /// quietly be about a different run than the one it names.
+    fn only(
+        painted: &[(String, egui::Rect, egui::FontId)],
+        text: &str,
+    ) -> (egui::Rect, egui::FontId) {
+        let mut hits = painted.iter().filter(|(t, _, _)| t == text);
+        let hit = hits
+            .next()
+            .unwrap_or_else(|| panic!("nothing painted {text:?}; painted: {painted:?}"));
+        assert!(
+            hits.next().is_none(),
+            "{text:?} was painted more than once, so this assertion is ambiguous"
+        );
+        (hit.1, hit.2.clone())
+    }
+
+    fn frame_shapes(
+        item: &VaultItem,
+        totp: &TotpState,
+        reveal: RevealState,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(PANE, PANE),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut reveal = reveal;
+        ctx.run_ui(input(), |ui| {
+            draw_detail_read(ui, item, 3, totp, false, &mut reveal, None);
+        })
+        .shapes
     }
 
     fn painted(item: &VaultItem, totp: &TotpState) -> Vec<String> {
@@ -2246,5 +2435,118 @@ mod tests {
             metadata_line(Some(0), 5, "abc"),
             "Updated today \u{b7} Filled 5 times \u{b7} Strength: Weak"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Design 2b, the header strip.
+    // -----------------------------------------------------------------
+
+    /// The report this work came from, as an assertion. Design 2b's detail
+    /// column is `background: #f7f6f5` and the *only* white element on it is
+    /// the header strip, which spans the pane's full width from its very top.
+    #[test]
+    fn the_pane_is_the_warm_grey_and_the_strip_across_its_top_is_the_white() {
+        assert_ne!(
+            theme::CARD,
+            theme::WINDOW_BG,
+            "this whole test is vacuous if the two surfaces are the same colour"
+        );
+        let rects = painted_rects(&an_item(Some(1)), &TotpState::NoSecret);
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(PANE, PANE));
+        assert!(
+            rects
+                .iter()
+                .any(|(r, fill)| *fill == theme::WINDOW_BG && r.contains_rect(pane)),
+            "the pane is not filled with the design's #f7f6f5: {rects:?}"
+        );
+        let strip = rects
+            .iter()
+            .find(|(r, fill)| {
+                *fill == theme::CARD && r.top() == 0.0 && r.left() == 0.0 && r.right() == PANE
+            })
+            .unwrap_or_else(|| panic!("no full-width white header strip at the top: {rects:?}"));
+        assert!(
+            strip.0.height() >= 84.0,
+            "the strip is shorter than the design's 20px padding + 44px avatar + 20px \
+             padding: {:?}",
+            strip.0
+        );
+    }
+
+    /// The strip's own grid: `padding: 20px 24px`, a 44px avatar, `gap: 14px`,
+    /// then a 22px/800 title over a 12px subtitle.
+    #[test]
+    fn the_header_strip_lays_its_avatar_and_title_out_on_the_designs_grid() {
+        let item = an_item(Some(1));
+        let rects = painted_rects(&item, &TotpState::NoSecret);
+        let avatar = rects
+            .iter()
+            .find(|(r, fill)| *fill == theme::BLUE_WASH && r.width() == 44.0 && r.height() == 44.0)
+            .unwrap_or_else(|| panic!("no 44px avatar tile in the header: {rects:?}"));
+        assert_eq!(
+            avatar.0.left(),
+            24.0,
+            "the avatar is not at the strip's 24px left padding"
+        );
+        assert_eq!(
+            avatar.0.top(),
+            20.0,
+            "the avatar is not at the strip's 20px top padding -- if the title column \
+             now stands taller than 44px, the centred row has pushed it down"
+        );
+
+        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
+        let (title, title_font) = only(&painted, "Sample");
+        assert_eq!(
+            title.left(),
+            82.0,
+            "the title is not 24 + 44 + 14 from the pane's left edge"
+        );
+        assert_eq!(title_font.size, 22.0, "the title is not the design's 22px");
+        assert_eq!(
+            title_font.family,
+            egui::FontFamily::Name(theme::EXTRABOLD.into()),
+            "the title is not the design's 800 weight"
+        );
+
+        let (subtitle, subtitle_font) = only(&painted, "Login");
+        assert_eq!(
+            subtitle.left(),
+            82.0,
+            "the subtitle does not share the title's column"
+        );
+        assert_eq!(
+            subtitle_font.size, 12.0,
+            "the subtitle is not the design's 12px"
+        );
+    }
+
+    /// `height: 34px` for both, one filled `#1b3fa0` and one outline-only,
+    /// with the primary's shortcut hint at 10px monospace beside its 13px
+    /// label rather than appended to it at the label's own size.
+    #[test]
+    fn the_header_buttons_are_the_designs_34px_filled_and_outlined_pair() {
+        let item = an_item(Some(1));
+        let rects = painted_rects(&item, &TotpState::NoSecret);
+        let tall: Vec<_> = rects.iter().filter(|(r, _)| r.height() == 34.0).collect();
+        assert!(
+            tall.iter().any(|(_, fill)| *fill == theme::BLUE),
+            "no 34px blue-filled \"Fill in app\" button: {rects:?}"
+        );
+        assert!(
+            tall.iter().any(|(_, fill)| *fill == theme::CARD),
+            "no 34px outline-only header button: {rects:?}"
+        );
+
+        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
+        assert_eq!(
+            only(&painted, "Edit").1.size,
+            13.0,
+            "Edit is not the design's 13px"
+        );
+        assert_eq!(only(&painted, "Fill in app").1.size, 13.0);
+        let (_, hint) = only(&painted, "CTRL+SHIFT+F");
+        assert_eq!(hint.size, 10.0, "the shortcut hint is not the design's 10px");
+        assert_eq!(hint.family, egui::FontFamily::Monospace);
     }
 }
