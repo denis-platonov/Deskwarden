@@ -22,7 +22,8 @@
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{
-    with_app_match, with_folder, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem,
+    with_app_match, with_folder, without_deleted_date, Folder, NewLoginItem, VaultBridge,
+    VaultError, VaultItem,
 };
 use std::sync::Mutex;
 
@@ -1113,6 +1114,140 @@ impl VaultCache {
             // Unconditional, unlike the edits above: a delete has to be
             // recorded even when the snapshot did not hold the item, because
             // what it has to survive is a fetch that DOES hold it.
+            snapshot.note_item_write(id, true);
+        }
+        Ok(())
+    }
+
+    /// The vault's trash, fetched fresh every time.
+    ///
+    /// **TRASH IS DELIBERATELY NOT IN THE SNAPSHOT**, and this is the design
+    /// decision of the Trash backend. The snapshot is `items` + `folders`
+    /// wrapped in the era/epoch machinery, the pending-write log and
+    /// [`Self::snapshot_unless_superseded`] -- a structure that exists because
+    /// fifteen consecutive review findings came out of concurrent reads of it.
+    /// Putting a second collection inside it makes every one of those findings
+    /// reachable again for that collection (a replay that must know which of
+    /// two lists an id belongs to; a `VaultSnapshot` whose shape changes under
+    /// every existing consumer; a restore that has to move an id BETWEEN two
+    /// era-guarded lists atomically), and it buys a cache for a list the user
+    /// measured at seven items.
+    ///
+    /// The argument is not just "small, so who cares" -- **not caching it is
+    /// what makes two of this feature's three correctness requirements
+    /// unfalsifiable rather than tested**:
+    ///
+    ///  * after a purge the trash list must not contain the item. Here that
+    ///    holds because there is no trash list to be stale: the next call asks
+    ///    the server, which has already purged it. A cached trash list would
+    ///    have to be pruned on purge, and that pruning is a thing that can be
+    ///    forgotten.
+    ///  * likewise after a restore.
+    ///
+    /// What it costs, stated rather than glossed: one HTTP round-trip when the
+    /// Trash row is opened (and one per refresh), and **a sidebar badge cannot
+    /// count the trash without paying that round-trip**. A badge that must be
+    /// live at all times is the one requirement that would change this answer;
+    /// nothing in the backend brief asks for one.
+    ///
+    /// It routes through the cache anyway, rather than callers reaching
+    /// [`Self::bridge`], so that there is one door for the whole feature and
+    /// so a later decision to cache it changes this function and nothing else.
+    pub fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.bridge.list_trash()
+    }
+
+    /// Takes `item` out of the trash and puts it back in the live snapshot.
+    ///
+    /// Takes the whole trashed item, not just its id, for the reason
+    /// [`Self::move_item_to_folder`] does: the snapshot then holds what the
+    /// caller had rather than a reconstruction, and `POST /restore/item/{id}`
+    /// returns nothing this crate has verified the shape of.
+    ///
+    /// **[`without_deleted_date`] is load-bearing, not tidying.** The item the
+    /// caller holds came from [`Self::list_trash`] and carries `deletedDate`
+    /// in [`VaultItem::other`], which is serialized on every write this app
+    /// makes -- so pushing it in verbatim would leave the live snapshot's copy
+    /// claiming a deletion date, and the vault window's next ordinary edit of
+    /// that item would PUT the key back at a backend whose handling of it is
+    /// unverified.
+    ///
+    /// **`note_item_write` is the one thing here that can be wrong**, and it
+    /// is unconditional rather than recorded only on the `Some` arm, because
+    /// unlike every other write on this type the restore is *undoing a
+    /// recorded delete*. `record_write` is last-write-wins per id
+    /// (see `record_write`), so the entry this call replaces is the
+    /// `deleted: true` one that [`Self::delete_item`] left when the item was
+    /// trashed in the first place. Without this line that entry survives, and
+    /// `replay_writes` then strips the restored id out of **every** subsequent
+    /// fetch until the next [`Self::clear`] -- the item comes back on the
+    /// server and stays invisible in this process for the rest of the session.
+    /// `a_restore_overrides_the_pending_delete_that_trashed_the_item` walks
+    /// exactly that, deterministically.
+    ///
+    /// Returns `Result<(), VaultError>` rather than an [`AppMatchWrite`]-style
+    /// outcome, on the same test that doc sets (the two misses must demand
+    /// identical caller behaviour):
+    ///
+    ///  * **Cache unpopulated.** Write-through skipped, and self-curing: any
+    ///    populate fetches from a server that has the item live. Note that the
+    ///    stale-pending-entry hazard above cannot apply in this case --
+    ///    `clear` is the only thing that unpopulates, and it empties both
+    ///    pending logs.
+    ///  * **Populated.** Cannot miss: the `None` arm pushes, so the id is
+    ///    present either way and the write is always recorded.
+    ///
+    /// Nothing arms itself from an item's trashed-ness, so neither case leaves
+    /// a consumer acting on a claim the vault does not support.
+    pub fn restore_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+        // Bridge call BEFORE `self.lock()`, like every other write here: no
+        // lock may be held across HTTP.
+        self.bridge.restore_item(&item.id)?;
+        let restored = without_deleted_date(item);
+        let mut snapshot = self.lock();
+        if !snapshot.populated {
+            drop(snapshot);
+            log::warn!(
+                "restored vault item {} from the trash but the cache holds no snapshot to write \
+                 it through to; the vault has it live and any populate will bring it in",
+                item.id
+            );
+            return Ok(());
+        }
+        match snapshot.items.iter().position(|i| i.id == item.id) {
+            // A restored item is by definition absent from the live snapshot,
+            // so `push` is the ordinary arm and `Some` is the unusual one --
+            // reachable when an older populate's fetch still carried the item
+            // as live. Replacing rather than pushing there is what keeps the
+            // snapshot from holding the same id twice.
+            Some(at) => snapshot.items[at] = restored,
+            None => snapshot.items.push(restored),
+        }
+        // UNCONDITIONAL, unlike the `position`-guarded writes above: both arms
+        // changed the snapshot, and this entry has a stale `deleted: true` to
+        // overwrite. See the doc.
+        snapshot.note_item_write(&item.id, false);
+        Ok(())
+    }
+
+    /// Deletes a trashed item for good, via
+    /// [`VaultBridge::purge_item`]'s `permanent=true`.
+    ///
+    /// The snapshot side is [`Self::delete_item`]'s, and for the same reason:
+    /// the id must be recorded as deleted **unconditionally**, because what
+    /// the record has to survive is not the current snapshot (a trashed item
+    /// is normally absent from it already) but a fetch that predates the
+    /// purge and still carries the item as live. The `retain` is the belt to
+    /// that braces -- a purge of an item an older populate had just restored
+    /// to the snapshot must still leave.
+    ///
+    /// Nothing prunes a cached trash list here because there is none; see
+    /// [`Self::list_trash`] for why that is the point rather than an omission.
+    pub fn purge_item(&self, id: &str) -> Result<(), VaultError> {
+        self.bridge.purge_item(id)?;
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.items.retain(|i| i.id != id);
             snapshot.note_item_write(id, true);
         }
         Ok(())
@@ -2544,5 +2679,325 @@ mod tests {
             3,
             "each populate that took the write-back lock must have taken a number"
         );
+    }
+
+    // --- Trash -------------------------------------------------------------
+
+    /// The trash as `bw serve` answers `?trash=true`: one item, carrying a
+    /// `deletedDate` and NOT among the two in `items_body`.
+    fn trash_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"t1","name":"Old thing","fields":[],"type":1,
+             "deletedDate":"2026-07-30T09:15:00.000Z"}
+        ]}}"#
+    }
+
+    /// A populated cache holding `items_body`'s two live items and one
+    /// folder. Same shape as `populated_cache_with_a_filed_item` above, with
+    /// one addition that matters: the live-items mock states
+    /// `Matcher::Missing`, so it can only answer the *unqualified* list. The
+    /// `?trash=true` request each test registers separately therefore cannot
+    /// be served by this mock by accident, which is what would let a
+    /// `list_trash` that forgot its query silently pass here.
+    fn populated_cache(server: &mut mockito::Server) -> VaultCache {
+        server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        cache
+    }
+
+    /// The single trashed item, fetched through the cache.
+    fn the_trashed_item(cache: &VaultCache) -> VaultItem {
+        cache.list_trash().unwrap().into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn listing_the_trash_does_not_disturb_the_live_snapshot() {
+        // The whole of decision (a) in one assertion: trash is fetched, never
+        // stored. If it were merged into `items` the Trash view would leak
+        // deleted rows into every live list in the app -- the sidebar, the
+        // item list and `app::handle_match`'s autofill candidates all read
+        // `items`.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+
+        let trashed = cache.list_trash().unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id, "t1");
+
+        let live = cache.items();
+        assert_eq!(live.len(), 2, "the trash fetch changed the live snapshot: {live:?}");
+        assert!(
+            !live.iter().any(|i| i.id == "t1"),
+            "a trashed item leaked into the live snapshot"
+        );
+    }
+
+    #[test]
+    fn a_successful_restore_puts_the_item_into_the_live_snapshot() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+        let restore = server
+            .mock("POST", "/restore/item/t1")
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let item = the_trashed_item(&cache);
+        cache.restore_item(&item).unwrap();
+        restore.assert();
+
+        let live = cache.items();
+        assert_eq!(live.len(), 3, "a restored item did not reach the live snapshot: {live:?}");
+        let back = live.iter().find(|i| i.id == "t1").expect("the restored item");
+        assert_eq!(back.name, "Old thing");
+    }
+
+    #[test]
+    fn a_restored_item_no_longer_claims_a_deletion_date() {
+        // `deletedDate` rides the catch-all, and the catch-all is serialized
+        // on every write this app makes. A restored item left carrying it
+        // means the vault window's next ordinary edit PUTs a deletion date at
+        // a backend whose handling of one is UNVERIFIED. Dropped at the one
+        // place the item crosses from trash to live.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+
+        let item = the_trashed_item(&cache);
+        assert_eq!(
+            crate::vault_bridge::deleted_date(&item),
+            Some("2026-07-30T09:15:00.000Z"),
+            "the premise: the item arrived from the trash carrying a deletion date"
+        );
+
+        cache.restore_item(&item).unwrap();
+        let back = cache.items().into_iter().find(|i| i.id == "t1").unwrap();
+        assert_eq!(
+            crate::vault_bridge::deleted_date(&back),
+            None,
+            "the live snapshot holds an item that still claims to be deleted"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_leaves_the_snapshot_alone() {
+        // The Trash view will report the failure and keep the row in the
+        // trash, so a rejected restore must not come back `Ok` and must not
+        // put the item into the live list.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+        let _r = server.mock("POST", "/restore/item/t1").with_status(500).create();
+
+        let item = the_trashed_item(&cache);
+        assert!(cache.restore_item(&item).is_err(), "a rejected restore came back Ok");
+        let live = cache.items();
+        assert_eq!(live.len(), 2, "a failed restore added the item anyway: {live:?}");
+        assert!(!live.iter().any(|i| i.id == "t1"));
+    }
+
+    #[test]
+    fn a_restore_overrides_the_pending_delete_that_trashed_the_item() {
+        // THE ONE PLACE THIS FEATURE CAN BE WRONG, walked deterministically.
+        //
+        // Trashing an item IS `delete_item`, which records `deleted: true`
+        // against its id. `record_write` is last-write-wins per id, so unless
+        // the restore records its own entry that delete survives -- and
+        // `replay_writes` then strips the id out of EVERY later fetch whose
+        // mark predates it, for the rest of the session. The item is live on
+        // the server, visibly restored in the UI, and gone again at the next
+        // sync, permanently, until a lock.
+        //
+        // The ordering is the whole test: mark BEFORE the delete, so the
+        // replayed window covers both the delete and the restore, which is
+        // exactly the window a sync started before the user opened Trash
+        // occupies.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _d = server.mock("DELETE", "/object/item/1").with_status(200).create();
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"data":{"data":[
+                    {"id":"1","name":"Alpha","fields":[],"type":1,
+                     "deletedDate":"2026-07-30T09:15:00.000Z"}
+                ]}}"#,
+            )
+            .create();
+        let _r = server.mock("POST", "/restore/item/1").with_status(200).create();
+
+        // A sync that fetched the vault while item 1 was still live.
+        let mark = cache.epoch();
+        let fetched = cache.items();
+        assert!(fetched.iter().any(|i| i.id == "1"), "the fetch must predate the delete");
+
+        cache.delete_item("1").unwrap();
+        assert!(!cache.items().iter().any(|i| i.id == "1"), "the delete must have landed");
+
+        let trashed = the_trashed_item(&cache);
+        cache.restore_item(&trashed).unwrap();
+        assert_eq!(
+            cache.epoch().era(),
+            mark.era(),
+            "a restore must not start a new era -- that would supersede every reader holding one"
+        );
+
+        // Now the slow sync lands with its pre-delete fetch.
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+        assert!(
+            cache.items().iter().any(|i| i.id == "1"),
+            "a populate stripped a RESTORED item back out, because the restore left the \
+             pending delete in place: {:?}",
+            cache.items()
+        );
+    }
+
+    #[test]
+    fn a_successful_purge_survives_a_populate_whose_fetch_predates_it() {
+        // The mirror of the test above, and the reason purge records a delete
+        // even though a trashed item is normally absent from the live
+        // snapshot: what the record has to survive is not the snapshot but a
+        // FETCH taken while the item was still live. Without it, the purge is
+        // undone in the cache and the vault window shows a row for an item
+        // that no longer exists anywhere.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let purge = server
+            .mock("DELETE", "/object/item/1")
+            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let mark = cache.epoch();
+        let fetched = cache.items();
+        assert!(fetched.iter().any(|i| i.id == "1"), "the fetch must predate the purge");
+
+        cache.purge_item("1").unwrap();
+        purge.assert();
+        assert!(
+            !cache.items().iter().any(|i| i.id == "1"),
+            "a purge left the item in the live snapshot"
+        );
+
+        assert_eq!(
+            cache.populate_with(fetched, mark).unwrap(),
+            PopulateOutcome::Populated
+        );
+        assert!(
+            !cache.items().iter().any(|i| i.id == "1"),
+            "a populate resurrected a permanently deleted item: {:?}",
+            cache.items()
+        );
+    }
+
+    #[test]
+    fn a_failed_purge_leaves_the_snapshot_alone() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _p = server
+            .mock("DELETE", "/object/item/1")
+            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .with_status(500)
+            .create();
+
+        assert!(cache.purge_item("1").is_err(), "a rejected purge came back Ok");
+        assert!(
+            cache.items().iter().any(|i| i.id == "1"),
+            "a failed purge removed the item from the cache anyway"
+        );
+    }
+
+    #[test]
+    fn a_401_on_a_trash_call_reaches_the_caller_as_unauthorized() {
+        // The cache must not flatten the variant the vault window's re-auth
+        // path keys off. Nothing here maps errors -- they ride `?` -- so this
+        // pins that nobody adds a `map_err` later.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(401)
+            .create();
+        let _p = server
+            .mock("DELETE", "/object/item/1")
+            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .with_status(401)
+            .create();
+        let _r = server.mock("POST", "/restore/item/1").with_status(401).create();
+
+        assert!(matches!(cache.list_trash(), Err(VaultError::Unauthorized)));
+        assert!(matches!(cache.purge_item("1"), Err(VaultError::Unauthorized)));
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(matches!(cache.restore_item(&item), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn restoring_into_an_unpopulated_cache_is_reported_as_success_and_writes_nothing() {
+        // The self-curing miss, pinned so it stays self-curing: no snapshot to
+        // write through to, the vault has the item live, and any populate
+        // brings it in. It must NOT be an error -- the server accepted the
+        // restore -- and it must not mark the cache populated.
+        let mut server = mockito::Server::new();
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let cache = cache_for(server.url());
+        assert!(!cache.is_populated());
+
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"t1","name":"Old thing","fields":[],"type":1,
+                "deletedDate":"2026-07-30T09:15:00.000Z"}"#,
+        )
+        .unwrap();
+        cache.restore_item(&item).unwrap();
+
+        assert!(!cache.is_populated(), "a restore marked an empty cache populated");
+        assert!(cache.items().is_empty(), "a restore seeded an unpopulated snapshot");
     }
 }

@@ -355,6 +355,57 @@ pub fn with_folder(item: &VaultItem, folder_id: Option<&str>) -> VaultItem {
     moved
 }
 
+/// The key `bw serve` puts on an item that is in the trash, and on no other
+/// item.
+///
+/// It is **deliberately not a field on [`VaultItem`]** -- it rides
+/// [`VaultItem::other`] like `attachments` and `reprompt` do, and the two
+/// functions below are the whole of this crate's typed access to it. The
+/// tradeoff is recorded in full in `.superpowers/sdd/progress.md`; the short
+/// version is that adding a field to `VaultItem` is a compile error at
+/// nineteen struct literals across nine files, five of them in files the trash
+/// backend does not own, and an accessor over the catch-all buys the UI
+/// everything a typed field would (read it, sort by it, show "deleted N days
+/// ago") without that blast radius.
+const DELETED_DATE_KEY: &str = "deletedDate";
+
+/// When `bw serve` says this item was trashed, or `None` for a live item.
+///
+/// Verified against the live backend (`.superpowers/sdd/item-shapes-capture.md`):
+/// `GET /list/object/items?trash=true` returns ONLY trashed items and every
+/// one of them carries `deletedDate`, while not one of the 1654 items in the
+/// default list does. So presence of the key is exactly "this item is in the
+/// trash", and this function is also the trashed-ness predicate.
+///
+/// Returns the raw ISO-8601 string `bw` sent rather than a parsed timestamp:
+/// this crate has no date type, no date dependency, and nothing to check a
+/// parse against, so inventing one here would be modelling from memory. A UI
+/// that wants "deleted 3 days ago" parses this.
+pub fn deleted_date(item: &VaultItem) -> Option<&str> {
+    item.other.get(DELETED_DATE_KEY).and_then(|v| v.as_str())
+}
+
+/// A copy of `item` with the trash marker removed -- what a restored item
+/// looks like, built the same way [`with_folder`] builds a moved one.
+///
+/// **This is not cosmetic.** A trashed item arrives carrying `deletedDate`,
+/// that key rides [`VaultItem::other`], and `other` is serialized on every
+/// write this app makes. Putting the item back into the live snapshot verbatim
+/// would leave the snapshot's copy claiming a deletion date the server no
+/// longer holds, and the next ordinary edit of that item would PUT the stale
+/// key straight back at `bw serve`. What that backend does with a `deletedDate`
+/// on an item PUT is **unverified** -- it was not probed, and this crate does
+/// not guess -- which is exactly why the key is dropped here rather than sent
+/// and hoped about.
+///
+/// Every other key is cloned untouched, including everything else riding the
+/// catch-all.
+pub fn without_deleted_date(item: &VaultItem) -> VaultItem {
+    let mut restored = item.clone();
+    restored.other.remove(DELETED_DATE_KEY);
+    restored
+}
+
 /// The request body for a move: the item's ordinary write shape, with
 /// `folderId` **stated explicitly** -- present, and `null` when the item is
 /// being un-filed.
@@ -709,6 +760,85 @@ impl VaultBridge {
         let url = format!("{}/object/item/{}", self.base_url, id);
         self.agent
             .delete(&url)
+            .call()
+            .map_err(map_http_err)?;
+        Ok(())
+    }
+
+    /// The items in the vault's trash, and only those.
+    ///
+    /// Same path as [`Self::list_items`] with one query parameter, which is
+    /// the entire difference and is measured, not guessed
+    /// (`.superpowers/sdd/item-shapes-capture.md`, verified against the user's
+    /// live `bw serve` 2026.7.0):
+    ///
+    /// | query | items returned | carrying `deletedDate` |
+    /// |---|---|---|
+    /// | none | 1654 | 0 |
+    /// | `trash=true` | 14 | 14 |
+    /// | `deleted=true` | 1654 | 0 -- **silently ignored** |
+    /// | `includeDeleted=true` | 1654 | 0 -- **silently ignored** |
+    ///
+    /// Two things follow, and both are why this is not a filter over
+    /// [`Self::list_items`]. `trash=true` returns a DISJOINT set, not a
+    /// superset, so there is nothing in the default list to filter. And the
+    /// two plausible-looking spellings do not fail -- they answer 200 with the
+    /// whole live vault -- so a typo here does not surface as an error; it
+    /// surfaces as a Trash view showing the user's entire vault.
+    /// `list_trash_asks_for_only_the_trashed_items` therefore asserts the
+    /// REQUEST's query string, not the parsed response.
+    ///
+    /// Deliberately NOT cached: see [`crate::vault_cache::VaultCache::list_trash`].
+    pub fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
+        let url = format!("{}/list/object/items", self.base_url);
+        let body: Envelope<ItemList> = self
+            .agent
+            .get(&url)
+            .query("trash", "true")
+            .call()
+            .map_err(map_http_err)?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data.data)
+    }
+
+    /// Takes a trashed item out of the trash: `POST /restore/item/{id}`.
+    ///
+    /// A different path shape from every other item call in this file
+    /// (`/restore/item/{id}`, not `/object/item/{id}`), which is why the test
+    /// asserts the path and the method rather than only the outcome.
+    /// VERIFIED against the live backend: the item returns to the default
+    /// `/list/object/items` afterwards.
+    ///
+    /// Callers should reach this through
+    /// [`crate::vault_cache::VaultCache`], not here, so the live snapshot
+    /// gains the item the server just un-deleted.
+    pub fn restore_item(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/restore/item/{}", self.base_url, id);
+        self.agent
+            .post(&url)
+            .call()
+            .map_err(map_http_err)?;
+        Ok(())
+    }
+
+    /// Deletes a trashed item for good: `DELETE /object/item/{id}?permanent=true`.
+    ///
+    /// **The query parameter is the whole operation.** The same path without
+    /// it is [`Self::delete_item`], which SOFT-deletes -- so dropping
+    /// `permanent=true` does not fail, it silently re-trashes an
+    /// already-trashed item and the user's "delete forever" does nothing
+    /// whatever while reporting success. `purging_an_item_states_permanent_true`
+    /// asserts the query is on the wire for exactly that reason, and
+    /// `an_ordinary_delete_is_still_a_soft_delete_and_states_no_query`
+    /// guards the mirror-image mistake.
+    ///
+    /// VERIFIED against the live backend: the item leaves the trash list.
+    pub fn purge_item(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/object/item/{}", self.base_url, id);
+        self.agent
+            .delete(&url)
+            .query("permanent", "true")
             .call()
             .map_err(map_http_err)?;
         Ok(())
@@ -2047,5 +2177,244 @@ mod tests {
         let _m = server.mock("GET", "/object/totp/4").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.get_totp("4"), Err(VaultError::Http(_))));
+    }
+
+    // --- Trash -------------------------------------------------------------
+
+    /// One trashed item with EVERY key the live capture found on one
+    /// (`.superpowers/sdd/item-shapes-capture.md`), transcribed from that
+    /// document and not from `VaultItem` -- so this is an independent
+    /// statement of the wire shape rather than a restatement of the struct.
+    /// Note `folderId` and `notes` are absent, exactly as the capture records.
+    fn a_trashed_item_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"t1","object":"item","type":1,"name":"Old thing",
+             "deletedDate":"2026-07-30T09:15:00.000Z",
+             "creationDate":"2020-01-01T00:00:00.000Z",
+             "revisionDate":"2021-01-01T00:00:00.000Z",
+             "favorite":false,"fields":[],"collectionIds":[],"attachments":[],
+             "key":"K","reprompt":0,"passwordHistory":[],
+             "login":{"username":"u","password":"p"}}
+        ]}}"#
+    }
+
+    #[test]
+    fn list_trash_asks_for_only_the_trashed_items() {
+        // THE ASSERTION IS ON THE REQUEST, and it has to be. `?deleted=true`
+        // and `?includeDeleted=true` were both measured against the live
+        // backend and both answer 200 with the ENTIRE LIVE VAULT -- they are
+        // ignored, not rejected. So a wrong or missing parameter here cannot
+        // be caught by looking at what comes back: the response parses fine
+        // and the Trash view shows 1654 live items. `Matcher::Exact` on the
+        // query string is what makes this bite: it rejects an absent query, a
+        // renamed parameter and an extra one, each as a mockito 501 that turns
+        // the `unwrap` below into a failure.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_trashed_item_body())
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let trashed = bridge.list_trash().unwrap();
+        m.assert();
+
+        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed[0].id, "t1");
+        assert_eq!(deleted_date(&trashed[0]), Some("2026-07-30T09:15:00.000Z"));
+    }
+
+    #[test]
+    fn the_live_item_list_still_states_no_query_at_all() {
+        // The mirror of the test above, and not redundant with it: the two
+        // calls share a path, so the failure this rules out is `list_items`
+        // acquiring `trash=true` (every item in the app becoming a trashed
+        // one) rather than `list_trash` losing it. `Matcher::Missing` matches
+        // only a request with no query string.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[{"id":"1","name":"A","fields":[]}]}}"#)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert_eq!(bridge.list_items().unwrap().len(), 1);
+        m.assert();
+    }
+
+    #[test]
+    fn restore_item_posts_to_the_restore_endpoint() {
+        // A different path shape from every other item call in this file, so
+        // the path itself is the thing under test: mockito only answers a POST
+        // to exactly `/restore/item/t1`, and anything else is a 501.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("POST", "/restore/item/t1")
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.restore_item("t1").unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn purging_an_item_states_permanent_true() {
+        // THE SILENT-FAILURE GUARD. `DELETE /object/item/{id}` without this
+        // parameter is a SOFT delete -- the same call `delete_item` makes. Run
+        // against an item that is already in the trash it succeeds, changes
+        // nothing, and the user's "delete forever" silently does not happen.
+        // Nothing about the response distinguishes the two, so the query
+        // string is asserted directly.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("DELETE", "/object/item/t1")
+            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.purge_item("t1").unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn an_ordinary_delete_is_still_a_soft_delete_and_states_no_query() {
+        // The mirror-image mistake, and the more destructive of the two:
+        // `permanent=true` leaking onto the ordinary delete path would turn
+        // every "Delete" in the app into an unrecoverable purge, with the item
+        // never reaching the trash the user expects to find it in.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("DELETE", "/object/item/1")
+            .match_query(mockito::Matcher::Missing)
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.delete_item("1").unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn a_401_on_any_trash_call_maps_to_unauthorized() {
+        // The vault window's re-auth path keys off `Unauthorized`, so a stale
+        // session on any of these three must not arrive as a generic `Http`
+        // failure -- a Trash view that reports "something went wrong" for a
+        // locked vault is the `get_totp` defect (recorded above) in a new
+        // place.
+        let mut server = mockito::Server::new();
+        let _list = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(401)
+            .create();
+        let _restore = server.mock("POST", "/restore/item/t1").with_status(401).create();
+        let _purge = server
+            .mock("DELETE", "/object/item/t1")
+            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .with_status(401)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.list_trash(), Err(VaultError::Unauthorized)));
+        assert!(matches!(bridge.restore_item("t1"), Err(VaultError::Unauthorized)));
+        assert!(matches!(bridge.purge_item("t1"), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn a_non_401_failure_on_a_trash_call_stays_a_plain_http_error() {
+        let mut server = mockito::Server::new();
+        let _restore = server.mock("POST", "/restore/item/t1").with_status(500).create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.restore_item("t1"), Err(VaultError::Http(_))));
+    }
+
+    #[test]
+    fn a_trashed_item_round_trips_with_every_captured_key_including_deleted_date() {
+        // The capture's trashed-item key list, verbatim. `deletedDate` is
+        // UNMODELLED on purpose, so what this pins is that riding the
+        // catch-all is lossless: a trashed item written back (the restore path
+        // does not PUT, but the vault window's ordinary edit can reach an item
+        // this app has held) must not be a truncated copy of what arrived.
+        let raw = r#"{"id":"t1","object":"item","type":1,"name":"Old thing",
+            "deletedDate":"2026-07-30T09:15:00.000Z",
+            "creationDate":"2020-01-01T00:00:00.000Z",
+            "revisionDate":"2021-01-01T00:00:00.000Z",
+            "favorite":false,"fields":[],"collectionIds":[],"attachments":[],
+            "key":"K","reprompt":0,"passwordHistory":[],
+            "login":{"username":"u","password":"p"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_value(&item).unwrap(),
+            "a trashed item changed shape across a round trip"
+        );
+    }
+
+    #[test]
+    fn deleted_date_is_present_on_a_trashed_item_and_absent_on_a_live_one() {
+        // The accessor IS the trashed-ness predicate, which is only true
+        // because the capture measured zero `deletedDate` keys across 1654
+        // live items. Both directions are asserted so the property cannot rot
+        // into "always Some" or "always None".
+        let trashed: VaultItem = serde_json::from_str(
+            r#"{"id":"t1","name":"A","fields":[],"deletedDate":"2026-07-30T09:15:00.000Z"}"#,
+        )
+        .unwrap();
+        let live: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
+        assert_eq!(deleted_date(&trashed), Some("2026-07-30T09:15:00.000Z"));
+        assert_eq!(deleted_date(&live), None);
+    }
+
+    #[test]
+    fn without_deleted_date_drops_that_key_and_nothing_else() {
+        // The one key a restore must not carry into the live snapshot, and
+        // every other key -- including the rest of the catch-all -- untouched.
+        let raw = r#"{"id":"t1","object":"item","type":1,"name":"Old thing",
+            "deletedDate":"2026-07-30T09:15:00.000Z","favorite":true,"fields":[],
+            "reprompt":0,"key":"K","login":{"username":"u"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let restored = without_deleted_date(&item);
+
+        assert_eq!(deleted_date(&restored), None, "a restored item still claims a deletion date");
+
+        let mut expected: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            expected.as_object_mut().unwrap().remove("deletedDate"),
+            Some(serde_json::json!("2026-07-30T09:15:00.000Z")),
+            "the premise: the source item carried the key"
+        );
+        assert_eq!(
+            expected,
+            serde_json::to_value(&restored).unwrap(),
+            "restoring an item changed something other than its deletion date"
+        );
+    }
+
+    #[test]
+    fn without_deleted_date_on_a_live_item_is_a_faithful_copy() {
+        // Idempotent, so the restore path cannot be got wrong by being run
+        // twice or on an item that was never trashed.
+        let raw = r#"{"id":"1","name":"A","type":1,"favorite":false,"fields":[],
+            "reprompt":0,"login":{"username":"u"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            serde_json::to_value(&item).unwrap(),
+            serde_json::to_value(without_deleted_date(&item)).unwrap()
+        );
     }
 }
