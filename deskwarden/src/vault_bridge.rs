@@ -354,7 +354,6 @@ pub fn with_folder(item: &VaultItem, folder_id: Option<&str>) -> VaultItem {
     moved.folder_id = folder_id.map(str::to_string);
     moved
 }
-
 /// The key `bw serve` puts on an item that is in the trash, and on no other
 /// item.
 ///
@@ -788,6 +787,176 @@ struct TotpData {
     data: Option<String>,
 }
 
+/// `GET /generate` wraps its answer the same double-nested way
+/// `/object/totp/{id}` does -- the CLI builds a `StringResponse`
+/// (`{object: "string", data: "<secret>"}`) and hands it to
+/// `Response.success`, which puts *that* in the envelope's `data`. Same
+/// wrapper rule as [`TotpData`], and it is asserted rather than assumed by
+/// `a_generator_response_that_is_not_the_expected_envelope_is_a_parse_error`.
+#[derive(Deserialize)]
+struct GeneratedString {
+    data: String,
+}
+
+/// What to ask `GET /generate` for: a character password, or a word
+/// passphrase.
+///
+/// **The two are different requests, not one request with a flag**, because
+/// they take disjoint options: `length`/`minNumber`/`minSpecial`/the four
+/// character classes belong to one and `words`/`separator`/`capitalize`/
+/// `includeNumber` to the other. `GenerateCommand` reads *every* key on
+/// *every* request and simply ignores the ones its chosen type has no use
+/// for, so a single flat struct would happily send a character length with a
+/// passphrase request and appear to work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateRequest {
+    Password(PasswordRecipe),
+    Passphrase(PassphraseRecipe),
+}
+
+/// A character password's options, named for the query keys the **serve
+/// route** accepts.
+///
+/// VERIFIED, not transcribed from the CLI's flag list: `bw serve`'s
+/// `/generate` handler passes `ctx.request.query` straight to
+/// `GenerateCommand.run`, which reads `uppercase`, `lowercase`, `number`,
+/// `special`, `length`, `passphrase`, `separator`, `words`, `capitalize`,
+/// `includeNumber`, `minNumber`, `minSpecial` and `ambiguous` off that object
+/// (`apps/cli/src/oss-serve-configurator.ts`,
+/// `apps/cli/src/tools/generate.command.ts`). The CLI's SHORT flags -- `-u`,
+/// `-l`, `-n`, `-s`, `-p`, `-c` -- are commander aliases on the argv parser
+/// and do not exist as query keys; `?u=true` is read by nothing and silently
+/// drops the class. Cross-checked against the user's live `bw serve`
+/// (2026.7.0) on 2026-08-01, which answered both spellings of a real request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordRecipe {
+    /// `length`. The route clamps anything below 5 up to 5.
+    pub length: u32,
+    pub uppercase: bool,
+    pub lowercase: bool,
+    pub number: bool,
+    pub special: bool,
+    /// `minNumber`.
+    pub min_number: u32,
+    /// `minSpecial`.
+    pub min_special: u32,
+    /// `ambiguous` -- and the name here is the opposite way round from the
+    /// wire key ON PURPOSE. The CLI's own help for the flag is "Avoid
+    /// ambiguous characters", and `GenerateCommand` passes
+    /// `ambiguous: !normalizedOptions.ambiguous` into the generator, whose
+    /// `ambiguous: true` means *allow* them. So `ambiguous=true` on the query
+    /// string means "avoid", which is what this field is called.
+    pub avoid_ambiguous: bool,
+}
+
+/// Deskwarden's own default recipe, and it is deliberately **not** the CLI's
+/// (`-uln --length 14`): this is what a user gets for clicking Generate
+/// beside a password box, so it turns on all four classes and asks for 20
+/// characters rather than shipping a weaker default because a command-line
+/// tool from another decade had one.
+impl Default for PasswordRecipe {
+    fn default() -> Self {
+        Self {
+            length: 20,
+            uppercase: true,
+            lowercase: true,
+            number: true,
+            special: true,
+            min_number: 1,
+            min_special: 1,
+            avoid_ambiguous: true,
+        }
+    }
+}
+
+/// A word passphrase's options. See [`PasswordRecipe`] for how the key
+/// spellings were verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassphraseRecipe {
+    /// `words`. The route clamps anything below 3 up to 3.
+    pub words: u32,
+    /// `separator`. The route takes only the FIRST character of anything
+    /// longer than one, and treats the literal words `space` and `empty` as
+    /// `" "` and `""`.
+    pub separator: String,
+    pub capitalize: bool,
+    /// `includeNumber`.
+    pub include_number: bool,
+}
+
+impl Default for PassphraseRecipe {
+    fn default() -> Self {
+        Self {
+            words: 4,
+            separator: "-".to_string(),
+            capitalize: true,
+            include_number: true,
+        }
+    }
+}
+
+impl GenerateRequest {
+    /// The query parameters, in a fixed order so a test can assert the whole
+    /// string exactly.
+    ///
+    /// **Every boolean is stated, `false` included**, rather than omitted when
+    /// off. Two reasons, both measured from the route's own code. First,
+    /// `convertBooleanOption` reads a missing key as `false` *and* reads any
+    /// value that is not `""` or `"true"` as `false`, so an omitted `special`
+    /// and a `special=false` are the same thing to the server -- stating it
+    /// costs nothing and makes the request self-describing on the wire.
+    /// Second, and the reason it matters: when all four character classes come
+    /// out false the command **silently substitutes `uppercase + lowercase +
+    /// number`**. A recipe that asked for lowercase only would therefore be
+    /// honoured, but one that asked for nothing at all comes back as a
+    /// three-class password with no error -- so a caller must not let all four
+    /// be off, and this function does not hide the fact that it can happen.
+    fn query(&self) -> Vec<(&'static str, String)> {
+        match self {
+            Self::Password(p) => vec![
+                ("length", p.length.to_string()),
+                ("uppercase", bool_param(p.uppercase)),
+                ("lowercase", bool_param(p.lowercase)),
+                ("number", bool_param(p.number)),
+                ("special", bool_param(p.special)),
+                ("minNumber", p.min_number.to_string()),
+                ("minSpecial", p.min_special.to_string()),
+                ("ambiguous", bool_param(p.avoid_ambiguous)),
+            ],
+            // `passphrase` FIRST, so the switch that decides which kind of
+            // secret this is reads at the front of the string.
+            Self::Passphrase(p) => vec![
+                ("passphrase", bool_param(true)),
+                ("words", p.words.to_string()),
+                ("separator", p.separator.clone()),
+                ("capitalize", bool_param(p.capitalize)),
+                ("includeNumber", bool_param(p.include_number)),
+            ],
+        }
+    }
+
+    /// The query as one `key=value&...` string. Test-facing: it is what makes
+    /// "a passphrase request states no character length" assertable without a
+    /// server. The real call builds the request from [`Self::query`] pair by
+    /// pair so `ureq` does the percent-encoding.
+    #[cfg(test)]
+    fn query_string(&self) -> String {
+        self.query()
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+}
+
+/// A boolean as the route spells it. Not `to_string()` inline at each call
+/// site: `convertBooleanOption` accepts exactly `""` and `"true"` and reads
+/// `"1"`, `"yes"` and `"on"` as *off*, so which spelling is used is a wire
+/// fact worth having in one place.
+fn bool_param(value: bool) -> String {
+    if value { "true".to_string() } else { "false".to_string() }
+}
+
 #[derive(Clone)]
 pub struct VaultBridge {
     base_url: String,
@@ -1088,6 +1257,35 @@ impl VaultBridge {
             }
             Err(e) => Err(VaultError::Http(e.to_string())),
         }
+    }
+
+    /// Asks `bw serve` for a fresh password or passphrase: `GET /generate`.
+    ///
+    /// Returns `Zeroizing<String>` rather than a `String` for the reason
+    /// [`LoginData::password`] is one: what comes back IS a password from the
+    /// moment it exists, so it wipes itself on drop wherever a caller took a
+    /// copy. That guarantee is partial and this crate says so rather than
+    /// implying more -- `into_json`'s own buffer holds the plaintext for the
+    /// length of the call and is not wiped, exactly as it is not for every
+    /// other secret this file reads.
+    ///
+    /// Every non-2xx goes through [`map_http_err`], so a `401` from a locked
+    /// vault reaches the re-auth path as [`VaultError::Unauthorized`] instead
+    /// of a generic failure beside a password box. Unlike [`Self::get_totp`]
+    /// there is **no special-cased status**: this route has no equivalent of
+    /// "this item has no TOTP secret", so every failure really is one.
+    pub fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
+        let url = format!("{}/generate", self.base_url);
+        let mut call = self.agent.get(&url);
+        for (key, value) in request.query() {
+            call = call.query(key, &value);
+        }
+        let body: Envelope<GeneratedString> = call
+            .call()
+            .map_err(map_http_err)?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(Zeroizing::new(body.data.data))
     }
 }
 
@@ -2886,5 +3084,211 @@ mod tests {
             serde_json::to_value(&item).unwrap(),
             serde_json::to_value(without_deleted_date(&item)).unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `GET /generate`
+    //
+    // EVERY assertion here is on the REQUEST, and that is the whole point.
+    // `bw serve` hands `ctx.request.query` to `GenerateCommand` verbatim and
+    // that command reads each key with `CliUtils.convertBooleanOption` /
+    // `convertNumberOption` / `convertStringOption`, every one of which
+    // FALLS BACK SILENTLY: an unrecognised key is not an error, it is an
+    // absent option, and the command then substitutes a default. So a
+    // misspelled parameter answers 200 with a perfectly good password
+    // generated to the WRONG recipe -- a 20-character 4-class password
+    // silently becomes the CLI's default 14-character `uln` one, and nothing
+    // about the response says so. Asserting the query string is the only
+    // thing that can catch it.
+    // -----------------------------------------------------------------------
+
+    fn a_generated_body(value: &str) -> String {
+        // The shape `StringResponse` + `Response.success` produce, which is
+        // the same double-nested envelope `/object/totp/{id}` uses.
+        format!(r#"{{"success":true,"data":{{"object":"string","data":"{value}"}}}}"#)
+    }
+
+    #[test]
+    fn generating_a_password_asks_for_every_option_by_its_serve_route_spelling() {
+        // The spellings are the LONG option names only. The CLI's short flags
+        // (`-u`, `-l`, `-n`, `-s`, `-p`, `-c`) are commander aliases that
+        // exist only on the argv parser; the serve route never sees them, so
+        // `?u=true` would be ignored and the class silently dropped.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Exact(
+                "length=20&uppercase=true&lowercase=true&number=true&special=true\
+                 &minNumber=1&minSpecial=1&ambiguous=true"
+                    .into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_generated_body("XJl2s6xNXpa1fpTiC2pKWzoA"))
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let generated = bridge
+            .generate(&GenerateRequest::Password(PasswordRecipe::default()))
+            .unwrap();
+        m.assert();
+        assert_eq!(generated.as_str(), "XJl2s6xNXpa1fpTiC2pKWzoA");
+    }
+
+    #[test]
+    fn generating_a_passphrase_states_passphrase_true_and_its_own_options() {
+        // Without `passphrase=true` the route generates a PASSWORD and
+        // answers 200: `GenerateCommand` picks its type from exactly this key
+        // (`convertBooleanOption(passedOptions?.passphrase) ? "passphrase" :
+        // "password"`), so the omission is not an error anywhere, it is a
+        // different kind of secret than the user asked for.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Exact(
+                "passphrase=true&words=4&separator=-&capitalize=true&includeNumber=true".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_generated_body("Haiku-Gaffe-Sliding-Broker"))
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let generated = bridge
+            .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
+            .unwrap();
+        m.assert();
+        assert_eq!(generated.as_str(), "Haiku-Gaffe-Sliding-Broker");
+    }
+
+    #[test]
+    fn a_password_request_never_states_passphrase_and_a_passphrase_never_states_length() {
+        // The mirror-image mistakes, and neither would fail against the live
+        // backend: `passphrase=false` leaking onto a password request is
+        // harmless today but would become a passphrase the moment the key were
+        // built from a variable, and `length` on a passphrase request is read
+        // by the command and then ignored, so a UI offering a length control
+        // for a passphrase would appear to work.
+        let password = GenerateRequest::Password(PasswordRecipe::default()).query_string();
+        let passphrase = GenerateRequest::Passphrase(PassphraseRecipe::default()).query_string();
+        assert!(
+            !password.contains("passphrase"),
+            "a password request stated the passphrase switch: {password}"
+        );
+        assert!(
+            !passphrase.contains("length"),
+            "a passphrase request stated a character length: {passphrase}"
+        );
+        assert!(
+            passphrase.starts_with("passphrase=true"),
+            "a passphrase request did not state passphrase=true: {passphrase}"
+        );
+    }
+
+    #[test]
+    fn booleans_are_stated_as_the_literal_true_and_false_the_route_understands() {
+        // `CliUtils.convertBooleanOption` accepts a value of `""` or `"true"`
+        // (case-insensitively) and treats EVERYTHING ELSE as false -- `"1"`,
+        // `"yes"` and `"on"` all read as off. So `false` has to be spelled,
+        // and it has to be spelled as something that is not `true`.
+        let off = PasswordRecipe {
+            uppercase: false,
+            special: false,
+            avoid_ambiguous: false,
+            ..PasswordRecipe::default()
+        };
+        let query = GenerateRequest::Password(off).query_string();
+        assert!(query.contains("uppercase=false"), "{query}");
+        assert!(query.contains("special=false"), "{query}");
+        assert!(query.contains("ambiguous=false"), "{query}");
+        assert!(query.contains("lowercase=true"), "{query}");
+    }
+
+    #[test]
+    fn a_401_from_the_generator_maps_to_unauthorized() {
+        // Same rule as every other call in this file: a locked vault must
+        // reach the re-auth path, not a generic "something went wrong" beside
+        // a password box.
+        let mut server = mockito::Server::new();
+        // `Matcher::Any` is stated rather than left to the default, and it
+        // has to be: mockito 1.x defaults a mock's query matcher to
+        // "no query string at all", so a mock declared without this answers
+        // **501** to the query-carrying request under test -- which arrives
+        // as `Http`, and would have made this test claim the 401 mapping was
+        // broken when it was not. Watched, not assumed.
+        let _m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Any)
+            .with_status(401)
+            .create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(
+            bridge.generate(&GenerateRequest::Password(PasswordRecipe::default())),
+            Err(VaultError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn a_non_401_generator_failure_stays_a_plain_http_error() {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(
+            bridge.generate(&GenerateRequest::Password(PasswordRecipe::default())),
+            Err(VaultError::Http(_))
+        ));
+    }
+
+    #[test]
+    fn a_generator_response_that_is_not_the_expected_envelope_is_a_parse_error() {
+        // `/generate` wraps its answer the same double-nested way
+        // `/object/totp/{id}` does. A bare `{"success":true,"data":"pw"}` is
+        // what a naive reading of the route would expect, and taking it would
+        // mean this call had quietly stopped matching the backend.
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":"pw"}"#)
+            .create();
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(
+            bridge.generate(&GenerateRequest::Password(PasswordRecipe::default())),
+            Err(VaultError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_passphrase_separator_reaches_the_wire_percent_encoded() {
+        // The one free-text option. A separator of `&` or `=` written into the
+        // query unescaped would split into extra parameters, and the route
+        // would read the fragments as options rather than fail -- so what is
+        // pinned is that the value survives as ONE parameter.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::UrlEncoded("separator".into(), "&".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_generated_body("a&b&c&d"))
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge
+            .generate(&GenerateRequest::Passphrase(PassphraseRecipe {
+                separator: "&".to_string(),
+                ..PassphraseRecipe::default()
+            }))
+            .unwrap();
+        m.assert();
     }
 }

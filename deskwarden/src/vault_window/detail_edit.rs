@@ -4,7 +4,10 @@
 //! from read mode.
 
 use crate::theme;
-use crate::vault_bridge::{CardData, Folder, IdentityData, ItemKind, NewItem, VaultItem};
+use crate::vault_bridge::{
+    CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
+    PasswordRecipe, VaultItem,
+};
 #[cfg(test)]
 use crate::vault_bridge::{LoginData, UriEntry};
 use crate::vault_window::sidebar;
@@ -141,7 +144,56 @@ pub struct EditDraft {
     /// offers a notes editor for; on every other kind the item's own notes
     /// ride the clone untouched.
     pub note_body: String,
+    /// What the Generate control beside the password box will ask
+    /// `bw serve` for. See [`GeneratorDraft`].
+    pub generator: GeneratorDraft,
 }
+
+/// The generator's own form state: which kind of secret to make, and how big.
+///
+/// **Deliberately not a [`crate::vault_bridge::GenerateRequest`].** That type
+/// is the wire shape and holds a `String` separator and eight booleans; this
+/// is what two or three widgets edit across frames, and
+/// [`EditDraft::generator_request`] is the one conversion between them. Every
+/// option the form does not offer is supplied there from
+/// `PasswordRecipe::default()`/`PassphraseRecipe::default()`, so adding a
+/// control later changes this struct and that function and nothing else.
+///
+/// `length` and `words` are **both** kept, rather than one number reinterpreted
+/// by `passphrase`: 20 characters and 20 words are wildly different requests,
+/// and a shared field would silently carry one over as the other when the
+/// combo box is flipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratorDraft {
+    /// A word passphrase rather than a character password.
+    pub passphrase: bool,
+    /// Characters, when generating a password. The route clamps below 5.
+    pub length: u32,
+    /// Words, when generating a passphrase. The route clamps below 3.
+    pub words: u32,
+}
+
+impl Default for GeneratorDraft {
+    fn default() -> Self {
+        Self {
+            passphrase: false,
+            length: PasswordRecipe::default().length,
+            words: PassphraseRecipe::default().words,
+        }
+    }
+}
+
+/// The bounds the generator's number control offers.
+///
+/// The lower bounds are the route's own clamps (`length` below 5 becomes 5,
+/// `words` below 3 becomes 3) stated as UI limits, so the box cannot show a
+/// number the backend will silently ignore -- the form would otherwise say 3
+/// and produce 5. The upper bounds are this app's, and they are generous
+/// rather than derived: nothing in the route caps either.
+const MIN_LENGTH: u32 = 5;
+const MAX_LENGTH: u32 = 128;
+const MIN_WORDS: u32 = 3;
+const MAX_WORDS: u32 = 20;
 
 impl Default for EditDraft {
     /// A blank **login** draft. `ItemKind` has no `Default` of its own on
@@ -160,6 +212,7 @@ impl Default for EditDraft {
             identity: IdentityDraft::default(),
             ssh_key: SshKeyDraft::default(),
             note_body: String::new(),
+            generator: GeneratorDraft::default(),
         }
     }
 }
@@ -305,6 +358,7 @@ impl EditDraft {
             // for the same reason.
             ssh_key: SshKeyDraft::default(),
             note_body: drafted(item.notes.as_deref().map(|n| n.as_str())),
+            generator: GeneratorDraft::default(),
         }
     }
 
@@ -364,6 +418,73 @@ impl EditDraft {
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
         self.note_body = String::new();
+        // `generator` is deliberately NOT cleared. Everything above is the
+        // abandoned kind's *data*, and the argument for wiping it is that
+        // carrying it forward puts one kind's contents on the wire under
+        // another. The generator holds no item data at all -- it is two
+        // numbers and a switch describing what the user wants their next
+        // password to look like -- so there is nothing to leak, and resetting
+        // it would undo a preference the user set moments earlier for a
+        // reason unrelated to the kind.
+    }
+
+    /// What the Generate control should ask `bw serve` for, built from the
+    /// form's own state plus this crate's default recipe for everything the
+    /// form does not offer a control for.
+    ///
+    /// **The one conversion between the form and the wire**, so a control
+    /// added to [`GeneratorDraft`] has exactly one place to be honoured and
+    /// cannot half-arrive. The unoffered options are taken from
+    /// `PasswordRecipe::default()` (all four character classes on, a minimum
+    /// of one digit and one symbol, ambiguous characters avoided) and
+    /// `PassphraseRecipe::default()` (a `-` separator, capitalised, with a
+    /// number) -- see those types for why those defaults are Deskwarden's and
+    /// not the CLI's weaker ones.
+    ///
+    /// The lengths are clamped here as well as in the widget. Not belt and
+    /// braces: the route silently raises a too-small `length`/`words` to its
+    /// own minimum, so an unclamped 1 would come back as a 5-character
+    /// password against a form that said 1 -- a request that "succeeds" and
+    /// ignores what was asked. Clamping means the form and the result agree.
+    pub fn generator_request(&self) -> GenerateRequest {
+        if self.generator.passphrase {
+            GenerateRequest::Passphrase(PassphraseRecipe {
+                words: self.generator.words.clamp(MIN_WORDS, MAX_WORDS),
+                ..PassphraseRecipe::default()
+            })
+        } else {
+            GenerateRequest::Password(PasswordRecipe {
+                length: self.generator.length.clamp(MIN_LENGTH, MAX_LENGTH),
+                ..PasswordRecipe::default()
+            })
+        }
+    }
+
+    /// Puts a freshly generated secret into the draft's password box.
+    ///
+    /// A named method rather than `draft.password = generated.to_string()` at
+    /// the call site, because the call site is `vault_window/mod.rs` and this
+    /// is where the rule about what a generate REPLACES belongs: the whole
+    /// password, unconditionally, including one the user had already typed.
+    /// (There is no "append" or "only if empty" reading of the button --
+    /// generating a password over an empty box and over a typed one are the
+    /// same gesture.)
+    ///
+    /// **The box stays masked.** Bitwarden's own generators reveal what they
+    /// produced; this one does not, because `reveal_password` is the user's
+    /// toggle and a generate silently flipping it would show a secret the
+    /// user never asked to see -- on a form that may be sitting in front of
+    /// other people. The Show control is beside the box and is one click.
+    /// Stated because it is a deliberate deviation, not an oversight.
+    ///
+    /// Takes `&str` rather than the bridge's `Zeroizing<String>` so this file
+    /// does not need to own one: the caller's `Zeroizing` still wipes on
+    /// drop, and the copy that lands in `password` is the same plain `String`
+    /// every other box on this form holds (`CardDraft`'s doc records why the
+    /// draft's fields are not `Zeroizing` -- egui's `TextEdit` buffer is a
+    /// plain `String` regardless).
+    pub fn set_generated_password(&mut self, generated: &str) {
+        self.password = generated.to_string();
     }
 
     /// A name is the one thing `bw serve`'s create/edit endpoints reject an
@@ -671,6 +792,20 @@ pub enum EditAction {
     None,
     Save,
     Cancel,
+    /// The Generate control beside the password box was clicked.
+    ///
+    /// It carries nothing, and the caller is expected to ask
+    /// [`EditDraft::generator_request`] what to send and
+    /// [`EditDraft::set_generated_password`] where to put the answer. That
+    /// shape is deliberate: this form cannot perform the request itself
+    /// (`draw_detail_edit` has no backend handle, and it runs on the UI
+    /// thread), but the *decisions* -- which recipe, and what a generate
+    /// replaces -- belong here rather than being re-made at the call site.
+    ///
+    /// A failed generate is therefore the caller's to report, and it must be
+    /// reported: the box is unchanged on failure, so a silently swallowed
+    /// error looks exactly like a button that does nothing.
+    GeneratePassword,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -738,6 +873,60 @@ pub fn draw_detail_edit(
 
                     theme::field_label(ui, "Password");
                     theme::password_field(ui, &mut draft.password, &mut draft.reveal_password);
+                    ui.add_space(6.0);
+                    // The generator, in this form's own idiom rather than
+                    // design block 3d's. 3d is the OVERLAY's generator -- a
+                    // full panel with its own chrome, character-class
+                    // switches and a re-roll -- and it lives in a file this
+                    // work does not own. Porting its chrome into a stacked
+                    // label/field form would look like a foreign panel
+                    // dropped into the middle of it. So: one control row
+                    // under the box it fills, built from the same widgets
+                    // every other row here uses. **The overlay's generator is
+                    // a separate, still-outstanding task.**
+                    ui.horizontal(|ui| {
+                        if theme::secondary_button(ui, "Generate").clicked() {
+                            action = EditAction::GeneratePassword;
+                        }
+                        egui::ComboBox::from_id_salt("generator-kind")
+                            .selected_text(if draft.generator.passphrase {
+                                "Passphrase"
+                            } else {
+                                "Password"
+                            })
+                            .width(110.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut draft.generator.passphrase,
+                                    false,
+                                    "Password",
+                                );
+                                ui.selectable_value(
+                                    &mut draft.generator.passphrase,
+                                    true,
+                                    "Passphrase",
+                                );
+                            });
+                        // One control, two meanings, because a passphrase's
+                        // "4" and a password's "20" are not the same quantity
+                        // -- so they are separate fields on the draft (see
+                        // `GeneratorDraft`) and the suffix says which is on
+                        // screen. The ranges are the route's own clamps; a
+                        // box that offered 1 would come back as 5.
+                        if draft.generator.passphrase {
+                            ui.add(
+                                egui::DragValue::new(&mut draft.generator.words)
+                                    .range(MIN_WORDS..=MAX_WORDS)
+                                    .suffix(" words"),
+                            );
+                        } else {
+                            ui.add(
+                                egui::DragValue::new(&mut draft.generator.length)
+                                    .range(MIN_LENGTH..=MAX_LENGTH)
+                                    .suffix(" chars"),
+                            );
+                        }
+                    });
                     ui.add_space(10.0);
                 }
                 FormBody::Card => {
@@ -1799,5 +1988,137 @@ mod tests {
         assert_eq!(payload["name"], serde_json::json!("New"));
         assert_eq!(payload["folderId"], serde_json::json!("f2"));
         assert_eq!(payload["type"], serde_json::json!(1));
+    }
+
+    // -----------------------------------------------------------------
+    // The password generator
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_fresh_draft_generates_a_password_not_a_passphrase() {
+        // The default matters: it is what the button does before anyone
+        // touches the combo box.
+        let draft = EditDraft::empty();
+        assert!(matches!(
+            draft.generator_request(),
+            GenerateRequest::Password(_)
+        ));
+    }
+
+    #[test]
+    fn the_form_state_reaches_the_request_for_both_kinds() {
+        let mut draft = EditDraft::empty();
+        draft.generator.length = 32;
+        match draft.generator_request() {
+            GenerateRequest::Password(p) => assert_eq!(p.length, 32),
+            other => panic!("expected a password request: {other:?}"),
+        }
+
+        draft.generator.passphrase = true;
+        draft.generator.words = 7;
+        match draft.generator_request() {
+            GenerateRequest::Passphrase(p) => assert_eq!(p.words, 7),
+            other => panic!("expected a passphrase request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_length_the_route_would_silently_raise_is_clamped_before_it_is_sent() {
+        // THE "SUCCEEDS AND IGNORES YOU" GUARD. `bw serve` raises a `length`
+        // below 5 to 5 and `words` below 3 to 3, answers 200, and says
+        // nothing. A form showing 1 would therefore appear to work while
+        // producing something else. Clamping here means the number on screen
+        // and the secret that comes back agree.
+        let mut draft = EditDraft::empty();
+        draft.generator.length = 1;
+        match draft.generator_request() {
+            GenerateRequest::Password(p) => assert_eq!(p.length, MIN_LENGTH),
+            other => panic!("expected a password request: {other:?}"),
+        }
+
+        draft.generator.passphrase = true;
+        draft.generator.words = 1;
+        match draft.generator_request() {
+            GenerateRequest::Passphrase(p) => assert_eq!(p.words, MIN_WORDS),
+            other => panic!("expected a passphrase request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_passphrase_and_a_password_do_not_share_one_number() {
+        // `GeneratorDraft` keeps `length` and `words` apart on purpose. With
+        // one shared field, setting 32 characters and then flipping the combo
+        // box would ask for 32 WORDS -- a request that succeeds and produces
+        // something absurd.
+        let mut draft = EditDraft::empty();
+        draft.generator.length = 32;
+        draft.generator.passphrase = true;
+        match draft.generator_request() {
+            GenerateRequest::Passphrase(p) => assert_eq!(
+                p.words,
+                PassphraseRecipe::default().words,
+                "flipping to a passphrase carried the character length over as a word count"
+            ),
+            other => panic!("expected a passphrase request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn generating_replaces_a_password_the_user_had_already_typed() {
+        // The rule about what a generate REPLACES lives on the draft, not at
+        // the call site -- "only if empty" and "append" are both readings of
+        // the button that this pins out.
+        let mut draft = EditDraft::empty();
+        draft.password = "typed-by-hand".into();
+        draft.set_generated_password("Fresh-Generated-1");
+        assert_eq!(draft.password, "Fresh-Generated-1");
+    }
+
+    #[test]
+    fn a_generated_password_does_not_unmask_the_box_by_itself() {
+        // A deliberate deviation from Bitwarden's own generators, which show
+        // what they produced. `reveal_password` is the user's toggle; a
+        // generate flipping it would put a secret on screen that nobody asked
+        // to see.
+        let mut draft = EditDraft::empty();
+        assert!(!draft.reveal_password, "the premise");
+        draft.set_generated_password("Fresh-Generated-1");
+        assert!(
+            !draft.reveal_password,
+            "generating a password unmasked the box on the user's behalf"
+        );
+    }
+
+    #[test]
+    fn switching_kind_keeps_the_generator_settings() {
+        // `set_kind` clears every kind-specific field because carrying one
+        // kind's DATA into another is how it reaches the wire under the wrong
+        // type. The generator holds no item data -- two numbers and a switch
+        // -- so it is exempt, and this pins that the exemption is deliberate
+        // rather than a field someone forgot to add to `set_kind`.
+        let mut draft = EditDraft::empty();
+        draft.generator.length = 32;
+        draft.generator.passphrase = true;
+        draft.set_kind(ItemKind::Card);
+        draft.set_kind(ItemKind::Login);
+        assert_eq!(draft.generator.length, 32);
+        assert!(draft.generator.passphrase);
+    }
+
+    #[test]
+    fn the_generators_unoffered_options_come_from_the_crates_own_default_recipe() {
+        // The form offers a kind and a size and nothing else, so everything
+        // that makes the result STRONG -- all four character classes, a
+        // minimum digit and symbol, ambiguous characters avoided -- is
+        // supplied by `generator_request`. Nothing else in the app would
+        // notice if it quietly stopped being.
+        match EditDraft::empty().generator_request() {
+            GenerateRequest::Password(p) => {
+                assert!(p.uppercase && p.lowercase && p.number && p.special, "{p:?}");
+                assert!(p.min_number >= 1 && p.min_special >= 1, "{p:?}");
+                assert!(p.avoid_ambiguous, "{p:?}");
+            }
+            other => panic!("expected a password request: {other:?}"),
+        }
     }
 }
