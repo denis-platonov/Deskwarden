@@ -7,6 +7,7 @@ use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, NewLoginItem, VaultItem};
 #[cfg(test)]
 use crate::vault_bridge::{LoginData, UriEntry};
+use crate::vault_window::sidebar;
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use zeroize::Zeroizing;
 
@@ -413,6 +414,35 @@ pub enum EditAction {
     Cancel,
 }
 
+/// The folders this form may actually move an item **into**: the folder list
+/// as the backend sends it, minus `bw serve`'s virtual "No Folder" bucket.
+///
+/// The CLI reports that bucket alongside real folders, as a folder with an
+/// empty id (see [`sidebar::is_virtual_folder`], the one definition of
+/// "virtual" -- an inline `id.is_empty()` here would be a second one).
+/// Listing it as a destination offered the user two near-identical rows --
+/// this form's own hardcoded "No folder" and the server's "No Folder" -- and
+/// choosing the second wrote `folderId: ""`, which is neither a folder the
+/// item is in nor unfiled: `SidebarFilter::Unfiled` means `folder_id: None`,
+/// so the item showed up under no folder row and no virtual row, visible only
+/// under "All items", while the combo box's own label resolved the empty id
+/// back to the bucket's name and so reported success.
+///
+/// A separate pure function rather than a filter inline in the combo box
+/// because nothing in this crate can call [`draw_detail_edit`] (it needs an
+/// egui context), and an untestable seam is exactly what let the unfiltered
+/// loop ship. `the_folder_dropdown_offers_exactly_the_assignable_folders` is
+/// the source-text guard tying the two together.
+///
+/// Note what this does *not* do: it does not make un-filing possible. That is
+/// a separate, backend-side limitation handled by [`EditDraft::may_unfile`],
+/// which greys out the hardcoded "No folder" row. The two are independent --
+/// this one removes a destination that was never real, that one disables a
+/// transition the CLI ignores.
+pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
+    folders.iter().filter(|folder| !sidebar::is_virtual_folder(folder)).collect()
+}
+
 pub fn draw_detail_edit(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
@@ -511,9 +541,17 @@ pub fn draw_detail_edit(
             }
 
             theme::field_label(ui, "Folder");
+            // Both the label and the rows read the *assignable* list, not the
+            // raw one, and the label matters as much as the rows: resolving a
+            // draft's folder id against the virtual bucket is what let an
+            // item carrying `folderId: ""` display the bucket's name and look
+            // correctly filed while belonging to nothing. Unresolvable now
+            // falls through to "No folder", which is at least a state the
+            // sidebar agrees exists.
+            let assignable = assignable_folders(folders);
             egui::ComboBox::from_id_salt("edit-folder")
                 .selected_text(
-                    folders
+                    assignable
                         .iter()
                         .find(|f| Some(&f.id) == draft.folder_id.as_ref())
                         .map(|f| f.name.as_str())
@@ -528,7 +566,7 @@ pub fn draw_detail_edit(
                     if ui.add_enabled(may_unfile, unfile).clicked() {
                         draft.folder_id = None;
                     }
-                    for folder in folders {
+                    for folder in &assignable {
                         let selected = draft.folder_id.as_deref() == Some(folder.id.as_str());
                         if ui.selectable_label(selected, &folder.name).clicked() {
                             draft.folder_id = Some(folder.id.clone());
@@ -599,6 +637,67 @@ mod tests {
             favorite: true,
             other: item_other,
         }
+    }
+
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder { id: id.into(), name: name.into(), other: serde_json::Map::new() }
+    }
+
+    #[test]
+    fn the_virtual_no_folder_bucket_is_not_offered_as_a_destination() {
+        // The regression this guards: `bw serve` reports "no folder" as a
+        // folder with an EMPTY id, and this form's combo box listed the
+        // folder slice verbatim. That put two near-identical rows in the
+        // dropdown -- the hardcoded "No folder" and the server's "No Folder"
+        // -- and choosing the second wrote `folderId: ""`. Such an item then
+        // matches no folder row (its id is "") and no `Unfiled` row (that is
+        // `None`), so it is visible only under "All items", while the pane's
+        // own `selected_text` resolves the empty id to the bucket's name and
+        // reports success.
+        let folders = [folder("", "No Folder"), folder("f1", "Banking"), folder("f2", "Work")];
+        let offered = assignable_folders(&folders);
+        assert_eq!(
+            offered.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["f1", "f2"],
+            "the virtual bucket is not a folder and cannot be one, so it is not a destination"
+        );
+    }
+
+    #[test]
+    fn a_real_folder_named_no_folder_is_still_offered() {
+        // The other half of `sidebar::is_virtual_folder`'s reason for keying
+        // on the ID rather than the name: "No Folder" is user-facing text a
+        // real folder can be called, and filtering by name would lock the
+        // user out of a folder they actually own.
+        let folders = [folder("", "No Folder"), folder("f9", "No Folder")];
+        let offered = assignable_folders(&folders);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].id, "f9");
+    }
+
+    #[test]
+    fn the_folder_dropdown_offers_exactly_the_assignable_folders() {
+        // `draw_detail_edit` needs an egui context, so no test in this crate
+        // can click that combo box -- which is precisely how the unfiltered
+        // loop survived. A source-text guard over this file instead (the
+        // same device as `settings.rs`'s
+        // `the_config_path_still_matches_the_one_main_resolves`): the pure
+        // function above is only worth anything if the dropdown is the thing
+        // calling it.
+        let source = include_str!("detail_edit.rs");
+        assert!(
+            source.contains("let assignable = assignable_folders(folders);"),
+            "the folder combo box no longer builds its rows from `assignable_folders`, so the \
+             virtual \"No Folder\" bucket is being offered as a destination again"
+        );
+        // Assembled rather than written out, or this assertion's own needle
+        // would be the match it is looking for.
+        let raw_loop = format!("for folder in {}", "folders");
+        assert!(
+            !source.contains(&raw_loop),
+            "something in this file iterates the raw folder slice again -- that slice includes \
+             `bw serve`'s virtual bucket; go through `assignable_folders`"
+        );
     }
 
     #[test]
