@@ -295,7 +295,8 @@ fn can_pick_next(selected_id: &Option<String>) -> bool {
 /// click a list belonging to a vault session the user never asked about.
 /// **The two refusals are handled differently, and that distinction lives in
 /// the return type rather than being re-derived here** -- review 26's Minor 3.
-/// While `items_unless_superseded` answered a bare `Option`, a cleared cache
+/// While the checked read answered a bare `Option` (the `items_unless_superseded`
+/// projection review 28's Important 1 deleted), a cleared cache
 /// and a never-filled one were the same answer, so this function ran a full
 /// vault populate -- seconds of HTTP under the spinner -- for a `VaultLocked`
 /// that was already knowable, only to fail the re-check below. Correct answer,
@@ -355,13 +356,25 @@ fn load_items_for_picker(cache: &VaultCache, era: VaultEra) -> PickerItemsResult
             // under the same era is what distinguishes "the vault is here"
             // from "a vault is here, but not yours".
             //
-            // The items-only door on purpose: this is the one read here for
-            // which both refusals really do mean the same thing. The populate
-            // above returned `Populated`, so `Unpopulated` in this era is not
-            // reachable from it, and either way the answer is `VaultLocked`.
-            match cache.items_unless_superseded(era) {
-                Some(items) => items,
-                None => {
+            // BOTH REFUSALS COLLAPSE HERE, ON PURPOSE, AND THIS IS THE ONE
+            // READ IN THE CRATE WHERE THAT IS SOUND -- recorded because it
+            // reads like the collapse review 28 removed from
+            // `settle_sync_outcome`, and it is not the same thing. The
+            // populate above returned `Populated`, and the only thing that
+            // can un-set `populated` afterwards is `clear`, which ALSO bumps
+            // the era; so an `Unpopulated` refusal in this era is not
+            // reachable from this point, and a `Superseded` one is exactly
+            // what the log line below describes. They are also handled
+            // identically -- `VaultLocked` -- so nothing downstream could act
+            // on the difference even if it existed.
+            //
+            // It goes through `snapshot_unless_superseded` regardless (the
+            // file's ONE checked door since review 28's Important 1 deleted
+            // the items-only projection), and the discarded `folders` clone
+            // is the same price this function already pays at its first read.
+            match cache.snapshot_unless_superseded(era) {
+                Ok(snapshot) => snapshot.items,
+                Err(VaultUnavailable::Superseded | VaultUnavailable::Unpopulated) => {
                     log::warn!(
                         "the vault was cleared between the picker's click and its populate; the \
                          snapshot that now exists belongs to a later vault session"
@@ -458,7 +471,7 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     // Captured HERE, on the main thread, before the worker starts: it names
     // the vault session this click belongs to. Everything the worker goes on
     // to read is checked against it in one lock
-    // (`VaultCache::items_unless_superseded`), so a `clear` landing while the
+    // (`VaultCache::snapshot_unless_superseded`), so a `clear` landing while the
     // worker runs -- the vault locking, or a re-auth into a possibly
     // different account -- cannot come back as this click's item list. See
     // `load_items_for_picker`.
@@ -766,6 +779,52 @@ fn can_save_app_match(selected_pid: Option<u32>, backend_ready: &BackendReadines
     selected_pid.is_some() && *backend_ready == BackendReadiness::Ready
 }
 
+/// The gate the button actually uses: [`can_save_app_match`] plus "this
+/// window has not already saved something".
+///
+/// Added by review 28's Important 2, which gave [`AppMatchWrite::ServerOnly`]
+/// a user-visible surface. That surface keeps the window OPEN with a notice
+/// instead of closing it, which is the first state in this window's life
+/// where a save has succeeded and the window still exists -- and a second
+/// Save click from there would re-PUT a match the server already has.
+///
+/// A separate function rather than an `&& !already_saved` at the call site so
+/// it is testable at all: everything else in that closure is unreachable
+/// outside a real event loop.
+fn can_save_app_match_now(
+    selected_pid: Option<u32>,
+    backend_ready: &BackendReadiness,
+    already_saved: bool,
+) -> bool {
+    !already_saved && can_save_app_match(selected_pid, backend_ready)
+}
+
+/// What the user is told, inline and on screen, when the save reached the
+/// server but not the snapshot ([`AppMatchWrite::ServerOnly`]).
+///
+/// Review 28's Important 2: this state had no surface at all. `run_picker`
+/// returned `Some(m)`, `main` logged a warn, and the user was shown a window
+/// that simply closed -- the same thing a fully live save looks like -- while
+/// the match was invisible to everything reading the cache.
+///
+/// **The wording deliberately does not promise the next sync will fix it**,
+/// which is what every copy of this message used to say. That promise holds
+/// only for the unpopulated miss. The reachable path for the other one --
+/// the id being absent from a populated snapshot -- needs the item to have
+/// stopped existing after the PUT was accepted (see
+/// [`crate::vault_cache::AppMatchWrite::ServerOnly`]'s own doc), and no sync
+/// can bring a deleted item's match back. So this says what is TRUE for both
+/// -- the vault has it, this app's autofill may not yet -- and names the one
+/// action that is always right.
+fn server_only_notice(item_name: &str) -> String {
+    format!(
+        "Your match was saved to \u{201c}{item_name}\u{201d} in your vault, but Deskwarden \
+         couldn\u{2019}t make it live in this session -- so autofill may not use it yet. Reopen \
+         your vault (or restart Deskwarden) and check the item; if the match isn\u{2019}t there, \
+         the item was changed or removed elsewhere while you were saving."
+    )
+}
+
 /// The inline message shown for a failed save attempt (review 10's
 /// Important 1's sibling bug, and the redesign's item 2): stays inline,
 /// under the Save/Cancel row, rather than a `MessageBoxW` -- this app has its
@@ -853,12 +912,30 @@ fn spawn_readiness_probe(cache: &VaultCache) -> mpsc::Receiver<Result<(), String
     ready_rx
 }
 
+/// What [`run_picker`] hands back on a successful Save: the match the user
+/// built **and** how far it actually got.
+///
+/// A struct rather than a bare [`AppMatch`] because of review 28's Important
+/// 2. The caller's next act is to rebuild the match engine, and for
+/// [`AppMatchWrite::ServerOnly`] the snapshot it would rebuild from does not
+/// hold this match -- so `Some(AppMatch)` alone was an answer the caller
+/// could not act on correctly, and it silently armed an engine without the
+/// thing the user had just spent two windows creating.
+///
+/// `None` still means, and only means, "the user cancelled". A save that
+/// reached the server is `Some` whichever variant it carries: reporting it as
+/// a cancellation would be a different and false statement.
+pub struct SavedAppMatch {
+    pub app_match: AppMatch,
+    pub write: AppMatchWrite,
+}
+
 pub fn run_picker(
     cache: Arc<VaultCache>,
     target_item: VaultItem,
     default_pid: Option<u32>,
     backend_already_running: bool,
-) -> Option<AppMatch> {
+) -> Option<SavedAppMatch> {
     let windows: Vec<WindowInfo> = window_list::list_windows(std::process::id());
 
     // The update closure must `move`-capture its state (it's FnMut + 'static
@@ -869,7 +946,7 @@ pub fn run_picker(
     // returns. This is safe because eframe runs the closure on the same
     // thread that's blocked inside `run_simple_native` -- there's no
     // cross-thread sharing happening.
-    let result: Rc<RefCell<Option<AppMatch>>> = Rc::new(RefCell::new(None));
+    let result: Rc<RefCell<Option<SavedAppMatch>>> = Rc::new(RefCell::new(None));
     let result_for_closure = result.clone();
 
     let default_window = default_pid.and_then(|pid| windows.iter().find(|w| w.pid == pid));
@@ -920,6 +997,15 @@ pub fn run_picker(
     // process choice both still intact for the user to try "Add app..."
     // again from scratch if they want to.
     let mut save_error: Option<String> = None;
+
+    // The other inline message, added by review 28's Important 2 and rendered
+    // in the same slot: the save SUCCEEDED against the server but the cache's
+    // snapshot did not take it (`AppMatchWrite::ServerOnly`). Distinct from
+    // `save_error` in three ways that all matter -- it is not an error, it is
+    // terminal (there is nothing useful to retry), and the window's result is
+    // already set when it appears, so closing from here still returns the
+    // saved match rather than a cancellation. See `server_only_notice`.
+    let mut save_notice: Option<String> = None;
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1091,6 +1177,13 @@ pub fn run_picker(
                     ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
                     ui.add_space(6.0);
                 }
+                // Same slot, same idiom, deliberately NOT `theme::ERROR`: the
+                // save worked, and colouring it as a failure would send the
+                // user to re-do something that is already in their vault.
+                if let Some(notice) = &save_notice {
+                    ui.label(RichText::new(notice).size(11.0).color(theme::TEXT_FAINT));
+                    ui.add_space(6.0);
+                }
 
                 ui.horizontal(|ui| {
                     // Item 1 (review 10's Important 1) and item 3 (Important
@@ -1098,7 +1191,8 @@ pub fn run_picker(
                     // with nothing selected, and unclickable until the
                     // backend is confirmed to actually be answering --
                     // never both true is what let either bug happen before.
-                    let can_save = can_save_app_match(selected_pid, &backend_ready);
+                    let can_save =
+                        can_save_app_match_now(selected_pid, &backend_ready, save_notice.is_some());
                     let save_clicked = ui
                         .add_enabled_ui(can_save, |ui| theme::primary_button(ui, "Save", None))
                         .inner
@@ -1134,19 +1228,45 @@ pub fn run_picker(
                                         // different and false statement. See
                                         // the ledger for the `main.rs` half
                                         // this cannot reach from here.
+                                        // Set BEFORE the arms below, because
+                                        // the `ServerOnly` arm deliberately
+                                        // does not close the window: whatever
+                                        // closes it afterwards (Cancel, the
+                                        // title-bar X) must still hand this
+                                        // match back, since the save really
+                                        // did happen.
+                                        *result_for_closure.borrow_mut() = Some(SavedAppMatch {
+                                            app_match: m,
+                                            write: written,
+                                        });
                                         match written {
-                                            AppMatchWrite::WroteThrough => {}
-                                            AppMatchWrite::ServerOnly => log::warn!(
-                                                "saved the app match for vault item {} to the \
-                                                 server, but the cache's snapshot does not hold \
-                                                 that item, so a match engine rebuilt from the \
-                                                 cache will NOT have it; it goes live at the \
-                                                 next full sync",
-                                                target_item.id
-                                            ),
+                                            AppMatchWrite::WroteThrough => done = true,
+                                            AppMatchWrite::ServerOnly => {
+                                                log::warn!(
+                                                    "saved the app match for vault item {} to the \
+                                                     server, but the cache's snapshot does not \
+                                                     hold that item, so a match engine rebuilt \
+                                                     from the cache alone would NOT have it",
+                                                    target_item.id
+                                                );
+                                                // Review 28's Important 2:
+                                                // this used to close exactly
+                                                // like a fully live save, so
+                                                // the ONE state where the
+                                                // user has to do something
+                                                // looked identical to the
+                                                // state where they do not.
+                                                // Staying open is what makes
+                                                // the notice visible at all;
+                                                // `can_save` above goes false
+                                                // the moment it is set, so
+                                                // Cancel (relabelled below)
+                                                // is the only way on.
+                                                save_error = None;
+                                                save_notice =
+                                                    Some(server_only_notice(&target_item.name));
+                                            }
                                         }
-                                        *result_for_closure.borrow_mut() = Some(m);
-                                        done = true;
                                     }
                                     // Item 2 (review 10's Important 1): stay
                                     // open with the item and process choice
@@ -1171,7 +1291,16 @@ pub fn run_picker(
                             }
                         }
                     }
-                    if theme::secondary_button(ui, "Cancel").clicked() {
+                    // "Close", not "Cancel", once a save has landed: the
+                    // window's result is already set, so this button no
+                    // longer cancels anything and labelling it as though it
+                    // did would suggest clicking it undoes the save.
+                    let dismiss = if save_notice.is_some() {
+                        "Close"
+                    } else {
+                        "Cancel"
+                    };
+                    if theme::secondary_button(ui, dismiss).clicked() {
                         done = true;
                     }
                 });
@@ -1636,6 +1765,53 @@ mod tests {
         assert!(
             !other.contains("expired"),
             "a non-auth failure must not claim the session expired: {other}"
+        );
+    }
+
+    /// Review 28's Important 2. A `ServerOnly` save is not a failure -- the
+    /// vault has the match -- so Save must not stay armed for a retry that
+    /// would PUT the same match again; the window is now a report, and the
+    /// only thing left to do in it is close it.
+    #[test]
+    fn save_is_disabled_once_a_save_has_already_succeeded() {
+        assert!(
+            !can_save_app_match_now(Some(1234), &BackendReadiness::Ready, true),
+            "the save already landed on the server; clicking Save again repeats the PUT"
+        );
+        assert!(
+            can_save_app_match_now(Some(1234), &BackendReadiness::Ready, false),
+            "and it must not disable Save for a window that has saved nothing yet"
+        );
+        assert!(
+            !can_save_app_match_now(None, &BackendReadiness::Ready, false),
+            "the original gate still applies underneath"
+        );
+    }
+
+    /// Review 28's Important 2 again: `ServerOnly` had NO user-visible
+    /// surface -- `run_picker` returned `Some(m)` and only logged, so the
+    /// user was told nothing while the match sat live on the server and
+    /// invisible to everything reading the cache.
+    ///
+    /// The wording is asserted rather than left to taste because the old copy
+    /// promised a remedy that does not apply: "it goes live at the next full
+    /// sync" is true for the unpopulated miss and FALSE for the reachable
+    /// `position` miss, where the item was deleted out from under the write
+    /// and no sync can bring the match back.
+    #[test]
+    fn the_server_only_notice_does_not_promise_a_sync_will_fix_it() {
+        let notice = server_only_notice("GitHub");
+        assert!(
+            notice.contains("GitHub"),
+            "the user needs to know WHICH item this is about: {notice}"
+        );
+        assert!(
+            notice.contains("saved"),
+            "the save succeeded and saying otherwise would send the user to re-do it: {notice}"
+        );
+        assert!(
+            !notice.contains("next full sync") && !notice.contains("goes live at"),
+            "a promise the crate cannot keep -- see this test's doc: {notice}"
         );
     }
 }

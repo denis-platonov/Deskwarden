@@ -45,8 +45,8 @@ use std::sync::Mutex;
 ///    snapshot as it stands now.
 ///
 /// So an era answers "may I still act on the vault session I saw?", never "is
-/// what I fetched still current?". A consumer that needs items should ask
-/// [`VaultCache::items_unless_superseded`], which answers the first question
+/// what I fetched still current?". A consumer that needs the vault should ask
+/// [`VaultCache::snapshot_unless_superseded`], which answers the first question
 /// and hands back the answer to the second in one step, under one lock,
 /// rather than comparing eras and then re-deriving data itself.
 ///
@@ -90,8 +90,9 @@ pub struct VaultEpoch {
 }
 
 impl VaultEpoch {
-    /// Just the vault-session half -- what [`VaultCache::items_unless_superseded`]
-    /// takes, and all a *reader* of the snapshot ever needs.
+    /// Just the vault-session half -- what
+    /// [`VaultCache::snapshot_unless_superseded`] takes, and all a *reader* of
+    /// the snapshot ever needs.
     pub fn era(&self) -> VaultEra {
         self.era
     }
@@ -274,9 +275,23 @@ pub enum VaultUnavailable {
 /// Returned instead of a bare `Ok(())` because the write-through to the
 /// snapshot can miss, and a caller that arms its match engine from that
 /// snapshot needs to know it did (review 26's Minor 2). It is not a *failure*
-/// -- the vault has the match and the next full sync will bring it back -- so
-/// it is not a [`VaultError`]; but it is emphatically not "saved and live"
-/// either, and every call site that could only see `Ok` read it as that.
+/// -- the server accepted the write -- so it is not a [`VaultError`]; but it
+/// is emphatically not "saved and live" either, and every call site that
+/// could only see `Ok` read it as that.
+///
+/// **ONE VARIANT FOR TWO MISSES, AND THE GROUND IS "SAME IMMEDIATE CALLER
+/// ACTION", NOT "SAME REMEDY"** -- review 28's Important 2 corrected this.
+/// Until then the doc said both misses were cured by the next full sync.
+/// That is true of the unpopulated miss and FALSE of the other one (see
+/// [`Self::ServerOnly`]), so a variant justified on a shared remedy was
+/// justified on something that does not hold. What both misses really share
+/// is the only thing the caller can act on at the instant it gets the answer:
+/// **the snapshot does not reflect this write, so do not arm anything from
+/// it as though it did.** That is one fact, so it is one variant.
+/// [`PopulateOutcome`]'s split exists because ITS two cases demand opposite
+/// caller behaviour; these two demand identical behaviour and differ only
+/// diagnostically, which is why the difference lives in two `log::warn!`
+/// lines instead of the type.
 ///
 /// Deliberately NOT `#[must_use]`: the enum travels inside a `Result`, where
 /// (as [`PopulateOutcome`]'s doc records, measured rather than assumed) the
@@ -289,11 +304,36 @@ pub enum AppMatchWrite {
     /// The server accepted the match AND the snapshot now holds the matched
     /// item, so anything rebuilt from the cache has it.
     WroteThrough,
-    /// The server accepted the match but the snapshot does not hold it: the
-    /// cache is unpopulated, or the id is no longer in it (our PUT raced a
-    /// remote delete, and a populate has since written a fetch back without
-    /// it). Nothing is pending either -- there is no snapshot copy for a
-    /// replay to take -- so only a fresh populate can make the match live.
+    /// The server accepted the match but the snapshot does not hold it.
+    /// Nothing is pending either -- the `position` miss skips
+    /// [`Snapshot::note_item_write`], so there is no snapshot copy for a
+    /// later populate's replay to take.
+    ///
+    /// **TWO MISSES, AND THEY DO NOT HAVE THE SAME CURE** (review 28's
+    /// Important 2 -- the doc used to claim they did):
+    ///
+    ///  * **The cache is unpopulated.** Wide open, and cured by ANY populate:
+    ///    a `clear` (lock, re-auth, quit) with nothing filled after it. The
+    ///    item still exists, so the next sync really does make the match live.
+    ///  * **The id is absent from a POPULATED snapshot.** Narrow, and NOT
+    ///    curable by a sync. Work out what reaches it: the PUT succeeded, so
+    ///    the item existed server-side when it was processed; for a populate's
+    ///    fetch to then lack the id, the item must have stopped existing
+    ///    between that moment and the fetch; and that populate's write-back
+    ///    must beat this method's `self.lock()`, which is the statement
+    ///    immediately after the PUT returns -- so the whole window is the
+    ///    PUT's response-return latency. Real, but tiny. The scenario the doc
+    ///    named before ("our PUT raced a remote delete") does not hold as
+    ///    written: if the delete lands FIRST, `VaultBridge::set_app_match`
+    ///    returns `Err` and this variant is never produced. The delete has to
+    ///    come AFTER, which is exactly why no sync can bring the match back --
+    ///    the item it was attached to is gone.
+    ///
+    /// So nothing on this path may promise the user a sync will fix it. What
+    /// is true for both is that the vault has the write and this process's
+    /// snapshot does not; see `picker_ui::server_only_notice` for the copy
+    /// that says only that, and `main`'s `add_app_rebuild_source` for the one
+    /// thing a caller can do about it without a fetch.
     ServerOnly,
 }
 
@@ -492,73 +532,57 @@ impl VaultCache {
         self.lock().populates
     }
 
-    /// The snapshot's items **as they stand now**, or `None` if a
-    /// [`Self::clear`] has started a new era since `era` was captured.
-    ///
-    /// This is the one place that answers "is a result computed back in
-    /// `era` still applicable, and if so what should I act on?". It exists
-    /// because those are two questions that were being answered by two
-    /// different mechanisms, and the pairing was wrong (review 18's third
-    /// finding): callers compared eras to decide applicability and then
-    /// acted on a `Vec` frozen at their own, earlier fetch. Since a write
-    /// mutates the snapshot without starting a new era (see [`VaultEra`]),
-    /// "the era still matches" was read as "so my frozen copy is still the
-    /// snapshot", which it never was -- and an app match saved while a sync
-    /// was in flight was silently overwritten by that sync's older list.
-    ///
-    /// Returning the items rather than a bool is the whole point: the answer
-    /// to "still applicable?" is useless without the data it applies to, and
-    /// splitting them is what let them drift apart. Both facts are read under
-    /// a single lock, so no `clear` can land between the check and the read.
-    ///
-    /// `None` also covers an unpopulated snapshot in the same era, and that
-    /// half is LOAD-BEARING, not defensive (it was documented as unreachable
-    /// until review 25's Minor 3). `era` is a `u64` starting at zero and
-    /// `clear` is what advances it, so the snapshot a process starts with --
-    /// never populated, era 0 -- compares EQUAL to an era captured before the
-    /// first populate. That is exactly the state `picker_ui`'s
-    /// `load_items_for_picker` asks about on every "Add app..." click, and
-    /// reading the era as a proxy for "so it is populated" would hand it an
-    /// empty `Vec` as though it were the vault. This function's job is to hand
-    /// back a vault, and an empty unpopulated snapshot is not one (see
-    /// [`PopulateOutcome`]).
-    ///
-    /// **WHICH OF THE TWO CHECKED DOORS TO USE, in one sentence each:** this
-    /// one when items are the only fact you act on and either refusal means
-    /// the same thing to you; [`Self::snapshot_unless_superseded`] whenever
-    /// you also need folders, or need to tell a superseded era apart from a
-    /// snapshot that has simply never been filled.
-    ///
-    /// This is the items-only projection of that function, not a second
-    /// mechanism: it delegates, so there is still exactly ONE lock
-    /// acquisition and ONE era check in the file. `items_if_populated()` --
-    /// the same thing minus the era check -- was retired by review 25's
-    /// Minor 3 rather than let the file answer one question two ways, and the
-    /// same rule applies here: a caller that wants folders too must not
-    /// compose this with [`Self::folders`], which is exactly the tear review
-    /// 26's Important 2 is about. [`Self::items`] and [`Self::folders`]
-    /// remain as the unchecked reads for callers that have established both
-    /// facts some other way.
-    pub fn items_unless_superseded(&self, era: VaultEra) -> Option<Vec<VaultItem>> {
-        self.snapshot_unless_superseded(era)
-            .ok()
-            .map(|snapshot| snapshot.items)
-    }
-
     /// The vault as one observation: items **and** folders, read under a
     /// single lock and checked against `era` in the same acquisition.
     ///
-    /// **Why this exists at all** (review 26's Important 2). The file had an
-    /// era-checked door for items and none for folders, so the repair anyone
-    /// reading it reaches for -- `items_unless_superseded(era)` followed by a
+    /// **THE ONE CHECKED DOOR.** Every era-checked read in the crate comes
+    /// through here -- three production call sites as of review 28's
+    /// Important 1 (`main`'s "Add app..." rebuild, `main`'s
+    /// `settle_sync_outcome`, and `picker_ui`'s `load_items_for_picker`,
+    /// which asks twice). The items-only projection that used to sit above
+    /// this, `items_unless_superseded`, is GONE: it was introduced as a
+    /// two-line `.ok().map(|s| s.items)` with one caller and a recorded
+    /// tripwire ("if a third caller appears, the projection has become a door
+    /// again"), and the tripwire had already tripped when it was written.
+    /// What it cost was not a lock -- it delegated -- but the REFUSAL: it
+    /// folded `Superseded` and `Unpopulated` into one `None`, and
+    /// `settle_sync_outcome` then logged "after the vault was cleared" for a
+    /// refusal it had not distinguished. See that function.
+    ///
+    /// **The price of having only this door**, weighed rather than waved
+    /// past: two of the three call sites run on the UI thread and discard the
+    /// `folders` half, so they clone a `Vec<Folder>` -- two `String`s per
+    /// folder -- under the mutex that `app::handle_match` blocks every
+    /// autofill on. That is two or three orders of magnitude below the
+    /// `Vec<VaultItem>` clone the same call already pays on the same line
+    /// (each item carries a name, a field vec, and a login with its uris), so
+    /// it does not change the shape of the critical section. If it ever does,
+    /// the answer is a borrow-based read under the guard, NOT a second door.
+    ///
+    /// **Why an era-checked read at all** (review 18's third finding).
+    /// "Is a result computed back in `era` still applicable?" and "so what
+    /// should I act on?" were being answered by two different mechanisms, and
+    /// the pairing was wrong: callers compared eras to decide applicability
+    /// and then acted on a `Vec` frozen at their own, earlier fetch. Since a
+    /// write mutates the snapshot without starting a new era (see
+    /// [`VaultEra`]), "the era still matches" was read as "so my frozen copy
+    /// is still the snapshot", which it never was -- and an app match saved
+    /// while a sync was in flight was silently overwritten by that sync's
+    /// older list. Returning the data rather than a bool is the whole point:
+    /// the answer to "still applicable?" is useless without the data it
+    /// applies to, and splitting them is what let them drift apart.
+    ///
+    /// **Why items and folders together** (review 26's Important 2). The file
+    /// had an era-checked door for items and none for folders, so the repair
+    /// anyone reading it reaches for -- the checked items read followed by a
     /// bare `folders()` -- takes the lock twice with a `clear` window between
     /// the two, and LOOKS checked. The result is a refresh that paints one
-    /// account's items filed under another account's folders. That is the
-    /// same "both facts, one observation" argument
-    /// [`Self::items_unless_superseded`]'s own doc makes, applied to the pair
-    /// rather than to check-and-data: the check and the two halves must not
-    /// be able to drift apart, and the only place that can be guaranteed is
-    /// inside one lock scope, here.
+    /// account's items filed under another account's folders. Same argument
+    /// as above, applied to the pair rather than to check-and-data: the check
+    /// and the two halves must not be able to drift apart, and the only place
+    /// that can be guaranteed is inside one lock scope, here.
+    /// [`Self::items`] and [`Self::folders`] remain as the UNCHECKED reads,
+    /// for callers that have established both facts some other way.
     ///
     /// **Why the refusal is typed rather than an `Option`** (review 26's
     /// Minor 3). The two ways to have no vault want opposite handling from
@@ -833,7 +857,7 @@ impl VaultCache {
     /// Also begins a new era, which is what makes this actually stick against
     /// a populate that is already in flight -- see [`Self::populate`]. It is
     /// the ONLY thing that begins one, deliberately: see [`VaultEra`] for why
-    /// the writes below must not, and [`Self::items_unless_superseded`] for
+    /// the writes below must not, and [`Self::snapshot_unless_superseded`] for
     /// what consumers should ask instead of comparing eras themselves.
     ///
     /// The pending-write logs go with the data they describe: there is no
@@ -896,17 +920,17 @@ impl VaultCache {
     /// match field the server had just been told to save.
     /// **The write-through can miss, and it is REPORTED rather than swallowed**
     /// -- review 26's Minor 2. This used to answer `Ok(())` whether or not the
-    /// snapshot took the match, and the miss needs no `clear` to reach: a tray
-    /// Sync is in flight (the "Add app..." handler does not gate on
-    /// `backend_task_in_progress`), its `populate_with` lands while the user is
-    /// still in `run_picker`, and its fetch legitimately no longer holds the
-    /// item because our PUT raced a remote delete. The `position` miss then
-    /// skipped [`Snapshot::note_item_write`] too, so nothing was pending for a
-    /// later populate to replay either; `main` rebuilt the engine from a
-    /// same-era populated snapshot (its `else` warn does NOT fire) and armed it
-    /// without the match, while the user had been told the save succeeded. It
-    /// had -- server-side -- which is why this is an [`AppMatchWrite`] and not
-    /// a [`VaultError`].
+    /// snapshot took the match. The consequence is the same for either miss:
+    /// `main` rebuilds the engine from a same-era populated snapshot (its
+    /// `else` warn does NOT fire) and arms it without the match, while the
+    /// user has been told the save succeeded. It had -- server-side -- which
+    /// is why this is an [`AppMatchWrite`] and not a [`VaultError`].
+    ///
+    /// The unpopulated miss needs only a `clear` with nothing filled after it.
+    /// What reaches the `position` miss is narrower than this doc used to
+    /// claim, and the difference matters because the two misses have different
+    /// cures -- see [`AppMatchWrite::ServerOnly`], which works it out in full
+    /// (review 28's Important 2).
     ///
     /// **The other writes on this type are NOT all the same case**, and the
     /// difference is in what the miss costs, not in its shape:
@@ -917,16 +941,27 @@ impl VaultCache {
     ///    unpopulated cache has nothing for them to be missing FROM.
     ///  * [`Self::update_item`] and [`Self::update_folder`] have exactly this
     ///    `position` miss and exactly this silence. They are deliberately left
-    ///    alone here, for a reason and not for tidiness: their loss is an edit
-    ///    the snapshot does not show, which the next populate brings in from
-    ///    the server anyway and which no consumer arms anything from -- and an
-    ///    id absent from the snapshot is also absent from the vault window's
-    ///    list, so there is no follow-on edit to PUT a stale copy back. This
-    ///    one is different because the *point* of the write is a match engine
-    ///    rebuilt from the snapshot moments later, so a silent miss is a
-    ///    feature that visibly does nothing. Both of their call sites live in
-    ///    `vault_window/`, which this pass did not own; changing their return
-    ///    types is recorded in the ledger as the consistent follow-up.
+    ///    alone here, for a reason and not for tidiness -- but NOT the reason
+    ///    recorded in review 26, which was false (review 28's Minor 2). That
+    ///    reason was "an id absent from the snapshot is also absent from the
+    ///    vault window's list, so there is no follow-on edit to PUT a stale
+    ///    copy back". The window's list is a LOCAL `Vec` loaded once when the
+    ///    window opens and mutated in place on every save
+    ///    (`items[pos] = updated`), whether or not the write-through landed,
+    ///    so snapshot absence says nothing whatever about list presence.
+    ///
+    ///    The real reason is stronger, and it is the same fact read the other
+    ///    way round: the BASE for a subsequent edit is also that local vec, so
+    ///    it already carries the prior edit. A second edit therefore PUTs the
+    ///    prior edit plus the new one, which is correct -- there is no stale
+    ///    copy anywhere on the path, and the missed write-through costs only
+    ///    an item the window's own list is right about and the cache is
+    ///    behind on until the next populate. Nothing arms itself from that.
+    ///    `set_app_match` is different because the *point* of the write is a
+    ///    match engine rebuilt from the snapshot moments later, so a silent
+    ///    miss there is a feature that visibly does nothing. Both of their
+    ///    call sites live in `vault_window/`, which neither pass owned;
+    ///    changing their return types stays a recorded follow-up.
     pub fn set_app_match(
         &self,
         item: &VaultItem,
@@ -938,18 +973,17 @@ impl VaultCache {
             drop(snapshot);
             log::warn!(
                 "saved an app match onto vault item {} but the cache holds no snapshot to write \
-                 it through to; it goes live at the next populate",
+                 it through to; the vault has it and any populate will bring it in",
                 item.id
             );
             return Ok(AppMatchWrite::ServerOnly);
         }
-        // The two misses are one variant on purpose, and that is not the
-        // `PopulateOutcome` mistake being repeated: a caller's question here
-        // is "does the snapshot reflect this write?", and for both the answer
-        // is no for the same reason and with the same remedy (a populate).
-        // `PopulateOutcome`'s two variants exist because they demand OPPOSITE
-        // caller behaviour. The distinction that is genuinely useful between
-        // these two is diagnostic, so it lives in the log line, not the type.
+        // The two misses are one variant on purpose -- see `AppMatchWrite`,
+        // which states the ground: the same IMMEDIATE caller action, NOT the
+        // same remedy. Review 28's Important 2 found the remedy is not in
+        // fact shared, and that the variant had been justified on it.
+        // The distinction that IS genuinely useful between them is
+        // diagnostic, so it lives in these two log lines, not in the type.
         match snapshot.items.iter().position(|i| i.id == item.id) {
             Some(at) => {
                 snapshot.items[at] = with_app_match(item, m);
@@ -960,8 +994,9 @@ impl VaultCache {
                 drop(snapshot);
                 log::warn!(
                     "saved an app match onto vault item {} but the snapshot no longer holds that \
-                     id -- a populate's fetch dropped it (our write raced a remote delete), so \
-                     nothing rebuilt from the cache will have this match until the next full sync",
+                     id -- a populate's fetch dropped it, which needs the item to have stopped \
+                     existing AFTER the server accepted this write, so a later sync will NOT \
+                     bring the match back. Nothing rebuilt from the cache alone will have it",
                     item.id
                 );
                 Ok(AppMatchWrite::ServerOnly)
@@ -1431,6 +1466,13 @@ mod tests {
         );
     }
 
+    // NAME KEPT ACROSS REVIEW 28'S DELETION OF `items_unless_superseded`, for
+    // this test and the two below it. The projection is gone and every call
+    // here now goes through `snapshot_unless_superseded`; what these three
+    // pin is the CONTRACT of the checked read ("items, unless superseded"),
+    // which is unchanged, and their assertions are untouched down to the
+    // message text. Renaming them would have silently broken the by-name
+    // verification the review briefs use.
     #[test]
     fn items_unless_superseded_hands_back_a_write_that_landed_after_the_epoch_was_captured() {
         // The contract in one test (review 18's third finding). A caller
@@ -1475,8 +1517,9 @@ mod tests {
         );
 
         let items = cache
-            .items_unless_superseded(epoch.era())
-            .expect("a write is not a supersession -- the vault session is the same one");
+            .snapshot_unless_superseded(epoch.era())
+            .expect("a write is not a supersession -- the vault session is the same one")
+            .items;
         let updated = items.into_iter().find(|i| i.id == "1").unwrap();
         assert!(
             updated
@@ -1513,16 +1556,16 @@ mod tests {
         let epoch = cache.epoch();
         cache.clear();
 
-        assert!(cache.items_unless_superseded(epoch.era()).is_none());
+        assert!(cache.snapshot_unless_superseded(epoch.era()).is_err());
         // ...and a *repopulate* for the new account does not make the old
         // era applicable again: this is the cross-account case, and the
         // era is what closes it.
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         assert!(
-            cache.items_unless_superseded(epoch.era()).is_none(),
+            cache.snapshot_unless_superseded(epoch.era()).is_err(),
             "an era from before a clear must stay superseded even once the cache refills"
         );
-        assert!(cache.items_unless_superseded(cache.epoch().era()).is_some());
+        assert!(cache.snapshot_unless_superseded(cache.epoch().era()).is_ok());
     }
 
     /// Every mock a populate plus a write to item 1 needs.
@@ -1648,15 +1691,18 @@ mod tests {
         let cache = cache_for(server.url());
         let era_before_any_populate = cache.epoch().era();
         assert!(
-            cache.items_unless_superseded(era_before_any_populate).is_none(),
+            cache
+                .snapshot_unless_superseded(era_before_any_populate)
+                .is_err(),
             "a snapshot that has never been filled is not a vault, however current its era"
         );
 
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         assert_eq!(
             cache
-                .items_unless_superseded(era_before_any_populate)
+                .snapshot_unless_superseded(era_before_any_populate)
                 .unwrap()
+                .items
                 .len(),
             2,
             "a populate does not begin a new era, so the same era must now yield the vault"
@@ -1664,7 +1710,9 @@ mod tests {
 
         cache.clear();
         assert!(
-            cache.items_unless_superseded(era_before_any_populate).is_none(),
+            cache
+                .snapshot_unless_superseded(era_before_any_populate)
+                .is_err(),
             "a cleared snapshot is not a vault either"
         );
     }
@@ -1989,11 +2037,17 @@ mod tests {
 
     #[test]
     fn snapshot_unless_superseded_cannot_hand_back_two_eras_at_once() {
-        // REVIEW 26'S IMPORTANT 2. The repair a reader reaches for is
-        // `items_unless_superseded(era)` plus a bare `cache.folders()`. That
-        // is two lock acquisitions with a `clear` window between them, and it
-        // LOOKS checked. This test exhibits the tear in that spelling and
-        // then shows the combined door cannot produce the same pair.
+        // REVIEW 26'S IMPORTANT 2. The repair a reader reaches for is a
+        // checked ITEMS read plus a bare `cache.folders()`. That is two lock
+        // acquisitions with a `clear` window between them, and it LOOKS
+        // checked. This test exhibits the tear in that spelling and then
+        // shows the combined door cannot produce the same pair.
+        //
+        // Since review 28's Important 1 there is no items-only door to spell
+        // the first half with, so it is spelled as the projection that door
+        // WAS (`.map(|s| s.items)`) -- which is the shape any future caller
+        // tempted to re-add one would write, and therefore still the tear
+        // being exhibited.
         let mut server = mockito::Server::new();
         let _i = server
             .mock("GET", "/list/object/items")
@@ -2014,7 +2068,8 @@ mod tests {
         // The two-call spelling, with the `clear` landing in the window it
         // leaves open. Scripted rather than raced, so it is deterministic.
         let torn_items = cache
-            .items_unless_superseded(era)
+            .snapshot_unless_superseded(era)
+            .map(|snapshot| snapshot.items)
             .expect("the era is still current at this point");
         cache.clear();
         let torn_folders = cache.folders();

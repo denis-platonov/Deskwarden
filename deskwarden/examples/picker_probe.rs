@@ -59,9 +59,13 @@ fn main() {
     // need to spawn its own readiness wait -- same `backend_already_running`
     // meaning `main.rs`'s real call site passes.
     match run_picker(cache.clone(), target.clone(), None, true) {
-        Some(m) => println!(
-            "Saved AppMatch: process={} trigger={:?}",
-            m.process, m.trigger
+        // `write` is printed too, because it is the whole point of review
+        // 28's Important 2: a `ServerOnly` save looks identical to a live one
+        // from the outside, and this probe exists to make the picker's real
+        // behaviour observable by hand.
+        Some(saved) => println!(
+            "Saved AppMatch: process={} trigger={:?} write={:?}",
+            saved.app_match.process, saved.app_match.trigger, saved.write
         ),
         None => println!("Picker was cancelled (or save failed) -- got None"),
     }
