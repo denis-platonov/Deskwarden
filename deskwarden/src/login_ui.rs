@@ -688,6 +688,274 @@ pub fn round_window_corners(window_title: &str) {
     }
 }
 
+/// Thickness of the invisible band along each window *edge* that starts a
+/// resize drag, in egui points. 6 is what Windows itself uses for a
+/// non-themed frame's sizing border; wider starts eating clicks meant for the
+/// sidebar's own left edge.
+const RESIZE_BAND: f32 = 6.0;
+/// Side of the square zone at each *corner*, which resizes in both axes at
+/// once. Deliberately larger than [`RESIZE_BAND`]: a corner is the hardest
+/// target to hit and the only one that cannot be reached any other way.
+const RESIZE_CORNER: f32 = 14.0;
+
+/// One resize hit-zone: where it is, which way it resizes, and the cursor it
+/// shows while the pointer is over it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResizeZone {
+    pub rect: egui::Rect,
+    pub direction: egui::viewport::ResizeDirection,
+    pub cursor: egui::CursorIcon,
+    /// Stable, per-zone suffix for the interaction id. Not the direction's
+    /// `Debug` string: ids are load-bearing across frames and must not move
+    /// if that formatting ever changes.
+    pub id: &'static str,
+}
+
+/// The eight zones -- four corners, four edges -- for a window occupying
+/// `window`.
+///
+/// Pure and separate from any drawing so the geometry can be asserted
+/// directly; the drawing half ([`draw_resize_handles`]) needs a real window
+/// and cannot be.
+///
+/// The zones DO NOT OVERLAP, and that is the whole design. egui resolves a
+/// hit to one widget, so overlapping corner and edge zones would mean the
+/// corner works only where it happens to have been registered later -- a rule
+/// that lives in call order and cannot be read off the geometry. Here the
+/// corners take their `RESIZE_CORNER` squares first and each edge spans only
+/// what is left between them, so which zone a point belongs to is a property
+/// of the rects alone.
+///
+/// An edge whose span between the corners would be empty (a window narrower
+/// or shorter than two corners) is omitted rather than emitted inverted: an
+/// inverted `Rect` silently contains nothing, so it would be a zone that
+/// exists in the list and can never be hit.
+pub fn resize_zones(window: egui::Rect, band: f32, corner: f32) -> Vec<ResizeZone> {
+    use egui::viewport::ResizeDirection as Dir;
+    use egui::CursorIcon as Cursor;
+
+    let (left, top, right, bottom) = (window.min.x, window.min.y, window.max.x, window.max.y);
+    let mut zones = vec![
+        ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(left, top), Pos2::new(left + corner, top + corner)),
+            direction: Dir::NorthWest,
+            cursor: Cursor::ResizeNorthWest,
+            id: "nw",
+        },
+        ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(right - corner, top), Pos2::new(right, top + corner)),
+            direction: Dir::NorthEast,
+            cursor: Cursor::ResizeNorthEast,
+            id: "ne",
+        },
+        ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(left, bottom - corner), Pos2::new(left + corner, bottom)),
+            direction: Dir::SouthWest,
+            cursor: Cursor::ResizeSouthWest,
+            id: "sw",
+        },
+        ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(right - corner, bottom - corner), Pos2::new(right, bottom)),
+            direction: Dir::SouthEast,
+            cursor: Cursor::ResizeSouthEast,
+            id: "se",
+        },
+    ];
+
+    if right - corner > left + corner {
+        zones.push(ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(left + corner, top), Pos2::new(right - corner, top + band)),
+            direction: Dir::North,
+            cursor: Cursor::ResizeNorth,
+            id: "n",
+        });
+        zones.push(ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(left + corner, bottom - band), Pos2::new(right - corner, bottom)),
+            direction: Dir::South,
+            cursor: Cursor::ResizeSouth,
+            id: "s",
+        });
+    }
+    if bottom - corner > top + corner {
+        zones.push(ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(left, top + corner), Pos2::new(left + band, bottom - corner)),
+            direction: Dir::West,
+            cursor: Cursor::ResizeWest,
+            id: "w",
+        });
+        zones.push(ResizeZone {
+            rect: egui::Rect::from_min_max(Pos2::new(right - band, top + corner), Pos2::new(right, bottom - corner)),
+            direction: Dir::East,
+            cursor: Cursor::ResizeEast,
+            id: "e",
+        });
+    }
+    zones
+}
+
+/// Makes the window's edges and corners draggable to resize it.
+///
+/// **Only the vault window calls this.** The login and preferences windows
+/// are fixed-size by design (their `ViewportBuilder`s say
+/// `with_resizable(false)`, and their ▢ control is drawn permanently ghosted
+/// with no click handler at all -- see `draw_window_chrome_with_extra`'s
+/// `maximizable` parameter). That is why this is a separate function rather
+/// than another branch inside the shared chrome: a window becomes resizable
+/// by *calling* this, so a window that does not call it cannot become
+/// resizable by accident.
+///
+/// Why it exists at all: this window runs `with_decorations(false)` so the
+/// chrome can be drawn to match the design, and with no OS frame there are no
+/// OS sizing borders -- `with_resizable(true)` alone is inert on Windows.
+/// `ViewportCommand::BeginResize` hands the drag to the OS's own resize loop
+/// (`winit::Window::drag_resize_window`), exactly as the titlebar's
+/// `StartDrag` hands over a move, so the OS keeps enforcing
+/// `with_min_inner_size`, snapping, and the live-resize feel.
+///
+/// The zones live in their own `Order::Foreground` [`egui::Area`] rather than
+/// in the window's panel layer. Two reasons, and it is worth separating them
+/// because only one is proven:
+///
+///  * **Layout.** These rects are absolute window-edge coordinates. Allocated
+///    into the panel layer they would take part in its layout and push the
+///    real content around; an `Area` has no place in any flow.
+///  * **Hit-testing.** Belt and braces. MEASURED, not assumed: egui's hit
+///    test already prefers the *smaller* candidate, so the thin zones win
+///    against a `CentralPanel` that claims the whole window even when they
+///    are registered in that same layer -- `draw_resize_handles_tests` was
+///    run against a root-layer variant and stayed green, so those tests do
+///    NOT distinguish the layer choice. The foreground layer is here so the
+///    behaviour does not rest on that preference, which is an egui
+///    implementation detail, not a documented guarantee.
+///
+/// Being a layer rather than a call-order trick also means this can be called
+/// at the top of the frame, before the early returns for the loading and
+/// unavailable states -- a window that is still loading is still resizable.
+pub fn draw_resize_handles(ctx: &egui::Context) {
+    // `viewport_rect`, not `content_rect`: the resize borders belong on the
+    // window's real edges, not inside any platform safe-area inset.
+    let window = ctx.input(|i| i.viewport_rect());
+    egui::Area::new(egui::Id::new("window-resize-handles"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(window.min)
+        // `Area::new` defaults to `movable: true`, which registers a drag
+        // sense over the area's WHOLE rect -- here, the entire window -- and
+        // would both swallow every drag meant for the zones below and start
+        // sliding this layer around. `constrain: false` for the same class of
+        // reason: this area is deliberately flush with the window's edges,
+        // and constraining it inside the screen nudges it off them.
+        .movable(false)
+        .constrain(false)
+        .show(ctx, |ui| {
+            for zone in resize_zones(window, RESIZE_BAND, RESIZE_CORNER) {
+                let response = ui.interact(
+                    zone.rect,
+                    egui::Id::new("window-resize").with(zone.id),
+                    Sense::drag(),
+                );
+                // `dragged()` as well as `hovered()`: once the OS resize loop
+                // has the pointer it can leave the band, and the cursor
+                // flicking back to an arrow mid-drag reads as the drag having
+                // been dropped.
+                if response.hovered() || response.dragged() {
+                    ctx.set_cursor_icon(zone.cursor);
+                }
+                if response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(zone.direction));
+                }
+            }
+        });
+}
+
+/// Every monitor's work area (the monitor minus the taskbar and any other
+/// appbars), primary first, in egui points -- the space
+/// `settings::clamp_window_geometry` and `ViewportBuilder::with_position`
+/// both work in.
+///
+/// Empty if the enumeration fails, which `clamp_window_geometry` treats as
+/// "restore the size but let the OS place the window".
+///
+/// HONEST LIMIT, because this is the one approximation in the restore path:
+/// Win32 reports monitor rects in *physical pixels*, and the conversion below
+/// divides by a single scale factor read from the desktop DC, which under
+/// winit's per-monitor-DPI-v2 awareness is the *primary* monitor's. On a
+/// uniform-DPI desktop (including every 100% one) that is exact. On a mixed-
+/// DPI desktop a secondary monitor's work area is off by the ratio between
+/// the two scales, so a window restored onto it can be clamped a little too
+/// eagerly or not quite enough. Doing better needs `GetDpiForMonitor`, which
+/// lives behind a `Win32_UI_HiDpi` Cargo feature this crate does not enable.
+/// The failure mode is a slightly wrong clamp, never an unreachable window on
+/// the primary monitor.
+pub fn monitor_work_areas() -> Vec<crate::settings::WorkArea> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetDeviceCaps, GetDC, GetMonitorInfoW, ReleaseDC, HDC, HMONITOR,
+        LOGPIXELSX, MONITORINFO,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
+
+    // Collected as (is_primary, work area in physical pixels) so the primary
+    // can be sorted to the front -- `EnumDisplayMonitors` promises no order,
+    // and "the primary is the fallback" is a rule `clamp_window_geometry`
+    // spells as "the first element".
+    let mut found: Vec<(bool, RECT)> = Vec::new();
+
+    unsafe extern "system" fn callback(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        lparam: LPARAM,
+    ) -> windows::Win32::Foundation::BOOL {
+        let found = unsafe { &mut *(lparam.0 as *mut Vec<(bool, RECT)>) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            found.push((info.dwFlags & MONITORINFOF_PRIMARY != 0, info.rcWork));
+        }
+        true.into()
+    }
+
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(callback),
+            LPARAM(&mut found as *mut Vec<(bool, RECT)> as isize),
+        );
+    }
+
+    let scale = unsafe {
+        let hdc = GetDC(None);
+        if hdc.is_invalid() {
+            1.0
+        } else {
+            let dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+            ReleaseDC(None, hdc);
+            if dpi > 0 {
+                dpi as f32 / 96.0
+            } else {
+                1.0
+            }
+        }
+    };
+
+    found.sort_by_key(|(is_primary, _)| !is_primary);
+    found
+        .into_iter()
+        .map(|(_, work)| {
+            let to_points = |v: i32| (v as f32 / scale).round() as i32;
+            crate::settings::WorkArea {
+                x: to_points(work.left),
+                y: to_points(work.top),
+                width: to_points(work.right - work.left),
+                height: to_points(work.bottom - work.top),
+            }
+        })
+        .collect()
+}
+
 /// The login window's form state, owned by the caller across frames.
 #[derive(Default)]
 pub struct LoginForm {
@@ -1448,6 +1716,323 @@ pub fn run_login_flow() -> String {
             log::error!("login window was closed without producing a session token; exiting");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod resize_zone_tests {
+    //! The eight-direction resize hit-zone geometry.
+    //!
+    //! The behavioural half -- that a hover over a zone sets its cursor, that
+    //! a drag emits `ViewportCommand::BeginResize`, and that a panel drawn
+    //! over the same pixels does not steal either -- is in
+    //! `draw_resize_handles_tests` below, which drives real frames.
+    //!
+    //! WHAT NEITHER MODULE CAN ASSERT, said plainly rather than dressed up as
+    //! coverage: that Windows then actually resizes the window. Everything
+    //! past `send_viewport_cmd` is `egui_winit` calling
+    //! `Window::drag_resize_window`, which needs a real winit window inside a
+    //! real event loop and a real mouse button held down; a headless
+    //! `egui::Context` records the command and there is nobody on the other
+    //! end of it. So these tests prove the command is issued for the right
+    //! direction from the right pixels, and nothing about what the OS does
+    //! with it. That last step, and the `with_min_inner_size` floor the OS
+    //! enforces during the drag, are UNVERIFIED HERE.
+    use super::{resize_zones, RESIZE_BAND, RESIZE_CORNER};
+    use eframe::egui;
+
+    const BAND: f32 = 6.0;
+    const CORNER: f32 = 14.0;
+
+    fn window() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1240.0, 740.0))
+    }
+
+    fn zones() -> Vec<super::ResizeZone> {
+        resize_zones(window(), BAND, CORNER)
+    }
+
+    #[test]
+    fn all_eight_directions_are_present_exactly_once() {
+        // The user asked for all eight. A missing one is invisible: the edge
+        // simply does nothing, which is indistinguishable from the bug this
+        // whole feature fixes.
+        let zones = zones();
+        let mut directions: Vec<_> = zones.iter().map(|z| format!("{:?}", z.direction)).collect();
+        directions.sort();
+        assert_eq!(
+            directions,
+            vec![
+                "East", "North", "NorthEast", "NorthWest", "South", "SouthEast", "SouthWest",
+                "West"
+            ]
+        );
+        let mut ids: Vec<_> = zones.iter().map(|z| z.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "each zone needs its own stable interaction id");
+    }
+
+    #[test]
+    fn no_two_zones_overlap() {
+        // The property the corner-first layout exists to give: which zone a
+        // point belongs to is readable off the rects, not off the order they
+        // happen to be registered in.
+        let zones = zones();
+        for (i, a) in zones.iter().enumerate() {
+            for b in &zones[i + 1..] {
+                let overlap = a.rect.intersect(b.rect);
+                assert!(
+                    !overlap.is_positive(),
+                    "{} and {} overlap at {overlap:?} -- whichever is registered later would \
+                     silently win, and the corners are the ones that would lose",
+                    a.id,
+                    b.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_zone_lies_on_the_window_edge_it_names() {
+        let window = window();
+        for zone in zones() {
+            assert!(
+                window.contains_rect(zone.rect),
+                "{} at {:?} pokes outside the window",
+                zone.id,
+                zone.rect
+            );
+            let touches_edge = zone.rect.min.x == window.min.x
+                || zone.rect.min.y == window.min.y
+                || zone.rect.max.x == window.max.x
+                || zone.rect.max.y == window.max.y;
+            assert!(touches_edge, "{} at {:?} is not on any edge", zone.id, zone.rect);
+        }
+    }
+
+    #[test]
+    fn each_corner_is_hit_before_the_edges_that_meet_there() {
+        // A corner point must belong to the corner zone and to nothing else.
+        // Without the non-overlapping split it belongs to two edges as well,
+        // and diagonal resizing quietly becomes single-axis resizing.
+        let window = window();
+        for (corner, id) in [
+            (window.min, "nw"),
+            (egui::pos2(window.max.x - 1.0, window.min.y), "ne"),
+            (egui::pos2(window.min.x, window.max.y - 1.0), "sw"),
+            (egui::pos2(window.max.x - 1.0, window.max.y - 1.0), "se"),
+        ] {
+            let hits: Vec<_> = zones()
+                .into_iter()
+                .filter(|z| z.rect.contains(corner))
+                .map(|z| z.id)
+                .collect();
+            assert_eq!(hits, vec![id], "{corner:?} should belong only to {id}");
+        }
+    }
+
+    #[test]
+    fn a_point_in_the_middle_of_the_window_belongs_to_no_zone() {
+        // Otherwise the entire window body starts resizing instead of
+        // clicking, which would be far worse than not resizing at all.
+        let centre = window().center();
+        assert!(zones().into_iter().all(|z| !z.rect.contains(centre)));
+    }
+
+    #[test]
+    fn a_window_too_small_for_two_corners_emits_corners_only() {
+        // The floor makes this unreachable in the vault window, but an
+        // inverted `Rect` contains nothing, so emitting one would create a
+        // zone that exists in the list and can never be hit -- a silent hole
+        // rather than an obvious absence.
+        let sliver = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(20.0, 20.0));
+        let zones = resize_zones(sliver, BAND, CORNER);
+        assert_eq!(zones.len(), 4);
+        for zone in &zones {
+            assert!(zone.rect.is_positive(), "{} is inverted or empty", zone.id);
+        }
+    }
+
+    #[test]
+    fn the_corner_target_is_larger_than_the_edge_band() {
+        // Not decoration: a corner is a two-axis target reachable no other
+        // way, and at `RESIZE_BAND` it is a 6x6 square in the very pixel the
+        // window ends.
+        assert!(RESIZE_CORNER > RESIZE_BAND);
+    }
+}
+
+#[cfg(test)]
+mod draw_resize_handles_tests {
+    //! Real frames through `draw_resize_handles`, reading back the cursor it
+    //! asked for and the viewport commands it issued.
+    //!
+    //! These exist because the geometry tests above prove only that the rects
+    //! are in the right places. Two things sit between correct rects and a
+    //! window that resizes, and both are invisible: whether the zones win the
+    //! hit test against the panels laid out over the very same pixels, and
+    //! whether a drag on one issues the command naming ITS direction.
+    //!
+    //! WHAT THESE DO NOT DISTINGUISH, recorded because it was checked and the
+    //! obvious reading of them is wrong: they stay green when
+    //! `draw_resize_handles` is rewritten to register its zones directly in
+    //! the root panel layer, with no `Area` at all. egui's hit test prefers
+    //! the smaller candidate, so the thin zones beat a whole-window
+    //! `CentralPanel` either way. The `Order::Foreground` layer is defence in
+    //! depth against that preference changing -- these tests do not pin it.
+    use super::draw_resize_handles;
+    use eframe::egui;
+
+    const WINDOW: egui::Vec2 = egui::Vec2::new(1240.0, 740.0);
+
+    fn base_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        }
+    }
+
+    /// Draws the handles and then a `CentralPanel` that fills the entire
+    /// window with an interactive widget -- i.e. the vault window's own
+    /// layout, which covers every edge the handles sit on. Anything the
+    /// handles win here, they win in spite of that.
+    fn frame(ctx: &egui::Context, input: egui::RawInput) -> egui::FullOutput {
+        ctx.run_ui(input, |ui| {
+            draw_resize_handles(ui.ctx());
+            egui::CentralPanel::default().show(ui, |ui| {
+                let rect = ui.max_rect();
+                ui.interact(rect, egui::Id::new("a-panel-covering-everything"), egui::Sense::click_and_drag());
+            });
+        })
+    }
+
+    fn hover_at(pos: egui::Pos2) -> egui::CursorIcon {
+        let ctx = egui::Context::default();
+        let input = |pos: egui::Pos2| egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..base_input()
+        };
+        // Three settling frames, measured not guessed: egui resolves an
+        // interaction against the widget rects registered in the PREVIOUS
+        // pass, and an `Area`'s own rect is itself only known one pass after
+        // its contents were first laid out -- so the hover does not resolve
+        // until the third.
+        for _ in 0..3 {
+            let _ = frame(&ctx, input(pos));
+        }
+        frame(&ctx, input(pos)).platform_output.cursor_icon
+    }
+
+    #[test]
+    fn each_edge_and_corner_shows_its_own_resize_cursor_through_the_panels() {
+        // Pixel-by-pixel: 2 points in from an edge is inside the 6pt band; 4
+        // points in from a corner is inside the 14pt corner square. Every one
+        // of these points is also covered by the `CentralPanel` above.
+        for (pos, expected, what) in [
+            (egui::pos2(2.0, 370.0), egui::CursorIcon::ResizeWest, "left edge"),
+            (egui::pos2(1238.0, 370.0), egui::CursorIcon::ResizeEast, "right edge"),
+            (egui::pos2(620.0, 2.0), egui::CursorIcon::ResizeNorth, "top edge"),
+            (egui::pos2(620.0, 738.0), egui::CursorIcon::ResizeSouth, "bottom edge"),
+            (egui::pos2(4.0, 4.0), egui::CursorIcon::ResizeNorthWest, "top-left corner"),
+            (egui::pos2(1236.0, 4.0), egui::CursorIcon::ResizeNorthEast, "top-right corner"),
+            (egui::pos2(4.0, 736.0), egui::CursorIcon::ResizeSouthWest, "bottom-left corner"),
+            (egui::pos2(1236.0, 736.0), egui::CursorIcon::ResizeSouthEast, "bottom-right corner"),
+        ] {
+            assert_eq!(
+                hover_at(pos),
+                expected,
+                "the {what} at {pos:?} did not offer a resize cursor -- either the zone is not \
+                 there, or the `CentralPanel` drawn over every one of these pixels won the hit \
+                 test instead"
+            );
+        }
+    }
+
+    #[test]
+    fn the_middle_of_the_window_offers_no_resize_cursor() {
+        // The complement, and the one that would catch a band so wide (or a
+        // zone rect so wrong) that the window body starts resizing instead of
+        // clicking.
+        assert_ne!(hover_at(egui::pos2(620.0, 370.0)), egui::CursorIcon::ResizeWest);
+        assert_eq!(hover_at(egui::pos2(620.0, 370.0)), egui::CursorIcon::default());
+    }
+
+    #[test]
+    fn dragging_an_edge_asks_the_os_to_resize_in_that_edges_direction() {
+        // The direction is the part that can silently be wrong: a copy-paste
+        // that gives the west zone `ResizeDirection::East` compiles, hovers
+        // correctly, and resizes the opposite edge.
+        for (start, drift, expected, what) in [
+            (egui::pos2(2.0, 370.0), egui::vec2(40.0, 0.0), egui::viewport::ResizeDirection::West, "left edge"),
+            (egui::pos2(1238.0, 370.0), egui::vec2(-40.0, 0.0), egui::viewport::ResizeDirection::East, "right edge"),
+            (egui::pos2(620.0, 2.0), egui::vec2(0.0, -40.0), egui::viewport::ResizeDirection::North, "top edge"),
+            (egui::pos2(620.0, 738.0), egui::vec2(0.0, 40.0), egui::viewport::ResizeDirection::South, "bottom edge"),
+            (egui::pos2(4.0, 4.0), egui::vec2(-40.0, -40.0), egui::viewport::ResizeDirection::NorthWest, "top-left corner"),
+            (egui::pos2(1236.0, 4.0), egui::vec2(40.0, -40.0), egui::viewport::ResizeDirection::NorthEast, "top-right corner"),
+            (egui::pos2(4.0, 736.0), egui::vec2(-40.0, 40.0), egui::viewport::ResizeDirection::SouthWest, "bottom-left corner"),
+            (egui::pos2(1236.0, 736.0), egui::vec2(40.0, 40.0), egui::viewport::ResizeDirection::SouthEast, "bottom-right corner"),
+        ] {
+            assert_eq!(
+                begin_resize_commands_for_drag(start, drift),
+                vec![expected],
+                "dragging the {what} must ask for exactly one resize, in its own direction"
+            );
+        }
+    }
+
+    #[test]
+    fn dragging_the_middle_of_the_window_asks_for_no_resize_at_all() {
+        assert!(
+            begin_resize_commands_for_drag(egui::pos2(620.0, 370.0), egui::vec2(40.0, 40.0))
+                .is_empty(),
+            "a drag in the window body is a drag in the window body"
+        );
+    }
+
+    /// Presses at `start`, moves by `drift` with the button held, and returns
+    /// every `BeginResize` direction issued across those frames.
+    fn begin_resize_commands_for_drag(
+        start: egui::Pos2,
+        drift: egui::Vec2,
+    ) -> Vec<egui::viewport::ResizeDirection> {
+        let ctx = egui::Context::default();
+        let at = |events: Vec<egui::Event>| egui::RawInput { events, ..base_input() };
+
+        // Three settling frames (see `hover_at`), then the press. Measured,
+        // not assumed: `drag_started` fires on the PRESS frame itself, not on
+        // the first frame the pointer subsequently moves -- which is the
+        // behaviour a resize wants, since the OS takes the drag over from
+        // there and egui never sees the motion.
+        for _ in 0..3 {
+            let _ = frame(&ctx, at(vec![egui::Event::PointerMoved(start)]));
+        }
+        let mut directions = Vec::new();
+        let mut collect = |output: egui::FullOutput| {
+            for viewport in output.viewport_output.values() {
+                for command in &viewport.commands {
+                    if let egui::ViewportCommand::BeginResize(direction) = command {
+                        directions.push(*direction);
+                    }
+                }
+            }
+        };
+        collect(frame(
+            &ctx,
+            at(vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }]),
+        ));
+        // Two further frames with the button still held. They collect too, so
+        // the assertion of exactly ONE command also proves the resize is not
+        // re-issued on every frame of the drag -- which would fight the OS's
+        // own resize loop for the rest of it.
+        collect(frame(&ctx, at(vec![egui::Event::PointerMoved(start + drift)])));
+        collect(frame(&ctx, at(vec![egui::Event::PointerMoved(start + drift + drift)])));
+        directions
     }
 }
 

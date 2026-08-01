@@ -30,10 +30,11 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 const WINDOW_TITLE: &str = "Deskwarden";
-/// The window's initial/default size -- not a fixed size. Since the
-/// titlebar's maximize control was wired up (see this window's
-/// `NativeOptions.with_resizable(true)` and its `maximizable: true` chrome
-/// call), the window can grow past this; it just opens at this size.
+/// The size this window opens at the very first time, before it has ever been
+/// closed and had its geometry recorded. Design 2b's own 1240x740.
+///
+/// Every later launch uses `Settings::vault_window` instead, run through
+/// `settings::clamp_window_geometry` -- see `initial_placement`.
 const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
 const SIDEBAR_WIDTH: f32 = 212.0;
 const LIST_WIDTH: f32 = 390.0;
@@ -64,6 +65,67 @@ const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
 /// confirmation. This is a *lower* bound on top of `DELETE_CONFIRM_WINDOW`'s
 /// existing upper bound (the arm still expires after that long either way).
 const MIN_CONFIRM_DWELL: Duration = Duration::from_millis(300);
+
+/// The size and position to open this window at, given whatever the last
+/// session recorded and the monitors that exist now.
+///
+/// The `None` arm is the only thing separating "never been closed yet" from
+/// "closed at design 2b's own size": on a first run there is nothing to
+/// clamp, so the window opens at [`WINDOW_SIZE`] and the OS places it. Every
+/// other case is [`settings::clamp_window_geometry`]'s, which is where all
+/// the actual rules live.
+fn initial_placement(
+    saved: Option<crate::settings::WindowGeometry>,
+    work_areas: &[crate::settings::WorkArea],
+) -> crate::settings::WindowPlacement {
+    match saved {
+        Some(geometry) => crate::settings::clamp_window_geometry(geometry, work_areas),
+        None => crate::settings::WindowPlacement {
+            width: WINDOW_SIZE[0] as i32,
+            height: WINDOW_SIZE[1] as i32,
+            position: None,
+        },
+    }
+}
+
+/// The geometry worth writing back to `settings.json` this frame, or `None`
+/// if this frame's window state does not describe one.
+///
+/// Three states are deliberately excluded, and each would otherwise be
+/// persisted as the *restored* size:
+///
+///  * **Maximized.** Its rect is the whole work area. Recorded, a user who
+///    maximizes once gets a window that opens filling the screen forever, and
+///    un-maximizing restores it to... the whole screen.
+///  * **Minimized.** winit reports no position at all for a minimized window
+///    (`update_viewport_info` sets both rects to `None` for it), so there is
+///    nothing here to record in the first place -- but saying so is what stops
+///    a future egui reporting some placeholder rect from being believed.
+///  * **A non-finite rect**, which no comparison in `clamp_window_geometry`
+///    could then reject, since that function's `i32`s cannot represent it.
+fn geometry_to_record(
+    inner_rect: Option<egui::Rect>,
+    maximized: bool,
+    minimized: bool,
+) -> Option<crate::settings::WindowGeometry> {
+    if maximized || minimized {
+        return None;
+    }
+    let rect = inner_rect?;
+    if !rect.min.x.is_finite()
+        || !rect.min.y.is_finite()
+        || !rect.width().is_finite()
+        || !rect.height().is_finite()
+    {
+        return None;
+    }
+    Some(crate::settings::WindowGeometry {
+        x: rect.min.x.round() as i32,
+        y: rect.min.y.round() as i32,
+        width: rect.width().round() as i32,
+        height: rect.height().round() as i32,
+    })
+}
 
 pub struct VaultWindowResult {
     pub locked: bool,
@@ -394,22 +456,52 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut folder_edit: Option<FolderEditState> = None;
 
     let mut styled = false;
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            // Starting/default size only -- see WINDOW_SIZE's doc comment.
-            // Unlike the login window (fixed-size by design), this window's
-            // three-pane layout (fixed-width sidebar/list, flexible detail
-            // pane -- see the `Panel`/`CentralPanel` setup below) degrades
-            // fine at larger sizes, so it's resizable/maximizable now that
-            // the titlebar's ▢ control (`draw_window_chrome_with_extra`'s
-            // `maximizable: true` at this window's call site) actually does
-            // something.
-            .with_inner_size(WINDOW_SIZE)
-            .with_resizable(true)
-            .with_decorations(false)
-            .with_icon(theme::window_icon()),
-        ..Default::default()
-    };
+    // Where this window was when it was last closed, re-homed onto the
+    // monitors that exist right now. Read here, on the main thread, before
+    // the window exists -- `Settings::load` is a small file read and every
+    // failure in it (missing, partial, corrupt) already falls back to
+    // defaults, so this cannot be a reason the window does not open.
+    let settings_path = crate::settings::default_path();
+    let placement = initial_placement(
+        settings_path
+            .as_deref()
+            .and_then(|path| crate::settings::Settings::load(path).vault_window),
+        &crate::login_ui::monitor_work_areas(),
+    );
+    // The geometry to write back on close, updated every frame the window is
+    // in an ordinary (neither maximized nor minimized) state. An
+    // `Rc<RefCell<_>>` for the same reason `locked` and `needs_reauth` are:
+    // the update closure is `FnMut + 'static` and cannot hand anything back
+    // directly. Written to disk ONCE, after the event loop returns -- a
+    // per-frame write would be a file write per pixel of a resize drag.
+    let last_geometry: Rc<RefCell<Option<crate::settings::WindowGeometry>>> =
+        Rc::new(RefCell::new(None));
+    let last_geometry_for_closure = last_geometry.clone();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([placement.width as f32, placement.height as f32])
+        // `with_resizable(true)` alone is INERT here: `with_decorations(false)`
+        // means there is no OS frame to grab, which is exactly the bug this
+        // window shipped with. It is still set because it is what makes the
+        // OS treat the window as sizable at all (maximize, snap, and the
+        // `BeginResize` drag `login_ui::draw_resize_handles` starts all go
+        // through it); the actual grabbable edges are drawn by that function,
+        // called at the top of the frame closure below.
+        .with_resizable(true)
+        // Enforced by the OS during the resize drag, so the user cannot pull
+        // an edge past it -- the other half of the floor
+        // `settings::clamp_window_geometry` applies to a *stored* size. Both
+        // are needed: this one cannot stop a bad value on disk, and that one
+        // cannot stop a drag.
+        .with_min_inner_size([
+            crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32,
+            crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
+        ])
+        .with_decorations(false)
+        .with_icon(theme::window_icon());
+    if let Some((x, y)) = placement.position {
+        viewport = viewport.with_position([x as f32, y as f32]);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
@@ -419,6 +511,33 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // The eight grabbable edges/corners. FIRST, before anything else this
+        // frame, and deliberately above every early return below (auto-lock,
+        // the loading spinner, the unavailable body): a window that is still
+        // loading, or that failed to load, is still a window the user is
+        // allowed to resize. It costs nothing to be here rather than at the
+        // end -- the zones live in their own `Order::Foreground` layer, so
+        // egui hit-tests them ahead of the panels regardless of call order
+        // (see `draw_resize_handles`).
+        //
+        // The login and preferences windows do not call this, which is the
+        // whole of how they stay fixed-size.
+        crate::login_ui::draw_resize_handles(ui.ctx());
+
+        // Where the window is right now, kept for the write that happens
+        // after the event loop returns. `None` on the frames that describe
+        // no restorable geometry (maximized/minimized) LEAVES THE PREVIOUS
+        // VALUE STANDING rather than clearing it: a window that is maximized
+        // when the user closes it should reopen at whatever size it had
+        // before being maximized, not at the default.
+        if let Some(geometry) = geometry_to_record(
+            ui.ctx().input(|i| i.viewport().inner_rect),
+            ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false)),
+            ui.ctx().input(|i| i.viewport().minimized.unwrap_or(false)),
+        ) {
+            *last_geometry_for_closure.borrow_mut() = Some(geometry);
         }
 
         // Fires once, on the window's first *real* frame (after the guard
@@ -1298,6 +1417,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // its own, much faster, cadence.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
     });
+
+    // One write, here, after the window is gone -- not per frame, which
+    // during a resize drag would be a file write per repaint. A failure is
+    // logged and otherwise ignored: losing the remembered size is a smaller
+    // problem than anything worth failing a lock/close over, and
+    // `Settings::load` treats whatever is (or is not) on disk as advisory
+    // anyway. Read-modify-write, so a preference changed in the preferences
+    // window while this one was open is not reverted -- see
+    // `persist_vault_window_geometry`.
+    if let (Some(path), Some(geometry)) = (settings_path.as_deref(), *last_geometry.borrow()) {
+        if let Err(e) = crate::settings::Settings::persist_vault_window_geometry(path, geometry) {
+            log::warn!("could not save the vault window's geometry: {e}");
+        }
+    }
 
     let locked = *locked.borrow();
     let needs_reauth = *needs_reauth.borrow();
@@ -4211,6 +4344,86 @@ mod vault_body_state_tests {
         // failed would be a worse regression than the blank window this
         // fixes; the pill reports it instead.
         assert_eq!(vault_body_state(false, false, Some("connection refused")), VaultBodyState::Vault);
+    }
+}
+
+#[cfg(test)]
+mod window_geometry_tests {
+    //! The two decisions either side of `settings::clamp_window_geometry`:
+    //! what to open with, and what is worth writing back.
+    use super::{geometry_to_record, initial_placement, WINDOW_SIZE};
+    use crate::settings::{WindowGeometry, WindowPlacement, WorkArea};
+    use eframe::egui;
+
+    const SCREEN: WorkArea = WorkArea { x: 0, y: 0, width: 1920, height: 1040 };
+
+    #[test]
+    fn a_first_ever_launch_opens_at_the_design_size_and_lets_the_os_place_it() {
+        assert_eq!(
+            initial_placement(None, &[SCREEN]),
+            WindowPlacement {
+                width: WINDOW_SIZE[0] as i32,
+                height: WINDOW_SIZE[1] as i32,
+                position: None,
+            },
+            "with nothing stored there is nothing to clamp, and inventing a position would \
+             put the window somewhere the OS did not choose for no reason at all"
+        );
+    }
+
+    #[test]
+    fn a_stored_geometry_goes_through_the_clamp_rather_than_straight_to_the_window() {
+        // The regression this guards is the obvious shortcut: taking the
+        // stored value as-is because it "was fine when we wrote it". It was
+        // fine on the monitor that wrote it.
+        let placement =
+            initial_placement(Some(WindowGeometry { x: 9000, y: 9000, width: 10, height: 10 }), &[SCREEN]);
+        assert_eq!(placement.width, 900, "the floor was applied");
+        assert_eq!(placement.height, 600);
+        let (x, y) = placement.position.expect("a known monitor yields a position");
+        assert!(x + 900 <= 1920 && y + 600 <= 1040, "{placement:?} is off-screen");
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h)))
+    }
+
+    #[test]
+    fn an_ordinary_window_records_its_rect_rounded_to_whole_points() {
+        assert_eq!(
+            geometry_to_record(rect(120.4, 80.6, 1240.2, 739.5), false, false),
+            Some(WindowGeometry { x: 120, y: 81, width: 1240, height: 740 })
+        );
+    }
+
+    #[test]
+    fn a_maximized_window_records_nothing() {
+        // Its rect is the whole work area. Recorded, one click of ▢ makes
+        // every future launch full-screen and un-maximizing restores to the
+        // same full screen -- the size the user actually chose is gone.
+        assert_eq!(geometry_to_record(rect(0.0, 0.0, 1920.0, 1040.0), true, false), None);
+    }
+
+    #[test]
+    fn a_minimized_window_records_nothing() {
+        assert_eq!(geometry_to_record(rect(0.0, 0.0, 1240.0, 740.0), false, true), None);
+    }
+
+    #[test]
+    fn a_window_with_no_reported_rect_records_nothing() {
+        // What winit actually reports for a minimized window
+        // (`update_viewport_info` sets both rects to `None`), and what egui
+        // reports on a frame before the window has been measured.
+        assert_eq!(geometry_to_record(None, false, false), None);
+    }
+
+    #[test]
+    fn a_non_finite_rect_records_nothing() {
+        // `WindowGeometry` is `i32`, so a NaN would land as some arbitrary
+        // integer that every later comparison would treat as a real position.
+        // Rejecting it here is the only place it can be rejected.
+        assert_eq!(geometry_to_record(rect(f32::NAN, 0.0, 1240.0, 740.0), false, false), None);
+        assert_eq!(geometry_to_record(rect(0.0, 0.0, f32::INFINITY, 740.0), false, false), None);
     }
 }
 
