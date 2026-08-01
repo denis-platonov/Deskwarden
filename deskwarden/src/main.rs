@@ -408,12 +408,14 @@ fn main() {
     let current_version =
         Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
 
-    // Bounded connect/read timeouts, same "don't trust an external dependency
-    // to answer promptly" reasoning as `bw_serve::READINESS_DEADLINE` -- just
-    // applied to `api.github.com` instead of localhost. `ureq::Agent` is a
-    // cheap `Arc`-backed handle, so it's fine to clone into the background
-    // threads below.
-    let http_agent = updater::build_agent();
+    // Two agents, not one, because the two updater requests need two different
+    // *kinds* of bound and ureq can carry only one per agent: the releases
+    // check is a small JSON response bounded by total time, the installer
+    // download is a ~6 MB stream bounded by time without progress. See
+    // `deskwarden::http_agent`. Both are cheap `Arc`-backed handles, so it's
+    // fine to clone them into the background threads below.
+    let update_check_agent = updater::build_api_agent();
+    let download_agent = updater::build_download_agent();
 
     // The update check talks to an external host and, prior to this fix, ran
     // synchronously here -- before the tray, hotkey, and window-watch thread
@@ -426,7 +428,7 @@ fn main() {
     let mut available_update: Option<ReleaseInfo> = None;
     let (update_tx, update_rx) = mpsc::channel::<ReleaseInfo>();
     {
-        let agent = http_agent.clone();
+        let agent = update_check_agent.clone();
         let version = current_version.clone();
         let tx = update_tx.clone();
         std::thread::spawn(move || {
@@ -876,7 +878,7 @@ fn main() {
                         // the main loop keeps pumping messages and picks the
                         // outcome up from `apply_rx` whenever it lands.
                         let release = release.clone();
-                        let agent = http_agent.clone();
+                        let agent = download_agent.clone();
                         let dest_dir = update_download_dir.clone();
                         let tx = apply_tx.clone();
                         std::thread::spawn(move || {
@@ -1036,7 +1038,7 @@ fn main() {
             // background thread rather than blocking the main loop (and
             // therefore tray/hotkey/window-watch responsiveness) for however
             // long `api.github.com` takes to answer.
-            let agent = http_agent.clone();
+            let agent = update_check_agent.clone();
             let version = current_version.clone();
             let tx = update_tx.clone();
             std::thread::spawn(move || {

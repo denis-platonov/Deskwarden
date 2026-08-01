@@ -1123,65 +1123,48 @@ pub struct VaultBridge {
 /// slow network the benefit of the doubt.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Read timeout for `agent` below (time to receive the response once the
-/// request has been sent, not overall request time). `list_items` -- the
-/// slowest normal call, pulling the entire vault in one response -- was
-/// measured at ~1.1s for 1657 items against a cold `bw serve`; this leaves
-/// generous headroom above that for a larger vault or a loaded machine while
-/// still bounding the worst case. Notably: this agent is shared by every
-/// vault call in this app, including the once-per-second TOTP poll on the
-/// vault window's UI thread (review Minor 4, independent review of a7b33cb)
-/// -- with no timeout at all, a `bw serve` that accepted the connection but
-/// then hung (not crashed -- a crash fails fast on its own) blocked that
-/// poll, and the whole UI thread with it, indefinitely.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Whole-request deadline for `agent` below, and the only bound that survives
-/// connection reuse.
+/// Total-time bound for `agent` below: the longest a single vault call may
+/// take before it is treated as failed.
 ///
-/// `timeout_read` above is **not enough on its own**, and that gap shipped in
-/// v0.3.0 as a hard UI hang. In ureq 2.12.1 the read timeout is set on the
-/// socket only on the connect path (`stream.rs:436`), and `Stream::reset()`
-/// clears it again (`socket.set_read_timeout(None)`, `stream.rs:265`) before
-/// the connection goes back into the keep-alive pool. `connect_socket` returns
-/// a pooled connection early (`unit.rs:361-364`), skipping the connect path,
-/// so the timeout is never reapplied. The response *head* is then read through
-/// `DeadlineStream::new(stream, unit.deadline)` (`response.rs:574`), and
-/// `unit.deadline` comes only from `request.timeout.or(agent.config.timeout)`
-/// (`request.rs:122`) -- i.e. from this setting. Net effect without it: the
-/// first request on a fresh socket is bounded, every later request on that
-/// pooled socket waits for the status line forever. That is exactly what
-/// happened -- the eframe UI thread was found parked in `recv` on the
-/// `::1:8087` socket with a byte-identical stack minutes apart, while
-/// `bw serve` itself answered fresh connections fine.
+/// **This is a freeze budget, not a patience budget.** Nine bridge calls are
+/// still made synchronously on the eframe UI thread, including the
+/// once-per-second TOTP poll, so this number is measured in "how long the
+/// whole app is unresponsive", and every second of it is paid by the user
+/// watching a frozen window.
 ///
-/// 30s, matching [`crate::bw_serve::READINESS_DEADLINE`] rather than inventing
-/// a number: that is already this app's agreed answer to "how long may the
-/// local backend legitimately take before something is treated as wrong", and
-/// a bound that covers a cold start covers any warm call comfortably. For
-/// scale, `/list/object/items` against this app's largest observed vault
-/// (1654 items) measured 1.2s warm. Unlike `timeout_read` this bounds the
-/// whole request including the body, which is fine here: every response is
-/// JSON from a process on loopback, not a bulk transfer.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+/// 10s. Derived from what the call actually costs, not from another
+/// constant: `/list/object/items` -- the slowest call this bridge makes --
+/// measures 1.1s cold and 1.2s warm against this app's largest observed vault
+/// (1654 items), so this is roughly 8x headroom for a bigger vault on a loaded
+/// machine, over loopback, against a process that is either answering or
+/// broken.
+///
+/// It is deliberately **not** [`crate::bw_serve::READINESS_DEADLINE`], which
+/// an earlier version of this comment cited. That 30s is the total budget for
+/// a whole *retry schedule* (`bw_serve::readiness_schedule`) covering a Node
+/// cold start -- a different quantity from a single call's bound. And this
+/// codebase has already decided 30s is the wrong length for a legitimate
+/// single backend operation, in both directions: `bw_serve::BACKEND_OP_TIMEOUT`
+/// exists precisely because 30s is too *short* for a backend start or sync.
+/// Neither of those runs through this agent (`bw sync` is a separate CLI
+/// process), so borrowing either number would import reasoning that does not
+/// apply. Adopting 30s here also tripled the UI-thread worst case on a fresh
+/// connection, which used to be bounded at 10s and was never reported as too
+/// tight.
+///
+/// Whole-request rather than per-read, and that is what closes the v0.3.0
+/// hang: a per-read timeout does not survive connection reuse, and this agent
+/// pools aggressively (the TOTP poll hits the same socket every second). See
+/// [`crate::http_agent`] for the full trace. Bounding the body along with the
+/// head costs nothing here -- every response is JSON from a process on
+/// loopback, not a bulk transfer.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 
 impl VaultBridge {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self::with_request_deadline(base_url, REQUEST_DEADLINE)
-    }
-
-    /// [`VaultBridge::new`] with the whole-request deadline chosen by the
-    /// caller. Exists so the pooled-connection regression test can assert the
-    /// deadline actually fires without the test itself having to wait
-    /// [`REQUEST_DEADLINE`]; production always goes through `new`.
-    fn with_request_deadline(base_url: impl Into<String>, request_deadline: Duration) -> Self {
         Self {
             base_url: base_url.into(),
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(CONNECT_TIMEOUT)
-                .timeout_read(READ_TIMEOUT)
-                .timeout(request_deadline)
-                .build(),
+            agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, REQUEST_DEADLINE),
         }
     }
 
@@ -2230,74 +2213,34 @@ mod tests {
         assert_eq!(items[1].name, "Mabl");
     }
 
-    /// Regression test for the v0.3.0 UI hang.
+    /// Pins [`REQUEST_DEADLINE`] as a UI-thread freeze budget derived from
+    /// measured call cost, and specifically *not* re-derived from
+    /// `bw_serve`'s constants -- which is how it drifted to 30s and tripled
+    /// the worst-case freeze on a fresh connection.
     ///
-    /// The trap this deliberately avoids: stalling the *first* request proves
-    /// nothing, because a fresh connection does get `timeout_read` applied on
-    /// ureq's connect path -- that version of this test passes with or without
-    /// the fix. The exposure is only on a **reused** connection, whose read
-    /// timeout `Stream::reset()` cleared on its way into the keep-alive pool.
-    /// So this serves one request normally (putting the socket in the pool),
-    /// then accepts the second request on that same socket and never answers.
-    ///
-    /// Without `.timeout()` on the agent this call blocks until the server
-    /// thread finally drops the socket, far past the asserted bound.
+    /// That the deadline is applied *at all*, and that it survives connection
+    /// reuse, is pinned separately and by timing in
+    /// `http_agent::a_total_bounded_agent_bounds_a_pooled_connection_that_never_answers`
+    /// -- `VaultBridge::new` cannot build an agent without passing this
+    /// constant to `bounded_total`, so there is no way to drop the bound here
+    /// without a compile error.
     #[test]
-    fn a_pooled_connection_that_never_answers_is_bounded_by_the_request_deadline() {
-        use std::io::{Read as _, Write as _};
+    fn the_ui_thread_deadline_is_a_single_call_budget_not_a_backend_lifecycle_one() {
+        // The slowest call this bridge makes, measured: /list/object/items
+        // over 1654 items, 1.1s cold / 1.2s warm.
+        const SLOWEST_MEASURED_CALL: Duration = Duration::from_millis(1_200);
 
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Reads one request head off `stream`, so the next one can be read
-        // separately -- the whole point is that both arrive on one socket.
-        fn read_head(stream: &mut std::net::TcpStream) {
-            let mut seen = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte).unwrap_or(0) == 1 {
-                seen.push(byte[0]);
-                if seen.ends_with(b"\r\n\r\n") {
-                    return;
-                }
-            }
-        }
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_head(&mut stream);
-            // Keep-alive by default in HTTP/1.1, and a Content-Length so ureq
-            // knows the body ended and can return the socket to the pool.
-            let body = r#"{"success":true,"data":{"data":[]}}"#;
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            let _ = stream.flush();
-            // Second request on the *same* socket: accept it, answer nothing.
-            read_head(&mut stream);
-            std::thread::sleep(Duration::from_secs(15));
-        });
-
-        let deadline = Duration::from_secs(2);
-        let bridge = VaultBridge::with_request_deadline(format!("http://127.0.0.1:{port}"), deadline);
-
-        bridge.list_items().expect("first request should succeed and pool its connection");
-
-        let started = std::time::Instant::now();
-        let result = bridge.list_items();
-        let elapsed = started.elapsed();
-
-        assert!(result.is_err(), "a server that never answers must not look like success");
-        // Comfortably above `deadline` so a loaded machine can't flake this,
-        // and far below the server thread's 15s sleep so an unbounded read
-        // cannot possibly sneak under it.
         assert!(
-            elapsed < Duration::from_secs(8),
-            "second (pooled) request was not bounded by the request deadline: took {elapsed:?}"
+            REQUEST_DEADLINE >= SLOWEST_MEASURED_CALL * 5,
+            "not enough headroom over the slowest real call"
         );
+        // Both of `bw_serve`'s numbers describe backend *lifecycle* waits --
+        // a retry schedule over a Node cold start, and a start-or-sync
+        // operation -- neither of which runs through this agent. Borrowing
+        // either as this bound is what made the UI freeze longer than it had
+        // to; the assertion is that this stays strictly the smaller quantity.
+        assert!(REQUEST_DEADLINE < crate::bw_serve::READINESS_DEADLINE);
+        assert!(REQUEST_DEADLINE < crate::bw_serve::BACKEND_OP_TIMEOUT);
     }
 
     #[test]

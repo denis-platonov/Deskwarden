@@ -19,6 +19,7 @@ pub mod favicon;
 pub mod fill_stats;
 pub mod hello;
 pub mod hotkey;
+pub mod http_agent;
 pub mod icon;
 pub mod injector;
 pub mod job_object;

@@ -72,18 +72,17 @@ pub fn domain_from_uri(uri: &str) -> Option<String> {
 /// How long to wait for the icon host's TCP handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long to wait between successive reads of the icon body.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Whole-request deadline, and the only bound here that survives connection
-/// reuse -- ureq 2.12.1 clears `timeout_read` when a connection is returned to
-/// the keep-alive pool and never reapplies it (see
-/// `vault_bridge::REQUEST_DEADLINE` for the full trace), and icons are fetched
-/// repeatedly against one host, so pooled connections are the *normal* case
-/// here, not the edge case.
+/// Total-time bound for one icon fetch.
 ///
-/// 10s: a favicon is a few kilobytes, and the caller's fallback for a failed
-/// fetch is the monogram it is already drawing -- waiting longer buys nothing.
+/// An icon is a few kilobytes, so total elapsed time is the right quantity:
+/// there is nothing here to stream and no reason to distinguish "slow" from
+/// "stalled". The caller's fallback for a failed fetch is the monogram it is
+/// already drawing, so waiting longer than this buys nothing.
+///
+/// It also has to be a *total* bound rather than a per-read one for a second
+/// reason: icons are fetched repeatedly against a single host, so pooled
+/// connections are the normal case here, and a per-read timeout does not
+/// survive pooling. See [`crate::http_agent`].
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Blocking GET for the icon's raw bytes. Call only from a background
@@ -100,13 +99,8 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
     // a single host, and a fresh agent per call would throw away connection
     // reuse (and open a new TCP+TLS handshake for every icon in the list).
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    let agent = AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(READ_TIMEOUT)
-            .timeout(REQUEST_DEADLINE)
-            .build()
-    });
+    let agent =
+        AGENT.get_or_init(|| crate::http_agent::bounded_total(CONNECT_TIMEOUT, REQUEST_DEADLINE));
     let response = agent.get(url).call().ok()?;
     let mut bytes = Vec::new();
     response.into_reader().read_to_end(&mut bytes).ok()?;

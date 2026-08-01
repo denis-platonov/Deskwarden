@@ -17,67 +17,51 @@ pub struct ReleaseInfo {
 /// How long to wait for a TCP connection to establish before giving up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long to wait between successive reads of a response body.
+/// Total-time bound for the releases-API check.
 ///
-/// This bounds a *stalled* transfer, not a slow one: ureq applies
-/// `timeout_read` per read, so a slow-but-steady download is never cut off by
-/// it. Read the caveat on [`API_DEADLINE`] before treating it as this agent's
-/// only protection -- on a reused keep-alive connection it is not applied at
-/// all.
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Whole-request deadline for the releases-API check.
-///
-/// Needed because `timeout_read` is silently dropped on connection reuse in
-/// ureq 2.12.1: it is set on the socket only on the connect path
-/// (`stream.rs:436`) and `Stream::reset()` clears it again (`stream.rs:265`)
-/// before the connection is pooled, while `connect_socket` returns a pooled
-/// connection without re-entering that path (`unit.rs:361-364`). The response
-/// head is read under `unit.deadline` (`response.rs:574`), which comes only
-/// from `request.timeout.or(agent.config.timeout)` (`request.rs:122`). So an
-/// agent with `timeout_read` alone bounds its first request and nothing after
-/// it -- the same defect that hung the vault path in v0.3.0 (see
-/// `vault_bridge::REQUEST_DEADLINE`).
-///
-/// 30s: the response is a single small JSON document, so anything near this
-/// is already a broken path, and the update check runs on a background thread
-/// where a 30s wait costs the user nothing.
+/// The response is one small JSON document, so total elapsed time is the right
+/// shape here: anything near this number is a broken path, not a slow one. The
+/// check runs on a background thread (`main.rs`), so a 30s wait costs the user
+/// nothing but a late tray badge.
 const API_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Whole-request deadline for the installer download.
+/// No-progress bound for the installer download.
 ///
-/// Deliberately *not* the same number as [`API_DEADLINE`], and deliberately
-/// not left unset. A whole-request deadline caps the entire transfer, body
-/// included -- so the value that is right for a one-line JSON response would
-/// abort a legitimate ~6 MB installer download on a slow link and trade a hang
-/// for a broken updater. But leaving it unset is what caused the shipped hang,
-/// so the download gets its own, generous bound instead of none.
+/// The download is a ~6 MB stream and its legitimate duration is unknown -- it
+/// depends entirely on the user's link -- so *total* time is the wrong thing
+/// to bound. v0.3.0's first fix bounded it anyway, at 600s, and that number is
+/// the proof: too tight to allow a genuinely slow download, too loose to be a
+/// bound anyone benefits from, and it left the tray pinned on "Updating to vX"
+/// for ten minutes with repeat clicks swallowed (`main.rs`) where a stalled
+/// download used to fail in fifteen seconds.
 ///
-/// 10 minutes sustains a ~6 MB installer at roughly 80 kbit/s end to end,
-/// which is below any connection that could have reached GitHub to discover
-/// the release in the first place. It is a "this will never finish" bound, not
-/// a performance budget. `READ_TIMEOUT` still catches the common stall case
-/// much sooner on a fresh connection; this is the backstop that also holds on
-/// a pooled one. The download runs on a background thread, so the worst case
-/// is a background update attempt that gives up after 10 minutes.
-const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(600);
+/// So this bounds the gap *between* reads instead: 15s with no byte arriving
+/// is a dead transfer at any link speed worth downloading over, while a
+/// slow-but-steady stream runs as long as it needs to. Deliberately *not*
+/// paired with a whole-request deadline -- see
+/// [`crate::http_agent::bounded_stall`]; adding one is exactly what made this
+/// setting inert before.
+///
+/// Not bounded here: a server that dribbles one byte every 14s forever. That
+/// is indistinguishable from a very slow link by any time-based rule, and this
+/// is the shape that says so rather than pretending otherwise.
+const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Builds a `ureq::Agent` with bounded connect/read timeouts, so a stalled
-/// `api.github.com` (or any host on the network path to it) can't hang a
-/// caller indefinitely the way the implicit default agent would. Mirrors the
-/// bounded-wait pattern `bw_serve::READINESS_DEADLINE` already uses for the
-/// local `bw serve` dependency -- just applied to an external host, which has
-/// strictly more failure modes than localhost.
+/// Agent for [`check_for_update`]: a small JSON response, bounded by total
+/// time.
 ///
-/// The whole-request deadline is *not* set here: it is set per request by
-/// [`check_for_update`] and [`download_and_verify`], because one agent is
-/// shared by a tiny API response and a multi-megabyte download and no single
-/// number is correct for both.
-pub fn build_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(CONNECT_TIMEOUT)
-        .timeout_read(READ_TIMEOUT)
-        .build()
+/// Separate from [`build_download_agent`] because the two requests need
+/// different *kinds* of bound and ureq 2.12.1 can express only one per agent.
+/// They used to share one agent with both settings applied, which meant one of
+/// the settings silently did nothing; see [`crate::http_agent`].
+pub fn build_api_agent() -> ureq::Agent {
+    crate::http_agent::bounded_total(CONNECT_TIMEOUT, API_DEADLINE)
+}
+
+/// Agent for [`download_and_verify`]: a multi-megabyte stream, bounded by time
+/// without progress. See [`build_api_agent`] for why this is its own agent.
+pub fn build_download_agent() -> ureq::Agent {
+    crate::http_agent::bounded_stall(CONNECT_TIMEOUT, DOWNLOAD_STALL_TIMEOUT)
 }
 
 pub fn check_for_update(
@@ -88,7 +72,6 @@ pub fn check_for_update(
     let url = format!("{base_url}/repos/denis-platonov/deskwarden/releases/latest");
     let body: serde_json::Value = agent
         .get(&url)
-        .timeout(API_DEADLINE)
         .call()
         .map_err(|e| format!("failed to reach GitHub releases API: {e}"))?
         .into_json()
@@ -172,6 +155,13 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+/// Streams the release installer to `dest_dir` and refuses anything not signed
+/// by the expected signer.
+///
+/// `agent` must come from [`build_download_agent`], not [`build_api_agent`]:
+/// this is the one caller in the crate whose bound is "time without progress"
+/// rather than "total time", and an agent of the wrong shape would either
+/// abort a legitimately slow download or leave the stall unbounded.
 pub fn download_and_verify(
     release: &ReleaseInfo,
     expected_thumbprint: &str,
@@ -187,7 +177,6 @@ pub fn download_and_verify(
 
     let response = agent
         .get(&release.installer_download_url)
-        .timeout(DOWNLOAD_DEADLINE)
         .call()
         .map_err(|e| format!("failed to download installer: {e}"))?;
     let mut reader = response.into_reader();
@@ -233,7 +222,7 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let agent = build_agent();
+        let agent = build_api_agent();
         let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         let release = result.expect("expected an available update");
@@ -261,7 +250,7 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let agent = build_agent();
+        let agent = build_api_agent();
         let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         let release = result.expect("expected an available update");
@@ -284,7 +273,7 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let agent = build_agent();
+        let agent = build_api_agent();
         let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         assert!(result.is_none());
@@ -306,7 +295,7 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let agent = build_agent();
+        let agent = build_api_agent();
         let result = check_for_update(&server.url(), &current, &agent).unwrap();
 
         assert!(result.is_none());
@@ -386,9 +375,92 @@ mod tests {
             .create();
 
         let current = Version::parse("1.1.0").unwrap();
-        let agent = build_agent();
+        let agent = build_api_agent();
         let result = check_for_update(&server.url(), &current, &agent);
 
         assert!(result.is_err());
+    }
+
+    /// Pins that the *production* download agent -- not a test-built one --
+    /// really is the non-pooling, stall-bounded shape.
+    ///
+    /// Connection reuse is the whole question: on a reused socket ureq has
+    /// cleared the read timeout, and this agent deliberately carries no
+    /// whole-request deadline to fall back on, so a pooled second request
+    /// would be unbounded. `bounded_stall`'s `max_idle_connections(0)` is what
+    /// makes that impossible; this asserts `build_download_agent` actually
+    /// goes through it. Counted, not timed, so it cannot flake.
+    #[test]
+    fn the_production_download_agent_never_reuses_a_connection() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        fn read_head(stream: &mut TcpStream) -> bool {
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+
+        let counted = Arc::clone(&accepts);
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    while read_head(&mut stream) {
+                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+                        let _ = stream.flush();
+                    }
+                });
+            }
+        });
+
+        let agent = build_download_agent();
+        let url = format!("http://127.0.0.1:{port}/installer.exe");
+        for _ in 0..2 {
+            agent.get(&url).call().unwrap().into_string().unwrap();
+        }
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "the download agent pooled a connection, so its stall bound is not in force"
+        );
+    }
+
+    /// Pins the two production numbers against the failure each was chosen to
+    /// avoid, rather than leaving them to be re-tuned by feel.
+    ///
+    /// The 600s whole-request deadline this replaced is the reason: it pinned
+    /// the tray's "Updating to vX" state -- and swallowed repeat clicks
+    /// (`main.rs`) -- for ten minutes on a stalled download. A no-progress
+    /// bound has to stay short enough that the tray recovers on a human
+    /// timescale.
+    #[test]
+    fn the_download_stall_bound_stays_short_enough_for_the_tray_to_recover() {
+        assert!(
+            DOWNLOAD_STALL_TIMEOUT <= Duration::from_secs(60),
+            "a stalled download must not pin the tray label for minutes"
+        );
+        // And long enough that a brief hiccup on a slow link isn't mistaken
+        // for a dead transfer.
+        assert!(DOWNLOAD_STALL_TIMEOUT >= Duration::from_secs(10));
+        // The API check is bounded by *total* time, the download by time
+        // without progress -- different quantities, so this is not a
+        // "one must exceed the other" ordering claim. It is only a guard that
+        // the two never collapse back into one shared number, which is the
+        // arrangement that produced the inert setting in the first place.
+        assert_ne!(API_DEADLINE, DOWNLOAD_STALL_TIMEOUT);
     }
 }
