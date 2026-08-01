@@ -795,12 +795,25 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 match &mut mode {
                     DetailMode::Read => {
                         if let Some(item) = &selected_item {
-                            if item.item_type != Some(1) {
-                                ui.label(theme::bold(&item.name, 19.0).color(theme::INK));
-                                ui.add_space(6.0);
-                                ui.label("This item type isn't editable in Deskwarden yet.");
-                                return;
-                            }
+                            // There is deliberately no `item_type != Some(1)`
+                            // early return here any more. There used to be
+                            // one, drawing the name over "This item type
+                            // isn't editable in Deskwarden yet." and
+                            // returning -- which meant `draw_detail_read` was
+                            // *never called* for a card, a note, an identity
+                            // or an SSH key. Every kind-aware decision in
+                            // `detail.rs` would have been correct and inert,
+                            // which is this repository's most-repeated defect
+                            // shape. The pane is now kind-aware itself
+                            // (`detail::detail_body_for`), so this bails out
+                            // of nothing.
+                            //
+                            // What that guard was protecting is still
+                            // protected, one layer down and more precisely:
+                            // the *edit* form is still login-shaped, so
+                            // `detail::kind_offers_edit` draws no Edit button
+                            // for a kind `EditDraft` would corrupt (see its
+                            // doc). Read and Delete are safe for every kind.
 
                             // Only poll `bw serve` for a TOTP code if this
                             // item's own login data says one is configured.
@@ -910,8 +923,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             // equivalent of clicking "Fill in app" -- checked
                             // here, not at the top level, because it needs
                             // exactly the selected `item` this arm already
-                            // has and the button click above doesn't.
-                            if ui.ctx().input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)) {
+                            // has and the button click above doesn't. Gated
+                            // on the item's kind by the same predicate the
+                            // button is; see `fill_hotkey_applies`.
+                            if fill_hotkey_applies(
+                                crate::vault_bridge::ItemKind::of(item),
+                                ui.ctx().input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)),
+                            ) {
                                 action = DetailAction::Fill;
                             }
                             // `item` and `totp_code` already hold everything
@@ -1387,6 +1405,19 @@ fn apply_totp_poll_result(
 /// rather than taking the `TotpState` itself so this stays the "is it time
 /// yet" decision and the "does this state still want an answer" decision
 /// stays in its own testable function.
+/// Whether Ctrl+Shift+F should fill the currently selected item.
+///
+/// Gated on exactly the predicate the "Fill in app" button is
+/// (`detail::kind_offers_fill`), not on a second copy of the rule: the
+/// shortcut is that button's keyboard equivalent, so hiding the button for a
+/// card while leaving the shortcut live would keep the very door open that
+/// hiding it was meant to close -- two empty strings typed into whatever
+/// window is focused. Pulled out of the `egui` closure so that pairing is
+/// something a test can assert rather than something a reader has to notice.
+fn fill_hotkey_applies(kind: crate::vault_bridge::ItemKind, pressed: bool) -> bool {
+    pressed && detail::kind_offers_fill(kind)
+}
+
 fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool, state_wants_poll: bool) -> bool {
     poll_due && !poll_in_flight && state_wants_poll
 }
@@ -3006,5 +3037,40 @@ mod entered_no_code_reported_tests {
         ] {
             assert!(!entered_no_code_reported(&TotpState::Fetching, &after), "{after:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod fill_hotkey_applies_tests {
+    use super::fill_hotkey_applies;
+    use crate::vault_bridge::ItemKind;
+
+    /// Ctrl+Shift+F is the keyboard equivalent of the "Fill in app" button,
+    /// so it has to be gated by the same predicate. Gating only the button
+    /// would leave the hotkey typing two empty strings into the focused
+    /// window for exactly the kinds the button was hidden from -- a fix
+    /// correct at one layer and inert at the door next to it, which is the
+    /// shape this repository's ledger keeps recording.
+    #[test]
+    fn the_fill_hotkey_is_gated_by_the_same_rule_as_the_fill_button() {
+        for kind in [
+            ItemKind::Login,
+            ItemKind::SecureNote,
+            ItemKind::Card,
+            ItemKind::Identity,
+            ItemKind::SshKey,
+            ItemKind::Unknown(9),
+        ] {
+            assert_eq!(
+                fill_hotkey_applies(kind, true),
+                crate::vault_window::detail::kind_offers_fill(kind),
+                "{kind:?}: the hotkey and the button disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unpressed_hotkey_fills_nothing_even_on_a_login() {
+        assert!(!fill_hotkey_applies(ItemKind::Login, false));
     }
 }
