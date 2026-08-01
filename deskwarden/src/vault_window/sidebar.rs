@@ -1065,4 +1065,33 @@ mod tests {
         assert_eq!(count_for(&items, &SidebarFilter::Folder(String::new())), 0);
         assert_eq!(count_for(&items, &SidebarFilter::All), 5);
     }
+
+    /// Pins `ROW_INSET_X` and `SECTION_LABEL_INSET` to the actual numbers in
+    /// design 4.8's CSS, not merely to each other.
+    ///
+    /// `the_lock_countdown_starts_on_the_same_x_as_the_row_labels` and
+    /// `the_countdown_and_the_rows_are_both_row_inset_from_the_panel_edge`
+    /// both compute their expected value from these two constants
+    /// (`header_left - SECTION_LABEL_INSET + ROW_INSET_X`), so a change that
+    /// moves a constant away from the design -- while leaving the countdown
+    /// and the rows agreeing with each other -- leaves both of those tests
+    /// green. Demonstrated: bumping `ROW_INSET_X` from `10.0` to `16.0`, or
+    /// `SECTION_LABEL_INSET` from `8.0` to `20.0`, does not fail either test,
+    /// because both quantities cancel out of the comparison. Neither test is
+    /// wrong -- they correctly check that the countdown and the rows line up
+    /// with each other -- but nothing before this test checked that the
+    /// value they line up *on* is the one the design specifies.
+    ///
+    /// Design 4.8, block `2b`: each sidebar row is `padding: 8px 10px`
+    /// (`ROW_INSET_X` is the 10px), and the section header is `padding: 0 8px
+    /// 8px` (`SECTION_LABEL_INSET` is the 8px) -- see the doc comments on
+    /// both constants, which already cite the same source.
+    #[test]
+    fn the_row_and_section_insets_match_design_4_8s_padding_not_just_each_other() {
+        assert_eq!(ROW_INSET_X, 10.0, "design 4.8 block 2b: row `padding: 8px 10px`");
+        assert_eq!(
+            SECTION_LABEL_INSET, 8.0,
+            "design 4.8 block 2b: section header `padding: 0 8px 8px`"
+        );
+    }
 }
