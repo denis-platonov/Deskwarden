@@ -1529,6 +1529,45 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 DetailAction::OpenWebsite(url) => {
                                     webbrowser_open(&url);
                                 }
+                                // `set_favorite` returns the written item
+                                // rather than `Ok(())` precisely so this
+                                // cannot paint a favourited row from a write
+                                // the server refused: the local copy is
+                                // replaced with what came back, or nothing
+                                // changes and the failure is reported.
+                                DetailAction::ToggleFavorite(to) => {
+                                    match cache.set_favorite(item, to) {
+                                        Ok(updated) => {
+                                            if let Some(pos) =
+                                                items.iter().position(|i| i.id == updated.id)
+                                            {
+                                                items[pos] = updated;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!("could not change the favourite flag: {e:?}");
+                                            flag_reauth_if_unauthorized(
+                                                ui.ctx(),
+                                                &needs_reauth_for_closure,
+                                                &e,
+                                            );
+                                        }
+                                    }
+                                }
+                                // The action carries the row INDEX, not the
+                                // password: a previous password is a secret,
+                                // and `DetailAction` is built by the render
+                                // pass, so a value in it would be a plaintext
+                                // copy living for the frame. Resolve it here.
+                                DetailAction::CopyPasswordHistory(index) => {
+                                    match crate::vault_bridge::password_history(item).get(index) {
+                                        Some(entry) => ui.ctx().copy_text(entry.password.to_string()),
+                                        None => log::warn!(
+                                            "copy requested for history row {index}, which no \
+                                             longer exists on this item"
+                                        ),
+                                    }
+                                }
                                 // As with the sidebar's folder ×,
                                 // `confirm_click` gates this on a confirming
                                 // second click -- see its doc comment. Only
@@ -1575,6 +1614,23 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                     }
                                 }
                             }
+                            // The box is left unchanged on failure, so a
+                            // swallowed error here would read as a dead
+                            // button. `generator_request` carries the form's
+                            // own kind and size choices.
+                            EditAction::GeneratePassword => {
+                                match cache.bridge().generate(&draft.generator_request()) {
+                                    Ok(generated) => draft.set_generated_password(&generated),
+                                    Err(e) => {
+                                        log::warn!("could not generate a password: {e:?}");
+                                        flag_reauth_if_unauthorized(
+                                            ui.ctx(),
+                                            &needs_reauth_for_closure,
+                                            &e,
+                                        );
+                                    }
+                                }
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -1608,6 +1664,23 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                         "Save reached an item kind with no create payload; \
                                          the form should not have offered it"
                                     );
+                                }
+                            }
+                            // The box is left unchanged on failure, so a
+                            // swallowed error here would read as a dead
+                            // button. `generator_request` carries the form's
+                            // own kind and size choices.
+                            EditAction::GeneratePassword => {
+                                match cache.bridge().generate(&draft.generator_request()) {
+                                    Ok(generated) => draft.set_generated_password(&generated),
+                                    Err(e) => {
+                                        log::warn!("could not generate a password: {e:?}");
+                                        flag_reauth_if_unauthorized(
+                                            ui.ctx(),
+                                            &needs_reauth_for_closure,
+                                            &e,
+                                        );
+                                    }
                                 }
                             }
                             EditAction::Cancel => mode = DetailMode::Read,
