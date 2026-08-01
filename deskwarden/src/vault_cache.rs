@@ -26,6 +26,10 @@ struct Snapshot {
     items: Vec<VaultItem>,
     folders: Vec<Folder>,
     populated: bool,
+    /// Bumped by [`VaultCache::clear`]. Every populate captures this before
+    /// it starts fetching and refuses to write its result back if the value
+    /// has moved on since -- see [`VaultCache::populate`].
+    epoch: u64,
 }
 
 pub struct VaultCache {
@@ -49,9 +53,30 @@ impl VaultCache {
 
     /// Fills the snapshot from the backend. Called once per unlock, and
     /// again after a sync.
+    ///
+    /// **Epoch-guarded.** Fetching happens with no lock held (deliberately --
+    /// this is a real HTTP round-trip and can take seconds), and callers are
+    /// free to run it on a detached background thread; `picker_ui`'s
+    /// "Add app..." fallback does exactly that. So a [`Self::clear`] --
+    /// which `main` performs on lock and on re-authentication, precisely
+    /// because the *next* unlock may land on a different account -- can
+    /// happen while this call is in flight. Without a guard, the slow
+    /// success then lands afterwards and restores the pre-lock account's
+    /// decrypted snapshot with `populated = true`, so `app::fill_from_vault`
+    /// and the next vault-window open (which short-circuits on
+    /// `is_populated`) serve the *previous* account's items and passwords
+    /// while the app considers itself locked (review 13's Minor 2).
+    ///
+    /// The guard lives here rather than at any call site on purpose: there
+    /// is no correct behaviour a caller could choose instead, and the one
+    /// call site that got this wrong got it wrong by not knowing there was
+    /// anything to reason about. A discarded result leaves the cache exactly
+    /// as `clear` left it -- empty and unpopulated -- and returns `Ok(())`,
+    /// since nothing *failed*: the answer simply stopped being wanted.
     pub fn populate(&self) -> Result<(), VaultError> {
+        let epoch = self.lock().epoch;
         let items = self.bridge.list_items()?;
-        self.populate_with(items)
+        self.populate_with_at_epoch(items, epoch)
     }
 
     /// Same as [`Self::populate`], but with items already fetched by the
@@ -65,9 +90,27 @@ impl VaultCache {
     /// folders, since nothing else already has, and mirrors `populate`'s
     /// atomicity: the snapshot is only replaced if that fetch also succeeds,
     /// not left holding the given `items` with no folders to match.
+    /// Epoch-guarded exactly like [`Self::populate`] -- see its doc. The
+    /// epoch is captured here, on entry, which covers this method's own
+    /// `list_folders` round-trip; [`Self::populate`] threads its earlier
+    /// capture through `populate_with_at_epoch` so its `list_items` call is
+    /// covered too.
     pub fn populate_with(&self, items: Vec<VaultItem>) -> Result<(), VaultError> {
+        let epoch = self.lock().epoch;
+        self.populate_with_at_epoch(items, epoch)
+    }
+
+    fn populate_with_at_epoch(&self, items: Vec<VaultItem>, epoch: u64) -> Result<(), VaultError> {
         let folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
+        if snapshot.epoch != epoch {
+            log::info!(
+                "discarding a vault populate that finished after the cache was cleared \
+                 (epoch {epoch} -> {}); the snapshot stays empty",
+                snapshot.epoch
+            );
+            return Ok(());
+        }
         snapshot.items = items;
         snapshot.folders = folders;
         snapshot.populated = true;
@@ -87,6 +130,9 @@ impl VaultCache {
     }
 
     /// Drops everything. Called on lock and on quit.
+    ///
+    /// Also bumps the epoch, which is what makes this actually stick against
+    /// a populate that is already in flight -- see [`Self::populate`].
     pub fn clear(&self) {
         let mut snapshot = self.lock();
         snapshot.items.clear();
@@ -94,6 +140,7 @@ impl VaultCache {
         snapshot.folders.clear();
         snapshot.folders.shrink_to_fit();
         snapshot.populated = false;
+        snapshot.epoch = snapshot.epoch.wrapping_add(1);
     }
 
     pub fn create_item(&self, new_item: &NewLoginItem) -> Result<VaultItem, VaultError> {
@@ -232,6 +279,82 @@ mod tests {
         }
         items.assert();
         folders.assert();
+    }
+
+    #[test]
+    fn a_populate_whose_epoch_was_bumped_mid_flight_leaves_the_cache_empty() {
+        // Review 13's Minor 2. `picker_ui::pick_vault_item` runs
+        // `load_items_for_picker` -> `populate()` on a *detached* thread, and
+        // `main` calls `clear()` when the vault window locks and the user
+        // re-authenticates -- possibly into a different account. A populate
+        // that started before that `clear` and succeeds after it must not
+        // restore the pre-lock account's decrypted snapshot with
+        // `populated = true`, or `app::fill_from_vault` and the next vault
+        // window open (which short-circuits on `is_populated`) serve the
+        // previous account's items while the app considers itself locked.
+        //
+        // The `clear()` is fired from inside the *folders* response handler,
+        // so it lands strictly after the populate began fetching and
+        // strictly before it tries to write -- the exact interleaving,
+        // deterministically, with no sleeping.
+        let mut server = mockito::Server::new();
+        let cache = std::sync::Arc::new(cache_for(server.url()));
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let cache_for_handler = cache.clone();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                cache_for_handler.clear();
+                folders_body().as_bytes().to_vec()
+            })
+            .create();
+
+        // `Ok`: nothing failed, the answer just stopped being wanted.
+        cache.populate().unwrap();
+
+        assert!(
+            !cache.is_populated(),
+            "a populate that finished after clear() must not mark the cache populated -- \
+             the next vault-window open short-circuits on exactly this flag"
+        );
+        assert!(cache.items().is_empty(), "the pre-clear account's items must not be restored");
+        assert!(cache.folders().is_empty());
+    }
+
+    #[test]
+    fn a_populate_that_finishes_without_an_intervening_clear_still_lands() {
+        // The guard must not be so eager that the ordinary path stops
+        // working: with no `clear()` in flight the epoch is unchanged and
+        // the snapshot is written exactly as before.
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+
+        let cache = cache_for(server.url());
+        // A previous clear (bumping the epoch to a non-zero value) must not
+        // poison later populates -- only one that lands *during* one does.
+        cache.clear();
+        cache.populate().unwrap();
+
+        assert!(cache.is_populated());
+        assert_eq!(cache.items().len(), 2);
     }
 
     #[test]

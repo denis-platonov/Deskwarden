@@ -18,11 +18,18 @@ use std::sync::mpsc::Receiver;
 /// yields a value, then closes and returns `Some(value)`.
 ///
 /// `rx` is expected to be the receiving half of a channel whose sending half
-/// was handed to a `std::thread::scope`d worker thread computing `T` --
-/// scoped rather than a bare `std::thread::spawn`, so the worker can borrow
-/// data (e.g. `&VaultBridge`) from the caller's stack without needing it to
-/// be `'static`. `rx` itself has no such borrow (an `mpsc::Receiver<T>` is
-/// self-contained), so it's fine to move into this window's own `'static`
+/// was handed to a worker thread computing `T`. Both current call sites
+/// (`main::wait_for_vault_ready_with_spinner` and
+/// `picker_ui::pick_vault_item`) *detach* that worker with a bare
+/// `std::thread::spawn`, giving it owned data (a `VaultBridge` clone, an
+/// `Arc<VaultCache>` clone) rather than borrowing from the caller's stack.
+/// That is deliberate: a `std::thread::scope`d worker -- which is what both
+/// sites used to do -- forces the caller to block until the worker finishes
+/// even after this function has already returned `None` because the user
+/// closed the window, which made "the user can close this" a lie (review
+/// 12). Detached, the worker simply finishes on its own and its result is
+/// dropped unheard. `rx` itself is self-contained (an `mpsc::Receiver<T>`
+/// borrows nothing), so it is fine to move into this window's own `'static`
 /// closure regardless of where it was created.
 ///
 /// Returns `None` if the window closed without `rx` ever yielding a value --

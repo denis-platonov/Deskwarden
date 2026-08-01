@@ -706,12 +706,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         if selected_id != last_selected_id {
             mode = DetailMode::Read;
             reveal_password = false;
-            // `NoSecret` is just this reset block's neutral placeholder for
-            // "haven't looked yet" -- the per-frame TOTP block right below
-            // (gated on `totp_last_poll`, forced to fire immediately by the
-            // reset two lines down) overwrites it for real before this ever
-            // reaches the render call, so a stale code or unavailable state
-            // from the *previous* selection can never leak onto this one.
+            // `NoSecret` is this reset block's neutral "haven't looked yet"
+            // value, and it is deliberately the one value the per-frame TOTP
+            // block's `totp_state_for_secret_presence` promotes: on the very
+            // next line of that block, still in this same frame, an item
+            // that does have a seed becomes `Fetching` (so the row is
+            // present and honest while the background poll is out) and one
+            // that doesn't stays `NoSecret`. What this line actually
+            // guarantees is only that nothing from the *previous* selection
+            // -- a code, an `Unavailable`, or a `NoCodeReported` -- survives
+            // into this one; it does not, and since the poll moved onto a
+            // background thread cannot, guarantee a fetched code is in place
+            // by render time. (The comment that used to sit here claimed
+            // exactly that -- review 12 flagged it as false.)
             totp_state = TotpState::NoSecret;
             // Force the `totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL`
             // check below to be true on the very next check, matching how
@@ -795,6 +802,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             } else if should_start_totp_poll(
                                 totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
                                 totp_poll_in_flight,
+                                totp_state_wants_poll(&totp_state),
                             ) {
                                 totp_last_poll = Instant::now();
                                 totp_poll_in_flight = true;
@@ -915,8 +923,9 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 }
                                 DetailAction::CopyTotp => {
                                     // Only `Code` has anything to copy --
-                                    // `NoSecret` and `Unavailable` both have
-                                    // no valid current code (the detail pane
+                                    // `NoSecret`, `Fetching`,
+                                    // `NoCodeReported` and `Unavailable` all
+                                    // have no valid current code (the detail pane
                                     // doesn't even offer a Copy button for
                                     // either, but this stays defensive rather
                                     // than assuming the button state and the
@@ -1129,13 +1138,52 @@ fn current_totp_seconds_left() -> u8 {
 /// already something honest to show, and a fresh poll (once one starts) is
 /// what should replace it, not this presence check.
 ///
+/// `NoCodeReported` is likewise left untouched, and that is the whole point
+/// of it existing as its own variant (review 13's Important). It used to be
+/// spelled `NoSecret` -- the same value this function promotes -- so a poll
+/// that had just answered "no current code for this item" was promoted
+/// straight back to `Fetching` on the very next frame, `should_start_totp_poll`
+/// fired another poll a second later, and an item whose stored seed
+/// `bw serve` rejects with a `400` (removed on another device before a sync
+/// landed, or malformed) rendered "One-time code / Fetching..." forever
+/// while hammering the backend once a second for as long as it stayed
+/// selected. Because the two situations are now two variants, that promotion
+/// is not merely guarded against here, it is unrepresentable: this function
+/// cannot see the polled answer at all.
+///
 /// Pulled out on its own, the same way `apply_totp_poll_result` is, so this
 /// transition is directly unit-testable.
 fn totp_state_for_secret_presence(has_totp_secret: bool, previous: TotpState) -> TotpState {
     match (has_totp_secret, previous) {
         (false, _) => TotpState::NoSecret,
         (true, TotpState::NoSecret) => TotpState::Fetching,
+        (true, TotpState::NoCodeReported) => TotpState::NoCodeReported,
         (true, other) => other,
+    }
+}
+
+/// Whether the current `TotpState` is one a fresh poll could still improve
+/// on -- the second half of review 13's Important, and the reason
+/// `NoCodeReported` had to stop polling as well as stop being promoted.
+///
+/// Every state except `NoCodeReported` wants polling: `Fetching` is waiting
+/// for the first answer, `Code` needs refreshing before its 30s window
+/// closes, `Unavailable` is a *transient* failure that a later poll should
+/// recover from, and `NoSecret` never reaches this function's call site
+/// anyway (the call site's `if !has_totp_secret` arm returns first, and the
+/// derivation above has already promoted any `NoSecret` to `Fetching` by
+/// then). `NoCodeReported` is the one state where the backend has already
+/// given a definitive, successful answer for this item, so re-asking every
+/// second buys nothing and is exactly the per-second HTTP flood the review
+/// found. Selecting the item again re-derives from `NoSecret` and polls
+/// normally.
+///
+/// Exhaustive, no catch-all, for the same reason the render site is: a new
+/// variant must be a compile error here, not a silent default.
+fn totp_state_wants_poll(state: &TotpState) -> bool {
+    match state {
+        TotpState::NoSecret | TotpState::Fetching | TotpState::Code { .. } | TotpState::Unavailable => true,
+        TotpState::NoCodeReported => false,
     }
 }
 
@@ -1160,8 +1208,17 @@ fn totp_state_for_secret_presence(has_totp_secret: bool, previous: TotpState) ->
 /// error moves to `TotpState::Unavailable` -- restoring the pre-1d6c5ab
 /// always-assign behaviour, just landing on an explicit "unreachable" state
 /// instead of a blanked `Option` that read identically to "no TOTP here" --
-/// while a genuine `Ok(None)` ("no TOTP configured") moves to `NoSecret`,
-/// exactly as `Ok(None)` always has.
+/// while a genuine `Ok(None)` ("no code for this item") moves to
+/// `NoCodeReported`.
+///
+/// `Ok(None)` used to land on `NoSecret`, which rendered identically but was
+/// also the value the per-frame presence derivation
+/// (`totp_state_for_secret_presence`) promotes to `Fetching` -- so this arm
+/// was invisible in the live composition and the pane looped
+/// `Fetching` -> poll -> `Ok(None)` -> `Fetching` forever, once a second
+/// (review 13's Important). `NoCodeReported` exists so that this arm's
+/// answer is a state neither the derivation nor the poll gate can undo. See
+/// its doc.
 fn apply_totp_poll_result(
     result: Result<Option<String>, VaultError>,
     seconds_left: u8,
@@ -1173,7 +1230,7 @@ fn apply_totp_poll_result(
             None
         }
         Ok(None) => {
-            *totp_state = TotpState::NoSecret;
+            *totp_state = TotpState::NoCodeReported;
             None
         }
         Err(e) => {
@@ -1201,8 +1258,16 @@ fn apply_totp_poll_result(
 /// but `run`'s loop would spawn a *new* such thread every
 /// `TOTP_POLL_INTERVAL` for as long as it stayed hung, one more piling up on
 /// top of the last with nothing to bound how many accumulate.
-fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool) -> bool {
-    poll_due && !poll_in_flight
+///
+/// `state_wants_poll` (from `totp_state_wants_poll`) is review 13's other
+/// half: a `NoCodeReported` state is a definitive answer already received
+/// for this item, so continuing to poll it every second is pure load on
+/// `bw serve` with no possible new information. Passed in as a plain `bool`
+/// rather than taking the `TotpState` itself so this stays the "is it time
+/// yet" decision and the "does this state still want an answer" decision
+/// stays in its own testable function.
+fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool, state_wants_poll: bool) -> bool {
+    poll_due && !poll_in_flight && state_wants_poll
 }
 
 /// Whether a `totp_rx` message fetched for `item_id` should still be applied
@@ -1690,12 +1755,17 @@ mod apply_totp_poll_result_tests {
     }
 
     #[test]
-    fn a_genuine_no_totp_configured_response_becomes_no_secret_with_no_error() {
+    fn a_genuine_no_code_response_becomes_no_code_reported_with_no_error() {
+        // Deliberately NOT `NoSecret`, even though the two render the same:
+        // `NoSecret` is the value the per-frame presence derivation promotes
+        // back to `Fetching`, which is what made this arm invisible in the
+        // live composition (review 13's Important). See
+        // `a_backend_reported_absence_is_never_promoted_back_to_fetching`.
         let mut totp_state = TotpState::Code { code: "111111".to_string(), seconds_left: 20 };
 
         let error = apply_totp_poll_result(Ok(None), 15, &mut totp_state);
 
-        assert_eq!(totp_state, TotpState::NoSecret);
+        assert_eq!(totp_state, TotpState::NoCodeReported);
         assert!(error.is_none());
     }
 
@@ -1747,12 +1817,21 @@ mod should_start_totp_poll_tests {
 
     #[test]
     fn starts_when_due_with_nothing_in_flight() {
-        assert!(should_start_totp_poll(true, false));
+        assert!(should_start_totp_poll(true, false, true));
     }
 
     #[test]
     fn does_not_start_before_the_interval_elapses() {
-        assert!(!should_start_totp_poll(false, false));
+        assert!(!should_start_totp_poll(false, false, true));
+    }
+
+    #[test]
+    fn does_not_start_when_the_state_already_has_a_definitive_answer() {
+        // Review 13's Important, second half: a `NoCodeReported` state means
+        // the backend has already answered "no current code for this item".
+        // Without this the pane re-asked once a second, forever, for as long
+        // as the item stayed selected.
+        assert!(!should_start_totp_poll(true, false, false));
     }
 
     #[test]
@@ -1762,7 +1841,44 @@ mod should_start_totp_poll_tests {
         // would still spawn a fresh background thread every
         // `TOTP_POLL_INTERVAL`, piling up indefinitely instead of the single
         // outstanding poll this is meant to bound it to.
-        assert!(!should_start_totp_poll(true, true));
+        assert!(!should_start_totp_poll(true, true, true));
+    }
+}
+
+#[cfg(test)]
+mod totp_state_wants_poll_tests {
+    // Review 13's Important, second half. `NoCodeReported` is the only state
+    // where the backend has already given a definitive, *successful* answer
+    // for this item, so it is the only one that must stop the per-second
+    // poll. Everything else -- including `Unavailable`, which is transient
+    // by definition and must be able to recover -- keeps asking.
+    use super::totp_state_wants_poll;
+    use crate::vault_window::detail::TotpState;
+
+    #[test]
+    fn a_backend_reported_absence_stops_polling() {
+        assert!(!totp_state_wants_poll(&TotpState::NoCodeReported));
+    }
+
+    #[test]
+    fn a_pending_fetch_keeps_polling() {
+        assert!(totp_state_wants_poll(&TotpState::Fetching));
+    }
+
+    #[test]
+    fn a_live_code_keeps_polling_so_it_can_be_refreshed_before_its_window_closes() {
+        assert!(totp_state_wants_poll(&TotpState::Code {
+            code: "111111".to_string(),
+            seconds_left: 4
+        }));
+    }
+
+    #[test]
+    fn an_unavailable_state_keeps_polling_so_a_transient_outage_can_recover() {
+        // The distinction that makes `NoCodeReported` worth its own variant:
+        // "the backend could not be reached" must keep retrying, "the
+        // backend answered, there is no code" must not.
+        assert!(totp_state_wants_poll(&TotpState::Unavailable));
     }
 }
 
@@ -1824,6 +1940,30 @@ mod totp_state_for_secret_presence_tests {
     }
 
     #[test]
+    fn a_backend_reported_absence_also_clears_when_the_secret_is_gone() {
+        // Review 9's property must survive review 13's redesign: the
+        // derivation runs unconditionally, every frame, *before* the poll
+        // gate, so an item whose seed was removed on another device lands on
+        // `NoSecret` in the same frame the reload carrying that removal
+        // lands -- from any previous state, `NoCodeReported` included. The
+        // new variant is exempt from the *promotion*, not from this.
+        let next = totp_state_for_secret_presence(false, TotpState::NoCodeReported);
+
+        assert_eq!(next, TotpState::NoSecret);
+    }
+
+    #[test]
+    fn a_backend_reported_absence_survives_while_the_secret_is_still_present() {
+        // The other side of the same coin: while the item still carries a
+        // seed, the polled answer stands. Left as `NoSecret` it would be
+        // promoted to `Fetching` on this very frame and re-polled on the
+        // next.
+        let next = totp_state_for_secret_presence(true, TotpState::NoCodeReported);
+
+        assert_eq!(next, TotpState::NoCodeReported);
+    }
+
+    #[test]
     fn no_secret_stays_no_secret_when_the_secret_is_still_absent() {
         let next = totp_state_for_secret_presence(false, TotpState::NoSecret);
 
@@ -1850,6 +1990,25 @@ mod totp_state_for_secret_presence_tests {
         let next = totp_state_for_secret_presence(true, TotpState::Unavailable);
 
         assert_eq!(next, TotpState::Unavailable);
+    }
+
+    #[test]
+    fn a_backend_reported_absence_is_never_promoted_back_to_fetching() {
+        // The composed assertion review 13 found missing: both halves were
+        // individually correct, and together they looped forever.
+        use super::apply_totp_poll_result;
+        let mut state = TotpState::Fetching;
+        apply_totp_poll_result(Ok(None), 15, &mut state);
+
+        let next = totp_state_for_secret_presence(true, state);
+
+        assert_ne!(
+            next,
+            TotpState::Fetching,
+            "a poll that authoritatively answered \"no code for this item\" must not be \
+             promoted straight back into Fetching, or the pane says \"Fetching...\" forever \
+             and polls bw serve once a second for as long as the item stays selected"
+        );
     }
 
     #[test]

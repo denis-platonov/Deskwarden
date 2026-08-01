@@ -29,6 +29,13 @@ use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 pub enum TotpState {
     /// This item has no TOTP secret configured -- the row is omitted
     /// entirely, same as before TOTP existed in this pane at all.
+    ///
+    /// *Derived from the item*, every frame, by
+    /// `vault_window::mod::totp_state_for_secret_presence`: it is whatever
+    /// the item we currently hold says, so a secret removed on another
+    /// device clears the row in the same frame the reload lands. It is
+    /// deliberately **not** a conclusion drawn from a poll -- that is
+    /// `NoCodeReported`, below.
     NoSecret,
     /// This item *does* have a TOTP secret, but the poll for its current
     /// code is a background thread now (see `totp_poll_in_flight`'s doc in
@@ -52,6 +59,34 @@ pub enum TotpState {
     /// `NoSecret` specifically so the row stays visible with an honest
     /// "unavailable" state instead of vanishing and reading as "not set up".
     Unavailable,
+    /// A poll *answered*, successfully, that there is no current code for
+    /// this item (`get_totp` -> `Ok(None)`; `bw serve` returns `400` for
+    /// this, see `VaultBridge::get_totp`). Renders exactly like `NoSecret`
+    /// -- no row -- because the backend has authoritatively said there is no
+    /// code, which is the same thing the user needs to know. It is a
+    /// *separate variant* purely so the per-frame presence derivation
+    /// (`totp_state_for_secret_presence`) structurally cannot see it and
+    /// cannot promote it, and so the poll gate
+    /// (`totp_state_wants_poll`) can stop asking.
+    ///
+    /// Review 13's Important: this used to share `NoSecret`, and the two
+    /// situations behind that one value pulled in opposite directions.
+    /// `NoSecret` is *derived from the item* and must be re-derived every
+    /// frame (review 9's fix -- a remotely removed secret has to clear
+    /// immediately), which meant the unconditional derivation promoted a
+    /// just-polled `Ok(None)` straight back to `Fetching`, the poll gate
+    /// fired again a second later, and an item whose stored seed the backend
+    /// rejects (removed on another device before a sync landed, or
+    /// malformed) sat on "One-time code / Fetching..." forever while issuing
+    /// one HTTP round-trip per second, indefinitely. Splitting the two
+    /// situations into two variants is what dissolves that, the same move
+    /// that dissolved `TotpState` itself, `PickerItemsResult`,
+    /// `BackendReadiness` and `VaultReadyOutcome`.
+    ///
+    /// Reset on selection change (`run`'s reset block sets `NoSecret`, which
+    /// the derivation then promotes to `Fetching`), so selecting the item
+    /// again polls normally.
+    NoCodeReported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +215,15 @@ pub fn draw_detail_read(
         // here" even when it was, just unreachable right now.
         match totp {
             TotpState::NoSecret => {}
+            // Same render as `NoSecret` on purpose: the backend answered,
+            // and its answer was "there is no current code for this item".
+            // Omitting the row is the honest, pre-existing behaviour for
+            // that answer -- it is *not* the review-8 "vanished row" bug,
+            // which was about an UNREACHABLE backend (that is `Unavailable`,
+            // below, and it keeps its row). The two are separate variants
+            // for the state machine's sake, not the pixels' -- see
+            // `NoCodeReported`'s doc.
+            TotpState::NoCodeReported => {}
             TotpState::Fetching => {
                 theme::hairline(ui);
                 totp_fetching_row(ui);

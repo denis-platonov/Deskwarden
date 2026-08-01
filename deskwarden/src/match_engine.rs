@@ -17,6 +17,21 @@ impl MatchEngine {
             .collect();
     }
 
+    /// Drops every match, so nothing can be looked up until a rebuild.
+    ///
+    /// Pairs with `VaultCache::clear`: an empty cache and a populated engine
+    /// are an inconsistent pair (review 13's Minor 3). Left populated after
+    /// a lock the user then declined to unlock, a matched process still
+    /// raises the autofill prompt, and the fill then finds nothing --
+    /// `handle_match` looks the item up in the now-empty cache, misses, and
+    /// falls through to a `bridge.get_item` with an id belonging to an
+    /// account the app is no longer signed into. Clearing both together
+    /// means a locked app is simply inert, which is what "locked" should
+    /// look like.
+    pub fn clear(&mut self) {
+        self.by_process.clear();
+    }
+
     pub fn lookup(&self, exe_name: &str) -> Option<(&str, &AppMatch)> {
         self.by_process
             .get(&exe_name.to_lowercase())
@@ -53,6 +68,20 @@ mod tests {
         let (id, m) = engine.lookup("RockstarGamesLauncher.exe").unwrap();
         assert_eq!(id, "1");
         assert_eq!(m.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn clear_drops_every_match_so_a_locked_app_is_inert() {
+        // Review 13's Minor 3: after lock recovery is dismissed the cache is
+        // empty, so the engine must be too -- otherwise a matched process
+        // still raises the autofill prompt for an account the app is no
+        // longer signed into, and the fill can only fail.
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[entry("1", "RockstarGamesLauncher.exe", TriggerMode::Prompt)]);
+
+        engine.clear();
+
+        assert!(engine.lookup("RockstarGamesLauncher.exe").is_none());
     }
 
     #[test]

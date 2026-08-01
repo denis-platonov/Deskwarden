@@ -285,7 +285,7 @@ fn main() {
     // Losing that race used to leave the match engine permanently empty with
     // no diagnostic, so the app silently did nothing forever.
     let schedule = readiness_schedule(READINESS_DEADLINE);
-    let items = match wait_for_vault_ready_with_spinner(&vault, &schedule) {
+    let items = match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_MESSAGE) {
         VaultReadyOutcome::Ready(items) => items,
         VaultReadyOutcome::Dismissed => {
             // Closing the "setting up" window is not, on its own, evidence
@@ -299,7 +299,7 @@ fn main() {
                 "setup window closed before the vault backend was confirmed ready; trying the \
                  readiness probe again before treating anything as actually broken"
             );
-            match wait_for_vault_ready_with_spinner(&vault, &schedule) {
+            match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_RETRY_MESSAGE) {
                 VaultReadyOutcome::Ready(items) => items,
                 VaultReadyOutcome::Dismissed => recover_from_failed_vault_wait(
                     "setup window closed a second time without the vault backend becoming ready",
@@ -1429,7 +1429,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 ));
             }
         };
-        match wait_for_vault_ready_with_spinner(cache.bridge(), schedule) {
+        match wait_for_vault_ready_with_spinner(cache.bridge(), schedule, SETUP_MESSAGE) {
             VaultReadyOutcome::Ready(_items) => {
                 if let Err(e) = cache.populate() {
                     log::warn!("could not repopulate the vault cache after unlock: {e:?}");
@@ -1453,10 +1453,24 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 // vault. Exiting the whole app -- tray, hotkey, autofill,
                 // all of it -- over an impatient click on a spinner is not
                 // an acceptable trade for a vault that was already locked.
+                //
+                // The engine has to be cleared alongside the cache that
+                // `clear()` emptied further up (review 13's Minor 3). Only
+                // the `Ready` arm above rebuilds it, so without this the app
+                // sits with an EMPTY cache and the PRE-reauth account's app
+                // matches: a matched process still raises the autofill
+                // prompt, and the fill then misses in the empty cache and
+                // falls through to a `get_item` with an id from an account
+                // this session is no longer signed into -- a prompt that can
+                // only ever end in an error log. An empty cache and a
+                // populated engine are simply not a consistent pair; a
+                // locked app should be inert.
+                engine.clear();
                 log::warn!(
                     "setup window closed before the vault backend was confirmed ready after \
                      unlocking; leaving Deskwarden running with the vault effectively still \
-                     locked -- open it again from the tray to retry"
+                     locked (app matches cleared too, so nothing can prompt to autofill until \
+                     it is unlocked) -- open it again from the tray to retry"
                 );
             }
             VaultReadyOutcome::Failed(e) => {
@@ -1777,6 +1791,19 @@ fn spawn_sync(
     });
 }
 
+/// What the readiness spinner says the first time it is shown for a given
+/// attempt at getting the vault ready.
+const SETUP_MESSAGE: &str = "Setting up your vault...";
+
+/// What it says when it comes back after the user closed it, or after a
+/// fresh sign-in (review 13's Minor 4). Closing the window used to bring an
+/// apparently identical one straight back with nothing to distinguish it, so
+/// the retry read as the app ignoring the click rather than as a deliberate
+/// second attempt -- and closing *that* one jumped to a master-password
+/// prompt with no explanation at all. Kept short: this is a 320px-wide
+/// window with one line of text.
+const SETUP_RETRY_MESSAGE: &str = "Still not ready -- trying once more...";
+
 /// Outcome of [`wait_for_vault_ready_with_spinner`].
 ///
 /// Review 12's Critical: a user closing the "setting up" window and the
@@ -1811,14 +1838,25 @@ enum VaultReadyOutcome {
 /// dropped) and was thrown away regardless of whether it was actually `Ok`.
 /// `vault`/`schedule` are cloned into the worker rather than borrowed for
 /// the same reason: a detached thread can't borrow the caller's stack.
-fn wait_for_vault_ready_with_spinner(vault: &VaultBridge, schedule: &[Duration]) -> VaultReadyOutcome {
+/// `message` is what the spinner says. It is a parameter rather than a
+/// constant because the retry after a dismissal has to look *different* from
+/// the window the user just closed (review 13's Minor 4): re-running this
+/// with the identical wording made closing the window pop an apparently
+/// identical one straight back, with nothing to explain why, and closing
+/// that one jumped to a master-password prompt with no explanation either.
+/// The bounded retry itself is correct and stays; only its wording changes.
+fn wait_for_vault_ready_with_spinner(
+    vault: &VaultBridge,
+    schedule: &[Duration],
+    message: &str,
+) -> VaultReadyOutcome {
     let (tx, rx) = mpsc::channel();
     let worker_vault = vault.clone();
     let worker_schedule = schedule.to_vec();
     std::thread::spawn(move || {
         let _ = tx.send(wait_for_vault_ready(&worker_vault, &worker_schedule));
     });
-    match loading_ui::show_while("Setting up your vault...", rx) {
+    match loading_ui::show_while(message, rx) {
         Some(Ok(items)) => VaultReadyOutcome::Ready(items),
         Some(Err(e)) => VaultReadyOutcome::Failed(e),
         None => VaultReadyOutcome::Dismissed,
@@ -1874,7 +1912,7 @@ fn recover_from_failed_vault_wait(
         }
     };
 
-    match wait_for_vault_ready_with_spinner(vault, schedule) {
+    match wait_for_vault_ready_with_spinner(vault, schedule, SETUP_RETRY_MESSAGE) {
         VaultReadyOutcome::Ready(items) => items,
         VaultReadyOutcome::Dismissed => {
             if let Some(child) = bw_serve_child.as_mut() {
