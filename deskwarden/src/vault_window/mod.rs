@@ -814,6 +814,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             // `detail::kind_offers_edit` draws no Edit button
                             // for a kind `EditDraft` would corrupt (see its
                             // doc). Read and Delete are safe for every kind.
+                            //
+                            // That removal is now pinned by a test rather
+                            // than by this comment:
+                            // `draw_read_arm_tests::the_read_arm_paints_a_
+                            // real_pane_for_every_kind` fails for all five
+                            // non-login kinds if any early return reappears
+                            // inside `draw_read_arm`.
 
                             // Only poll `bw serve` for a TOTP code if this
                             // item's own login data says one is configured.
@@ -910,7 +917,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             }
                             let delete_pending = item_delete_pending.as_ref().map(|(id, _)| id.as_str()) == Some(item.id.as_str());
 
-                            let mut action = draw_detail_read(
+                            // Everything this arm *draws* -- the pane and the
+                            // Ctrl+Shift+F gate over it -- lives in
+                            // `draw_read_arm` rather than here, so it can be
+                            // driven headlessly by a test. See that
+                            // function's doc for why that is not a stylistic
+                            // preference on this particular arm.
+                            let action = draw_read_arm(
                                 ui,
                                 item,
                                 fill_count,
@@ -919,19 +932,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 &mut reveal_password,
                                 icons.textures.get(item.id.as_str()),
                             );
-                            // Ctrl+Shift+F (spec section 5) is the keyboard
-                            // equivalent of clicking "Fill in app" -- checked
-                            // here, not at the top level, because it needs
-                            // exactly the selected `item` this arm already
-                            // has and the button click above doesn't. Gated
-                            // on the item's kind by the same predicate the
-                            // button is; see `fill_hotkey_applies`.
-                            if fill_hotkey_applies(
-                                crate::vault_bridge::ItemKind::of(item),
-                                ui.ctx().input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)),
-                            ) {
-                                action = DetailAction::Fill;
-                            }
                             // `item` and `totp_code` already hold everything
                             // a copy action needs -- `draw_detail_read` only
                             // needs to report *which* field was clicked, not
@@ -1379,6 +1379,82 @@ fn apply_totp_poll_result(
     }
 }
 
+/// Everything `run`'s `DetailMode::Read` arm *draws*: the detail pane itself
+/// and the Ctrl+Shift+F gate layered over it. Returns the single
+/// [`DetailAction`] the arm then acts on; it performs no side effects of its
+/// own, so a test can call it with nothing but an `egui::Context`.
+///
+/// **This is a function, and not a block inside `run`'s closure, because the
+/// single most load-bearing line of commit b758f5e had no test.** That commit
+/// deleted an `if item.item_type != Some(1) { ...; return; }` early return
+/// from the top of this arm. Without that deletion `draw_detail_read` is
+/// *never called* for a card, a note, an identity or an SSH key, and every
+/// kind-aware decision in `detail.rs` is correct and inert -- this
+/// repository's most-repeated defect shape. Reinstating the guard left all
+/// 392 tests green. The same hole covered the [`fill_hotkey_applies`] call
+/// site: reverting it to a bare `ui.ctx().input(..)` check kept
+/// `fill_hotkey_applies_tests` green while the hotkey filled a card again.
+///
+/// Neither is observable by running the app: the vault this was built against
+/// holds 1656 items and every one of them is a login. `draw_read_arm_tests`
+/// is the only evidence that exists, and Task 6 will be editing this exact
+/// region to make Edit kind-aware.
+///
+/// The per-frame TOTP block deliberately stays in `run`: it spawns threads,
+/// reads `run`'s poll bookkeeping, and its rendering is already pinned from
+/// both directions in `detail.rs`. Moving it would restructure the one part
+/// of this pane with five findings and a redesign behind it.
+fn draw_read_arm(
+    ui: &mut egui::Ui,
+    item: &VaultItem,
+    fill_count: u32,
+    totp_state: &TotpState,
+    delete_pending: bool,
+    reveal_password: &mut bool,
+    icon: Option<&egui::TextureHandle>,
+) -> DetailAction {
+    let mut action = draw_detail_read(
+        ui,
+        item,
+        fill_count,
+        totp_state,
+        delete_pending,
+        reveal_password,
+        icon,
+    );
+    // Ctrl+Shift+F (spec section 5) is the keyboard equivalent of clicking
+    // "Fill in app" -- checked here, not at the top level, because it needs
+    // exactly the selected `item` and the button click above doesn't. Gated
+    // on the item's kind by the same predicate the button is; see
+    // `fill_hotkey_applies`.
+    if fill_hotkey_applies(
+        crate::vault_bridge::ItemKind::of(item),
+        ui.ctx()
+            .input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)),
+    ) {
+        action = DetailAction::Fill;
+    }
+    action
+}
+
+/// Whether Ctrl+Shift+F should fill the currently selected item.
+///
+/// Gated on exactly the predicate the "Fill in app" button is
+/// (`detail::kind_offers_fill`), not on a second copy of the rule: the
+/// shortcut is that button's keyboard equivalent, so hiding the button for a
+/// card while leaving the shortcut live would keep the very door open that
+/// hiding it was meant to close -- two empty strings typed into whatever
+/// window is focused. Pulled out of the `egui` closure so that pairing is
+/// something a test can assert rather than something a reader has to notice.
+///
+/// Its *call site* is `draw_read_arm`, which is itself a function rather than
+/// a block inside `run`'s closure, so `draw_read_arm_tests` can prove the
+/// wiring as well as the rule -- reverting the call site to a bare
+/// `ui.ctx().input(..)` check used to leave every test here green.
+fn fill_hotkey_applies(kind: crate::vault_bridge::ItemKind, pressed: bool) -> bool {
+    pressed && detail::kind_offers_fill(kind)
+}
+
 /// Whether `run`'s per-frame TOTP block should spawn a new background poll
 /// this frame. Pulled out into its own function, the same way
 /// `totp_state_for_secret_presence`/`apply_totp_poll_result` are, so the two
@@ -1405,19 +1481,6 @@ fn apply_totp_poll_result(
 /// rather than taking the `TotpState` itself so this stays the "is it time
 /// yet" decision and the "does this state still want an answer" decision
 /// stays in its own testable function.
-/// Whether Ctrl+Shift+F should fill the currently selected item.
-///
-/// Gated on exactly the predicate the "Fill in app" button is
-/// (`detail::kind_offers_fill`), not on a second copy of the rule: the
-/// shortcut is that button's keyboard equivalent, so hiding the button for a
-/// card while leaving the shortcut live would keep the very door open that
-/// hiding it was meant to close -- two empty strings typed into whatever
-/// window is focused. Pulled out of the `egui` closure so that pairing is
-/// something a test can assert rather than something a reader has to notice.
-fn fill_hotkey_applies(kind: crate::vault_bridge::ItemKind, pressed: bool) -> bool {
-    pressed && detail::kind_offers_fill(kind)
-}
-
 fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool, state_wants_poll: bool) -> bool {
     poll_due && !poll_in_flight && state_wants_poll
 }
@@ -3072,5 +3135,201 @@ mod fill_hotkey_applies_tests {
     #[test]
     fn an_unpressed_hotkey_fills_nothing_even_on_a_login() {
         assert!(!fill_hotkey_applies(ItemKind::Login, false));
+    }
+}
+
+#[cfg(test)]
+mod draw_read_arm_tests {
+    //! The wiring tests for the detail pane's Read arm.
+    //!
+    //! `detail.rs`'s own tests prove `draw_detail_read` obeys the per-kind
+    //! decisions. They cannot prove that `run` ever *calls* it, nor that the
+    //! Ctrl+Shift+F gate is the one at the call site. Both of those were
+    //! untested until this module existed, and both are load-bearing: commit
+    //! b758f5e's entire contribution was deleting an `item_type != Some(1)`
+    //! early return from this arm, and reinstating it left all 392 tests
+    //! green while every kind-aware behaviour silently disappeared.
+    //!
+    //! These drive `draw_read_arm` -- the function that arm's body was
+    //! hoisted into for exactly this reason -- headlessly, and read back what
+    //! the frame actually painted.
+    use super::{draw_read_arm, DetailAction, TotpState};
+    use crate::theme;
+    use crate::vault_bridge::{ItemKind, VaultItem};
+    use eframe::egui;
+
+    fn an_item(item_type: Option<i64>) -> VaultItem {
+        VaultItem {
+            id: "id-1".to_string(),
+            name: "Sample".to_string(),
+            fields: Vec::new(),
+            login: None,
+            card: None,
+            identity: None,
+            notes: None,
+            item_type,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn item_type_for(kind: ItemKind) -> Option<i64> {
+        match kind {
+            ItemKind::Login => Some(1),
+            ItemKind::SecureNote => Some(2),
+            ItemKind::Card => Some(3),
+            ItemKind::Identity => Some(4),
+            ItemKind::SshKey => Some(5),
+            ItemKind::Unknown(t) => Some(t),
+        }
+    }
+
+    const EVERY_KIND: [ItemKind; 6] = [
+        ItemKind::Login,
+        ItemKind::SecureNote,
+        ItemKind::Card,
+        ItemKind::Identity,
+        ItemKind::SshKey,
+        ItemKind::Unknown(9),
+    ];
+
+    /// Runs one headless frame of `draw_read_arm` and returns both what it
+    /// returned and every string it painted.
+    ///
+    /// `theme::apply`'s font set only takes effect at the start of the *next*
+    /// frame, so two throwaway frames run first -- same reason `detail.rs`'s
+    /// `painted_text` harness does.
+    fn run_read_arm(item: &VaultItem, hotkey_pressed: bool) -> (DetailAction, Vec<String>) {
+        let ctx = egui::Context::default();
+        let hotkey_modifiers = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        let input = |hotkey: bool| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            modifiers: if hotkey {
+                hotkey_modifiers
+            } else {
+                egui::Modifiers::default()
+            },
+            events: if hotkey {
+                vec![egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: hotkey_modifiers,
+                }]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(false), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(false), |_ui| {});
+
+        let mut reveal_password = false;
+        let mut action = DetailAction::None;
+        let output = ctx.run_ui(input(hotkey_pressed), |ui| {
+            action = draw_read_arm(
+                ui,
+                item,
+                3,
+                &TotpState::NoSecret,
+                false,
+                &mut reveal_password,
+                None,
+            );
+        });
+
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        (action, texts)
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn contains(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    /// **The regression guard for b758f5e.** Reinstating the
+    /// `item_type != Some(1)` early return -- which is what this arm did
+    /// before that commit, and what Task 6 will be editing around -- makes
+    /// every non-login kind fail here, because the pane it drew instead was
+    /// the item's name over "This item type isn't editable in Deskwarden
+    /// yet." and nothing else.
+    ///
+    /// The user's real vault is 1656 items, every one type 1, so nothing on
+    /// this path is observable by running the app. These assertions are the
+    /// only evidence that exists.
+    #[test]
+    fn the_read_arm_paints_a_real_pane_for_every_kind() {
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let (_, texts) = run_read_arm(&item, false);
+            assert!(
+                texts.contains(&kind.label()),
+                "{kind:?}: the read arm painted no {:?} subtitle, so `draw_detail_read` \
+                 was not reached for it; painted: {texts:?}",
+                kind.label()
+            );
+            assert!(
+                contains(&texts, "Delete"),
+                "{kind:?}: the read arm painted no Delete button; painted: {texts:?}"
+            );
+            assert!(
+                !contains(&texts, "isn't editable in Deskwarden yet"),
+                "{kind:?}: the read arm is short-circuiting to a placeholder again; \
+                 painted: {texts:?}"
+            );
+        }
+    }
+
+    /// **The regression guard for the hotkey call site.** `fill_hotkey_applies`
+    /// being correct proves nothing about whether the arm calls it: reverting
+    /// this call site to a bare `ui.ctx().input(..)` check leaves
+    /// `fill_hotkey_applies_tests` entirely green while Ctrl+Shift+F fills a
+    /// card with two empty strings again.
+    #[test]
+    fn the_fill_hotkey_gate_is_wired_at_the_call_site_for_every_kind() {
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let (action, _) = run_read_arm(&item, true);
+            let expected = if crate::vault_window::detail::kind_offers_fill(kind) {
+                DetailAction::Fill
+            } else {
+                DetailAction::None
+            };
+            assert_eq!(
+                action, expected,
+                "{kind:?}: Ctrl+Shift+F at the call site disagrees with kind_offers_fill"
+            );
+        }
+    }
+
+    /// The other half: the gate must not manufacture a fill out of nothing.
+    #[test]
+    fn an_unpressed_hotkey_returns_no_action_on_a_login() {
+        let (action, _) = run_read_arm(&an_item(Some(1)), false);
+        assert_eq!(action, DetailAction::None);
     }
 }
