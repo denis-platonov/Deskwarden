@@ -263,6 +263,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: None,
             folder_id: None,

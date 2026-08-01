@@ -23,7 +23,7 @@
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
-    password_history, CardData, IdentityData, ItemKind, PasswordHistoryEntry, VaultItem,
+    password_history, CardData, IdentityData, ItemKind, PasswordHistoryEntry, SshKeyData, VaultItem,
 };
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
@@ -74,6 +74,23 @@ const ROW_VALUE_SIZE: f32 = 14.0;
 /// A masked value: `font-size: 15px; letter-spacing: 0.08em` in monospace.
 const MASKED_SIZE: f32 = 15.0;
 const MASKED_TRACKING: f32 = 1.2;
+/// How many bullets a masked value draws, **whatever its real length**.
+///
+/// It was `value.chars().count().max(8)` -- one bullet per character -- and
+/// that is wrong twice over.
+///
+/// It **breaks the row**: an SSH private key is ~94 characters, so the value
+/// column claimed the whole row and pushed the Copy and Reveal controls off
+/// the pane. The pane then showed a masked private key with no way to reveal
+/// or copy it, which is the entire point of an SSH key item.
+/// `the_ssh_private_key_is_not_painted_by_default` catches it now; nothing
+/// did before, because the only masked values that existed were a card
+/// number and a security code, both short enough to fit.
+///
+/// It also **published the secret's exact character count** to anyone
+/// glancing at the screen -- a password's length is not the password, but it
+/// is not nothing either, and there is no reason to draw it.
+const MASKED_BULLETS: usize = 10;
 /// A live one-time code: `font-size: 17px; letter-spacing: 0.12em`, then a
 /// `96x4` progress bar and the seconds remaining, `gap: 12px` apart.
 const TOTP_CODE_SIZE: f32 = 17.0;
@@ -268,6 +285,15 @@ pub struct RevealState {
     /// server's own cap; a history longer than that is truncated *visibly*
     /// rather than silently -- see [`history_rows`].
     pub password_history: [bool; MAX_HISTORY_ROWS],
+    /// An SSH key's private-key row.
+    ///
+    /// The fourth flag, and the one the struct's "adding a fourth masked row
+    /// cannot quietly reuse another row's flag" paragraph above was written
+    /// in anticipation of. It costs `vault_window::mod` nothing: `run`
+    /// constructs this through `RevealState::default()` and resets it the
+    /// same way, so the field is added and cleared without that file
+    /// changing.
+    pub ssh_private_key: bool,
 }
 
 /// How many PREVIOUS PASSWORDS rows the pane will draw.
@@ -296,6 +322,13 @@ pub enum DetailAction {
     CopyCardNumber,
     /// A card's security code was copied. See [`Self::CopyCardNumber`].
     CopyCardCode,
+    /// An SSH key's private key was copied. Named rather than carrying the
+    /// value, for exactly the reason [`Self::CopyCardNumber`] is: the private
+    /// key is `Zeroizing<String>` on the item, and [`Self::CopyValue`] is
+    /// documented as carrying only values that are *not* `Zeroizing` in the
+    /// model. Routing it through that variant would give the plaintext a
+    /// second, non-zeroizing home inside this enum.
+    CopySshPrivateKey,
     /// A non-secret row was copied, carrying its own already-rendered value --
     /// the card's cardholder name, brand and expiry, and every identity field.
     ///
@@ -435,6 +468,9 @@ pub enum DetailBody {
     Card,
     /// Task 4 fills this in; today it is the heading and nothing else.
     Identity,
+    /// The SSH KEY card: public key, fingerprint, and the private key behind
+    /// a mask.
+    SshKey,
     /// This build cannot show the item's own data, and says so.
     Unsupported(UnsupportedPane),
 }
@@ -448,28 +484,23 @@ pub enum DetailBody {
 /// The plan assumed a type-5 item would fall through to `Unknown` and get the
 /// unsupported pane for free. It does not: `ItemKind::SshKey` is a real
 /// variant, so `ItemKind::of` maps type 5 straight onto it. Without this arm
-/// it would have rendered whatever sat next to it. What it gets instead is
-/// the unsupported pane with its *own* message, because the two situations
-/// are genuinely different: an unknown type is one Deskwarden does not
-/// recognise, while an SSH key is one it recognises and still cannot show --
-/// `VaultItem` deliberately carries no `ssh_key` field, since type 5's wire
-/// shape is the one this repo could not verify and modelling it from memory
-/// is how a modelled field and its `other` copy start disagreeing (see
-/// `VaultItem::notes`' doc). Rendering an SSH pane with blank rows would say
-/// the key is missing; it is not, it is riding `other` intact.
+/// it would render whatever sat next to it.
+///
+/// That arm used to be an [`UnsupportedPane`], because `VaultItem` carried no
+/// `ssh_key` field: type 5's wire shape was the one this repo could not
+/// verify, and modelling it from memory is how a modelled field and its
+/// `other` copy start disagreeing. The shape is now captured and modelled
+/// (see [`SshKeyData`] and `.superpowers/sdd/item-shapes-capture.md`), so
+/// `Unsupported` would now be the dishonest answer -- the data is there.
+/// `Unknown` keeps its unsupported pane, and the two are no longer the same
+/// situation at all.
 pub fn detail_body_for(kind: ItemKind) -> DetailBody {
     match kind {
         ItemKind::Login => DetailBody::LoginCredentials,
         ItemKind::SecureNote => DetailBody::NotesOnly,
         ItemKind::Card => DetailBody::Card,
         ItemKind::Identity => DetailBody::Identity,
-        ItemKind::SshKey => DetailBody::Unsupported(UnsupportedPane {
-            heading: "SSH KEY",
-            message: "Deskwarden can't show SSH keys yet. This item's key is unchanged \
-                      and safe -- open it in the Bitwarden web vault or app to view or \
-                      edit it."
-                .to_string(),
-        }),
+        ItemKind::SshKey => DetailBody::SshKey,
         ItemKind::Unknown(item_type) => DetailBody::Unsupported(UnsupportedPane {
             heading: "UNSUPPORTED ITEM",
             message: format!(
@@ -575,6 +606,49 @@ pub fn card_fields(data: &CardData) -> CardFields {
         number: non_empty(data.number.as_deref().map(|n| n.as_str())).map(str::to_string),
         expiry: card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref()),
         code: non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string),
+    }
+}
+
+/// Every value the SSH key pane shows, emptiness-suppressed once.
+///
+/// The same shape as [`CardFields`], and it exists for the same two findings.
+/// It is the *only* producer of an SSH key's displayed text, so what
+/// `vault_window::mod`'s Copy handler puts on the clipboard is character for
+/// character what the pane painted -- the trimming divergence that was found
+/// on the card's number. And [`Self::is_empty`] is the one emptiness rule,
+/// destructured so a fourth field is a compile error here rather than a row
+/// that renders underneath a "No SSH key details on this item." note.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SshKeyFields {
+    pub public_key: Option<String>,
+    pub fingerprint: Option<String>,
+    /// Masked until revealed. Plain `String` rather than `Zeroizing`: this is
+    /// the same already-formatted copy the pane paints, and the wrapped field
+    /// on the item is untouched -- exactly the position [`CardFields::number`]
+    /// records, and the module's recorded "zeroize is leaky beyond the wrapped
+    /// fields" deferral covers.
+    pub private_key: Option<String>,
+}
+
+impl SshKeyFields {
+    /// True when this SSH key has nothing at all to draw. See
+    /// [`CardFields::is_empty`], which this mirrors deliberately.
+    pub fn is_empty(&self) -> bool {
+        let Self {
+            public_key,
+            fingerprint,
+            private_key,
+        } = self;
+        public_key.is_none() && fingerprint.is_none() && private_key.is_none()
+    }
+}
+
+/// See [`SshKeyFields`].
+pub fn ssh_key_fields(data: &SshKeyData) -> SshKeyFields {
+    SshKeyFields {
+        public_key: non_empty(data.public_key.as_deref()).map(str::to_string),
+        fingerprint: non_empty(data.key_fingerprint.as_deref()).map(str::to_string),
+        private_key: non_empty(data.private_key.as_deref().map(|k| k.as_str())).map(str::to_string),
     }
 }
 
@@ -937,6 +1011,12 @@ pub fn draw_detail_read(
             });
             ui.add_space(CARD_GAP);
         }
+        DetailBody::SshKey => {
+            card(ui, "SSH KEY", |ui| {
+                ssh_key_rows(ui, item.ssh_key.as_ref().map(ssh_key_fields), reveal, &mut action);
+            });
+            ui.add_space(10.0);
+        }
         DetailBody::Unsupported(pane) => {
             unsupported_card(ui, &pane);
             ui.add_space(CARD_GAP);
@@ -1187,7 +1267,7 @@ fn masked_row(
     let shown = if *revealed {
         value.to_string()
     } else {
-        "•".repeat(value.chars().count().max(8))
+        "•".repeat(MASKED_BULLETS)
     };
     row(
         ui,
@@ -1369,6 +1449,68 @@ fn history_rows(
                 if hidden == 1 { "password is" } else { "passwords are" }
             ),
         );
+    }
+}
+
+/// The SSH KEY rows: public key, fingerprint, and the private key behind a
+/// mask.
+///
+/// **The private key is the only masked row, and it is the point of the
+/// item.** The public key and the fingerprint are public by construction --
+/// masking either would be theatre that makes the pane harder to use without
+/// protecting anything.
+///
+/// Ordered public-first so the row a user reaches for most often is at the
+/// top and the destructive-to-leak one is last.
+///
+/// It takes [`SshKeyFields`], never an [`SshKeyData`], for the structural
+/// reason [`card_rows`] and [`identity_rows`] both record: with the raw data
+/// in scope, a fourth row drawn straight off it compiles, renders, and is
+/// invisible to [`SshKeyFields::is_empty`] -- so the pane draws a row *and*
+/// says it has no SSH key details. The conversion happens at the call site,
+/// so there is no `data` here to reach for.
+fn ssh_key_rows(
+    ui: &mut egui::Ui,
+    fields: Option<SshKeyFields>,
+    reveal: &mut RevealState,
+    action: &mut DetailAction,
+) {
+    let Some(fields) = fields else {
+        empty_pane_note(ui, "No SSH key details on this item.");
+        return;
+    };
+    if fields.is_empty() {
+        empty_pane_note(ui, "No SSH key details on this item.");
+        return;
+    }
+    let SshKeyFields {
+        public_key,
+        fingerprint,
+        private_key,
+    } = fields;
+
+    // `first` tracks whether a hairline is owed, so suppressing a row never
+    // leaves a separator with nothing on one side of it -- same as
+    // `card_rows`.
+    let mut first = true;
+    let separate = |ui: &mut egui::Ui, first: &mut bool| {
+        if *first {
+            *first = false;
+        } else {
+            theme::hairline(ui);
+        }
+    };
+    if let Some(v) = &public_key {
+        separate(ui, &mut first);
+        credential_row(ui, "Public key", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+    }
+    if let Some(v) = &fingerprint {
+        separate(ui, &mut first);
+        credential_row(ui, "Fingerprint", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+    }
+    if let Some(v) = &private_key {
+        separate(ui, &mut first);
+        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey);
     }
 }
 
@@ -1594,6 +1736,7 @@ mod tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type,
             folder_id: None,
@@ -1959,28 +2102,18 @@ mod tests {
         );
     }
 
-    /// The correction to the plan: `ItemKind::SshKey` is a real variant, so a
-    /// type-5 item does *not* fall through to `Unknown` and does not get the
-    /// unsupported pane for free. `VaultItem` deliberately has no `ssh_key`
-    /// field (the wire shape is the one this repo could not verify), so the
-    /// only honest pane is one that says so -- blank rows would read as an
-    /// item whose key had been lost.
+    /// **`Unknown` is the only kind left with an unsupported pane.** SSH keys
+    /// shared it while their wire shape was unverified; now that
+    /// `SshKeyData` exists, an SSH item saying "open it in the web vault"
+    /// would be a false claim about data the pane is holding.
     #[test]
-    fn an_ssh_key_says_it_is_not_supported_yet_rather_than_rendering_blank_rows() {
-        let item = an_item(Some(5));
-        let texts = painted(&item, &TotpState::NoSecret);
-        assert!(
-            contains(&texts, "SSH KEY"),
-            "an SSH key item drew no SSH card at all: {texts:?}"
-        );
-        assert!(
-            contains(&texts, "web vault"),
-            "the SSH key pane does not say the data is still viewable elsewhere: {texts:?}"
-        );
-        for blank_row_label in ["Public key", "Fingerprint", "Private key"] {
-            assert!(
-                !contains(&texts, blank_row_label),
-                "the SSH key pane rendered a {blank_row_label} row it has no data for"
+    fn only_an_unknown_type_still_gets_the_unsupported_pane() {
+        for kind in EVERY_KIND {
+            let texts = painted(&an_item(item_type_for(kind)), &TotpState::NoSecret);
+            assert_eq!(
+                contains(&texts, "web vault"),
+                matches!(kind, ItemKind::Unknown(_)),
+                "{kind:?}: the unsupported pane is drawn for the wrong kinds: {texts:?}"
             );
         }
     }
@@ -2057,23 +2190,23 @@ mod tests {
         assert_eq!(detail_body_for(ItemKind::SecureNote), DetailBody::NotesOnly);
         assert_eq!(detail_body_for(ItemKind::Card), DetailBody::Card);
         assert_eq!(detail_body_for(ItemKind::Identity), DetailBody::Identity);
+        // Was an `Unsupported` pane until `SshKeyData` existed.
+        assert_eq!(detail_body_for(ItemKind::SshKey), DetailBody::SshKey);
 
-        for kind in [ItemKind::SshKey, ItemKind::Unknown(9)] {
-            match detail_body_for(kind) {
-                DetailBody::Unsupported(pane) => {
-                    assert!(
-                        pane.message.contains("web vault"),
-                        "{kind:?}'s message must point at where the data can still be seen: {:?}",
-                        pane.message
-                    );
-                    assert!(
-                        pane.message.contains("unchanged"),
-                        "{kind:?}'s message must say the item's own data is intact: {:?}",
-                        pane.message
-                    );
-                }
-                other => panic!("{kind:?} dispatched to {other:?}, not an unsupported pane"),
+        match detail_body_for(ItemKind::Unknown(9)) {
+            DetailBody::Unsupported(pane) => {
+                assert!(
+                    pane.message.contains("web vault"),
+                    "the message must point at where the data can still be seen: {:?}",
+                    pane.message
+                );
+                assert!(
+                    pane.message.contains("unchanged"),
+                    "the message must say the item's own data is intact: {:?}",
+                    pane.message
+                );
             }
+            other => panic!("Unknown(9) dispatched to {other:?}, not an unsupported pane"),
         }
     }
 
@@ -2092,14 +2225,18 @@ mod tests {
     }
 
     /// The SSH pane is not the unknown pane wearing a different number: a
-    /// type-5 item is one Deskwarden *recognises* and still cannot show.
+    /// type-5 item is one Deskwarden recognises *and can now show*, so it
+    /// must not dispatch anywhere near the unsupported pane -- and an
+    /// `Unknown(5)`, which is unreachable via `ItemKind::of` but
+    /// constructible here, must not pick up the SSH body by number.
     #[test]
-    fn the_ssh_pane_and_the_unknown_pane_are_different_messages() {
+    fn the_ssh_pane_and_the_unknown_pane_are_different_bodies() {
         let (ssh, unknown) = (
             detail_body_for(ItemKind::SshKey),
             detail_body_for(ItemKind::Unknown(5)),
         );
         assert_ne!(ssh, unknown);
+        assert_eq!(ssh, DetailBody::SshKey);
     }
 
     /// Fill count and password strength are login facts. A secure note with
@@ -2201,6 +2338,7 @@ mod tests {
                 }
                 DetailBody::Card => assert!(heading_present("CARD DETAILS"), "{kind:?}: {texts:?}"),
                 DetailBody::Identity => assert!(heading_present("IDENTITY"), "{kind:?}: {texts:?}"),
+                DetailBody::SshKey => assert!(heading_present("SSH KEY"), "{kind:?}: {texts:?}"),
                 DetailBody::Unsupported(pane) => {
                     assert!(heading_present(pane.heading), "{kind:?}: {texts:?}");
                     assert!(heading_present(&pane.message), "{kind:?}: {texts:?}");
@@ -2375,6 +2513,7 @@ mod tests {
             card_number: true,
             card_code: true,
             password_history: [false; MAX_HISTORY_ROWS],
+            ssh_private_key: false,
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
         assert!(
@@ -2467,6 +2606,7 @@ mod tests {
                 card_number: true,
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: false,
             },
             "clicking the card number's Reveal did not write through to the caller's \
              RevealState, or wrote through to the wrong field"
@@ -2506,6 +2646,7 @@ mod tests {
                 card_number: true,
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: false,
             },
         );
         assert!(
@@ -2526,6 +2667,7 @@ mod tests {
                 card_number: false,
                 card_code: true,
                 password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: false,
             },
         );
         assert!(
@@ -2641,6 +2783,7 @@ mod tests {
                 card_number: true,
                 card_code: true,
                 password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: false,
             },
         );
         for value in [fields.number.expect("number"), fields.code.expect("code")] {
@@ -2725,6 +2868,250 @@ mod tests {
             contains(&texts, "No identity details"),
             "an empty identity drew a heading over nothing: {texts:?}"
         );
+    }
+
+    /// A private key body no other fixture string contains, so
+    /// `contains(&texts, PRIVATE_KEY_BODY)` is a statement about the private
+    /// key row and nothing else. The public key deliberately carries a
+    /// *different* base64 run for the same reason.
+    const PRIVATE_KEY_BODY: &str = "b3BlbnNzaC1rZXktdjEAAAAA";
+    const PRIVATE_KEY: &str = concat!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        "b3BlbnNzaC1rZXktdjEAAAAA\n",
+        "-----END OPENSSH PRIVATE KEY-----"
+    );
+    const PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 deskwarden-ssh-test";
+    const FINGERPRINT: &str = "SHA256:8QhVn0pR";
+
+    fn an_ssh_key_item() -> VaultItem {
+        let mut item = an_item(Some(5));
+        item.ssh_key = Some(crate::vault_bridge::SshKeyData {
+            private_key: Some(PRIVATE_KEY.to_string().into()),
+            public_key: Some(PUBLIC_KEY.to_string()),
+            key_fingerprint: Some(FINGERPRINT.to_string()),
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    #[test]
+    fn the_ssh_key_pane_paints_every_populated_row() {
+        let texts = painted(&an_ssh_key_item(), &TotpState::NoSecret);
+        for label in ["SSH KEY", "Public key", PUBLIC_KEY, "Fingerprint", FINGERPRINT, "Private key"] {
+            assert!(contains(&texts, label), "the SSH pane painted no {label:?}: {texts:?}");
+        }
+        // The pane it replaced said this build could not show SSH keys.
+        assert!(
+            !contains(&texts, "can't show SSH keys"),
+            "the SSH pane is still the unsupported placeholder: {texts:?}"
+        );
+    }
+
+    /// **The negative half.** The private key is the secret the item exists
+    /// to hold, so it is masked until asked for, exactly as the card's number
+    /// and security code are.
+    ///
+    /// Worthless on its own -- a pane that rendered *nothing at all* would
+    /// pass it too. See the positive control below; that exact pair was
+    /// required for the card secrets and is required here for the same
+    /// reason.
+    /// **A masked row draws the same number of bullets whatever it hides.**
+    ///
+    /// Two things ride on this, and neither had a test. A per-character run
+    /// let a ~94-character SSH private key claim the whole row and push the
+    /// Copy and Reveal controls off the pane -- the pane masked the key and
+    /// then offered no way to see or copy it. It also drew the secret's exact
+    /// length on screen for anyone looking.
+    ///
+    /// Asserted across a 16-digit card number and a ~94-character private
+    /// key, i.e. the shortest and longest masked values the app has, and
+    /// against the constant rather than against each other -- two runs that
+    /// moved together would satisfy an equality check while both being wrong.
+    #[test]
+    fn a_masked_row_draws_a_fixed_bullet_run_whatever_it_hides() {
+        let expected = "•".repeat(MASKED_BULLETS);
+        for (label, item) in [("card", a_full_card()), ("ssh key", an_ssh_key_item())] {
+            let texts = painted(&item, &TotpState::NoSecret);
+            let runs: Vec<&String> = texts.iter().filter(|t| t.starts_with('•')).collect();
+            assert!(
+                !runs.is_empty(),
+                "the {label} pane painted no masked row at all, so this proves nothing: {texts:?}"
+            );
+            for run in runs {
+                assert_eq!(
+                    *run, expected,
+                    "a {label} masked row drew {} bullets instead of {MASKED_BULLETS}, so the \
+                     mask still tracks the secret's length",
+                    run.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_ssh_private_key_is_not_painted_by_default() {
+        let texts = painted(&an_ssh_key_item(), &TotpState::NoSecret);
+        assert!(
+            !contains(&texts, PRIVATE_KEY_BODY),
+            "the SSH private key was painted in the clear by default: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "Reveal"),
+            "the SSH pane offers no way to reveal what it masked: {texts:?}"
+        );
+    }
+
+    /// **The positive control** for the test above: with the flag set, the
+    /// very substring asserted absent there is painted. Without this, "the
+    /// key is absent" would also pass against a pane that draws no rows.
+    #[test]
+    fn a_revealed_ssh_private_key_is_painted() {
+        let texts = painted_with_reveal(
+            &an_ssh_key_item(),
+            &TotpState::NoSecret,
+            RevealState {
+                password: false,
+                card_number: false,
+                card_code: false,
+                password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: true,
+            },
+        );
+        assert!(
+            contains(&texts, PRIVATE_KEY_BODY),
+            "a revealed SSH private key did not paint, so the pane ignores the caller's \
+             reveal state: {texts:?}"
+        );
+        assert!(contains(&texts, "Hide"), "a revealed row still offers Reveal: {texts:?}");
+    }
+
+    /// Nothing but the private key is masked: a fingerprint behind bullets
+    /// would be as wrong as a private key in front of them.
+    #[test]
+    fn nothing_but_the_private_key_is_masked_on_an_ssh_key() {
+        let texts = painted(&an_ssh_key_item(), &TotpState::NoSecret);
+        for visible in [PUBLIC_KEY, FINGERPRINT] {
+            assert!(
+                contains(&texts, visible),
+                "{visible:?} was masked; only the private key may be: {texts:?}"
+            );
+        }
+    }
+
+    /// **Which flag feeds which row, across the two panes that have masked
+    /// rows.** `each_card_secret_is_revealed_only_by_its_own_flag` pins the
+    /// card's two against each other; this pins the fourth flag against them,
+    /// which is the slip a fourth `&mut reveal.<field>` invites: passing
+    /// `&mut reveal.card_number` to the private-key row compiles, and every
+    /// other test in this file sets one item's flags at a time.
+    ///
+    /// Both directions. A card item and an SSH item are different kinds, so
+    /// they cannot share a frame -- each `RevealState` is therefore painted
+    /// onto both fixtures.
+    #[test]
+    fn the_ssh_private_key_and_the_card_secrets_do_not_share_a_flag() {
+        let ssh_only = RevealState {
+            password: false,
+            card_number: false,
+            card_code: false,
+            password_history: [false; MAX_HISTORY_ROWS],
+            ssh_private_key: true,
+        };
+        let texts = painted_with_reveal(&an_ssh_key_item(), &TotpState::NoSecret, ssh_only);
+        assert!(
+            contains(&texts, PRIVATE_KEY_BODY),
+            "ssh_private_key: true did not reveal the private key: {texts:?}"
+        );
+        let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, ssh_only);
+        assert!(
+            !contains(&texts, "4242424242424242"),
+            "revealing the SSH PRIVATE KEY also unmasked the card number -- the rows are \
+             reading the same flag: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "123"),
+            "revealing the SSH PRIVATE KEY also unmasked the security code: {texts:?}"
+        );
+
+        let card_only = RevealState {
+            password: false,
+            card_number: true,
+            card_code: true,
+            password_history: [false; MAX_HISTORY_ROWS],
+            ssh_private_key: false,
+        };
+        let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, card_only);
+        assert!(
+            contains(&texts, "4242424242424242"),
+            "card_number: true did not reveal the number: {texts:?}"
+        );
+        let texts = painted_with_reveal(&an_ssh_key_item(), &TotpState::NoSecret, card_only);
+        assert!(
+            !contains(&texts, PRIVATE_KEY_BODY),
+            "revealing the CARD's secrets also unmasked the SSH private key -- the rows \
+             are reading the same flag: {texts:?}"
+        );
+    }
+
+    /// A `type: 5` with no `sshKey` object is an *empty SSH key*, not an
+    /// unsupported item -- the same rule the card pane follows, and for the
+    /// same reason: an empty box under a heading reads as contents that
+    /// failed to load.
+    #[test]
+    fn an_ssh_key_with_no_ssh_key_object_says_so_rather_than_drawing_blank_rows() {
+        let texts = painted(&an_item(Some(5)), &TotpState::NoSecret);
+        assert!(contains(&texts, "SSH KEY"), "{texts:?}");
+        assert!(
+            contains(&texts, "No SSH key details"),
+            "an empty SSH key drew a heading over nothing: {texts:?}"
+        );
+        for absent in ["Public key", "Fingerprint", "Private key", "Reveal"] {
+            assert!(
+                !contains(&texts, absent),
+                "an empty SSH key drew a {absent:?} row it has no data for: {texts:?}"
+            );
+        }
+    }
+
+    /// The emptiness rule, expressed once and tested per field -- the same
+    /// guard `a_card_is_empty_exactly_when_every_field_it_renders_is` gives
+    /// the card pane. A field added to the rows and not to `is_empty` yields
+    /// a pane that draws a row *and* says "No SSH key details on this item.".
+    #[test]
+    fn an_ssh_key_is_empty_exactly_when_every_field_it_renders_is() {
+        use crate::vault_bridge::SshKeyData;
+        assert!(ssh_key_fields(&SshKeyData::default()).is_empty());
+        let one_at_a_time: [(&str, Box<dyn Fn(&mut SshKeyData)>); 3] = [
+            ("public key", Box::new(|s: &mut SshKeyData| s.public_key = Some(PUBLIC_KEY.into()))),
+            ("fingerprint", Box::new(|s: &mut SshKeyData| s.key_fingerprint = Some(FINGERPRINT.into()))),
+            ("private key", Box::new(|s: &mut SshKeyData| s.private_key = Some(PRIVATE_KEY.to_string().into()))),
+        ];
+        for (name, populate) in one_at_a_time {
+            let mut data = SshKeyData::default();
+            populate(&mut data);
+            assert!(
+                !ssh_key_fields(&data).is_empty(),
+                "an SSH key carrying only its {name} was called empty, so that row renders \
+                 under a \"No SSH key details on this item.\" note"
+            );
+        }
+    }
+
+    /// Whitespace-only is absent, for the secret as much as the plain rows --
+    /// and the trim is what makes the copied value character-for-character
+    /// the painted one, the finding `card_fields` already carries.
+    #[test]
+    fn ssh_key_fields_trims_and_treats_blanks_as_absent() {
+        use crate::vault_bridge::SshKeyData;
+        let fields = ssh_key_fields(&SshKeyData {
+            private_key: Some("  PRIV  ".to_string().into()),
+            public_key: Some("   ".to_string()),
+            key_fingerprint: Some(String::new()),
+            other: serde_json::Map::new(),
+        });
+        assert_eq!(fields.private_key.as_deref(), Some("PRIV"));
+        assert_eq!(fields.public_key, None);
+        assert_eq!(fields.fingerprint, None);
     }
 
     /// The plan's test, plus the case the plan got wrong. Bitwarden's own
@@ -3074,6 +3461,7 @@ mod tests {
                 card_number: false,
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
+                ssh_private_key: false,
             },
         );
         assert!(

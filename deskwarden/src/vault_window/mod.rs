@@ -1506,6 +1506,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                         ui.ctx().copy_text(code);
                                     }
                                 }
+                                // The SSH private key, read back off the item
+                                // through its one producer for the same
+                                // reason the two card secrets are: what is
+                                // copied is what was painted, trimming
+                                // included.
+                                DetailAction::CopySshPrivateKey => {
+                                    if let Some(key) = item
+                                        .ssh_key
+                                        .as_ref()
+                                        .and_then(|s| detail::ssh_key_fields(s).private_key)
+                                    {
+                                        ui.ctx().copy_text(key);
+                                    }
+                                }
                                 // A non-secret row (the card's cardholder
                                 // name, brand and expiry, and every identity
                                 // field) hands its own already-rendered value
@@ -3855,6 +3869,7 @@ mod folder_drop_tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type: Some(1),
             folder_id: folder_id.map(str::to_string),
@@ -5605,6 +5620,7 @@ mod draw_read_arm_tests {
             login: None,
             card: None,
             identity: None,
+            ssh_key: None,
             notes: None,
             item_type,
             folder_id: None,
