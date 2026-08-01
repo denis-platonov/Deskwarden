@@ -61,12 +61,18 @@ pub enum TotpState {
     Unavailable,
     /// A poll *answered*, successfully, that there is no current code for
     /// this item (`get_totp` -> `Ok(None)`; `bw serve` returns `400` for
-    /// this, see `VaultBridge::get_totp`). Renders exactly like `NoSecret`
-    /// -- no row -- because the backend has authoritatively said there is no
-    /// code, which is the same thing the user needs to know. It is a
-    /// *separate variant* purely so the per-frame presence derivation
-    /// (`totp_state_for_secret_presence`) structurally cannot see it and
-    /// cannot promote it, and so the poll gate
+    /// this, see `VaultBridge::get_totp`). Keeps its own row
+    /// (`totp_no_code_row`), distinct from both `NoSecret`'s absent row and
+    /// `Unavailable`'s: at the live call site this state can *only* mean a
+    /// disagreement -- `get_totp` is reachable only for an item whose own
+    /// login data carries a seed, so "this item has no TOTP" is not one of
+    /// the things `Ok(None)` can be saying (review 14's Important; 48cff27
+    /// rendered it as no row and that justification did not survive contact
+    /// with the call site).
+    ///
+    /// It is also a *separate variant* from `NoSecret` so the per-frame
+    /// presence derivation (`totp_state_for_secret_presence`) structurally
+    /// cannot see it and cannot promote it, and so the poll gate
     /// (`totp_state_wants_poll`) can stop asking.
     ///
     /// Review 13's Important: this used to share `NoSecret`, and the two
@@ -87,6 +93,62 @@ pub enum TotpState {
     /// the derivation then promotes to `Fetching`), so selecting the item
     /// again polls normally.
     NoCodeReported,
+}
+
+/// What the LOGIN CREDENTIALS card's One-time code row actually shows --
+/// the *render* layer's own vocabulary, derived from [`TotpState`] by
+/// [`totp_row_for`] and nothing else.
+///
+/// This exists because the render layer had its own instance of the bug that
+/// [`TotpState`]'s own variants were introduced to kill: several distinct
+/// situations sharing one representation. `NoSecret` and `NoCodeReported`
+/// were two different facts about an item that both drew *nothing*, and
+/// "nothing" is not a neutral rendering -- it is the pixel-for-pixel
+/// rendering of "this item has no 2FA at all", which is what made a
+/// previous reviewer point out a user would re-enrol.
+///
+/// `Option<TotpRow>` is the single source of truth for whether the row
+/// appears: `draw_detail_read` cannot omit a row without `totp_row_for`
+/// having said `None`, so the decision is unit-testable directly rather than
+/// living inside an `egui` closure no test can call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TotpRow<'a> {
+    /// [`TotpState::Fetching`].
+    Fetching,
+    /// [`TotpState::Code`].
+    Code { code: &'a str, seconds_left: u8 },
+    /// [`TotpState::Unavailable`].
+    Unavailable,
+    /// [`TotpState::NoCodeReported`].
+    NoCode,
+}
+
+/// The One-time code row for a given [`TotpState`], or `None` for the one
+/// state that genuinely means "this item has no one-time codes".
+///
+/// Exhaustive with no catch-all, so a new `TotpState` variant is a compile
+/// error here rather than silently inheriting some other variant's pixels.
+///
+/// **Only `NoSecret` may return `None`.** Review 14's Important: at the live
+/// call site (`vault_window::mod`'s per-frame TOTP block), `get_totp` is
+/// only ever called for an item whose *own login data carries a seed*, so
+/// the one situation in which `Ok(None)` could have meant "this item has no
+/// TOTP" is unreachable -- every `NoCodeReported` that can actually occur is
+/// a *disagreement* between the cached item and `bw serve`. Drawing that as
+/// an absent row is the same "reads as: this item has no TOTP" conflation
+/// reviews 8 and 12 forced out of `Unavailable` and `Fetching`; it had
+/// simply reappeared one layer down.
+pub fn totp_row_for(totp: &TotpState) -> Option<TotpRow<'_>> {
+    match totp {
+        TotpState::NoSecret => None,
+        TotpState::Fetching => Some(TotpRow::Fetching),
+        TotpState::Code { code, seconds_left } => Some(TotpRow::Code {
+            code: code.as_str(),
+            seconds_left: *seconds_left,
+        }),
+        TotpState::Unavailable => Some(TotpRow::Unavailable),
+        TotpState::NoCodeReported => Some(TotpRow::NoCode),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,35 +268,19 @@ pub fn draw_detail_read(
         credential_row(ui, "Username", username, "Copy", &mut action, DetailAction::CopyUsername);
         theme::hairline(ui);
         password_row(ui, password, reveal_password, &mut action);
-        // Exhaustive on purpose -- no catch-all arm -- so a new `TotpState`
-        // variant fails to compile here instead of silently falling through
-        // to whatever the last arm happened to do. `NoSecret` omits the row
-        // entirely (this item never had a code to show); `Unavailable` keeps
-        // the row but says so honestly instead of vanishing, which used to
-        // be pixel-identical to `NoSecret` and read as "TOTP isn't set up
-        // here" even when it was, just unreachable right now.
-        match totp {
-            TotpState::NoSecret => {}
-            // Same render as `NoSecret` on purpose: the backend answered,
-            // and its answer was "there is no current code for this item".
-            // Omitting the row is the honest, pre-existing behaviour for
-            // that answer -- it is *not* the review-8 "vanished row" bug,
-            // which was about an UNREACHABLE backend (that is `Unavailable`,
-            // below, and it keeps its row). The two are separate variants
-            // for the state machine's sake, not the pixels' -- see
-            // `NoCodeReported`'s doc.
-            TotpState::NoCodeReported => {}
-            TotpState::Fetching => {
-                theme::hairline(ui);
-                totp_fetching_row(ui);
-            }
-            TotpState::Code { code, seconds_left } => {
-                theme::hairline(ui);
-                totp_row(ui, code, *seconds_left, &mut action);
-            }
-            TotpState::Unavailable => {
-                theme::hairline(ui);
-                totp_unavailable_row(ui);
+        // Whether there is a row at all is decided by `totp_row_for` and
+        // nowhere else (see its doc), so "this item looks like it has no
+        // 2FA" is a decision a unit test can call directly instead of one
+        // buried in an `egui` closure. Exhaustive on purpose -- no catch-all
+        // arm -- so a new `TotpRow` variant fails to compile here instead of
+        // silently inheriting whatever the last arm happened to draw.
+        if let Some(row) = totp_row_for(totp) {
+            theme::hairline(ui);
+            match row {
+                TotpRow::Fetching => totp_fetching_row(ui),
+                TotpRow::Code { code, seconds_left } => totp_code_row(ui, code, seconds_left, &mut action),
+                TotpRow::Unavailable => totp_unavailable_row(ui),
+                TotpRow::NoCode => totp_no_code_row(ui),
             }
         }
     });
@@ -327,7 +373,7 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
     ui.add_space(6.0);
 }
 
-fn totp_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
+fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
             ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
@@ -397,6 +443,44 @@ fn totp_unavailable_row(ui: &mut egui::Ui) {
     });
 }
 
+/// The One-time code row for `TotpState::NoCodeReported`: this item's own
+/// login data carries a TOTP seed, but `bw serve` answered -- successfully --
+/// that it has no current code for it. That is a *disagreement* between the
+/// item we hold and the backend, not "this item has no 2FA", and it is the
+/// only thing it can be at the live call site: `get_totp` is never called for
+/// an item without a seed (see `vault_window::mod`'s per-frame TOTP block).
+///
+/// Same shape as `totp_unavailable_row`, deliberately, and same reason: the
+/// row has to stay put so the pane is not pixel-identical to an item that
+/// never had 2FA -- the reading that had a previous reviewer point out a user
+/// would conclude TOTP was not set up and needlessly re-enrol. Different
+/// wording, though, because it is a different fact: `Unavailable` means the
+/// vault could not be reached and the app is still trying; this one means the
+/// vault was reached and had nothing to give. The hint names the usual cause
+/// (the seed changed elsewhere and this copy of the item predates it) and the
+/// one action that resolves it, since -- unlike `Unavailable` -- this state
+/// deliberately stops polling.
+fn totp_no_code_row(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new("One-time code").size(11.0).color(theme::TEXT_FAINT));
+            ui.label(
+                RichText::new("No code available for this item")
+                    .size(13.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.label(
+                RichText::new(
+                    "The vault has no current code for it. If its authenticator key was \
+                     changed on another device, Sync to pick that up.",
+                )
+                .size(10.0)
+                .color(theme::TEXT_GHOST),
+            );
+        });
+    });
+}
+
 /// Days between an RFC3339 `revisionDate` (as `bw serve` sends it) and now.
 /// `None` on anything unparseable -- the caller shows "Updated recently"
 /// rather than a wrong number.
@@ -435,6 +519,41 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review 14's Important, at the render layer. `NoSecret` is the *only*
+    /// state that may draw nothing, because drawing nothing is the exact
+    /// pixels of "this item has no 2FA" -- and every other state belongs to
+    /// an item that demonstrably does have a seed.
+    #[test]
+    fn no_secret_is_the_only_state_that_omits_the_one_time_code_row() {
+        assert_eq!(totp_row_for(&TotpState::NoSecret), None);
+
+        for state in [
+            TotpState::Fetching,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 12 },
+            TotpState::Unavailable,
+            TotpState::NoCodeReported,
+        ] {
+            assert!(
+                totp_row_for(&state).is_some(),
+                "{state:?} belongs to an item that HAS a TOTP seed, so omitting the row \
+                 renders it pixel-identically to an item with no 2FA at all"
+            );
+        }
+    }
+
+    /// `NoCodeReported` and `Unavailable` are two different messages, not one
+    /// row wearing two labels: the first is "the backend answered and has no
+    /// code for this", the second is "the backend could not be reached".
+    /// Keeping them visually distinct is the property review 8 established
+    /// for `Unavailable` and must survive `NoCodeReported` gaining a row.
+    #[test]
+    fn no_code_reported_and_unavailable_render_as_different_rows() {
+        assert_ne!(
+            totp_row_for(&TotpState::NoCodeReported),
+            totp_row_for(&TotpState::Unavailable)
+        );
+    }
 
     #[test]
     fn metadata_line_pluralizes_fill_count() {

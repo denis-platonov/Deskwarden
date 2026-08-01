@@ -45,7 +45,7 @@ use deskwarden::injector::{
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
-use deskwarden::vault_cache::VaultCache;
+use deskwarden::vault_cache::{PopulateOutcome, VaultCache};
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, prefs_ui,
     session_store, settings, tray, vault_window, window_watch,
@@ -269,6 +269,13 @@ fn main() {
     // periodic match-engine refresh all still want the live server rather
     // than a snapshot that's deliberately not re-fetched on every read.
     let cache = Arc::new(VaultCache::new(vault.clone()));
+    // Captured here, *before* the readiness probe below, because that probe's
+    // own `list_items()` is the fetch whose result seeds the cache further
+    // down via `populate_with` -- and the epoch guard can only cover the
+    // window it is handed (review 14's Minor 3). Nothing between here and
+    // there calls `cache.clear()` today, so this is inert; it is written this
+    // way so it stays correct if any of that moves onto a background thread.
+    let startup_epoch = cache.epoch();
     let mut engine = MatchEngine::new();
 
     // `Option` rather than a plain `Child`: with `keep_backend_running`
@@ -350,8 +357,12 @@ fn main() {
     // carrying a serde_json::Map "other" catch-all) resident for the rest of
     // the process's life doing nothing -- this app spends nearly all its
     // runtime idle in the tray with no window open.
-    if let Err(e) = cache.populate_with(items) {
-        log::warn!("could not populate the vault cache at startup: {e:?}");
+    match cache.populate_with(items, startup_epoch) {
+        Ok(PopulateOutcome::Populated) => {}
+        Ok(PopulateOutcome::DiscardedStale) => {
+            log::warn!("the vault cache was cleared during startup's populate; it stays empty")
+        }
+        Err(e) => log::warn!("could not populate the vault cache at startup: {e:?}"),
     }
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
@@ -1431,14 +1442,44 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         };
         match wait_for_vault_ready_with_spinner(cache.bridge(), schedule, SETUP_MESSAGE) {
             VaultReadyOutcome::Ready(_items) => {
-                if let Err(e) = cache.populate() {
-                    log::warn!("could not repopulate the vault cache after unlock: {e:?}");
-                }
-                match refresh_match_engine(cache.bridge(), engine) {
-                    Ok(count) => {
-                        log::info!("match engine refreshed after unlock: {count} app match(es)")
+                // The match engine is only rebuilt when the cache actually
+                // came back (review 14's Minor 4). `refresh_match_engine`
+                // reads the BRIDGE, not the cache, so it happily succeeded
+                // after a failed `populate` and left the app in exactly the
+                // pairing the `Dismissed` arm below calls inconsistent: an
+                // empty cache beside a populated engine, where every matched
+                // process raises a prompt and then logs "cache miss ...
+                // falling back to bw serve" on a fill. Both arms now hold
+                // the same invariant instead of one asserting it and the
+                // other quietly breaking it.
+                match cache.populate() {
+                    Ok(PopulateOutcome::Populated) => match refresh_match_engine(cache.bridge(), engine) {
+                        Ok(count) => {
+                            log::info!("match engine refreshed after unlock: {count} app match(es)")
+                        }
+                        Err(e) => {
+                            engine.clear();
+                            log::warn!(
+                                "match engine refresh after unlock failed ({e:?}); cleared it \
+                                 rather than keeping the pre-lock account's app matches"
+                            );
+                        }
+                    },
+                    Ok(PopulateOutcome::DiscardedStale) => {
+                        engine.clear();
+                        log::warn!(
+                            "the vault cache was cleared again while repopulating after unlock; \
+                             leaving it empty with no app matches until the next unlock"
+                        );
                     }
-                    Err(e) => log::warn!("match engine refresh after unlock failed: {e:?}"),
+                    Err(e) => {
+                        engine.clear();
+                        log::warn!(
+                            "could not repopulate the vault cache after unlock ({e:?}); app \
+                             matches cleared too, so nothing can prompt to autofill against an \
+                             empty cache until it is unlocked again"
+                        );
+                    }
                 }
             }
             VaultReadyOutcome::Dismissed => {
@@ -1618,12 +1659,31 @@ enum BackendOp {
     EnsureRunning(Result<Child, BackendStartError>),
     /// The tray's "Sync" item: ensure the backend is running (`child` is
     /// `Some` only if this operation itself had to start it), then run
-    /// `bw sync` and repopulate the cache. `outcome` is `Err` if starting,
-    /// syncing, or repopulating failed.
+    /// `bw sync` and repopulate the cache.
     Sync {
         child: Option<Result<Child, BackendStartError>>,
-        outcome: Result<(), String>,
+        outcome: SyncOutcome,
     },
+}
+
+/// What a tray-triggered sync actually achieved.
+///
+/// Three outcomes, not two: a `Result<(), String>` could not tell "the vault
+/// was refreshed" apart from "the sync ran but its result was discarded
+/// because the vault locked underneath it", so the latter took the success
+/// path -- logging "sync complete", rebuilding the match engine from an
+/// empty cache and returning the tray to its idle "Sync" label as though the
+/// vault were freshly in sync (review 14's Minor). Matched exhaustively in
+/// `apply_backend_op` with no catch-all.
+enum SyncOutcome {
+    /// `bw sync` succeeded and the refreshed vault landed in the cache.
+    Refreshed,
+    /// `bw sync` succeeded, but the cache was cleared while the repopulate
+    /// was in flight, so nothing local was refreshed. Not a failure of the
+    /// sync and not a success for the user's purposes either.
+    DiscardedStale,
+    /// Starting the backend, syncing, or repopulating failed.
+    Failed(String),
 }
 
 /// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
@@ -1661,7 +1721,7 @@ fn apply_backend_op(
                 None => {}
             }
             match outcome {
-                Ok(()) => {
+                SyncOutcome::Refreshed => {
                     let entries = match_entries(&cache.items());
                     log::info!(
                         "sync complete; match engine refreshed: {} app match(es)",
@@ -1670,7 +1730,24 @@ fn apply_backend_op(
                     engine.rebuild(&entries);
                     tray::set_sync_idle(tray);
                 }
-                Err(e) => {
+                SyncOutcome::DiscardedStale => {
+                    // Deliberately touches neither the engine nor the cache:
+                    // whatever cleared the cache (lock, re-auth) owns both,
+                    // and by now it may already have repopulated them for a
+                    // *different* account -- rebuilding from `cache.items()`
+                    // here could just as easily wipe a freshly correct engine
+                    // as clear a stale one. What must not happen is the tray
+                    // reporting a completed sync for a sync that refreshed
+                    // nothing locally; "click to retry" is the honest label,
+                    // and retrying is exactly right once the vault is
+                    // unlocked again.
+                    log::warn!(
+                        "sync ran, but the vault was locked while its result was being applied; \
+                         nothing local was refreshed"
+                    );
+                    tray::set_sync_failed(tray);
+                }
+                SyncOutcome::Failed(e) => {
                     log::error!("sync failed: {e}");
                     tray::set_sync_failed(tray);
                 }
@@ -1761,7 +1838,7 @@ fn spawn_sync(
         };
 
         let start_failed = matches!(&child, Some(Err(_)));
-        let outcome = if start_failed {
+        let ready = if start_failed {
             Err("bw serve could not be started".to_string())
         } else if currently_running {
             bw_serve::run_bw_sync(&session_token)
@@ -1784,8 +1861,16 @@ fn spawn_sync(
             // definition, already past this race.
             let schedule = readiness_schedule(READINESS_DEADLINE);
             wait_for_vault_ready(cache.bridge(), &schedule).map(|_items| ())
-        }
-        .and_then(|()| cache.populate().map_err(|e| format!("{e:?}")));
+        };
+
+        let outcome = match ready {
+            Err(e) => SyncOutcome::Failed(e),
+            Ok(()) => match cache.populate() {
+                Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed,
+                Ok(PopulateOutcome::DiscardedStale) => SyncOutcome::DiscardedStale,
+                Err(e) => SyncOutcome::Failed(format!("{e:?}")),
+            },
+        };
 
         let _ = tx.send(BackendOp::Sync { child, outcome });
     });
@@ -1795,14 +1880,23 @@ fn spawn_sync(
 /// attempt at getting the vault ready.
 const SETUP_MESSAGE: &str = "Setting up your vault...";
 
-/// What it says when it comes back after the user closed it, or after a
-/// fresh sign-in (review 13's Minor 4). Closing the window used to bring an
-/// apparently identical one straight back with nothing to distinguish it, so
-/// the retry read as the app ignoring the click rather than as a deliberate
-/// second attempt -- and closing *that* one jumped to a master-password
-/// prompt with no explanation at all. Kept short: this is a 320px-wide
-/// window with one line of text.
+/// What it says when it comes back after the user closed it (review 13's
+/// Minor 4). Closing the window used to bring an apparently identical one
+/// straight back with nothing to distinguish it, so the retry read as the
+/// app ignoring the click rather than as a deliberate second attempt. Kept
+/// short: this is a 320px-wide window with one line of text.
 const SETUP_RETRY_MESSAGE: &str = "Still not ready -- trying once more...";
+
+/// What it says on the wait that follows a fresh master-password sign-in
+/// (`recover_from_failed_vault_wait`).
+///
+/// Its own message rather than `SETUP_RETRY_MESSAGE` (review 14's nit):
+/// "Still not ready -- trying once more..." describes a retry of something
+/// the user watched fail, but from *this* window's point of view the user
+/// has just typed their master password into a fresh login and nothing has
+/// been tried since. What is actually happening is a backend that was just
+/// restarted under a new session coming up.
+const SETUP_AFTER_SIGN_IN_MESSAGE: &str = "Signed in -- starting your vault...";
 
 /// Outcome of [`wait_for_vault_ready_with_spinner`].
 ///
@@ -1912,7 +2006,7 @@ fn recover_from_failed_vault_wait(
         }
     };
 
-    match wait_for_vault_ready_with_spinner(vault, schedule, SETUP_RETRY_MESSAGE) {
+    match wait_for_vault_ready_with_spinner(vault, schedule, SETUP_AFTER_SIGN_IN_MESSAGE) {
         VaultReadyOutcome::Ready(items) => items,
         VaultReadyOutcome::Dismissed => {
             if let Some(child) = bw_serve_child.as_mut() {

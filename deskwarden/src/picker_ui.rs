@@ -4,7 +4,7 @@ use crate::icon;
 use crate::loading_ui;
 use crate::theme;
 use crate::vault_bridge::{VaultError, VaultItem};
-use crate::vault_cache::VaultCache;
+use crate::vault_cache::{PopulateOutcome, VaultCache};
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
@@ -194,6 +194,16 @@ enum PickerItemsResult {
     /// The cache was never populated and a fresh populate also failed --
     /// `bw serve` is unreachable, not merely idle.
     BackendUnreachable(String),
+    /// The populate succeeded but was discarded: the vault was locked (or
+    /// re-authenticated into a possibly different account) while it was in
+    /// flight, so the cache is deliberately empty.
+    ///
+    /// Its own variant for the same reason `EmptyVault` and
+    /// `BackendUnreachable` are each their own (review 14's Minor): with
+    /// only `Ok`/`Err` to go on, this landed on `EmptyVault` and told a user
+    /// whose vault had just locked that their vault "doesn't have any items
+    /// yet" and to go add one.
+    VaultLocked,
 }
 
 /// Whether `pick_vault_item`'s "Next" button should be clickable: only once
@@ -233,9 +243,19 @@ fn can_pick_next(selected_id: &Option<String>) -> bool {
 fn load_items_for_picker(cache: &VaultCache) -> PickerItemsResult {
     if !cache.is_populated() {
         log::warn!("vault cache is not populated; populating it now for the picker");
-        if let Err(e) = cache.populate() {
-            log::error!("could not populate the vault cache for the picker: {e:?}");
-            return PickerItemsResult::BackendUnreachable(format!("{e:?}"));
+        match cache.populate() {
+            Ok(PopulateOutcome::Populated) => {}
+            Ok(PopulateOutcome::DiscardedStale) => {
+                log::warn!(
+                    "the vault was cleared while the picker's populate was in flight; the \
+                     cache is deliberately empty"
+                );
+                return PickerItemsResult::VaultLocked;
+            }
+            Err(e) => {
+                log::error!("could not populate the vault cache for the picker: {e:?}");
+                return PickerItemsResult::BackendUnreachable(format!("{e:?}"));
+            }
         }
     }
 
@@ -335,6 +355,22 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                          app\u{2026}\u{201d} again.\n\n{reason}"
                     )),
                     &HSTRING::from("Deskwarden: could not load vault"),
+                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+                );
+            }
+            return None;
+        }
+        PickerItemsResult::VaultLocked => {
+            log::warn!("the vault locked while loading items for the picker");
+            unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(
+                        "Deskwarden\u{2019}s vault was locked while it was loading your \
+                         items.\n\nOpen the vault window and unlock it, then use \u{201c}Add \
+                         app\u{2026}\u{201d} again.",
+                    ),
+                    &HSTRING::from("Deskwarden: vault is locked"),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -1024,7 +1060,10 @@ mod tests {
             .with_body(folders_body())
             .create();
         let cache = cache_for(server.url());
-        cache.populate_with(vec![item("Alpha")]).unwrap();
+        assert_eq!(
+            cache.populate_with(vec![item("Alpha")], cache.epoch()).unwrap(),
+            PopulateOutcome::Populated
+        );
 
         let result = load_items_for_picker(&cache);
 
@@ -1107,7 +1146,10 @@ mod tests {
             .with_body(folders_body())
             .create();
         let cache = cache_for(server.url());
-        cache.populate_with(vec![]).unwrap();
+        assert_eq!(
+            cache.populate_with(vec![], cache.epoch()).unwrap(),
+            PopulateOutcome::Populated
+        );
 
         let result = load_items_for_picker(&cache);
 
@@ -1115,6 +1157,49 @@ mod tests {
             matches!(result, PickerItemsResult::EmptyVault),
             "a populated-but-empty cache must be reported as EmptyVault, not BackendUnreachable"
         );
+    }
+
+    #[test]
+    fn load_items_for_picker_reports_a_vault_that_locked_mid_populate_distinctly() {
+        // Review 14's Minor. `pick_vault_item` runs this on a detached
+        // thread, and `main` clears the cache when the vault locks or the
+        // user re-authenticates. A populate that started before that clear
+        // and finished after it is correctly discarded -- but it used to be
+        // indistinguishable from a real populate, so the picker read the
+        // (deliberately) empty cache as data and told the user their vault
+        // "doesn't have any items yet" and to go add one, when what actually
+        // happened is that it locked.
+        //
+        // Deterministic, no sleeping: the `clear()` fires from inside the
+        // mocked folders response handler, so it lands strictly after the
+        // populate began fetching and strictly before it tries to write --
+        // the same interleaving `vault_cache`'s own guard test uses.
+        let mut server = mockito::Server::new();
+        let cache = std::sync::Arc::new(cache_for(server.url()));
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let cache_for_handler = cache.clone();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |_| {
+                cache_for_handler.clear();
+                folders_body().as_bytes().to_vec()
+            })
+            .create();
+
+        let result = load_items_for_picker(&cache);
+
+        assert!(
+            matches!(result, PickerItemsResult::VaultLocked),
+            "a vault that locked mid-populate must not be reported as an empty vault"
+        );
+        assert!(!cache.is_populated());
     }
 
     #[test]

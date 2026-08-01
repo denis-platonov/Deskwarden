@@ -23,7 +23,7 @@
 use deskwarden::overlay_ui::{show_prompt_overlay, OverlayMatch};
 use deskwarden::picker_ui::run_picker;
 use deskwarden::vault_bridge::VaultBridge;
-use deskwarden::vault_cache::VaultCache;
+use deskwarden::vault_cache::{PopulateOutcome, VaultCache};
 use std::sync::Arc;
 
 fn main() {
@@ -36,7 +36,13 @@ fn main() {
     // `run_picker` now writes through the cache (Task 5), not the bridge
     // directly -- see its doc comment for why -- so it needs one to exist.
     let cache = Arc::new(VaultCache::new(vault.clone()));
-    cache.populate().expect("failed to populate the vault cache");
+    // The probe drives a live, unlocked backend and never clears the cache,
+    // so `DiscardedStale` cannot occur here -- but the outcome is matched
+    // rather than discarded so it stays a compile error if that changes.
+    match cache.populate().expect("failed to populate the vault cache") {
+        PopulateOutcome::Populated => {}
+        PopulateOutcome::DiscardedStale => panic!("the vault cache was cleared mid-populate"),
+    }
 
     let target = match &search {
         Some(term) => items

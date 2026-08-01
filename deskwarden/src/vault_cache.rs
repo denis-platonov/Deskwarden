@@ -37,6 +37,29 @@ pub struct VaultCache {
     snapshot: Mutex<Snapshot>,
 }
 
+/// What a populate actually did. Returned instead of a bare `Ok(())` because
+/// "the snapshot now holds the vault" and "this result was thrown away
+/// because the cache was cleared underneath it" are two different facts, and
+/// every caller that could only see `Ok` read the second as the first
+/// (review 14's Minor): the picker reported a *locked* vault as an empty one
+/// ("your vault doesn't have any items yet"), and the tray's Sync item
+/// reported a completed sync for a sync that refreshed nothing.
+///
+/// `#[must_use]` so a caller cannot go back to ignoring the distinction by
+/// writing `let _ = cache.populate();`.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopulateOutcome {
+    /// The snapshot was replaced with the fetched vault and is populated.
+    Populated,
+    /// A [`VaultCache::clear`] landed while this populate was in flight, so
+    /// its result was discarded and the snapshot is still empty and
+    /// unpopulated. Nothing *failed* -- the answer stopped being wanted --
+    /// which is why this is an `Ok` and not a `VaultError`; but it is also
+    /// not data, and a caller must not present the empty cache as the vault.
+    DiscardedStale,
+}
+
 impl VaultCache {
     pub fn new(bridge: VaultBridge) -> Self {
         Self {
@@ -67,16 +90,27 @@ impl VaultCache {
     /// `is_populated`) serve the *previous* account's items and passwords
     /// while the app considers itself locked (review 13's Minor 2).
     ///
-    /// The guard lives here rather than at any call site on purpose: there
-    /// is no correct behaviour a caller could choose instead, and the one
-    /// call site that got this wrong got it wrong by not knowing there was
-    /// anything to reason about. A discarded result leaves the cache exactly
-    /// as `clear` left it -- empty and unpopulated -- and returns `Ok(())`,
-    /// since nothing *failed*: the answer simply stopped being wanted.
-    pub fn populate(&self) -> Result<(), VaultError> {
-        let epoch = self.lock().epoch;
+    /// A discarded result leaves the cache exactly as `clear` left it --
+    /// empty and unpopulated -- and is reported as
+    /// [`PopulateOutcome::DiscardedStale`] rather than an error, since
+    /// nothing *failed*: the answer simply stopped being wanted. It is
+    /// reported at all because an empty cache is not a vault with no items;
+    /// see [`PopulateOutcome`].
+    pub fn populate(&self) -> Result<PopulateOutcome, VaultError> {
+        let epoch = self.epoch();
         let items = self.bridge.list_items()?;
         self.populate_with_at_epoch(items, epoch)
+    }
+
+    /// The snapshot's current epoch, for a caller that fetches the vault
+    /// itself and then hands the result to [`Self::populate_with`].
+    ///
+    /// Capture it **before** starting that fetch: the guard can only cover
+    /// the window it is given, and a `clear` that lands between a caller's
+    /// own `list_items` and its `populate_with` is invisible to an epoch
+    /// captured inside `populate_with` (review 14's Minor).
+    pub fn epoch(&self) -> u64 {
+        self.lock().epoch
     }
 
     /// Same as [`Self::populate`], but with items already fetched by the
@@ -90,17 +124,28 @@ impl VaultCache {
     /// folders, since nothing else already has, and mirrors `populate`'s
     /// atomicity: the snapshot is only replaced if that fetch also succeeds,
     /// not left holding the given `items` with no folders to match.
-    /// Epoch-guarded exactly like [`Self::populate`] -- see its doc. The
-    /// epoch is captured here, on entry, which covers this method's own
-    /// `list_folders` round-trip; [`Self::populate`] threads its earlier
-    /// capture through `populate_with_at_epoch` so its `list_items` call is
-    /// covered too.
-    pub fn populate_with(&self, items: Vec<VaultItem>) -> Result<(), VaultError> {
-        let epoch = self.lock().epoch;
+    ///
+    /// Epoch-guarded exactly like [`Self::populate`] -- see its doc for what
+    /// the guard is for -- but the epoch is the caller's, taken from
+    /// [`Self::epoch`], not one captured on entry here. What the guard
+    /// actually promises is "no `clear` landed between that capture and the
+    /// write", so the capture has to happen before the *caller's own fetch*
+    /// for the caller's fetch to be covered at all. Capturing on entry, after
+    /// the caller had already listed items, left exactly the hole the epoch
+    /// exists to close: a `clear` in that window was invisible and the
+    /// pre-clear account's items were written with `populated = true`
+    /// (review 14's Minor -- inert at the only caller today, which runs on
+    /// the main thread before any `clear` site exists, but not inert for the
+    /// background-thread callers the encrypted-disk-cache work will add).
+    pub fn populate_with(&self, items: Vec<VaultItem>, epoch: u64) -> Result<PopulateOutcome, VaultError> {
         self.populate_with_at_epoch(items, epoch)
     }
 
-    fn populate_with_at_epoch(&self, items: Vec<VaultItem>, epoch: u64) -> Result<(), VaultError> {
+    fn populate_with_at_epoch(
+        &self,
+        items: Vec<VaultItem>,
+        epoch: u64,
+    ) -> Result<PopulateOutcome, VaultError> {
         let folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
         if snapshot.epoch != epoch {
@@ -109,12 +154,12 @@ impl VaultCache {
                  (epoch {epoch} -> {}); the snapshot stays empty",
                 snapshot.epoch
             );
-            return Ok(());
+            return Ok(PopulateOutcome::DiscardedStale);
         }
         snapshot.items = items;
         snapshot.folders = folders;
         snapshot.populated = true;
-        Ok(())
+        Ok(PopulateOutcome::Populated)
     }
 
     pub fn is_populated(&self) -> bool {
@@ -270,7 +315,7 @@ mod tests {
 
         let cache = cache_for(server.url());
         assert!(!cache.is_populated());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
 
         // Many reads, one fetch: `expect(1)` fails if a read hits HTTP.
         for _ in 0..5 {
@@ -316,8 +361,11 @@ mod tests {
             })
             .create();
 
-        // `Ok`: nothing failed, the answer just stopped being wanted.
-        cache.populate().unwrap();
+        // `Ok`, but explicitly `DiscardedStale`: nothing failed, the answer
+        // just stopped being wanted -- and a caller must be able to tell that
+        // apart from a real populate, because the empty cache it leaves
+        // behind is not a vault with no items in it (review 14's Minor).
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::DiscardedStale);
 
         assert!(
             !cache.is_populated(),
@@ -351,7 +399,7 @@ mod tests {
         // A previous clear (bumping the epoch to a non-zero value) must not
         // poison later populates -- only one that lands *during* one does.
         cache.clear();
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
 
         assert!(cache.is_populated());
         assert_eq!(cache.items().len(), 2);
@@ -384,12 +432,52 @@ mod tests {
             other: serde_json::Map::new(),
         }];
 
-        cache.populate_with(seeded).unwrap();
+        assert_eq!(cache.populate_with(seeded, cache.epoch()).unwrap(), PopulateOutcome::Populated);
 
         assert_eq!(cache.items().len(), 1);
         assert_eq!(cache.folders().len(), 1);
         assert!(cache.is_populated());
         folders.assert();
+    }
+
+    #[test]
+    fn populate_with_discards_items_the_caller_fetched_before_a_clear() {
+        // Review 14's Minor 3. The caller does its own `list_items` (here,
+        // `seeded`), and a `clear` -- lock, or re-auth into a *different*
+        // account -- lands between that fetch and the handoff. The epoch the
+        // caller captured *before* fetching is what makes that window
+        // visible; an epoch captured on entry to `populate_with` would see an
+        // unchanged value and write the pre-clear account's items with
+        // `populated = true`, which is the precise hole the epoch exists to
+        // close.
+        let mut server = mockito::Server::new();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+
+        let cache = cache_for(server.url());
+        let epoch = cache.epoch();
+        let seeded = vec![VaultItem {
+            id: "1".to_string(),
+            name: "Alpha".to_string(),
+            fields: vec![],
+            login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }];
+        cache.clear();
+
+        assert_eq!(
+            cache.populate_with(seeded, epoch).unwrap(),
+            PopulateOutcome::DiscardedStale
+        );
+        assert!(!cache.is_populated(), "a pre-clear fetch must not mark the cache populated");
+        assert!(cache.items().is_empty(), "the pre-clear account's items must not be restored");
     }
 
     #[test]
@@ -411,7 +499,7 @@ mod tests {
             other: serde_json::Map::new(),
         }];
 
-        assert!(cache.populate_with(seeded).is_err());
+        assert!(cache.populate_with(seeded, cache.epoch()).is_err());
         assert!(!cache.is_populated());
         assert!(cache.items().is_empty());
     }
@@ -433,7 +521,7 @@ mod tests {
             .create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         assert_eq!(cache.items().len(), 2);
 
         cache.clear();
@@ -460,7 +548,7 @@ mod tests {
         let _d = server.mock("DELETE", "/object/item/1").with_status(200).create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         cache.delete_item("1").unwrap();
 
         let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
@@ -486,7 +574,7 @@ mod tests {
         let _d = server.mock("DELETE", "/object/item/1").with_status(500).create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         assert!(cache.delete_item("1").is_err());
         assert_eq!(cache.items().len(), 2, "a failed delete removed it anyway");
     }
@@ -514,7 +602,7 @@ mod tests {
             .create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         cache.update_folder("f1", "Renamed").unwrap();
 
         assert_eq!(cache.folders()[0].name, "Renamed");
@@ -542,7 +630,7 @@ mod tests {
         let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
         let m = an_app_match();
 
@@ -575,7 +663,7 @@ mod tests {
         let _u = server.mock("PUT", "/object/item/1").with_status(500).create();
 
         let cache = cache_for(server.url());
-        cache.populate().unwrap();
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
 
         assert!(cache.set_app_match(&item, &an_app_match()).is_err());

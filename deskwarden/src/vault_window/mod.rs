@@ -17,7 +17,7 @@ use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultError, VaultItem};
-use crate::vault_cache::VaultCache;
+use crate::vault_cache::{PopulateOutcome, VaultCache};
 use detail::{draw_detail_read, DetailAction, TotpState};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
 use eframe::egui::{self, Margin};
@@ -396,6 +396,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 &mut vault_loading,
                 &mut selected_id,
                 &mut sync_status,
+                &mut totp_state,
             );
         }
 
@@ -463,7 +464,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // determines what B's row shows.
             if totp_poll_result_is_current(&item_id, selected_id.as_deref()) {
                 let seconds_left = current_totp_seconds_left();
+                let before = totp_state.clone();
                 let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
+                // `Ok(None)` is not a quiet success: at this call site it can
+                // only mean the item we hold says it has a TOTP seed and
+                // `bw serve` will not produce a code for it (review 14's
+                // Important). Logged on the transition only -- see
+                // `entered_no_code_reported`'s doc.
+                if entered_no_code_reported(&before, &totp_state) {
+                    log::warn!(
+                        "bw serve reports no current one-time code for {item_id}, but this \
+                         item's login data carries a TOTP seed -- showing the row as \
+                         \"no code available\"; polling for it stops until the selection \
+                         changes or a vault reload lands"
+                    );
+                }
                 // Logged on the failing/recovered transition only (review
                 // Important 2 on commit 1d6c5ab) -- with the backend down
                 // every 1s poll would otherwise fill the log file, this
@@ -1187,6 +1202,25 @@ fn totp_state_wants_poll(state: &TotpState) -> bool {
     }
 }
 
+/// Whether applying a poll result just *entered* `NoCodeReported`, i.e. this
+/// is the transition into it rather than another frame already sitting in it.
+///
+/// The `Ok(None)` arm was the one poll outcome that left no trace anywhere
+/// (review 14's Important): `apply_totp_poll_result` returns `None` for the
+/// error, so the drain's `None` arm logged nothing and cleared
+/// `totp_poll_failing` -- the app's only diagnostic channel said a poll had
+/// simply succeeded. Logged on the transition only, exactly the way
+/// `totp_poll_failing` already gates the error path, so this cannot become a
+/// per-poll flood; `NoCodeReported` stops polling anyway, but the guard is
+/// what makes that a property of the logging rather than a coincidence of
+/// the poll gate.
+///
+/// Pulled out as its own predicate for the same reason every other decision
+/// in this block is: it is directly testable, and `run`'s closure is not.
+fn entered_no_code_reported(before: &TotpState, after: &TotpState) -> bool {
+    matches!(after, TotpState::NoCodeReported) && !matches!(before, TotpState::NoCodeReported)
+}
+
 /// Applies one `get_totp` poll result to `totp_state`, returning the error
 /// (if any) for the caller to log/reauth on. Pulled out of `run`'s TOTP poll
 /// site into its own function, the same way `apply_vault_load_result` was
@@ -1308,6 +1342,7 @@ fn apply_vault_load_result(
     vault_loading: &mut bool,
     selected_id: &mut Option<String>,
     sync_status: &mut Option<Result<(), String>>,
+    totp_state: &mut TotpState,
 ) {
     if generation != latest_generation {
         log::debug!(
@@ -1320,6 +1355,26 @@ fn apply_vault_load_result(
             *items = loaded_items;
             *folders = loaded_folders;
             *vault_loading = false;
+            // Fresh item data deserves a fresh poll (review 14's Important,
+            // part b). `totp_state` was otherwise reset *only* on a selection
+            // change, and `NoCodeReported` deliberately stops polling -- so a
+            // user who noticed the "no code available" row, fixed the item's
+            // authenticator key in the web vault and clicked Sync got the
+            // reload landing here, replacing `items` underneath a latched
+            // `NoCodeReported`, and still no code, with nothing on screen
+            // saying "click a different item and back". `NoSecret` is the
+            // same neutral "haven't looked yet" value the selection-change
+            // reset uses: the per-frame derivation promotes it to `Fetching`
+            // in the same frame if the (possibly just-updated) item still
+            // carries a seed, and leaves it alone if it doesn't.
+            //
+            // Deliberately keyed on "a reload landed", not on comparing the
+            // seed's VALUE: holding a copy of the 2FA seed in this loop to
+            // diff against is exactly what 8b1e441 stopped doing, and a
+            // reload is a sufficient trigger on its own -- they are rare
+            // (window open, sync, forced refresh), so re-polling on each
+            // costs one request.
+            *totp_state = TotpState::NoSecret;
             match &*selected_id {
                 // Nothing selected yet (the initial load): select the first
                 // item now that there is one. This makes `selected_id !=
@@ -1455,10 +1510,25 @@ fn spawn_vault_load_with_schedule(
                     return;
                 }
             }
-            if let Err(e) = cache.populate() {
-                log::warn!("could not populate the vault cache: {e:?}");
-                let _ = tx.send((generation, Err(format!("{e:?}"))));
-                return;
+            match cache.populate() {
+                Ok(PopulateOutcome::Populated) => {}
+                // The cache was cleared underneath this populate (a lock, or
+                // a re-auth into a possibly different account), so it is
+                // deliberately empty. Reporting `Ok((empty, empty))` here
+                // would paint an empty vault list -- data, drawn from the
+                // absence of data (review 14's Minor). The `Err` arm in
+                // `apply_vault_load_result` instead keeps whatever snapshot
+                // was already on screen and says so in the log.
+                Ok(PopulateOutcome::DiscardedStale) => {
+                    log::warn!("the vault was cleared while this refresh was in flight");
+                    let _ = tx.send((generation, Err("the vault was locked while refreshing".to_string())));
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("could not populate the vault cache: {e:?}");
+                    let _ = tx.send((generation, Err(format!("{e:?}"))));
+                    return;
+                }
             }
         }
         let _ = tx.send((generation, Ok((cache.items(), cache.folders()))));
@@ -1796,6 +1866,80 @@ mod apply_totp_poll_result_tests {
 
         assert_eq!(totp_state, TotpState::Unavailable);
         assert!(matches!(error, Some(VaultError::Unauthorized)));
+    }
+
+    /// **The composed assertion** (review 14's Important). Each pure function
+    /// below is correct on its own; what a user actually sees is the result
+    /// of running them in sequence at the live call site and then rendering
+    /// the outcome, and *that* is where an item with a seed used to end up
+    /// drawing nothing at all.
+    ///
+    /// The live call site (`run`'s per-frame TOTP block) reaches `get_totp`
+    /// only through `has_totp_secret == true`, so this walks every poll
+    /// result that can occur there, applies it, runs the same per-frame
+    /// presence derivation the next frame runs, and asserts the render layer
+    /// still draws a One-time code row. No poll result may make an item that
+    /// carries a seed look like an item that never had 2FA.
+    #[test]
+    fn an_item_with_a_seed_never_renders_as_a_no_totp_item_whatever_the_poll_returned() {
+        use crate::vault_window::detail::totp_row_for;
+        use crate::vault_window::{totp_state_for_secret_presence, totp_state_wants_poll};
+
+        let poll_results: Vec<Result<Option<String>, VaultError>> = vec![
+            Ok(Some("123456".to_string())),
+            Ok(None),
+            Err(VaultError::Http("connection reset".to_string())),
+            Err(VaultError::Unauthorized),
+        ];
+
+        for poll_result in poll_results {
+            let label = format!("{poll_result:?}");
+            // Frame 0: the item was just selected, so `run`'s reset block set
+            // `NoSecret` and the derivation promoted it to `Fetching`.
+            let mut totp_state = totp_state_for_secret_presence(true, TotpState::NoSecret);
+            assert_eq!(totp_state, TotpState::Fetching, "{label}");
+            assert!(totp_row_for(&totp_state).is_some(), "{label}: no row while fetching");
+
+            // The poll lands.
+            let _ = apply_totp_poll_result(poll_result, 15, &mut totp_state);
+            assert!(
+                totp_row_for(&totp_state).is_some(),
+                "{label}: the One-time code row vanished for an item whose own login data \
+                 carries a seed -- pixel-identical to an item that never had 2FA"
+            );
+
+            // Every subsequent frame re-runs the derivation, with the seed
+            // still present. The row must stay put for as long as the item
+            // stays selected, whether or not the state still wants polling.
+            for _ in 0..3 {
+                totp_state = totp_state_for_secret_presence(true, totp_state.clone());
+                assert!(
+                    totp_row_for(&totp_state).is_some(),
+                    "{label}: the row vanished on a later frame's presence derivation"
+                );
+            }
+            let _ = totp_state_wants_poll(&totp_state);
+        }
+    }
+
+    /// The other half of the composition: once the item's *own* login data no
+    /// longer carries a seed, the row does go away -- that is review 9's
+    /// property and it must survive `NoCodeReported` gaining a row.
+    #[test]
+    fn an_item_whose_seed_is_gone_does_render_as_a_no_totp_item() {
+        use crate::vault_window::detail::totp_row_for;
+        use crate::vault_window::totp_state_for_secret_presence;
+
+        for previous in [
+            TotpState::Fetching,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            TotpState::Unavailable,
+            TotpState::NoCodeReported,
+        ] {
+            let state = totp_state_for_secret_presence(false, previous);
+            assert_eq!(state, TotpState::NoSecret);
+            assert_eq!(totp_row_for(&state), None);
+        }
     }
 }
 
@@ -2339,6 +2483,7 @@ mod apply_vault_load_result_tests {
     // load's success already landed).
     use super::apply_vault_load_result;
     use crate::vault_bridge::VaultItem;
+    use crate::vault_window::detail::TotpState;
 
     fn item(id: &str) -> VaultItem {
         serde_json::from_str(&format!(r#"{{"id":"{id}","name":"{id}","fields":[]}}"#)).unwrap()
@@ -2367,6 +2512,7 @@ mod apply_vault_load_result_tests {
         let mut vault_loading = false;
         let mut selected_id = Some("2".to_string());
         let mut sync_status = Some(Ok(()));
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
 
         apply_vault_load_result(
             1, // this result's generation
@@ -2377,6 +2523,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut selected_id,
             &mut sync_status,
+            &mut totp_state,
         );
 
         assert_eq!(
@@ -2397,6 +2544,7 @@ mod apply_vault_load_result_tests {
         let mut vault_loading = false;
         let mut selected_id = Some("stale".to_string());
         let mut sync_status = Some(Err("bw serve never became ready".to_string()));
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
 
         apply_vault_load_result(
             1,
@@ -2407,6 +2555,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut selected_id,
             &mut sync_status,
+            &mut totp_state,
         );
 
         assert_eq!(ids(&items), vec!["stale"], "a superseded (stale) success must not be applied");
@@ -2429,6 +2578,7 @@ mod apply_vault_load_result_tests {
         let mut vault_loading = false;
         let mut selected_id = Some("pre-sync".to_string());
         let mut sync_status = Some(Ok(()));
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
 
         apply_vault_load_result(
             2,
@@ -2439,6 +2589,7 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut selected_id,
             &mut sync_status,
+            &mut totp_state,
         );
 
         assert_eq!(sync_status, Some(Err("bw serve never became ready".to_string())));
@@ -2451,6 +2602,7 @@ mod apply_vault_load_result_tests {
         let mut vault_loading = true;
         let mut selected_id = None;
         let mut sync_status = None;
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
 
         apply_vault_load_result(
             1,
@@ -2461,11 +2613,147 @@ mod apply_vault_load_result_tests {
             &mut vault_loading,
             &mut selected_id,
             &mut sync_status,
+            &mut totp_state,
         );
 
         assert_eq!(ids(&items), vec!["a", "b"]);
         assert!(!vault_loading);
         assert_eq!(selected_id, Some("a".to_string()), "the first item is selected once nothing was selected yet");
         assert_eq!(sync_status, None, "a load with no preceding sync claim must not invent one");
+    }
+
+    /// Review 14's Important, part b. `NoCodeReported` deliberately stops
+    /// polling, and `totp_state` was reset only on a *selection change*, so
+    /// the obvious user response to the "no code available" row -- fix the
+    /// item's authenticator key elsewhere, then click Sync -- replaced
+    /// `items` while leaving the latched state behind, and the row stayed
+    /// exactly as it was. A landed reload has to un-latch it.
+    #[test]
+    fn a_landed_reload_re_arms_the_totp_poll() {
+        let mut items = vec![item("a")];
+        let mut folders = Vec::new();
+        let mut vault_loading = true;
+        let mut selected_id = Some("a".to_string());
+        let mut sync_status = Some(Ok(()));
+        let mut totp_state = TotpState::NoCodeReported;
+
+        apply_vault_load_result(
+            1,
+            1,
+            Ok((vec![item("a")], Vec::new())),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(
+            totp_state,
+            TotpState::NoSecret,
+            "a reload must re-arm the TOTP poll: NoCodeReported stops polling, so a user who \
+             fixed the seed and clicked Sync would otherwise still see no code with nothing \
+             on screen telling them to reselect the item"
+        );
+        // And the composed consequence: the very next frame's presence
+        // derivation turns that back into a row for an item that has a seed.
+        assert_eq!(
+            super::totp_state_for_secret_presence(true, totp_state),
+            TotpState::Fetching
+        );
+    }
+
+    /// The reset belongs to a load that was actually *applied*. A superseded
+    /// one is dropped whole -- re-arming a poll off it would be state the
+    /// newer load is about to determine for itself.
+    #[test]
+    fn a_superseded_reload_does_not_re_arm_the_totp_poll() {
+        let mut items = vec![item("a")];
+        let mut folders = Vec::new();
+        let mut vault_loading = false;
+        let mut selected_id = Some("a".to_string());
+        let mut sync_status = None;
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+
+        apply_vault_load_result(
+            1,
+            2,
+            Ok((vec![item("late")], Vec::new())),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+    }
+
+    /// A *failed* reload leaves the last known snapshot on screen (see the
+    /// `Err` arm's own comment), so the state that goes with it stays too --
+    /// re-arming here would drop a live code for data that did not change.
+    #[test]
+    fn a_failed_reload_does_not_re_arm_the_totp_poll() {
+        let mut items = vec![item("a")];
+        let mut folders = Vec::new();
+        let mut vault_loading = true;
+        let mut selected_id = Some("a".to_string());
+        let mut sync_status = None;
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+
+        apply_vault_load_result(
+            1,
+            1,
+            Err("connection refused".to_string()),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+    }
+}
+
+#[cfg(test)]
+mod entered_no_code_reported_tests {
+    // Review 14's Important: `Ok(None)` used to leave no trace anywhere --
+    // no error to log, and the drain's success arm actively cleared the
+    // failing flag. This is the predicate that gives it one, once.
+    use super::entered_no_code_reported;
+    use crate::vault_window::detail::TotpState;
+
+    #[test]
+    fn entering_the_state_is_logged() {
+        assert!(entered_no_code_reported(&TotpState::Fetching, &TotpState::NoCodeReported));
+        assert!(entered_no_code_reported(
+            &TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            &TotpState::NoCodeReported
+        ));
+        assert!(entered_no_code_reported(&TotpState::Unavailable, &TotpState::NoCodeReported));
+    }
+
+    #[test]
+    fn staying_in_the_state_is_not_logged_again() {
+        assert!(!entered_no_code_reported(
+            &TotpState::NoCodeReported,
+            &TotpState::NoCodeReported
+        ));
+    }
+
+    #[test]
+    fn no_other_outcome_logs_this() {
+        for after in [
+            TotpState::NoSecret,
+            TotpState::Fetching,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            TotpState::Unavailable,
+        ] {
+            assert!(!entered_no_code_reported(&TotpState::Fetching, &after), "{after:?}");
+        }
     }
 }
