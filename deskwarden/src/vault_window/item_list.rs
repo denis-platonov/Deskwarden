@@ -23,7 +23,16 @@ pub struct IconCache {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemListAction {
     None,
-    NewItem,
+    /// A kind was picked from the `+ New` button's type menu.
+    ///
+    /// The kind is carried rather than assumed: `+ New` used to create a
+    /// login on the spot, and the caller's job is now to open a blank draft
+    /// **of this kind** (`EditDraft::empty_of`). Always one of
+    /// [`detail_edit::CREATABLE_KINDS`] -- the menu has no other rows to
+    /// click, which is why that array is what the rows are built from.
+    ///
+    /// [`detail_edit::CREATABLE_KINDS`]: super::detail_edit::CREATABLE_KINDS
+    NewItem(ItemKind),
     /// An entry of some row's right-click menu was chosen.
     ///
     /// The item's id is carried rather than left to `selected_id`, even
@@ -418,9 +427,34 @@ pub fn draw_item_list(
                 // remainder minus a guess at it -- which is exactly the
                 // `available_width() - 70.0` guess this replaces.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::primary_button_matching_field(ui, "+ New").clicked() {
-                        action = ItemListAction::NewItem;
-                    }
+                    // ALWAYS opens the menu; the button itself creates
+                    // nothing. That is the user's explicit choice over the
+                    // alternative ("+ New" makes a login, a separate caret
+                    // opens the list), and it is the reason the click is not
+                    // also reported as an action here.
+                    //
+                    // `Popup::menu` draws into its own `Area`, so nothing in
+                    // the closure below allocates in this strip -- which is
+                    // what keeps the list beneath it in register with the
+                    // fixed pitch `show_rows` virtualizes against. Pinned by
+                    // `the_new_menu_does_not_change_the_rows_below_it`.
+                    let new = theme::primary_button_matching_field(ui, "+ New");
+                    egui::Popup::menu(&new).show(|ui| {
+                        // Built FROM `CREATABLE_KINDS`, never from a list
+                        // written out here. That array is one of the three
+                        // doors keeping `ItemKind::Unknown` -- "a type this
+                        // build does not understand" -- unreachable from
+                        // creation, and a hand-written list is precisely the
+                        // door that would leak: it would keep compiling, and
+                        // keep offering whatever it said, after the array
+                        // moved on.
+                        for kind in super::detail_edit::CREATABLE_KINDS {
+                            if ui.button(kind.label()).clicked() {
+                                action = ItemListAction::NewItem(kind);
+                                ui.close();
+                            }
+                        }
+                    });
                     // "Search 180 logins" -- see `search_hint`, which owns
                     // both the count's source and the per-filter noun.
                     let hint = search_hint(super::sidebar::count_for(items, filter), filter);
@@ -2669,6 +2703,176 @@ mod row_tile_tests {
             assert!(
                 (open.top() - closed.top()).abs() < 0.5 && (open.height() - closed.height()).abs() < 0.5,
                 "a row tile moved or resized while a menu was open: {open:?} vs {closed:?}"
+            );
+        }
+    }
+
+    // ---- The "+ New" type menu ------------------------------------------
+    //
+    // `+ New` no longer creates a login on the spot: it opens a menu of the
+    // kinds this build can create, and nothing exists until one is picked.
+    // These drive the real button through real pointer frames, because the
+    // menu is drawn into egui's popup layer and nothing about it is visible
+    // to a unit test over the action enum.
+
+    /// The five rows the menu must offer, in order, spelled out.
+    ///
+    /// **Deliberately hardcoded and NOT derived from `CREATABLE_KINDS`.** A
+    /// test that mapped the array through `ItemKind::label` would agree with
+    /// the menu no matter what the array said, which is exactly the shape of
+    /// "coverage" this codebase has already been bitten by. The array is
+    /// pinned against this same list separately, by
+    /// `the_creatable_kinds_are_exactly_the_five_the_menu_is_pinned_to`, so a
+    /// sixth kind fails HERE (the menu grew a row) and THERE (the array grew
+    /// an entry) rather than passing quietly in both.
+    const NEW_MENU_ROWS: [&str; 5] = ["Login", "Secure note", "Card", "Identity", "SSH key"];
+
+    /// The centre of the `+ New` button, read off a painted frame.
+    fn new_button_centre(items: &[VaultItem]) -> egui::Pos2 {
+        let p = paint(items, None);
+        p.texts
+            .iter()
+            .find(|(text, _, _)| text == "+ New")
+            .expect("the \"+ New\" button was never painted")
+            .1
+            .center()
+    }
+
+    /// Every string painted this frame, in paint order. Used as a
+    /// before/after pair so the menu's contents are found by DIFFERENCE
+    /// rather than by looking for the labels the test expects -- a menu that
+    /// also offered "Unsupported item" would show up in the difference.
+    fn all_texts(p: &Painted) -> Vec<String> {
+        p.texts.iter().map(|(text, _, _)| text.clone()).collect()
+    }
+
+    /// The strings `open` painted that `closed` did not, in order.
+    fn extra_texts(closed: &Painted, open: &Painted) -> Vec<String> {
+        let mut before = all_texts(closed);
+        let mut extra = Vec::new();
+        for text in all_texts(open) {
+            match before.iter().position(|t| *t == text) {
+                Some(at) => {
+                    before.remove(at);
+                }
+                None => extra.push(text),
+            }
+        }
+        extra
+    }
+
+    /// Left-clicks `+ New` and returns the frame its menu is open on.
+    fn open_new_menu(items: &[VaultItem]) -> Painted {
+        let at = new_button_centre(items);
+        paint_core(
+            items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu {
+                folders: vec![],
+                delete_pending: None,
+                frames: click_frames(at, egui::PointerButton::Primary),
+            },
+        )
+    }
+
+    #[test]
+    fn the_new_button_opens_a_menu_of_exactly_the_creatable_kinds() {
+        // Item names chosen so none of them can be mistaken for a kind row.
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let closed = paint(&items, None);
+        let open = open_new_menu(&items);
+        assert_eq!(
+            extra_texts(&closed, &open),
+            NEW_MENU_ROWS,
+            "the \"+ New\" menu drew something other than exactly the creatable kinds"
+        );
+    }
+
+    #[test]
+    fn the_creatable_kinds_are_exactly_the_five_the_menu_is_pinned_to() {
+        // The other half of `NEW_MENU_ROWS`' contract: the menu builds its
+        // rows FROM `CREATABLE_KINDS`, and that array is one of three doors
+        // keeping `ItemKind::Unknown` unreachable from creation. If a kind is
+        // added to it, this fails and says so, rather than the painted test
+        // above failing on its own with no explanation of where the extra row
+        // came from.
+        let labels: Vec<String> = super::super::detail_edit::CREATABLE_KINDS
+            .iter()
+            .map(|kind| kind.label())
+            .collect();
+        assert_eq!(labels, NEW_MENU_ROWS);
+    }
+
+    #[test]
+    fn opening_the_new_menu_creates_nothing_by_itself() {
+        // The user's explicit choice: the button ALWAYS opens the dropdown,
+        // and nothing is created until a kind is picked. A `+ New` that
+        // reported `NewItem(Login)` on the way to showing the menu would
+        // look identical on screen and be wrong.
+        let items = [full_login("Ledgerline")];
+        assert_eq!(open_new_menu(&items).action, ItemListAction::None);
+    }
+
+    #[test]
+    fn picking_a_kind_asks_for_a_new_item_of_that_kind() {
+        // Every row, with its kind written out rather than looked up, so a
+        // menu that offered the right five labels wired to the wrong five
+        // kinds fails here.
+        for (label, kind) in [
+            ("Login", ItemKind::Login),
+            ("Secure note", ItemKind::SecureNote),
+            ("Card", ItemKind::Card),
+            ("Identity", ItemKind::Identity),
+            ("SSH key", ItemKind::SshKey),
+        ] {
+            let items = [full_login("Ledgerline")];
+            let row = text_centre(&open_new_menu(&items), label);
+            let at = new_button_centre(&items);
+            let mut frames = click_frames(at, egui::PointerButton::Primary);
+            let mut pick = click_frames(row, egui::PointerButton::Primary);
+            // Measured on the release, which is the frame egui resolves the
+            // click on -- see `choose_entry`.
+            pick.pop();
+            frames.extend(pick);
+            let p = paint_core(
+                &items,
+                None,
+                0,
+                PANE_WIDTH,
+                |_| IconCache::default(),
+                Menu { folders: vec![], delete_pending: None, frames },
+            );
+            assert_eq!(
+                p.action,
+                ItemListAction::NewItem(kind),
+                "picking {label:?} asked for the wrong kind"
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_menu_does_not_change_the_rows_below_it() {
+        // VIRTUALIZATION, the same guard `the_menu_does_not_change_the_rows_
+        // it_is_drawn_over` applies to the row menu: `show_rows` reads
+        // `item_spacing.y` from the ui it is given BEFORE its closure runs
+        // and scrolls by a fixed pitch, so anything the menu allocated in the
+        // toolbar strip would move every tile below it. A `Popup` draws into
+        // its own `Area`, which allocates nothing here -- asserted rather
+        // than assumed.
+        let items: Vec<VaultItem> = (0..100).map(|i| full_login(&format!("Item {i:03}"))).collect();
+        let closed = paint(&items, None);
+        let open = open_new_menu(&items);
+        assert_eq!(open.visible, closed.visible, "the laid-out row range changed");
+        let closed_tiles: Vec<egui::Rect> = row_tiles(&closed).iter().map(|t| t.rect).collect();
+        let open_tiles: Vec<egui::Rect> = row_tiles(&open).iter().map(|t| t.rect).collect();
+        assert_eq!(open_tiles.len(), closed_tiles.len(), "a row tile changed height");
+        for (open, closed) in open_tiles.iter().zip(&closed_tiles) {
+            assert!(
+                (open.top() - closed.top()).abs() < 0.5,
+                "a row tile moved while the \"+ New\" menu was open: {open:?} vs {closed:?}"
             );
         }
     }

@@ -1030,7 +1030,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     &icons,
                     &mut visible_ids,
                 ) {
-                    ItemListAction::NewItem => mode = DetailMode::Create(EditDraft::empty()),
+                    // The kind the `+ New` menu was clicked on -- `empty_of`,
+                    // not `empty`, which would open a login form whatever row
+                    // the user picked. Always one of `CREATABLE_KINDS`; the
+                    // menu has no other rows.
+                    ItemListAction::NewItem(kind) => {
+                        mode = DetailMode::Create(EditDraft::empty_of(kind))
+                    }
                     // Not acted on here: this closure holds `items` borrowed
                     // (a Delete has to drain it) and, more importantly, the
                     // selection this right-click just made has not been
@@ -5404,5 +5410,71 @@ mod draw_read_arm_tests {
     fn an_unpressed_hotkey_returns_no_action_on_a_login() {
         let (action, _) = run_read_arm(&an_item(Some(1)), false);
         assert_eq!(action, DetailAction::None);
+    }
+}
+
+/// The `+ New` menu's wiring, guarded at source level.
+///
+/// WHAT THIS MODULE CAN AND CANNOT SEE, PLAINLY. `item_list`'s own painted
+/// tests drive the real button through real pointer frames and pin that
+/// picking "Card" reports `ItemListAction::NewItem(ItemKind::Card)`. What no
+/// test in this crate can reach is the other half -- the arm in `run` that
+/// turns that action into a draft -- because `run` opens a real OS window
+/// inside `eframe::run_ui_native`. The failure that half can have is precise
+/// and silent: `EditDraft::empty()` where `empty_of(kind)` belongs opens a
+/// LOGIN form no matter which row was picked, and every painted test upstream
+/// still passes. So it is guarded the same way `window_era_placement_tests`
+/// guards its own unreachable slice, with the same split-literal rule -- do
+/// not re-join these needles, or they match themselves inside this module.
+#[cfg(test)]
+mod new_item_kind_placement_tests {
+    const ARM: &str = concat!("ItemListAction::NewItem(kind)", " => {");
+    const SEEDED: &str = concat!("DetailMode::Create(EditDraft::", "empty_of(kind))");
+    /// The kindless constructor. Exactly one production use is legitimate:
+    /// Ctrl+N, which has no kind to carry and deliberately opens the default
+    /// (a login). A second occurrence means the menu's arm lost its kind.
+    const KINDLESS: &str = concat!("EditDraft::", "empty()");
+    const TESTS_BEGIN: &str = concat!("#[cfg(", "test)]");
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(TESTS_BEGIN)
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    #[test]
+    fn the_new_item_arm_seeds_the_draft_with_the_kind_that_was_picked() {
+        let production = production();
+        let arm = production.find(ARM).unwrap_or_else(|| {
+            panic!(
+                "{ARM:?} is not in the production code. `+ New` reports the kind that was \
+                 picked; if the arm was reshaped, update this needle -- but if it stopped \
+                 binding the kind at all, the menu's five rows all open the same form"
+            )
+        });
+        let seeded = production.find(SEEDED).unwrap_or_else(|| {
+            panic!(
+                "{SEEDED:?} is not in the production code -- the picked kind is no longer what \
+                 the draft is created from"
+            )
+        });
+        assert!(
+            arm < seeded && seeded - arm < 400,
+            "the seeded-draft construction is not inside the NewItem arm (arm at {arm}, \
+             construction at {seeded})"
+        );
+    }
+
+    #[test]
+    fn the_kindless_constructor_survives_only_on_the_ctrl_n_path() {
+        let count = production().matches(KINDLESS).count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one production use of {KINDLESS:?} (Ctrl+N, which has no kind to \
+             carry), found {count}. A second one is how the type menu quietly goes back to \
+             opening a login whatever row was clicked"
+        );
     }
 }
