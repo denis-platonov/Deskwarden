@@ -551,14 +551,17 @@ mod tests {
         let virtual_bucket = Folder {
             id: String::new(),
             name: "No Folder".into(),
+            other: serde_json::Map::new(),
         };
         let real_folder_same_name = Folder {
             id: "a4e839ea-252a-4bcf-9ae0-f29f33304ef2".into(),
             name: "No Folder".into(),
+            other: serde_json::Map::new(),
         };
         let ordinary = Folder {
             id: "957b860f-1130-42d9-a72c-7814f828b4d5".into(),
             name: "Napps".into(),
+            other: serde_json::Map::new(),
         };
 
         assert!(is_virtual_folder(&virtual_bucket));

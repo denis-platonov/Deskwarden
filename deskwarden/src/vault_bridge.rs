@@ -23,6 +23,25 @@ use zeroize::Zeroizing;
 /// fields. Preserving unknown keys is the fix; naming them is a separate
 /// feature, and modelling a wire shape from memory is how a modelled field and
 /// its `other` copy start disagreeing.
+///
+/// Note what these two modelled fields deliberately do *not* carry, unlike
+/// [`LoginData`]'s: `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+/// That attribute would honour the "don't inject a key the source never had"
+/// rule for a field arriving as `{"name":"PIN","type":1}` -- but it would
+/// break the *observed* shape in exchange, because `Option<String>` cannot
+/// tell an absent key from an explicit `null` once deserialized, and a LINKED
+/// custom field really does arrive as `{"value":null,"type":3,"linkedId":100}`.
+/// Adding it drops that `null` and fails
+/// `unknown_keys_on_a_custom_field_survive_a_round_trip`. Doing this properly
+/// needs `Option<Option<String>>` (outer = key present, inner = null vs
+/// value), which changes the type every caller reads. RECORDED, NOT ACTIONED.
+///
+/// `other` is `pub` and unguarded, so inserting `"name"` or `"value"` into it
+/// would emit a duplicate JSON key and `bw` would take the last one --
+/// silently renaming the field. Not reachable today (deserialize routes those
+/// two keys into the typed fields, and nothing in the crate writes to `other`),
+/// and [`UriEntry`]/[`LoginData`] share the shape; it is why `other` should
+/// stay a map only serde fills.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultField {
     pub name: Option<String>,
@@ -285,10 +304,12 @@ impl ItemKind {
 /// are preserved unchanged, since `bw serve`'s edit endpoint expects the
 /// full item as the new state rather than a server-merged patch.
 pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
-    let is_app_match = |f: &&VaultField| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME);
+    let is_app_match = |f: &VaultField| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME);
     // Every *other* field is cloned wholesale, so anything unmodelled on it
     // (`type`, `linkedId`, ...) rides `VaultField::other` untouched.
-    let mut fields: Vec<VaultField> = item.fields.iter().filter(|f| !is_app_match(f)).cloned().collect();
+    let mut fields: Vec<VaultField> = item.fields.clone();
+    let existing = fields.iter().position(|f| is_app_match(f));
+
     // The app-match field is the one field rebuilt rather than copied, because
     // its `value` is the thing being changed. Its extra keys are still the
     // server's to keep: `bw` normalises what this app writes (a field created
@@ -297,17 +318,22 @@ pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
     // struct's `other` exists to prevent, one field further in. When there is
     // no such field to replace, an empty map is correct: inventing keys nobody
     // observed would be modelling from memory.
-    let other = item
-        .fields
-        .iter()
-        .find(is_app_match)
-        .map(|f| f.other.clone())
-        .unwrap_or_default();
-    fields.push(VaultField {
+    let other = match existing {
+        Some(i) => fields[i].other.clone(),
+        None => serde_json::Map::new(),
+    };
+    let rebuilt = VaultField {
         name: Some(APP_MATCH_FIELD_NAME.to_string()),
         value: Some(m.to_field_value()),
         other,
-    });
+    };
+    // Replaced IN PLACE, not removed and re-appended: Bitwarden preserves and
+    // displays custom-field order, so appending would visibly reshuffle the
+    // user's own fields every time an app match is saved.
+    match existing {
+        Some(i) => fields[i] = rebuilt,
+        None => fields.push(rebuilt),
+    }
 
     let mut updated = item.clone();
     updated.fields = fields;
@@ -358,10 +384,31 @@ struct ItemList {
     data: Vec<VaultItem>,
 }
 
+/// A vault folder as `bw serve` lists it.
+///
+/// The `#[serde(flatten)] other` is the same rule as [`UriEntry`]'s and
+/// [`VaultField`]'s -- keep every key the server sent, so nothing this app
+/// writes back can be a truncated copy of what it read. Unlike those two it is
+/// currently belt-and-braces rather than load-bearing: *nothing PUTs a folder
+/// today*. `create_folder`/`update_folder` build their payload as
+/// `json!({ "name": name })` and never serialize a `Folder`, `delete_folder`
+/// sends no body, and `VaultCache`'s folder methods only mutate the in-memory
+/// snapshot. The path that makes it load-bearing is the encrypted vault disk
+/// cache, which serializes `Vec<Folder>` to disk and reads it back: without
+/// this, every key beyond id/name (`organizationId`, `revisionDate`, ...)
+/// would be lost across the round trip through the file.
+///
+/// One shared caveat with the other catch-alls: `other` is `pub` and
+/// unguarded, so inserting `"id"` or `"name"` into it would emit a duplicate
+/// JSON key and `bw` would take the last one -- unreachable today, since
+/// deserialize routes those two into the typed fields and no code writes to
+/// `other`, but it is why `other` should stay something only serde fills.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Folder {
     pub id: String,
     pub name: String,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1085,6 +1132,68 @@ mod tests {
     }
 
     #[test]
+    fn a_custom_field_arriving_without_a_value_gains_a_null_value_on_write() {
+        // PINS A KNOWN DEFECT, it does not bless it. `VaultField`'s two
+        // modelled fields have no `skip_serializing_if`, so a field that
+        // arrives as `{"name":"PIN","type":1}` is written back as
+        // `{"name":"PIN","value":null,"type":1}` -- the very thing
+        // `LoginData`'s doc comment forbids.
+        //
+        // It is NOT fixed by adding the attribute: `Option<String>` cannot
+        // tell an absent key from an explicit `null`, and a linked custom
+        // field genuinely arrives carrying `"value": null` (see
+        // `unknown_keys_on_a_custom_field_survive_a_round_trip`), which the
+        // attribute would then drop. Trading an unobserved shape for an
+        // observed one is not a fix. The real fix is
+        // `Option<Option<String>>`, which changes the type every caller
+        // reads. This test exists so that change has something to flip.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,
+            "fields":[{"name":"PIN","type":1}]}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let value = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            value["fields"][0],
+            serde_json::json!({"name": "PIN", "value": null, "type": 1}),
+            "the injected-null behaviour changed; if it was fixed, flip this test"
+        );
+    }
+
+    #[test]
+    fn with_app_match_replaces_the_existing_field_in_place() {
+        // Bitwarden preserves and displays custom-field order. Filtering the
+        // old app-match field out and appending the new one reshuffles the
+        // user's fields in the Bitwarden UI on every save; replacing in place
+        // does not.
+        let raw = format!(
+            r#"{{"id":"1","name":"Site","type":1,"favorite":false,
+                "fields":[{{"name":"First","value":"a","type":0}},
+                          {{"name":"{}","value":"old.exe|prompt","type":0}},
+                          {{"name":"Last","value":"z","type":0}}]}}"#,
+            APP_MATCH_FIELD_NAME_FOR_TEST
+        );
+        let item: VaultItem = serde_json::from_str(&raw).unwrap();
+
+        let updated = with_app_match(
+            &item,
+            &AppMatch {
+                process: "new.exe".into(),
+                trigger: TriggerMode::Prompt,
+            },
+        );
+        let names: Vec<&str> = updated
+            .fields
+            .iter()
+            .filter_map(|f| f.name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["First", APP_MATCH_FIELD_NAME_FOR_TEST, "Last"],
+            "saving an app match reordered the user's custom fields"
+        );
+        assert_eq!(extract_app_match(&updated).unwrap().process, "new.exe");
+    }
+
+    #[test]
     fn with_app_match_keeps_a_hidden_field_hidden() {
         // The user-visible harm, stated as a test: attaching an app match to
         // an item that already has a HIDDEN custom field (`"type": 1`)
@@ -1443,6 +1552,24 @@ mod tests {
 
         assert_eq!(folders.len(), 2);
         assert_eq!(folders[0].name, "Engineering");
+    }
+
+    #[test]
+    fn unknown_keys_on_a_folder_survive_a_round_trip() {
+        // `Folder` is the fourth struct in this crate to need a catch-all.
+        // `bw` sends more on a folder than id/name (`organizationId`,
+        // `revisionDate`, ...), and the encrypted-disk-cache plan serializes
+        // `Vec<Folder>` to disk, which makes the loss real rather than
+        // theoretical.
+        let raw = r#"{"id":"f1","name":"Engineering",
+            "organizationId":null,"revisionDate":"2026-01-02T03:04:05.000Z"}"#;
+        let folder: Folder = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_value(&folder).unwrap(),
+            "a key on a folder was dropped across a round trip"
+        );
     }
 
     #[test]
