@@ -282,9 +282,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // way `spawn_vault_load`/`spawn_vault_sync` already are: `should_start_totp_poll`
     // below gates spawning a one-shot thread that reports over `totp_tx`, and
     // the non-blocking `totp_rx` drain applies whatever it sends back.
+    //
+    // Tagged `(load_generation, item_id, result)`: the id alone said which
+    // ITEM a result belongs to but not which vault state it was fetched
+    // against, so a poll issued before a reload could be applied after it
+    // and undo the reload's re-arm (review 15's Minor 5) -- see
+    // `totp_poll_result_is_current`.
     let (totp_tx, totp_rx): (
-        mpsc::Sender<(String, Result<Option<String>, VaultError>)>,
-        Receiver<(String, Result<Option<String>, VaultError>)>,
+        mpsc::Sender<(u64, String, Result<Option<String>, VaultError>)>,
+        Receiver<(u64, String, Result<Option<String>, VaultError>)>,
     ) = mpsc::channel();
     // True from the moment a poll thread is spawned until its result is
     // drained. Gates `should_start_totp_poll` so a `bw serve` that never
@@ -452,7 +458,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // `totp_poll_in_flight` permanently once the user switched away
         // before it returned, silently wedging every poll after it for the
         // rest of the session.
-        if let Ok((item_id, poll_result)) = totp_rx.try_recv() {
+        if let Ok((generation, item_id, poll_result)) = totp_rx.try_recv() {
+            // Cleared before any staleness check, deliberately: a dropped
+            // result still means the thread that held this flag has
+            // finished, and gating the clear on currency is exactly how it
+            // would latch and wedge every later poll.
             totp_poll_in_flight = false;
             // A poll only ever updates `totp_state` if it's still for the
             // selected item -- one spawned for item A can land after the
@@ -462,7 +472,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // superseded vault load is (`apply_vault_load_result`); B's own
             // poll (already in flight or about to be spawned) is what
             // determines what B's row shows.
-            if totp_poll_result_is_current(&item_id, selected_id.as_deref()) {
+            if totp_poll_result_is_current(&item_id, selected_id.as_deref(), generation, load_generation) {
                 let seconds_left = current_totp_seconds_left();
                 let before = totp_state.clone();
                 let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
@@ -493,7 +503,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                         flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, e);
                     }
                     None => {
-                        if totp_poll_failing {
+                        // Not every non-error is a recovery (review 15's
+                        // nit): an outage that flips to a `400` yields
+                        // `Ok(None)`, so the log read "no current one-time
+                        // code ..." immediately followed by "TOTP fetch
+                        // recovered", two lines that contradict each other
+                        // about the same poll.
+                        if totp_poll_failing && poll_success_is_a_recovery(&totp_state) {
                             log::info!("TOTP fetch for {item_id} recovered");
                             totp_poll_failing = false;
                         }
@@ -848,9 +864,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 let item_id = item.id.clone();
                                 let bridge = cache.bridge().clone();
                                 let tx = totp_tx.clone();
+                                // Tagged with the vault state this poll is
+                                // being fetched against, so a reload
+                                // spawned while it is in flight can drop it
+                                // rather than let it overwrite the state
+                                // that reload re-armed (review 15's Minor
+                                // 5) -- see `totp_poll_result_is_current`.
+                                let generation = load_generation;
                                 std::thread::spawn(move || {
                                     let result = bridge.get_totp(&item_id);
-                                    let _ = tx.send((item_id, result));
+                                    let _ = tx.send((generation, item_id, result));
                                 });
                             }
                             // Refreshed every frame regardless of whether a
@@ -1202,6 +1225,70 @@ fn totp_state_wants_poll(state: &TotpState) -> bool {
     }
 }
 
+/// The `TotpState` a landed vault reload should leave behind.
+///
+/// The re-arm itself is review 14's Important part b and stays: a reload is
+/// the only other event besides a selection change that can un-latch
+/// `NoCodeReported`, which deliberately stops polling, so a user who fixed
+/// the item's seed in the web vault and clicked Sync needs it to fire.
+/// `NoSecret` is the neutral "haven't looked yet" value the selection-change
+/// reset also uses -- the per-frame presence derivation promotes it back to
+/// `Fetching` in the same frame if the (possibly just-updated) item still
+/// carries a seed.
+///
+/// `Code` is the exception, and it is the only one. Two reasons, and the
+/// second is why this is a skip rather than a `totp_last_poll` reset:
+///  * There is nothing to un-latch. `totp_state_wants_poll` returns true for
+///    `Code`, so that state is already polling once per `TOTP_POLL_INTERVAL`
+///    and will pick up a changed seed on its own within a second. The
+///    re-arm exists for the states that STOPPED polling.
+///  * Blanking it is visible. A displayed code becomes "Fetching...",
+///    losing the Copy button and shifting the row's layout under a user
+///    reaching for it, and the window's own first-frame auto-sync makes that
+///    the ordinary case rather than a corner. Resetting `totp_last_poll`
+///    alongside the blank would shorten the flicker to one HTTP round-trip
+///    but not remove it; skipping removes it entirely.
+///
+/// A `Code` for an item whose seed has since been removed is not this
+/// function's problem either: `totp_state_for_secret_presence` clears it to
+/// `NoSecret` on the very next frame, from the freshly loaded item, which is
+/// review 9's property and is unaffected by anything here.
+///
+/// Exhaustive, no catch-all, like every other decision over `TotpState`.
+fn totp_state_after_reload(previous: TotpState) -> TotpState {
+    match previous {
+        TotpState::Code { code, seconds_left } => TotpState::Code { code, seconds_left },
+        TotpState::NoSecret | TotpState::Fetching | TotpState::NoCodeReported | TotpState::Unavailable => {
+            TotpState::NoSecret
+        }
+    }
+}
+
+/// Whether a poll that returned no *error* actually ended a failure streak.
+///
+/// `apply_totp_poll_result` reports `None` for both `Ok(Some(code))` and
+/// `Ok(None)`, and the drain treated either as a recovery -- so a backend
+/// outage that turns into a `400` (`bw serve` answering, but refusing this
+/// item's seed) logged `warn: bw serve reports no current one-time code ...`
+/// and `info: TOTP fetch ... recovered` back to back about the same poll
+/// (review 15's nit). Only a poll that produced a code is a recovery; the
+/// streak is left standing for `NoCodeReported`, so if the seed is later
+/// fixed and a reload re-arms the poll, the eventual code still logs the
+/// recovery the streak was waiting for.
+///
+/// Exhaustive, no catch-all. The three states that cannot be reached from a
+/// successful poll are named rather than defaulted, so a future variant is a
+/// compile error here like everywhere else `TotpState` is decided over.
+fn poll_success_is_a_recovery(after: &TotpState) -> bool {
+    match after {
+        TotpState::Code { .. } => true,
+        TotpState::NoCodeReported => false,
+        // Not reachable from `apply_totp_poll_result`'s `Ok` arms (they
+        // write only the two above), and not a claim of recovery either.
+        TotpState::NoSecret | TotpState::Fetching | TotpState::Unavailable => false,
+    }
+}
+
 /// Whether applying a poll result just *entered* `NoCodeReported`, i.e. this
 /// is the transition into it rather than another frame already sitting in it.
 ///
@@ -1313,8 +1400,33 @@ fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool, state_wants_poll
 /// row than the one it was fetched for; `selected_id` being anything other
 /// than `Some(item_id)` -- including `None` -- means this result is stale and
 /// must be dropped rather than applied.
-fn totp_poll_result_is_current(item_id: &str, selected_id: Option<&str>) -> bool {
-    selected_id == Some(item_id)
+///
+/// The same result must also be dropped if it was fetched against a vault
+/// state that has since been superseded (review 15's Minor 5). A poll
+/// carries the `load_generation` current when it was spawned; `run`'s
+/// `vault_rx` drain runs before its `totp_rx` drain, so a reload can land
+/// and re-arm `totp_state` and then, in the same frame, a poll issued before
+/// that reload can be applied on top -- landing back on `NoCodeReported`,
+/// which stops polling, and silently undoing the re-arm the user asked for
+/// by clicking Sync. This is the same generation-tag pattern `vault_rx`
+/// results already use (`apply_vault_load_result`), chosen over reordering
+/// the two drains: that ordering is load-bearing and enforced by nothing but
+/// source order inside one long `eframe` closure, and adding a second such
+/// dependency would trade one implicit constraint for two.
+///
+/// It is deliberately slightly eager: `load_generation` is incremented when
+/// a reload is *spawned*, not when it lands, so a poll spawned before that
+/// increment is dropped even if the reload has not landed yet. The cost is
+/// one skipped poll -- the next one fires within `TOTP_POLL_INTERVAL` -- and
+/// the alternative (tagging with "the generation last applied") would need a
+/// second counter that means almost the same thing.
+fn totp_poll_result_is_current(
+    item_id: &str,
+    selected_id: Option<&str>,
+    generation: u64,
+    latest_generation: u64,
+) -> bool {
+    selected_id == Some(item_id) && generation == latest_generation
 }
 
 /// Applies one result received from `vault_rx` -- the state update `run`'s
@@ -1374,7 +1486,12 @@ fn apply_vault_load_result(
             // reload is a sufficient trigger on its own -- they are rare
             // (window open, sync, forced refresh), so re-polling on each
             // costs one request.
-            *totp_state = TotpState::NoSecret;
+            //
+            // `totp_state_after_reload`, not a bare assignment: the
+            // unconditional version blanked a code that was on screen and
+            // live (review 15's Minor 3). See that function for why a `Code`
+            // is the one state a reload has nothing to fix.
+            *totp_state = totp_state_after_reload(totp_state.clone());
             match &*selected_id {
                 // Nothing selected yet (the initial load): select the first
                 // item now that there is one. This makes `selected_id !=
@@ -1519,6 +1636,15 @@ fn spawn_vault_load_with_schedule(
                 // absence of data (review 14's Minor). The `Err` arm in
                 // `apply_vault_load_result` instead keeps whatever snapshot
                 // was already on screen and says so in the log.
+                //
+                // Not reachable as the app is wired today (review 15's
+                // Minor 1): every `VaultCache::clear` runs on the main
+                // thread, and `vault_window::run` owns that thread for this
+                // window's whole lifetime, so nothing can clear the cache
+                // while this background populate is in flight. Kept, and
+                // recorded as unreachable rather than presented as a fix to
+                // live misbehaviour -- the planned encrypted disk cache adds
+                // the background-thread `clear` callers that make it real.
                 Ok(PopulateOutcome::DiscardedStale) => {
                     log::warn!("the vault was cleared while this refresh was in flight");
                     let _ = tx.send((generation, Err("the vault was locked while refreshing".to_string())));
@@ -2038,18 +2164,33 @@ mod totp_poll_result_is_current_tests {
 
     #[test]
     fn a_result_for_the_still_selected_item_is_current() {
-        assert!(totp_poll_result_is_current("item-1", Some("item-1")));
+        assert!(totp_poll_result_is_current("item-1", Some("item-1"), 3, 3));
     }
 
     #[test]
     fn a_result_for_a_no_longer_selected_item_is_stale() {
         // The user switched from item A to item B before A's poll returned.
-        assert!(!totp_poll_result_is_current("item-a", Some("item-b")));
+        assert!(!totp_poll_result_is_current("item-a", Some("item-b"), 3, 3));
     }
 
     #[test]
     fn a_result_landing_after_the_selection_was_cleared_is_stale() {
-        assert!(!totp_poll_result_is_current("item-1", None));
+        assert!(!totp_poll_result_is_current("item-1", None, 3, 3));
+    }
+
+    #[test]
+    fn a_result_from_before_a_newer_load_was_spawned_is_stale() {
+        // Review 15's Minor 5. The `vault_rx` drain runs BEFORE the
+        // `totp_rx` drain in `run`'s closure, so within a single frame a
+        // reload can land (re-arming `totp_state`) and then a poll issued
+        // against the PRE-sync backend state can be applied on top of it --
+        // re-latching `NoCodeReported` and stopping polling again, defeating
+        // the re-arm the user just triggered by clicking Sync. Fixed by
+        // tagging, the way vault loads already are, rather than by swapping
+        // the two drains: the ordering in that closure is load-bearing and
+        // enforced by nothing but source order, and a second such dependency
+        // is not an improvement on one.
+        assert!(!totp_poll_result_is_current("item-1", Some("item-1"), 1, 2));
     }
 }
 
@@ -2161,11 +2302,16 @@ mod totp_state_for_secret_presence_tests {
         // runs on a background thread and reports back later over
         // `totp_rx`, so a freshly selected item (or one whose secret just
         // reappeared) must not render as `NoSecret` -- which draws no row at
-        // all (`detail::draw_detail_read`) and reads as "this item has no
-        // TOTP" -- for however long the fetch takes. `NoSecret` is only ever
-        // the correct answer once a poll actually confirms there is nothing
-        // to fetch (`apply_totp_poll_result`'s `Ok(None)` arm); before that,
-        // it must read as "fetching", not "not set up here".
+        // all (`totp_row_for` maps it, and only it, to `None`) and reads as
+        // "this item has no TOTP" -- for however long the fetch takes.
+        // `NoSecret` is the value DERIVED FROM THE ITEM: it is only correct
+        // while the item we hold carries no seed. It is deliberately not
+        // what a poll concludes -- `apply_totp_poll_result`'s `Ok(None)` arm
+        // has written `NoCodeReported` since 48cff27, precisely so this
+        // promotion cannot undo it -- and it is also the neutral "haven't
+        // looked yet" value that a selection change and a landed reload
+        // (`totp_state_after_reload`) reset to. In all of those cases, with
+        // a seed present, it must read as "fetching", not "not set up here".
         let next = totp_state_for_secret_presence(true, TotpState::NoSecret);
 
         assert_eq!(next, TotpState::Fetching);
@@ -2664,6 +2810,41 @@ mod apply_vault_load_result_tests {
         );
     }
 
+    /// Review 15's Minor 3: the re-arm was unconditional inside the
+    /// applied-`Ok` arm, so it also blanked a code that was on screen and
+    /// live. The auto-sync that fires on the window's first frame makes this
+    /// the ordinary case, not a corner: open the window on a TOTP item, the
+    /// code appears, and a second later it flickers to "Fetching..." and
+    /// back while the row's layout shifts under a user reaching for Copy.
+    #[test]
+    fn an_applied_reload_does_not_blank_a_live_code() {
+        let mut items = vec![item("a")];
+        let mut folders = Vec::new();
+        let mut vault_loading = true;
+        let mut selected_id = Some("a".to_string());
+        let mut sync_status = None;
+        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+
+        apply_vault_load_result(
+            1,
+            1,
+            Ok((vec![item("a")], Vec::new())),
+            &mut items,
+            &mut folders,
+            &mut vault_loading,
+            &mut selected_id,
+            &mut sync_status,
+            &mut totp_state,
+        );
+
+        assert_eq!(
+            totp_state,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            "a reload must not replace a displayed code with \"Fetching...\" -- a live Code is \
+             already polling, so there is no latch here for the re-arm to break"
+        );
+    }
+
     /// The reset belongs to a load that was actually *applied*. A superseded
     /// one is dropped whole -- re-arming a poll off it would be state the
     /// newer load is about to determine for itself.
@@ -2716,6 +2897,76 @@ mod apply_vault_load_result_tests {
         );
 
         assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+    }
+}
+
+#[cfg(test)]
+mod poll_success_is_a_recovery_tests {
+    use super::{apply_totp_poll_result, poll_success_is_a_recovery};
+    use crate::vault_window::detail::TotpState;
+
+    #[test]
+    fn a_fetched_code_ends_the_failure_streak() {
+        let mut state = TotpState::Unavailable;
+        let error = apply_totp_poll_result(Ok(Some("123456".to_string())), 12, &mut state);
+        assert!(error.is_none());
+        assert!(poll_success_is_a_recovery(&state));
+    }
+
+    #[test]
+    fn a_backend_reported_absence_is_not_a_recovery() {
+        // Review 15's nit: the outage turned into a 400 rather than going
+        // away, so "TOTP fetch recovered" directly contradicts the warning
+        // logged one line above it about the same poll.
+        let mut state = TotpState::Unavailable;
+        let error = apply_totp_poll_result(Ok(None), 12, &mut state);
+        assert!(error.is_none(), "Ok(None) carries no error -- which is how it reached the log");
+        assert!(!poll_success_is_a_recovery(&state));
+    }
+}
+
+#[cfg(test)]
+mod totp_state_after_reload_tests {
+    use super::totp_state_after_reload;
+    use crate::vault_window::detail::TotpState;
+
+    #[test]
+    fn every_non_code_state_is_re_armed() {
+        // Review 14's Important part b: a landed reload is what un-latches
+        // NoCodeReported (which stops polling) and gives Unavailable a fresh
+        // start; NoSecret/Fetching are already the neutral values.
+        for state in [
+            TotpState::NoSecret,
+            TotpState::Fetching,
+            TotpState::NoCodeReported,
+            TotpState::Unavailable,
+        ] {
+            assert_eq!(totp_state_after_reload(state.clone()), TotpState::NoSecret, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_live_code_survives_a_reload() {
+        // Review 15's Minor 3. `Code` already polls (`totp_state_wants_poll`
+        // is true for it), so there is no latch here for the re-arm to
+        // break -- and blanking it is a visible flicker plus a layout shift
+        // on the window's own first-frame auto-sync.
+        let code = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        assert_eq!(totp_state_after_reload(code.clone()), code);
+    }
+
+    #[test]
+    fn a_surviving_code_is_still_cleared_when_the_seed_is_gone() {
+        // The composed assertion (the lesson from review 13): keeping the
+        // Code across a reload must not resurrect review 9's bug, where a
+        // seed removed on another device left a stale code rendering under a
+        // live countdown. The next frame's presence derivation, run against
+        // the item the reload just delivered, is what clears it.
+        let kept = totp_state_after_reload(TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        });
+        assert_eq!(super::totp_state_for_secret_presence(false, kept), TotpState::NoSecret);
     }
 }
 

@@ -22,9 +22,14 @@ use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 /// TOTP here" and inviting a needless 2FA re-enrolment.
 ///
 /// Computed in exactly one place (`vault_window::mod`'s per-frame TOTP
-/// block) and rendered exhaustively below (`draw_detail_read`'s `match` has
-/// no catch-all arm), so a future variant is a compile error here rather
-/// than a silently-unhandled case.
+/// block). `draw_detail_read` no longer matches on it at all: the exhaustive
+/// match moved into `totp_row_for`, which turns this state into the
+/// `Option<TotpRow>` that is the single decision about whether the One-time
+/// code row exists (review 14's Important). That match has no catch-all
+/// arm, so a future variant is a compile error there rather than a
+/// silently-unhandled case -- and "does this item look like it has no 2FA"
+/// is a question a unit test asks directly instead of one buried in an egui
+/// closure.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TotpState {
     /// This item has no TOTP secret configured -- the row is omitted

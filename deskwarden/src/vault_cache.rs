@@ -45,8 +45,17 @@ pub struct VaultCache {
 /// ("your vault doesn't have any items yet"), and the tray's Sync item
 /// reported a completed sync for a sync that refreshed nothing.
 ///
-/// `#[must_use]` so a caller cannot go back to ignoring the distinction by
-/// writing `let _ = cache.populate();`.
+/// What actually holds the distinction is the exhaustive `match` at every
+/// call site, and nothing else. The `#[must_use]` below is worth keeping but
+/// is NOT the guarantee this comment used to claim (review 15's Minor):
+/// because the enum is returned *inside* a `Result`, both
+/// `let _ = cache.populate();` and `if let Err(_) = cache.populate() {}`
+/// compile with zero warnings -- verified empirically with `rustc`, not
+/// assumed. The one form that does warn, a bare `cache.populate();`, warns
+/// because of `Result`'s own `#[must_use]` and would warn identically
+/// without this attribute. It is kept because it costs nothing and would
+/// start earning its keep the moment any API here returns this enum
+/// unwrapped, not because it enforces anything today.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopulateOutcome {

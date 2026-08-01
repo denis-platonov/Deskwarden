@@ -203,6 +203,18 @@ enum PickerItemsResult {
     /// only `Ok`/`Err` to go on, this landed on `EmptyVault` and told a user
     /// whose vault had just locked that their vault "doesn't have any items
     /// yet" and to go add one.
+    ///
+    /// **Not reachable today, and recorded as such rather than claimed as a
+    /// fix to live misbehaviour** (review 15's Minor 1). Every
+    /// `VaultCache::clear` in the crate runs on the main thread, and both
+    /// this picker's spinner and `vault_window::run` block that thread for
+    /// their whole duration, so no `clear` can interleave with the populate
+    /// below. Even if a leftover detached worker from an abandoned picker
+    /// did produce this, its `rx` is already dropped, so the value never
+    /// reaches the `MessageBoxW` in `pick_vault_item`. The typing is still
+    /// the right call: the planned encrypted disk cache adds exactly the
+    /// background-thread callers that make this reachable, and a future
+    /// session should not credit it as verified-live before then.
     VaultLocked,
 }
 
@@ -245,6 +257,8 @@ fn load_items_for_picker(cache: &VaultCache) -> PickerItemsResult {
         log::warn!("vault cache is not populated; populating it now for the picker");
         match cache.populate() {
             Ok(PopulateOutcome::Populated) => {}
+            // Not reachable from this call site today (every `clear` is on
+            // the blocked main thread) -- see `PickerItemsResult::VaultLocked`.
             Ok(PopulateOutcome::DiscardedStale) => {
                 log::warn!(
                     "the vault was cleared while the picker's populate was in flight; the \
@@ -360,6 +374,8 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             }
             return None;
         }
+        // Unreachable as the app is wired today -- see `VaultLocked`'s own
+        // doc for why, and for why the arm exists anyway.
         PickerItemsResult::VaultLocked => {
             log::warn!("the vault locked while loading items for the picker");
             unsafe {

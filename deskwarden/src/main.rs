@@ -1261,6 +1261,60 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 ///
 /// Takes `cache`, not a separate `vault: &VaultBridge` -- `cache.bridge()` is
 /// that same bridge, so a second parameter would just be another name for it.
+/// Rebuilds both halves of the post-unlock state -- the vault cache and the
+/// match engine -- once the readiness wait has confirmed `bw serve` is
+/// answering with the *new* session.
+///
+/// The two are refreshed INDEPENDENTLY, and that is the whole point.
+/// `cache.populate()` makes two requests (`list_items` then `list_folders`)
+/// and is atomic over both, so a 500 on the folders half -- a failure
+/// `picker_ui::load_items_for_picker`'s doc records as something that
+/// actually happens -- fails the populate even though the vault reads fine.
+/// Tying the engine's refresh to that outcome (as this code did between
+/// 128000c and review 15's Important) meant one transient folders failure
+/// cleared the engine and, with no periodic match-engine refresh left in
+/// this app, disarmed autofill silently for the whole session: nothing
+/// matches, nothing prompts, nothing arms the hotkey, and the app looks
+/// perfectly alive.
+///
+/// The invariant that motivated the coupling -- "an empty cache beside a
+/// populated engine is inconsistent" -- is only true when the ENGINE'S
+/// CONTENTS might belong to a different account. That is the `Dismissed`
+/// arm's situation (no usable backend, nothing re-fetched, the entries are
+/// whatever the pre-lock account left behind), and clearing there is right.
+/// Here the backend has just been restarted and authenticated with the new
+/// session, and `refresh_match_engine` reads the BRIDGE rather than the
+/// cache, so anything it loads is the current account's by construction. An
+/// empty cache paired with a freshly-fetched engine is a pairing this
+/// codebase deliberately supports: `app::fill_from_vault` falls back to the
+/// bridge on a cache miss precisely so a fill still works in it.
+///
+/// So the engine is cleared only when its OWN refresh fails, which is the
+/// case where its entries can only be the pre-lock account's.
+fn repopulate_and_refresh_after_unlock(cache: &VaultCache, engine: &mut MatchEngine) {
+    match cache.populate() {
+        Ok(PopulateOutcome::Populated) => {}
+        Ok(PopulateOutcome::DiscardedStale) => log::warn!(
+            "the vault cache was cleared again while repopulating after unlock; it stays empty"
+        ),
+        Err(e) => log::warn!(
+            "could not repopulate the vault cache after unlock ({e:?}); autofill will fall back \
+             to bw serve per fill until the next successful populate"
+        ),
+    }
+    match refresh_match_engine(cache.bridge(), engine) {
+        Ok(count) => log::info!("match engine refreshed after unlock: {count} app match(es)"),
+        Err(e) => {
+            engine.clear();
+            log::warn!(
+                "match engine refresh after unlock failed ({e:?}); cleared it rather than \
+                 keeping the pre-lock account's app matches, which are the only thing it could \
+                 still be holding"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     cache: &Arc<VaultCache>,
@@ -1442,45 +1496,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         };
         match wait_for_vault_ready_with_spinner(cache.bridge(), schedule, SETUP_MESSAGE) {
             VaultReadyOutcome::Ready(_items) => {
-                // The match engine is only rebuilt when the cache actually
-                // came back (review 14's Minor 4). `refresh_match_engine`
-                // reads the BRIDGE, not the cache, so it happily succeeded
-                // after a failed `populate` and left the app in exactly the
-                // pairing the `Dismissed` arm below calls inconsistent: an
-                // empty cache beside a populated engine, where every matched
-                // process raises a prompt and then logs "cache miss ...
-                // falling back to bw serve" on a fill. Both arms now hold
-                // the same invariant instead of one asserting it and the
-                // other quietly breaking it.
-                match cache.populate() {
-                    Ok(PopulateOutcome::Populated) => match refresh_match_engine(cache.bridge(), engine) {
-                        Ok(count) => {
-                            log::info!("match engine refreshed after unlock: {count} app match(es)")
-                        }
-                        Err(e) => {
-                            engine.clear();
-                            log::warn!(
-                                "match engine refresh after unlock failed ({e:?}); cleared it \
-                                 rather than keeping the pre-lock account's app matches"
-                            );
-                        }
-                    },
-                    Ok(PopulateOutcome::DiscardedStale) => {
-                        engine.clear();
-                        log::warn!(
-                            "the vault cache was cleared again while repopulating after unlock; \
-                             leaving it empty with no app matches until the next unlock"
-                        );
-                    }
-                    Err(e) => {
-                        engine.clear();
-                        log::warn!(
-                            "could not repopulate the vault cache after unlock ({e:?}); app \
-                             matches cleared too, so nothing can prompt to autofill against an \
-                             empty cache until it is unlocked again"
-                        );
-                    }
-                }
+                repopulate_and_refresh_after_unlock(cache, engine);
             }
             VaultReadyOutcome::Dismissed => {
                 // Review 12's Critical: closing this window must not be
@@ -1496,8 +1512,18 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                 // an acceptable trade for a vault that was already locked.
                 //
                 // The engine has to be cleared alongside the cache that
-                // `clear()` emptied further up (review 13's Minor 3). Only
-                // the `Ready` arm above rebuilds it, so without this the app
+                // `clear()` emptied further up (review 13's Minor 3). This
+                // is deliberately NOT what the `Ready` arm does, and the
+                // difference is the backend: here nothing confirmed that
+                // `bw serve` is answering with the new session, so nothing
+                // re-fetched, so the engine can only be holding the PRE-lock
+                // account's matches -- clearing is the only correct answer.
+                // On `Ready` the backend is freshly authenticated and
+                // `refresh_match_engine` re-reads it, so its entries are the
+                // current account's and an empty cache beside them is a
+                // supported pairing (see
+                // `repopulate_and_refresh_after_unlock`). Only the `Ready`
+                // arm rebuilds the engine, so without this the app
                 // sits with an EMPTY cache and the PRE-reauth account's app
                 // matches: a matched process still raises the autofill
                 // prompt, and the fill then misses in the empty cache and
@@ -2318,6 +2344,85 @@ mod tests {
         );
 
         kill_and_reap(&mut bw_serve_child);
+    }
+
+    fn vault_item_with_match(id: &str, process: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{id}","type":1,"fields":[{{"name":"deskwarden:app-match","value":"{{\"process\":\"{process}\",\"trigger\":\"auto\"}}"}}]}}"#
+        )
+    }
+
+    /// Review 15's Important: a transient `list_folders` failure on the
+    /// post-unlock repopulate must NOT disarm autofill for the rest of the
+    /// session. `populate()` fetches items and *then* folders, so a 500 on
+    /// the second request fails the whole populate -- but the match engine
+    /// is rebuilt from the BRIDGE, against a backend that has just been
+    /// restarted with the new session, so its entries are the current
+    /// account's by construction and `fill_from_vault`'s documented bridge
+    /// fallback serves the fill from an empty cache.
+    #[test]
+    fn a_folders_failure_after_unlock_leaves_the_match_engine_armed() {
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":{{"data":[{}]}}}}"#,
+                vault_item_with_match("1", "notepad.exe")
+            ))
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+
+        repopulate_and_refresh_after_unlock(&cache, &mut engine);
+
+        assert!(
+            !cache.is_populated(),
+            "the populate genuinely failed; this test is about what happens *despite* that"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "a transient list_folders failure must not disarm autofill for the whole session -- \
+             there is no periodic match-engine refresh left, so nothing would ever re-arm it"
+        );
+    }
+
+    /// The other half of the same invariant: if the *engine's own* refresh
+    /// fails, its entries can only be the pre-lock account's, and those must
+    /// not survive into a session that may be a different account.
+    #[test]
+    fn a_failed_engine_refresh_after_unlock_clears_the_pre_lock_matches() {
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(500)
+            .with_body("nope")
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[(
+            "old".to_string(),
+            deskwarden::app_match::AppMatch {
+                process: "notepad.exe".into(),
+                trigger: deskwarden::app_match::TriggerMode::Auto,
+            },
+        )]);
+
+        repopulate_and_refresh_after_unlock(&cache, &mut engine);
+
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "matches from the account this app was signed into before the unlock must not \
+             survive a refresh that could not confirm them"
+        );
     }
 
     /// Whether a process with the given id still exists, via `tasklist` --
