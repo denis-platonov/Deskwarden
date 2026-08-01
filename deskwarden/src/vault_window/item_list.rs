@@ -1574,6 +1574,18 @@ mod toolbar_strip_tests {
         search: &mut String,
         before_frame: impl FnOnce(&egui::Context),
     ) -> (egui::FullOutput, egui::Context) {
+        run_item_list_with_events(items, search, before_frame, Vec::new())
+    }
+
+    /// [`run_item_list`], with `events` delivered to the MEASURED frame --
+    /// how the Esc hint's click and the Escape key are driven without
+    /// reaching into egui's private input state.
+    fn run_item_list_with_events(
+        items: &[VaultItem],
+        search: &mut String,
+        before_frame: impl FnOnce(&egui::Context),
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, egui::Context) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1591,8 +1603,8 @@ mod toolbar_strip_tests {
         let mut selected = None;
         let icons = IconCache::default();
         let mut visible = Vec::new();
-        let mut draw = |ctx: &egui::Context, search: &mut String| {
-            ctx.run_ui(input(), |ui| {
+        let mut draw = |ctx: &egui::Context, search: &mut String, raw: egui::RawInput| {
+            ctx.run_ui(raw, |ui| {
                 draw_item_list(
                     ui,
                     items,
@@ -1604,9 +1616,11 @@ mod toolbar_strip_tests {
                 );
             })
         };
-        let _ = draw(&ctx, search);
+        let _ = draw(&ctx, search, input());
         before_frame(&ctx);
-        let output = draw(&ctx, search);
+        let mut raw = input();
+        raw.events = events;
+        let output = draw(&ctx, search, raw);
         (output, ctx)
     }
 
@@ -1749,6 +1763,171 @@ mod toolbar_strip_tests {
             "Ctrl+K's `request_focus(Id::new(\"vault-search\"))` no longer lands on the search \
              field -- the id was renamed, or it is no longer the TextEdit's own id"
         );
+    }
+
+    /// A left click at `pos`: the move, the press and the release, which is
+    /// the whole sequence egui needs to report `clicked()`.
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    fn escape_key() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }]
+    }
+
+    #[test]
+    fn the_shortcut_slot_shows_ctrl_k_while_empty_and_esc_once_something_is_typed() {
+        // THE REPORT: the search field's `CTRL+K` hint should become an "Esc"
+        // that clears the field, in the same slot, once there is anything to
+        // clear. Both directions asserted, so neither "absent" claim can pass
+        // against a field that renders no hint at all.
+        let items = [an_item("Ledgerline")];
+
+        let mut empty = String::new();
+        let (output, _) = run_item_list(&items, &mut empty, |_| {});
+        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "CTRL+K"), "painted: {texts:?}");
+        assert!(!texts.iter().any(|t| t == "Esc"), "painted: {texts:?}");
+
+        let mut typed = "ledger".to_string();
+        let (output, _) = run_item_list(&items, &mut typed, |_| {});
+        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "Esc"), "painted: {texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "CTRL+K"),
+            "the focus shortcut and the clear affordance share ONE slot; both are showing: \
+             {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_esc_hint_lands_in_exactly_the_slot_ctrl_k_occupied() {
+        // "Same slot, no layout shift". The two strings are different widths,
+        // so the slot is sized to the WIDER of them and both are right-aligned
+        // in it -- the right edge and the vertical centre are asserted equal
+        // to the pt, absolutely, between the two states.
+        let items = [an_item("Ledgerline")];
+        let mut empty = String::new();
+        let (a, _) = run_item_list(&items, &mut empty, |_| {});
+        let ctrl_k = painted(&a).into_iter().find(|(t, _)| t == "CTRL+K").expect("CTRL+K").1;
+
+        let mut typed = "ledger".to_string();
+        let (b, _) = run_item_list(&items, &mut typed, |_| {});
+        let esc = painted(&b).into_iter().find(|(t, _)| t == "Esc").expect("Esc").1;
+
+        assert!(
+            (ctrl_k.right() - esc.right()).abs() < 0.01,
+            "the hint's right edge moved from x={} to x={} when the field filled",
+            ctrl_k.right(),
+            esc.right()
+        );
+        assert!(
+            (ctrl_k.center().y - esc.center().y).abs() < 0.01,
+            "the hint's baseline moved from y={} to y={}",
+            ctrl_k.center().y,
+            esc.center().y
+        );
+    }
+
+    #[test]
+    fn clicking_the_esc_hint_clears_the_search() {
+        let items = [an_item("Ledgerline")];
+        // Where the hint is, measured from a first run rather than guessed.
+        let mut probe = "ledger".to_string();
+        let (output, _) = run_item_list(&items, &mut probe, |_| {});
+        let esc = painted(&output).into_iter().find(|(t, _)| t == "Esc").expect("Esc").1;
+
+        let mut search = "ledger".to_string();
+        let (_, _) = run_item_list_with_events(&items, &mut search, |_| {}, click_at(esc.center()));
+        assert_eq!(search, "", "clicking the Esc hint must clear the search field");
+    }
+
+    #[test]
+    fn clicking_where_the_hint_is_does_not_clear_anything_while_it_reads_ctrl_k() {
+        // The positive control's mirror: the slot is only an affordance when
+        // there is something to clear, so a click in the same place with an
+        // empty field must not be wired to anything. Without this, "the click
+        // cleared it" could just be "any click anywhere clears it".
+        let items = [an_item("Ledgerline")];
+        let mut probe = String::new();
+        let (output, _) = run_item_list(&items, &mut probe, |_| {});
+        let slot = painted(&output).into_iter().find(|(t, _)| t == "CTRL+K").expect("CTRL+K").1;
+
+        // Same click, but the field starts empty and the caller then types --
+        // i.e. the click must not have consumed or armed anything.
+        let mut search = String::new();
+        let (_, ctx) = run_item_list_with_events(&items, &mut search, |_| {}, click_at(slot.center()));
+        assert_eq!(search, "");
+        let _ = ctx;
+    }
+
+    #[test]
+    fn escape_clears_the_search_while_the_field_has_focus() {
+        let items = [an_item("Ledgerline")];
+        let mut search = "ledger".to_string();
+        let id = egui::Id::new("vault-search");
+        let (_, _) = run_item_list_with_events(
+            &items,
+            &mut search,
+            |ctx| ctx.memory_mut(|m| m.request_focus(id)),
+            escape_key(),
+        );
+        assert_eq!(search, "", "Escape must clear the search field while it has focus");
+    }
+
+    #[test]
+    fn escape_is_ignored_when_the_search_field_never_had_focus() {
+        // WHY THIS MATTERS BEYOND THE FIELD. Escape is already bound in this
+        // window: `folder_modal::draw_folder_edit_modal` cancels on it, and it
+        // runs LATER in the frame than this function does. The field's Escape
+        // is therefore gated on the field's own focus, and reads the key
+        // without consuming it, so the modal's binding can never be swallowed.
+        let items = [an_item("Ledgerline")];
+        let mut search = "ledger".to_string();
+        let (_, _) = run_item_list_with_events(&items, &mut search, |_| {}, escape_key());
+        assert_eq!(
+            search, "ledger",
+            "Escape cleared the search field without it ever having focus -- the folder modal's \
+             own Escape binding runs later in the frame and would be shadowed"
+        );
+    }
+
+    #[test]
+    fn escape_on_an_empty_focused_field_is_left_alone_too() {
+        // The other half of the gate: nothing to clear, nothing to claim.
+        let items = [an_item("Ledgerline")];
+        let mut search = String::new();
+        let id = egui::Id::new("vault-search");
+        let (output, _) = run_item_list_with_events(
+            &items,
+            &mut search,
+            |ctx| ctx.memory_mut(|m| m.request_focus(id)),
+            escape_key(),
+        );
+        assert_eq!(search, "");
+        // ...and the slot is still the focus shortcut, not a clear button.
+        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
+        assert!(texts.iter().any(|t| t == "CTRL+K"), "painted: {texts:?}");
     }
 
     #[test]

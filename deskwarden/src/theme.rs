@@ -1180,12 +1180,40 @@ fn paint_magnifier(painter: &egui::Painter, rect: Rect, color: Color32) {
     );
 }
 
+/// The label the shortcut slot takes over once there is something to clear.
+const SEARCH_CLEAR_HINT: &str = "Esc";
+
 /// Design 2b's search box: a full-width bordered field with the magnifier on
 /// the left and a keyboard-shortcut hint on the right.
 ///
-/// `hint` is shown while the field is empty (the mock's "Search 180 logins"),
-/// `shortcut` is always shown (its "CTRL+K"). `id` is the caller's, because
-/// the vault window focuses this field from outside it.
+/// `hint` is shown while the field is empty (the mock's "Search 180 logins").
+/// `id` is the caller's, because the vault window focuses this field from
+/// outside it.
+///
+/// THE RIGHT-HAND SLOT HAS TWO STATES, and `value` may be CLEARED here:
+///
+/// * empty field -- `shortcut` (the mock's "CTRL+K"), inert, the way to get
+///   INTO the field;
+/// * non-empty field -- a clickable "Esc", the way to get out of it, which
+///   clears `value`. Pressing the Escape KEY does the same while the field
+///   has focus.
+///
+/// The slot is sized to the WIDER of the two labels and both are right-
+/// aligned in it, so the box's text area does not resize as the user types
+/// the first character.
+///
+/// ESCAPE IS READ, NOT CONSUMED, and only acts when the field both has focus
+/// and has something in it. That is deliberate and the vault window depends
+/// on it: `vault_window::folder_modal` cancels on Escape too, and it runs
+/// LATER in the frame than the item list does, so consuming the key here
+/// would silently shadow the modal's own binding on any frame where both
+/// were live.
+///
+/// Focus is checked with `lost_focus()`, not `has_focus()`: egui clears a
+/// `TextEdit`'s focus on Escape in `Memory::begin_pass`, i.e. BEFORE this
+/// function runs, so on the very frame the key arrives the field no longer
+/// reports having it. Escape therefore also drops focus, exactly as it does
+/// everywhere else in egui; clearing the text is the added behaviour.
 ///
 /// Full width, not the fixed 300px of design **3f**: 3f is the macOS vault
 /// window, whose search sits in a unified toolbar; 2b -- the window this crate
@@ -1221,19 +1249,42 @@ pub fn search_field(
     );
     paint_magnifier(ui.painter(), icon_rect, TEXT_GHOST);
 
-    let shortcut_galley = ui.painter().layout_no_wrap(
-        shortcut.to_string(),
-        FontId::new(10.0, FontFamily::Monospace),
-        TEXT_GHOST,
+    // The slot is as wide as the WIDER of the two labels, whichever is
+    // currently showing, so the text area either side of it never resizes.
+    let slot_font = FontId::new(10.0, FontFamily::Monospace);
+    let lay = |text: &str| ui.painter().layout_no_wrap(text.to_string(), slot_font.clone(), TEXT_GHOST);
+    let clearable = !value.is_empty();
+    let label = lay(if clearable { SEARCH_CLEAR_HINT } else { shortcut });
+    let shortcut_width = lay(shortcut).size().x.max(lay(SEARCH_CLEAR_HINT).size().x);
+
+    // The whole slot is the click target, not just the glyphs: a 3-character
+    // run of 10px monospace is a ~17pt target, which is below anything
+    // comfortably clickable. Interacting with an explicit rect rather than
+    // allocating one keeps this out of the layout, the same reason
+    // `pencil_glyph_at` does it -- the field's own box is already allocated.
+    let slot = Rect::from_min_max(
+        Pos2::new(outer.max.x - PAD_X - shortcut_width, outer.min.y),
+        Pos2::new(outer.max.x - PAD_X, outer.max.y),
     );
-    let shortcut_width = shortcut_galley.size().x;
+    let mut clear = false;
+    let slot_color = if clearable {
+        let hit = ui.interact(slot, id.with("clear"), Sense::click());
+        if hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        clear |= hit.clicked();
+        // Darkened on hover, the affordance `pencil_glyph_at` already uses.
+        if hit.hovered() { INK } else { TEXT_GHOST }
+    } else {
+        TEXT_GHOST
+    };
     ui.painter().galley(
         Pos2::new(
-            outer.max.x - PAD_X - shortcut_width,
-            outer.center().y - shortcut_galley.size().y / 2.0,
+            outer.max.x - PAD_X - label.size().x,
+            outer.center().y - label.size().y / 2.0,
         ),
-        shortcut_galley,
-        TEXT_GHOST,
+        label,
+        slot_color,
     );
 
     // The text row sits between the icon and the shortcut, centred on the
@@ -1260,6 +1311,20 @@ pub fn search_field(
             .margin(Margin::ZERO)
             .desired_width(inner.width()),
     );
+
+    // See this function's doc: `lost_focus`, because egui has already cleared
+    // the field's focus by the time we get here on an Escape frame; and
+    // `key_pressed`, which READS the event without consuming it, so the
+    // folder modal's own Escape binding further down the frame still sees it.
+    if clearable && response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        clear = true;
+    }
+    if clear {
+        value.clear();
+        // The text and this slot's label were both laid out earlier in this
+        // frame, so the cleared state first paints on the next one.
+        ui.ctx().request_repaint();
+    }
 
     let rounding = CornerRadius::same(8);
     let border = if response.has_focus() {
