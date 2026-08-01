@@ -658,6 +658,11 @@ fn main() {
                     spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
                 }
 
+                // The vault session this "Add app..." belongs to, captured
+                // before the first of its two windows opens -- review 25's
+                // Minor 3. The rebuild below is the only consumer; see there
+                // for why an era rather than a bare "is it populated?".
+                let add_app_era = cache.epoch().era();
                 if let Some(item) = picker_ui::pick_vault_item(&cache) {
                     log::info!("adding an app match to vault item {}", item.id);
                     match picker_ui::run_picker(cache.clone(), item, last_active_pid, backend_already_running) {
@@ -691,7 +696,19 @@ fn main() {
                             // every `clear` runs on, and this is a place where
                             // "populated" and "the items" must be the same
                             // observation.
-                            if let Some(items) = cache.items_if_populated() {
+                            //
+                            // AND ONE DOOR, not two (review 25's Minor 3).
+                            // This was `items_if_populated()`, which is
+                            // `items_unless_superseded` minus the era check;
+                            // the era `add_app_era` supplies is not ceremony
+                            // here, because the two windows this flow opens
+                            // are a long user interaction and a `clear` --
+                            // the vault locking, or a re-auth into a possibly
+                            // different ACCOUNT -- can land inside it. Arming
+                            // the engine from whatever snapshot happens to
+                            // exist afterwards would be arming it from a
+                            // vault the user did not just edit.
+                            if let Some(items) = cache.items_unless_superseded(add_app_era) {
                                 let entries = match_entries(&items);
                                 log::info!(
                                     "match engine refreshed: {} app match(es)",
@@ -699,19 +716,22 @@ fn main() {
                                 );
                                 engine.rebuild(&entries);
                             } else {
-                                // Not reachable from here today --
-                                // `pick_vault_item` populates the cache and
-                                // returns nothing to pick if that fails, so a
-                                // save implies a populated snapshot -- and
-                                // checked rather than assumed, because
-                                // rebuilding from an empty snapshot would
+                                // Not reachable from here today -- every
+                                // `clear` runs on this thread, which is
+                                // blocked inside the two picker windows for
+                                // the whole flow, and `pick_vault_item`
+                                // populates the cache and returns nothing to
+                                // pick if that fails -- and checked rather
+                                // than assumed, because rebuilding from an
+                                // empty or another account's snapshot would
                                 // DISARM autofill instead of merely failing to
                                 // arm the new match.
                                 log::warn!(
-                                    "an app match was saved against an unpopulated vault cache; \
-                                     leaving the match engine as it is rather than rebuilding it \
-                                     from an empty snapshot. The match goes live at the next sync \
-                                     or unlock"
+                                    "an app match was saved against a vault cache that is no \
+                                     longer the session it was saved in (unpopulated, or cleared \
+                                     and refilled meanwhile); leaving the match engine as it is \
+                                     rather than rebuilding it from the wrong snapshot. The match \
+                                     goes live at the next sync or unlock"
                                 );
                             }
                         }

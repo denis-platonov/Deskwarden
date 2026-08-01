@@ -154,6 +154,30 @@ fn record_write(log: &mut Vec<PendingWrite>, seq: u64, id: &str, deleted: bool) 
 /// and that loss is permanent rather than self-healing. Distinguishing the two
 /// needs a server-side revision the bridge does not expose. A transient extra
 /// row that heals itself beats a silently discarded write.
+/// Names the replayed ids for the replay log line, **keeping item ids and
+/// folder ids apart** -- review 25's Minor 5.
+///
+/// They were previously concatenated into one `Vec<String>` under the words
+/// "local write(s)", which is two different id spaces rendered
+/// indistinguishably: reading that line, nothing said whether `abc` was an
+/// item the user had edited or a folder they had renamed, and the two are
+/// looked up through different endpoints. The count stays a single total,
+/// because what it measures -- how much this populate could not have fetched
+/// -- genuinely is one number.
+///
+/// Pure and separate from the `log::info!` so the wording is testable without
+/// a logger, and so it can be called after the snapshot lock is released.
+fn replayed_summary(items: &[String], folders: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !items.is_empty() {
+        parts.push(format!("item(s) {}", items.join(", ")));
+    }
+    if !folders.is_empty() {
+        parts.push(format!("folder(s) {}", folders.join(", ")));
+    }
+    parts.join("; ")
+}
+
 fn replay_writes<T: Clone>(
     fetched: &mut Vec<T>,
     current: &[T],
@@ -173,11 +197,37 @@ fn replay_writes<T: Clone>(
             }
         } else {
             // Recorded as written but no longer in the snapshot, without a
-            // delete having replaced the entry. Not reachable -- every write
-            // below records only what it actually applied, and a delete
-            // replaces the id's entry (see `record_write`) -- and skipped
-            // rather than unwrapped, because the cost of being wrong is a
-            // panic on the UI thread.
+            // delete having replaced the entry.
+            //
+            // THIS ARM IS REACHABLE, and the claim that it was not is review
+            // 25's Important (it was true only while a populate also pruned
+            // the log, which review 23 had to delete). Nothing about the
+            // moment of WRITING can rule it out, because what puts the
+            // snapshot into this state happens afterwards and to somebody
+            // else's id: a populate whose own fetch legitimately does not
+            // contain the id -- our PUT raced a remote delete -- assigns
+            // `snapshot.items = items` and the id leaves the snapshot, while
+            // the entry stays (the entry is retired per-populate, by
+            // `seq > since`, and never deleted for the others). An OLDER
+            // in-flight populate, whose mark predates the write, then arrives
+            // here and finds the entry live and the snapshot empty of it.
+            // `a_populate_whose_fetch_dropped_a_written_id_the_snapshot_no_longer_has_skips_it`
+            // walks exactly that, deterministically.
+            //
+            // SKIPPING IS THE CORRECT ANSWER, not a defensive guess. The
+            // entry says "the snapshot holds newer truth for this id than
+            // your fetch does"; the snapshot no longer holds anything for it,
+            // so there is nothing newer to re-apply and the id is correctly
+            // absent from `replayed`. A fetch taken before the id was dropped
+            // has nothing to say about the drop either way, so whatever this
+            // fetch carries for the id is left exactly as fetched -- which is
+            // the recorded fetch-vs-fetch staleness deferral (an older
+            // populate's items can lag a newer one's until the next populate),
+            // not a fresh loss.
+            //
+            // Still `continue` rather than `unwrap`/`unreachable!`: this runs
+            // under the snapshot lock on whatever thread a populate landed on,
+            // including the UI thread.
             continue;
         }
         replayed.push(write.id.clone());
@@ -353,12 +403,29 @@ impl VaultCache {
     /// splitting them is what let them drift apart. Both facts are read under
     /// a single lock, so no `clear` can land between the check and the read.
     ///
-    /// `None` also covers an unpopulated snapshot in the same era. That is
-    /// unreachable today -- `clear` is the only thing that unpopulates and it
-    /// begins a new era -- but this function's job is to hand back a vault, and
-    /// an empty unpopulated snapshot is not one (see [`PopulateOutcome`]);
-    /// deriving that fact from the era instead of checking it is exactly the
-    /// inference this whole type exists to stop people making.
+    /// `None` also covers an unpopulated snapshot in the same era, and that
+    /// half is LOAD-BEARING, not defensive (it was documented as unreachable
+    /// until review 25's Minor 3). `era` is a `u64` starting at zero and
+    /// `clear` is what advances it, so the snapshot a process starts with --
+    /// never populated, era 0 -- compares EQUAL to an era captured before the
+    /// first populate. That is exactly the state `picker_ui`'s
+    /// `load_items_for_picker` asks about on every "Add app..." click, and
+    /// reading the era as a proxy for "so it is populated" would hand it an
+    /// empty `Vec` as though it were the vault. This function's job is to hand
+    /// back a vault, and an empty unpopulated snapshot is not one (see
+    /// [`PopulateOutcome`]).
+    ///
+    /// **The one door for "give me the vault, if it is still mine".** There
+    /// was briefly a second, `items_if_populated()`, which was this minus the
+    /// era check, for callers that did not happen to have an era in hand;
+    /// review 25's Minor 3 retired it rather than let the file answer one
+    /// question two ways. Both of its callers turned out to have a real era
+    /// available -- the picker's is the moment of the user's click, `main`'s
+    /// is the moment "Add app..." was chosen -- and in both the era catches a
+    /// `clear` that the populated flag alone does not: a cleared-and-refilled
+    /// cache is populated, and belongs to a different vault session, possibly
+    /// a different account. [`Self::items`] remains as the unchecked read for
+    /// callers that have already established both facts some other way.
     pub fn items_unless_superseded(&self, era: VaultEra) -> Option<Vec<VaultItem>> {
         let snapshot = self.lock();
         if snapshot.epoch().era() != era || !snapshot.populated {
@@ -409,14 +476,37 @@ impl VaultCache {
     /// minted by a `begin_fetch()` that the caller must hand back -- and did
     /// NOT do it, because it does not actually close the hole: nothing stops a
     /// caller calling `begin_fetch()` after its own `list_items`, so it is a
-    /// rename of [`Self::epoch`] with a better-placed doc, and it would ripple
-    /// into `picker_ui`'s call sites for that. The shape that WOULD close it is
-    /// inverting control -- `populate_from(|| bridge.list_items())`, with the
-    /// mark captured inside, before the closure runs -- and that is in direct
-    /// conflict with why this function exists at all: startup and sync pass in
-    /// items from a fetch THAT HAS ALREADY SUCCEEDED, deliberately, so that a
-    /// later transient failure cannot disarm the engine (review 16's
-    /// Important). Re-fetching inside would reintroduce it. So the invariant
+    /// rename of [`Self::epoch`] with a better-placed doc.
+    ///
+    /// **It then recorded that the hole "cannot be enforced without
+    /// re-fetching", and that is WRONG** -- review 25's finding, corrected
+    /// here so nobody re-derives it. The claim only rules out inverting
+    /// control (`populate_from(|| bridge.list_items())`, mark captured
+    /// inside), which really is in direct conflict with why this function
+    /// exists: startup and sync pass in items from a fetch THAT HAS ALREADY
+    /// SUCCEEDED, deliberately, so a later transient failure cannot disarm the
+    /// engine (review 16's Important). The third shape enforces it while
+    /// re-fetching nothing:
+    ///
+    /// ```text
+    /// pub struct Fetched { items: Vec<VaultItem>, epoch: VaultEpoch } // no public constructor
+    /// fn fetch_items(&self) -> Result<Fetched, VaultError>            // stamps BEFORE the request
+    /// fn populate_with(&self, f: Fetched) -> Result<PopulateOutcome, VaultError>
+    /// ```
+    ///
+    /// A late capture becomes unrepresentable because there is no other way to
+    /// build a `Fetched`, and review 16's requirement is preserved exactly: by
+    /// the time `populate_with` is entered the items fetch has already
+    /// succeeded, and the caller can still hold `f.items` to arm the engine
+    /// from if the folders fetch inside later fails. [`Self::populate`] is
+    /// already this shape internally; it just is not extractable by callers.
+    ///
+    /// WHY IT IS DEFERRED RATHER THAN DONE, which is the part nobody had
+    /// named: startup and unlock do not get their items from this cache at
+    /// all. They come from `bw_serve::wait_for_vault_ready`'s readiness probe,
+    /// which would have to carry the stamp -- taking a `&VaultCache`, or a
+    /// `|| cache.fetch_items()` closure -- so the change reaches `bw_serve.rs`
+    /// and the startup path and is a task of its own. Until then the invariant
     /// stays a documented one, stated here rather than inferred.
     pub fn populate_with(
         &self,
@@ -486,37 +576,33 @@ impl VaultCache {
         let mut folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
         if snapshot.epoch().era() != epoch.era() {
+            let now = snapshot.epoch().era();
+            // Logged after the guard is dropped, for the reason given at the
+            // replay log line below: `log::info!` is file I/O.
+            drop(snapshot);
             log::info!(
                 "discarding a vault populate that finished after the cache was cleared \
                  (era {} -> {}); the snapshot stays empty",
                 epoch.era(),
-                snapshot.epoch().era()
+                now
             );
             return Ok(PopulateOutcome::DiscardedStale);
         }
 
-        let mut replayed = replay_writes(
+        let replayed_items = replay_writes(
             &mut items,
             &snapshot.items,
             &snapshot.pending_items,
             epoch.writes,
             |i| &i.id,
         );
-        replayed.extend(replay_writes(
+        let replayed_folders = replay_writes(
             &mut folders,
             &snapshot.folders,
             &snapshot.pending_folders,
             epoch.writes,
             |f| &f.id,
-        ));
-        if !replayed.is_empty() {
-            log::info!(
-                "a vault populate finished after {} local write(s) it could not have fetched \
-                 ({}); re-applying them over it so the newer local truth survives",
-                replayed.len(),
-                replayed.join(", ")
-            );
-        }
+        );
 
         snapshot.items = items;
         snapshot.folders = folders;
@@ -540,6 +626,23 @@ impl VaultCache {
         // they live: `seq > since` retires every entry a given populate's own
         // fetch covered *for that populate*, without deleting it for anyone
         // else.
+        drop(snapshot);
+
+        // OUTSIDE THE LOCK, deliberately -- review 25's Minor 4. Building
+        // this line clones every replayed id and joins them into one string,
+        // and `log::info!` then does file I/O; none of that is work the
+        // snapshot has to be held for, and every read in the app (autofill
+        // included) blocks behind this mutex. It used to be a single `usize`,
+        // which is how it went unnoticed; with the prune gone the replay set
+        // is bounded only by the distinct ids written since the last `clear`.
+        if !replayed_items.is_empty() || !replayed_folders.is_empty() {
+            log::info!(
+                "a vault populate finished after {} local write(s) it could not have fetched \
+                 ({}); re-applying them over it so the newer local truth survives",
+                replayed_items.len() + replayed_folders.len(),
+                replayed_summary(&replayed_items, &replayed_folders)
+            );
+        }
         Ok(PopulateOutcome::Populated)
     }
 
@@ -549,29 +652,6 @@ impl VaultCache {
 
     pub fn items(&self) -> Vec<VaultItem> {
         self.lock().items.clone()
-    }
-
-    /// The items, but only if the snapshot is a real populated vault --
-    /// `None` for an empty snapshot that merely has not been filled yet.
-    ///
-    /// The one-lock door for "rebuild something from the whole vault", which
-    /// is a question that must never be answered from an unpopulated snapshot:
-    /// rebuilding the match engine from an empty `items()` DISARMS autofill
-    /// rather than merely failing to arm whatever was just saved, and that is
-    /// indistinguishable at the call site from a vault with no matches in it.
-    ///
-    /// It exists because the alternative spelling -- `is_populated()` and then
-    /// `items()` -- takes the lock twice, and a `clear` landing between them
-    /// yields exactly the empty-but-"populated" pair the check was there to
-    /// rule out. Today every `clear` is on the main thread and so is the one
-    /// caller, so the two-lock version was sound; it was sound by an argument
-    /// about thread affinity rather than by construction, and that argument is
-    /// the kind this file has already had to relearn once (review 18's third
-    /// finding, and [`Self::items_unless_superseded`], which is this same door
-    /// for the "may I still act on what I saw?" question).
-    pub fn items_if_populated(&self) -> Option<Vec<VaultItem>> {
-        let snapshot = self.lock();
-        snapshot.populated.then(|| snapshot.items.clone())
     }
 
     pub fn folders(&self) -> Vec<Folder> {
@@ -1321,24 +1401,37 @@ mod tests {
     }
 
     #[test]
-    fn items_if_populated_refuses_an_unfilled_snapshot_and_a_cleared_one() {
-        // The one-lock door the "Add app..." save's engine rebuild goes
-        // through. An empty `Vec` and "there is no vault here" must not be
-        // the same answer: rebuilding the match engine from the first DISARMS
-        // autofill for the session.
+    fn items_unless_superseded_refuses_an_unfilled_snapshot_in_its_own_era() {
+        // THE HALF THAT IS NOT ABOUT ERAS AT ALL, and that review 25's Minor 3
+        // made load-bearing when `items_if_populated` was retired into this
+        // function. A brand-new process has era 0 and `populated == false`, so
+        // an era captured before the first populate compares EQUAL -- the era
+        // check alone says "still yours" and would hand back an empty `Vec` as
+        // though it were the vault. Both the picker's "Add app..." click and
+        // `main`'s engine rebuild ask exactly here, and rebuilding the match
+        // engine from an empty snapshot DISARMS autofill rather than merely
+        // failing to arm whatever was just saved.
         let server = populating_server_with_a_writable_item();
         let cache = cache_for(server.url());
+        let era_before_any_populate = cache.epoch().era();
         assert!(
-            cache.items_if_populated().is_none(),
-            "a snapshot that has never been filled is not a vault"
+            cache.items_unless_superseded(era_before_any_populate).is_none(),
+            "a snapshot that has never been filled is not a vault, however current its era"
         );
 
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
-        assert_eq!(cache.items_if_populated().unwrap().len(), 2);
+        assert_eq!(
+            cache
+                .items_unless_superseded(era_before_any_populate)
+                .unwrap()
+                .len(),
+            2,
+            "a populate does not begin a new era, so the same era must now yield the vault"
+        );
 
         cache.clear();
         assert!(
-            cache.items_if_populated().is_none(),
+            cache.items_unless_superseded(era_before_any_populate).is_none(),
             "a cleared snapshot is not a vault either"
         );
     }
@@ -1417,6 +1510,91 @@ mod tests {
     }
 
     #[test]
+    fn a_populate_whose_fetch_dropped_a_written_id_the_snapshot_no_longer_has_skips_it() {
+        // REVIEW 25'S IMPORTANT: the `else { continue }` arm of
+        // `replay_writes`, which called itself unreachable, and which review
+        // 23's deletion of the prune made reachable. This test IS the claim
+        // now made at that arm, so the claim is checked rather than asserted.
+        //
+        // The trace, deterministic and with no threads:
+        //  1. Populate. B takes the older mark and a fetch that still holds
+        //     item 1.
+        //  2. The user edits item 1 locally -> a live pending entry for it,
+        //     and the snapshot holds it.
+        //  3. Item 1 is deleted from ANOTHER client. Populate P, marked after
+        //     the write, lands with a fetch that legitimately lacks item 1.
+        //     Nothing is replayed (P's own fetch is newer than the write), so
+        //     `snapshot.items = items` drops item 1 -- and the pending entry
+        //     SURVIVES, because a populate no longer prunes on its own
+        //     authority (review 23's Critical).
+        //  4. B finally lands. Its mark predates the write, so the entry is
+        //     replayed; it is not a delete; and the snapshot has no item 1 to
+        //     copy. That is the arm.
+        let server = populating_server_with_a_writable_item();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        // (1) B: mark and fetch, both before the write.
+        let mark_b = cache.epoch();
+        let fetched_b = cache.bridge().list_items().unwrap();
+        assert!(
+            fetched_b.iter().any(|i| i.id == "1"),
+            "B's fetch must predate the delete"
+        );
+
+        // (2) the local edit.
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache.set_app_match(&item, &an_app_match()).unwrap();
+
+        // (3) P: marked after the write, fetching a vault the remote delete
+        // has already been applied to. (The mock always replays the same
+        // body, so the post-delete fetch is built here rather than requested.)
+        let mark_p = cache.epoch();
+        let fetched_p: Vec<VaultItem> = cache
+            .bridge()
+            .list_items()
+            .unwrap()
+            .into_iter()
+            .filter(|i| i.id != "1")
+            .collect();
+        assert_eq!(
+            cache.populate_with(fetched_p, mark_p).unwrap(),
+            PopulateOutcome::Populated
+        );
+        let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            vec!["2".to_string()],
+            "P's own fetch is newer than the write, so it must be adopted as it stands -- \
+             this is what takes item 1 out of the snapshot while its pending entry lives on"
+        );
+
+        // (4) B lands into exactly the state the arm describes.
+        assert_eq!(
+            cache.populate_with(fetched_b, mark_b).unwrap(),
+            PopulateOutcome::Populated,
+            "the arm must skip the entry, not fail the populate"
+        );
+
+        let after = cache.items();
+        let one = after
+            .iter()
+            .find(|i| i.id == "1")
+            .expect("B's own fetch carries item 1, and the arm must leave it exactly as fetched");
+        assert!(
+            !has_app_match(one),
+            "the arm re-applied a local write the snapshot no longer holds -- there is nothing \
+             newer to re-apply, and copying from a snapshot that dropped the id is not \
+             something this arm can do"
+        );
+        assert_eq!(after.len(), 2);
+        // What is left behind is the RECORDED fetch-vs-fetch staleness
+        // deferral -- B's pre-delete fetch keeps item 1 in the snapshot until
+        // the next populate -- and not a lost write. Asserted so a future
+        // reader does not mistake it for a defect this test failed to catch.
+    }
+
+    #[test]
     fn a_populate_whose_own_fetch_already_covers_a_write_replaces_it_wholesale() {
         // THE MIRROR, and the reason the write position is a sequence rather
         // than a "has anything been written?" flag. Once a fetch has been
@@ -1460,6 +1638,21 @@ mod tests {
             "the fetched item must be adopted as it stands"
         );
         assert_eq!(cache.items().len(), 2);
+    }
+
+    #[test]
+    fn the_replay_log_line_says_which_ids_are_items_and_which_are_folders() {
+        // Review 25's Minor 5. The two id spaces were concatenated under the
+        // words "local write(s)", so the line could not be read without
+        // guessing which endpoint each id belonged to.
+        assert_eq!(
+            replayed_summary(&["a".to_string(), "b".to_string()], &["f1".to_string()]),
+            "item(s) a, b; folder(s) f1"
+        );
+        // ...and neither half is mentioned when it contributed nothing, so a
+        // pure-item replay does not read as though a folder was touched.
+        assert_eq!(replayed_summary(&["a".to_string()], &[]), "item(s) a");
+        assert_eq!(replayed_summary(&[], &["f1".to_string()]), "folder(s) f1");
     }
 
     #[test]

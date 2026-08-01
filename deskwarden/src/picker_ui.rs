@@ -4,7 +4,7 @@ use crate::icon;
 use crate::loading_ui;
 use crate::theme;
 use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
-use crate::vault_cache::{PopulateOutcome, VaultCache};
+use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra};
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
@@ -221,13 +221,21 @@ enum PickerItemsResult {
     /// fix to live misbehaviour** (review 15's Minor 1). Every
     /// `VaultCache::clear` in the crate runs on the main thread, and both
     /// this picker's spinner and `vault_window::run` block that thread for
-    /// their whole duration, so no `clear` can interleave with the populate
-    /// below. Even if a leftover detached worker from an abandoned picker
-    /// did produce this, its `rx` is already dropped, so the value never
-    /// reaches the `MessageBoxW` in `pick_vault_item`. The typing is still
-    /// the right call: the planned encrypted disk cache adds exactly the
-    /// background-thread callers that make this reachable, and a future
+    /// their whole duration, so no `clear` can interleave with the picker's
+    /// worker at all. Even if a leftover detached worker from an abandoned
+    /// picker did produce this, its `rx` is already dropped, so the value
+    /// never reaches the `MessageBoxW` in `pick_vault_item`. The typing is
+    /// still the right call: the planned encrypted disk cache adds exactly
+    /// the background-thread callers that make this reachable, and a future
     /// session should not credit it as verified-live before then.
+    ///
+    /// Since review 25's Minor 2 it is reported for THREE distinct ways the
+    /// era can move, not one, and `load_items_for_picker` names each at its
+    /// site: the populate itself coming back `DiscardedStale`; a `clear`
+    /// after the click that makes the pre-populate read miss; and a `clear`
+    /// after the click that a *successful* populate then refills for a later
+    /// session. The last two are the ones the old two-lock spelling reported
+    /// as `EmptyVault`.
     VaultLocked,
 }
 
@@ -265,31 +273,69 @@ fn can_pick_next(selected_id: &Option<String>) -> bool {
 /// `pick_vault_item`), not the calling thread, so a slow or hung populate no
 /// longer blocks the app before any window has even appeared (review 10's
 /// Minor 4).
-fn load_items_for_picker(cache: &VaultCache) -> PickerItemsResult {
-    if !cache.is_populated() {
-        log::warn!("vault cache is not populated; populating it now for the picker");
-        match cache.populate() {
-            Ok(PopulateOutcome::Populated) => {}
-            // Not reachable from this call site today (every `clear` is on
-            // the blocked main thread) -- see `PickerItemsResult::VaultLocked`.
-            Ok(PopulateOutcome::DiscardedStale) => {
-                log::warn!(
-                    "the vault was cleared while the picker's populate was in flight; the \
-                     cache is deliberately empty"
-                );
-                return PickerItemsResult::VaultLocked;
+///
+/// **`era` is the vault session the user's click belongs to**, captured by
+/// `pick_vault_item` on the main thread before this is handed to that
+/// detached worker, and it is what every read below is checked against --
+/// review 25's Minor 2. This used to be `if !cache.is_populated() { .. }`
+/// followed by `let items = cache.items();`: TWO locks, on a thread that is
+/// explicitly not the main one, so a `clear` landing between them yielded an
+/// empty `Vec` and the answer "your vault doesn't have any items yet" for a
+/// vault that had just LOCKED -- precisely the misdiagnosis
+/// [`PickerItemsResult::VaultLocked`] exists to prevent. It was sound only
+/// while the main thread stayed parked in `loading_ui::show_while`, which is
+/// an argument about thread affinity rather than about this code, and this
+/// crate has had to un-write that argument more than once.
+///
+/// The era does strictly more than close the two-lock window, and that is
+/// why it is a parameter rather than a capture taken here: a `clear` that
+/// lands after the click but before this function even starts is invisible to
+/// anything captured on entry, and the populate below would then succeed
+/// against the NEW session (it takes its own, newer epoch) and hand this
+/// click a list belonging to a vault session the user never asked about.
+fn load_items_for_picker(cache: &VaultCache, era: VaultEra) -> PickerItemsResult {
+    let items = match cache.items_unless_superseded(era) {
+        Some(items) => items,
+        None => {
+            log::warn!("no vault snapshot for the picker's era; populating it now");
+            match cache.populate() {
+                Ok(PopulateOutcome::Populated) => {}
+                Ok(PopulateOutcome::DiscardedStale) => {
+                    log::warn!(
+                        "the vault was cleared while the picker's populate was in flight; the \
+                         cache is deliberately empty"
+                    );
+                    return PickerItemsResult::VaultLocked;
+                }
+                Err(e) => {
+                    log::error!("could not populate the vault cache for the picker: {e:?}");
+                    return PickerItemsResult::BackendUnreachable(format!("{e:?}"));
+                }
             }
-            Err(e) => {
-                log::error!("could not populate the vault cache for the picker: {e:?}");
-                return PickerItemsResult::BackendUnreachable(format!("{e:?}"));
+            // A populate that *succeeded* still proves nothing about this
+            // click's era: it captured its own epoch, so it happily refills
+            // the cache for whatever session is current now. Asking again
+            // under the same era is what distinguishes "the vault is here"
+            // from "a vault is here, but not yours".
+            match cache.items_unless_superseded(era) {
+                Some(items) => items,
+                None => {
+                    log::warn!(
+                        "the vault was cleared between the picker's click and its populate; the \
+                         snapshot that now exists belongs to a later vault session"
+                    );
+                    return PickerItemsResult::VaultLocked;
+                }
             }
         }
-    }
+    };
 
-    let items = cache.items();
     // Emptiness is judged BEFORE the login filter and non-emptiness after
     // it, so the three outcomes stay distinct: nothing in the vault at all,
     // things in the vault but nothing attachable, and something to list.
+    // "There is no vault for this era at all" is a FOURTH state and was
+    // handled above, as `VaultLocked` -- it must never arrive here as an
+    // empty `Vec`.
     if items.is_empty() {
         return PickerItemsResult::EmptyVault;
     }
@@ -367,9 +413,17 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     // to run. Detaching means this function returns as soon as `show_while`
     // does; the worker simply finishes on its own and its result (nobody is
     // listening any more) is dropped.
+    // Captured HERE, on the main thread, before the worker starts: it names
+    // the vault session this click belongs to. Everything the worker goes on
+    // to read is checked against it in one lock
+    // (`VaultCache::items_unless_superseded`), so a `clear` landing while the
+    // worker runs -- the vault locking, or a re-auth into a possibly
+    // different account -- cannot come back as this click's item list. See
+    // `load_items_for_picker`.
+    let era = cache.epoch().era();
     let cache_for_thread = cache.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(load_items_for_picker(&cache_for_thread));
+        let _ = tx.send(load_items_for_picker(&cache_for_thread, era));
     });
     let result = loading_ui::show_while("Loading your vault...", rx);
 
@@ -1169,7 +1223,7 @@ mod tests {
             PopulateOutcome::Populated
         );
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         match result {
             PickerItemsResult::Items(items) => {
@@ -1206,7 +1260,7 @@ mod tests {
         let cache = cache_for(server.url());
         assert!(!cache.is_populated());
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         match result {
             PickerItemsResult::Items(items) => {
@@ -1228,7 +1282,7 @@ mod tests {
         let cache = cache_for("http://127.0.0.1:1".to_string());
         assert!(!cache.is_populated());
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         assert!(
             matches!(result, PickerItemsResult::BackendUnreachable(_)),
@@ -1255,7 +1309,7 @@ mod tests {
             PopulateOutcome::Populated
         );
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         assert!(
             matches!(result, PickerItemsResult::EmptyVault),
@@ -1288,7 +1342,7 @@ mod tests {
             PopulateOutcome::Populated
         );
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         assert!(
             matches!(result, PickerItemsResult::NoLogins),
@@ -1320,13 +1374,56 @@ mod tests {
             PopulateOutcome::Populated
         );
 
-        match load_items_for_picker(&cache) {
+        match load_items_for_picker(&cache, cache.epoch().era()) {
             PickerItemsResult::Items(items) => {
                 let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
                 assert_eq!(names, vec!["Site"], "a non-login was offered to the picker");
             }
             _ => panic!("expected Items: the vault holds a login"),
         }
+    }
+
+    #[test]
+    fn load_items_for_picker_reports_a_vault_cleared_after_the_click_as_locked() {
+        // REVIEW 25'S MINOR 2, and the half that no `DiscardedStale` check can
+        // reach. `pick_vault_item` captures the era on the main thread at the
+        // moment of the click and hands it to this function on a DETACHED
+        // thread; a `clear` -- lock, or re-auth into a possibly different
+        // account -- can land after that. The populate below then succeeds
+        // perfectly well (it captures its own, newer epoch), so "did the
+        // populate land?" answers yes, and the old spelling
+        // (`is_populated()` then `items()`) went on to hand the user a list.
+        // For the era this click belongs to there is no vault: the right
+        // answer is `VaultLocked`, not a list and not "your vault doesn't have
+        // any items yet".
+        let mut server = mockito::Server::new();
+        let _items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+
+        // The click: the era is captured here, before the worker starts.
+        let era = cache.epoch().era();
+        // ...and the vault locks while the worker is on its way.
+        cache.clear();
+
+        let result = load_items_for_picker(&cache, era);
+
+        assert!(
+            matches!(result, PickerItemsResult::VaultLocked),
+            "a vault cleared after the click was reported as data (or as an empty vault) \
+             rather than as locked"
+        );
     }
 
     #[test]
@@ -1363,7 +1460,7 @@ mod tests {
             })
             .create();
 
-        let result = load_items_for_picker(&cache);
+        let result = load_items_for_picker(&cache, cache.epoch().era());
 
         assert!(
             matches!(result, PickerItemsResult::VaultLocked),
