@@ -1518,17 +1518,35 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     }
                     DetailMode::Create(draft) => {
                         match draw_detail_edit(ui, draft, &folders, true) {
-                            EditAction::Save => match cache.create_item(&draft.to_new_item()) {
-                                Ok(created) => {
-                                    selected_id = Some(created.id.clone());
-                                    items.push(created);
-                                    mode = DetailMode::Read;
+                            // `to_new_item` is fallible because `NewItem` has no
+                            // variant for `ItemKind::Unknown(_)`: a future Bitwarden
+                            // type has no create payload, and every total
+                            // alternative lies -- returning a login would POST an
+                            // item of the wrong type from a form filled in for
+                            // something else. `detail_edit` already withholds Save
+                            // for an uncreatable kind, so this `None` is the third
+                            // door on a path that should be unreachable, not a case
+                            // the user can provoke.
+                            EditAction::Save => {
+                                if let Some(new_item) = draft.to_new_item() {
+                                    match cache.create_item(&new_item) {
+                                        Ok(created) => {
+                                            selected_id = Some(created.id.clone());
+                                            items.push(created);
+                                            mode = DetailMode::Read;
+                                        }
+                                        Err(e) => {
+                                            log::warn!("failed to create item: {e:?}");
+                                            flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                                        }
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "Save reached an item kind with no create payload; \
+                                         the form should not have offered it"
+                                    );
                                 }
-                                Err(e) => {
-                                    log::warn!("failed to create item: {e:?}");
-                                    flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
-                                }
-                            },
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
