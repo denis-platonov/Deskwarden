@@ -88,6 +88,54 @@ pub struct VaultItem {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+/// What kind of thing an item is, derived from `bw`'s numeric `type`.
+///
+/// `Unknown` is not defensive padding: Bitwarden can ship a type 6, and an
+/// unrecognised item must render as unsupported rather than fall through to
+/// a login-shaped pane over data that is not a login. Collapsing a distinct
+/// situation into a representation that means something else is the failure
+/// mode behind most of the findings recorded in this repo's progress ledger.
+///
+/// Match it **exhaustively, with no catch-all arm**, everywhere behaviour
+/// differs by kind. A `_ =>` would silently give `Unknown` whatever the
+/// neighbouring arm does, which is precisely what this variant exists to
+/// prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    Login,
+    SecureNote,
+    Card,
+    Identity,
+    SshKey,
+    Unknown(i64),
+}
+
+impl ItemKind {
+    /// The one place a type number becomes a kind. An absent `type`
+    /// preserves today's behaviour, in which every item was a login.
+    pub fn of(item: &VaultItem) -> Self {
+        match item.item_type {
+            None | Some(1) => ItemKind::Login,
+            Some(2) => ItemKind::SecureNote,
+            Some(3) => ItemKind::Card,
+            Some(4) => ItemKind::Identity,
+            Some(5) => ItemKind::SshKey,
+            Some(other) => ItemKind::Unknown(other),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            ItemKind::Login => "Login".to_string(),
+            ItemKind::SecureNote => "Secure note".to_string(),
+            ItemKind::Card => "Card".to_string(),
+            ItemKind::Identity => "Identity".to_string(),
+            ItemKind::SshKey => "SSH key".to_string(),
+            ItemKind::Unknown(_) => "Unsupported item".to_string(),
+        }
+    }
+}
+
 /// Pure helper: returns a copy of `item` with its `deskwarden:app-match`
 /// custom field replaced (or added) to encode `m`. All other fields —
 /// including anything not modeled by `VaultItem` and captured in `other` —
@@ -406,6 +454,61 @@ impl VaultBridge {
 mod tests {
     use super::*;
     use crate::app_match::TriggerMode;
+
+    /// A minimal item with no type, for tests that only care about one field.
+    fn a_bare_item() -> VaultItem {
+        VaultItem {
+            id: "1".into(),
+            name: "x".into(),
+            fields: vec![],
+            login: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn item_kind_covers_every_type_number() {
+        let kind = |t: Option<i64>| {
+            let mut item = a_bare_item();
+            item.item_type = t;
+            ItemKind::of(&item)
+        };
+        assert_eq!(kind(Some(1)), ItemKind::Login);
+        assert_eq!(kind(Some(2)), ItemKind::SecureNote);
+        assert_eq!(kind(Some(3)), ItemKind::Card);
+        assert_eq!(kind(Some(4)), ItemKind::Identity);
+        assert_eq!(kind(Some(5)), ItemKind::SshKey);
+        // A type Bitwarden has not shipped yet must be representable as
+        // itself, not collapsed into a login -- otherwise a future item
+        // renders a login-shaped pane over data that is not a login.
+        assert_eq!(kind(Some(6)), ItemKind::Unknown(6));
+        // An absent type preserves today's behaviour.
+        assert_eq!(kind(None), ItemKind::Login);
+    }
+
+    #[test]
+    fn every_kind_has_its_own_label() {
+        // A label shared by two kinds would make the read pane's subtitle
+        // lie about one of them.
+        let labels = [
+            ItemKind::Login,
+            ItemKind::SecureNote,
+            ItemKind::Card,
+            ItemKind::Identity,
+            ItemKind::SshKey,
+            ItemKind::Unknown(6),
+        ]
+        .map(ItemKind::label);
+        for (i, label) in labels.iter().enumerate() {
+            assert!(!label.is_empty());
+            for other in &labels[i + 1..] {
+                assert_ne!(label, other, "two kinds share the label {label:?}");
+            }
+        }
+    }
 
     #[test]
     fn extract_app_match_finds_matching_field() {

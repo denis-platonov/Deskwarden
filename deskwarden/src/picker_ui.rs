@@ -3,7 +3,7 @@ use crate::bw_serve::{readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEO
 use crate::icon;
 use crate::loading_ui;
 use crate::theme;
-use crate::vault_bridge::{VaultError, VaultItem};
+use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
 use crate::vault_cache::{PopulateOutcome, VaultCache};
 use crate::window_list::{self, WindowInfo};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
@@ -191,6 +191,19 @@ enum PickerItemsResult {
     Items(Vec<VaultItem>),
     /// The cache (freshly populated, if it needed to be) is genuinely empty.
     EmptyVault,
+    /// The vault holds items, but none of them are logins -- so the picker,
+    /// which offers logins only (see `logins_only`), has nothing to list.
+    ///
+    /// Its own variant rather than a second use of `EmptyVault`, for exactly
+    /// the reason `EmptyVault` and `BackendUnreachable` were split apart in
+    /// the first place (review 10's Minor 5) and `VaultLocked` after them
+    /// (review 14's Minor): the vault plainly *does* have items, so telling
+    /// this user it "doesn't have any items yet" would be a fresh instance of
+    /// the misdiagnosis those two changes removed from this very function.
+    /// The remedy differs too -- "add an item" versus "add a *login*" -- and
+    /// a message that names the wrong one sends the user somewhere that will
+    /// not fix it.
+    NoLogins,
     /// The cache was never populated and a fresh populate also failed --
     /// `bw serve` is unreachable, not merely idle.
     BackendUnreachable(String),
@@ -274,16 +287,47 @@ fn load_items_for_picker(cache: &VaultCache) -> PickerItemsResult {
     }
 
     let items = cache.items();
+    // Emptiness is judged BEFORE the login filter and non-emptiness after
+    // it, so the three outcomes stay distinct: nothing in the vault at all,
+    // things in the vault but nothing attachable, and something to list.
     if items.is_empty() {
-        PickerItemsResult::EmptyVault
+        return PickerItemsResult::EmptyVault;
+    }
+    let logins = logins_only(items);
+    if logins.is_empty() {
+        PickerItemsResult::NoLogins
     } else {
-        PickerItemsResult::Items(items)
+        PickerItemsResult::Items(logins)
     }
 }
 
-/// Opens a blocking egui window listing the user's vault items with a search
-/// box, and returns the one they pick (or `None` if they cancel, or the vault
-/// has nothing to show).
+/// The picker offers only logins.
+///
+/// An app match on a secure note or a card is meaningless: `credentials_for`
+/// would resolve an empty username and password, and the injector would type
+/// two empty strings into the matched application. Filtering here rather
+/// than at fill time means the user is never offered the choice.
+///
+/// Goes through `ItemKind` rather than testing `item_type == Some(1)`, so
+/// this and the sidebar's `Logins` filter cannot drift apart about what
+/// counts as a login -- including for an item whose `type` the server
+/// omitted, which both treat as one.
+fn logins_only(items: Vec<VaultItem>) -> Vec<VaultItem> {
+    items
+        .into_iter()
+        .filter(|i| ItemKind::of(i) == ItemKind::Login)
+        .collect()
+}
+
+/// Opens a blocking egui window listing the user's vault **logins** with a
+/// search box, and returns the one they pick (or `None` if they cancel, or
+/// there is nothing to show).
+///
+/// Logins only (`load_items_for_picker` -> `logins_only`): autofill resolves
+/// exactly a username and a password, so an app matched to a card or a
+/// secure note would have the injector type two empty strings into it. A
+/// vault with items but no logins gets its own `NoLogins` message rather
+/// than the empty-vault one.
 ///
 /// This is step one of the tray's "Add app..." flow: `run_picker` needs a
 /// specific `VaultItem` to attach a match to, and nothing previously chose
@@ -352,6 +396,26 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                          from the vault window, then use \u{201c}Add app\u{2026}\u{201d} again.",
                     ),
                     &HSTRING::from("Deskwarden: vault is empty"),
+                    MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
+                );
+            }
+            return None;
+        }
+        // Deliberately NOT folded into `EmptyVault` above -- see `NoLogins`'s
+        // own doc. This user's vault is full; it just has nothing that can
+        // usefully fill an application, and the message says which.
+        PickerItemsResult::NoLogins => {
+            log::warn!("vault has items but no logins to attach an app match to");
+            unsafe {
+                MessageBoxW(
+                    None,
+                    &HSTRING::from(
+                        "\u{201c}Add app\u{2026}\u{201d} can only fill from a login, and your \
+                         Bitwarden vault doesn\u{2019}t have any login items yet \u{2014} only \
+                         other kinds, like secure notes or cards.\n\nAdd a login from the vault \
+                         window, then use \u{201c}Add app\u{2026}\u{201d} again.",
+                    ),
+                    &HSTRING::from("Deskwarden: no logins to choose from"),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -1014,6 +1078,27 @@ mod tests {
         }
     }
 
+    fn item_of_type(name: &str, item_type: Option<i64>) -> VaultItem {
+        VaultItem {
+            item_type,
+            ..item(name)
+        }
+    }
+
+    #[test]
+    fn the_picker_lists_only_logins() {
+        // Attaching an app match to a secure note is meaningless: the fill
+        // would type two empty strings into the matched application.
+        let items = vec![
+            item_of_type("Site", Some(1)),
+            item_of_type("Wifi", Some(2)),
+            item_of_type("Visa", Some(3)),
+            item_of_type("Legacy", None),
+        ];
+        let listed: Vec<String> = logins_only(items).into_iter().map(|i| i.name).collect();
+        assert_eq!(listed, vec!["Site".to_string(), "Legacy".to_string()]);
+    }
+
     #[test]
     fn empty_filter_matches_every_item() {
         assert!(item_matches_filter(&item("Rockstar Games"), ""));
@@ -1173,6 +1258,72 @@ mod tests {
             matches!(result, PickerItemsResult::EmptyVault),
             "a populated-but-empty cache must be reported as EmptyVault, not BackendUnreachable"
         );
+    }
+
+    #[test]
+    fn load_items_for_picker_reports_a_vault_with_items_but_no_logins_distinctly() {
+        // The picker filters to logins, so a vault holding only notes and
+        // cards now lists nothing -- but it is emphatically NOT an empty
+        // vault, and saying "your vault doesn't have any items yet" about a
+        // vault full of items would be a fresh instance of the exact
+        // misdiagnosis reviews 10 and 14 removed from this very function.
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(
+            cache
+                .populate_with(
+                    vec![item_of_type("Wifi", Some(2)), item_of_type("Visa", Some(3))],
+                    cache.epoch()
+                )
+                .unwrap(),
+            PopulateOutcome::Populated
+        );
+
+        let result = load_items_for_picker(&cache);
+
+        assert!(
+            matches!(result, PickerItemsResult::NoLogins),
+            "a vault with items but no logins must not be reported as an empty vault"
+        );
+    }
+
+    #[test]
+    fn load_items_for_picker_only_offers_logins() {
+        // The filter must be applied where the picker actually reads its
+        // list, not merely available as a helper nothing calls -- this
+        // plan's recurring failure shape is a change correct in isolation
+        // that never reaches the behaviour it claims.
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(
+            cache
+                .populate_with(
+                    vec![item_of_type("Wifi", Some(2)), item_of_type("Site", Some(1))],
+                    cache.epoch()
+                )
+                .unwrap(),
+            PopulateOutcome::Populated
+        );
+
+        match load_items_for_picker(&cache) {
+            PickerItemsResult::Items(items) => {
+                let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+                assert_eq!(names, vec!["Site"], "a non-login was offered to the picker");
+            }
+            _ => panic!("expected Items: the vault holds a login"),
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! also counted), plus the auto-lock countdown pinned to the bottom.
 
 use crate::theme;
-use crate::vault_bridge::{Folder, VaultItem};
+use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, RichText};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +29,16 @@ impl SidebarFilter {
     /// had drifted into two copies that happened to still agree, but had no
     /// mechanism keeping them that way).
     ///
+    /// The type-based variants go through [`ItemKind::of`] rather than
+    /// comparing `item.item_type` to a literal, for the same reason: the
+    /// mapping from `bw`'s numeric type to a meaning now lives in exactly
+    /// one place, so this file and the read pane cannot drift apart about
+    /// what a `3` is. One deliberate behaviour change came with that: an
+    /// item whose `type` the server omitted is a `Login` to `ItemKind`, so
+    /// it now counts under `Logins` where the hand-written `== Some(1)`
+    /// left it out of every type filter while the rest of the app was
+    /// already treating it as a login.
+    ///
     /// `Trash` always returns `false`: this codebase has no confirmed
     /// knowledge of `bw serve`'s trash/deletedDate JSON shape, so rather
     /// than guess at it (and risk silently misclassifying real data), Trash
@@ -39,7 +49,7 @@ impl SidebarFilter {
         match self {
             SidebarFilter::All => true,
             SidebarFilter::Favorites => item.favorite,
-            SidebarFilter::Logins => item.item_type == Some(1),
+            SidebarFilter::Logins => ItemKind::of(item) == ItemKind::Login,
             // Passkeys are not their own item type -- Bitwarden stores them
             // as `fido2Credentials` on ordinary login items, so this is a
             // filter over logins rather than a type match.
@@ -58,10 +68,10 @@ impl SidebarFilter {
                 .and_then(|login| login.other.get("fido2Credentials"))
                 .and_then(|value| value.as_array())
                 .is_some_and(|credentials| !credentials.is_empty()),
-            SidebarFilter::Cards => item.item_type == Some(3),
-            SidebarFilter::Identities => item.item_type == Some(4),
-            SidebarFilter::SecureNotes => item.item_type == Some(2),
-            SidebarFilter::SshKeys => item.item_type == Some(5),
+            SidebarFilter::Cards => ItemKind::of(item) == ItemKind::Card,
+            SidebarFilter::Identities => ItemKind::of(item) == ItemKind::Identity,
+            SidebarFilter::SecureNotes => ItemKind::of(item) == ItemKind::SecureNote,
+            SidebarFilter::SshKeys => ItemKind::of(item) == ItemKind::SshKey,
             // Not implementable from the endpoint this window reads:
             // `/list/object/items` returns no trashed items and carries no
             // `deletedDate` field to filter on (verified against a real
@@ -498,6 +508,35 @@ mod tests {
         assert_eq!(count_for(&items, &SidebarFilter::Logins), 1);
         assert_eq!(count_for(&items, &SidebarFilter::Cards), 0);
         assert_eq!(count_for(&items, &SidebarFilter::SecureNotes), 0);
+    }
+
+    /// An item whose `type` the server omitted is a login everywhere else in
+    /// the app (`ItemKind::of`, and therefore the read pane and the picker),
+    /// so the sidebar must agree. Before `scope_contains` went through
+    /// `ItemKind` it compared `item_type == Some(1)` by hand and left such an
+    /// item out of Logins while every other surface showed it as one -- the
+    /// two-copies-that-happen-to-agree hazard this function's own doc names.
+    #[test]
+    fn an_item_with_no_type_counts_as_a_login_like_it_does_everywhere_else() {
+        let items = vec![item(None, false, None)];
+        assert_eq!(count_for(&items, &SidebarFilter::Logins), 1);
+        assert_eq!(count_for(&items, &SidebarFilter::Cards), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::SecureNotes), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::Identities), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::SshKeys), 0);
+    }
+
+    /// A type this build does not know (`ItemKind::Unknown`) must fall into
+    /// no type filter at all rather than into Logins.
+    #[test]
+    fn an_unknown_item_type_counts_under_no_type_filter() {
+        let items = vec![item(Some(6), false, None)];
+        assert_eq!(count_for(&items, &SidebarFilter::All), 1);
+        assert_eq!(count_for(&items, &SidebarFilter::Logins), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::Cards), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::SecureNotes), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::Identities), 0);
+        assert_eq!(count_for(&items, &SidebarFilter::SshKeys), 0);
     }
 
     /// `bw serve` lists its virtual "No Folder" bucket with an empty id.
