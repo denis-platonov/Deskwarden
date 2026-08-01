@@ -22,7 +22,9 @@
 
 use crate::password_strength;
 use crate::theme;
-use crate::vault_bridge::{CardData, IdentityData, ItemKind, VaultItem};
+use crate::vault_bridge::{
+    password_history, CardData, IdentityData, ItemKind, PasswordHistoryEntry, VaultItem,
+};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
 // ---------------------------------------------------------------------------
@@ -251,7 +253,34 @@ pub struct RevealState {
     pub card_number: bool,
     /// A card's security-code row.
     pub card_code: bool,
+    /// One flag per PREVIOUS PASSWORDS row, indexed the same way
+    /// [`crate::vault_bridge::password_history`] orders its entries.
+    ///
+    /// **An array rather than a single `bool`**, for the reason this struct
+    /// exists at all: a shared flag would reveal every previous password at
+    /// once, which is the same defect as two card rows sharing one bool and
+    /// worse, because there can be five of them.
+    ///
+    /// It is a fixed-size array rather than a `Vec` so [`RevealState`] stays
+    /// `Copy` -- `vault_window::mod` owns one by value and resets it by
+    /// assignment, and making it non-`Copy` would change a file this work
+    /// does not own. The length is [`MAX_HISTORY_ROWS`], which is above the
+    /// server's own cap; a history longer than that is truncated *visibly*
+    /// rather than silently -- see [`history_rows`].
+    pub password_history: [bool; MAX_HISTORY_ROWS],
 }
+
+/// How many PREVIOUS PASSWORDS rows the pane will draw.
+///
+/// **Eight, against a server-side cap of five.** Bitwarden's own
+/// `CipherService.adjustPasswordHistoryLength` slices every save down to the
+/// last five entries, so five is what an item can actually hold; eight leaves
+/// room without pretending this array can hold an unbounded history. When
+/// more than this arrive the pane says how many it is not showing rather than
+/// dropping them quietly -- an omitted previous password looks exactly like a
+/// password the user never had.
+pub const MAX_HISTORY_ROWS: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailAction {
     None,
@@ -300,6 +329,16 @@ pub enum DetailAction {
     /// favourite that went through a draft would be silently dropped on save.
     /// See `vault_bridge::with_favorite`.
     ToggleFavorite(bool),
+    /// One PREVIOUS PASSWORDS row's Copy was clicked, identified by its
+    /// **index** into `vault_bridge::password_history(item)`.
+    ///
+    /// The index and not the value, for exactly the reason
+    /// [`Self::CopyCardNumber`] carries neither: the caller already holds the
+    /// item and can read the `Zeroizing<String>` back out of it, so a
+    /// previous password -- which is a password -- never gets a second,
+    /// non-zeroizing home inside this enum. [`Self::CopyValue`]'s door is for
+    /// non-secrets and this must not use it.
+    CopyPasswordHistory(usize),
 }
 
 /// Whether this kind can be filled into an application.
@@ -904,6 +943,21 @@ pub fn draw_detail_read(
         }
     }
 
+    // Directly under the body card, where a login's current password is, and
+    // above NOTES. Drawn for ANY kind that has the array rather than gated on
+    // `ItemKind::Login`: `passwordHistory` is an item-level key (see the
+    // capture) that `bw` puts on every item it sends, so what decides whether
+    // the card appears is whether there is anything in it -- the same rule
+    // `notes_text` uses. An empty history draws nothing at all; a heading
+    // over no rows would read as previous passwords that failed to load.
+    let history = password_history(item);
+    if !history.is_empty() {
+        card(ui, "PREVIOUS PASSWORDS", |ui| {
+            history_rows(ui, &history, reveal, &mut action);
+        });
+        ui.add_space(CARD_GAP);
+    }
+
     if let Some(notes) = notes_text(item) {
         card(ui, "NOTES", |ui| {
             card_text(ui, RichText::new(notes).size(ROW_VALUE_SIZE).color(theme::INK));
@@ -1244,6 +1298,77 @@ fn card_rows(
     if let Some(v) = &code {
         separate(ui, &mut first);
         masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode);
+    }
+}
+
+/// A previous password's row label: when it stopped being the current one.
+///
+/// The date goes in the LABEL column rather than beside the value because
+/// every row on this pane puts its identifying text there, and what
+/// identifies one previous password among five is when it was replaced.
+///
+/// Unparseable and absent both fall back to "Earlier" rather than to a
+/// fabricated number -- the same rule [`updated_text`] follows for a
+/// missing `revisionDate`, and the same reason `password_history` keeps an
+/// entry whose date is missing: the secret is still real.
+fn history_label(last_used_date: Option<&str>) -> String {
+    match last_used_date.and_then(days_since) {
+        Some(0) => "Today".to_string(),
+        Some(1) => "1 day ago".to_string(),
+        Some(n) => format!("{n} days ago"),
+        None => "Earlier".to_string(),
+    }
+}
+
+/// The PREVIOUS PASSWORDS rows: one masked row per entry, each driven by its
+/// **own** flag in [`RevealState::password_history`].
+///
+/// The indexing is the load-bearing part. `masked_row` takes a `&mut bool`,
+/// and passing the wrong one is a single-token slip that renders perfectly --
+/// it was made for real on the card pane and caught only by a test that
+/// revealed one row and asserted the other stayed masked. Here the same slip
+/// would reveal a previous password the user did not ask to see, so the flag
+/// is taken by index from the same enumeration that produces the row and
+/// `each_history_row_is_revealed_only_by_its_own_flag` pins it.
+///
+/// The copy action carries the row's INDEX, not its value -- see
+/// [`DetailAction::CopyPasswordHistory`].
+fn history_rows(
+    ui: &mut egui::Ui,
+    history: &[PasswordHistoryEntry],
+    reveal: &mut RevealState,
+    action: &mut DetailAction,
+) {
+    for (index, entry) in history.iter().take(MAX_HISTORY_ROWS).enumerate() {
+        if index > 0 {
+            theme::row_rule(ui);
+        }
+        masked_row(
+            ui,
+            &history_label(entry.last_used_date.as_deref()),
+            entry.password.as_str(),
+            &mut reveal.password_history[index],
+            action,
+            DetailAction::CopyPasswordHistory(index),
+        );
+    }
+    // Truncation is STATED, never silent. A previous password the pane simply
+    // omitted is indistinguishable from one the user never had, and this pane
+    // is the only place in the app they are visible at all. Unreachable
+    // against today's backend -- Bitwarden's own `adjustPasswordHistoryLength`
+    // slices every save to five -- which is exactly why it would rot unnoticed
+    // if it were left to a comment.
+    let hidden = history.len().saturating_sub(MAX_HISTORY_ROWS);
+    if hidden > 0 {
+        theme::row_rule(ui);
+        empty_pane_note(
+            ui,
+            &format!(
+                "{hidden} older {} not shown here -- open this item in the Bitwarden web \
+                 vault or app to see all of them.",
+                if hidden == 1 { "password is" } else { "passwords are" }
+            ),
+        );
     }
 }
 
@@ -2249,6 +2374,7 @@ mod tests {
             password: false,
             card_number: true,
             card_code: true,
+            password_history: [false; MAX_HISTORY_ROWS],
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
         assert!(
@@ -2340,6 +2466,7 @@ mod tests {
                 password: false,
                 card_number: true,
                 card_code: false,
+                password_history: [false; MAX_HISTORY_ROWS],
             },
             "clicking the card number's Reveal did not write through to the caller's \
              RevealState, or wrote through to the wrong field"
@@ -2378,6 +2505,7 @@ mod tests {
                 password: false,
                 card_number: true,
                 card_code: false,
+                password_history: [false; MAX_HISTORY_ROWS],
             },
         );
         assert!(
@@ -2397,6 +2525,7 @@ mod tests {
                 password: false,
                 card_number: false,
                 card_code: true,
+                password_history: [false; MAX_HISTORY_ROWS],
             },
         );
         assert!(
@@ -2511,6 +2640,7 @@ mod tests {
                 password: false,
                 card_number: true,
                 card_code: true,
+                password_history: [false; MAX_HISTORY_ROWS],
             },
         );
         for value in [fields.number.expect("number"), fields.code.expect("code")] {
@@ -2943,6 +3073,7 @@ mod tests {
                 password: true,
                 card_number: false,
                 card_code: false,
+                password_history: [false; MAX_HISTORY_ROWS],
             },
         );
         assert!(
@@ -3100,4 +3231,164 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Previous passwords
+    // -----------------------------------------------------------------
+
+    /// A login carrying two previous passwords, in the wire shape the CLI's
+    /// own `PasswordHistoryResponse` builds.
+    fn a_login_with_history(entries: usize) -> VaultItem {
+        let mut item = a_login();
+        let history: Vec<serde_json::Value> = (0..entries)
+            .map(|i| {
+                serde_json::json!({
+                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "password": format!("old-secret-{i}"),
+                })
+            })
+            .collect();
+        item.other
+            .insert("passwordHistory".to_string(), serde_json::Value::Array(history));
+        item
+    }
+
+    #[test]
+    fn an_item_with_no_password_history_gets_no_card_at_all() {
+        // A heading over no rows reads as previous passwords that failed to
+        // load -- the same argument `notes_text` makes for the notes card.
+        let texts = painted(&a_login(), &TotpState::NoSecret);
+        assert!(
+            !contains(&texts, "PREVIOUS PASSWORDS"),
+            "an item with no history still drew the card: {texts:?}"
+        );
+    }
+
+    /// **Masked by default, negative assertion, WITH A POSITIVE CONTROL.**
+    /// The absence half alone is not evidence: a pane that rendered the card
+    /// not at all, or rendered nothing whatever, satisfies it. So the same
+    /// frame must also show the card's heading and a Reveal control, and the
+    /// test below must show the value painting when the flag is set.
+    #[test]
+    fn previous_passwords_are_masked_by_default() {
+        let texts = painted(&a_login_with_history(2), &TotpState::NoSecret);
+        assert!(
+            contains(&texts, "PREVIOUS PASSWORDS"),
+            "the history card did not render, so the masking assertion below would \
+             pass against a pane drawing nothing: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "old-secret-0"),
+            "a previous password was painted in the clear by default: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "old-secret-1"),
+            "a previous password was painted in the clear by default: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "Reveal"),
+            "the history card offers no way to reveal what it masked: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_revealed_previous_password_paints_in_the_clear() {
+        // The positive control for the test above.
+        let mut reveal = RevealState::default();
+        reveal.password_history[0] = true;
+        reveal.password_history[1] = true;
+        let texts = painted_with_reveal(&a_login_with_history(2), &TotpState::NoSecret, reveal);
+        assert!(
+            contains(&texts, "old-secret-0"),
+            "password_history[0] did not reveal the first entry: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "old-secret-1"),
+            "password_history[1] did not reveal the second entry: {texts:?}"
+        );
+    }
+
+    /// **Which flag feeds which row**, the same property
+    /// `each_card_secret_is_revealed_only_by_its_own_flag` pins one card over
+    /// -- and the reason it is pinned again here is that the slip it catches
+    /// was made for real: a `&mut reveal.card_number` passed to the wrong row
+    /// renders perfectly and unmasks a secret the user did not ask to see.
+    /// With five history rows the index is written once and reused, so an
+    /// off-by-one or a constant index would look identical on screen for the
+    /// first row.
+    #[test]
+    fn each_history_row_is_revealed_only_by_its_own_flag() {
+        let item = a_login_with_history(3);
+
+        let mut first_only = RevealState::default();
+        first_only.password_history[0] = true;
+        let texts = painted_with_reveal(&item, &TotpState::NoSecret, first_only);
+        assert!(contains(&texts, "old-secret-0"), "index 0 did not reveal row 0: {texts:?}");
+        assert!(
+            !contains(&texts, "old-secret-1"),
+            "revealing row 0 also unmasked row 1: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "old-secret-2"),
+            "revealing row 0 also unmasked row 2: {texts:?}"
+        );
+
+        let mut middle_only = RevealState::default();
+        middle_only.password_history[1] = true;
+        let texts = painted_with_reveal(&item, &TotpState::NoSecret, middle_only);
+        assert!(contains(&texts, "old-secret-1"), "index 1 did not reveal row 1: {texts:?}");
+        assert!(
+            !contains(&texts, "old-secret-0"),
+            "revealing row 1 also unmasked row 0 -- the rows share a flag, or the \
+             index is constant: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "old-secret-2"),
+            "revealing row 1 also unmasked row 2: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_history_longer_than_the_pane_can_reveal_says_how_much_it_is_hiding() {
+        // Unreachable against today's backend -- Bitwarden slices every save
+        // to five entries -- which is exactly why it needs a test: an omitted
+        // previous password is indistinguishable from one the user never had,
+        // and this pane is the only place in the app they are visible.
+        let texts = painted(&a_login_with_history(MAX_HISTORY_ROWS + 3), &TotpState::NoSecret);
+        assert!(
+            contains(&texts, "3 older passwords are not shown"),
+            "a truncated history did not say how many rows it dropped: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_history_that_fits_says_nothing_about_hidden_rows() {
+        // The mirror: the notice must not appear when nothing is hidden.
+        let texts = painted(&a_login_with_history(MAX_HISTORY_ROWS), &TotpState::NoSecret);
+        assert!(
+            !contains(&texts, "not shown"),
+            "a history that fits claimed rows were hidden: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_history_row_is_labelled_by_when_that_password_stopped_being_current() {
+        // The label column is what distinguishes one masked row from another,
+        // so it carries the date. Absent and unparseable both fall back to a
+        // word rather than a fabricated number, the same rule `updated_text`
+        // follows.
+        assert_eq!(history_label(None), "Earlier");
+        assert_eq!(history_label(Some("not-a-date")), "Earlier");
+        assert_eq!(history_label(Some("1970-01-01T00:00:00.000Z")).ends_with("days ago"), true);
+
+        let mut item = a_login();
+        item.other.insert(
+            "passwordHistory".to_string(),
+            serde_json::json!([{ "password": "dateless" }]),
+        );
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(
+            contains(&texts, "Earlier"),
+            "a dated-less history row lost its label entirely: {texts:?}"
+        );
+    }
 }

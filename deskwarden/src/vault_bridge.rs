@@ -379,6 +379,98 @@ pub fn with_favorite(item: &VaultItem, favorite: bool) -> VaultItem {
     updated.favorite = favorite;
     updated
 }
+
+/// The key `bw serve` puts an item's previous passwords under.
+///
+/// **Deliberately not a field on [`VaultItem`]**, for exactly the reason
+/// [`DELETED_DATE_KEY`] is not: a typed field is a compile error at nineteen
+/// struct literals across nine files. The precedent set there is followed
+/// here -- an accessor over the catch-all, which buys the UI everything a
+/// typed field would.
+///
+/// Riding `other` also means the array is preserved verbatim on every write
+/// this app makes, which is the property that matters most: password history
+/// is data the *server* maintains, and a client that dropped it on a PUT
+/// would destroy it.
+const PASSWORD_HISTORY_KEY: &str = "passwordHistory";
+
+/// One previous password, with when it stopped being the current one.
+///
+/// `password` is `Zeroizing<String>` because a previous password **is a
+/// password** -- the same reason [`LoginData::password`] is one. The
+/// materialised copy this accessor hands back therefore wipes itself on
+/// drop; the JSON value it was read *from* still sits in
+/// [`VaultItem::other`] un-wiped, which is the existing, recorded escape
+/// route rather than a new one (see the `>>>` zeroize block in
+/// `.superpowers/sdd/progress.md`).
+///
+/// `last_used_date` is the raw ISO-8601 string `bw` sent, for the same reason
+/// [`deleted_date`] returns one: this crate has no date type and inventing a
+/// parse here would be modelling from memory. It is `Option` because the
+/// entry is a JSON object whose keys this crate does not control -- an entry
+/// with a password and no date is showable, and dropping the whole entry
+/// because its timestamp was missing would hide a secret the user has.
+#[derive(Clone)]
+pub struct PasswordHistoryEntry {
+    pub password: Zeroizing<String>,
+    pub last_used_date: Option<String>,
+}
+
+/// Hand-written so `{:?}` cannot print a previous password. Every other
+/// secret-carrying struct in this file derives `Debug` and does leak into a
+/// format string, which is the recorded state of play -- this one is new, so
+/// it starts without the escape route rather than adding one more.
+impl std::fmt::Debug for PasswordHistoryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordHistoryEntry")
+            .field("password", &"<redacted>")
+            .field("last_used_date", &self.last_used_date)
+            .finish()
+    }
+}
+
+/// The item's previous passwords, newest first as `bw` orders them.
+///
+/// Reads [`VaultItem::other`] rather than a modelled field -- see
+/// [`PASSWORD_HISTORY_KEY`]. The wire shape is
+/// `[{"lastUsedDate": "<iso>", "password": "<string>"}, ...]`, taken from the
+/// CLI's own `PasswordHistoryResponse`
+/// (`apps/cli/src/vault/models/password-history.response.ts`), which is the
+/// class that literally builds this JSON, not a recollection of it.
+///
+/// **Every malformed shape yields an empty vector or a shorter one, never an
+/// error**, and that is a decision rather than laziness. This is a read for
+/// *display*: an item whose history is absent, `null`, an empty array or --
+/// if Bitwarden ever changes it -- something else entirely has no previous
+/// passwords worth showing, and a `Result` here would put an error banner on
+/// a detail pane over a field the user never asked about. Absent and empty
+/// are both real and both common: the CLI normalises an empty history to
+/// `null` when saving (`adjustPasswordHistoryLength`), while the list
+/// endpoint sends `[]` -- measured as `[]` on all 1654 items of the user's
+/// live vault on 2026-08-01.
+///
+/// An entry with no `password` string is skipped rather than shown blank: the
+/// row exists to show a secret, and a row of bullets over nothing claims the
+/// user has a previous password that this build failed to load.
+pub fn password_history(item: &VaultItem) -> Vec<PasswordHistoryEntry> {
+    let Some(entries) = item.other.get(PASSWORD_HISTORY_KEY).and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let password = entry.get("password")?.as_str()?;
+            Some(PasswordHistoryEntry {
+                password: Zeroizing::new(password.to_string()),
+                last_used_date: entry
+                    .get("lastUsedDate")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
 /// The key `bw serve` puts on an item that is in the trash, and on no other
 /// item.
 ///
@@ -3157,6 +3249,126 @@ mod tests {
             body.get("favorite"),
             Some(&serde_json::json!(false)),
             "un-favouriting produced a body that does not state favorite=false: {body}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `passwordHistory`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn password_history_reads_the_captured_wire_shape_newest_first() {
+        // The shape is the CLI's own `PasswordHistoryResponse`
+        // (`lastUsedDate`, `password`), which is the class that builds this
+        // JSON -- not a recollection of it.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],"passwordHistory":[
+                {"lastUsedDate":"2026-07-30T09:15:00.000Z","password":"newer-old"},
+                {"lastUsedDate":"2024-01-02T03:04:05.000Z","password":"older-old"}
+            ]}"#,
+        )
+        .unwrap();
+        let history = password_history(&item);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].password.as_str(), "newer-old");
+        assert_eq!(history[0].last_used_date.as_deref(), Some("2026-07-30T09:15:00.000Z"));
+        assert_eq!(history[1].password.as_str(), "older-old");
+        assert_eq!(history[1].last_used_date.as_deref(), Some("2024-01-02T03:04:05.000Z"));
+    }
+
+    #[test]
+    fn an_item_with_no_history_reads_as_empty_rather_than_failing() {
+        // All four ways "no history" actually arrives. `[]` is not a
+        // hypothetical: it is what all 1654 items of the user's live vault
+        // carried when this was measured on 2026-08-01. `null` is what the
+        // CLI writes when a history is emptied
+        // (`adjustPasswordHistoryLength`), and an absent key is what a freshly
+        // created item has. The fourth is a shape change this build has never
+        // seen, and the rule for it is the same: no rows, no error banner.
+        for raw in [
+            r#"{"id":"1","name":"A","fields":[],"passwordHistory":[]}"#,
+            r#"{"id":"1","name":"A","fields":[],"passwordHistory":null}"#,
+            r#"{"id":"1","name":"A","fields":[]}"#,
+            r#"{"id":"1","name":"A","fields":[],"passwordHistory":"nonsense"}"#,
+        ] {
+            let item: VaultItem = serde_json::from_str(raw).unwrap();
+            assert!(
+                password_history(&item).is_empty(),
+                "expected no history entries from {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_history_entry_without_a_password_is_skipped_and_one_without_a_date_is_kept() {
+        // Asymmetric on purpose. The password is what the row exists to show,
+        // so an entry without one is not a row; the date is decoration, so an
+        // entry without one still shows the secret the user has.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],"passwordHistory":[
+                {"lastUsedDate":"2026-07-30T09:15:00.000Z"},
+                {"password":"dateless"},
+                {"lastUsedDate":"2026-07-30T09:15:00.000Z","password":null},
+                "not-an-object"
+            ]}"#,
+        )
+        .unwrap();
+        let history = password_history(&item);
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(history[0].password.as_str(), "dateless");
+        assert_eq!(history[0].last_used_date, None);
+    }
+
+    #[test]
+    fn an_items_password_history_survives_a_round_trip_untouched() {
+        // The property that matters most, and the reason this is an accessor
+        // over the catch-all rather than a modelled field: password history is
+        // data the SERVER maintains, every write this app makes is a
+        // full-state PUT, and a client that dropped the array would delete the
+        // user's previous passwords. Two entries, so an off-by-one truncation
+        // would show.
+        let raw = r#"{"id":"1","object":"item","type":1,"name":"A","favorite":false,
+            "fields":[],"reprompt":0,"key":"K","collectionIds":[],"attachments":[],
+            "passwordHistory":[
+                {"lastUsedDate":"2026-07-30T09:15:00.000Z","password":"p1"},
+                {"lastUsedDate":"2024-01-02T03:04:05.000Z","password":"p2"}],
+            "login":{"username":"u","password":"p"}}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_value(&item).unwrap(),
+            "an item's password history did not survive a round trip"
+        );
+        // And it survives the two helpers that rebuild an item, since both
+        // are on the write path.
+        for rebuilt in [with_favorite(&item, true), with_folder(&item, Some("f1"))] {
+            assert_eq!(
+                password_history(&rebuilt).len(),
+                2,
+                "a rebuilt item lost its password history"
+            );
+        }
+    }
+
+    #[test]
+    fn a_history_password_is_not_printed_by_its_own_debug() {
+        // `{:?}` on a secret is how plaintext reaches a log line. Every
+        // pre-existing secret-carrying struct here derives `Debug` and does
+        // leak -- recorded, not re-litigated -- so this new one starts
+        // without the escape route.
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"A","fields":[],
+                "passwordHistory":[{"lastUsedDate":"2026-07-30T09:15:00.000Z",
+                                    "password":"correct-horse"}]}"#,
+        )
+        .unwrap();
+        let printed = format!("{:?}", password_history(&item));
+        assert!(!printed.contains("correct-horse"), "a previous password was printed: {printed}");
+        assert!(
+            printed.contains("2026-07-30T09:15:00.000Z"),
+            "the redaction also swallowed the date, so this test could pass on an \
+             empty vector: {printed}"
         );
     }
 
