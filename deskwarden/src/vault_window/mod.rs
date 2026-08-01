@@ -241,11 +241,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut selected_id: Option<String> = None;
     // Tracks the previous frame's `selected_id` so a change (from clicking a
     // different row in `draw_item_list`) can be detected and used to reset
-    // the per-selection state below (`mode`, `reveal_password`, the TOTP
+    // the per-selection state below (`mode`, `reveal`, the TOTP
     // cache) -- see the reset block after the item-list panel further down.
     let mut last_selected_id: Option<String> = selected_id.clone();
     let mut mode = DetailMode::Read;
-    let mut reveal_password = false;
+    // Every masked value the read pane can reveal -- a login's password, a
+    // card's number and its security code. It lives HERE, in `run`'s
+    // per-selection state, and not inside the pane's closure: a `let mut
+    // revealed = false` declared per frame is dropped at the end of that
+    // frame, so the toggle flips and the next frame draws masked again. See
+    // `RevealState`'s doc; that bug has been shipped once already, in
+    // `detail_edit.rs`. Cleared by the selection-change reset block below,
+    // so a revealed card number cannot follow the user onto the next item.
+    let mut reveal = detail::RevealState::default();
     let mut icons = IconCache::default();
     // Ids of the item rows `draw_item_list` actually rendered this frame --
     // populated by that call each frame, then used right after to trigger
@@ -736,7 +744,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // TOTP code under B.
         if selected_id != last_selected_id {
             mode = DetailMode::Read;
-            reveal_password = false;
+            reveal = detail::RevealState::default();
             // `NoSecret` is this reset block's neutral "haven't looked yet"
             // value, and it is deliberately the one value the per-frame TOTP
             // block's `totp_state_for_secret_presence` promotes: on the very
@@ -929,7 +937,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 fill_count,
                                 &totp_state,
                                 delete_pending,
-                                &mut reveal_password,
+                                &mut reveal,
                                 icons.textures.get(item.id.as_str()),
                             );
                             // `item` and `totp_code` already hold everything
@@ -977,6 +985,31 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                         ui.ctx().copy_text(password.to_string());
                                     }
                                 }
+                                // The two card secrets are looked up from the
+                                // item here rather than carried on the action,
+                                // exactly as the password above is: that keeps
+                                // the plaintext inside the `Zeroizing` it
+                                // arrived in for as long as this app controls
+                                // it. (The clipboard is one of the escape
+                                // routes `deskwarden/README.md` already
+                                // documents; that is unchanged here.)
+                                DetailAction::CopyCardNumber => {
+                                    if let Some(number) = item.card.as_ref().and_then(|c| c.number.as_deref()) {
+                                        ui.ctx().copy_text(number.to_string());
+                                    }
+                                }
+                                DetailAction::CopyCardCode => {
+                                    if let Some(code) = item.card.as_ref().and_then(|c| c.code.as_deref()) {
+                                        ui.ctx().copy_text(code.to_string());
+                                    }
+                                }
+                                // A non-secret row (the card's cardholder
+                                // name, brand and expiry, and every identity
+                                // field) hands its own already-rendered value
+                                // back -- see `DetailAction::CopyValue`.
+                                DetailAction::CopyValue(value) => {
+                                    ui.ctx().copy_text(value);
+                                }
                                 DetailAction::CopyTotp => {
                                     // Only `Code` has anything to copy --
                                     // `NoSecret`, `Fetching`,
@@ -1009,7 +1042,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                                 // vault is now empty --
                                                 // either way the reset block
                                                 // above clears `mode`/
-                                                // `reveal_password`/
+                                                // `reveal`/
                                                 // `totp_code` for us on the
                                                 // next frame.
                                                 selected_id = items.first().map(|i| i.id.clone());
@@ -1410,7 +1443,7 @@ fn draw_read_arm(
     fill_count: u32,
     totp_state: &TotpState,
     delete_pending: bool,
-    reveal_password: &mut bool,
+    reveal: &mut detail::RevealState,
     icon: Option<&egui::TextureHandle>,
 ) -> DetailAction {
     let mut action = draw_detail_read(
@@ -1419,7 +1452,7 @@ fn draw_read_arm(
         fill_count,
         totp_state,
         delete_pending,
-        reveal_password,
+        reveal,
         icon,
     );
     // Ctrl+Shift+F (spec section 5) is the keyboard equivalent of clicking
@@ -1596,7 +1629,7 @@ fn apply_vault_load_result(
                 // A reload where the selected item no longer exists (deleted
                 // on another device, say): drop the stale id. Left alone,
                 // `selected_id` would keep pointing at the vanished item and
-                // leave `mode`/`reveal_password`/`totp_code` stuck as they
+                // leave `mode`/`reveal`/`totp_code` stuck as they
                 // were; clearing it routes through that same reset block.
                 Some(id) => {
                     if !items.iter().any(|i| &i.id == id) {
@@ -3234,7 +3267,7 @@ mod draw_read_arm_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(input(false), |_ui| {});
 
-        let mut reveal_password = false;
+        let mut reveal = crate::vault_window::detail::RevealState::default();
         let mut action = DetailAction::None;
         let output = ctx.run_ui(input(hotkey_pressed), |ui| {
             action = draw_read_arm(
@@ -3243,7 +3276,7 @@ mod draw_read_arm_tests {
                 3,
                 &TotpState::NoSecret,
                 false,
-                &mut reveal_password,
+                &mut reveal,
                 None,
             );
         });

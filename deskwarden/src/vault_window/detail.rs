@@ -22,7 +22,7 @@
 
 use crate::password_strength;
 use crate::theme;
-use crate::vault_bridge::{ItemKind, VaultItem};
+use crate::vault_bridge::{CardData, IdentityData, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 
 /// The One-time code row's single source of truth. Replaces a bare
@@ -171,6 +171,31 @@ pub fn totp_row_for(totp: &TotpState) -> Option<TotpRow<'_>> {
     }
 }
 
+/// Which of the read pane's masked values are currently revealed.
+///
+/// **This is owned by `vault_window::mod`'s `run`, in its per-selection state
+/// block next to where the lone `reveal_password` bool used to sit, and is
+/// cleared by the same selection-change reset.** That placement is the whole
+/// point of the type existing. A `let mut revealed = false` declared inside
+/// the pane closure is reset on every frame: the Reveal click flips it, the
+/// frame ends, the binding is dropped, and the next frame draws the value
+/// masked again -- a toggle that visibly does nothing. That exact bug was
+/// found and fixed once already in `detail_edit.rs`, and adding two more
+/// masked rows is exactly the moment it would come back.
+///
+/// One struct rather than three `&mut bool` parameters so adding a fourth
+/// masked row cannot quietly reuse another row's flag: two rows sharing one
+/// bool would reveal both at once.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RevealState {
+    /// A login's password row.
+    pub password: bool,
+    /// A card's number row.
+    pub card_number: bool,
+    /// A card's security-code row.
+    pub card_code: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailAction {
     None,
@@ -179,6 +204,22 @@ pub enum DetailAction {
     CopyUsername,
     CopyPassword,
     CopyTotp,
+    /// A card's number was copied. Named rather than carrying the value, for
+    /// the same reason [`Self::CopyPassword`] is: the caller already holds the
+    /// item and can read the `Zeroizing<String>` out of it, so the plaintext
+    /// secret never gets a second, non-zeroizing home inside this enum.
+    CopyCardNumber,
+    /// A card's security code was copied. See [`Self::CopyCardNumber`].
+    CopyCardCode,
+    /// A non-secret row was copied, carrying its own already-rendered value --
+    /// the card's cardholder name, brand and expiry, and every identity field.
+    ///
+    /// These carry the value because naming them would mean twenty-odd
+    /// variants and a second copy of the field-to-value mapping in
+    /// `vault_window::mod`, which is how the two would drift. The two card
+    /// secrets deliberately do *not* use this door; nothing that reaches here
+    /// is `Zeroizing` in the model either.
+    CopyValue(String),
     OpenWebsite(String),
     /// The header's Delete button was clicked. `vault_window::mod`'s
     /// two-click `confirm_click` gates whether this click is armed or
@@ -328,6 +369,108 @@ pub fn detail_body_for(kind: ItemKind) -> DetailBody {
     }
 }
 
+/// Trimmed text, or `None` when there is nothing to render. The single
+/// empty-suppression rule this file's panes share: an empty string and an
+/// absent key are the same thing to a reader, and a blank label is worse than
+/// no row.
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// A card's expiry as `MM/YYYY`, with either half allowed to be missing.
+///
+/// Both halves are strings on the wire and either may be absent, so "what does
+/// a card with a month but no year show" is a decision rather than an
+/// accident: it renders whichever half exists rather than a half-formed
+/// `03/`, which reads as data loss.
+///
+/// **The month is padded only when it needs padding.** Bitwarden's own
+/// `item.card` template sends `expMonth: "04"` -- already zero-padded (see
+/// `.superpowers/sdd/item-shapes-capture.md`) -- so a formatter that blindly
+/// prefixed a `0` would render `004`. Parsing first and reformatting handles
+/// both shapes; anything that does not parse as a month (`"xx"`, `"13"`,
+/// `"0"`) is passed through untouched, because showing an unexpected value
+/// beats silently dropping it.
+pub fn card_expiry_text(month: Option<&str>, year: Option<&str>) -> Option<String> {
+    let month = non_empty(month).map(|m| match m.parse::<u8>() {
+        Ok(n) if (1..=12).contains(&n) => format!("{n:02}"),
+        _ => m.to_string(),
+    });
+    let year = non_empty(year).map(str::to_string);
+    match (month, year) {
+        (Some(m), Some(y)) => Some(format!("{m}/{y}")),
+        (Some(m), None) => Some(m),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
+/// The identity pane's rows, grouped, with empty fields and empty groups
+/// removed.
+///
+/// Pure so the suppression rule is tested directly rather than inferred from a
+/// screenshot. An identity has eighteen fields and a real one populates a
+/// handful; without this the pane is mostly blank labels, which is the risk
+/// the spec names by name.
+///
+/// `address3` is in the Address group deliberately. It is absent from
+/// Bitwarden's captured template but present in its documented schema, so it
+/// is modelled (see [`IdentityData`]'s doc); if a real item carries it, the
+/// pane shows it instead of hiding it in `other`. It costs one suppressed row
+/// on every item that does not.
+pub fn identity_groups(identity: &IdentityData) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+    let f = |label: &'static str, value: &Option<String>| {
+        non_empty(value.as_deref()).map(|v| (label, v.to_string()))
+    };
+    let group = |name: &'static str, rows: Vec<Option<(&'static str, String)>>| {
+        (name, rows.into_iter().flatten().collect::<Vec<_>>())
+    };
+    let groups = vec![
+        group(
+            "Name",
+            vec![
+                f("Title", &identity.title),
+                f("First name", &identity.first_name),
+                f("Middle name", &identity.middle_name),
+                f("Last name", &identity.last_name),
+            ],
+        ),
+        group(
+            "Contact",
+            vec![
+                f("Email", &identity.email),
+                f("Phone", &identity.phone),
+                f("Username", &identity.username),
+                f("Company", &identity.company),
+            ],
+        ),
+        group(
+            "Address",
+            vec![
+                f("Address", &identity.address1),
+                f("Address 2", &identity.address2),
+                f("Address 3", &identity.address3),
+                f("City", &identity.city),
+                f("State", &identity.state),
+                f("Postal code", &identity.postal_code),
+                f("Country", &identity.country),
+            ],
+        ),
+        group(
+            "Government IDs",
+            vec![
+                f("SSN", &identity.ssn),
+                f("Passport number", &identity.passport_number),
+                f("Licence number", &identity.license_number),
+            ],
+        ),
+    ];
+    groups
+        .into_iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
 /// The metadata strip's text: "Updated N days ago · Filled N times ·
 /// Strength: X". `updated_days_ago` is `None` when the item carries no
 /// parseable `revisionDate` (shows "Updated recently" rather than
@@ -388,7 +531,9 @@ pub fn draw_detail_read(
     // what the Delete button shows; `vault_window::mod`'s `confirm_click` is
     // what actually decides whether a click here is arming or confirming.
     delete_pending: bool,
-    reveal_password: &mut bool,
+    // Owned by `vault_window::mod`'s `run` and reset on selection change --
+    // see `RevealState`'s doc for why it cannot live inside this function.
+    reveal: &mut RevealState,
     // This item's favicon texture, if `vault_window::mod`'s icon cache has
     // already loaded one -- mirrors `item_list.rs`'s `item_row`, which uses
     // the exact same `Some(tex)`/`None` pattern for its row avatar. `None`
@@ -474,7 +619,7 @@ pub fn draw_detail_read(
             card(ui, "LOGIN CREDENTIALS", |ui| {
                 credential_row(ui, "Username", username, "Copy", &mut action, DetailAction::CopyUsername);
                 theme::hairline(ui);
-                password_row(ui, password, reveal_password, &mut action);
+                password_row(ui, password, &mut reveal.password, &mut action);
                 // Whether there is a row at all is decided by `totp_row_for` and
                 // nowhere else (see its doc), so "this item looks like it has no
                 // 2FA" is a decision a unit test can call directly instead of one
@@ -503,16 +648,16 @@ pub fn draw_detail_read(
         // The body is the NOTES card below, and that card is shared with
         // every other kind rather than duplicated here.
         DetailBody::NotesOnly => {}
-        // Task 4 fills these two in. A heading-only card, deliberately not
-        // `todo!()`: this task is meant to be independently reviewable by
-        // running the app, and `todo!()` panics the moment a card is
-        // selected.
         DetailBody::Card => {
-            card(ui, "CARD DETAILS", |_ui| {});
+            card(ui, "CARD DETAILS", |ui| {
+                card_rows(ui, item.card.as_ref(), reveal, &mut action);
+            });
             ui.add_space(10.0);
         }
         DetailBody::Identity => {
-            card(ui, "IDENTITY", |_ui| {});
+            card(ui, "IDENTITY", |ui| {
+                identity_rows(ui, item.identity.as_ref(), &mut action);
+            });
             ui.add_space(10.0);
         }
         DetailBody::Unsupported(pane) => {
@@ -616,15 +761,32 @@ fn credential_row(
 }
 
 fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
+    masked_row(ui, "Password", password, revealed, action, DetailAction::CopyPassword);
+}
+
+/// A secret row: monospace, bullets until revealed, with Reveal and Copy.
+///
+/// Extracted verbatim from `password_row` when the card pane gained two more
+/// secrets, so the treatment the spec calls for ("exactly as passwords are")
+/// is literally the same code rather than a second copy that drifts. The
+/// bullet run is `max(8)` so a short value does not leak its length.
+fn masked_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    revealed: &mut bool,
+    action: &mut DetailAction,
+    on_copy: DetailAction,
+) {
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            ui.label(RichText::new("Password").size(11.0).color(theme::TEXT_FAINT));
-            let shown = if *revealed { password.to_string() } else { "•".repeat(password.chars().count().max(8)) };
+            ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
+            let shown = if *revealed { value.to_string() } else { "•".repeat(value.chars().count().max(8)) };
             ui.label(RichText::new(shown).size(13.0).color(theme::INK).family(egui::FontFamily::Monospace));
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if theme::secondary_button(ui, "Copy").clicked() {
-                *action = DetailAction::CopyPassword;
+                *action = on_copy;
             }
             if theme::secondary_button(ui, if *revealed { "Hide" } else { "Reveal" }).clicked() {
                 *revealed = !*revealed;
@@ -632,6 +794,98 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
         });
     });
     ui.add_space(6.0);
+}
+
+/// A short line of body text for a pane that has a heading and no rows.
+///
+/// The alternative is an empty box under a heading, which `notes_text`'s own
+/// doc argues reads as contents that failed to load rather than as an item
+/// with nothing in it. Reachable for real: the spec's rule is that a `type: 3`
+/// carrying no `card` object is an *empty card*, not an unsupported item.
+fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(theme::TEXT_FAINT));
+}
+
+/// The CARD DETAILS rows. Empty fields do not render, exactly as the identity
+/// pane's do not -- a card populates five fields at most and a blank "Brand"
+/// label is noise.
+///
+/// The number and the security code are the only masked values on either
+/// pane, and their reveal flags come from the caller (see [`RevealState`]).
+fn card_rows(
+    ui: &mut egui::Ui,
+    card_data: Option<&CardData>,
+    reveal: &mut RevealState,
+    action: &mut DetailAction,
+) {
+    let Some(data) = card_data else {
+        empty_pane_note(ui, "No card details on this item.");
+        return;
+    };
+
+    let cardholder = non_empty(data.cardholder_name.as_deref()).map(str::to_string);
+    let brand = non_empty(data.brand.as_deref()).map(str::to_string);
+    let number = non_empty(data.number.as_deref().map(|n| n.as_str())).map(str::to_string);
+    let expiry = card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref());
+    let code = non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string);
+
+    if cardholder.is_none() && brand.is_none() && number.is_none() && expiry.is_none() && code.is_none() {
+        empty_pane_note(ui, "No card details on this item.");
+        return;
+    }
+
+    // `first` tracks whether a hairline is owed, so suppressing a row never
+    // leaves a separator with nothing on one side of it.
+    let mut first = true;
+    let separate = |ui: &mut egui::Ui, first: &mut bool| {
+        if *first {
+            *first = false;
+        } else {
+            theme::hairline(ui);
+        }
+    };
+    if let Some(v) = &cardholder {
+        separate(ui, &mut first);
+        credential_row(ui, "Cardholder name", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+    }
+    if let Some(v) = &brand {
+        separate(ui, &mut first);
+        credential_row(ui, "Brand", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+    }
+    if let Some(v) = &number {
+        separate(ui, &mut first);
+        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber);
+    }
+    if let Some(v) = &expiry {
+        separate(ui, &mut first);
+        credential_row(ui, "Expiry", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+    }
+    if let Some(v) = &code {
+        separate(ui, &mut first);
+        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode);
+    }
+}
+
+/// The IDENTITY rows, grouped by [`identity_groups`] and nothing else -- the
+/// suppression of empty fields *and* of whole empty groups is that function's
+/// decision, tested directly, and this only draws what it hands back.
+fn identity_rows(ui: &mut egui::Ui, identity: Option<&IdentityData>, action: &mut DetailAction) {
+    let groups = identity.map(identity_groups).unwrap_or_default();
+    if groups.is_empty() {
+        empty_pane_note(ui, "No identity details on this item.");
+        return;
+    }
+    for (index, (group_name, rows)) in groups.iter().enumerate() {
+        if index > 0 {
+            theme::hairline(ui);
+            ui.add_space(4.0);
+        }
+        ui.label(theme::semibold(*group_name, 11.0).color(theme::TEXT_SECONDARY));
+        ui.add_space(4.0);
+        for (label, value) in rows {
+            credential_row(ui, label, value, "Copy", action, DetailAction::CopyValue(value.clone()));
+        }
+    }
 }
 
 fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
@@ -837,7 +1091,12 @@ mod tests {
     /// frame (see `paint_window_background`'s doc), so this runs a throwaway
     /// frame before the real one -- without it, every `FontFamily::Name`
     /// lookup in the pane resolves against a family that does not exist yet.
-    fn painted_text(item: &VaultItem, totp: &TotpState, delete_pending: bool) -> Vec<String> {
+    fn painted_text(
+        item: &VaultItem,
+        totp: &TotpState,
+        delete_pending: bool,
+        reveal: RevealState,
+    ) -> Vec<String> {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -850,9 +1109,9 @@ mod tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
 
-        let mut reveal_password = false;
+        let mut reveal = reveal;
         let output = ctx.run_ui(input(), |ui| {
-            draw_detail_read(ui, item, 3, totp, delete_pending, &mut reveal_password, None);
+            draw_detail_read(ui, item, 3, totp, delete_pending, &mut reveal, None);
         });
 
         let mut texts = Vec::new();
@@ -879,7 +1138,11 @@ mod tests {
     }
 
     fn painted(item: &VaultItem, totp: &TotpState) -> Vec<String> {
-        painted_text(item, totp, false)
+        painted_text(item, totp, false, RevealState::default())
+    }
+
+    fn painted_with_reveal(item: &VaultItem, totp: &TotpState, reveal: RevealState) -> Vec<String> {
+        painted_text(item, totp, false, reveal)
     }
 
     fn contains(texts: &[String], needle: &str) -> bool {
@@ -1362,6 +1625,241 @@ mod tests {
             totp_row_for(&TotpState::NoCodeReported),
             totp_row_for(&TotpState::Unavailable)
         );
+    }
+
+    /// A card with every field populated. The number is Bitwarden's own
+    /// template value, which is what the masking assertions look for.
+    fn a_full_card() -> VaultItem {
+        let mut item = an_item(Some(3));
+        item.card = Some(crate::vault_bridge::CardData {
+            cardholder_name: Some("John Doe".to_string()),
+            brand: Some("visa".to_string()),
+            number: Some("4242424242424242".to_string().into()),
+            exp_month: Some("04".to_string()),
+            exp_year: Some("2023".to_string()),
+            code: Some("123".to_string().into()),
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    #[test]
+    fn the_card_pane_paints_every_populated_row() {
+        let texts = painted(&a_full_card(), &TotpState::NoSecret);
+        for label in [
+            "CARD DETAILS",
+            "Cardholder name",
+            "John Doe",
+            "Brand",
+            "visa",
+            "Number",
+            "Expiry",
+            "04/2023",
+            "Security code",
+        ] {
+            assert!(contains(&texts, label), "the card pane painted no {label:?}: {texts:?}");
+        }
+    }
+
+    /// **Masked by default.** The assertion is negative on purpose: it is not
+    /// enough that a Reveal button exists, the digits must not be in the
+    /// frame's own shape list at all. `4242` rather than the whole number, so
+    /// a partial mask ("**** 4242") fails too.
+    #[test]
+    fn the_card_number_and_security_code_are_masked_by_default() {
+        let texts = painted(&a_full_card(), &TotpState::NoSecret);
+        assert!(
+            !contains(&texts, "4242"),
+            "the card number was painted in the clear by default: {texts:?}"
+        );
+        assert!(
+            !contains(&texts, "123"),
+            "the security code was painted in the clear by default: {texts:?}"
+        );
+        assert!(
+            contains(&texts, "Reveal"),
+            "the card pane offers no way to reveal what it masked: {texts:?}"
+        );
+    }
+
+    /// The other half: the mask is driven by state the *caller* owns, so a
+    /// toggle can survive a frame. A `let mut revealed = false` inside the
+    /// pane would make this unreachable -- which is precisely the bug this
+    /// pins, already found and fixed once in `detail_edit.rs`.
+    #[test]
+    fn revealing_is_driven_by_caller_owned_state_that_outlives_the_frame() {
+        let reveal = RevealState {
+            password: false,
+            card_number: true,
+            card_code: true,
+        };
+        let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
+        assert!(
+            contains(&texts, "4242424242424242"),
+            "a revealed card number did not paint, so the pane ignores the caller's \
+             reveal state: {texts:?}"
+        );
+        assert!(contains(&texts, "123"), "a revealed security code did not paint: {texts:?}");
+        assert!(contains(&texts, "Hide"), "a revealed row still offers Reveal: {texts:?}");
+    }
+
+    /// Nothing else on these panes is masked -- the requirement is exactly two
+    /// fields, so a cardholder name behind bullets would be as wrong as a
+    /// number in front of them.
+    #[test]
+    fn nothing_but_the_number_and_the_code_is_masked_on_a_card() {
+        let texts = painted(&a_full_card(), &TotpState::NoSecret);
+        for visible in ["John Doe", "visa", "04/2023"] {
+            assert!(
+                contains(&texts, visible),
+                "{visible:?} was masked; only the number and the security code may be: {texts:?}"
+            );
+        }
+    }
+
+    /// A `type: 3` with no `card` object is an *empty card*, not an unknown
+    /// type (the spec's own words). It still gets the heading -- and a line of
+    /// body text, because an empty box under a heading reads as a card whose
+    /// contents failed to load.
+    #[test]
+    fn a_card_with_no_card_object_says_it_is_empty_rather_than_drawing_a_blank_box() {
+        let texts = painted(&an_item(Some(3)), &TotpState::NoSecret);
+        assert!(contains(&texts, "CARD DETAILS"), "{texts:?}");
+        assert!(
+            contains(&texts, "No card details"),
+            "an empty card drew a heading over nothing: {texts:?}"
+        );
+        for absent in ["Cardholder name", "Number", "Security code", "Reveal"] {
+            assert!(
+                !contains(&texts, absent),
+                "an empty card drew a {absent:?} row it has no data for: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_identity_pane_paints_its_groups_and_rows() {
+        let mut item = an_item(Some(4));
+        item.identity = Some(crate::vault_bridge::IdentityData {
+            first_name: Some("Ada".to_string()),
+            last_name: Some("Lovelace".to_string()),
+            email: Some("ada@example.com".to_string()),
+            passport_number: Some("P123".to_string()),
+            ..Default::default()
+        });
+        let texts = painted(&item, &TotpState::NoSecret);
+        for label in [
+            "IDENTITY",
+            "Name",
+            "First name",
+            "Ada",
+            "Last name",
+            "Lovelace",
+            "Contact",
+            "Email",
+            "ada@example.com",
+            "Government IDs",
+            "Passport number",
+            "P123",
+        ] {
+            assert!(contains(&texts, label), "the identity pane painted no {label:?}: {texts:?}");
+        }
+        // An empty group must not render its heading either.
+        assert!(
+            !contains(&texts, "Address"),
+            "an identity with no address still drew the Address group: {texts:?}"
+        );
+    }
+
+    /// Eighteen fields, none populated: eighteen blank labels is the failure
+    /// mode the suppression rule exists to prevent, and the group headings are
+    /// half of it.
+    #[test]
+    fn an_empty_identity_paints_no_group_headings() {
+        let mut item = an_item(Some(4));
+        item.identity = Some(crate::vault_bridge::IdentityData::default());
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(contains(&texts, "IDENTITY"), "{texts:?}");
+        for heading in ["Name", "Contact", "Address", "Government IDs"] {
+            assert!(
+                !contains(&texts, heading),
+                "an empty identity drew the {heading:?} group heading: {texts:?}"
+            );
+        }
+        assert!(
+            contains(&texts, "No identity details"),
+            "an empty identity drew a heading over nothing: {texts:?}"
+        );
+    }
+
+    /// The plan's test, plus the case the plan got wrong. Bitwarden's own
+    /// `item.card` template sends `expMonth: "04"` -- already padded -- so a
+    /// formatter that only handles the unpadded case would produce `"004"`.
+    #[test]
+    fn card_expiry_renders_whatever_half_is_present() {
+        let t = |m, y| card_expiry_text(m, y);
+        assert_eq!(t(Some("3"), Some("2028")), Some("03/2028".to_string()));
+        assert_eq!(t(Some("11"), Some("2028")), Some("11/2028".to_string()));
+        // The verified capture's own shape: already zero-padded, and it must
+        // not be padded a second time.
+        assert_eq!(t(Some("04"), Some("2023")), Some("04/2023".to_string()));
+        // Either half may be absent, and a half-formed "03/" reads as data
+        // loss rather than as a partially-filled item.
+        assert_eq!(t(Some("3"), None), Some("03".to_string()));
+        assert_eq!(t(None, Some("2028")), Some("2028".to_string()));
+        assert_eq!(t(None, None), None);
+        assert_eq!(t(Some(""), Some("")), None);
+        assert_eq!(t(Some("  "), Some(" ")), None);
+        assert_eq!(t(Some(" 4 "), Some(" 2028 ")), Some("04/2028".to_string()));
+        // Not a month: show it rather than swallowing it.
+        assert_eq!(t(Some("xx"), Some("2028")), Some("xx/2028".to_string()));
+        assert_eq!(t(Some("13"), Some("2028")), Some("13/2028".to_string()));
+        assert_eq!(t(Some("0"), Some("2028")), Some("0/2028".to_string()));
+    }
+
+    #[test]
+    fn identity_groups_hide_empty_fields_and_empty_groups() {
+        let identity = crate::vault_bridge::IdentityData {
+            first_name: Some("Ada".to_string()),
+            last_name: Some("Lovelace".to_string()),
+            email: Some("ada@example.com".to_string()),
+            ..Default::default()
+        };
+        let groups = identity_groups(&identity);
+        let names: Vec<&str> = groups.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["Name", "Contact"], "an empty group was rendered");
+
+        let name_fields: Vec<&str> = groups[0].1.iter().map(|(l, _)| *l).collect();
+        assert_eq!(name_fields, vec!["First name", "Last name"]);
+    }
+
+    #[test]
+    fn an_entirely_empty_identity_renders_no_groups() {
+        assert!(identity_groups(&crate::vault_bridge::IdentityData::default()).is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_identity_fields_count_as_empty() {
+        let identity = crate::vault_bridge::IdentityData {
+            company: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(identity_groups(&identity).is_empty());
+    }
+
+    /// `address3` is absent from Bitwarden's captured template but present in
+    /// its documented schema, so it is modelled on purpose. If a real item
+    /// carries it, the pane must show it rather than hide it in `other`.
+    #[test]
+    fn address3_is_in_the_address_group() {
+        let identity = crate::vault_bridge::IdentityData {
+            address3: Some("Flat 3".to_string()),
+            ..Default::default()
+        };
+        let groups = identity_groups(&identity);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "Address");
+        assert_eq!(groups[0].1, vec![("Address 3", "Flat 3".to_string())]);
     }
 
     #[test]
