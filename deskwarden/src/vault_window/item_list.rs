@@ -123,6 +123,25 @@ pub fn draw_item_list(
     let mut action = ItemListAction::None;
     visible_ids.clear();
 
+    // Design 2b's list container butts STRAIGHT against the header strip:
+    // there is no gap between the two, and the list's own `padding: 10px` is
+    // the only space above the first tile. egui would otherwise insert its
+    // ambient `item_spacing.y` between the two frames -- 8, from
+    // `theme::apply` -- putting 18pt above the first tile against 10 at the
+    // sides, which is the reported defect.
+    //
+    // Zeroed HERE, before the strip is drawn, and not between the two frames:
+    // egui's placer advances its cursor by `rect + item_spacing` as each
+    // widget is ALLOCATED, so by the time the strip has been shown the gap is
+    // already committed and a later change to the spacing cannot retract it.
+    //
+    // This is the only vertical spacing this function relies on egui for --
+    // the strip's padding, the list's padding and the rows' `gap: 6px` are
+    // all set explicitly -- so zeroing it costs nothing else. The list frame
+    // below re-sets `item_spacing.y` to `ROW_GAP` on its own ui before
+    // `show_rows` reads it, so the scroll pitch is untouched by this.
+    ui.spacing_mut().item_spacing.y = 0.0;
+
     // Design 4.8/2b's toolbar strip: `padding: 12px; gap: 8px; border-bottom:
     // 1px solid #eae7e7; background: #ffffff` -- a WHITE tile spanning the
     // full width of this pane, with the search box and `+ New` on it. This is
@@ -190,8 +209,19 @@ pub fn draw_item_list(
 
     // Design 2b's list padding (`padding: 10px`), applied here now that the
     // pane's panel frame has none -- see the header strip's comment above.
+    //
+    // The RIGHT padding is 0 because the scroll bar is given that lane
+    // instead: see `theme::scrollbar_in_gutter` below, which reserves exactly
+    // `LIST_PADDING` for itself. The row tiles therefore still end at
+    // `pane_right - LIST_PADDING`, unchanged, and the bar is centred in the
+    // padding rather than drawn hard against the tiles.
     egui::Frame::new()
-        .inner_margin(Margin::same(LIST_PADDING as i8))
+        .inner_margin(Margin {
+            left: LIST_PADDING as i8,
+            right: 0,
+            top: LIST_PADDING as i8,
+            bottom: LIST_PADDING as i8,
+        })
         .show(ui, |ui| {
             // The design's `gap: 6px`, set on THIS ui rather than inside the
             // closure below. `show_rows` reads `item_spacing.y` from the ui it
@@ -201,8 +231,13 @@ pub fn draw_item_list(
             // maths on the old pitch, which puts the list out of register
             // with its own scrollbar.
             ui.spacing_mut().item_spacing.y = ROW_GAP;
+            theme::scrollbar_in_gutter(ui, LIST_PADDING);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                // Required by `scrollbar_in_gutter`: the reserved lane is
+                // what keeps the tiles one width, and egui only reserves it
+                // for a bar it is actually showing.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show_rows(ui, ROW_TILE_HEIGHT, filtered.len(), |ui, row_range| {
                     for row in row_range {
                         let item = filtered[row];
@@ -694,6 +729,105 @@ mod row_tile_tests {
             .unwrap_or_else(|| panic!("{needle:?} was never painted; painted: {:?}", p.texts))
             .1
             .clone()
+    }
+
+    /// Design 2b's header strip: `padding: 12px` around a `height: 34px`
+    /// search box, i.e. 12 + 34 + 12. Written out rather than derived from
+    /// `theme::SEARCH_FIELD_HEIGHT` so this stays an INDEPENDENT statement of
+    /// the geometry -- a test that recomputed the strip from the same
+    /// constants the code uses would stay green if both moved together.
+    const STRIP_HEIGHT: f32 = 58.0;
+
+    #[test]
+    fn the_first_tile_sits_exactly_the_lists_own_padding_below_the_header_strip() {
+        // THE REPORT: "top padding above the first tile is too big; should
+        // match left/right". Design 2b's list container butts straight against
+        // the header strip and carries `padding: 10px` of its own, so at this
+        // pane the first tile's top edge is at 58 + 10 = 68 and its left edge
+        // at 10 -- the SAME 10.
+        //
+        // ABSOLUTE on both axes against a pinned pane geometry, deliberately:
+        // asserting `top - strip_bottom == left` would have stayed green while
+        // egui's ambient `item_spacing.y` (8, from `theme::apply`) pushed the
+        // whole list down, because both sides are measured off the same list.
+        let p = paint(&[login("Ledgerline", "a.novak@ledgerline.com")], None);
+        let tile = one_tile(&p);
+        assert!(
+            (tile.rect.top() - (STRIP_HEIGHT + LIST_PADDING)).abs() < 0.5,
+            "the first row tile's top edge is at y={}, expected {} (the {STRIP_HEIGHT}pt header \
+             strip plus the list's own {LIST_PADDING}pt padding and NOTHING else -- egui's \
+             ambient item_spacing is sitting between the strip and the list)",
+            tile.rect.top(),
+            STRIP_HEIGHT + LIST_PADDING
+        );
+        assert!(
+            (tile.rect.left() - LIST_PADDING).abs() < 0.5,
+            "the first row tile's left edge is at x={}, expected {LIST_PADDING}",
+            tile.rect.left()
+        );
+    }
+
+    #[test]
+    fn the_scrollbar_is_centred_in_the_lists_right_padding_and_the_tiles_keep_their_width() {
+        // THE REPORT: "the scrollbar sits against the tiles' right edge;
+        // centre it in the right padding".
+        //
+        // The gutter is the list's own `padding: 10px` on the right, i.e.
+        // x in [380, 390] at this pane. A 6pt bar centred in it occupies
+        // [382, 388]. ABSOLUTE numbers, not "the bar is right of the tiles".
+        //
+        // Paired with the tile geometry, which must NOT move: giving the
+        // gutter to the scroll area only works if the bar takes its space
+        // from the content, so the tiles still span 10..380.
+        const GUTTER: std::ops::Range<f32> = 380.0..390.0;
+        let items: Vec<VaultItem> = (0..40)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let p = paint(&items, None);
+
+        for tile in row_tiles(&p) {
+            assert!(
+                (tile.rect.left() - LIST_PADDING).abs() < 0.5
+                    && (tile.rect.right() - (PANE_WIDTH - LIST_PADDING)).abs() < 0.5,
+                "a row tile spans {}..{}, expected {LIST_PADDING}..{} -- the tiles must keep \
+                 their exact width when the scrollbar is given the gutter",
+                tile.rect.left(),
+                tile.rect.right(),
+                PANE_WIDTH - LIST_PADDING
+            );
+        }
+
+        // The scroll bar's own two rects (track and handle) are the only
+        // things painted in the gutter at all. Found by geometry -- they are
+        // the rects that lie strictly right of the tiles.
+        let in_gutter: Vec<egui::Rect> = p
+            .rects
+            .iter()
+            .map(|r| r.rect)
+            .filter(|r| r.right() > PANE_WIDTH - LIST_PADDING + 0.5 && r.width() < LIST_PADDING)
+            .collect();
+        assert!(
+            !in_gutter.is_empty(),
+            "nothing at all was painted in the list's right padding, so there is no scrollbar \
+             there to centre; painted: {:?}",
+            p.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
+        );
+        for bar in &in_gutter {
+            assert!(
+                bar.left() >= GUTTER.start - 0.01 && bar.right() <= GUTTER.end + 0.01,
+                "the scrollbar spans x={}..{}, which leaves the {GUTTER:?} gutter -- it is being \
+                 drawn over the tiles",
+                bar.left(),
+                bar.right()
+            );
+            let slack_left = bar.left() - GUTTER.start;
+            let slack_right = GUTTER.end - bar.right();
+            assert!(
+                (slack_left - slack_right).abs() < 0.51,
+                "the scrollbar has {slack_left}pt of gutter to its left and {slack_right}pt to \
+                 its right -- it is not centred"
+            );
+        }
     }
 
     #[test]

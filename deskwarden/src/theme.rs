@@ -1062,6 +1062,51 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
     });
 }
 
+/// Width of a scroll bar drawn by [`scrollbar_in_gutter`].
+///
+/// egui's own `ScrollStyle::solid()` uses 6 for the same thing; there is no
+/// scroll bar anywhere in the design document to read a value off, so this
+/// follows egui rather than inventing a number.
+pub const SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// Configures `ui` so that an [`egui::ScrollArea`] shown inside it reserves a
+/// `gutter`-wide lane down its right-hand edge and draws its bar CENTRED in
+/// that lane, instead of over the content's own right edge.
+///
+/// The caller MUST pair this with
+/// `.scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)` and with a
+/// container whose right padding is ZERO -- the lane replaces that padding.
+/// Both halves are load-bearing:
+///
+/// * The lane is reserved by `floating_allocated_width`, which egui only
+///   applies on the axes it is showing a bar for. Under the default
+///   `VisibleWhenNeeded` the lane would therefore appear and disappear as the
+///   content crossed the overflow threshold, and the content's right edge --
+///   the row tiles' -- would jump 10pt sideways with it. `AlwaysVisible`
+///   makes the reservation unconditional, so the content keeps one width.
+/// * The bar stays FLOATING (egui's default), not `solid()`. Only the
+///   floating branch fades the bar out when the pointer is away from the
+///   area, which is the behaviour this list already had; `solid()` pins both
+///   opacities to 1.0 and takes the handle's colour from
+///   `widgets.inactive.bg_fill`, which [`apply`] sets to [`CARD`] -- a white
+///   handle on a white track, i.e. invisible. Fixing that would have meant
+///   overriding three widget states just to style a scroll bar.
+///
+/// The centring itself is `bar_outer_margin`: egui pins a floating bar's
+/// RIGHT edge at `outer_rect.right() - bar_outer_margin`, and the outer rect
+/// now ends at the container's own right edge because of the reserved lane.
+/// Half the leftover lane on each side therefore centres it. `floating_width`
+/// is raised to the full `bar_width` so the bar does not GROW leftward over
+/// the content when hovered -- a bar that only stays centred while dormant
+/// would not have fixed the report.
+pub fn scrollbar_in_gutter(ui: &mut Ui, gutter: f32) {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.floating_allocated_width = gutter;
+    scroll.bar_width = SCROLLBAR_WIDTH;
+    scroll.floating_width = SCROLLBAR_WIDTH;
+    scroll.bar_outer_margin = (gutter - SCROLLBAR_WIDTH) / 2.0;
+}
+
 /// A muted field label ("User name", "Master password").
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
