@@ -28,6 +28,34 @@ const DEFAULT_AUTO_LOCK_MINUTES: u64 = 15;
 /// being treated as meaningful.
 const MIN_AUTO_LOCK_MINUTES: u64 = 1;
 
+/// The auto-lock period that will *actually* be used for a stored
+/// `auto_lock_minutes` -- [`MIN_AUTO_LOCK_MINUTES`] applied, and nothing else.
+///
+/// Public and pure, and separate from [`Settings::auto_lock_timeout`], because
+/// the preferences window has to be able to ask the question "what will this
+/// number really do?" before it offers the number to the user. A spinner that
+/// accepted `0` would display `0` while the vault locked after a minute --
+/// a control whose displayed value is not the value in effect, which is the
+/// same silent-override defect class as a switch that does nothing.
+/// `prefs_ui` therefore routes every value it accepts (typed, stepped, and the
+/// one it loads out of `settings.json`) through this function, so the number on
+/// screen and the number `auto_lock_timeout` uses are the same number by
+/// construction rather than by two matching `.max()` calls that could drift.
+///
+/// A floor only: there is deliberately no ceiling. `auto_lock_timeout`
+/// saturates rather than overflowing, so every `u64` above the floor is a
+/// meaningful timeout, and inventing a maximum here would mean a hand-written
+/// `settings.json` silently losing its value the first time the preferences
+/// window was opened.
+pub const fn clamp_auto_lock_minutes(minutes: u64) -> u64 {
+    // `Ord::max` is not const, hence the explicit branch.
+    if minutes < MIN_AUTO_LOCK_MINUTES {
+        MIN_AUTO_LOCK_MINUTES
+    } else {
+        minutes
+    }
+}
+
 /// Smallest inner size the vault window may ever be given, in egui points.
 ///
 /// The vault window's three panes are two fixed-width columns (212 + 390)
@@ -331,16 +359,16 @@ impl Settings {
     }
 
     pub fn auto_lock_timeout(&self) -> Duration {
-        // `.max(MIN_AUTO_LOCK_MINUTES)` first, so the floor applies to the
-        // stored value itself rather than to a possibly-already-overflowed
-        // product. `saturating_mul` handles the separate case of an absurdly
-        // large stored value (a corrupt or hand-edited file): plain `* 60`
-        // would overflow `u64` and panic in a debug build (or silently wrap
-        // to a tiny duration in release), where saturating to
+        // The floor is applied to the stored value itself rather than to a
+        // possibly-already-overflowed product; see
+        // [`clamp_auto_lock_minutes`] for why there is a floor at all.
+        // `saturating_mul` handles the separate case of an absurdly large
+        // stored value (a corrupt or hand-edited file): plain `* 60` would
+        // overflow `u64` and panic in a debug build (or silently wrap to a
+        // tiny duration in release), where saturating to
         // `Duration::from_secs(u64::MAX)` -- effectively forever -- is a far
         // safer failure mode for a *lock* timeout to have.
-        let minutes = self.auto_lock_minutes.max(MIN_AUTO_LOCK_MINUTES);
-        Duration::from_secs(minutes.saturating_mul(60))
+        Duration::from_secs(clamp_auto_lock_minutes(self.auto_lock_minutes).saturating_mul(60))
     }
 }
 
@@ -546,6 +574,32 @@ mod tests {
             main_rs.contains(&join),
             "main.rs no longer builds its settings path with {join} -- see above"
         );
+    }
+
+    #[test]
+    fn the_auto_lock_floor_is_one_minute_and_nothing_above_it_is_touched() {
+        // Absolute values, not `MIN_AUTO_LOCK_MINUTES`: a test that re-derives
+        // its expectation from the constant under test passes for every value
+        // that constant could ever hold, including a wrong one. This is the
+        // function the preferences window bounds its input with, so what it
+        // returns is exactly what that window is allowed to display.
+        assert_eq!(clamp_auto_lock_minutes(0), 1, "the vault-window-closes-on-frame-one case");
+        assert_eq!(clamp_auto_lock_minutes(1), 1);
+        assert_eq!(clamp_auto_lock_minutes(2), 2);
+        assert_eq!(clamp_auto_lock_minutes(15), 15);
+        assert_eq!(clamp_auto_lock_minutes(u64::MAX), u64::MAX, "the floor is a floor, not a range");
+    }
+
+    #[test]
+    fn the_timeout_is_the_clamped_minutes_in_seconds() {
+        // Ties the two together, so `auto_lock_timeout` cannot quietly grow a
+        // second, different floor from the one the UI bounds its input with.
+        for minutes in [0u64, 1, 5, 15, 600] {
+            assert_eq!(
+                Settings { auto_lock_minutes: minutes, ..Settings::default() }.auto_lock_timeout(),
+                Duration::from_secs(clamp_auto_lock_minutes(minutes) * 60)
+            );
+        }
     }
 
     #[test]
