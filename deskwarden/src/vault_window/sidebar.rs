@@ -13,6 +13,22 @@ use eframe::egui::{self, CornerRadius};
 pub enum SidebarFilter {
     All,
     Favorites,
+    /// The items this app can fill into a Windows application -- the ones
+    /// carrying an app match.
+    ///
+    /// **Membership is [`crate::vault_bridge::extract_app_match`] and nothing
+    /// else.** That function reads one custom field
+    /// (`APP_MATCH_FIELD_NAME`) out of `item.fields` and parses it, and it is
+    /// already the single definition the picker, the match engine and the
+    /// detail pane's AUTOFILL TARGETS card all use. A second notion of "has
+    /// an app" here -- "any field whose name looks like ours", "a non-empty
+    /// value", "the field exists" -- would be a row that disagreed with the
+    /// pane it sends the user to, which is the two-copies-that-happen-to-
+    /// agree hazard [`SidebarFilter::scope_contains`]'s own doc names. A
+    /// field this build cannot PARSE is deliberately not on this row: the
+    /// rest of the app cannot fill from it either, so listing it would
+    /// promise an autofill that will not happen.
+    Apps,
     Logins,
     Passkeys,
     Cards,
@@ -70,6 +86,9 @@ impl SidebarFilter {
         match self {
             SidebarFilter::All => true,
             SidebarFilter::Favorites => item.favorite,
+            // The EXISTING definition of "this item has an app", not a
+            // second one -- see the variant's doc.
+            SidebarFilter::Apps => crate::vault_bridge::extract_app_match(item).is_some(),
             SidebarFilter::Logins => ItemKind::of(item) == ItemKind::Login,
             // Passkeys are not their own item type -- Bitwarden stores them
             // as `fido2Credentials` on ordinary login items, so this is a
@@ -234,6 +253,11 @@ pub fn draw_sidebar(
         for (label, filter) in [
             ("All items", SidebarFilter::All),
             ("Favorites", SidebarFilter::Favorites),
+            // Directly after Favorites, by the user's explicit instruction
+            // ("it is our main feature"). Design 2b has no such row -- it
+            // predates app matching -- so the placement is theirs and the
+            // styling is the neighbouring rows'.
+            ("Apps", SidebarFilter::Apps),
             ("Logins", SidebarFilter::Logins),
             ("Passkeys", SidebarFilter::Passkeys),
             ("Cards", SidebarFilter::Cards),
@@ -1219,6 +1243,77 @@ mod tests {
         assert_eq!(count_for(&items, &SidebarFilter::Passkeys), 1);
     }
 
+    /// The Apps row, against the storage the rest of the app already uses.
+    ///
+    /// The three items are built by `vault_bridge::with_app_match` -- the
+    /// function the picker writes an app match with -- rather than by hand-
+    /// assembling a `VaultField`, so this test fails if the row's predicate
+    /// and the writer ever stop agreeing about the field's name or value
+    /// format. A hand-built fixture would keep passing against exactly that
+    /// break.
+    #[test]
+    fn apps_counts_the_items_carrying_an_app_match() {
+        use crate::app_match::{AppMatch, TriggerMode};
+        use crate::vault_bridge::with_app_match;
+
+        let matched = with_app_match(
+            &item(Some(1), false, None),
+            &AppMatch { process: "Ledgerline.exe".into(), trigger: TriggerMode::Prompt },
+        );
+        let also_matched = with_app_match(
+            &item(Some(3), false, None),
+            &AppMatch { process: "Vantage.exe".into(), trigger: TriggerMode::Auto },
+        );
+        let plain = item(Some(1), false, None);
+
+        let items = vec![matched.clone(), also_matched, plain.clone()];
+        // Absolute: 2 of the 3 fixture items were given an app match.
+        assert_eq!(count_for(&items, &SidebarFilter::Apps), 2);
+        // ...and per item, so a count that happened to come out right for the
+        // wrong reason cannot pass.
+        assert!(SidebarFilter::Apps.scope_contains(&matched));
+        assert!(!SidebarFilter::Apps.scope_contains(&plain));
+        // The row cuts across kinds -- a card with an app match is on it --
+        // so it must not have quietly become "logins that have a field".
+        assert_eq!(count_for(&items, &SidebarFilter::Logins), 2);
+        assert_eq!(count_for(&items, &SidebarFilter::All), 3);
+    }
+
+    /// A field with the right NAME but a value this build cannot parse is not
+    /// on the Apps row.
+    ///
+    /// This is what pins the row to `extract_app_match` rather than to "does
+    /// a field called `deskwarden:app-match` exist": the two differ only
+    /// here, and the difference is the point. Nothing else in this app can
+    /// fill from an unparseable match, so a row that listed it would send the
+    /// user to a pane that offers an autofill which cannot happen.
+    #[test]
+    fn a_field_with_our_name_but_an_unreadable_value_is_not_an_app() {
+        use crate::app_match::APP_MATCH_FIELD_NAME;
+        use crate::vault_bridge::VaultField;
+
+        let mut broken = item(Some(1), false, None);
+        broken.fields = vec![VaultField {
+            name: Some(APP_MATCH_FIELD_NAME.to_string()),
+            value: Some("not json".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        assert!(!SidebarFilter::Apps.scope_contains(&broken));
+        assert_eq!(crate::vault_bridge::extract_app_match(&broken), None);
+
+        // POSITIVE CONTROL: the same fixture with a value the app CAN read is
+        // on the row, so this is not a test that passes against a row which
+        // matches nothing at all.
+        let readable = crate::vault_bridge::with_app_match(
+            &broken,
+            &crate::app_match::AppMatch {
+                process: "Ledgerline.exe".into(),
+                trigger: crate::app_match::TriggerMode::Prompt,
+            },
+        );
+        assert!(SidebarFilter::Apps.scope_contains(&readable));
+    }
+
     #[test]
     fn identities_and_ssh_keys_match_their_own_types() {
         let items = vec![
@@ -1486,6 +1581,64 @@ mod tests {
             plus.center().x,
             pencil.center().x,
             (pencil.center().x - plus.center().x).abs()
+        );
+    }
+
+    /// Every VAULT-section row label, in the order they are painted down the
+    /// panel -- read off a real frame, so this is the order the user sees and
+    /// not a restatement of the array `draw_sidebar` loops over.
+    fn vault_row_labels_in_painted_order(painted: &[(String, egui::Rect)]) -> Vec<String> {
+        let folders_header_y = painted
+            .iter()
+            .find(|(text, _)| text == "FOLDERS")
+            .map(|(_, rect)| rect.top())
+            .expect("the sidebar painted no FOLDERS header");
+        let mut rows: Vec<(f32, String)> = painted
+            .iter()
+            // Above the FOLDERS header (so folder rows are excluded), below
+            // the VAULT one, and not a count badge: the badges are the only
+            // other strings in that band, and they are digits.
+            .filter(|(text, rect)| {
+                rect.top() < folders_header_y
+                    && text != "VAULT"
+                    // The FOLDERS header's "+" is painted centred on that
+                    // header's band, and its 18px glyph box starts a hair
+                    // above the band's own top -- so it slips under the
+                    // `top()` cut. Excluded by name rather than by widening
+                    // the cut, which would start swallowing the SSH keys row.
+                    && text != "+"
+                    && !text.chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|(text, rect)| (rect.top(), text.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// The user's explicit instruction: Apps sits **directly after
+    /// Favorites**, and it is "our main feature".
+    ///
+    /// Asserted against the whole painted VAULT column rather than "Apps is
+    /// somewhere below Favorites": a relative check passes just as happily
+    /// for a row that landed at the bottom of the section, and the whole
+    /// point of the instruction was the position.
+    #[test]
+    fn the_apps_row_is_painted_directly_after_favorites() {
+        let (painted, _, _) = painted_sidebar_and_bounds("Locks in 11:42");
+        assert_eq!(
+            vault_row_labels_in_painted_order(&painted),
+            vec![
+                "All items",
+                "Favorites",
+                "Apps",
+                "Logins",
+                "Passkeys",
+                "Cards",
+                "Identities",
+                "Secure notes",
+                "SSH keys",
+                "Trash",
+            ]
         );
     }
 

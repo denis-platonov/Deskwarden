@@ -338,6 +338,11 @@ pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
     let (singular, plural) = match filter {
         SidebarFilter::All => ("item", "items"),
         SidebarFilter::Favorites => ("favorite", "favorites"),
+        // Named after the row, like every other specific noun here
+        // (Favorites -> favorites, Logins -> logins). "Search 12 apps" is
+        // the scope the sidebar shows as selected, so the two read as one
+        // thing rather than the placeholder inventing a second name for it.
+        SidebarFilter::Apps => ("app", "apps"),
         SidebarFilter::Logins => ("login", "logins"),
         SidebarFilter::Passkeys => ("passkey", "passkeys"),
         SidebarFilter::Cards => ("card", "cards"),
