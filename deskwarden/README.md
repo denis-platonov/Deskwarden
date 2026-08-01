@@ -96,10 +96,21 @@ a previous run).
 - The cached session token is encrypted at rest with DPAPI, and decrypted
   copies are wiped from memory after use.
 - While the vault is unlocked, deskwarden holds an in-memory snapshot of your
-  vault items, so it can serve reads without `bw serve` running. This
-  snapshot is dropped when the vault locks and when the app quits, but unlike
-  the master password and session token, it is not individually zeroized on
-  drop.
+  vault items, so it can serve reads without `bw serve` running. Each item's
+  password and TOTP seed are wrapped so they are zeroized on every drop of
+  that snapshot — the vault locking, the app quitting, and every intermediate
+  clone the app makes along the way, not just one designated copy. Other
+  fields Bitwarden's CLI sends inside a login, including password history and
+  notes, are not individually modeled and are not zeroized.
+- That zeroizing only covers the cached snapshot itself. Plaintext still
+  passes through copies this app does not control: the value typed into a
+  matched app, an item open for editing (and egui's own text-field state
+  while it's open), a revealed password on screen (egui's text-rendering
+  cache), the Windows clipboard after "Copy password", and the JSON buffers
+  built to send a write to `bw serve` or to parse its response to a vault
+  read (which returns your whole vault in one payload). None of these are
+  wiped after use, and the memory they occupied can persist until the process
+  exits.
 - `bw serve` binds only to localhost and is placed in a Windows job object that
   terminates it if this app exits for any reason — including a crash — so an
   unlocked vault is never left served in the background.

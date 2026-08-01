@@ -37,8 +37,14 @@ pub struct LoginData {
     /// wire format `bw serve` sends or receives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<Zeroizing<String>>,
+    /// `Zeroizing<String>` for the same reason [`Self::password`] is: the
+    /// TOTP seed is a long-lived 2FA secret, not a one-time code (`bw
+    /// serve`'s `/object/totp/{id}` endpoint derives the current code from
+    /// this on every call), so it deserves the same wipe-on-drop guarantee
+    /// as the password sitting right next to it rather than lingering in
+    /// freed memory as a plain `String`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub totp: Option<String>,
+    pub totp: Option<Zeroizing<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uris: Vec<UriEntry>,
     #[serde(flatten)]
@@ -707,7 +713,7 @@ mod tests {
         assert_eq!(item.folder_id.as_deref(), Some("f1"));
         assert!(item.favorite);
         let login = item.login.unwrap();
-        assert_eq!(login.totp.as_deref(), Some("SEED123"));
+        assert_eq!(login.totp.as_deref().map(|t| t.as_str()), Some("SEED123"));
         assert_eq!(login.uris[0].uri.as_deref(), Some("https://app.ledgerline.com"));
     }
 

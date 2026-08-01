@@ -261,7 +261,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // per-frame TOTP block below: unconditionally forced to `NoSecret` the
     // instant the selected item's local login data stops carrying a TOTP
     // secret (review Important 1), and otherwise only from a poll's own
-    // result (`apply_totp_poll_result`).
+    // result (`apply_totp_poll_result`), applied via the `totp_rx` drain
+    // below.
     let mut totp_state = TotpState::NoSecret;
     let mut totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
     // Tracks whether the *previous* poll for the current selection errored,
@@ -270,6 +271,26 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // stays down -- see the poll site below and review Important 1 on
     // commit 1d6c5ab.
     let mut totp_poll_failing = false;
+    // The TOTP poll used to run inline on this thread (a real HTTP call to
+    // `bw serve` via `ureq`), which stalled the whole window -- input,
+    // repaint, everything -- for however long that call took. `ureq`'s read
+    // timeout bounds a single read *syscall*, not the response as a whole, so
+    // a `bw serve` that accepts a connection and then trickles bytes (or
+    // stalls between them) can hold a read well past the configured timeout;
+    // against that, a poll every `TOTP_POLL_INTERVAL` could freeze the window
+    // for a large fraction of every second it was open. Backgrounded the same
+    // way `spawn_vault_load`/`spawn_vault_sync` already are: `should_start_totp_poll`
+    // below gates spawning a one-shot thread that reports over `totp_tx`, and
+    // the non-blocking `totp_rx` drain applies whatever it sends back.
+    let (totp_tx, totp_rx): (
+        mpsc::Sender<(String, Result<Option<String>, VaultError>)>,
+        Receiver<(String, Result<Option<String>, VaultError>)>,
+    ) = mpsc::channel();
+    // True from the moment a poll thread is spawned until its result is
+    // drained. Gates `should_start_totp_poll` so a `bw serve` that never
+    // answers can pile up at most one outstanding poll thread rather than a
+    // new one every `TOTP_POLL_INTERVAL` for as long as it stays hung.
+    let mut totp_poll_in_flight = false;
     let mut last_activity = Instant::now();
     // The fill count shown in the detail pane's metadata line. Computed
     // once per selection change (below, and here for the initial
@@ -414,6 +435,56 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 log::warn!("manual vault sync failed: {e}");
             }
             sync_status = Some(result);
+        }
+
+        // Non-blocking, like the drains above: the background TOTP poll
+        // thread (spawned in the per-frame TOTP block further down) reports
+        // its result here, tagged with the item id it was fetched for.
+        //
+        // This drain runs unconditionally every frame -- not nested inside
+        // the Read-mode/selected-item block that spawns the poll -- because
+        // that block does not run at all once the selection is cleared or
+        // the pane switches to Edit mode, and `totp_poll_in_flight` has to be
+        // cleared regardless of whether either is still true when the result
+        // actually lands; leaving it gated the same way the spawn is would
+        // let a poll started while an item was selected latch
+        // `totp_poll_in_flight` permanently once the user switched away
+        // before it returned, silently wedging every poll after it for the
+        // rest of the session.
+        if let Ok((item_id, poll_result)) = totp_rx.try_recv() {
+            totp_poll_in_flight = false;
+            // A poll only ever updates `totp_state` if it's still for the
+            // selected item -- one spawned for item A can land after the
+            // user has since selected item B (nothing here blocks waiting
+            // for it), and applying it then would show A's code, or A's
+            // failure, under B's row. Dropped silently, the same way a
+            // superseded vault load is (`apply_vault_load_result`); B's own
+            // poll (already in flight or about to be spawned) is what
+            // determines what B's row shows.
+            if totp_poll_result_is_current(&item_id, selected_id.as_deref()) {
+                let seconds_left = current_totp_seconds_left();
+                let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
+                // Logged on the failing/recovered transition only (review
+                // Important 2 on commit 1d6c5ab) -- with the backend down
+                // every 1s poll would otherwise fill the log file, this
+                // app's only diagnostic channel, for the rest of the
+                // session.
+                match &error {
+                    Some(e) => {
+                        if !totp_poll_failing {
+                            log::warn!("TOTP fetch for {item_id} started failing: {e:?}");
+                            totp_poll_failing = true;
+                        }
+                        flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, e);
+                    }
+                    None => {
+                        if totp_poll_failing {
+                            log::info!("TOTP fetch for {item_id} recovered");
+                            totp_poll_failing = false;
+                        }
+                    }
+                }
+            }
         }
 
         // Sync, the account avatar, and Lock live in the titlebar itself
@@ -721,59 +792,44 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // this item's secret ever comes back and the
                                 // very first poll happens to succeed.
                                 totp_poll_failing = false;
-                            } else if totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL {
+                            } else if should_start_totp_poll(
+                                has_totp_secret,
+                                totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
+                                totp_poll_in_flight,
+                            ) {
                                 totp_last_poll = Instant::now();
+                                totp_poll_in_flight = true;
                                 // The deliberate exception: TOTP codes are
                                 // generated by the CLI per request and are
                                 // not cacheable, so this stays on the bridge.
                                 //
-                                // `apply_totp_poll_result` (see its doc) is
-                                // the regression fix for review Important 1
-                                // on commit 1d6c5ab, now expressed over
-                                // `TotpState` rather than a bare
-                                // `Option<String>`: any error moves the pane
-                                // to `Unavailable` rather than leaving a
-                                // stale code rendering under a countdown that
-                                // keeps ticking as if it were live. Only a
-                                // 401 (`VaultError::Unauthorized`) still
-                                // routes through `flag_reauth_if_unauthorized`
-                                // on top of that -- a genuine "no TOTP
-                                // configured" (`Ok(None)`) moves to
-                                // `NoSecret` with no reauth, and still does.
-                                let seconds_left = current_totp_seconds_left();
-                                let poll_result = cache.bridge().get_totp(&item.id);
-                                let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
-                                // Logged on the failing/recovered transition
-                                // only (review Important 2 on the same
-                                // commit) -- with the backend down every
-                                // 1s poll would otherwise fill the log file,
-                                // this app's only diagnostic channel, for
-                                // the rest of the session.
-                                match &error {
-                                    Some(e) => {
-                                        if !totp_poll_failing {
-                                            log::warn!(
-                                                "TOTP fetch for {} started failing: {e:?}",
-                                                item.id
-                                            );
-                                            totp_poll_failing = true;
-                                        }
-                                        flag_reauth_if_unauthorized(
-                                            ui.ctx(),
-                                            &needs_reauth_for_closure,
-                                            e,
-                                        );
-                                    }
-                                    None => {
-                                        if totp_poll_failing {
-                                            log::info!(
-                                                "TOTP fetch for {} recovered",
-                                                item.id
-                                            );
-                                            totp_poll_failing = false;
-                                        }
-                                    }
-                                }
+                                // Backgrounded on a one-shot thread rather
+                                // than called inline, the same reason
+                                // `spawn_vault_load`/`spawn_vault_sync` are:
+                                // `get_totp` is a real HTTP round-trip to
+                                // `bw serve`, and `ureq`'s read timeout bounds
+                                // one read syscall, not the response as a
+                                // whole, so a trickling or stalled `bw serve`
+                                // could hold this call -- and this window's
+                                // entire UI thread with it -- well past that
+                                // timeout, once per `TOTP_POLL_INTERVAL`. The
+                                // result lands on `totp_rx`, drained further
+                                // up (see that drain's doc for why it isn't
+                                // nested in this same block); the actual
+                                // state transition still goes through
+                                // `apply_totp_poll_result` there, so the fix
+                                // for review Important 1 on commit 1d6c5ab
+                                // (any error moves the pane to `Unavailable`
+                                // rather than leaving a stale code rendering
+                                // under a countdown that keeps ticking as if
+                                // it were live) is unchanged.
+                                let item_id = item.id.clone();
+                                let bridge = cache.bridge().clone();
+                                let tx = totp_tx.clone();
+                                std::thread::spawn(move || {
+                                    let result = bridge.get_totp(&item_id);
+                                    let _ = tx.send((item_id, result));
+                                });
                             }
                             // Refreshed every frame regardless of whether a
                             // poll happened this tick: the TOTP window is
@@ -1105,6 +1161,36 @@ fn apply_totp_poll_result(
             Some(e)
         }
     }
+}
+
+/// Whether `run`'s per-frame TOTP block should spawn a new background poll
+/// this frame. Pulled out into its own function, the same way
+/// `totp_state_for_secret_presence`/`apply_totp_poll_result` are, so the
+/// three conditions -- a secret worth polling for, the interval having
+/// actually elapsed, and no poll already outstanding -- are unit-testable
+/// together without an `eframe` context.
+///
+/// `poll_in_flight` is the one new condition here (see `totp_poll_in_flight`'s
+/// declaration in `run`): without it, a `bw serve` that never answers would
+/// still only ever have one real HTTP call blocking on it -- the call itself
+/// moved to a background thread -- but `run`'s loop would spawn a *new* such
+/// thread every `TOTP_POLL_INTERVAL` for as long as it stayed hung, one more
+/// piling up on top of the last with nothing to bound how many accumulate.
+fn should_start_totp_poll(has_totp_secret: bool, poll_due: bool, poll_in_flight: bool) -> bool {
+    has_totp_secret && poll_due && !poll_in_flight
+}
+
+/// Whether a `totp_rx` message fetched for `item_id` should still be applied
+/// to `totp_state`, or dropped as stale. A poll runs on a background thread
+/// now (see `totp_poll_in_flight`'s declaration in `run`), so nothing blocks
+/// waiting for it -- the user is free to select a different item, or none at
+/// all, before it reports back. Applying a result for an item that is no
+/// longer selected would show its code, or its failure, under a different
+/// row than the one it was fetched for; `selected_id` being anything other
+/// than `Some(item_id)` -- including `None` -- means this result is stale and
+/// must be dropped rather than applied.
+fn totp_poll_result_is_current(item_id: &str, selected_id: Option<&str>) -> bool {
+    selected_id == Some(item_id)
 }
 
 /// Applies one result received from `vault_rx` -- the state update `run`'s
@@ -1615,6 +1701,73 @@ mod apply_totp_poll_result_tests {
 
         assert_eq!(totp_state, TotpState::Unavailable);
         assert!(matches!(error, Some(VaultError::Unauthorized)));
+    }
+}
+
+#[cfg(test)]
+mod should_start_totp_poll_tests {
+    // The TOTP poll moved off the UI thread onto a one-shot background
+    // thread (see `totp_poll_in_flight`'s declaration in `run`) because
+    // `ureq`'s read timeout bounds one read syscall, not `get_totp`'s
+    // response as a whole -- a trickling or stalled `bw serve` could freeze
+    // this window for well past that timeout, once per `TOTP_POLL_INTERVAL`.
+    // These pin the three-way gate that replaced the old unconditional call:
+    // a poll only starts when there's a secret to poll for, the interval has
+    // actually elapsed, and -- the new condition -- no poll is already
+    // outstanding, so a hung backend accumulates at most one background
+    // thread instead of one more every second for as long as it stays hung.
+    use super::should_start_totp_poll;
+
+    #[test]
+    fn starts_when_due_with_a_secret_and_nothing_in_flight() {
+        assert!(should_start_totp_poll(true, true, false));
+    }
+
+    #[test]
+    fn does_not_start_without_a_totp_secret() {
+        assert!(!should_start_totp_poll(false, true, false));
+    }
+
+    #[test]
+    fn does_not_start_before_the_interval_elapses() {
+        assert!(!should_start_totp_poll(true, false, false));
+    }
+
+    #[test]
+    fn does_not_start_a_second_poll_while_one_is_already_in_flight() {
+        // The regression this exists to prevent: without this gate, a hung
+        // `bw serve` (one read syscall away from `ureq`'s timeout, forever)
+        // would still spawn a fresh background thread every
+        // `TOTP_POLL_INTERVAL`, piling up indefinitely instead of the single
+        // outstanding poll this is meant to bound it to.
+        assert!(!should_start_totp_poll(true, true, true));
+    }
+}
+
+#[cfg(test)]
+mod totp_poll_result_is_current_tests {
+    // Backgrounding the poll (see `should_start_totp_poll_tests` above) means
+    // a result can land after the user has already selected a different item
+    // than the one it was fetched for -- nothing blocks waiting for it. These
+    // pin that a late result is only ever applied to the selection it was
+    // actually fetched for, so a poll in flight for item A can never blank or
+    // overwrite a currently-valid code showing for a since-selected item B.
+    use super::totp_poll_result_is_current;
+
+    #[test]
+    fn a_result_for_the_still_selected_item_is_current() {
+        assert!(totp_poll_result_is_current("item-1", Some("item-1")));
+    }
+
+    #[test]
+    fn a_result_for_a_no_longer_selected_item_is_stale() {
+        // The user switched from item A to item B before A's poll returned.
+        assert!(!totp_poll_result_is_current("item-a", Some("item-b")));
+    }
+
+    #[test]
+    fn a_result_landing_after_the_selection_was_cleared_is_stale() {
+        assert!(!totp_poll_result_is_current("item-1", None));
     }
 }
 

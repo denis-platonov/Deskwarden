@@ -175,7 +175,7 @@ mod tests {
             login: Some(LoginData {
                 username: Some("a@b.com".into()),
                 password: Some("p".to_string().into()),
-                totp: Some("SEED".into()),
+                totp: Some("SEED".to_string().into()),
                 uris: vec![UriEntry { uri: Some("https://ledgerline.example".into()), other: serde_json::Map::new() }],
                 other: login_other,
             }),
@@ -231,7 +231,7 @@ mod tests {
         assert!(updated.favorite, "favorite must survive an edit the form doesn't expose");
         assert_eq!(updated.item_type, Some(1));
         let login = updated.login.as_ref().unwrap();
-        assert_eq!(login.totp.as_deref(), Some("SEED"));
+        assert_eq!(login.totp.as_deref().map(|t| t.as_str()), Some("SEED"));
         assert_eq!(
             login.uris.len(),
             1,
