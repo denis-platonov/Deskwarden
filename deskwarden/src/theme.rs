@@ -59,7 +59,10 @@ pub const BLUE_SOFT: Color32 = Color32::from_rgb(0x7f, 0xa4, 0xef);
 pub const BLUE_WASH: Color32 = Color32::from_rgb(0xee, 0xf2, 0xfc);
 /// Blue edge: borders on blue-washed elements, text selection.
 pub const BLUE_EDGE: Color32 = Color32::from_rgb(0xb8, 0xc7, 0xea);
-/// Focus ring around the active input.
+/// Focus ring around the active input. The design uses this same value as
+/// its deepest blue wash -- one step past [`BLUE_WASH`] -- for a chip that
+/// sits ON a selected or blue-washed surface (2b's selected item row
+/// carries its `app` badge in it), so it is not only a focus colour.
 pub const FOCUS_RING: Color32 = Color32::from_rgb(0xdb, 0xe4, 0xf7);
 /// Track of a switched-off toggle (design 3e's settings rows).
 pub const TOGGLE_OFF: Color32 = Color32::from_rgb(0xe4, 0xe2, 0xe0);

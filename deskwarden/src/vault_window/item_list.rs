@@ -76,7 +76,28 @@ pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
     format!("Search {count} {}", if count == 1 { singular } else { plural })
 }
 
-const ROW_HEIGHT: f32 = 50.0;
+/// The design's avatar/favicon tile: `width: 32px; height: 32px`.
+const AVATAR_SIZE: f32 = 32.0;
+
+/// Design 2b's row box, in full: `padding: 10px 12px` around a 32px avatar,
+/// plus the 1px border every row carries. egui's `Frame` sizes itself
+/// `content + inner_margin + 2 * stroke.width`, which is the same box CSS's
+/// content-box model produces -- 32 + 10 + 10 + 1 + 1.
+///
+/// This is what `ScrollArea::show_rows` is virtualized against, so it has to
+/// be the height the rows really paint at; `consecutive_row_tiles_sit_exactly_
+/// one_design_gap_apart_and_span_the_pane` asserts that from painted output
+/// rather than trusting the arithmetic above.
+const ROW_TILE_HEIGHT: f32 = AVATAR_SIZE + 2.0 * ROW_PAD_Y + 2.0 * ROW_BORDER;
+const ROW_PAD_Y: f32 = 10.0;
+const ROW_PAD_X: f32 = 12.0;
+const ROW_BORDER: f32 = 1.0;
+/// The row's `gap: 11px`, between the avatar, the title column and the badge.
+const ROW_GAP_X: f32 = 11.0;
+/// The list container's `gap: 6px`.
+const ROW_GAP: f32 = 6.0;
+/// The list container's `padding: 10px`.
+const LIST_PADDING: f32 = 10.0;
 
 /// Draws the search box, `+ New` button, and the virtualized item list.
 ///
@@ -168,12 +189,19 @@ pub fn draw_item_list(
     // Design 2b's list padding (`padding: 10px`), applied here now that the
     // pane's panel frame has none -- see the header strip's comment above.
     egui::Frame::new()
-        .inner_margin(Margin::same(10))
+        .inner_margin(Margin::same(LIST_PADDING as i8))
         .show(ui, |ui| {
+            // The design's `gap: 6px`, set on THIS ui rather than inside the
+            // closure below. `show_rows` reads `item_spacing.y` from the ui it
+            // is given, BEFORE the closure runs, and virtualizes against
+            // `row_height + that spacing` -- a gap set inside the closure
+            // changes where the rows actually paint while leaving the scroll
+            // maths on the old pitch, which puts the list out of register
+            // with its own scrollbar.
+            ui.spacing_mut().item_spacing.y = ROW_GAP;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show_rows(ui, ROW_HEIGHT, filtered.len(), |ui, row_range| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
+                .show_rows(ui, ROW_TILE_HEIGHT, filtered.len(), |ui, row_range| {
                     for row in row_range {
                         let item = filtered[row];
                         visible_ids.push(item.id.clone());
@@ -188,6 +216,39 @@ pub fn draw_item_list(
     action
 }
 
+/// Design 2b's trailing row chip: `font-size: 10px; border-radius: 5px;
+/// padding: 2px 6px`, `#605d5d on #f3f2f2` unselected and `#14307a on
+/// #dbe4f7` selected.
+///
+/// Not [`theme::kbd_chip`]: that one is a fixed-height MONOSPACE keyboard
+/// hint (10px in an 18px box, radius 4), which is a different element of the
+/// design that happens to be a similar size. Kept private here rather than
+/// added to `theme` because the badge exists in exactly one place and its
+/// colours all come from constants `theme` already owns.
+fn row_badge(ui: &mut egui::Ui, text: &str, selected: bool) {
+    const PAD_X: f32 = 6.0;
+    const PAD_Y: f32 = 2.0;
+    let (bg, fg) = if selected {
+        // `#dbe4f7`. The design uses one value for the focus halo and for
+        // this chip; see `theme::FOCUS_RING`.
+        (theme::FOCUS_RING, theme::BLUE_DEEP)
+    } else {
+        (theme::CANVAS, theme::TEXT_MUTED)
+    };
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+        fg,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        galley.size() + egui::Vec2::new(PAD_X * 2.0, PAD_Y * 2.0),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
+    ui.painter()
+        .galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, fg);
+}
+
 fn item_row(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -195,18 +256,29 @@ fn item_row(
     icon: Option<&egui::TextureHandle>,
 ) -> bool {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
+    // The design's "app" chip. It is not decorative and it is not invented:
+    // `deskwarden:app-match` is the custom field that makes an item fillable
+    // into a native window, and `extract_app_match` answers it from the item
+    // already in hand -- no extra lookup, and only for the handful of rows
+    // `show_rows` actually hands us.
+    let badged = crate::vault_bridge::extract_app_match(item).is_some();
     let frame = egui::Frame::new()
-        .fill(if selected { theme::CARD } else { theme::CANVAS })
-        .stroke(if selected {
-            Stroke::new(1.0, theme::BLUE)
-        } else {
-            Stroke::NONE
-        })
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(10, 8))
+        // Design 2b: EVERY row is `background: #ffffff`, selected or not.
+        // Filling unselected rows with the pane's own `CANVAS` is what made
+        // them read as flat bands instead of tiles -- the reported defect.
+        .fill(theme::CARD)
+        .stroke(Stroke::new(
+            ROW_BORDER,
+            if selected { theme::BLUE } else { theme::HAIRLINE },
+        ))
+        // `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)`, selected only.
+        .shadow(if selected { SELECTED_ROW_SHADOW } else { egui::Shadow::NONE })
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = ROW_GAP_X;
                 match icon {
                     Some(tex) => {
                         // Rounded to match `theme::avatar`'s initials-tile
@@ -214,26 +286,47 @@ fn item_row(
                         // cornered square in the identical box read as
                         // visually heavier/bigger than the monogram fallback
                         // even at the same pixel dimensions.
-                        const SIZE: f32 = 32.0;
                         ui.add(
                             egui::Image::new((tex.id(), tex.size_vec2()))
-                                .fit_to_exact_size(egui::Vec2::splat(SIZE))
-                                .corner_radius(CornerRadius::same((SIZE * 0.25) as u8)),
+                                .fit_to_exact_size(egui::Vec2::splat(AVATAR_SIZE))
+                                .corner_radius(CornerRadius::same((AVATAR_SIZE * 0.25) as u8)),
                         );
                     }
-                    None => theme::avatar(ui, &theme::initials(&item.name), 32.0, selected),
+                    None => theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected),
                 }
-                ui.add_space(2.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(theme::semibold(&item.name, 13.0).color(if selected {
-                        theme::BLUE_DEEP
-                    } else {
-                        theme::INK
-                    }));
-                    if !username.is_empty() {
-                        ui.label(RichText::new(username).size(11.0).color(theme::TEXT_FAINT));
+                // The design's title column is `flex: 1` with the badge
+                // trailing it. Laid out right-to-left so the badge takes its
+                // own width off the right edge and the column gets the
+                // remainder -- the same trick the toolbar strip above uses
+                // for `+ New` and the search field, and the reason neither
+                // needs a guessed width.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if badged {
+                        row_badge(ui, "app", selected);
                     }
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let title = if selected {
+                            // `font-weight: 700; color: #14307a`.
+                            theme::bold(&item.name, 13.0).color(theme::BLUE_DEEP)
+                        } else {
+                            theme::semibold(&item.name, 13.0).color(theme::INK)
+                        };
+                        // Truncated, not wrapped: a name long enough to wrap
+                        // ("Remote Desktop — Bastion" is already close) would
+                        // make one row taller than every other and slide the
+                        // whole virtualized list out of register with the
+                        // fixed pitch `show_rows` scrolls by.
+                        ui.add(egui::Label::new(title).truncate());
+                        if !username.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(username).size(11.0).color(theme::TEXT_FAINT),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    });
                 });
             });
         });
@@ -243,6 +336,15 @@ fn item_row(
     }
     response.clicked()
 }
+
+/// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's selected
+/// row. Alpha is `0.06 * 255`, rounded.
+const SELECTED_ROW_SHADOW: egui::Shadow = egui::Shadow {
+    offset: [0, 1],
+    blur: 2,
+    spread: 0,
+    color: egui::Color32::from_rgba_unmultiplied_const(45, 43, 43, 15),
+};
 
 #[cfg(test)]
 mod tests {
@@ -340,6 +442,527 @@ mod search_hint_tests {
         // "Search 0 login" is the other half of the same off-by-one.
         assert_eq!(search_hint(0, &SidebarFilter::Logins), "Search 0 logins");
         assert_eq!(search_hint(0, &SidebarFilter::All), "Search 0 items");
+    }
+}
+
+#[cfg(test)]
+mod row_tile_tests {
+    //! The user-reported defect: "those result set tiles should have white
+    //! color -- check win design as well".
+    //!
+    //! Design 2b (the WINDOWS vault window -- its shortcut hints read
+    //! `CTRL+K`/`CTRL+L` and it draws the —/▢/✕ window controls, unlike the
+    //! macOS `3f` block) draws EVERY item row as a white tile:
+    //! `background: #ffffff; border-radius: 10px; padding: 10px 12px;
+    //! gap: 11px`, `border: 1px solid #eae7e7` unselected and
+    //! `1px solid #1b3fa0` selected. The implementation filled unselected rows
+    //! with the pane's own grey canvas and gave them no border at all, so they
+    //! read as flat bands rather than tiles -- exactly the report.
+    //!
+    //! These drive real frames of `draw_item_list` and read back the painted
+    //! `RectShape`s and galleys, so fills, stroke colours, corner radii and
+    //! geometry are all asserted from what egui actually emitted.
+    use super::*;
+    use crate::app_match::{AppMatch, TriggerMode, APP_MATCH_FIELD_NAME};
+    use crate::theme;
+    use crate::vault_bridge::VaultField;
+    use eframe::egui::epaint::RectShape;
+
+    const PANE_WIDTH: f32 = 390.0;
+    const PANE_HEIGHT: f32 = 700.0;
+    /// A row tile spans the pane minus the list frame's `padding: 10px`.
+    const TILE_WIDTH: f32 = PANE_WIDTH - 2.0 * LIST_PADDING;
+
+    fn login(name: &str, username: &str) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            fields: vec![],
+            login: Some(crate::vault_bridge::LoginData {
+                username: Some(username.to_string()),
+                password: None,
+                totp: None,
+                uris: vec![],
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// The same custom field `app::save_app_match` writes and
+    /// `vault_bridge::extract_app_match` reads -- built through `AppMatch`'s
+    /// own serializer so this cannot drift from the real format.
+    fn with_app_match(mut item: VaultItem) -> VaultItem {
+        item.fields.push(VaultField {
+            name: Some(APP_MATCH_FIELD_NAME.to_string()),
+            value: Some(
+                AppMatch {
+                    process: "ledgerline.exe".to_string(),
+                    trigger: TriggerMode::Prompt,
+                }
+                .to_field_value(),
+            ),
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    struct Painted {
+        rects: Vec<RectShape>,
+        texts: Vec<(String, egui::Rect, egui::Color32)>,
+        fonts: Vec<(String, egui::FontId)>,
+        visible: Vec<String>,
+    }
+
+    fn walk(shape: &egui::Shape, p: &mut Painted) {
+        match shape {
+            egui::Shape::Rect(rect) => p.rects.push(rect.clone()),
+            egui::Shape::Text(text) => {
+                if let Some(section) = text.galley.job.sections.first() {
+                    p.fonts
+                        .push((text.galley.text().to_string(), section.format.font_id.clone()));
+                }
+                // The colour egui will actually render with: an explicit
+                // override wins, then the layout job's own section colour,
+                // and only an unset (`PLACEHOLDER`) section falls back.
+                let color = text
+                    .override_text_color
+                    .or_else(|| {
+                        text.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|s| s.format.color)
+                            .filter(|c| *c != egui::Color32::PLACEHOLDER)
+                    })
+                    .unwrap_or(text.fallback_color);
+                p.texts.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    color,
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// One real frame of `draw_item_list` at the item pane's own width, with
+    /// `selected` already chosen, returning everything it painted.
+    fn paint(items: &[VaultItem], selected: Option<&str>) -> Painted {
+        paint_with(items, selected, 0)
+    }
+
+    /// One real frame of `draw_item_list` at the item pane's own width, with
+    /// `selected` already chosen, returning everything it painted.
+    ///
+    /// `wheel_frames` frames of downward mouse wheel are pumped in first (and
+    /// then settled), which is how the scrolled test drives the list to its
+    /// end without reaching into `ScrollArea`'s private state.
+    fn paint_with(items: &[VaultItem], selected: Option<&str>, wheel_frames: usize) -> Painted {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+        );
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+        // Two throwaway frames so `theme::apply`'s font set is live -- the
+        // same reason `detail.rs`'s and `sidebar.rs`'s harnesses run them.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut selected_id = selected.map(str::to_string);
+        let mut search = String::new();
+        let icons = IconCache::default();
+        let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
+            ctx.run_ui(input, |ui| {
+                draw_item_list(
+                    ui,
+                    items,
+                    &SidebarFilter::All,
+                    &mut search,
+                    &mut selected_id,
+                    &icons,
+                    visible,
+                );
+            })
+        };
+        let mut visible = Vec::new();
+        let _ = draw(&ctx, input(), &mut visible);
+        for frame in 0..wheel_frames {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(screen.center()));
+            // Only the first half of the frames scroll; the rest let egui's
+            // scroll smoothing settle, so the measured frame is at rest.
+            if frame < wheel_frames / 2 {
+                raw.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -2000.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::default(),
+                });
+            }
+            let _ = draw(&ctx, raw, &mut visible);
+        }
+        let output = draw(&ctx, input(), &mut visible);
+
+        let mut painted = Painted {
+            rects: Vec::new(),
+            texts: Vec::new(),
+            fonts: Vec::new(),
+            visible,
+        };
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// The row tiles, in paint order: full-width boxes exactly one row high.
+    /// Deliberately keyed on GEOMETRY rather than on fill, so a test that
+    /// asserts the fill cannot be the thing that found the rect. The
+    /// selected row's drop shadow occupies the same box, so it is excluded by
+    /// its blur -- and asserted on separately.
+    fn row_tiles(p: &Painted) -> Vec<RectShape> {
+        p.rects
+            .iter()
+            .filter(|r| {
+                // A rect that paints neither a fill nor a stroke is not a
+                // tile -- egui emits one per row for the layout itself.
+                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
+                    && r.blur_width == 0.0
+                    && (r.rect.width() - TILE_WIDTH).abs() < 0.5
+                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn one_tile(p: &Painted) -> RectShape {
+        let tiles = row_tiles(p);
+        assert_eq!(
+            tiles.len(),
+            1,
+            "expected exactly one {TILE_WIDTH}x{ROW_TILE_HEIGHT} row tile; every painted rect \
+             was: {:?}",
+            p.rects.iter().map(|r| (r.rect, r.fill)).collect::<Vec<_>>()
+        );
+        tiles[0].clone()
+    }
+
+    /// A square of exactly `size`, by geometry alone -- the avatar tile.
+    fn square(p: &Painted, size: f32) -> RectShape {
+        p.rects
+            .iter()
+            .find(|r| {
+                (r.rect.width() - size).abs() < 0.5 && (r.rect.height() - size).abs() < 0.5
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("no {size}x{size} tile was painted"))
+    }
+
+    fn text_color(p: &Painted, needle: &str) -> egui::Color32 {
+        p.texts
+            .iter()
+            .find(|(t, _, _)| t == needle)
+            .unwrap_or_else(|| panic!("{needle:?} was never painted; painted: {:?}", p.texts))
+            .2
+    }
+
+    /// The `FontId` a painted string was laid out with -- size and family,
+    /// i.e. the design's `font-size` and `font-weight`.
+    fn text_font(p: &Painted, needle: &str) -> egui::FontId {
+        p.fonts
+            .iter()
+            .find(|(t, _)| t == needle)
+            .unwrap_or_else(|| panic!("{needle:?} was never painted; painted: {:?}", p.texts))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn an_unselected_row_is_a_white_tile_with_the_designs_hairline_border() {
+        // THE REPORT, stated as an assertion. `background: #ffffff` on EVERY
+        // row -- the implementation filled unselected rows with `CANVAS`,
+        // the pane's own grey, which is why they did not read as tiles.
+        let p = paint(&[login("Atlas Studio", "a.novak@studio.atlas.com")], None);
+        let tile = one_tile(&p);
+        assert_eq!(
+            tile.fill,
+            theme::CARD,
+            "design 2b fills every row with #ffffff; this row is filled with {:?}",
+            tile.fill
+        );
+        assert_eq!(
+            tile.stroke.color,
+            theme::HAIRLINE,
+            "an unselected row's border is `1px solid #eae7e7`"
+        );
+        assert!(
+            (tile.stroke.width - 1.0).abs() < 0.01,
+            "border width {} , expected 1",
+            tile.stroke.width
+        );
+        assert_eq!(
+            tile.corner_radius,
+            CornerRadius::same(10),
+            "design 2b's rows are `border-radius: 10px`"
+        );
+    }
+
+    #[test]
+    fn a_selected_row_is_white_too_and_differs_only_in_its_blue_border() {
+        // The half of the design that WAS implemented (selected rows were
+        // already white) must survive the fix, and the difference between the
+        // two states must be the border colour -- not the fill.
+        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
+        let selected = one_tile(&paint(&items, Some("Ledgerline")));
+        let unselected = one_tile(&paint(&items, None));
+        assert_eq!(selected.fill, theme::CARD);
+        assert_eq!(unselected.fill, theme::CARD);
+        assert_eq!(
+            selected.stroke.color,
+            theme::BLUE,
+            "a selected row's border is `1px solid #1b3fa0`"
+        );
+        assert_ne!(
+            selected.stroke.color, unselected.stroke.color,
+            "selected and unselected rows must be distinguishable"
+        );
+    }
+
+    #[test]
+    fn the_selected_rows_title_is_the_designs_deep_blue_and_the_unselected_ones_is_ink() {
+        // `font-size: 13px; font-weight: 700; color: #14307a` when selected,
+        // the default ink at 600 otherwise. Absolute on both sides: asserting
+        // only that they differ would stay green if both drifted together.
+        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
+        let selected = paint(&items, Some("Ledgerline"));
+        let unselected = paint(&items, None);
+        assert_eq!(text_color(&selected, "Ledgerline"), theme::BLUE_DEEP);
+        assert_eq!(text_color(&unselected, "Ledgerline"), theme::INK);
+        // ...and the WEIGHT, which the colours alone would not have pinned:
+        // 700 selected, 600 otherwise, both at 13px.
+        for (state, font, family) in [
+            (&selected, text_font(&selected, "Ledgerline"), theme::BOLD),
+            (
+                &unselected,
+                text_font(&unselected, "Ledgerline"),
+                theme::SEMIBOLD,
+            ),
+        ] {
+            let _ = state;
+            assert_eq!(font.size, 13.0, "the design's `font-size: 13px`");
+            assert_eq!(
+                font.family,
+                egui::FontFamily::Name(family.into()),
+                "expected the {family} face"
+            );
+        }
+    }
+
+    #[test]
+    fn the_subtitle_is_the_designs_faint_grey_in_both_states() {
+        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
+        for selected in [None, Some("Ledgerline")] {
+            assert_eq!(
+                text_color(&paint(&items, selected), "a.novak@ledgerline.com"),
+                theme::TEXT_FAINT,
+                "the subtitle is `font-size: 11px; color: #7d7979` regardless of selection"
+            );
+        }
+    }
+
+    #[test]
+    fn the_avatar_tile_is_actually_filled_and_bordered_in_both_states() {
+        // "the tile is actually filled rather than transparent", asserted on
+        // the 32x32 monogram box: `background: #f3f2f2; border: 1px solid
+        // #eae7e7` unselected, `#eef2fc` / `#b8c7ea` selected.
+        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
+        let unselected = square(&paint(&items, None), 32.0);
+        assert_eq!(unselected.fill, theme::CANVAS);
+        let selected = square(&paint(&items, Some("Ledgerline")), 32.0);
+        assert_eq!(selected.fill, theme::BLUE_WASH);
+        assert_ne!(selected.fill, egui::Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn consecutive_row_tiles_sit_exactly_one_design_gap_apart_and_span_the_pane() {
+        // ABSOLUTE geometry, not "row 2 is below row 1": the list is
+        // `padding: 10px; gap: 6px`, so tiles start at x=10, are
+        // 390-20 wide, and leave exactly 6 between them. This is also what
+        // pins `ROW_TILE_HEIGHT + ROW_GAP` to the pitch `show_rows`
+        // virtualizes against -- if the painted rows and that pitch disagree,
+        // the list scrolls out of register.
+        let items = [
+            login("Ledgerline", "a.novak@ledgerline.com"),
+            login("Atlas Studio", "a.novak@studio.atlas.com"),
+            login("Vantage VPN", "a.novak@vantage.io"),
+        ];
+        let p = paint(&items, None);
+        let tiles = row_tiles(&p);
+        assert_eq!(tiles.len(), 3, "three items, three tiles");
+        for tile in &tiles {
+            assert!(
+                (tile.rect.left() - LIST_PADDING).abs() < 0.5,
+                "a row tile starts at x={}, expected {LIST_PADDING} (the list's own padding)",
+                tile.rect.left()
+            );
+            assert!(
+                (tile.rect.width() - TILE_WIDTH).abs() < 0.5,
+                "a row tile is {} wide, expected {TILE_WIDTH}",
+                tile.rect.width()
+            );
+            assert!(
+                (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
+                "a row tile is {} high, expected {ROW_TILE_HEIGHT} (32px avatar + 10px padding \
+                 top and bottom)",
+                tile.rect.height()
+            );
+        }
+        for pair in tiles.windows(2) {
+            let gap = pair[1].rect.top() - pair[0].rect.bottom();
+            assert!(
+                (gap - ROW_GAP).abs() < 0.5,
+                "consecutive tiles are {gap} apart, expected the design's {ROW_GAP}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_badge_marks_exactly_the_items_that_carry_an_app_match_field() {
+        // The design's trailing "app" chip. Its meaning is not decorative:
+        // it is `deskwarden:app-match`, the field that makes an item fillable
+        // into a native window, which `extract_app_match` answers from the
+        // item already in hand.
+        let with = paint(&[with_app_match(login("Ledgerline", "a@b.c"))], None);
+        assert!(
+            with.texts.iter().any(|(t, _, _)| t == "app"),
+            "an item with a `deskwarden:app-match` field must carry the badge; painted: {:?}",
+            with.texts
+        );
+        let without = paint(&[login("Vantage VPN", "a@b.c")], None);
+        assert!(
+            !without.texts.iter().any(|(t, _, _)| t == "app"),
+            "an item with no app match must NOT be badged -- a badge that means nothing is worse \
+             than no badge; painted: {:?}",
+            without.texts
+        );
+    }
+
+    #[test]
+    fn the_app_badge_takes_the_designs_two_colour_treatments() {
+        // `color: #605d5d; background: #f3f2f2` unselected;
+        // `color: #14307a; background: #dbe4f7` selected.
+        let items = [with_app_match(login("Ledgerline", "a@b.c"))];
+        let unselected = paint(&items, None);
+        assert_eq!(text_color(&unselected, "app"), theme::TEXT_MUTED);
+        let selected = paint(&items, Some("Ledgerline"));
+        assert_eq!(text_color(&selected, "app"), theme::BLUE_DEEP);
+
+        let badge_of = |p: &Painted| {
+            let label = p
+                .texts
+                .iter()
+                .find(|(t, _, _)| t == "app")
+                .expect("the badge")
+                .1;
+            p.rects
+                .iter()
+                .find(|r| r.rect.contains_rect(label) && r.rect.width() < 60.0)
+                .unwrap_or_else(|| panic!("the badge's own filled chip was never painted"))
+                .clone()
+        };
+        assert_eq!(badge_of(&unselected).fill, theme::CANVAS);
+        assert_eq!(badge_of(&selected).fill, theme::FOCUS_RING);
+        assert_eq!(badge_of(&unselected).corner_radius, CornerRadius::same(5));
+    }
+
+    #[test]
+    fn a_vault_sized_list_still_lays_out_only_the_visible_rows() {
+        // NON-NEGOTIABLE. The picker's list shipped un-virtualized once and
+        // was visibly laggy; painting a filled, bordered, rounded tile per row
+        // must not turn `draw` into an O(N) layout. 1656 is the user's real
+        // vault size. `visible_ids` is filled with exactly the rows
+        // `show_rows` handed back, so it is a direct readout of how many rows
+        // were laid out -- and the tile count proves the painting followed it.
+        let items: Vec<VaultItem> = (0..1656)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let p = paint(&items, None);
+        let ceiling = (PANE_HEIGHT / (ROW_TILE_HEIGHT + ROW_GAP)).ceil() as usize + 4;
+        assert!(
+            p.visible.len() <= ceiling,
+            "{} of 1656 rows were laid out; at most {ceiling} fit the {PANE_HEIGHT}pt pane, so \
+             the list is no longer virtualized",
+            p.visible.len()
+        );
+        // And the tiles followed the windowing rather than being painted for
+        // every item: never more than the rows that were laid out, and at
+        // least all but the one `show_rows` deliberately overshoots by (it
+        // hands back `ceil + 1` rows, and egui skips painting the one that
+        // falls outside the clip rect).
+        let tiles = row_tiles(&p).len();
+        assert!(
+            tiles <= p.visible.len() && tiles + 1 >= p.visible.len(),
+            "{tiles} tiles were painted for {} laid-out rows",
+            p.visible.len()
+        );
+        assert!(tiles > 0, "nothing was painted at all");
+    }
+
+    #[test]
+    fn the_rows_stay_in_register_with_the_scrollbar_all_the_way_to_the_end() {
+        // The trap the design's `gap: 6px` walks straight into.
+        // `ScrollArea::show_rows` reads `item_spacing.y` from the ui it is
+        // GIVEN, before its closure runs, and virtualizes against
+        // `row_height + that spacing`. Setting the gap inside the closure
+        // instead -- which is where the old 2pt gap was set, and the obvious
+        // place to put a new one -- leaves the scroll maths on the theme's
+        // default 8pt pitch while the rows paint 6pt apart. Nothing looks
+        // wrong until you scroll: the error is 2pt per row, so at the bottom
+        // of a 100-item list the last row sits ~200pt above where the
+        // scrollbar says the end is.
+        //
+        // Scrolled to the very end, the last row's tile must therefore end
+        // exactly on the list's own bottom padding edge. That is an ABSOLUTE
+        // position, not "below the one before it".
+        const N: usize = 100;
+        let items: Vec<VaultItem> = (0..N)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let p = paint_with(&items, None, 24);
+        let last = format!("Item {:04}", N - 1);
+        assert!(
+            p.visible.contains(&last),
+            "scrolled to the end, {last:?} was not among the laid-out rows: {:?}",
+            p.visible
+        );
+        let bottom = row_tiles(&p)
+            .iter()
+            .map(|t| t.rect.bottom())
+            .fold(f32::MIN, f32::max);
+        let expected = PANE_HEIGHT - LIST_PADDING;
+        assert!(
+            (bottom - expected).abs() < 1.5,
+            "at the end of the list the last row tile ends at y={bottom}, but the list's own \
+             bottom padding edge is at y={expected} -- the painted rows and the pitch \
+             `show_rows` scrolls by have drifted apart"
+        );
     }
 }
 
