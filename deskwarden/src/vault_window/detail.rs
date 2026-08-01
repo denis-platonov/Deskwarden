@@ -2857,6 +2857,38 @@ mod tests {
         );
     }
 
+    /// The password row goes through the same `masked_row` the two card
+    /// secrets do, so restyling that function restyles all three at once --
+    /// and nothing pinned the password half of it. Both directions, so this
+    /// cannot pass on a row that is always masked or always clear.
+    #[test]
+    fn a_logins_password_is_masked_by_default_and_revealed_only_by_its_own_flag() {
+        let item = a_login();
+        let masked = painted(&item, &TotpState::NoSecret);
+        assert!(
+            !contains(&masked, "hunter2"),
+            "the password was painted in the clear by default: {masked:?}"
+        );
+        assert!(
+            contains(&masked, "Reveal"),
+            "the password row offers no way to reveal what it masked: {masked:?}"
+        );
+
+        let revealed = painted_with_reveal(
+            &item,
+            &TotpState::NoSecret,
+            RevealState {
+                password: true,
+                card_number: false,
+                card_code: false,
+            },
+        );
+        assert!(
+            contains(&revealed, "hunter2"),
+            "password: true did not reveal the password: {revealed:?}"
+        );
+    }
+
     /// The design's last card is the metadata strip -- a white tile like the
     /// others, `padding: 13px 16px; font-size: 12px`, not a bare line of 11px
     /// ghost text sitting on the pane's grey.
