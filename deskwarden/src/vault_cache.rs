@@ -21,6 +21,40 @@ use crate::app_match::AppMatch;
 use crate::vault_bridge::{with_app_match, Folder, NewLoginItem, VaultBridge, VaultError, VaultItem};
 use std::sync::Mutex;
 
+/// Which *era* of the snapshot a caller is talking about.
+///
+/// A new epoch begins at every [`VaultCache::clear`] -- lock, re-authentication
+/// (possibly into a different account), quit -- and at nothing else. Two equal
+/// `VaultEpoch`s therefore prove exactly one thing, and it is worth stating
+/// both halves, because reading more into it is review 18's third finding:
+///
+///  * **What equality DOES prove:** the snapshot has not been dropped and
+///    rebuilt in between, so it still belongs to the same vault session --
+///    the same account, the same unlock. Nothing here can be another
+///    account's data, and (since `clear` is the only thing that sets
+///    `populated` back to `false`) it is still populated.
+///  * **What equality does NOT prove:** that the snapshot's CONTENTS are
+///    unchanged. `set_app_match`, `update_item`, `create_item` and
+///    `delete_item` all mutate it in place and deliberately do not bump the
+///    epoch. That is not an oversight to be fixed with a second counter: a
+///    write is *newer truth* than any fetch that predates it, so a consumer
+///    holding a stale epoch-tagged fetch does not want to be told "something
+///    changed, give up" -- it wants the snapshot as it stands now.
+///
+/// So an epoch answers "may I still act on the vault session I saw?", never
+/// "is what I fetched still current?". A consumer that needs items should ask
+/// [`VaultCache::items_unless_superseded`], which answers the first question
+/// and hands back the answer to the second in one step, under one lock,
+/// rather than comparing epochs and then re-deriving data itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultEpoch(u64);
+
+impl std::fmt::Display for VaultEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Default)]
 struct Snapshot {
     items: Vec<VaultItem>,
@@ -30,6 +64,12 @@ struct Snapshot {
     /// it starts fetching and refuses to write its result back if the value
     /// has moved on since -- see [`VaultCache::populate`].
     epoch: u64,
+}
+
+impl Snapshot {
+    fn epoch(&self) -> VaultEpoch {
+        VaultEpoch(self.epoch)
+    }
 }
 
 pub struct VaultCache {
@@ -118,8 +158,41 @@ impl VaultCache {
     /// the window it is given, and a `clear` that lands between a caller's
     /// own `list_items` and its `populate_with` is invisible to an epoch
     /// captured inside `populate_with` (review 14's Minor).
-    pub fn epoch(&self) -> u64 {
-        self.lock().epoch
+    pub fn epoch(&self) -> VaultEpoch {
+        self.lock().epoch()
+    }
+
+    /// The snapshot's items **as they stand now**, or `None` if a
+    /// [`Self::clear`] has started a new epoch since `epoch` was captured.
+    ///
+    /// This is the one place that answers "is a result computed back at
+    /// `epoch` still applicable, and if so what should I act on?". It exists
+    /// because those are two questions that were being answered by two
+    /// different mechanisms, and the pairing was wrong (review 18's third
+    /// finding): callers compared epochs to decide applicability and then
+    /// acted on a `Vec` frozen at their own, earlier fetch. Since a write
+    /// mutates the snapshot without touching the epoch (see [`VaultEpoch`]),
+    /// "the epoch still matches" was read as "so my frozen copy is still the
+    /// snapshot", which it never was -- and an app match saved while a sync
+    /// was in flight was silently overwritten by that sync's older list.
+    ///
+    /// Returning the items rather than a bool is the whole point: the answer
+    /// to "still applicable?" is useless without the data it applies to, and
+    /// splitting them is what let them drift apart. Both facts are read under
+    /// a single lock, so no `clear` can land between the check and the read.
+    ///
+    /// `None` also covers an unpopulated snapshot at the same epoch. That is
+    /// unreachable today -- `clear` is the only thing that unpopulates and it
+    /// bumps the epoch -- but this function's job is to hand back a vault, and
+    /// an empty unpopulated snapshot is not one (see [`PopulateOutcome`]);
+    /// deriving that fact from the epoch instead of checking it is exactly the
+    /// inference this whole type exists to stop people making.
+    pub fn items_unless_superseded(&self, epoch: VaultEpoch) -> Option<Vec<VaultItem>> {
+        let snapshot = self.lock();
+        if snapshot.epoch() != epoch || !snapshot.populated {
+            return None;
+        }
+        Some(snapshot.items.clone())
     }
 
     /// Same as [`Self::populate`], but with items already fetched by the
@@ -146,22 +219,26 @@ impl VaultCache {
     /// (review 14's Minor -- inert at the only caller today, which runs on
     /// the main thread before any `clear` site exists, but not inert for the
     /// background-thread callers the encrypted-disk-cache work will add).
-    pub fn populate_with(&self, items: Vec<VaultItem>, epoch: u64) -> Result<PopulateOutcome, VaultError> {
+    pub fn populate_with(
+        &self,
+        items: Vec<VaultItem>,
+        epoch: VaultEpoch,
+    ) -> Result<PopulateOutcome, VaultError> {
         self.populate_with_at_epoch(items, epoch)
     }
 
     fn populate_with_at_epoch(
         &self,
         items: Vec<VaultItem>,
-        epoch: u64,
+        epoch: VaultEpoch,
     ) -> Result<PopulateOutcome, VaultError> {
         let folders = self.bridge.list_folders()?;
         let mut snapshot = self.lock();
-        if snapshot.epoch != epoch {
+        if snapshot.epoch() != epoch {
             log::info!(
                 "discarding a vault populate that finished after the cache was cleared \
                  (epoch {epoch} -> {}); the snapshot stays empty",
-                snapshot.epoch
+                snapshot.epoch()
             );
             return Ok(PopulateOutcome::DiscardedStale);
         }
@@ -186,7 +263,10 @@ impl VaultCache {
     /// Drops everything. Called on lock and on quit.
     ///
     /// Also bumps the epoch, which is what makes this actually stick against
-    /// a populate that is already in flight -- see [`Self::populate`].
+    /// a populate that is already in flight -- see [`Self::populate`]. It is
+    /// the ONLY thing that bumps it, deliberately: see [`VaultEpoch`] for why
+    /// the writes below must not, and [`Self::items_unless_superseded`] for
+    /// what consumers should ask instead of comparing epochs themselves.
     pub fn clear(&self) {
         let mut snapshot = self.lock();
         snapshot.items.clear();
@@ -691,6 +771,90 @@ mod tests {
             unchanged.fields.is_empty(),
             "a failed set_app_match modified the cached item anyway"
         );
+    }
+
+    #[test]
+    fn items_unless_superseded_hands_back_a_write_that_landed_after_the_epoch_was_captured() {
+        // The contract in one test (review 18's third finding). A caller
+        // captures the epoch, goes away for a while, and comes back to ask
+        // whether its result still applies. A write landed meanwhile. The
+        // right answer is NOT "superseded" -- nothing changed vault session,
+        // and the write is newer truth than anything that caller fetched --
+        // it is "still applicable, and here is the snapshot INCLUDING that
+        // write". An epoch comparison alone answers the first half and
+        // silently invites the caller to act on its own stale copy.
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let epoch = cache.epoch();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache.set_app_match(&item, &an_app_match()).unwrap();
+        assert_eq!(cache.epoch(), epoch, "a write must not start a new epoch");
+
+        let items = cache
+            .items_unless_superseded(epoch)
+            .expect("a write is not a supersession -- the vault session is the same one");
+        let updated = items.into_iter().find(|i| i.id == "1").unwrap();
+        assert!(
+            updated
+                .fields
+                .iter()
+                .any(|f| f.name.as_deref() == Some(crate::app_match::APP_MATCH_FIELD_NAME)),
+            "the snapshot handed back must be the live one, not a copy from when the epoch \
+             was captured"
+        );
+    }
+
+    #[test]
+    fn items_unless_superseded_refuses_once_a_clear_has_started_a_new_epoch() {
+        // The other half, so the test above cannot pass by never refusing.
+        // A `clear` is a lock, a re-auth into a possibly different account,
+        // or a quit: a result computed in the previous epoch must not be
+        // acted on, and there is no snapshot to hand back either.
+        let mut server = mockito::Server::new();
+        let _i = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .create();
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let epoch = cache.epoch();
+        cache.clear();
+
+        assert!(cache.items_unless_superseded(epoch).is_none());
+        // ...and a *repopulate* for the new account does not make the old
+        // epoch applicable again: this is the cross-account case, and the
+        // epoch is what closes it.
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        assert!(
+            cache.items_unless_superseded(epoch).is_none(),
+            "an epoch from before a clear must stay superseded even once the cache refills"
+        );
+        assert!(cache.items_unless_superseded(cache.epoch()).is_some());
     }
 
     #[test]

@@ -45,7 +45,7 @@ use deskwarden::injector::{
 use deskwarden::match_engine::MatchEngine;
 use deskwarden::updater::{self, ReleaseInfo};
 use deskwarden::vault_bridge::VaultBridge;
-use deskwarden::vault_cache::{PopulateOutcome, VaultCache};
+use deskwarden::vault_cache::{PopulateOutcome, VaultCache, VaultEpoch};
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, prefs_ui,
     session_store, settings, tray, vault_window, window_watch,
@@ -1289,7 +1289,7 @@ fn repopulate_and_refresh_after_unlock(
     // probe's fetch and this write is invisible to an epoch captured any
     // later. Same contract, and the same reason, as startup's
     // `startup_epoch`.
-    epoch: u64,
+    epoch: VaultEpoch,
 ) {
     // Engine first, and unconditionally: it is pure, it cannot fail, and
     // doing it before the move into `populate_with` is what lets `items` be
@@ -1411,7 +1411,7 @@ fn restart_backend_after_unlock(
 fn settle_vault_after_unlock(
     cache: &VaultCache,
     engine: &mut MatchEngine,
-    epoch: u64,
+    epoch: VaultEpoch,
     mut probe: impl FnMut(&'static str) -> VaultReadyOutcome,
 ) {
     match probe(SETUP_MESSAGE) {
@@ -1886,22 +1886,24 @@ enum BackendOp {
 /// because the vault locked underneath it", so the latter took the success
 /// path -- logging "sync complete", rebuilding the match engine from an
 /// empty cache and returning the tray to its idle "Sync" label as though the
-/// vault were freshly in sync (review 14's Minor). Matched exhaustively in
-/// `apply_backend_op` with no catch-all. (`settle_sync_outcome` does have a
-/// catch-all, deliberately: it is a transformation that only ever downgrades
-/// `Refreshed`, not the place the outcomes are acted on.)
+/// vault were freshly in sync (review 14's Minor).
+///
+/// This is what the WORKER observed. What the main thread should do about it
+/// is [`SettledSync`], decided by `settle_sync_outcome`; both are matched
+/// exhaustively, with no catch-all anywhere between here and the tray.
 #[derive(Debug)]
 enum SyncOutcome {
     /// `bw sync` succeeded and the refreshed vault landed in the cache.
     Refreshed {
-        /// The cache epoch this sync was written at. Checked again by
-        /// `settle_sync_outcome` when the outcome is finally applied on the
-        /// main thread -- see that function.
-        epoch: u64,
-        /// The match-engine entries derived from the item list THIS sync
-        /// fetched, rather than from a later re-read of the cache. See
-        /// `sync_outcome_from`.
-        entries: Vec<(String, deskwarden::app_match::AppMatch)>,
+        /// The vault epoch this sync was written at, captured by the worker
+        /// BEFORE its own fetch. Re-checked by `settle_sync_outcome` when the
+        /// outcome is finally applied on the main thread -- see that function
+        /// and [`deskwarden::vault_cache::VaultEpoch`].
+        ///
+        /// Deliberately the ONLY thing this variant carries. It used to carry
+        /// the match entries this sync's own `list_items` produced as well,
+        /// which is review 18's third finding: see `settle_sync_outcome`.
+        epoch: VaultEpoch,
     },
     /// `bw sync` succeeded, but the cache was cleared while the repopulate
     /// was in flight, so nothing local was refreshed. Not a failure of the
@@ -1911,13 +1913,43 @@ enum SyncOutcome {
     Failed(String),
 }
 
-/// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
-/// `Sync`, rebuilds the match engine from the entries that sync itself
-/// fetched and reflects the outcome on the tray.
+/// What the main thread should DO about a completed sync, decided by
+/// `settle_sync_outcome` the moment before it acts.
 ///
-/// The only thing it reads from `cache` is the epoch, for
-/// `settle_sync_outcome`; it no longer re-reads `cache.items()` (review 17
-/// -- see `sync_outcome_from`).
+/// A separate type from [`SyncOutcome`] on purpose. `SyncOutcome` says what
+/// happened on the worker thread, minutes ago and possibly for a vault
+/// session that no longer exists; this says what is to be done here and now.
+/// Collapsing the two -- `settle_sync_outcome` used to take a `SyncOutcome`
+/// and return a `SyncOutcome` -- is what made it possible to write a
+/// re-checked outcome that still carried the worker's own stale payload, and
+/// for `apply_backend_op` to act on that payload believing the re-check had
+/// blessed it. Here the only variant that means "go ahead" carries the data
+/// to go ahead WITH, taken from the cache under the same check, so there is
+/// nothing else in scope for the apply site to reach for.
+enum SettledSync {
+    /// The sync is still applicable -- same vault session, cache still
+    /// populated -- and `items` is the snapshot AS IT STANDS NOW: this sync's
+    /// refresh plus anything written since, which is newer truth than the
+    /// sync and must survive it. Rebuild the match engine from these.
+    Applicable {
+        items: Vec<deskwarden::vault_bridge::VaultItem>,
+    },
+    /// The sync refreshed nothing that is still around to act on: either its
+    /// own populate was discarded on the worker thread, or a `clear` (lock,
+    /// re-auth, quit) started a new epoch before the main thread got here.
+    /// Touch neither the engine nor the cache.
+    NothingToApply,
+    /// Starting the backend, syncing, or repopulating failed.
+    Failed(String),
+}
+
+/// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
+/// `Sync`, rebuilds the match engine and reflects the outcome on the tray.
+///
+/// Whether a sync's outcome is still applicable at all, and what to build the
+/// engine from if it is, are both decided by `settle_sync_outcome` -- see
+/// there for the contract. This function never reaches into `cache` itself
+/// for that data, so there is no second, unchecked route to it.
 fn apply_backend_op(
     op: BackendOp,
     bw_serve_child: &mut Option<Child>,
@@ -1952,8 +1984,14 @@ fn apply_backend_op(
                 Some(Err(e)) => log::error!("sync could not start bw serve: {e}"),
                 None => {}
             }
-            match settle_sync_outcome(outcome, cache.epoch()) {
-                SyncOutcome::Refreshed { entries, .. } => {
+            match settle_sync_outcome(outcome, cache) {
+                SettledSync::Applicable { items } => {
+                    // From the snapshot `settle_sync_outcome` just checked and
+                    // handed over, NOT from anything this sync froze earlier:
+                    // a write that landed while the sync was in flight is
+                    // newer truth and has to survive it (review 18's third
+                    // finding). See `settle_sync_outcome`.
+                    let entries = match_entries(&items);
                     log::info!(
                         "sync complete; match engine refreshed: {} app match(es)",
                         entries.len()
@@ -1961,7 +1999,7 @@ fn apply_backend_op(
                     engine.rebuild(&entries);
                     tray::set_sync_idle(tray);
                 }
-                SyncOutcome::DiscardedStale => {
+                SettledSync::NothingToApply => {
                     // Deliberately touches neither the engine nor the cache:
                     // whatever cleared the cache (lock, re-auth) owns both,
                     // and by now it may already have repopulated them for a
@@ -1978,7 +2016,7 @@ fn apply_backend_op(
                     );
                     tray::set_sync_failed(tray);
                 }
-                SyncOutcome::Failed(e) => {
+                SettledSync::Failed(e) => {
                     log::error!("sync failed: {e}");
                     tray::set_sync_failed(tray);
                 }
@@ -2115,77 +2153,99 @@ fn spawn_sync(
     });
 }
 
-/// Re-checks a completed sync's result against the cache as it stands NOW,
-/// on the main thread, and downgrades a `Refreshed` whose snapshot has been
-/// cleared out from under it to `DiscardedStale`.
+/// **The freshness contract for a completed backend operation, in one
+/// place.** Re-checks a sync's result against the cache as it stands NOW, on
+/// the main thread, and answers with what to do about it.
 ///
-/// [`VaultCache::populate_with`]'s own epoch guard covers the window between
-/// the worker's fetch and the worker's write. It cannot cover the window
-/// after that, between the worker sending its outcome and `main` draining
-/// it -- and that window is reachable, because `open_vault_window` abandons
-/// an in-flight backend operation after `BACKEND_OP_TIMEOUT` and carries on
-/// into a lock recovery that calls `cache.clear()`. Applied unguarded, such
-/// a late arrival writes the PREVIOUS account's app matches over an engine
-/// the recovery has just armed correctly for the new one -- the same
-/// cross-account pairing `stand_down_after_unlock` exists to prevent, from
-/// the other direction.
+/// There are two windows between a sync's `list_items` and the engine rebuild
+/// it eventually causes, and they need OPPOSITE answers. That is the thing
+/// five consecutive reviews of this seam have each rediscovered from a
+/// different door, so it is written out rather than left to be re-derived:
 ///
-/// Comparing epochs answers exactly the right question: the epoch is bumped
-/// only by `clear`, so "unchanged since this sync captured it" means no lock,
-/// re-auth or quit has intervened and the snapshot in the cache is still the
-/// one this sync wrote. A downgrade lands in the `DiscardedStale` arm, which
-/// deliberately touches neither the engine nor the cache and reports the
-/// honest "click to retry" on the tray.
-fn settle_sync_outcome(outcome: SyncOutcome, cache_epoch: u64) -> SyncOutcome {
+///  1. **A `clear` -- lock, re-auth into a possibly different account, quit.**
+///    The sync's result must be thrown away. `VaultCache::populate_with`'s own
+///    epoch guard covers the worker's fetch-to-write window; this covers the
+///    one after it, between the worker sending its outcome and `main` draining
+///    it, which is reachable because `open_vault_window` abandons an in-flight
+///    backend operation after `BACKEND_OP_TIMEOUT` and carries on into a lock
+///    recovery that calls `cache.clear()`. Applied unguarded, such a late
+///    arrival writes the PREVIOUS account's app matches over an engine the
+///    recovery has just armed correctly for the new one -- the same
+///    cross-account pairing `stand_down_after_unlock` exists to prevent, from
+///    the other direction. It also covers review 17's finding, where the
+///    recovery's own populate failed and left the cache legitimately empty:
+///    that recovery clears first, so the epoch has moved and nothing is
+///    applied to the empty cache.
+///  2. **A WRITE -- an "Add app..." save, or any vault-window edit.** The
+///    sync's result must NOT be thrown away, and must not overwrite the write
+///    either. A write is newer truth than a fetch that predates it, and the
+///    "Add app..." handler does not block on `backend_task_in_progress`
+///    while its two picker windows block the main thread, so a save landing
+///    inside a queued sync's window is ordinary, not exotic.
+///
+/// Review 18's third finding is what happens when one mechanism is asked to
+/// answer both: `Refreshed` carried the entries from the sync's own
+/// `list_items`, and an unchanged epoch was read as proving they were still
+/// the vault. It never proved that -- writes mutate the snapshot without
+/// touching the epoch, deliberately (see [`VaultEpoch`]) -- so the app match
+/// the user had just spent two windows creating was rebuilt away, with two
+/// success log lines and no warning.
+///
+/// The fix is not a second counter to detect case 2. A counter would only let
+/// this discard a sync that is perfectly applicable, trading a silently lost
+/// match for a silently skipped refresh. What case 2 wants is the snapshot
+/// itself, at apply time -- which is also, by construction, exactly what case
+/// 1 wants when it is safe: `Refreshed` is only produced when the sync's own
+/// populate SUCCEEDED, so at an unchanged epoch the cache holds that sync's
+/// items plus any newer writes. One question ("is this vault session still
+/// the one I saw, and if so what is in it?"), asked of the one type that can
+/// answer it under a single lock: [`VaultCache::items_unless_superseded`].
+fn settle_sync_outcome(outcome: SyncOutcome, cache: &VaultCache) -> SettledSync {
     match outcome {
-        SyncOutcome::Refreshed { epoch, entries } if epoch == cache_epoch => {
-            SyncOutcome::Refreshed { epoch, entries }
-        }
-        SyncOutcome::Refreshed { epoch, .. } => {
-            log::info!(
-                "a completed sync's result reached the main thread after the vault was cleared \
-                 (epoch {epoch} -> {cache_epoch}); discarding it rather than writing it over \
-                 whatever cleared it"
-            );
-            SyncOutcome::DiscardedStale
-        }
-        other => other,
+        SyncOutcome::Refreshed { epoch } => match cache.items_unless_superseded(epoch) {
+            Some(items) => SettledSync::Applicable { items },
+            None => {
+                log::info!(
+                    "a completed sync's result reached the main thread after the vault was \
+                     cleared (epoch {epoch} -> {}); discarding it rather than writing it over \
+                     whatever cleared it",
+                    cache.epoch()
+                );
+                SettledSync::NothingToApply
+            }
+        },
+        SyncOutcome::DiscardedStale => SettledSync::NothingToApply,
+        SyncOutcome::Failed(e) => SettledSync::Failed(e),
     }
 }
 
 /// Refreshes the cache from `bw serve` after a completed `bw sync` and says
-/// what that achieved -- including, on success, the match-engine entries
-/// derived from the item list this call itself fetched.
+/// what that achieved.
 ///
-/// **Review 17's third finding.** `SyncOutcome::Refreshed` used to be a unit
-/// variant, and `apply_backend_op` answered it with
-/// `engine.rebuild(&match_entries(&cache.items()))` -- an engine rebuild
-/// derived from a RE-READ of the cache on the main thread rather than from
-/// the fetch that produced the outcome. `Refreshed` does imply the cache was
-/// non-empty at write time, but not that it still is when the main thread
-/// gets round to applying it, and the gap is reachable: `open_vault_window`
-/// abandons an in-flight backend operation after `BACKEND_OP_TIMEOUT` and
-/// carries on into lock recovery, so a sync whose `populate` had already
-/// landed can arrive through `main`'s ordinary drain *after* that recovery's
-/// `cache.clear()`. If the recovery then went `Ready` with a failing
-/// `list_folders` -- engine armed from the probe's items, cache empty by
-/// design -- this rebuilt the engine from nothing and silently disarmed
-/// autofill for the rest of the session. That is review 15's finding
-/// resurrected through a different door.
-///
-/// Carrying the entries removes the failure mode rather than guarding
-/// against it, the same shape as review 16's fix: there is no longer a
-/// re-read to be stale. `probe_items` lets a caller that has already listed
-/// the vault (the readiness wait `spawn_sync` runs when it had to start the
-/// backend itself) hand those items over instead of paying for a second
-/// full-vault `list_items`.
+/// `probe_items` lets a caller that has already listed the vault (the
+/// readiness wait `spawn_sync` runs when it had to start the backend itself)
+/// hand those items over instead of paying for a second full-vault
+/// `list_items`.
 ///
 /// `epoch` must be captured by the caller BEFORE the sync it is reporting on
 /// -- see [`VaultCache::epoch`]. This is the one genuinely live
 /// `DiscardedStale` producer in the crate.
+///
+/// **What this deliberately does NOT return** (review 18's third finding).
+/// Between review 17 and review 18 it also returned `match_entries(&items)`,
+/// so that the engine was rebuilt from the fetch that produced the outcome
+/// rather than from a re-read of the cache on the main thread. That closed
+/// review 17's case -- a late sync rebuilding the engine from a cache a lock
+/// recovery had emptied -- but by freezing data on a background thread and
+/// applying it minutes later, which is how it then erased writes that landed
+/// in between. Review 17's case is closed by the epoch instead (that recovery
+/// calls `cache.clear()`, which starts a new epoch, so the outcome is
+/// discarded before it can be applied to anything), and the engine is once
+/// again built from the cache at apply time -- see `settle_sync_outcome`,
+/// which owns that decision and the reasoning behind it.
 fn sync_outcome_from(
     cache: &VaultCache,
-    epoch: u64,
+    epoch: VaultEpoch,
     probe_items: Option<Vec<deskwarden::vault_bridge::VaultItem>>,
 ) -> SyncOutcome {
     let items = match probe_items {
@@ -2197,12 +2257,8 @@ fn sync_outcome_from(
         Err(e) => return SyncOutcome::Failed(format!("{e:?}")),
     };
 
-    // Derived before the move into `populate_with`, so nothing is cloned --
-    // and, incidentally, on this background thread rather than on the main
-    // one, where it used to run.
-    let entries = match_entries(&items);
     match cache.populate_with(items, epoch) {
-        Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed { epoch, entries },
+        Ok(PopulateOutcome::Populated) => SyncOutcome::Refreshed { epoch },
         Ok(PopulateOutcome::DiscardedStale) => SyncOutcome::DiscardedStale,
         Err(e) => SyncOutcome::Failed(format!("{e:?}")),
     }
@@ -3080,9 +3136,13 @@ mod tests {
         let outcome = sync_outcome_from(&cache, cache.epoch(), None);
 
         let mut engine = MatchEngine::new();
-        match settle_sync_outcome(outcome, cache.epoch()) {
-            SyncOutcome::Refreshed { entries, .. } => engine.rebuild(&entries),
-            other => panic!("expected a refreshed sync, got {other:?}"),
+        // No `{other:?}` here, and `SettledSync` deliberately does not derive
+        // `Debug`: its applicable variant carries vault items, and this is a
+        // type whose whole job is to be matched on rather than printed.
+        match settle_sync_outcome(outcome, &cache) {
+            SettledSync::Applicable { items } => engine.rebuild(&match_entries(&items)),
+            SettledSync::NothingToApply => panic!("expected a refreshed sync, got NothingToApply"),
+            SettledSync::Failed(e) => panic!("expected a refreshed sync, got Failed({e})"),
         }
         assert!(
             engine.lookup("notepad.exe").is_some(),
@@ -3100,10 +3160,14 @@ mod tests {
     /// `Ready` with a failing `list_folders` (engine armed from the probe's
     /// items, cache empty by design), the late sync rebuilt the engine from
     /// nothing and disarmed autofill for the whole session -- review 15's
-    /// finding through a different door. The outcome now carries both the
-    /// entries it fetched and the epoch it was written at, so a clear in
-    /// that window downgrades it to `DiscardedStale`: the engine the
-    /// recovery armed is left exactly as it is.
+    /// finding through a different door.
+    ///
+    /// Review 18 removed the entries again and left the epoch to close this,
+    /// which is why the test is worth reading twice: the recovery's own
+    /// `cache.clear()` starts a new epoch, so the outcome is discarded before
+    /// anything is read from the empty cache. The engine the recovery armed
+    /// is left exactly as it is -- the same assertion as before, now resting
+    /// on the epoch rather than on frozen entries.
     #[test]
     fn a_late_sync_result_cannot_disarm_an_engine_a_lock_recovery_just_armed() {
         let server = sync_server();
@@ -3118,8 +3182,8 @@ mod tests {
 
         assert!(
             matches!(
-                settle_sync_outcome(outcome, cache.epoch()),
-                SyncOutcome::DiscardedStale
+                settle_sync_outcome(outcome, &cache),
+                SettledSync::NothingToApply
             ),
             "a sync whose snapshot was cleared before its result reached the main thread must \
              not be applied to anything"
@@ -3127,6 +3191,122 @@ mod tests {
         assert!(
             engine.lookup("code.exe").is_some(),
             "the engine the recovery armed must survive the late arrival"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "the pre-clear vault's matches must not be armed by the late arrival"
+        );
+    }
+
+    /// The same guard in the shape with the worst consequence, and the one
+    /// review 18's redesign had to be checked against hardest: the recovery
+    /// SUCCEEDS and repopulates for a DIFFERENT account, so at settle time
+    /// the cache is populated and non-empty. Since the engine is now built
+    /// from the cache at apply time rather than from the sync's own frozen
+    /// entries, getting this wrong would not merely lose a refresh -- it
+    /// would arm account B's engine on a click that belongs to account A, and
+    /// (the mirror of it) an unguarded apply would write A's matches over B.
+    /// The epoch is what closes it: `clear` starts a new one, and nothing
+    /// afterwards can make the old one current again.
+    #[test]
+    fn a_late_sync_from_a_previous_account_is_discarded_even_though_the_cache_refilled() {
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        // Account A's sync: fetched, populated, outcome queued.
+        let outcome = sync_outcome_from(&cache, cache.epoch(), None);
+
+        // Lock, re-authentication into account B, and a recovery that works:
+        // the cache is cleared and repopulated from B's own readiness probe.
+        cache.clear();
+        let epoch_b = cache.epoch();
+        let refilled = cache.populate_with(probe_items(&[("2", "code.exe")]), epoch_b);
+        assert_eq!(refilled.unwrap(), PopulateOutcome::Populated);
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&match_entries(&probe_items(&[("2", "code.exe")])));
+
+        assert!(
+            matches!(
+                settle_sync_outcome(outcome, &cache),
+                SettledSync::NothingToApply
+            ),
+            "a sync from the previous account must be discarded even when the cache has since \
+             been refilled for the new one"
+        );
+        assert!(
+            engine.lookup("code.exe").is_some(),
+            "the new account's matches must stay armed"
+        );
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "the previous account's matches must not be armed after an account switch"
+        );
+    }
+
+    /// Review 18's third finding, and the composed case that matters: a sync
+    /// in flight, a WRITE landing while it is in flight, the sync's outcome
+    /// applying afterwards. The write must survive.
+    #[test]
+    fn an_app_match_saved_while_a_sync_was_in_flight_survives_that_sync() {
+        const ONE_ITEM_NO_MATCH: &str =
+            r#"{"success":true,"data":{"data":[{"id":"1","name":"1","type":1,"fields":[]}]}}"#;
+        let mut server = mockito::Server::new();
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(ONE_ITEM_NO_MATCH)
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        server
+            .mock("PUT", "/object/item/1")
+            .with_status(200)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        // The tray Sync worker: its `list_items` returns the vault as it was
+        // BEFORE the save below, and its outcome sits in the channel while
+        // the picker windows block the main thread.
+        let outcome = sync_outcome_from(&cache, cache.epoch(), None);
+
+        // "Add app...": the user saves a match through the cache, and
+        // `refresh_match_engine`'s equivalent arms the engine from it.
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        cache
+            .set_app_match(
+                &item,
+                &deskwarden::app_match::AppMatch {
+                    process: "notepad.exe".into(),
+                    trigger: deskwarden::app_match::TriggerMode::Auto,
+                },
+            )
+            .unwrap();
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&match_entries(&cache.items()));
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "the save itself must arm the engine"
+        );
+
+        // Only now does the main thread drain the sync outcome. Nothing
+        // cleared the cache, so it is applied -- and applying it must not
+        // reinstate the pre-save vault the worker happened to have fetched.
+        match settle_sync_outcome(outcome, &cache) {
+            SettledSync::Applicable { items } => engine.rebuild(&match_entries(&items)),
+            SettledSync::NothingToApply => panic!(
+                "a write is not a supersession: the vault session is the same one, so this sync \
+                 is still applicable"
+            ),
+            SettledSync::Failed(e) => panic!("expected a refreshed sync, got Failed({e})"),
+        }
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "the app match the user saved while the sync was in flight was silently dropped by \
+             the sync's own, older item list"
         );
     }
 
