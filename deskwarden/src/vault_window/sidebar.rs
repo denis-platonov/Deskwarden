@@ -144,6 +144,27 @@ const SECTION_LABEL_INSET: f32 = 8.0;
 /// the same line.
 const SECTION_HEADER_HEIGHT: f32 = 20.0;
 
+/// Where the sidebar's right-hand glyph column is centred, given the
+/// sidebar's own right edge -- the single source of truth for *both* glyphs
+/// that live in that column: the FOLDERS header's "+" (new folder) and each
+/// folder row's edit pencil.
+///
+/// The column is the `FOLDER_EDIT_BUTTON_WIDTH` lane that every folder row
+/// already gives up before it is laid out, so its centre is half that lane
+/// in from the edge. That lane is the fixed thing here; the "+" simply joins
+/// it.
+///
+/// It exists as a function rather than as two agreeing literals because that
+/// is precisely how these two drifted: the pencil was hung off the row's
+/// right edge (`right ..= right + FOLDER_EDIT_BUTTON_WIDTH`, centre at
+/// `edge - 12`) while the "+" was placed by unrelated arithmetic
+/// (`header_rect.right() - SECTION_LABEL_INSET - 8.0`, centre at `edge -
+/// 16`), leaving them 4px apart in one visual column with nothing keeping
+/// them together.
+fn glyph_column_center_x(sidebar_right: f32) -> f32 {
+    sidebar_right - FOLDER_EDIT_BUTTON_WIDTH / 2.0
+}
+
 pub fn draw_sidebar(
     ui: &mut egui::Ui,
     items: &[VaultItem],
@@ -201,8 +222,16 @@ pub fn draw_sidebar(
         // re-advance the parent cursor by their own content height, which
         // is what made these rows overlap.
         let header_rect = section_label(ui, "FOLDERS");
+        // ONE right edge for ONE glyph column, read off the header's
+        // full-width band and reused by every folder row's pencil below --
+        // `section_label` allocates all of `ui.available_width()`, which is
+        // the same width the rows then divide up, so this is the same edge
+        // the pencil lane is measured from. Deriving both from it is what
+        // keeps the "+" and the pencils on one column; see
+        // `glyph_column_center_x`.
+        let glyph_column_x = glyph_column_center_x(header_rect.right());
         let plus_rect = egui::Rect::from_center_size(
-            egui::Pos2::new(header_rect.right() - SECTION_LABEL_INSET - 8.0, header_rect.center().y),
+            egui::Pos2::new(glyph_column_x, header_rect.center().y),
             egui::Vec2::splat(18.0),
         );
         let plus = ui.interact(plus_rect, ui.id().with("new-folder"), egui::Sense::click());
@@ -231,13 +260,14 @@ pub fn draw_sidebar(
             if response.clicked() {
                 *selected = filter.clone();
             }
-            // Positioned against the row's own returned rect, in the same
-            // vertical span -- not a nested `ui.horizontal`, which is what
-            // caused this row to be taller (and differently spaced) than
-            // the plain VAULT rows above.
-            let edit_rect = egui::Rect::from_min_max(
-                egui::Pos2::new(response.rect.right(), response.rect.top()),
-                egui::Pos2::new(response.rect.right() + FOLDER_EDIT_BUTTON_WIDTH, response.rect.bottom()),
+            // Vertically, the row's own returned rect (same span, same
+            // height) -- not a nested `ui.horizontal`, which is what caused
+            // this row to be taller (and differently spaced) than the plain
+            // VAULT rows above. Horizontally, the shared glyph column, so
+            // the pencil and the header's "+" cannot drift apart again.
+            let edit_rect = egui::Rect::from_center_size(
+                egui::Pos2::new(glyph_column_x, response.rect.center().y),
+                egui::Vec2::new(FOLDER_EDIT_BUTTON_WIDTH, response.rect.height()),
             );
             // `bw serve` reports a virtual "No Folder" bucket -- the items
             // that are in no folder at all -- as a folder with an *empty
@@ -639,6 +669,28 @@ mod tests {
     /// so a selected row's `FontFamily::Name(BOLD)` would otherwise resolve
     /// against a family that does not exist yet.
     fn painted_sidebar(lock_countdown: &str) -> Vec<(String, egui::Rect)> {
+        painted_sidebar_and_bounds(lock_countdown).0
+    }
+
+    /// Every painted convex polygon's bounding rect. The folder pencil is
+    /// drawn as two `Shape::Path`s (see `theme::pencil_glyph_at`) rather than
+    /// as text, so it is invisible to `collect_text_rects`; this is how its
+    /// painted position is read.
+    fn collect_path_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Path(path) => out.push(path.visual_bounding_rect()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_path_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn painted_sidebar_and_bounds(
+        lock_countdown: &str,
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -659,15 +711,116 @@ mod tests {
         }];
         let mut selected = SidebarFilter::All;
 
+        let mut bounds = egui::Rect::NOTHING;
         let output = ctx.run_ui(input(), |ui| {
+            bounds = ui.max_rect();
             draw_sidebar(ui, &items, &folders, &mut selected, lock_countdown);
         });
 
         let mut rects = Vec::new();
+        let mut paths = Vec::new();
         for clipped in &output.shapes {
             collect_text_rects(&clipped.shape, &mut rects);
+            collect_path_rects(&clipped.shape, &mut paths);
         }
+        (rects, paths, bounds)
+    }
+
+    /// The pencil is two polygons (body + nib), each with its own bounding
+    /// box; the glyph's position is the union of them, which
+    /// `theme::pencil_glyph_at` centres on the rect it is given.
+    fn union_of(rects: &[egui::Rect]) -> egui::Rect {
+        assert!(!rects.is_empty(), "the sidebar painted no polygons at all");
         rects
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(b))
+            .expect("non-empty")
+    }
+
+    /// The right-hand glyph column's centre, stated as an absolute number
+    /// rather than only "the plus and the pencil agree".
+    ///
+    /// A relative-only assertion is exactly what let the previous defect in
+    /// this file through (see
+    /// `the_countdown_and_the_rows_are_both_row_inset_from_the_panel_edge`):
+    /// a probe that moved *both* insets together stayed green. So this pins
+    /// the function's output for a known right edge: the column is centred
+    /// inside the `FOLDER_EDIT_BUTTON_WIDTH` lane that folder rows already
+    /// give up, i.e. half that lane in from the edge.
+    #[test]
+    fn the_glyph_column_is_centred_in_the_lane_folder_rows_give_up() {
+        assert_eq!(glyph_column_center_x(212.0), 200.0);
+        assert_eq!(glyph_column_center_x(300.0), 288.0);
+        assert_eq!(
+            glyph_column_center_x(212.0),
+            212.0 - FOLDER_EDIT_BUTTON_WIDTH / 2.0
+        );
+    }
+
+    /// The user-reported defect: "Folder + should be aligned with pencil
+    /// icons". The FOLDERS header's "+" was placed by its own arithmetic
+    /// (`header_rect.right() - SECTION_LABEL_INSET - 8.0`, centre at
+    /// R-16) while the pencils hang off the reserved edit lane (centre at
+    /// R-12), so the two sat 4px apart. Both now come from
+    /// [`glyph_column_center_x`], and this asserts the painted "+" really
+    /// lands there -- against the sidebar's own right edge, absolutely, not
+    /// merely level with the pencil.
+    #[test]
+    fn the_folders_plus_is_painted_on_the_shared_glyph_column() {
+        let (painted, _, bounds) = painted_sidebar_and_bounds("Locks in 11:42");
+
+        let plus = painted
+            .iter()
+            .find(|(text, _)| text == "+")
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("the sidebar painted no \"+\": {painted:?}"));
+        let expected = glyph_column_center_x(bounds.right());
+        assert!(
+            (plus.center().x - expected).abs() < 0.5,
+            "the \"+\" is centred at x={}, expected {expected} \
+             (the glyph column for a sidebar whose right edge is {})",
+            plus.center().x,
+            bounds.right()
+        );
+    }
+
+    /// ...and the pencil is on that same column, read off its real painted
+    /// polygons rather than assumed. No fallback source-text guard was
+    /// needed: `theme::pencil_glyph_at` emits exactly two
+    /// `Shape::Path`s and centres their union on the rect it is handed, and
+    /// those are the only paths this sidebar paints (the rows, hairline and
+    /// washes are `Shape::Rect`, the labels `Shape::Text`).
+    #[test]
+    fn the_folder_pencil_sits_on_the_same_column_as_the_plus() {
+        let (painted, paths, bounds) = painted_sidebar_and_bounds("Locks in 11:42");
+
+        assert_eq!(
+            paths.len(),
+            2,
+            "expected exactly the pencil's two polygons, got {paths:?}"
+        );
+        let pencil = union_of(&paths);
+        let plus = painted
+            .iter()
+            .find(|(text, _)| text == "+")
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("the sidebar painted no \"+\": {painted:?}"));
+
+        assert!(
+            (pencil.center().x - glyph_column_center_x(bounds.right())).abs() < 0.5,
+            "the pencil is centred at x={}, expected {}",
+            pencil.center().x,
+            glyph_column_center_x(bounds.right())
+        );
+        assert!(
+            (pencil.center().x - plus.center().x).abs() < 0.5,
+            "the FOLDERS \"+\" is centred at x={} but the folder pencil at x={} \
+             -- they are {}px apart",
+            plus.center().x,
+            pencil.center().x,
+            (pencil.center().x - plus.center().x).abs()
+        );
     }
 
     fn left_edge_of(painted: &[(String, egui::Rect)], needle: &str) -> f32 {
