@@ -4,9 +4,11 @@
 //! in the thousands, and laying out every row on every repaint was already
 //! a confirmed source of a laggy picker before that fix.
 
+use super::detail::{kind_offers_edit, kind_offers_fill};
+use super::detail_edit::assignable_folders;
 use super::sidebar::SidebarFilter;
 use crate::theme;
-use crate::vault_bridge::VaultItem;
+use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::collections::HashMap;
 
@@ -18,10 +20,251 @@ pub struct IconCache {
     pub textures: HashMap<String, egui::TextureHandle>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemListAction {
     None,
     NewItem,
+    /// An entry of some row's right-click menu was chosen.
+    ///
+    /// The item's id is carried rather than left to `selected_id`, even
+    /// though a right-click also selects the row (see [`item_row`]): the two
+    /// are then belt and braces, and nothing about this action depends on
+    /// the caller having applied that selection before it acts.
+    Row { id: String, command: RowCommand },
+}
+
+/// What choosing an entry in an item row's right-click menu asks
+/// `vault_window::mod` to do.
+///
+/// Its own enum rather than `detail::DetailAction`, which it overlaps on six
+/// entries. The menu also has to express "move this item into that folder",
+/// a control the detail pane does not have; growing `DetailAction` a variant
+/// the read pane can never produce would make that enum's own exhaustive
+/// match at the call site carry a dead arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowCommand {
+    CopyUsername,
+    CopyPassword,
+    CopyTotp,
+    Fill,
+    /// Carries the URL, resolved from the item when the menu is built by the
+    /// same rule the detail pane's AUTOFILL TARGETS card uses.
+    OpenWebsite(String),
+    Edit,
+    /// The destination folder's id, always a real assignable folder --
+    /// see [`move_menu`].
+    MoveToFolder(String),
+    Delete,
+}
+
+/// One clickable line of the menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuCommand {
+    pub label: String,
+    pub command: RowCommand,
+    /// `false` draws the line greyed and unclickable, with
+    /// [`Self::disabled_reason`] on hover.
+    ///
+    /// **Disabled and absent are different situations and both occur here.**
+    /// "Copy TOTP" is ABSENT on an item with no seed -- there is nothing to
+    /// explain and no action to want. "Edit" is PRESENT AND DISABLED for the
+    /// kinds `detail::kind_offers_edit` rejects, because a user looking for
+    /// the obvious action needs to be told why it is not on offer rather
+    /// than left to conclude the menu is broken. Collapsing the two onto one
+    /// representation is this codebase's most-repeated defect; they are kept
+    /// apart deliberately.
+    pub enabled: bool,
+    pub disabled_reason: Option<&'static str>,
+}
+
+/// One entry of an item row's right-click menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuEntry {
+    Command(MenuCommand),
+    /// "Move to folder", which opens a submenu rather than acting.
+    MoveToFolder(MoveMenu),
+}
+
+/// The "Move to folder" submenu's contents.
+///
+/// Two variants rather than a possibly-empty `Vec`, so "this vault has no
+/// folders yet" is a state the renderer has to handle explicitly instead of
+/// opening an empty box, which reads as a submenu that failed to load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveMenu {
+    /// At least one assignable folder. Never empty.
+    Targets(Vec<MenuCommand>),
+    /// No assignable folder exists; the submenu says so and offers nothing.
+    Empty(&'static str),
+}
+
+/// The submenu's own label. A constant because the draw code and the tests
+/// that read painted galleys both need it.
+pub const MOVE_TO_FOLDER_LABEL: &str = "Move to folder";
+
+/// Why "Edit" is greyed for a non-login.
+///
+/// The reason, not just the fact: `detail::kind_offers_edit` is still
+/// login-only (its own doc calls itself a stopgap), because `EditDraft`
+/// became kind-aware before that gate was relaxed. This string has to be
+/// deleted the day that predicate starts returning `true` for other kinds --
+/// nothing else here would need to change, since the enabled flag is read
+/// straight off it.
+const EDIT_DISABLED_REASON: &str =
+    "Deskwarden's edit form only handles logins yet. Open this item in the Bitwarden \
+     web vault or app to edit it.";
+
+/// Shown instead of a destination list when the vault has no folder that can
+/// be assigned to.
+const NO_ASSIGNABLE_FOLDERS: &str = "No folders yet";
+
+/// Why the item's own folder is greyed inside the submenu. Kept rather than
+/// dropped from the list so the destinations do not reshuffle as items are
+/// selected, and so the row doubles as "this is where it lives now".
+const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
+
+/// The Delete entry's two labels. The second is the armed state of
+/// `vault_window::mod`'s existing `confirm_click` two-click confirmation --
+/// the SAME mechanism and the same wording the detail pane's Delete button
+/// uses, deliberately, rather than a second confirmation idiom.
+const DELETE_LABEL: &str = "Delete";
+const DELETE_CONFIRM_LABEL: &str = "Delete? Click to confirm";
+
+/// Trimmed text, or `None` when there is nothing worth an entry -- the same
+/// rule `detail::non_empty` applies to that pane's rows, restated here
+/// because it is private there.
+fn menu_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
+/// Every entry of `item`'s right-click menu, in order, for a vault holding
+/// `folders`.
+///
+/// Pure, and the single source of what the menu contains: `item_row` draws
+/// exactly this list and decides nothing itself. That split is not stylistic
+/// -- egui renders a context menu into its own popup layer, and a per-kind
+/// decision made inside that closure is one no test in this crate could
+/// reach.
+///
+/// `delete_pending` is `vault_window::mod`'s `item_delete_pending` for THIS
+/// item; it only changes the Delete entry's wording.
+///
+/// **Archive is deliberately not here.** The feature does not exist, and an
+/// entry that does nothing is worse than a missing one. It joins the list
+/// when Archive lands.
+///
+/// **Nor is a "No folder" / un-file entry.** `bw serve` (CLI 2026.7.0)
+/// cannot clear a folder assignment at all -- omitting the key, `null`, `""`
+/// and a fully round-tripped object were each proven against a control field
+/// that did change in the same request
+/// (`.superpowers/sdd/put-semantics-capture.md`). Offering it would write
+/// successfully and do nothing.
+pub fn menu_entries(item: &VaultItem, folders: &[Folder], delete_pending: bool) -> Vec<MenuEntry> {
+    let kind = ItemKind::of(item);
+    let login = item.login.as_ref();
+    let mut entries = Vec::new();
+
+    // Copy username/password are offered only when there is something to
+    // copy. A card has no login object at all, and a login may carry an
+    // empty one; either way an entry that puts "" on the clipboard is the
+    // same untruth as a blank row, which is the rule `detail::non_empty`
+    // already applies to that pane.
+    if menu_non_empty(login.and_then(|l| l.username.as_deref())).is_some() {
+        entries.push(enabled_command("Copy username", RowCommand::CopyUsername));
+    }
+    if menu_non_empty(login.and_then(|l| l.password.as_deref()).map(|p| p.as_str())).is_some() {
+        entries.push(enabled_command("Copy password", RowCommand::CopyPassword));
+        // No reveal and no confirmation before this one, by explicit user
+        // decision.
+    }
+    // `is_some`, NOT the non-empty rule above, and that is deliberate: the
+    // row's own "2FA" chip (see `item_row`) and `vault_window::mod`'s TOTP
+    // poll gate are both `totp.is_some()`, so anything stricter here would
+    // let a row show a 2FA chip whose menu then denies the code exists.
+    if login.and_then(|l| l.totp.as_ref()).is_some() {
+        entries.push(enabled_command("Copy TOTP", RowCommand::CopyTotp));
+    }
+    // Login-only, through the existing predicate rather than an inline
+    // `item_type == Some(1)`: the fill path resolves exactly a username and
+    // a password, so every other kind would type two empty strings into
+    // whatever window is focused.
+    if kind_offers_fill(kind) {
+        // Offered even when no app is matched to this item yet, matching the
+        // detail pane's own Fill button exactly -- `vault_window::mod` logs
+        // that case rather than treating it as an error.
+        entries.push(enabled_command("Fill in app", RowCommand::Fill));
+        // The same URL the pane's AUTOFILL TARGETS card opens: the first
+        // URI, when there is one.
+        if let Some(url) =
+            menu_non_empty(login.and_then(|l| l.uris.first()).and_then(|u| u.uri.as_deref()))
+        {
+            entries.push(enabled_command(
+                "Open website",
+                RowCommand::OpenWebsite(url.to_string()),
+            ));
+        }
+    }
+    // Present for every kind, enabled only for those the edit form can
+    // honestly edit -- see `MenuCommand::enabled` for why this one is greyed
+    // rather than hidden.
+    let editable = kind_offers_edit(kind);
+    entries.push(MenuEntry::Command(MenuCommand {
+        label: "Edit".to_string(),
+        command: RowCommand::Edit,
+        enabled: editable,
+        disabled_reason: (!editable).then_some(EDIT_DISABLED_REASON),
+    }));
+    entries.push(MenuEntry::MoveToFolder(move_menu(item, folders)));
+    entries.push(enabled_command(
+        if delete_pending { DELETE_CONFIRM_LABEL } else { DELETE_LABEL },
+        RowCommand::Delete,
+    ));
+    entries
+}
+
+/// A plain, clickable entry.
+fn enabled_command(label: &str, command: RowCommand) -> MenuEntry {
+    MenuEntry::Command(MenuCommand {
+        label: label.to_string(),
+        command,
+        enabled: true,
+        disabled_reason: None,
+    })
+}
+
+/// The destinations "Move to folder" offers for `item`.
+///
+/// Filtered through `detail_edit::assignable_folders` -- the EXISTING
+/// predicate, which drops `bw serve`'s virtual "No Folder" bucket via
+/// `sidebar::is_virtual_folder`. Not re-derived inline: offering that bucket
+/// writes `folderId: ""`, which strands the item out of every sidebar row,
+/// and one definition of "virtual" is what keeps this menu and the edit
+/// form's dropdown from drifting apart.
+fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
+    let assignable = assignable_folders(folders);
+    if assignable.is_empty() {
+        return MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS);
+    }
+    MoveMenu::Targets(
+        assignable
+            .into_iter()
+            .map(|folder| {
+                // The item's own folder stays in the list, greyed: dropping
+                // it would make the destinations reshuffle from item to
+                // item, and it is useful as a statement of where the item
+                // lives now. Moving an item to the folder it is already in
+                // is a write that achieves nothing, so it is not offered as
+                // an action.
+                let here = item.folder_id.as_deref() == Some(folder.id.as_str());
+                MenuCommand {
+                    label: folder.name.clone(),
+                    command: RowCommand::MoveToFolder(folder.id.clone()),
+                    enabled: !here,
+                    disabled_reason: here.then_some(ALREADY_IN_THIS_FOLDER),
+                }
+            })
+            .collect(),
+    )
 }
 
 /// True when `item` is both in `filter`'s scope (delegates to
@@ -111,12 +354,20 @@ const LIST_PADDING: f32 = 10.0;
 /// what's visible" behavior instead of only the single selected item. This
 /// module stays otherwise unaware of favicons/threads/caching -- it just
 /// reports what it drew.
+///
+/// `folders` and `delete_pending_id` are both only ever read by the rows'
+/// right-click menus: the first supplies "Move to folder"'s destinations, the
+/// second is `vault_window::mod`'s `item_delete_pending`, which decides
+/// whether that row's Delete entry reads "Delete" or the armed
+/// "Delete? Click to confirm". Neither affects what a row paints.
 pub fn draw_item_list(
     ui: &mut egui::Ui,
     items: &[VaultItem],
+    folders: &[Folder],
     filter: &SidebarFilter,
     search: &mut String,
     selected_id: &mut Option<String>,
+    delete_pending_id: Option<&str>,
     icons: &IconCache,
     visible_ids: &mut Vec<String>,
 ) -> ItemListAction {
@@ -243,8 +494,40 @@ pub fn draw_item_list(
                         let item = filtered[row];
                         visible_ids.push(item.id.clone());
                         let selected = selected_id.as_deref() == Some(item.id.as_str());
-                        if item_row(ui, item, selected, icons.textures.get(&item.id)) {
+                        // Pushed so the row's widget id -- and therefore the
+                        // id of the context-menu popup egui hangs off it --
+                        // is derived from the ITEM rather than from its
+                        // position in the visible range. Without this the
+                        // ids are positional (egui counts widgets within a
+                        // ui), so a list that scrolls while a menu is open
+                        // would leave that menu attached to whatever item
+                        // had slid into that slot. `push_id` allocates
+                        // exactly the child's own rect, so it does not
+                        // change the row's height or the scroll pitch --
+                        // see the ROW_GAP comment above.
+                        let outcome = ui
+                            .push_id(&item.id, |ui| {
+                                item_row(
+                                    ui,
+                                    item,
+                                    folders,
+                                    selected,
+                                    delete_pending_id == Some(item.id.as_str()),
+                                    icons.textures.get(&item.id),
+                                )
+                            })
+                            .inner;
+                        if outcome.select {
                             *selected_id = Some(item.id.clone());
+                        }
+                        if let Some(command) = outcome.command {
+                            // Overwrites a `NewItem` from the header strip in
+                            // the same frame. The two cannot both happen: an
+                            // open context menu is what a menu command comes
+                            // from, and the click that dismisses it is the
+                            // same click, so `+ New` is not also being
+                            // pressed.
+                            action = ItemListAction::Row { id: item.id.clone(), command };
                         }
                     }
                 });
@@ -319,12 +602,28 @@ fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
     height
 }
 
+/// What one drawn row reports back to [`draw_item_list`].
+struct RowOutcome {
+    /// The row was clicked and should become the selection.
+    ///
+    /// **True for a right-click as well as a left one**, which is the whole
+    /// reason this is not just `response.clicked()`: the context menu acts
+    /// on the row it was opened over, and if that row were not also selected
+    /// the menu and the detail pane could be showing two different items
+    /// while the user chose "Delete".
+    select: bool,
+    /// An entry of this row's context menu was chosen this frame.
+    command: Option<RowCommand>,
+}
+
 fn item_row(
     ui: &mut egui::Ui,
     item: &VaultItem,
+    folders: &[Folder],
     selected: bool,
+    delete_pending: bool,
     icon: Option<&egui::TextureHandle>,
-) -> bool {
+) -> RowOutcome {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
     // Design 2b's two trailing chips. Neither is decorative and neither is
     // invented: "app" is `deskwarden:app-match`, the custom field that makes
@@ -476,7 +775,65 @@ fn item_row(
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    response.clicked()
+    // The menu is rendered into egui's own popup layer (a separate `Area`),
+    // so nothing here allocates in the row's ui and the fixed row pitch
+    // `show_rows` virtualizes against is untouched.
+    //
+    // WHAT it contains is `menu_entries`' decision and not this closure's --
+    // see that function's doc for why a per-kind decision must not live in
+    // here.
+    let mut command = None;
+    response.context_menu(|ui| {
+        for entry in menu_entries(item, folders, delete_pending) {
+            match entry {
+                MenuEntry::Command(entry) => {
+                    if menu_command(ui, &entry) {
+                        command = Some(entry.command);
+                    }
+                }
+                MenuEntry::MoveToFolder(destinations) => {
+                    ui.menu_button(MOVE_TO_FOLDER_LABEL, |ui| match destinations {
+                        MoveMenu::Targets(targets) => {
+                            for target in targets {
+                                if menu_command(ui, &target) {
+                                    command = Some(target.command);
+                                }
+                            }
+                        }
+                        // Said out loud rather than left as an empty box,
+                        // which reads as a submenu that failed to load.
+                        MoveMenu::Empty(note) => {
+                            ui.add_enabled(false, egui::Button::new(note));
+                        }
+                    });
+                }
+            }
+        }
+    });
+    RowOutcome {
+        // A right-click selects the row too -- see `RowOutcome::select`.
+        select: response.clicked() || response.secondary_clicked(),
+        command,
+    }
+}
+
+/// One line of a row's context menu, drawn from [`MenuCommand`] and deciding
+/// nothing itself. Returns whether it was chosen.
+///
+/// A disabled entry states its reason on hover; that is the entire point of
+/// greying it rather than dropping it (see [`MenuCommand::enabled`]), so the
+/// two are set together here and cannot be drawn apart.
+fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
+    let button = ui.add_enabled(entry.enabled, egui::Button::new(entry.label.as_str()));
+    let button = match entry.disabled_reason {
+        Some(reason) => button.on_disabled_hover_text(reason),
+        None => button,
+    };
+    if button.clicked() {
+        ui.close();
+        return true;
+    }
+    false
 }
 
 /// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's selected
@@ -536,6 +893,341 @@ mod tests {
         let it = item("Ledgerline", None, Some(3)); // a Card
         assert!(!matches_filter(&it, &SidebarFilter::Logins, ""));
         assert!(!matches_filter(&it, &SidebarFilter::Logins, "ledgerline"));
+    }
+}
+
+#[cfg(test)]
+mod menu_entry_tests {
+    //! What an item row's right-click menu contains, per kind.
+    //!
+    //! Every assertion here reads the WHOLE entry list, not "does entry X
+    //! appear". A test that only probes for the entries it expects passes
+    //! just as happily against a menu that also offers three things it must
+    //! not -- "Fill in app" on a card, say -- and this file's history is
+    //! full of tests that agreed with a broken predicate rather than
+    //! checking it.
+    use super::*;
+    use crate::vault_bridge::{LoginData, UriEntry};
+    use zeroize::Zeroizing;
+
+    /// The one place these tests name an entry's on-screen wording, so a
+    /// relabelling is a single edit here and the assertions below stay
+    /// readable as lists.
+    fn labels(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| match entry {
+                MenuEntry::Command(c) => c.label.clone(),
+                MenuEntry::MoveToFolder(_) => MOVE_TO_FOLDER_LABEL.to_string(),
+            })
+            .collect()
+    }
+
+    /// The labels of the entries that are actually clickable.
+    fn enabled_labels(entries: &[MenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Command(c) => c.enabled.then(|| c.label.clone()),
+                // The submenu itself is always openable.
+                MenuEntry::MoveToFolder(_) => Some(MOVE_TO_FOLDER_LABEL.to_string()),
+            })
+            .collect()
+    }
+
+    fn move_menu_of(entries: &[MenuEntry]) -> MoveMenu {
+        entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::MoveToFolder(menu) => Some(menu.clone()),
+                MenuEntry::Command(_) => None,
+            })
+            .expect("no \"Move to folder\" entry was offered at all")
+    }
+
+    fn of_kind(item_type: Option<i64>) -> VaultItem {
+        VaultItem {
+            id: "i1".into(),
+            name: "Ledgerline".into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            notes: None,
+            item_type,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// A fully-populated login: username, password, TOTP seed and a URI.
+    fn full_login() -> VaultItem {
+        VaultItem {
+            login: Some(LoginData {
+                username: Some("a.novak@ledgerline.com".into()),
+                password: Some(Zeroizing::new("hunter2".into())),
+                totp: Some(Zeroizing::new("JBSWY3DPEHPK3PXP".into())),
+                uris: vec![UriEntry {
+                    uri: Some("https://ledgerline.com".into()),
+                    other: serde_json::Map::new(),
+                }],
+                other: serde_json::Map::new(),
+            }),
+            ..of_kind(Some(1))
+        }
+    }
+
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder { id: id.into(), name: name.into(), other: serde_json::Map::new() }
+    }
+
+    #[test]
+    fn a_full_login_offers_every_entry_in_the_agreed_order() {
+        assert_eq!(
+            labels(&menu_entries(&full_login(), &[], false)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                "Fill in app",
+                "Open website",
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Delete",
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_is_not_offered_anywhere() {
+        // Deliberately absent until the feature exists: an entry that does
+        // nothing is worse than a missing one. Asserted rather than left to
+        // the order test above so that its intent survives a relabelling.
+        for entry in labels(&menu_entries(&full_login(), &[folder("f1", "Work")], true)) {
+            assert!(!entry.to_lowercase().contains("archive"), "{entry:?} offers Archive");
+        }
+    }
+
+    #[test]
+    fn a_card_offers_neither_fill_nor_open_website_and_cannot_be_edited() {
+        // Both are login-only (`detail::kind_offers_fill`), and the edit
+        // form is still login-shaped (`detail::kind_offers_edit`) -- but
+        // those two are expressed differently on purpose: filling is ABSENT,
+        // editing is PRESENT AND GREYED.
+        let entries = menu_entries(&of_kind(Some(3)), &[], false);
+        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Delete"]);
+        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Delete"]);
+    }
+
+    #[test]
+    fn a_secure_note_offers_the_same_three_as_a_card() {
+        let entries = menu_entries(&of_kind(Some(2)), &[], false);
+        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Delete"]);
+        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Delete"]);
+    }
+
+    #[test]
+    fn the_greyed_edit_entry_says_why() {
+        // Greying without a reason is the failure this is guarding: the user
+        // sees the action they came for, unavailable, and no explanation.
+        let entries = menu_entries(&of_kind(Some(4)), &[], false);
+        let edit = entries
+            .iter()
+            .find_map(|e| match e {
+                MenuEntry::Command(c) if c.command == RowCommand::Edit => Some(c.clone()),
+                _ => None,
+            })
+            .expect("no Edit entry");
+        assert!(!edit.enabled);
+        assert_eq!(edit.disabled_reason, Some(EDIT_DISABLED_REASON));
+    }
+
+    #[test]
+    fn edit_follows_kind_offers_edit_for_every_kind() {
+        // Drives the predicate the menu itself consumes, so relaxing
+        // `kind_offers_edit` (its doc calls itself a stopgap) enables the
+        // entry here without anyone having to remember this file exists.
+        for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
+            let item = of_kind(item_type);
+            let entries = menu_entries(&item, &[], false);
+            let edit = entries
+                .iter()
+                .find_map(|e| match e {
+                    MenuEntry::Command(c) if c.command == RowCommand::Edit => Some(c.clone()),
+                    _ => None,
+                })
+                .expect("no Edit entry");
+            assert_eq!(
+                edit.enabled,
+                kind_offers_edit(ItemKind::of(&item)),
+                "Edit's enabled state disagrees with kind_offers_edit for type {item_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_totp_appears_only_when_the_item_carries_a_seed() {
+        let with_seed = full_login();
+        let without = VaultItem {
+            login: Some(LoginData { totp: None, ..with_seed.login.clone().unwrap() }),
+            ..full_login()
+        };
+        assert!(labels(&menu_entries(&with_seed, &[], false)).contains(&"Copy TOTP".to_string()));
+        assert_eq!(
+            labels(&menu_entries(&without, &[], false)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Fill in app",
+                "Open website",
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Delete",
+            ],
+            "removing the seed changed more than the TOTP entry"
+        );
+    }
+
+    #[test]
+    fn the_copy_entries_are_absent_when_there_is_nothing_to_copy() {
+        // A login with empty strings where its credentials should be. An
+        // entry that copies "" is the same untruth as a blank row.
+        let empty = VaultItem {
+            login: Some(LoginData {
+                username: Some("  ".into()),
+                password: Some(Zeroizing::new(String::new())),
+                totp: None,
+                uris: vec![UriEntry { uri: Some(String::new()), other: serde_json::Map::new() }],
+                other: serde_json::Map::new(),
+            }),
+            ..of_kind(Some(1))
+        };
+        assert_eq!(
+            labels(&menu_entries(&empty, &[], false)),
+            vec!["Fill in app", "Edit", MOVE_TO_FOLDER_LABEL, "Delete"]
+        );
+    }
+
+    #[test]
+    fn open_website_carries_the_url_the_detail_pane_would_open() {
+        let entries = menu_entries(&full_login(), &[], false);
+        let opens: Vec<&RowCommand> = entries
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Command(c) => Some(&c.command),
+                MenuEntry::MoveToFolder(_) => None,
+            })
+            .filter(|c| matches!(c, RowCommand::OpenWebsite(_)))
+            .collect();
+        assert_eq!(
+            opens,
+            vec![&RowCommand::OpenWebsite("https://ledgerline.com".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_move_submenu_excludes_the_virtual_no_folder_bucket() {
+        // `bw serve` reports its "no folder" bucket AS A FOLDER with an
+        // empty id. Offering it writes `folderId: ""` and strands the item
+        // out of every sidebar row -- a Critical fixed in the edit form, and
+        // this menu must not reintroduce it.
+        let folders = [folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")];
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        else {
+            panic!("the submenu reported no assignable folders when two exist");
+        };
+        assert_eq!(
+            targets.iter().map(|t| t.command.clone()).collect::<Vec<_>>(),
+            vec![
+                RowCommand::MoveToFolder("f1".into()),
+                RowCommand::MoveToFolder("f2".into()),
+            ]
+        );
+        assert_eq!(
+            targets.iter().map(|t| t.label.clone()).collect::<Vec<_>>(),
+            vec!["Work", "Personal"]
+        );
+    }
+
+    #[test]
+    fn a_real_folder_named_no_folder_is_still_a_destination() {
+        // The bucket is identified by its empty id, never by its name -- a
+        // user may own a folder actually called "No Folder", and matching on
+        // the name would lock them out of it.
+        let folders = [folder("f9", "No Folder")];
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        else {
+            panic!("a real folder named \"No Folder\" was dropped");
+        };
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].command, RowCommand::MoveToFolder("f9".into()));
+    }
+
+    #[test]
+    fn a_vault_with_no_assignable_folder_says_so_instead_of_opening_an_empty_box() {
+        let folders = [folder("", "No Folder")];
+        assert_eq!(
+            move_menu_of(&menu_entries(&full_login(), &folders, false)),
+            MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS)
+        );
+    }
+
+    #[test]
+    fn the_folder_the_item_already_lives_in_is_greyed_not_dropped() {
+        let folders = [folder("f1", "Work"), folder("f2", "Personal")];
+        let item = VaultItem { folder_id: Some("f1".into()), ..full_login() };
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, false)) else {
+            panic!("the submenu reported no assignable folders when two exist");
+        };
+        assert_eq!(
+            targets.iter().map(|t| (t.label.as_str(), t.enabled)).collect::<Vec<_>>(),
+            vec![("Work", false), ("Personal", true)]
+        );
+        assert_eq!(targets[0].disabled_reason, Some(ALREADY_IN_THIS_FOLDER));
+    }
+
+    #[test]
+    fn there_is_no_un_file_destination() {
+        // `bw serve` (CLI 2026.7.0) cannot clear a folder assignment: the
+        // write succeeds and does nothing. Every destination this menu
+        // offers must therefore name a real folder.
+        let folders = [folder("", "No Folder"), folder("f1", "Work")];
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        else {
+            panic!("the submenu reported no assignable folders when one exists");
+        };
+        for target in &targets {
+            let RowCommand::MoveToFolder(id) = &target.command else {
+                panic!("the submenu offered {:?}, which is not a move", target.command);
+            };
+            assert!(!id.is_empty(), "{:?} would write an empty folderId", target.label);
+        }
+    }
+
+    #[test]
+    fn delete_wears_the_armed_label_while_its_confirmation_is_pending() {
+        // The SAME two-click confirmation the detail pane's Delete button
+        // uses (`vault_window::mod`'s `confirm_click`), not a second idiom:
+        // the first click arms, the label changes, the second confirms.
+        assert_eq!(
+            labels(&menu_entries(&of_kind(Some(3)), &[], false)).last().unwrap(),
+            DELETE_LABEL
+        );
+        assert_eq!(
+            labels(&menu_entries(&of_kind(Some(3)), &[], true)).last().unwrap(),
+            DELETE_CONFIRM_LABEL
+        );
+    }
+
+    #[test]
+    fn arming_the_delete_changes_nothing_else_about_the_menu() {
+        let folders = [folder("f1", "Work")];
+        let armed = menu_entries(&full_login(), &folders, true);
+        let idle = menu_entries(&full_login(), &folders, false);
+        assert_eq!(labels(&armed).len(), labels(&idle).len());
+        assert_eq!(labels(&armed)[..labels(&idle).len() - 1], labels(&idle)[..labels(&idle).len() - 1]);
+        assert_eq!(move_menu_of(&armed), move_menu_of(&idle));
     }
 }
 
@@ -660,6 +1352,11 @@ mod row_tile_tests {
         texts: Vec<(String, egui::Rect, egui::Color32)>,
         fonts: Vec<(String, egui::FontId)>,
         visible: Vec<String>,
+        /// What `draw_item_list` left `selected_id` at. Read by the
+        /// right-click tests, which are about exactly that.
+        selected: Option<String>,
+        /// What `draw_item_list` returned on the measured frame.
+        action: ItemListAction,
     }
 
     fn walk(shape: &egui::Shape, p: &mut Painted) {
@@ -712,7 +1409,29 @@ mod row_tile_tests {
     /// then settled), which is how the scrolled test drives the list to its
     /// end without reaching into `ScrollArea`'s private state.
     fn paint_with(items: &[VaultItem], selected: Option<&str>, wheel_frames: usize) -> Painted {
-        paint_core(items, selected, wheel_frames, PANE_WIDTH, |_| IconCache::default())
+        paint_core(items, selected, wheel_frames, PANE_WIDTH, |_| IconCache::default(), Menu::none())
+    }
+
+    /// The row-menu inputs `draw_item_list` takes, and the pointer events
+    /// that drive the menu open and click an entry in it.
+    ///
+    /// Bundled so the four harness entry points that have nothing to do with
+    /// the menu can each pass one [`Menu::none`] instead of four arguments
+    /// of padding.
+    struct Menu {
+        folders: Vec<Folder>,
+        delete_pending: Option<String>,
+        /// One `Vec` of events per extra frame to run after the first draw.
+        /// Extra frames are needed at all because egui resolves a click only
+        /// on the frame the button is released, and a popup only exists from
+        /// the frame after the one that opened it.
+        frames: Vec<Vec<egui::Event>>,
+    }
+
+    impl Menu {
+        fn none() -> Self {
+            Self { folders: Vec::new(), delete_pending: None, frames: Vec::new() }
+        }
     }
 
     /// One real frame at an arbitrary pane width. The real pane is fixed at
@@ -721,7 +1440,7 @@ mod row_tile_tests {
     /// title is the tightest it ever gets, and what it does when it runs out
     /// of room should be a decision, not an accident.
     fn paint_at_width(items: &[VaultItem], selected: Option<&str>, width: f32) -> Painted {
-        paint_core(items, selected, 0, width, |_| IconCache::default())
+        paint_core(items, selected, 0, width, |_| IconCache::default(), Menu::none())
     }
 
     /// One real frame with a favicon TEXTURE loaded for every id in `ids` --
@@ -742,7 +1461,7 @@ mod row_tile_tests {
                 );
             }
             icons
-        })
+        }, Menu::none())
     }
 
     fn paint_core(
@@ -751,6 +1470,7 @@ mod row_tile_tests {
         wheel_frames: usize,
         pane_width: f32,
         make_icons: impl FnOnce(&egui::Context) -> IconCache,
+        menu: Menu,
     ) -> Painted {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(
@@ -770,14 +1490,18 @@ mod row_tile_tests {
         let mut selected_id = selected.map(str::to_string);
         let mut search = String::new();
         let icons = make_icons(&ctx);
+        let mut action = ItemListAction::None;
+        let Menu { folders, delete_pending, mut frames } = menu;
         let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
             ctx.run_ui(input, |ui| {
-                draw_item_list(
+                action = draw_item_list(
                     ui,
                     items,
+                    &folders,
                     &SidebarFilter::All,
                     &mut search,
                     &mut selected_id,
+                    delete_pending.as_deref(),
                     &icons,
                     visible,
                 );
@@ -800,13 +1524,31 @@ mod row_tile_tests {
             }
             let _ = draw(&ctx, raw, &mut visible);
         }
-        let output = draw(&ctx, input(), &mut visible);
+        // The LAST of `Menu::frames` is the measured one, so a test that
+        // clicks a menu entry reads back the frame that click resolved on --
+        // both what was painted and what `draw_item_list` returned.
+        let measured = frames.pop();
+        for events in frames {
+            let mut raw = input();
+            raw.events = events;
+            let _ = draw(&ctx, raw, &mut visible);
+        }
+        let output = draw(
+            &ctx,
+            match measured {
+                Some(events) => egui::RawInput { events, ..input() },
+                None => input(),
+            },
+            &mut visible,
+        );
 
         let mut painted = Painted {
             rects: Vec::new(),
             texts: Vec::new(),
             fonts: Vec::new(),
             visible,
+            selected: selected_id,
+            action,
         };
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
@@ -1530,6 +2272,406 @@ mod row_tile_tests {
              `show_rows` scrolls by have drifted apart"
         );
     }
+
+    // ---- the rows' right-click menu -------------------------------------
+    //
+    // What `menu_entries` decides is pinned directly, exhaustively, in
+    // `menu_entry_tests`. These are the OTHER half, and the half this
+    // repository keeps getting wrong: that the draw code actually obeys it.
+    // A correct decision inside a closure nothing calls is this file's
+    // most-repeated defect shape, and an egui context menu renders into its
+    // own popup layer, which is exactly the kind of place such a closure
+    // hides.
+    //
+    // They drive real pointer events -- a secondary press and release over a
+    // row tile whose position is read back from the previous frame's painted
+    // output -- and then read the galleys the popup painted.
+
+    /// Every label the row menu can paint. The painted assertions below
+    /// intersect what was drawn with this vocabulary, so they are ABSOLUTE
+    /// ("exactly these entries") rather than "the ones I looked for" -- a
+    /// menu that also offered "Fill in app" on a card would fail them.
+    const MENU_VOCABULARY: [&str; 9] = [
+        "Copy username",
+        "Copy password",
+        "Copy TOTP",
+        "Fill in app",
+        "Open website",
+        "Edit",
+        MOVE_TO_FOLDER_LABEL,
+        DELETE_LABEL,
+        DELETE_CONFIRM_LABEL,
+    ];
+
+    fn menu_labels(p: &Painted) -> Vec<String> {
+        p.texts
+            .iter()
+            .map(|(text, _, _)| text.clone())
+            .filter(|text| MENU_VOCABULARY.contains(&text.as_str()))
+            .collect()
+    }
+
+    fn click_frames(at: egui::Pos2, button: egui::PointerButton) -> Vec<Vec<egui::Event>> {
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        vec![
+            vec![egui::Event::PointerMoved(at), press(true)],
+            // egui resolves a click on the frame the button is RELEASED.
+            vec![press(false)],
+            // One settled frame, so the popup that release opened is
+            // painted with the pointer resting where it was left.
+            vec![egui::Event::PointerMoved(at)],
+        ]
+    }
+
+    /// The centre of row `row`'s tile, read from a first painted frame
+    /// rather than re-derived from the row-height constants -- a test that
+    /// computed the position itself could aim at the wrong place in exactly
+    /// the case (a row whose height changed) it exists to catch.
+    fn row_centre(items: &[VaultItem], row: usize) -> egui::Pos2 {
+        let tiles = row_tiles(&paint(items, None));
+        assert!(row < tiles.len(), "row {row} was never painted");
+        tiles[row].rect.center()
+    }
+
+    /// Right-clicks row `row` and returns the frame the menu is open on.
+    fn open_menu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
+        open_menu_with(items, folders, None, row)
+    }
+
+    fn open_menu_with(
+        items: &[VaultItem],
+        folders: Vec<Folder>,
+        delete_pending: Option<String>,
+        row: usize,
+    ) -> Painted {
+        let at = row_centre(items, row);
+        paint_core(
+            items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu {
+                folders,
+                delete_pending,
+                frames: click_frames(at, egui::PointerButton::Secondary),
+            },
+        )
+    }
+
+    fn text_centre(p: &Painted, label: &str) -> egui::Pos2 {
+        p.texts
+            .iter()
+            .find(|(text, _, _)| text == label)
+            .unwrap_or_else(|| {
+                panic!("{label:?} was never painted; the menu drew {:?}", menu_labels(p))
+            })
+            .1
+            .center()
+    }
+
+    /// Right-clicks row `row`, then rests the pointer on "Move to folder"
+    /// for several frames so its submenu opens (egui opens submenus on
+    /// hover, not on click).
+    fn open_move_submenu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
+        let hover = text_centre(&open_menu(items, folders.clone(), row), MOVE_TO_FOLDER_LABEL);
+        let at = row_centre(items, row);
+        let mut frames = click_frames(at, egui::PointerButton::Secondary);
+        frames.extend((0..4).map(|_| vec![egui::Event::PointerMoved(hover)]));
+        paint_core(
+            items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu { folders, delete_pending: None, frames },
+        )
+    }
+
+    /// Right-clicks row `row`, then left-clicks the menu entry reading
+    /// `label`, and returns the frame that second click resolved on.
+    fn choose_entry(items: &[VaultItem], folders: Vec<Folder>, row: usize, label: &str) -> Painted {
+        let entry = text_centre(&open_menu(items, folders.clone(), row), label);
+        let at = row_centre(items, row);
+        let mut frames = click_frames(at, egui::PointerButton::Secondary);
+        let mut entry_click = click_frames(entry, egui::PointerButton::Primary);
+        // The MEASURED frame has to be the one the click resolves on. egui
+        // reports a click on the frame the button is released, and the entry
+        // acts (and the menu closes) on that same frame -- measuring the
+        // settled frame after it reads back a closed menu and no action,
+        // which is what this harness did on its first run.
+        entry_click.pop();
+        frames.extend(entry_click);
+        paint_core(
+            items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu { folders, delete_pending: None, frames },
+        )
+    }
+
+    fn folder(id: &str, name: &str) -> Folder {
+        Folder { id: id.into(), name: name.into(), other: serde_json::Map::new() }
+    }
+
+    /// A login with a password, a TOTP seed and a URI, so every entry that
+    /// depends on one of those is reachable.
+    fn full_login(name: &str) -> VaultItem {
+        let mut item = login(name, "a.novak@ledgerline.com");
+        let data = item.login.as_mut().unwrap();
+        data.password = Some(zeroize::Zeroizing::new("hunter2".into()));
+        data.totp = Some(zeroize::Zeroizing::new("JBSWY3DPEHPK3PXP".into()));
+        data.uris = vec![crate::vault_bridge::UriEntry {
+            uri: Some("https://ledgerline.com".into()),
+            other: serde_json::Map::new(),
+        }];
+        item
+    }
+
+    fn card(name: &str) -> VaultItem {
+        VaultItem { item_type: Some(3), login: None, ..login(name, "") }
+    }
+
+    #[test]
+    fn a_right_click_selects_the_row_it_lands_on() {
+        // The whole reason right-click is not just "open a menu": the menu
+        // acts on this row, and if the row were not also selected the menu
+        // and the detail pane could be showing two different items while the
+        // user chose Delete.
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu(&items, vec![], 1);
+        assert_eq!(p.selected.as_deref(), Some("Vantage"));
+    }
+
+    #[test]
+    fn a_left_click_still_selects_the_row_it_lands_on() {
+        // The pre-existing behaviour, re-asserted from the same harness so
+        // that adding the right-click path cannot have quietly replaced it.
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let at = row_centre(&items, 0);
+        let p = paint_core(
+            &items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu {
+                folders: vec![],
+                delete_pending: None,
+                frames: click_frames(at, egui::PointerButton::Primary),
+            },
+        );
+        assert_eq!(p.selected.as_deref(), Some("Ledgerline"));
+    }
+
+    #[test]
+    fn a_right_click_on_a_login_paints_exactly_that_login_s_entries() {
+        let items = [full_login("Ledgerline")];
+        assert_eq!(
+            menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                "Fill in app",
+                "Open website",
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                DELETE_LABEL,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_a_card_paints_neither_fill_nor_open_website() {
+        // The painted half of `menu_entry_tests`' per-kind assertions: the
+        // decision being right is worth nothing if the popup draws a fixed
+        // list regardless.
+        let items = [card("Visa (personal)")];
+        assert_eq!(
+            menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, DELETE_LABEL]
+        );
+    }
+
+    #[test]
+    fn a_login_with_no_totp_seed_paints_no_copy_totp_entry() {
+        let mut item = full_login("Ledgerline");
+        item.login.as_mut().unwrap().totp = None;
+        assert_eq!(
+            menu_labels(&open_menu(&[item], vec![], 0)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Fill in app",
+                "Open website",
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                DELETE_LABEL,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_armed_delete_paints_its_confirming_label() {
+        let items = [full_login("Ledgerline")];
+        let p = open_menu_with(&items, vec![], Some("Ledgerline".to_string()), 0);
+        assert!(
+            menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()),
+            "the menu drew {:?}",
+            menu_labels(&p)
+        );
+        assert!(!menu_labels(&p).contains(&DELETE_LABEL.to_string()));
+    }
+
+    #[test]
+    fn an_armed_delete_on_another_row_leaves_this_row_s_entry_alone() {
+        // `delete_pending_id` is one id, not a flag: an arm belongs to the
+        // item it was set on.
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu_with(&items, vec![], Some("Vantage".to_string()), 0);
+        assert!(menu_labels(&p).contains(&DELETE_LABEL.to_string()));
+        assert!(!menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()));
+    }
+
+    #[test]
+    fn choosing_an_entry_reports_it_against_the_row_that_was_right_clicked() {
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let p = choose_entry(&items, vec![], 1, "Copy password");
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Vantage".to_string(),
+                command: RowCommand::CopyPassword,
+            }
+        );
+    }
+
+    #[test]
+    fn choosing_open_website_reports_the_items_own_url() {
+        let items = [full_login("Ledgerline")];
+        let p = choose_entry(&items, vec![], 0, "Open website");
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Ledgerline".to_string(),
+                command: RowCommand::OpenWebsite("https://ledgerline.com".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_greyed_edit_entry_reports_nothing_when_it_is_clicked() {
+        // Greyed has to mean inert. A disabled entry that still fired would
+        // hand a card to an edit form that cannot honestly edit one.
+        let items = [card("Visa (personal)")];
+        let p = choose_entry(&items, vec![], 0, "Edit");
+        assert_eq!(p.action, ItemListAction::None);
+    }
+
+    #[test]
+    fn just_opening_the_menu_reports_nothing() {
+        // The bite check on the two assertions above: if merely right-
+        // clicking produced an action, they would pass without a single
+        // menu entry ever being clicked.
+        let items = [full_login("Ledgerline")];
+        assert_eq!(open_menu(&items, vec![folder("f1", "Work")], 0).action, ItemListAction::None);
+    }
+
+    #[test]
+    fn the_move_submenu_paints_exactly_the_assignable_folders() {
+        // The painted half of `menu_entry_tests`'
+        // `the_move_submenu_excludes_the_virtual_no_folder_bucket`. `bw
+        // serve` reports its "no folder" bucket AS A FOLDER with an empty
+        // id; drawing it as a destination writes `folderId: ""` and strands
+        // the item out of every sidebar row.
+        let items = [full_login("Ledgerline")];
+        let folders = vec![
+            folder("", "No Folder"),
+            folder("f1", "Work"),
+            folder("f2", "Personal"),
+        ];
+        let p = open_move_submenu(&items, folders, 0);
+        let painted: Vec<String> = p
+            .texts
+            .iter()
+            .map(|(text, _, _)| text.clone())
+            .filter(|text| ["No Folder", "Work", "Personal"].contains(&text.as_str()))
+            .collect();
+        assert_eq!(painted, vec!["Work", "Personal"]);
+    }
+
+    #[test]
+    fn choosing_a_folder_reports_a_move_to_that_folders_id() {
+        let items = [full_login("Ledgerline")];
+        let folders = vec![folder("", "No Folder"), folder("f2", "Personal")];
+        let opened = open_move_submenu(&items, folders.clone(), 0);
+        let destination = text_centre(&opened, "Personal");
+        let hover = text_centre(&open_menu(&items, folders.clone(), 0), MOVE_TO_FOLDER_LABEL);
+        let at = row_centre(&items, 0);
+        let mut frames = click_frames(at, egui::PointerButton::Secondary);
+        // The pointer travels along the parent entry and then onto the
+        // destination, resting on each: egui opens a submenu on hover and
+        // closes it when the pointer leaves, so a jump straight from the row
+        // to a submenu row lands on a submenu that was never open.
+        frames.extend((0..4).map(|_| vec![egui::Event::PointerMoved(hover)]));
+        frames.extend((0..3).map(|_| vec![egui::Event::PointerMoved(destination)]));
+        let mut click = click_frames(destination, egui::PointerButton::Primary);
+        // Measured on the release -- see `choose_entry`.
+        click.pop();
+        frames.extend(click);
+        let p = paint_core(
+            &items,
+            None,
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu { folders, delete_pending: None, frames },
+        );
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Ledgerline".to_string(),
+                command: RowCommand::MoveToFolder("f2".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn the_menu_does_not_change_the_rows_it_is_drawn_over() {
+        // VIRTUALIZATION. `show_rows` reads `item_spacing.y` from the ui it
+        // is given before the closure runs and scrolls by a fixed pitch, so
+        // anything a row allocates for its menu would slide the list out of
+        // register with its own scrollbar. A context menu lives in egui's
+        // popup layer and allocates nothing here -- asserted, not assumed,
+        // by comparing the painted tiles and the laid-out range against the
+        // same list with no menu open.
+        let items: Vec<VaultItem> = (0..100).map(|i| full_login(&format!("Item {i:03}"))).collect();
+        let closed = paint(&items, None);
+        let open = open_menu(&items, vec![folder("f1", "Work")], 2);
+
+        assert_eq!(open.visible, closed.visible, "the laid-out row range changed");
+        let closed_tiles: Vec<egui::Rect> = row_tiles(&closed).iter().map(|t| t.rect).collect();
+        let open_tiles: Vec<egui::Rect> = row_tiles(&open).iter().map(|t| t.rect).collect();
+        assert_eq!(
+            open_tiles.len(),
+            closed_tiles.len(),
+            "a row stopped being exactly one ROW_TILE_HEIGHT tall while a menu was open"
+        );
+        for (open, closed) in open_tiles.iter().zip(&closed_tiles) {
+            assert!(
+                (open.top() - closed.top()).abs() < 0.5 && (open.height() - closed.height()).abs() < 0.5,
+                "a row tile moved or resized while a menu was open: {open:?} vs {closed:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1608,9 +2750,11 @@ mod toolbar_strip_tests {
                 draw_item_list(
                     ui,
                     items,
+                    &[],
                     &SidebarFilter::All,
                     search,
                     &mut selected,
+                    None,
                     &icons,
                     &mut visible,
                 );

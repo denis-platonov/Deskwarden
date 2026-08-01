@@ -1011,13 +1011,32 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // both, and a margin here would inset the strip so it read as a card
         // floating on grey rather than the tile the design draws. Both
         // paddings live in `draw_item_list` instead; see its header comment.
+        // Set by an item row's right-click menu below, and drained further
+        // down once the selection that right-click made has been reacted to.
+        let mut row_command: Option<(String, item_list::RowCommand)> = None;
         egui::Panel::left("vault-item-list")
             .exact_size(LIST_WIDTH)
             .resizable(false)
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
-                match draw_item_list(ui, &items, &filter, &mut search, &mut selected_id, &icons, &mut visible_ids) {
+                match draw_item_list(
+                    ui,
+                    &items,
+                    &folders,
+                    &filter,
+                    &mut search,
+                    &mut selected_id,
+                    item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
+                    &icons,
+                    &mut visible_ids,
+                ) {
                     ItemListAction::NewItem => mode = DetailMode::Create(EditDraft::empty()),
+                    // Not acted on here: this closure holds `items` borrowed
+                    // (a Delete has to drain it) and, more importantly, the
+                    // selection this right-click just made has not been
+                    // reacted to yet -- see where `row_command` is handled,
+                    // below the reset block.
+                    ItemListAction::Row { id, command } => row_command = Some((id, command)),
                     ItemListAction::None => {}
                 }
             });
@@ -1084,6 +1103,132 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // over and be confirmable against the newly selected one.
             item_delete_pending = None;
             last_selected_id = selected_id.clone();
+        }
+
+        // An entry of some item row's right-click menu, chosen this frame.
+        //
+        // Handled here, and deliberately AFTER the reset block above: a
+        // right-click both opens the menu and selects the row, and that
+        // reset clears `item_delete_pending`. Acting first would let the
+        // reset wipe the arm a Delete entry had just set, so the two-click
+        // confirmation could never reach its confirming click.
+        //
+        // Handled in its OWN block rather than folded into the read arm's
+        // `DetailAction` match, because the item list is drawn in EVERY
+        // mode: a command chosen while the edit form is open would otherwise
+        // be silently dropped, and forcing the pane back to Read to receive
+        // it would discard the draft. `Fill` and `Delete` go through the
+        // same two helpers the read arm calls, so the two paths cannot
+        // drift apart.
+        //
+        // The item is resolved from the id the menu carried rather than from
+        // `selected_id`. They agree -- the right-click selected this row --
+        // and that is exactly why neither has to be trusted to.
+        if let Some((id, command)) = row_command.take() {
+            if let Some(item) = items.iter().find(|i| i.id == id).cloned() {
+                let login = item.login.as_ref();
+                match command {
+                    // No reveal and no confirmation on either copy, matching
+                    // the detail pane's own Copy buttons.
+                    item_list::RowCommand::CopyUsername => {
+                        if let Some(username) = login.and_then(|l| l.username.as_deref()) {
+                            ui.ctx().copy_text(username.to_string());
+                        }
+                    }
+                    item_list::RowCommand::CopyPassword => {
+                        if let Some(password) = login.and_then(|l| l.password.as_deref()) {
+                            ui.ctx().copy_text(password.to_string());
+                        }
+                    }
+                    // Read out of the SAME `TotpState` the detail pane
+                    // renders -- this does not start a fetch of its own, and
+                    // deliberately does not touch the TOTP state machine.
+                    // The right-click that opened this menu selected the
+                    // row, which the reset block above turns into an
+                    // immediate poll, so by the time an entry can be clicked
+                    // the code has normally landed. When it has not (the
+                    // backend is unreachable, or the click was faster than
+                    // the round trip) there is no current code to copy and
+                    // this says so in the log rather than putting a stale or
+                    // empty one on the clipboard.
+                    item_list::RowCommand::CopyTotp => match &totp_state {
+                        TotpState::Code { code, .. } => ui.ctx().copy_text(code.clone()),
+                        TotpState::NoSecret
+                        | TotpState::Fetching
+                        | TotpState::NoCodeReported
+                        | TotpState::Unavailable => log::info!(
+                            "\"Copy TOTP\" for {}: no current code yet ({:?})",
+                            item.name,
+                            totp_state
+                        ),
+                    },
+                    item_list::RowCommand::Fill => {
+                        fill_item_into_app(&item, &cache, &injector, &fill_stats);
+                    }
+                    item_list::RowCommand::OpenWebsite(url) => webbrowser_open(&url),
+                    // Only from Read. A draft already open on this item IS
+                    // what "Edit" asks for, so re-seeding it would do nothing
+                    // but discard whatever the user had typed; the same goes
+                    // for a half-filled "+ New" draft. Editing a DIFFERENT
+                    // item is unaffected -- the right-click changed the
+                    // selection, and the reset block above has already put
+                    // the pane back into Read for it.
+                    item_list::RowCommand::Edit => {
+                        if matches!(mode, DetailMode::Read) {
+                            mode = DetailMode::Edit(EditDraft::from_item(&item));
+                        }
+                    }
+                    // Through `VaultCache`, never the bridge: the cache's
+                    // snapshot is what the rest of the app reads, and its
+                    // replay log is what stops an in-flight populate filing
+                    // the item back where it was.
+                    item_list::RowCommand::MoveToFolder(folder_id) => {
+                        match cache.move_item_to_folder(&item, Some(folder_id.as_str())) {
+                            Ok(()) => {
+                                if let Some(pos) = items.iter().position(|i| i.id == item.id) {
+                                    // The same value the cache wrote into its
+                                    // own snapshot, built the same way, so
+                                    // this window's copy cannot say something
+                                    // different from the cache's.
+                                    items[pos] = crate::vault_bridge::with_folder(
+                                        &item,
+                                        Some(folder_id.as_str()),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to move item {} ({}) into folder {folder_id}: {e:?}",
+                                    item.id,
+                                    item.name
+                                );
+                                flag_reauth_if_unauthorized(
+                                    ui.ctx(),
+                                    &needs_reauth_for_closure,
+                                    &e,
+                                );
+                            }
+                        }
+                    }
+                    // The existing two-click confirmation, unchanged: the
+                    // first choice arms `item_delete_pending` (which makes
+                    // the entry read "Delete? Click to confirm" the next time
+                    // the menu is opened), a second within the window
+                    // confirms.
+                    item_list::RowCommand::Delete => {
+                        if confirm_click(&mut item_delete_pending, &item.id) {
+                            delete_vault_item(
+                                ui.ctx(),
+                                &cache,
+                                &needs_reauth_for_closure,
+                                &mut items,
+                                &mut selected_id,
+                                &item,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         egui::CentralPanel::default()
@@ -1256,32 +1401,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
                                 DetailAction::Fill => {
-                                    match crate::vault_bridge::extract_app_match(item) {
-                                        Some(app_match) => {
-                                            let windows = crate::window_list::list_windows(std::process::id());
-                                            match crate::app::find_window_for_process(&windows, &app_match.process) {
-                                                // fill_from_vault does its own credential lookup
-                                                // (from the cache, not `bw serve` -- see its doc
-                                                // comment) and the fill in one call -- nothing
-                                                // else here needs to touch `injector` directly.
-                                                Some(target) => crate::app::fill_from_vault(
-                                                    &cache,
-                                                    &injector,
-                                                    &fill_stats,
-                                                    &item.id,
-                                                    target.hwnd,
-                                                ),
-                                                None => log::info!(
-                                                    "\"Fill in app\" for {}: {} isn't currently open",
-                                                    item.name, app_match.process
-                                                ),
-                                            }
-                                        }
-                                        None => log::info!(
-                                            "\"Fill in app\" for {}: no app is matched to this item yet",
-                                            item.name
-                                        ),
-                                    }
+                                    fill_item_into_app(item, &cache, &injector, &fill_stats);
                                 }
                                 DetailAction::CopyUsername => {
                                     if let Some(username) = login.and_then(|l| l.username.as_deref()) {
@@ -1353,32 +1473,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // `cache.delete_item`.
                                 DetailAction::Delete => {
                                     if confirm_click(&mut item_delete_pending, &item.id) {
-                                        match cache.delete_item(&item.id) {
-                                            Ok(()) => {
-                                                let deleted_id = item.id.clone();
-                                                items.retain(|i| i.id != deleted_id);
-                                                // Select the first remaining
-                                                // item, or `None` if the
-                                                // vault is now empty --
-                                                // either way the reset block
-                                                // above clears `mode`/
-                                                // `reveal`/
-                                                // `totp_code` for us on the
-                                                // next frame.
-                                                selected_id = items.first().map(|i| i.id.clone());
-                                            }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "failed to delete item {} ({}): {e:?}",
-                                                    item.id, item.name
-                                                );
-                                                flag_reauth_if_unauthorized(
-                                                    ui.ctx(),
-                                                    &needs_reauth_for_closure,
-                                                    &e,
-                                                );
-                                            }
-                                        }
+                                        delete_vault_item(
+                                            ui.ctx(),
+                                            &cache,
+                                            &needs_reauth_for_closure,
+                                            &mut items,
+                                            &mut selected_id,
+                                            item,
+                                        );
                                     }
                                 }
                                 DetailAction::None => {}
@@ -1513,6 +1615,75 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 /// session invalidated while this window is open is recovered from instead
 /// of leaving every subsequent write failing silently for the rest of the
 /// session (review Important 2).
+/// "Fill in app" for `item`: resolve its matched process to an open window
+/// and hand the fill to `app::fill_from_vault`.
+///
+/// Shared by the detail pane's Fill button and an item row's context-menu
+/// entry. Extracted rather than copied because both non-fatal outcomes
+/// (nothing matched yet, matched but not running) are only ever reported in
+/// the log, and a second copy of that reporting is a second place for it to
+/// go quietly missing.
+fn fill_item_into_app<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+    item: &VaultItem,
+    cache: &VaultCache,
+    injector: &Injector<A, B>,
+    fill_stats: &FillStats,
+) {
+    match crate::vault_bridge::extract_app_match(item) {
+        Some(app_match) => {
+            let windows = crate::window_list::list_windows(std::process::id());
+            match crate::app::find_window_for_process(&windows, &app_match.process) {
+                // fill_from_vault does its own credential lookup (from the
+                // cache, not `bw serve` -- see its doc comment) and the fill
+                // in one call -- nothing else here needs to touch `injector`
+                // directly.
+                Some(target) => {
+                    crate::app::fill_from_vault(cache, injector, fill_stats, &item.id, target.hwnd)
+                }
+                None => log::info!(
+                    "\"Fill in app\" for {}: {} isn't currently open",
+                    item.name,
+                    app_match.process
+                ),
+            }
+        }
+        None => log::info!(
+            "\"Fill in app\" for {}: no app is matched to this item yet",
+            item.name
+        ),
+    }
+}
+
+/// Move `item` to the trash and drop it out of this window's copy of the
+/// vault.
+///
+/// Shared by the detail pane's Delete button and an item row's context-menu
+/// entry, both of which reach it only through `confirm_click`'s two-click
+/// confirmation -- this function does no confirming of its own and must not
+/// be called without it.
+fn delete_vault_item(
+    ctx: &egui::Context,
+    cache: &VaultCache,
+    needs_reauth: &Rc<RefCell<bool>>,
+    items: &mut Vec<VaultItem>,
+    selected_id: &mut Option<String>,
+    item: &VaultItem,
+) {
+    match cache.delete_item(&item.id) {
+        Ok(()) => {
+            items.retain(|i| i.id != item.id);
+            // Select the first remaining item, or `None` if the vault is now
+            // empty -- either way the selection-change reset block clears
+            // `mode`/`reveal`/`totp_state` on the next frame.
+            *selected_id = items.first().map(|i| i.id.clone());
+        }
+        Err(e) => {
+            log::warn!("failed to delete item {} ({}): {e:?}", item.id, item.name);
+            flag_reauth_if_unauthorized(ctx, needs_reauth, &e);
+        }
+    }
+}
+
 fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bool>>, e: &VaultError) {
     if matches!(e, VaultError::Unauthorized) {
         *needs_reauth.borrow_mut() = true;
