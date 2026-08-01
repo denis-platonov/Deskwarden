@@ -263,6 +263,7 @@ mod tests {
                     vec![VaultField {
                         name: Some(APP_MATCH_FIELD_NAME.into()),
                         value: Some(v.into()),
+                        other: serde_json::Map::new(),
                     }]
                 })
                 .unwrap_or_default(),

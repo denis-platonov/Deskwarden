@@ -3,10 +3,32 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use zeroize::Zeroizing;
 
+/// One entry of an item's `fields` array -- a Bitwarden custom field.
+///
+/// It needs its own `#[serde(flatten)] other` for exactly the reason
+/// [`UriEntry`] does, and this one has teeth: a custom field carries more than
+/// name and value. At minimum `type` (0=text, 1=hidden, 2=boolean, 3=linked)
+/// and, for linked fields, `linkedId`. `VaultField` is serialized on every
+/// state-replacing write -- [`with_app_match`] rebuilds the whole `fields`
+/// vector and the item is PUT as its complete new state -- so a key dropped on
+/// deserialize is a key *deleted from the user's vault* on the next write.
+///
+/// The concrete harm, before this field existed: attaching an app match (via
+/// "Add app...") to an item that already had custom fields rewrote every one
+/// of them without its type. A **hidden field silently became an ordinary
+/// visible one**, and a linked field lost what it was linked to. Nothing
+/// failed, nothing was logged, and it happened on a real 1656-item vault.
+///
+/// Note what is deliberately *not* here: `type` and `linkedId` as typed
+/// fields. Preserving unknown keys is the fix; naming them is a separate
+/// feature, and modelling a wire shape from memory is how a modelled field and
+/// its `other` copy start disagreeing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultField {
     pub name: Option<String>,
     pub value: Option<String>,
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The `login` object `bw serve` returns for login-type items.
@@ -263,15 +285,28 @@ impl ItemKind {
 /// are preserved unchanged, since `bw serve`'s edit endpoint expects the
 /// full item as the new state rather than a server-merged patch.
 pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
-    let mut fields: Vec<VaultField> = item
+    let is_app_match = |f: &&VaultField| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME);
+    // Every *other* field is cloned wholesale, so anything unmodelled on it
+    // (`type`, `linkedId`, ...) rides `VaultField::other` untouched.
+    let mut fields: Vec<VaultField> = item.fields.iter().filter(|f| !is_app_match(f)).cloned().collect();
+    // The app-match field is the one field rebuilt rather than copied, because
+    // its `value` is the thing being changed. Its extra keys are still the
+    // server's to keep: `bw` normalises what this app writes (a field created
+    // here with no `type` comes back carrying one), so rebuilding from
+    // name/value alone would drop them on the next write -- the same bug this
+    // struct's `other` exists to prevent, one field further in. When there is
+    // no such field to replace, an empty map is correct: inventing keys nobody
+    // observed would be modelling from memory.
+    let other = item
         .fields
         .iter()
-        .filter(|f| f.name.as_deref() != Some(APP_MATCH_FIELD_NAME))
-        .cloned()
-        .collect();
+        .find(is_app_match)
+        .map(|f| f.other.clone())
+        .unwrap_or_default();
     fields.push(VaultField {
         name: Some(APP_MATCH_FIELD_NAME.to_string()),
         value: Some(m.to_field_value()),
+        other,
     });
 
     let mut updated = item.clone();
@@ -938,6 +973,7 @@ mod tests {
             fields: vec![VaultField {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
+                other: serde_json::Map::new(),
             }],
             login: None,
             card: None,
@@ -979,6 +1015,7 @@ mod tests {
             fields: vec![VaultField {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
                 value: Some("not json".into()),
+                other: serde_json::Map::new(),
             }],
             login: None,
             card: None,
@@ -1024,6 +1061,114 @@ mod tests {
         let m_back = extract_app_match(&updated).unwrap();
         assert_eq!(m_back.process, "RockstarGamesLauncher.exe");
         assert_eq!(m_back.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn unknown_keys_on_a_custom_field_survive_a_round_trip() {
+        // `VaultField` is serialized on every state-replacing PUT, and a real
+        // Bitwarden custom field carries more than name/value: `type`
+        // (0=text, 1=hidden, 2=boolean, 3=linked) and `linkedId`. Without
+        // `VaultField::other` those keys are dropped on deserialize and
+        // therefore absent on the next write. Same rule as `UriEntry`:
+        // `VaultItem`'s flatten cannot reach into a struct nested inside a
+        // `Vec`.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,
+            "fields":[{"name":"PIN","value":"1234","type":1,"linkedId":null},
+                      {"name":"Which user","value":null,"type":3,"linkedId":100}]}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let before: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_value(&item).unwrap(),
+            "a key on a custom field was dropped across a round trip"
+        );
+    }
+
+    #[test]
+    fn with_app_match_keeps_a_hidden_field_hidden() {
+        // The user-visible harm, stated as a test: attaching an app match to
+        // an item that already has a HIDDEN custom field (`"type": 1`)
+        // rewrote every one of its fields without their type, so the hidden
+        // field came back as an ordinary visible text field. Silent, on a
+        // real vault.
+        let raw = r#"{"id":"1","name":"Site","type":1,"favorite":false,
+            "fields":[{"name":"Recovery code","value":"s3cret","type":1,"linkedId":null}]}"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+
+        let updated = with_app_match(
+            &item,
+            &AppMatch {
+                process: "game.exe".into(),
+                trigger: TriggerMode::Prompt,
+            },
+        );
+        let value = serde_json::to_value(&updated).unwrap();
+        let fields = value["fields"].as_array().unwrap();
+
+        let hidden = fields
+            .iter()
+            .find(|f| f["name"] == serde_json::json!("Recovery code"))
+            .expect("the pre-existing custom field vanished");
+        assert_eq!(
+            hidden,
+            &serde_json::json!({
+                "name": "Recovery code", "value": "s3cret", "type": 1, "linkedId": null
+            }),
+            "a hidden custom field lost its type when an app match was attached"
+        );
+    }
+
+    #[test]
+    fn with_app_match_keeps_the_extra_keys_of_the_field_it_replaces() {
+        // The app-match field is the one field `with_app_match` rebuilds
+        // rather than copies. `bw` normalises what this app writes -- a field
+        // created here with no `type` comes back carrying one -- so rebuilding
+        // it from name/value alone would drop those keys on the *next* write.
+        // Replacing it must therefore carry over whatever else it arrived
+        // with.
+        let raw = format!(
+            r#"{{"id":"1","name":"Site","type":1,"favorite":false,
+                "fields":[{{"name":"{}","value":"old.exe|prompt","type":0,"linkedId":null}}]}}"#,
+            APP_MATCH_FIELD_NAME_FOR_TEST
+        );
+        let item: VaultItem = serde_json::from_str(&raw).unwrap();
+
+        let updated = with_app_match(
+            &item,
+            &AppMatch {
+                process: "new.exe".into(),
+                trigger: TriggerMode::Prompt,
+            },
+        );
+        let value = serde_json::to_value(&updated).unwrap();
+        let fields = value["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1, "the app-match field was duplicated");
+        assert_eq!(fields[0]["type"], serde_json::json!(0));
+        assert_eq!(fields[0]["linkedId"], serde_json::Value::Null);
+        assert_eq!(extract_app_match(&updated).unwrap().process, "new.exe");
+    }
+
+    #[test]
+    fn an_app_match_field_added_to_a_fresh_item_carries_no_extra_keys() {
+        // The other half of the rule above: when there is nothing to replace,
+        // the new field must be exactly name+value. Inventing a `type` we
+        // never observed would be modelling from memory.
+        let item = a_bare_item();
+        let updated = with_app_match(
+            &item,
+            &AppMatch {
+                process: "game.exe".into(),
+                trigger: TriggerMode::Prompt,
+            },
+        );
+        let value = serde_json::to_value(&updated).unwrap();
+        let fields = value["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(
+            fields[0].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["name", "value"],
+            "a freshly added app-match field gained keys nobody observed"
+        );
     }
 
     #[test]
