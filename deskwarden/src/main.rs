@@ -671,7 +671,9 @@ fn main() {
                             // snapshot on success precisely so nothing has to
                             // re-fetch it).
                             //
-                            // This used to be `refresh_match_engine`, a THIRD
+                            // This used to be `app::refresh_match_engine`
+                            // (deleted in review 23, once this was its last
+                            // caller and it had none left), a THIRD
                             // live `list_items` against `bw serve` after the
                             // picker's own populate and the save's PUT
                             // (review 21's Minor). A transient 500 or a reset
@@ -682,8 +684,15 @@ fn main() {
                             // mode review 16 removed from the unlock path, and
                             // the reason nothing in this app arms the engine
                             // from a request that has not already succeeded.
-                            if cache.is_populated() {
-                                let entries = match_entries(&cache.items());
+                            //
+                            // ONE LOCK, not `is_populated()` then `items()`
+                            // (review 23's fifth Minor): the two-lock spelling
+                            // was sound only by an argument about which thread
+                            // every `clear` runs on, and this is a place where
+                            // "populated" and "the items" must be the same
+                            // observation.
+                            if let Some(items) = cache.items_if_populated() {
+                                let entries = match_entries(&items);
                                 log::info!(
                                     "match engine refreshed: {} app match(es)",
                                     entries.len()
@@ -1284,7 +1293,8 @@ fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Op
 /// `picker_ui::load_items_for_picker`'s doc records as something that
 /// actually happens -- cleared the engine even though the vault read fine.
 /// e83ef03 made the two independent, which fixed the folders case and left
-/// the engine depending on `refresh_match_engine`'s own, THIRD `list_items`
+/// the engine depending on the since-deleted `app::refresh_match_engine`'s
+/// own, THIRD `list_items`
 /// (review 16's Important): a transient 500 or a connection reset on that one
 /// request cleared the engine just the same. With no periodic match-engine
 /// refresh left in this app, either version disarmed autofill silently for
@@ -1414,8 +1424,8 @@ fn restart_backend_after_unlock(
 /// `engine.clear()`, and the warn it logged advised the user to "open it
 /// again from the tray to retry" -- advice that is false. The engine is only
 /// ever rebuilt at four places (startup, this function's `Ready` path, a
-/// completed tray `Sync`, and `refresh_match_engine` from an "Add app..."
-/// save), and `open_vault_window` reaches the recovery ONLY when the window
+/// completed tray `Sync`, and the "Add app..." save's rebuild from the cache),
+/// and `open_vault_window` reaches the recovery ONLY when the window
 /// reports `locked || needs_reauth`. A normal open/close never touches the
 /// engine at all, so reopening the vault window repopulates the CACHE and
 /// leaves the ENGINE empty: the user sees all their items and autofill is
@@ -2805,7 +2815,8 @@ mod tests {
     /// Review 16's Important: the engine must be armed from the readiness
     /// probe's own items even if the backend answers 500 to absolutely
     /// everything afterwards. Before this fix the engine was rebuilt by
-    /// `refresh_match_engine`, i.e. by a THIRD `list_items` after the
+    /// `app::refresh_match_engine` (since deleted), i.e. by a THIRD
+    /// `list_items` after the
     /// probe's and the populate's, and a transient failure of that one
     /// request cleared the engine and silently disarmed autofill for the
     /// whole session -- the exact blast radius of review 15's finding, one
@@ -3311,7 +3322,7 @@ mod tests {
         let outcome = sync_outcome_from(&cache, cache.epoch(), None);
 
         // "Add app...": the user saves a match through the cache, and
-        // `refresh_match_engine`'s equivalent arms the engine from it.
+        // the save path's rebuild from the cache arms the engine from it.
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
         cache
             .set_app_match(

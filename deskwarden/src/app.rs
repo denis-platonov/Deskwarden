@@ -5,9 +5,8 @@
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::injector::ui_automation;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
-use crate::match_engine::MatchEngine;
 use crate::overlay_ui;
-use crate::vault_bridge::{extract_app_match, VaultBridge, VaultError, VaultItem};
+use crate::vault_bridge::{extract_app_match, VaultItem};
 use crate::vault_cache::VaultCache;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -233,20 +232,14 @@ pub fn match_entries(items: &[VaultItem]) -> Vec<(String, AppMatch)> {
         .collect()
 }
 
-/// Re-reads the vault and rebuilds `engine` from it.
-///
-/// Returns the number of matches loaded, or the underlying vault error --
-/// notably *not* swallowing failure into an empty engine, which is how the app
-/// used to end up silently matching nothing forever.
-pub fn refresh_match_engine(
-    vault: &VaultBridge,
-    engine: &mut MatchEngine,
-) -> Result<usize, VaultError> {
-    let items = vault.list_items()?;
-    let entries = match_entries(&items);
-    engine.rebuild(&entries);
-    Ok(entries.len())
-}
+// DELIBERATELY ABSENT: a `refresh_match_engine(vault, engine)` that did its own
+// `list_items` and rebuilt from the result. Reviews 15, 16 and 21 each removed
+// one of its call sites -- every time, the defect was the same shape: an extra
+// live request on a path that already had the data, so a transient backend
+// failure left the engine unarmed and the user's just-saved match dead until
+// the next sync. It survived as dead `pub` code (nothing warns) until review
+// 23. Rebuild from `match_entries(&cache.items())` instead: the cache is the
+// app's one source of vault truth and every write has already updated it.
 
 #[cfg(test)]
 mod tests {
