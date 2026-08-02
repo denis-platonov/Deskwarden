@@ -607,7 +607,8 @@ fn main() {
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
-                    settings.auto_lock_timeout(),
+                    &mut settings,
+                    &settings_path,
                     &tray,
                     &backend_op_tx,
                     &backend_op_rx,
@@ -919,7 +920,8 @@ fn main() {
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
-                    settings.auto_lock_timeout(),
+                    &mut settings,
+                    &settings_path,
                     &tray,
                     &backend_op_tx,
                     &backend_op_rx,
@@ -1698,12 +1700,34 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // synchronous call this function always made, just no longer on every
     // single open.
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
-    auto_lock: Duration,
+    // The live preferences, and where they are stored. Taken by `&mut` and
+    // as a path -- rather than the single pre-computed `auto_lock: Duration`
+    // this used to take -- because the titlebar's gear now opens the
+    // preferences window from *inside* a vault session (see
+    // `VaultWindowResult::open_preferences`). Serving that needs both: the
+    // struct, to hand to `prefs_ui::run` and to write back into so `main`'s
+    // own later reads (`settings.keep_backend_running` in its idle
+    // reconciliation) see the change, and the path to persist to.
+    //
+    // The auto-lock timeout is now derived per iteration of the loop below
+    // instead of being computed once by the caller, which is what lets a
+    // timeout edited in that window apply to the very next vault window
+    // rather than only to the next app launch.
+    settings: &mut settings::Settings,
+    settings_path: &std::path::Path,
     tray: &tray::AppTray,
     backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
     backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
 ) {
+    // Reopened, not merely opened once: the titlebar gear asks for the
+    // preferences window, and `prefs_ui::run` is its own `eframe` window on
+    // this same thread. eframe cannot nest one native event loop inside
+    // another, so the vault window must be fully gone before that call and
+    // has to come back afterwards -- which is a loop, not a straight line.
+    // Every other outcome (closed, locked, needs re-auth) still leaves this
+    // function exactly once, on its first pass.
+    loop {
     let status_details = match cached_status_details.take() {
         Some(details) => details,
         None => login_ui::check_bw_status_details(),
@@ -1744,9 +1768,52 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         status_details.user_email,
         session_token.clone(),
         icon_cache_dir.to_path_buf(),
-        auto_lock,
+        // Read fresh on every pass, so a timeout changed in the preferences
+        // window below governs the window this loop is about to reopen.
+        settings.auto_lock_timeout(),
         backend_already_running,
     );
+
+    // Handled before the lock/re-auth branch and with its own `continue`,
+    // never folded into it. `locked` and `needs_reauth` both mean the
+    // session is gone and both run the full recovery below -- clear the
+    // cache, stop `bw serve`, re-authenticate, restart, repopulate. Asking
+    // for Preferences means none of that: the vault was never locked and the
+    // backend is healthy, so reusing either flag would make a visit to the
+    // gear demand the master password and needlessly restart `bw serve`.
+    //
+    // On `keep_backend_running` (the setting most likely to be changed
+    // here): this deliberately does NOT call `stop_backend_if_idle` itself.
+    // That function's whole contract is "stop the backend if the policy says
+    // so AND no vault window is open", and this path is about to reopen the
+    // vault window immediately -- which needs the backend for writes and
+    // TOTP. `main`'s own loop reconciles the policy on its next idle
+    // iteration, which is reached as soon as this function finally returns,
+    // exactly as it is for the tray's preferences item. The change therefore
+    // takes effect when the vault session actually ends, which is the
+    // earliest moment at which it is meaningful. What DOES have to happen
+    // here is writing the new value into `*settings`, because that binding
+    // -- not the file -- is what that reconciliation reads.
+    if result.open_preferences {
+        let edited = prefs_ui::run(settings.clone());
+        if edited != *settings {
+            *settings = edited;
+            // `persist_preferences`, never a whole-struct `save`. This
+            // struct's `vault_window` field is whatever was on disk when
+            // `main` loaded it at startup, and `vault_window::run` has just
+            // written a fresh geometry straight to the same file on its way
+            // out of the call above. A whole-struct write here would put
+            // that stale geometry back and silently revert the size and
+            // position the user just left the window at -- the identical
+            // trap the tray's preferences handler documents at its own call
+            // site. `persist_preferences` re-reads the file and overwrites
+            // only the two preference fields, so the geometry survives.
+            if let Err(e) = settings.persist_preferences(settings_path) {
+                log::warn!("could not save settings: {e}");
+            }
+        }
+        continue;
+    }
 
     if result.locked || result.needs_reauth {
         // Two different triggers land here, both needing the exact same
@@ -1882,6 +1949,14 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         settle_vault_after_unlock(cache, engine, unlock_epoch, |message| {
             wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message)
         });
+    }
+
+    // The only way out that is not the `continue` above. Every non-
+    // preferences outcome -- a plain close, a lock, a re-auth, and the
+    // lock path's own early `return` when the backend could not be
+    // restarted -- leaves the loop here, so this function still runs the
+    // window exactly once for all of them.
+    return;
     }
 }
 

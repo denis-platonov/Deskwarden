@@ -1257,6 +1257,26 @@ pub const KEBAB_DOT_RADIUS: f32 = 1.7;
 /// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
 const EYE_PUPIL_RADIUS: f32 = 2.4;
 
+/// Teeth around the settings gear. Eight is the fewest that still reads as a
+/// cog rather than a flower at 28px, and it keeps the outline's vertex count
+/// clear of every other drawn icon here (see [`GEAR_VERTICES`]).
+const GEAR_TEETH: usize = 8;
+
+/// Vertices in the gear's outline: four per tooth (rise, crown-out,
+/// crown-in, fall), so 32.
+///
+/// Deliberately distinct from [`STAR_VERTICES`] (10) and [`EYE_VERTICES`]
+/// (24) -- [`icon_probe`] tells these icons apart by vertex count alone, so
+/// two of them sharing one count would make each findable as the other.
+pub const GEAR_VERTICES: usize = GEAR_TEETH * 4;
+
+/// The gear's hub. Not [`KEBAB_DOT_RADIUS`] (1.7) and not
+/// [`EYE_PUPIL_RADIUS`] (2.4), for the same reason those two differ from
+/// each other: `icon_probe::kebab_dots` finds circles BY radius, and a hub
+/// that matched would be reported as a stray kebab dot in every frame the
+/// titlebar is painted in.
+const GEAR_HUB_RADIUS: f32 = 3.2;
+
 /// The five-pointed star's outline, starting at the top point.
 ///
 /// Built around the origin and then translated so its own BOUNDING BOX --
@@ -1372,6 +1392,83 @@ pub fn kebab_button(ui: &mut Ui, armed: bool) -> Response {
         );
     }
     response
+}
+
+/// The gear's outline: [`GEAR_TEETH`] square-ish teeth around a hub, walked
+/// once anticlockwise as a single closed path.
+///
+/// Each tooth contributes four points -- the two roots either side of it at
+/// `root` radius and the two crown corners at `tip` -- so the path steps
+/// out, across, and back in for every tooth rather than being a star's
+/// alternating spikes. That is what makes it read as a cog: a gear's tooth
+/// has a flat top, a pentagram's point does not.
+fn gear_outline(center: Pos2, tip: f32, root: f32) -> Vec<Pos2> {
+    // Half the angular width of one tooth's crown, as a fraction of the
+    // per-tooth sector. 0.30 leaves the gap between teeth slightly wider
+    // than the teeth themselves, which is what stops the outline reading as
+    // a plain scalloped circle at this size.
+    const CROWN_HALF: f32 = 0.30;
+    let sector = std::f32::consts::TAU / GEAR_TEETH as f32;
+    let at = |angle: f32, radius: f32| {
+        center + Vec2::new(radius * angle.cos(), radius * angle.sin())
+    };
+    let mut points = Vec::with_capacity(GEAR_VERTICES);
+    for tooth in 0..GEAR_TEETH {
+        let mid = tooth as f32 * sector;
+        points.push(at(mid - sector * 0.5 + sector * 0.10, root));
+        points.push(at(mid - sector * CROWN_HALF, tip));
+        points.push(at(mid + sector * CROWN_HALF, tip));
+        points.push(at(mid + sector * 0.5 - sector * 0.10, root));
+    }
+    debug_assert_eq!(points.len(), GEAR_VERTICES);
+    points
+}
+
+/// The vault titlebar's Preferences control: a gear, stroked rather than
+/// typed.
+///
+/// **Measured, not assumed** -- and the measurement is the same one
+/// `the_icon_codepoints_are_not_carried_by_this_apps_own_typeface` records
+/// for ★/☆/👁. U+2699 GEAR *does* resolve in this app's stack, but at an
+/// advance of exactly 11.6875 at 13pt: identical to ★ and to ☸, and unlike
+/// Archivo's own 'A' (8.875) or 'W' (12.0). That single shared advance is
+/// the signature of egui's bundled emoji/icon fallback sitting behind
+/// Archivo, not of this app's own typeface having gained the codepoint --
+/// so as text it would arrive with a weight, an optical size and a baseline
+/// nobody here chose, next to a 28px Lock pill and a 28px avatar whose every
+/// measurement comes from design 2b. Drawn, it matches them.
+///
+/// Sized to the 28px the neighbouring titlebar controls use
+/// (`toolbar_button_with_shortcut`'s `HEIGHT`, `draw_circle_avatar`'s
+/// `SIZE`), so its hit target is theirs rather than only as big as the mark.
+///
+/// Carries a hover label because, unlike Lock, it has no word on it --
+/// [`close_glyph`]'s "Dismiss" is the precedent for an unlabelled drawn
+/// control naming itself on hover.
+pub fn gear_button(ui: &mut Ui) -> Response {
+    const SIZE: f32 = 28.0;
+    const TIP: f32 = 9.0;
+    const ROOT: f32 = 6.6;
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // The same two-state treatment `kebab_button` uses: this is a neutral
+    // navigation control with no "on" state, so it never takes BLUE (which
+    // `star_toggle` reserves for an actual toggle being on) and never takes
+    // ERROR (reserved for failures).
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    let center = rect.center();
+    ui.painter().add(egui::Shape::closed_line(
+        gear_outline(center, TIP, ROOT),
+        Stroke::new(1.3, color),
+    ));
+    // The hub, stroked rather than filled: a filled disc at this size closes
+    // the cog up into a blob, and the ring is what makes it a gear.
+    ui.painter()
+        .circle_stroke(center, GEAR_HUB_RADIUS, Stroke::new(1.3, color));
+    response.on_hover_text("Preferences")
 }
 
 /// The eye's almond outline: two parabolic lids meeting at the corners.
@@ -1509,6 +1606,19 @@ pub mod icon_probe {
     /// is a separate segment, so the almond is found either way.
     pub fn eyes(shape: &egui::Shape) -> Vec<Rect> {
         closed_paths(shape, EYE_VERTICES)
+    }
+
+    /// The settings gears this shape tree paints, with the colour each was
+    /// stroked in -- which is the only way `gear_button`'s hover state is
+    /// visible to a test, since it paints no fill and no string.
+    ///
+    /// Found by [`GEAR_VERTICES`] alone, exactly as [`stars`] and [`eyes`]
+    /// are found by theirs; the hub circle is deliberately NOT part of the
+    /// identification, so retuning it cannot make the gear invisible here.
+    pub fn gears(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        walk_paths(shape, GEAR_VERTICES, &mut out);
+        out
     }
 
     /// The strikes through the eyes above -- the ONLY thing that tells the

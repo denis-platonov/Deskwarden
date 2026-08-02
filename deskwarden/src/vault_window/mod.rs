@@ -158,6 +158,24 @@ pub struct VaultWindowResult {
     /// does (stop the stale backend, re-authenticate, restart with the fresh
     /// token, repopulate the cache).
     pub needs_reauth: bool,
+    /// True if the titlebar's gear was clicked: the user asked for the
+    /// Preferences window, and this window closed only because eframe cannot
+    /// nest one native window's event loop inside another's. The caller
+    /// (`open_vault_window`) runs `prefs_ui::run`, applies whatever came
+    /// back, and reopens this window.
+    ///
+    /// **A third field, not a reuse of either flag above, and the
+    /// distinction is not cosmetic.** `locked` and `needs_reauth` are
+    /// handled alike by the caller precisely because they mean the same
+    /// thing about the session -- it is gone -- and both therefore run the
+    /// full recovery: clear the cache, stop `bw serve`, re-authenticate,
+    /// restart, repopulate. Opening Preferences means nothing whatsoever
+    /// about the session. Folded into either flag, every visit to the gear
+    /// would make the user re-enter their master password to get back to a
+    /// vault that was never locked, and would tear down and restart a
+    /// perfectly healthy backend to do it. Distinct situations get distinct
+    /// fields here.
+    pub open_preferences: bool,
 }
 
 enum DetailMode {
@@ -234,6 +252,13 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // is `FnMut + 'static` and can't return anything directly.
     let needs_reauth = Rc::new(RefCell::new(false));
     let needs_reauth_for_closure = needs_reauth.clone();
+    // See `VaultWindowResult::open_preferences`. Same `Rc<RefCell<_>>`
+    // handoff as `locked` above and for the same mechanical reason (the
+    // update closure is `FnMut + 'static` and cannot return anything), but
+    // a separate cell rather than a share of either: see that field's doc
+    // for why the three outcomes must not collapse into one.
+    let open_preferences = Rc::new(RefCell::new(false));
+    let open_preferences_for_closure = open_preferences.clone();
     let mut sync_status: Option<Result<(), String>> = None;
     // When the most recent successful sync completed, for the toolbar's
     // sync pill ("Synced N min ago" per design spec 4.8) -- set below
@@ -918,10 +943,37 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         match draw_window_chrome_with_extra(ui, WINDOW_TITLE, ChromeMetrics::VAULT, true, |ui| {
             // Right-to-left, so this reads left-to-right (nearest the title,
             // furthest from the window controls, first) as: Sync status
-            // pill, "Lock CTRL+L", avatar -- design 2b's exact order. Added
-            // here in the opposite order (avatar closest to the window
-            // controls, sync pill furthest) since `right_to_left` packs
-            // each new widget just to the left of the previous one.
+            // pill, "Lock CTRL+L", avatar, settings gear. Added here in the
+            // opposite order (the gear closest to the window controls, sync
+            // pill furthest) since `right_to_left` packs each new widget
+            // just to the left of the previous one.
+            //
+            // The gear is therefore added FIRST precisely because it is
+            // asked to sit to the RIGHT of the avatar -- in this layout,
+            // earlier is further right. `the_settings_gear_sits_to_the_right_
+            // of_the_avatar` asserts the painted rects rather than this
+            // order, because reasoning about it is exactly how it would end
+            // up on the wrong side.
+            //
+            // Design 2b specifies no settings affordance at all (there is no
+            // gear, cog or "Settings" anywhere in `Deskwarden.dc.html`), so
+            // this is the user's direction rather than the design's, the
+            // same way the detail pane's star, kebab and eye were. What it
+            // does take from 2b is its metrics: `theme::gear_button` is 28px
+            // square, matching the Lock pill's height and the avatar's
+            // diameter beside it.
+            if theme::gear_button(ui).clicked() {
+                // The same two-step dance Lock does immediately below -- set
+                // the flag, then ask the window to close -- and for a reason
+                // specific to this control: `prefs_ui::run` is its own
+                // `eframe` window on this same thread, and eframe cannot
+                // nest one native event loop inside another. Calling it from
+                // inside this frame closure is not an option, so the request
+                // has to leave this window entirely and be served by the
+                // caller once this loop has ended.
+                *open_preferences_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             if let Some(email) = &account_email {
                 // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
                 // draws a rounded square (used elsewhere: item-list rows,
@@ -2256,7 +2308,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
     let locked = *locked.borrow();
     let needs_reauth = *needs_reauth.borrow();
-    VaultWindowResult { locked, needs_reauth }
+    // Read out of its own cell and reported as its own field. The geometry
+    // write just above has already happened by this point, which is what
+    // makes the caller's `persist_preferences` safe to run next: this
+    // window's `settings.json` write is done, so the preferences save cannot
+    // race it, and `persist_preferences` is a read-modify-write of the two
+    // preference fields only, so it cannot clobber the geometry either.
+    let open_preferences = *open_preferences.borrow();
+    VaultWindowResult { locked, needs_reauth, open_preferences }
 }
 
 /// If `e` is `VaultError::Unauthorized`, flags the window to close and
