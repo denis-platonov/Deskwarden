@@ -8530,3 +8530,95 @@ mod settings_gear_placement_tests {
         panic!("unbalanced braces after the gear's click -- this guard slices the block it opens")
     }
 }
+
+/// That "auto-lock is off" really is off, in the one place it has to be.
+///
+/// A source-text guard, for the same reason the modules above are: the idle
+/// check lives inside `run`'s eframe closure, and no harness in this crate can
+/// call `run`. `AutoLock` being an enum already makes the *type* mistakes
+/// impossible -- `last_activity.elapsed() >= auto_lock` no longer compiles,
+/// and neither does forgetting the `Never` arm -- but nothing in the compiler
+/// stops someone writing a lock, or an elapsed-time comparison, into the
+/// `Never` arm itself, which is exactly the change that would make "never"
+/// mean "after a while" again.
+///
+/// Every needle is split with `concat!` and is single-line: `include_str!`
+/// pulls this module in too, so a one-piece literal would match its own
+/// declaration, and a needle containing a newline passes on LF and fails on
+/// CRLF -- this repo has both.
+#[cfg(test)]
+mod auto_lock_never_wiring_tests {
+    const MATCH_HEAD: &str = concat!("let lock_countdown = match auto_", "lock {");
+    const NEVER_ARM: &str = concat!("AutoLock::Never => AUTO_LOCK_OFF_", "LABEL.to_owned(),");
+    const AFTER_ARM: &str = concat!("AutoLock::After(timeout) ", "=> {");
+    const ELAPSED_CHECK: &str = concat!("if last_activity.elapsed() >= ", "timeout {");
+    const LOCKS: &str = concat!("*locked_for_closure.borrow_mut() = ", "true;");
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    /// Everything the off case runs: the head of the match plus the `Never`
+    /// arm, up to where the timed arm begins. Sliced from the head rather
+    /// than from the `Never` arm itself so that a lock added *above* the arms
+    /// -- which would fire in both states -- is inside the slice too.
+    fn off_branch() -> &'static str {
+        let production = production();
+        let head = production.find(MATCH_HEAD).unwrap_or_else(|| {
+            panic!(
+                "{MATCH_HEAD:?} is not in production code -- the idle timer no longer \
+                 branches on `AutoLock` at all"
+            )
+        });
+        let after = production.find(AFTER_ARM).unwrap_or_else(|| {
+            panic!(
+                "{AFTER_ARM:?} is not in production code -- the timed arm is what the \
+                 `Never` arm is being contrasted against here"
+            )
+        });
+        assert!(after > head, "the match's arms are not in the order this guard slices them in");
+        // Non-empty by construction (the two indices differ), so neither
+        // assertion below can pass vacuously.
+        &production[head..after]
+    }
+
+    #[test]
+    fn the_never_arm_neither_locks_nor_measures_elapsed_time() {
+        let arm = off_branch();
+        assert!(
+            !arm.contains(LOCKS),
+            "the off branch locks the vault -- auto-lock being turned off must mean the idle \
+             timer never closes the window with `locked = true` at all: {arm:?}"
+        );
+        assert!(
+            !arm.contains("elapsed()"),
+            "the off branch measures elapsed time -- `Never` is not a very long timeout, and \
+             anything comparing against it is a timeout by another name: {arm:?}"
+        );
+        assert!(
+            arm.contains(NEVER_ARM),
+            "{NEVER_ARM:?} is not in the off branch, so the two assertions above are no longer \
+             looking at the case they name: {arm:?}"
+        );
+    }
+
+    #[test]
+    fn the_timed_arm_still_locks_after_the_timeout_elapses() {
+        // The positive control for the test above, which would otherwise be
+        // satisfied by a window that never auto-locks in either state.
+        let production = production();
+        let after = production.find(AFTER_ARM).expect("no timed arm in production code");
+        let arm = &production[after..];
+        let elapsed = arm
+            .find(ELAPSED_CHECK)
+            .expect("the timed arm no longer compares the idle time against its timeout");
+        let locks = arm[elapsed..]
+            .find(LOCKS)
+            .expect("the timed arm no longer locks once its timeout has elapsed");
+        assert!(locks > 0, "the lock must be inside the elapsed check, not before it");
+    }
+}

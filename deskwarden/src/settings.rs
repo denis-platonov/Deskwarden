@@ -103,7 +103,7 @@ pub const fn auto_lock_policy(enabled: bool, minutes: u64) -> AutoLock {
 /// same silent-override defect class as a switch that does nothing.
 /// `prefs_ui` therefore routes every value it accepts (typed, stepped, and the
 /// one it loads out of `settings.json`) through this function, so the number on
-/// screen and the number `auto_lock_timeout` uses are the same number by
+/// screen and the number `auto_lock_policy` uses are the same number by
 /// construction rather than by two matching `.max()` calls that could drift.
 ///
 /// A floor only: there is deliberately no ceiling. [`auto_lock_policy`]
