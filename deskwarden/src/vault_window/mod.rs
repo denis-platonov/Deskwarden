@@ -1531,7 +1531,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     // them drop the on-demand list they touched rather than
                     // editing it in place, because that list is not cached
                     // anywhere and refetching it is the cheap, always-correct
-                    // answer (`VaultCache::list_trash`'s recorded decision).
+                    // answer (`VaultCache::list_trash_unless_superseded`'s
+                    // recorded decision).
                     //
                     // NOTHING HERE READS A LIST BACK TO CONFIRM THE WRITE.
                     // A 200 from `/archive/item/{id}` does not prove the
@@ -2835,9 +2836,9 @@ fn apply_totp_poll_result(
 /// archive.
 ///
 /// Neither lives in `VaultCache`'s snapshot, and that is a recorded decision
-/// with reasons (see `VaultCache::list_trash`), so the window holds them
-/// itself. Both are fetched off the UI thread the first time their row is
-/// selected.
+/// with reasons (see `VaultCache::list_trash_unless_superseded`), so the
+/// window holds them itself. Both are fetched off the UI thread the first
+/// time their row is selected.
 ///
 /// **`items: None` is "never fetched", which is NOT "empty".** That
 /// distinction is the whole point of the `Option`: a badge that printed `0`

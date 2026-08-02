@@ -1387,7 +1387,8 @@ impl VaultBridge {
     /// `list_trash_asks_for_only_the_trashed_items` therefore asserts the
     /// REQUEST's query string, not the parsed response.
     ///
-    /// Deliberately NOT cached: see [`crate::vault_cache::VaultCache::list_trash`].
+    /// Deliberately NOT cached: see
+    /// [`crate::vault_cache::VaultCache::list_trash_unless_superseded`].
     pub fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
         let url = format!("{}/list/object/items", self.base_url);
         let body: Envelope<ItemList> = self
@@ -1414,8 +1415,9 @@ impl VaultBridge {
     /// because a test written against a mock that answers regardless of query
     /// passes for both spellings.
     ///
-    /// Deliberately NOT cached, for [`crate::vault_cache::VaultCache::list_trash`]'s
-    /// reasons exactly.
+    /// Deliberately NOT cached, for
+    /// [`crate::vault_cache::VaultCache::list_trash_unless_superseded`]'s reasons
+    /// exactly.
     pub fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
         let url = format!("{}/list/object/items", self.base_url);
         let body: Envelope<ItemList> = self

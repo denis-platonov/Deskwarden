@@ -1181,7 +1181,43 @@ impl VaultCache {
         Ok(())
     }
 
-    /// The vault's trash, fetched fresh every time.
+    /// The vault's trash in one call, **without the era guard** -- reachable
+    /// from tests only.
+    ///
+    /// `#[cfg(test)]` and private, and the gating is the point rather than
+    /// tidying. Every production path goes through
+    /// [`Self::list_trash_unless_superseded`], which throws away a result that
+    /// landed after a [`Self::clear`] began a new [`VaultEra`]. This function
+    /// was `pub` and sat immediately beside the guarded one with nothing
+    /// marking it, which is exactly how the next call site quietly reacquires
+    /// the hole `ca67475` closed -- account B's trashed item names under
+    /// account A's chrome -- by reaching for the shorter name. Under the cfg,
+    /// a production caller is a compile error rather than a review finding.
+    ///
+    /// The tests keep it because what they assert is the QUERY the bridge puts
+    /// on the wire (`?trash=true`, and the archive filter's spelling) and the
+    /// error mapping around it. The era guard is irrelevant to both, and
+    /// [`Self::list_trash_unless_superseded`] would only wrap the answer in an
+    /// `Option` those assertions would have to unwrap again.
+    ///
+    /// See [`Self::list_trash_unless_superseded`] for why neither list is
+    /// cached at all.
+    #[cfg(test)]
+    fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.bridge.list_trash()
+    }
+
+    /// [`Self::list_trash`] for the archive, test-only for its reasons.
+    #[cfg(test)]
+    fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.bridge.list_archive()
+    }
+
+    /// The vault's trash, fetched fresh every time, and **discarded if a
+    /// [`Self::clear`] began a new [`VaultEra`] while the fetch was in
+    /// flight** -- `Ok(None)`. The one door production has onto the trash.
+    ///
+    /// # Why the trash is not cached
     ///
     /// **TRASH IS DELIBERATELY NOT IN THE SNAPSHOT**, and this is the design
     /// decision of the Trash backend. The snapshot is `items` + `folders`
@@ -1215,18 +1251,8 @@ impl VaultCache {
     /// It routes through the cache anyway, rather than callers reaching
     /// [`Self::bridge`], so that there is one door for the whole feature and
     /// so a later decision to cache it changes this function and nothing else.
-    pub fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
-        self.bridge.list_trash()
-    }
-
-    /// The vault's archive, fetched fresh every time -- [`Self::list_trash`]'s
-    /// decision, for [`Self::list_trash`]'s reasons.
-    pub fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
-        self.bridge.list_archive()
-    }
-
-    /// [`Self::list_trash`], **discarded if a [`Self::clear`] began a new
-    /// [`VaultEra`] while the fetch was in flight** -- `Ok(None)`.
+    ///
+    /// # Why the era guard
     ///
     /// This is the on-demand lists' half of the guarantee
     /// [`Self::snapshot_unless_superseded`] gives the live load, and it exists
@@ -1264,8 +1290,8 @@ impl VaultCache {
         self.list_unless_superseded(era, |bridge| bridge.list_trash())
     }
 
-    /// [`Self::list_archive`] under [`Self::list_trash_unless_superseded`]'s
-    /// guard, for its reasons.
+    /// The vault's archive under [`Self::list_trash_unless_superseded`]'s
+    /// guard, for its reasons and with its caching decision.
     pub fn list_archive_unless_superseded(
         &self,
         era: VaultEra,
@@ -1362,7 +1388,8 @@ impl VaultCache {
     /// returns nothing this crate has verified the shape of.
     ///
     /// **[`without_deleted_date`] is load-bearing, not tidying.** The item the
-    /// caller holds came from [`Self::list_trash`] and carries `deletedDate`
+    /// caller holds came from [`Self::list_trash_unless_superseded`] and carries
+    /// `deletedDate`
     /// in [`VaultItem::other`], which is serialized on every write this app
     /// makes -- so pushing it in verbatim would leave the live snapshot's copy
     /// claiming a deletion date, and the vault window's next ordinary edit of
@@ -1439,7 +1466,8 @@ impl VaultCache {
     /// to the snapshot must still leave.
     ///
     /// Nothing prunes a cached trash list here because there is none; see
-    /// [`Self::list_trash`] for why that is the point rather than an omission.
+    /// [`Self::list_trash_unless_superseded`] for why that is the point rather
+    /// than an omission.
     pub fn purge_item(&self, id: &str) -> Result<(), VaultError> {
         self.bridge.purge_item(id)?;
         let mut snapshot = self.lock();
