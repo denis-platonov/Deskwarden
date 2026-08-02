@@ -978,7 +978,14 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
 /// to line up with the search box beside it). Two things the same size today
 /// for different reasons are two constants; folding them together is how one
 /// silently follows the other when the design moves.
-const HEADER_BUTTON_HEIGHT: f32 = 34.0;
+///
+/// **Also the WIDTH of the square controls.** [`star_toggle`] and
+/// [`kebab_button`] both allocate `splat(HEADER_BUTTON_HEIGHT)`, so this one
+/// number is how much room each of them takes on the strip -- which
+/// `detail.rs`'s `header_layout` has to know *before* it draws anything in
+/// order to decide whether the strip fits on one line. It is `pub` for that
+/// reader and no other.
+pub const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 
 // The outlined 34px header button that used to stand beside the primary
 // (design 2b's "Edit") is gone with the words it carried: Edit and Delete
@@ -998,26 +1005,19 @@ const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 /// draws a distinctly smaller, softer monospace run. Same two-galley
 /// construction as [`toolbar_button_with_shortcut`], which had the identical
 /// requirement one pane over.
-pub fn header_primary_button(ui: &mut Ui, label: &str, shortcut: &str) -> Response {
-    const PAD_X: f32 = 14.0;
-    const GAP: f32 = 8.0;
-    // `opacity: 0.85`, over the blue fill.
-    let hint_color = Color32::from_white_alpha(217);
-
-    let label_galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
-        Color32::WHITE,
-    );
-    let hint_galley = ui.painter().layout_no_wrap(
-        shortcut.to_string(),
-        FontId::new(10.0, FontFamily::Monospace),
-        hint_color,
-    );
-
-    let content_width = label_galley.size().x + GAP + hint_galley.size().x;
+///
+/// `shortcut` is an `Option` because the hint is the first thing this control
+/// gives up when the strip it sits on runs out of room: on a narrow pane the
+/// twelve monospace characters of "CTRL+SHIFT+F" are wider than the label they
+/// annotate, and the chord keeps working whether or not they are painted. See
+/// `detail.rs`'s `header_layout`, which is what decides.
+pub fn header_primary_button(ui: &mut Ui, label: &str, shortcut: Option<&str>) -> Response {
+    let (label_galley, hint_galley) = header_primary_galleys(ui, label, shortcut);
     let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(content_width + PAD_X * 2.0, HEADER_BUTTON_HEIGHT),
+        Vec2::new(
+            header_primary_width_of(&label_galley, hint_galley.as_ref()),
+            HEADER_BUTTON_HEIGHT,
+        ),
         Sense::click(),
     );
     if response.hovered() {
@@ -1026,16 +1026,66 @@ pub fn header_primary_button(ui: &mut Ui, label: &str, shortcut: &str) -> Respon
     ui.painter().rect_filled(rect, CornerRadius::same(8), BLUE);
 
     let label_pos = Pos2::new(
-        rect.min.x + PAD_X,
+        rect.min.x + HEADER_PRIMARY_PAD_X,
         rect.center().y - label_galley.size().y / 2.0,
     );
-    let hint_pos = Pos2::new(
-        label_pos.x + label_galley.size().x + GAP,
-        rect.center().y - hint_galley.size().y / 2.0,
-    );
+    let label_width = label_galley.size().x;
     ui.painter().galley(label_pos, label_galley, Color32::WHITE);
-    ui.painter().galley(hint_pos, hint_galley, hint_color);
+    if let Some(hint_galley) = hint_galley {
+        let hint_pos = Pos2::new(
+            label_pos.x + label_width + HEADER_PRIMARY_GAP,
+            rect.center().y - hint_galley.size().y / 2.0,
+        );
+        ui.painter()
+            .galley(hint_pos, hint_galley, HEADER_PRIMARY_HINT);
+    }
     response
+}
+
+const HEADER_PRIMARY_PAD_X: f32 = 14.0;
+const HEADER_PRIMARY_GAP: f32 = 8.0;
+/// The hint's `opacity: 0.85`, over the blue fill -- `from_white_alpha(217)`,
+/// spelled out because that constructor is not `const`.
+const HEADER_PRIMARY_HINT: Color32 = Color32::from_rgba_premultiplied(217, 217, 217, 217);
+
+/// [`header_primary_button`]'s two runs, laid out but not painted.
+///
+/// Shared with [`header_primary_button_width`] rather than measured twice: a
+/// caller that reserves room for this pill and a pill that then allocates a
+/// different width is exactly the drift that put "Fill in app" off the left
+/// edge of the pane in the first place.
+fn header_primary_galleys(
+    ui: &Ui,
+    label: &str,
+    shortcut: Option<&str>,
+) -> (Arc<egui::Galley>, Option<Arc<egui::Galley>>) {
+    let label_galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
+        Color32::WHITE,
+    );
+    let hint_galley = shortcut.map(|shortcut| {
+        ui.painter().layout_no_wrap(
+            shortcut.to_string(),
+            FontId::new(10.0, FontFamily::Monospace),
+            HEADER_PRIMARY_HINT,
+        )
+    });
+    (label_galley, hint_galley)
+}
+
+fn header_primary_width_of(label: &Arc<egui::Galley>, hint: Option<&Arc<egui::Galley>>) -> f32 {
+    label.size().x
+        + hint.map_or(0.0, |hint| HEADER_PRIMARY_GAP + hint.size().x)
+        + HEADER_PRIMARY_PAD_X * 2.0
+}
+
+/// Exactly what [`header_primary_button`] would allocate, without drawing it
+/// -- so a caller can find out whether it has room for the pill *before*
+/// committing to a layout that has to hold it.
+pub fn header_primary_button_width(ui: &Ui, label: &str, shortcut: Option<&str>) -> f32 {
+    let (label_galley, hint_galley) = header_primary_galleys(ui, label, shortcut);
+    header_primary_width_of(&label_galley, hint_galley.as_ref())
 }
 
 /// The small outlined control at the right-hand end of a detail-pane row

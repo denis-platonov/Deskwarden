@@ -45,6 +45,29 @@ const HEADER_AVATAR: f32 = 44.0;
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
 const TITLE_GAP: f32 = 3.0;
+/// **The floor under the item title, and the thing the rest of the strip
+/// gives way to.** Not from the design: 2b draws this pane at one width and
+/// says nothing about what happens below it.
+///
+/// A truncating title has no natural minimum -- egui will happily elide it to
+/// a single "…" and report that as a fitted layout -- so *something* has to
+/// state one, and the number is the point below which the title stops being a
+/// name. 120pt measures out at eight to ten characters of 22pt ExtraBold plus
+/// the ellipsis: enough of a name to recognise, not a mark. See
+/// [`header_layout`] for what is sacrificed to keep it, and
+/// `the_title_is_never_reduced_to_an_ellipsis_at_any_width` for the sweep
+/// that holds it to this.
+const TITLE_MIN: f32 = 120.0;
+/// The gap between the two lines of the header when it stacks -- see
+/// [`header_layout`]. Not [`HEADER_GAP`]: that one is 2b's horizontal `gap`
+/// inside a row the design draws, and this is the vertical space in a
+/// rearrangement the design does not draw at all.
+const HEADER_ROW_GAP: f32 = 10.0;
+/// The primary action's label and its chord, named once so the widths
+/// [`header_layout`] reserves are measured from the very strings that are
+/// later painted.
+const FILL_LABEL: &str = "Fill in app";
+const FILL_HINT: &str = "CTRL+SHIFT+F";
 /// The body below the strip: `padding: 18px 24px`.
 const BODY_PAD_X: i8 = 24;
 const BODY_PAD_Y: i8 = 18;
@@ -858,8 +881,22 @@ pub enum CopyShortcut {
 /// their fingers. All three are free in this app, checked rather than
 /// assumed: `vault_window::mod` takes CTRL+K, CTRL+L and CTRL+N, the fill
 /// button takes CTRL+SHIFT+F, the login window takes CTRL+H, and the global
-/// fill hotkey is CTRL+ALT+B -- a different chord from CTRL+B, and owned by
-/// the OS rather than by egui.
+/// fill hotkey is CTRL+ALT+B.
+///
+/// **CTRL+ALT+B not colliding with CTRL+B is a fact about Windows, not about
+/// egui.** An earlier version of this comment claimed the two were "a
+/// different chord ... owned by the OS rather than by egui" as if egui would
+/// tell them apart. It does not: `InputState::consume_key` matches with
+/// `Modifiers::matches_logically`, which rejects an event only when the
+/// *pattern* wants a modifier the event lacks, so extra alt and shift are
+/// ignored and CTRL+ALT+B, CTRL+SHIFT+B and CTRL+B were all one chord as far
+/// as this pane was concerned. What actually kept the global hotkey out of
+/// here is `global-hotkey` registering it through Win32 `RegisterHotKey`,
+/// which makes Windows swallow the keystroke instead of delivering it to the
+/// focused window -- a guarantee that covers exactly that one chord and
+/// nothing else. CTRL+SHIFT+B put a password on the clipboard. See
+/// [`consume_ctrl_key`], which now gates these on exact modifiers, and
+/// `an_extra_modifier_does_not_fire_a_copy`.
 const COPY_SHORTCUTS: [(CopyShortcut, egui::Key, &str); 3] = [
     (CopyShortcut::Password, egui::Key::B, "CTRL+B"),
     (CopyShortcut::Username, egui::Key::U, "CTRL+U"),
@@ -907,6 +944,106 @@ fn copy_shortcut_action(
     }
 }
 
+/// How the header strip arranges itself at a given width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeaderLayout {
+    /// The controls have moved off the title's line onto their own, right
+    /// aligned underneath it. The strip gets taller; nothing is dropped.
+    stacked: bool,
+    /// "Fill in app" still carries its `CTRL+SHIFT+F` hint.
+    hint: bool,
+}
+
+/// **What the header gives up, in order, as the pane narrows -- and it is
+/// never the title.**
+///
+/// The commit that made the controls claim their width first fixed a real
+/// bug (a "Fill in app" measured painting at x = -34.5, entirely off a 298pt
+/// pane) and introduced its mirror image: with the controls served first the
+/// title got the remainder, the remainder at 298pt was 21.6pt, and egui
+/// elided a 26-character name down to a lone "…" painted *inside the strip's
+/// left padding, on top of the avatar*. A layout that fits by annihilating
+/// its own subject is not a layout that fits, and the test of the day could
+/// not see it: `Galley::text()` returns the job's SOURCE text, so every
+/// painted-text assertion in this file reads the full name off a galley that
+/// drew one ellipsis.
+///
+/// So the title is given a floor ([`TITLE_MIN`]) and everything else is
+/// ranked by how much it costs to lose:
+///
+/// 1. **The shortcut hint.** Pure redundancy -- twelve monospace characters
+///    annotating a chord that works whether or not they are painted, and
+///    wider than the label they annotate. First to go, and it does not come
+///    back on the way down: a strip that regained ornament as the window
+///    shrank would be harder to reason about than one that only ever sheds.
+/// 2. **The single line.** Below that the controls move to their own row
+///    under the title. The strip gets taller, which the design does not draw
+///    -- but the design also does not draw a 298pt pane, and a taller strip
+///    costs some body space while the alternative costs the item's name.
+///
+/// Nothing is ever dropped, and no control is ever shrunk below its 34px hit
+/// target. The arithmetic says why there is no third option: at 298pt the
+/// strip has 250pt inside its padding, the avatar and its gap take 58, and
+/// the star, the kebab and a hintless "Fill in app" take about 188 of the
+/// 192 left. Even reduced to icons the three controls plus their gaps leave
+/// the title 0-ish points on one line. One row at that width means dropping
+/// a control; stacking keeps all three, worded.
+///
+/// Pure, and taking measured widths rather than measuring them, for this
+/// file's standing reason: a decision reachable only from inside an eframe
+/// closure is a decision that will not be tested.
+fn header_layout(content_width: f32, controls_with_hint: f32, controls_bare: f32) -> HeaderLayout {
+    // What is left of the strip's content box once the avatar and the gap
+    // after it are taken -- the band the controls and the title share.
+    let beside_avatar = content_width - HEADER_AVATAR - HEADER_GAP;
+    let fits_on_one_line =
+        |controls: f32| controls + HEADER_GAP + TITLE_MIN <= beside_avatar;
+    if fits_on_one_line(controls_with_hint) {
+        HeaderLayout { stacked: false, hint: true }
+    } else if fits_on_one_line(controls_bare) {
+        HeaderLayout { stacked: false, hint: false }
+    } else {
+        // Stacked, and hintless: the ladder only descends. The controls' own
+        // row is the full content width rather than `beside_avatar`, so it
+        // has 58pt more to work with than the branch above just rejected.
+        HeaderLayout { stacked: true, hint: false }
+    }
+}
+
+/// `CTRL+key` and **nothing else held**, taken out of the event queue.
+///
+/// egui's own [`egui::InputState::consume_key`] is the obvious call here and
+/// is wrong for this one: it matches with `Modifiers::matches_logically`,
+/// which only rejects an event for lacking a modifier the pattern asked for.
+/// Extra modifiers are ignored, so CTRL+ALT+B and CTRL+SHIFT+B both fired
+/// CTRL+B -- and what these three chords do is put a secret on the clipboard.
+/// Today nothing else in this app binds `CTRL+<any>+B|U|T`, so the only
+/// visible symptom was a stray modifier copying a password the user did not
+/// ask for; the moment something does bind one, the same keystroke would run
+/// two commands, one of them silent.
+///
+/// `matches_exact` instead, and the retain-and-consume written out here
+/// because egui exposes no exact-matching consumer. Consuming is still the
+/// point (see the call site): a chord that means "copy" here must not also
+/// reach whatever is underneath.
+fn consume_ctrl_key(input: &mut egui::InputState, key: egui::Key) -> bool {
+    let mut found = false;
+    input.events.retain(|event| {
+        let is_match = matches!(
+            event,
+            egui::Event::Key {
+                key: event_key,
+                modifiers,
+                pressed: true,
+                ..
+            } if *event_key == key && modifiers.matches_exact(egui::Modifiers::CTRL)
+        );
+        found |= is_match;
+        !is_match
+    });
+    found
+}
+
 pub fn draw_detail_read(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -949,7 +1086,7 @@ pub fn draw_detail_read(
     let shortcut = ui.input_mut(|i| {
         COPY_SHORTCUTS
             .iter()
-            .find(|(_, key, _)| i.consume_key(egui::Modifiers::CTRL, *key))
+            .find(|(_, key, _)| consume_ctrl_key(i, *key))
             .map(|(which, _, _)| *which)
     });
 
@@ -978,173 +1115,234 @@ pub fn draw_detail_read(
         .fill(theme::CARD)
         .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                match icon {
-                    Some(tex) => {
-                        // Rounded to match `theme::avatar`'s initials-tile
-                        // treatment (same `size * 0.25` formula) -- see
-                        // `item_list.rs`'s matching fix for why an unrounded
-                        // favicon in an identical box reads as visually
-                        // heavier than the monogram fallback.
-                        ui.add(
-                            egui::Image::new((tex.id(), tex.size_vec2()))
-                                .fit_to_exact_size(egui::Vec2::splat(HEADER_AVATAR))
-                                .corner_radius(CornerRadius::same((HEADER_AVATAR * 0.25) as u8)),
-                        );
-                    }
-                    None => theme::avatar(ui, &theme::initials(&item.name), HEADER_AVATAR, true),
+            let content_width = ui.available_width();
+            ui.set_width(content_width);
+
+            // **Measured before anything is drawn, and drawn the way the
+            // measurement said.** `header_primary_button_width` lays the very
+            // galleys the button will paint, so the room reserved here and
+            // the room taken below cannot drift apart -- which is the failure
+            // mode that put this control off the edge of the pane once
+            // already.
+            //
+            // A kind that offers no fill contributes neither the button nor
+            // the gap before it, so the strip does not reserve space for a
+            // control it will not draw.
+            let controls_width = |hint: Option<&str>| {
+                let fill = if kind_offers_fill(kind) {
+                    HEADER_GAP + theme::header_primary_button_width(ui, FILL_LABEL, hint)
+                } else {
+                    0.0
+                };
+                // The star and the kebab, square at the strip's own control
+                // height, plus the one gap between them.
+                theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP + fill
+            };
+            let layout = header_layout(
+                content_width,
+                controls_width(Some(FILL_HINT)),
+                controls_width(None),
+            );
+
+            // The three pieces of the strip, as closures, because the two
+            // arrangements below draw exactly the same controls in exactly
+            // the same order -- only on a different number of lines. Written
+            // out twice they would be two headers that have to be kept
+            // agreeing by hand.
+            let draw_avatar = |ui: &mut egui::Ui| match icon {
+                Some(tex) => {
+                    // Rounded to match `theme::avatar`'s initials-tile
+                    // treatment (same `size * 0.25` formula) -- see
+                    // `item_list.rs`'s matching fix for why an unrounded
+                    // favicon in an identical box reads as visually
+                    // heavier than the monogram fallback.
+                    ui.add(
+                        egui::Image::new((tex.id(), tex.size_vec2()))
+                            .fit_to_exact_size(egui::Vec2::splat(HEADER_AVATAR))
+                            .corner_radius(CornerRadius::same((HEADER_AVATAR * 0.25) as u8)),
+                    );
                 }
-                ui.add_space(HEADER_GAP);
-                // **The controls claim their width FIRST, and the title gets
-                // what is left.** Laid out the other way round -- title,
-                // then a right-aligned group in the remainder -- the title
-                // takes as much room as its text wants and the strip
-                // overflows: at the app's own minimum window size the detail
-                // column is 298pt, and "Fill in app" was measured painting at
-                // x = -34.5, entirely off the pane, under a title that ran
-                // straight through the buttons.
-                //
-                // So the whole rest of the row is one right-to-left group.
-                // The controls are placed from the right edge inward, and the
-                // title column is a left-to-right child of that group, which
-                // egui hands exactly the rect the controls did not take.
-                // Pinned by
-                // `every_header_control_fits_inside_the_minimum_width_pane`.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = HEADER_GAP;
-                    // **The overflow menu, rightmost.** Edit and Delete both
-                    // live in here, at the user's explicit direction: four
-                    // worded buttons across this strip did not fit the app's
-                    // own minimum window size -- at 900px wide the detail
-                    // column is 298pt and "Fill in app" was measured painting
-                    // at x = -34.5, entirely off the pane, with "Favourite"
-                    // overlapping the title. A star, one primary button and a
-                    // kebab is what fits, and
-                    // `every_header_control_fits_inside_the_minimum_width_pane`
-                    // pins it at that width rather than at the 900pt every
-                    // other geometry test here uses.
-                    //
-                    // Drawn ALWAYS, not gated: Delete means the same thing for
-                    // every kind (see `every_kind_can_still_be_deleted`), so
-                    // there is no kind whose menu would be empty. Edit inside
-                    // it is still `kind_offers_edit`'s decision.
-                    let kebab = theme::kebab_button(ui, delete_pending)
-                        .on_hover_text("More actions for this item");
-                    egui::Popup::menu(&kebab).show(|ui| {
-                        if kind_offers_edit(kind) && ui.button("Edit").clicked() {
-                            action = DetailAction::Edit;
-                            ui.close();
-                        }
-                        // **Still two clicks, and the menu stays open between
-                        // them.** Burying Delete does not remove the reason
-                        // `vault_window::mod`'s `confirm_click` gates it: one
-                        // misclick permanently deletes. So the armed state is
-                        // expressed exactly as the header button expressed it
-                        // -- the same two labels, the same `ERROR` red -- and
-                        // no `ui.close()` on the arming click, because a menu
-                        // that shut itself would hide the state it just
-                        // entered. The kebab itself also turns red (see
-                        // `kebab_button`) so an armed delete is visible after
-                        // a click elsewhere closes the menu.
-                        let (delete_label, delete_hover) = if delete_pending {
-                            (
-                                "Delete? Click to confirm",
-                                "Click again to delete this item. It may still be recoverable \
-                                 from bitwarden.com or another Bitwarden client afterward.",
-                            )
-                        } else {
-                            ("Delete", "Delete this item")
-                        };
-                        let delete = ui.add(
-                            egui::Button::new(
-                                RichText::new(delete_label).color(theme::ERROR),
-                            )
-                            .fill(theme::CARD),
-                        );
-                        if delete.on_hover_text(delete_hover).clicked() {
-                            action = DetailAction::Delete;
-                        }
-                    });
-                    // **Stays in the strip, and stays worded.** It is this
-                    // app's primary action, not one of the items the user
-                    // asked to have relocated into the kebab. Laid out
-                    // between the star and the kebab -- right-to-left, so
-                    // what reads left-to-right is ★, "Fill in app", ⋮.
-                    //
-                    // Not drawn for a kind that cannot be filled: the fill
-                    // path resolves exactly a username and a password, so this
-                    // button on a card would type two empty strings into
-                    // whatever window happens to be focused. See
-                    // `kind_offers_fill`.
-                    if kind_offers_fill(kind)
-                        && theme::header_primary_button(ui, "Fill in app", "CTRL+SHIFT+F").clicked()
-                    {
-                        action = DetailAction::Fill;
-                    }
-                    // **In the header, and gated on no kind at all.** Every
-                    // other control in this strip is per-kind because it acts
-                    // on the item's *contents* -- Fill needs a username and a
-                    // password, Edit needs a form that can honestly save the
-                    // type. A favourite is not a content field: it is a
-                    // property of the item as a row in a list, like its name
-                    // and its folder, and the sidebar's Favorites filter
-                    // applies it to every kind (`SidebarFilter::Favorites` is
-                    // `item.favorite` and nothing else). So a card can be a
-                    // favourite, and gating this the way Fill is gated would
-                    // make a filter the sidebar offers unreachable for four
-                    // of the five kinds.
-                    //
-                    // The header rather than a body row for the same reason:
-                    // the body is `detail_body_for`'s per-kind dispatch and a
-                    // row there would have to be repeated into every arm, and
-                    // would read as a field of the login/card/identity rather
-                    // than of the item.
-                    //
-                    // A STAR, and drawn rather than typed. The earlier version
-                    // of this control was two words ("Favourite"/"Favourited")
-                    // on the argument that a missing glyph renders as tofu --
-                    // correct about the risk, and `theme.rs`'s
-                    // `the_icon_codepoints_are_not_carried_by_this_apps_own
-                    // _typeface` now measures the actual answer: ★ resolves,
-                    // but only out of egui's fallback icon face, and ★/☆ are
-                    // two unrelated marks rather than one shape in two
-                    // weights. `theme::star_toggle` strokes it instead, so
-                    // both states are the same silhouette and the on state is
-                    // the palette's own BLUE.
-                    let favourite_hover = if item.favorite {
-                        "Remove this item from Favorites"
-                    } else {
-                        "Add this item to Favorites"
-                    };
-                    if theme::star_toggle(ui, item.favorite)
-                        .on_hover_text(favourite_hover)
-                        .clicked()
-                    {
-                        // The TARGET state, computed here from the item this
-                        // pane actually drew -- see `DetailAction::ToggleFavorite`.
-                        action = DetailAction::ToggleFavorite(!item.favorite);
-                    }
-                    // The title column, in whatever the controls left. It
-                    // TRUNCATES rather than wrapping: the design draws one
-                    // line, and a name long enough to wrap would push the
-                    // 44px avatar off its own 20px top padding and make the
-                    // strip's height a function of the item's name.
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = TITLE_GAP;
-                            let mut title = theme::pane_title(&item.name, TITLE_SIZE, theme::INK);
-                            title.wrap =
-                                egui::text::TextWrapping::truncate_at_width(ui.available_width());
-                            ui.label(title);
-                            ui.label(
-                                RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT),
-                            );
-                        });
+                None => theme::avatar(ui, &theme::initials(&item.name), HEADER_AVATAR, true),
+            };
+            // The title column, in whatever it has been left. It TRUNCATES
+            // rather than wrapping: the design draws one line, and a name
+            // long enough to wrap would push the 44px avatar off its own
+            // 20px top padding and make the strip's height a function of the
+            // item's name. `header_layout` is what guarantees the width it
+            // truncates at is at least `TITLE_MIN` -- truncation with no
+            // floor under it is how this ended up painting a lone ellipsis.
+            let draw_title = |ui: &mut egui::Ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = TITLE_GAP;
+                        let mut title = theme::pane_title(&item.name, TITLE_SIZE, theme::INK);
+                        title.wrap =
+                            egui::text::TextWrapping::truncate_at_width(ui.available_width());
+                        ui.label(title);
+                        ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT));
                     });
                 });
-            });
+            };
+            // **Right-to-left, so what reads left-to-right is ★, "Fill in
+            // app", ⋮.** The caller supplies a `Ui` already in that layout
+            // and already carrying `HEADER_GAP` spacing; this only fills it.
+            let mut draw_controls = |ui: &mut egui::Ui| {
+                // **The overflow menu, rightmost.** Edit and Delete both
+                // live in here, at the user's explicit direction: four
+                // worded buttons across this strip did not fit the app's
+                // own minimum window size.
+                //
+                // Drawn ALWAYS, not gated: Delete means the same thing for
+                // every kind (see `every_kind_can_still_be_deleted`), so
+                // there is no kind whose menu would be empty. Edit inside
+                // it is still `kind_offers_edit`'s decision.
+                let kebab = theme::kebab_button(ui, delete_pending)
+                    .on_hover_text("More actions for this item");
+                egui::Popup::menu(&kebab).show(|ui| {
+                    if kind_offers_edit(kind) && ui.button("Edit").clicked() {
+                        action = DetailAction::Edit;
+                        ui.close();
+                    }
+                    // **Still two clicks, and the menu stays open between
+                    // them.** Burying Delete does not remove the reason
+                    // `vault_window::mod`'s `confirm_click` gates it: one
+                    // misclick permanently deletes. So the armed state is
+                    // expressed exactly as the header button expressed it
+                    // -- the same two labels, the same `ERROR` red -- and
+                    // no `ui.close()` on the arming click, because a menu
+                    // that shut itself would hide the state it just
+                    // entered. The kebab itself also turns red (see
+                    // `kebab_button`) so an armed delete is visible after
+                    // a click elsewhere closes the menu.
+                    let (delete_label, delete_hover) = if delete_pending {
+                        (
+                            "Delete? Click to confirm",
+                            "Click again to delete this item. It may still be recoverable \
+                             from bitwarden.com or another Bitwarden client afterward.",
+                        )
+                    } else {
+                        ("Delete", "Delete this item")
+                    };
+                    let delete = ui.add(
+                        egui::Button::new(RichText::new(delete_label).color(theme::ERROR))
+                            .fill(theme::CARD),
+                    );
+                    if delete.on_hover_text(delete_hover).clicked() {
+                        action = DetailAction::Delete;
+                    }
+                });
+                // **Stays in the strip, and stays worded.** It is this
+                // app's primary action, not one of the items the user
+                // asked to have relocated into the kebab. What it gives up
+                // when the pane is narrow is its shortcut hint and then
+                // its line, never its label -- see `header_layout`.
+                //
+                // Not drawn for a kind that cannot be filled: the fill
+                // path resolves exactly a username and a password, so this
+                // button on a card would type two empty strings into
+                // whatever window happens to be focused. See
+                // `kind_offers_fill`.
+                if kind_offers_fill(kind)
+                    && theme::header_primary_button(ui, FILL_LABEL, layout.hint.then_some(FILL_HINT))
+                        .clicked()
+                {
+                    action = DetailAction::Fill;
+                }
+                // **In the header, and gated on no kind at all.** Every
+                // other control in this strip is per-kind because it acts
+                // on the item's *contents* -- Fill needs a username and a
+                // password, Edit needs a form that can honestly save the
+                // type. A favourite is not a content field: it is a
+                // property of the item as a row in a list, like its name
+                // and its folder, and the sidebar's Favorites filter
+                // applies it to every kind (`SidebarFilter::Favorites` is
+                // `item.favorite` and nothing else). So a card can be a
+                // favourite, and gating this the way Fill is gated would
+                // make a filter the sidebar offers unreachable for four
+                // of the five kinds.
+                //
+                // The header rather than a body row for the same reason:
+                // the body is `detail_body_for`'s per-kind dispatch and a
+                // row there would have to be repeated into every arm, and
+                // would read as a field of the login/card/identity rather
+                // than of the item.
+                //
+                // A STAR, and drawn rather than typed. The earlier version
+                // of this control was two words ("Favourite"/"Favourited")
+                // on the argument that a missing glyph renders as tofu --
+                // correct about the risk, and `theme.rs`'s
+                // `the_icon_codepoints_are_not_carried_by_this_apps_own
+                // _typeface` now measures the actual answer: ★ resolves,
+                // but only out of egui's fallback icon face, and ★/☆ are
+                // two unrelated marks rather than one shape in two
+                // weights. `theme::star_toggle` strokes it instead, so
+                // both states are the same silhouette and the on state is
+                // the palette's own BLUE.
+                let favourite_hover = if item.favorite {
+                    "Remove this item from Favorites"
+                } else {
+                    "Add this item to Favorites"
+                };
+                if theme::star_toggle(ui, item.favorite)
+                    .on_hover_text(favourite_hover)
+                    .clicked()
+                {
+                    // The TARGET state, computed here from the item this
+                    // pane actually drew -- see `DetailAction::ToggleFavorite`.
+                    action = DetailAction::ToggleFavorite(!item.favorite);
+                }
+            };
+
+            if layout.stacked {
+                // Two lines: the item on top, what can be done to it
+                // underneath. The controls' row is the full content width,
+                // right-aligned, which is where the room comes from that the
+                // one-line arrangement did not have.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    draw_avatar(ui);
+                    ui.add_space(HEADER_GAP);
+                    draw_title(ui);
+                });
+                ui.add_space(HEADER_ROW_GAP);
+                // A band of exactly one control height, allocated rather than
+                // left to `with_layout`: a right-to-left layout takes the
+                // whole *available* rect, and the available rect here runs to
+                // the bottom of the pane -- which centred the controls
+                // halfway down the window and made the white strip the full
+                // height of it.
+                let band = egui::vec2(ui.available_width(), theme::HEADER_BUTTON_HEIGHT);
+                ui.allocate_ui_with_layout(
+                    band,
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = HEADER_GAP;
+                        draw_controls(ui);
+                    },
+                );
+            } else {
+                // One line, and **the controls claim their width first.**
+                // Laid out the other way round -- title, then a
+                // right-aligned group in the remainder -- the title takes as
+                // much room as its text wants and the strip overflows: "Fill
+                // in app" was measured painting at x = -34.5, entirely off
+                // the pane, under a title that ran straight through the
+                // buttons. So the whole rest of the row is one right-to-left
+                // group and the title column is a left-to-right child of it,
+                // which egui hands exactly the rect the controls did not
+                // take. That the rect is big enough to hold a name is
+                // `header_layout`'s job, not this layout's.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    draw_avatar(ui);
+                    ui.add_space(HEADER_GAP);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = HEADER_GAP;
+                        draw_controls(ui);
+                        draw_title(ui);
+                    });
+                });
+            }
         });
     // The strip's `border-bottom: 1px solid #eae7e7`.
     theme::hairline(ui);
@@ -2170,6 +2368,9 @@ mod tests {
         let mut frame = Frame {
             action: DetailAction::None,
             texts: Vec::new(),
+            rendered: Vec::new(),
+            rects: Vec::new(),
+            cursor: output.platform_output.cursor_icon,
             stars: Vec::new(),
             eyes: Vec::new(),
             kebab_dots: Vec::new(),
@@ -2180,6 +2381,8 @@ mod tests {
         let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
         collect_text(&all, &mut texts);
         collect_text_rects(&all, &mut frame.texts);
+        collect_rendered_text(&all, &mut frame.rendered);
+        collect_rects(&all, &mut frame.rects);
         frame.stars = theme::icon_probe::stars(&all);
         frame.eyes = theme::icon_probe::eyes(&all);
         frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
@@ -2295,6 +2498,38 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     collect_text_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Same walk again, keeping the SOURCE string, the characters egui
+    /// actually placed glyphs for, and the rect -- see [`Frame::rendered`]
+    /// for why the first two are not the same thing.
+    ///
+    /// The rendered run is read out of the galley's rows rather than its
+    /// `text()`: `Galley::rows[..].glyphs[..].chr` is one entry per glyph
+    /// that was really laid out, so an elided run reports the prefix it drew
+    /// and the ellipsis it drew instead of the name it was handed.
+    fn collect_rendered_text(shape: &egui::Shape, out: &mut Vec<(String, String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rendered: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect();
+                out.push((
+                    text.galley.text().to_string(),
+                    rendered,
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_rendered_text(shape, out);
                 }
             }
             _ => {}
@@ -2486,6 +2721,23 @@ mod tests {
     struct Frame {
         action: DetailAction,
         texts: Vec<(String, egui::Rect)>,
+        /// Every string the frame painted with **the characters that were
+        /// actually laid out**, which is not the same list as [`texts`].
+        ///
+        /// `Galley::text()` returns the layout job's SOURCE string, so a run
+        /// egui elided down to one "…" still reports the full name it was
+        /// asked to draw. Every painted-text assertion in this file is blind
+        /// to truncation in exactly that way, and a header that annihilated
+        /// its own title passed a test that looked only at `texts`. The
+        /// glyphs are not blind to it.
+        rendered: Vec<(String, String, egui::Rect)>,
+        /// Every filled rectangle, so the tests can see the surfaces --
+        /// the strip, the avatar tile, a row's hover tint -- that paint no
+        /// string at all.
+        rects: Vec<(egui::Rect, egui::Color32)>,
+        /// The cursor this frame asked for. Half of a click affordance; the
+        /// other half is a fill in [`rects`].
+        cursor: egui::CursorIcon,
         stars: Vec<theme::icon_probe::Star>,
         eyes: Vec<egui::Rect>,
         kebab_dots: Vec<(egui::Rect, egui::Color32)>,
@@ -2577,6 +2829,61 @@ mod tests {
             first
         }
 
+        /// What was actually DRAWN for the run whose source text is `label`
+        /// -- glyphs, not the string the layout job was handed. See
+        /// [`Frame::rendered`].
+        fn rendered_glyphs(&self, label: &str) -> String {
+            let found: Vec<&String> = self
+                .rendered
+                .iter()
+                .filter(|(source, _, _)| source == label)
+                .map(|(_, rendered, _)| rendered)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one run laid out from {label:?}, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0].clone()
+        }
+
+        /// The header's white strip: every [`theme::CARD`] fill that starts
+        /// at the very top of the pane, unioned.
+        ///
+        /// The union rather than one rect because the strip is a `Frame`
+        /// background and the tests care about its OUTER bounds. A body card
+        /// is also CARD-filled, which is why this is anchored to the pane's
+        /// top edge; the first card starts well below it.
+        fn header_strip(&self) -> egui::Rect {
+            let strip = self
+                .rects
+                .iter()
+                .filter(|(rect, fill)| *fill == theme::CARD && rect.top() <= 0.5)
+                .map(|(rect, _)| *rect)
+                .reduce(egui::Rect::union);
+            strip.expect("the pane painted no white header strip at its top edge")
+        }
+
+        /// The header's avatar tile: the [`HEADER_AVATAR`]-square box, found
+        /// by its size because it paints no string of its own.
+        ///
+        /// Its fill and its border are two shapes at the same rect, so this
+        /// unions rather than insisting on exactly one.
+        fn avatar_tile(&self) -> egui::Rect {
+            let tile = self
+                .rects
+                .iter()
+                .filter(|(rect, _)| {
+                    (rect.width() - HEADER_AVATAR).abs() < 0.5
+                        && (rect.height() - HEADER_AVATAR).abs() < 0.5
+                })
+                .map(|(rect, _)| *rect)
+                .reduce(egui::Rect::union);
+            tile.expect("the header painted no 44px avatar tile")
+        }
+
         /// Every reveal eye, top-down -- the order the rows are drawn in, so
         /// `eyes()[0]` is the first masked row on the pane.
         fn eyes(&self) -> Vec<egui::Rect> {
@@ -2640,6 +2947,9 @@ mod tests {
             let mut frame = Frame {
                 action,
                 texts: Vec::new(),
+                rendered: Vec::new(),
+                rects: Vec::new(),
+                cursor: output.platform_output.cursor_icon,
                 stars: Vec::new(),
                 eyes: Vec::new(),
                 kebab_dots: Vec::new(),
@@ -2651,6 +2961,8 @@ mod tests {
             // see both and would report every filled star as an outline.
             let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
             collect_text_rects(&all, &mut frame.texts);
+            collect_rendered_text(&all, &mut frame.rendered);
+            collect_rects(&all, &mut frame.rects);
             frame.stars = theme::icon_probe::stars(&all);
             frame.eyes = theme::icon_probe::eyes(&all);
             frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
@@ -2664,6 +2976,14 @@ mod tests {
 
         fn click(&mut self, item: &VaultItem, totp: &TotpState, pos: egui::Pos2) -> Frame {
             self.frame(item, totp, click_at(pos))
+        }
+
+        /// The pointer resting on `pos`, and the frame it produced -- which
+        /// is where a hover *affordance* (a tint, a cursor) lives. A click
+        /// test cannot see either: both are gone by the time the click has
+        /// been reported.
+        fn hover(&mut self, item: &VaultItem, totp: &TotpState, pos: egui::Pos2) -> Frame {
+            self.frame(item, totp, vec![egui::Event::PointerMoved(pos)])
         }
 
         /// Lays the pane out, clicks the kebab, and returns the frame AFTER
@@ -3576,6 +3896,69 @@ mod tests {
         );
     }
 
+    /// **An inert row must not LOOK clickable either.**
+    ///
+    /// `copy_row`'s doc argues that "a row that reacted to a click and copied
+    /// nothing would be worse than an inert one, because there is no way to
+    /// tell from the outside that it did nothing" -- and that is an argument
+    /// about the affordance, not about the returned action. Changing `row`'s
+    /// `Sense::hover()` to `Sense::click()` switches on the `CARD_TINT` hover
+    /// fill and the `PointingHand` cursor for exactly these rows, promising a
+    /// copy that will never happen; the test above sees none of it, because
+    /// a `Sense::click()` row with no `on_copy` still returns
+    /// `DetailAction::None`. That mutation left 848/848 green.
+    ///
+    /// So: hover the inert row and assert BOTH halves of the affordance are
+    /// absent, against a positive control on a row that has one.
+    #[test]
+    fn a_row_with_nothing_to_copy_offers_no_click_affordance() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::Unavailable);
+        let inert = laid_out.rect_of("Unavailable right now");
+        let live = laid_out.rect_of("Password");
+
+        let hovered = pane.hover(&item, &TotpState::Unavailable, inert.center());
+        assert_ne!(
+            hovered.cursor,
+            egui::CursorIcon::PointingHand,
+            "hovering the TOTP row that has nothing to copy asks for the pointing hand -- \
+             it advertises a copy it cannot perform"
+        );
+        assert!(
+            !hovered
+                .rects
+                .iter()
+                .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(inert.center())),
+            "hovering the TOTP row that has nothing to copy paints the CARD_TINT hover fill \
+             every copyable tile uses: {:?}",
+            hovered
+                .rects
+                .iter()
+                .filter(|(_, fill)| *fill == theme::CARD_TINT)
+                .collect::<Vec<_>>()
+        );
+
+        // The positive control, on the row one up that DOES copy. Without it
+        // this passes against a harness whose pointer never lands anywhere,
+        // or a build in which no row has ever had a hover state.
+        let hovered = pane.hover(&item, &TotpState::Unavailable, live.center());
+        assert_eq!(
+            hovered.cursor,
+            egui::CursorIcon::PointingHand,
+            "no row on this pane offers the pointing hand, so its absence above proves nothing"
+        );
+        assert!(
+            hovered
+                .rects
+                .iter()
+                .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(live.center())),
+            "no row on this pane paints the hover tint, so its absence above proves nothing"
+        );
+    }
+
     /// The live code's row DOES copy -- the `Unavailable` row above is inert
     /// because it has no code, not because TOTP rows are inert.
     #[test]
@@ -4410,9 +4793,29 @@ mod tests {
     /// off the pane -- and "Favourite" overlapping the item's own title.
     /// Nothing caught it, because nothing tried that width.
     ///
-    /// So: every header control fully inside the pane, and none of them
-    /// touching the title. Two properties, and the second is not implied by
-    /// the first -- a strip can fit and still be printed over the name.
+    /// The first attempt at this test asserted two things -- controls inside
+    /// the pane, and `control.left() >= title.right()` -- and both held while
+    /// the strip was, in fact, broken in three separate ways. The star was
+    /// painted at x = 27.3..45.9, on top of an avatar tile occupying
+    /// 24.0..68.0; the title was elided to a single "…" at x = 5.6..27.2, in
+    /// the strip's own left padding; and the white strip itself started at
+    /// x = -18.4, off the left edge of the pane. The non-overlap assertion
+    /// passed by 0.1pt, and only because the title had collapsed to nothing.
+    ///
+    /// So this checks the four things that state actually violated:
+    ///
+    /// * every control inside the pane -- what the original test meant;
+    /// * every control clear of the AVATAR, which nothing looked at;
+    /// * the strip's own rect inside the pane, which is a layout overflow
+    ///   independent of anything in it;
+    /// * the title's RENDERED glyphs -- not `Galley::text()`, which returns
+    ///   the source string and reported the full 26-character name off a
+    ///   galley that drew one ellipsis.
+    ///
+    /// Rect intersection rather than a left/right comparison, because the
+    /// controls are not necessarily beside the title any more: below about
+    /// 420pt they move to their own line under it (see `header_layout`), and
+    /// a one-axis test would then be trivially satisfied.
     #[test]
     fn every_header_control_fits_inside_the_minimum_width_pane() {
         let mut item = a_login();
@@ -4422,16 +4825,13 @@ mod tests {
 
         let mut pane = Pane::wide(MIN_PANE);
         let frame = pane.idle(&item, &TotpState::NoSecret);
-        let bounds = egui::Rect::from_min_max(
-            egui::pos2(0.0, 0.0),
-            egui::pos2(MIN_PANE, PANE),
-        );
+        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
 
         let title = frame.rect_of("Ledgerline Treasury Portal");
-        let fill = frame.rect_of("Fill in app");
+        let avatar = frame.avatar_tile();
         let controls = [
             ("the favourite star", frame.star().rect),
-            ("the Fill in app button", fill),
+            ("the Fill in app button", frame.rect_of("Fill in app")),
             ("the kebab", frame.kebab()),
         ];
 
@@ -4443,12 +4843,23 @@ mod tests {
                 rect.right()
             );
             assert!(
-                rect.left() >= title.right(),
-                "{name} starts at x = {} while the title runs to x = {} -- they overlap",
-                rect.left(),
-                title.right()
+                !rect.intersects(avatar),
+                "{name} is painted ON TOP of the item's avatar at the app's minimum window \
+                 width: {name} {rect:?}, avatar {avatar:?}"
+            );
+            assert!(
+                !rect.intersects(title),
+                "{name} is painted ON TOP of the item's title at the app's minimum window \
+                 width: {name} {rect:?}, title {title:?}"
             );
         }
+
+        assert!(
+            bounds.contains_rect(frame.header_strip()),
+            "the white header strip itself runs to {:?} on a {MIN_PANE}pt pane -- it is \
+             painting outside the column it belongs to",
+            frame.header_strip()
+        );
 
         // The positive control. Without it, a pane that painted no header at
         // all would satisfy every assertion above by vacuity -- and
@@ -4457,6 +4868,72 @@ mod tests {
         // distinguishable from "a star that fits" without this.
         assert_eq!(frame.stars.len(), 1, "no star painted at the minimum width");
         assert_eq!(frame.kebab_dots.len(), 3, "no kebab painted at the minimum width");
+    }
+
+    /// **A band, not a width.** The defect the test above pins was not a
+    /// property of 298pt: the title was a bare "…" everywhere from 298 up to
+    /// about 478, and the star sat on the avatar from 298 to about 338. A
+    /// test at one width inside a broken band passes while the band is
+    /// broken, and a fix tuned to one width leaves the rest of it.
+    ///
+    /// So: every pane width from the app's minimum up through the point where
+    /// the strip has room to spare, checked for the one property the whole
+    /// rearrangement exists to protect -- the item's name is still readable
+    /// as a name.
+    ///
+    /// `rendered_glyphs`, not `rect_of`. The elided galley reports its full
+    /// source text, so an assertion phrased over `texts` cannot fail here no
+    /// matter what is on screen.
+    #[test]
+    fn the_title_is_never_reduced_to_an_ellipsis_at_any_width() {
+        let mut item = a_login();
+        item.name = "Ledgerline Treasury Portal".to_string();
+
+        // 4pt steps through the two rearrangement thresholds (~420pt, where
+        // the controls come back onto the title's line, and ~497pt, where the
+        // shortcut hint returns) and out the far side of both.
+        let mut width = MIN_PANE;
+        while width <= 560.0 {
+            let mut pane = Pane::wide(width);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let rendered = frame.rendered_glyphs("Ledgerline Treasury Portal");
+            // The ellipsis and the spaces do not count: "…" alone, " …", and
+            // "L…" are all the same failure.
+            let readable = rendered
+                .chars()
+                .filter(|c| *c != '\u{2026}' && !c.is_whitespace())
+                .count();
+            assert!(
+                readable >= 6,
+                "at a {width}pt pane the header drew {rendered:?} for a title of {:?} -- \
+                 the name has been truncated past the point of being a name",
+                item.name
+            );
+            let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(width, PANE));
+            let strip = frame.header_strip();
+            assert!(
+                bounds.contains_rect(strip),
+                "at a {width}pt pane the white header strip is painted at {strip:?} -- \
+                 outside the column"
+            );
+            let avatar = frame.avatar_tile();
+            for (name, rect) in [
+                ("the favourite star", frame.star().rect),
+                ("the Fill in app button", frame.rect_of("Fill in app")),
+                ("the kebab", frame.kebab()),
+            ] {
+                assert!(
+                    bounds.contains_rect(rect),
+                    "at a {width}pt pane {name} is painted at {rect:?} -- outside the column"
+                );
+                assert!(
+                    !rect.intersects(avatar),
+                    "at a {width}pt pane {name} is painted ON TOP of the item's avatar: \
+                     {name} {rect:?}, avatar {avatar:?}"
+                );
+            }
+            width += 4.0;
+        }
     }
 
     /// The minimum width is the app's, not this test's. If
@@ -4639,6 +5116,66 @@ mod tests {
         let _ = pane.idle(&login, &TotpState::NoSecret);
         assert_eq!(
             pane.frame(&login, &TotpState::NoSecret, ctrl(egui::Key::B))
+                .action,
+            DetailAction::CopyPassword,
+            "no chord reaches this pane at all, so the silence above proves nothing"
+        );
+    }
+
+    /// **CTRL and nothing else.** Against `consume_key` -- egui's obvious
+    /// call, and what this pane used -- every one of these put a secret on
+    /// the clipboard: `Modifiers::matches_logically` rejects an event only
+    /// for *lacking* a modifier the pattern wants, so CTRL+ALT+B and
+    /// CTRL+SHIFT+B were both CTRL+B. Measured against the code as it stood:
+    /// `CTRL+ALT+B -> CopyPassword`, `CTRL+SHIFT+B -> CopyPassword`,
+    /// `CTRL+ALT+U -> CopyUsername`.
+    ///
+    /// The chord that made this urgent is CTRL+ALT+B, the app's global fill
+    /// hotkey -- which never reaches egui only because `global-hotkey` takes
+    /// it through Win32 `RegisterHotKey`, a guarantee about that one chord
+    /// and no other. CTRL+SHIFT+B has no such cover.
+    ///
+    /// The plain-key row is the other half: a copy that fired on a bare `B`
+    /// would pass an extra-modifier test and be far worse.
+    #[test]
+    fn an_extra_modifier_does_not_fire_a_copy() {
+        let item = a_login();
+        let modified = |modifiers: egui::Modifiers, key: egui::Key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }]
+        };
+        let alt_ctrl = egui::Modifiers::CTRL | egui::Modifiers::ALT;
+        let shift_ctrl = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        for (name, modifiers, key) in [
+            ("CTRL+ALT+B", alt_ctrl, egui::Key::B),
+            ("CTRL+SHIFT+B", shift_ctrl, egui::Key::B),
+            ("CTRL+ALT+U", alt_ctrl, egui::Key::U),
+            ("CTRL+SHIFT+U", shift_ctrl, egui::Key::U),
+            ("ALT+B", egui::Modifiers::ALT, egui::Key::B),
+            ("plain B", egui::Modifiers::NONE, egui::Key::B),
+        ] {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            let pressed = pane.frame(&item, &TotpState::NoSecret, modified(modifiers, key));
+            assert_eq!(
+                pressed.action,
+                DetailAction::None,
+                "{name} copied {:?} -- a chord this pane does not bind put a secret on the \
+                 clipboard",
+                pressed.action
+            );
+        }
+
+        // The positive control: the exact chord, through the same harness.
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&item, &TotpState::NoSecret, ctrl(egui::Key::B))
                 .action,
             DetailAction::CopyPassword,
             "no chord reaches this pane at all, so the silence above proves nothing"
