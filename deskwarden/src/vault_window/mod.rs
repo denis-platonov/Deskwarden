@@ -2157,6 +2157,38 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 }
             });
 
+        // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
+        //
+        // `generate_error` used to be cleared only by the band's own
+        // dismissal and at the start of the next generate. Neither
+        // `EditAction::Cancel` nor the selection-change reset touched it, and
+        // `inline_notice` ranks Generate above Move -- so a generate failure
+        // the user had walked away from (cancel the form, click another item)
+        // kept the band and outranked every later "Couldn't archive ..." they
+        // provoked. One click surfaced the archive message on the next frame,
+        // so it was never a strand; what it cost was that the refused archive
+        // was invisible for that click, which is the whole of what the band
+        // exists to prevent.
+        //
+        // One condition rather than a clear at each of the five exits
+        // (Cancel and a successful Save in each of the two editors, plus the
+        // selection reset), because it states the actual rule instead of
+        // enumerating today's doors: the sentence explains a click made
+        // INSIDE an editor, and `DetailMode::Read` is precisely "there is no
+        // editor". A failing Generate leaves `mode` on `Edit`/`Create`, so
+        // this cannot clear the message on the frame it was set, and the
+        // band is computed at the TOP of the next frame -- after this ran,
+        // which is what makes the message disappear in one frame rather than
+        // lingering for one more.
+        //
+        // `move_error` has the analogous gap and does not get the analogous
+        // line: it is already bounded by the drag-begin clear further up, and
+        // it is the band's LOWEST-ranked source, so a stale one hides nothing.
+        let editor_is_closed = matches!(mode, DetailMode::Read);
+        if editor_is_closed {
+            generate_error = None;
+        }
+
         // Drawn last so it's the newest thing on the `Foreground` layer, on
         // top of the three panels above regardless of their own draw order
         // -- `egui::Area`'s layering is independent of when in the frame
@@ -5164,6 +5196,18 @@ mod generate_failure_wiring_tests {
     const DISMISS_MOVE: &str = concat!("NoticeSource::Move) => move", "_error = None,");
     const DISMISS_AUX: &str =
         concat!("NoticeSource::Aux) => match filter.source()", ".out_of_vault()");
+    /// The clear that ends a Generate failure's life with the draft it
+    /// explains. Two needles rather than one spanning a newline, because
+    /// this file is checked out with CRLF on Windows and a needle carrying
+    /// `\n` would pass here and fail there.
+    ///
+    /// The binding is named rather than tested inline because
+    /// `matches!(mode, DetailMode::Read)` is also the guard on
+    /// `RowCommand::Edit`, and a needle that matched both would count two and
+    /// say nothing about either.
+    const DIES_WITH_THE_DRAFT: &str =
+        concat!("let editor_is_closed = matches!(mode, DetailMode::", "Read);");
+    const CLEARS_GENERATE: &str = concat!("generate_error = ", "None;");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -5347,6 +5391,42 @@ mod generate_failure_wiring_tests {
             block.contains(DISMISS_MATCHES_SOURCE),
             "the dismissal no longer matches on {DISMISS_MATCHES_SOURCE:?}, so it is not \
              clearing the source that was on screen.\n{block}"
+        );
+    }
+
+    #[test]
+    fn a_generate_failure_does_not_outlive_the_draft_it_explains() {
+        // `generate_error` was cleared only by the dismissal above and at the
+        // start of the next generate. `EditAction::Cancel` and the
+        // selection-change reset both left it set, and `inline_notice` ranks
+        // Generate ABOVE Move -- so a generate failure the user had walked
+        // away from (cancel the form, click another item) kept the band and
+        // outranked every later "Couldn't archive ..." until it was clicked
+        // away. Never a strand -- one click surfaced the archive message on
+        // the next frame -- but the refused archive was invisible for that
+        // click, which is the whole of what the band exists to prevent.
+        //
+        // The fix is one condition on `mode` rather than a clear at each of
+        // the five exits, so this guard is one needle: a future edit that
+        // deletes it, or moves the clear back to enumerating doors, fails
+        // here.
+        let source = source();
+        assert_eq!(
+            source.matches(DIES_WITH_THE_DRAFT).count(),
+            1,
+            "nothing clears `generate_error` when the editor closes. A generate failure \
+             outranks the Move band, so a stale one hides every later refused \
+             Archive/Restore/Purge/Delete for as long as it takes the user to click it \
+             away -- on a screen where the row they acted on has not moved, which is the \
+             same ambiguity `list_command_failure_message` was written to end."
+        );
+        let at = source.find(DIES_WITH_THE_DRAFT).expect("counted above");
+        let after = &source[at..];
+        let window = &after[..after.len().min(160)];
+        assert!(
+            window.contains(CLEARS_GENERATE),
+            "the {DIES_WITH_THE_DRAFT:?} condition no longer clears the generate error. \
+             It is the only thing that condition is for.\n{window}"
         );
     }
 }
