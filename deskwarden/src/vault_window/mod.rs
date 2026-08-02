@@ -1498,18 +1498,34 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     // confirms.
                     item_list::RowCommand::Delete => {
                         if confirm_click(&mut item_delete_pending, &item.id) {
-                            delete_vault_item(
+                            if let Some(message) = delete_vault_item(
                                 ui.ctx(),
                                 &cache,
                                 &needs_reauth_for_closure,
                                 &mut items,
                                 &mut selected_id,
+                                &mut trash_list,
                                 &item,
-                            );
+                            ) {
+                                move_error = Some(message);
+                            }
                         }
                     }
-                    // The four commands that move an item between this
-                    // window's three lists. All of them go through
+                    // Delete, just above, is the FIRST of the five commands
+                    // that move an item between this window's three lists,
+                    // and read this arm's comment as covering it too. It is a
+                    // SOFT delete -- `delete_item` sends no `permanent=true`,
+                    // which is what `purge_item` is for -- so it moves the
+                    // item out of the live vault and into the Trash exactly
+                    // as these four move items between the other pairs. Its
+                    // body is in `delete_vault_item` rather than inline
+                    // because the detail pane's kebab reaches the same
+                    // command, and an invalidation written into this arm
+                    // alone would have covered one of the two doors. (It
+                    // owed both of the things below and did neither, for as
+                    // long as this comment said "the four commands".)
+                    //
+                    // The four below go through
                     // `VaultCache`, never the bridge, so the snapshot and its
                     // pending-write log move with the server -- and all of
                     // them drop the on-demand list they touched rather than
@@ -1984,14 +2000,25 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // `cache.delete_item`.
                                 DetailAction::Delete => {
                                     if confirm_click(&mut item_delete_pending, &item.id) {
-                                        delete_vault_item(
+                                        // The SECOND door onto the soft
+                                        // delete. It gets the invalidation
+                                        // and the band message for free
+                                        // because both live in
+                                        // `delete_vault_item`; all this arm
+                                        // owes is routing the sentence to
+                                        // the band, exactly as the row menu's
+                                        // arm does.
+                                        if let Some(message) = delete_vault_item(
                                             ui.ctx(),
                                             &cache,
                                             &needs_reauth_for_closure,
                                             &mut items,
                                             &mut selected_id,
+                                            &mut trash_list,
                                             item,
-                                        );
+                                        ) {
+                                            move_error = Some(message);
+                                        }
                                     }
                                 }
                                 DetailAction::None => {}
@@ -2248,20 +2275,44 @@ fn fill_item_into_app<A: UiAutomationFiller + Clone + 'static, B: SendInputFille
 }
 
 /// Move `item` to the trash and drop it out of this window's copy of the
-/// vault.
+/// vault, returning the inline-band sentence to show (`None` on success).
 ///
 /// Shared by the detail pane's Delete button and an item row's context-menu
 /// entry, both of which reach it only through `confirm_click`'s two-click
 /// confirmation -- this function does no confirming of its own and must not
 /// be called without it.
+///
+/// **The two things this body does beyond the write are here, and not at
+/// either call site, because there are two call sites.** `delete_item` is a
+/// SOFT delete (no `permanent=true` -- see `VaultCache::purge_item` for the
+/// other one), so it is the fifth command that moves an item between this
+/// window's three lists, and it owes the same two things the other four owe:
+///
+///  * `trash_list.invalidate()`, because the item is now IN the trash. The
+///    on-demand list is not cached and is never pruned in place, so a Trash
+///    row already fetched keeps listing -- and the badge keeps counting --
+///    the vault as it was before the delete, for the life of the window:
+///    `AuxList::wants_fetch` sees a list already in hand and never asks
+///    again.
+///  * a user-visible failure. This used to be `log::warn!` plus the re-auth
+///    flag and nothing else, which is the same "looked like a success that
+///    hadn't refreshed yet" the other four were fixed out of: the row simply
+///    stayed where it was.
+///
+/// Written in one place rather than twice, so a fix cannot cover the row menu
+/// and miss the kebab -- which is precisely the shape the other four's
+/// per-arm guard would have let through.
+#[must_use = "a refused delete has to reach the inline band -- assign it to \
+              `move_error`, or the failure is silent again"]
 fn delete_vault_item(
     ctx: &egui::Context,
     cache: &VaultCache,
     needs_reauth: &Rc<RefCell<bool>>,
     items: &mut Vec<VaultItem>,
     selected_id: &mut Option<String>,
+    trash_list: &mut AuxList,
     item: &VaultItem,
-) {
+) -> Option<String> {
     match cache.delete_item(&item.id) {
         Ok(()) => {
             items.retain(|i| i.id != item.id);
@@ -2269,10 +2320,13 @@ fn delete_vault_item(
             // empty -- either way the selection-change reset block clears
             // `mode`/`reveal`/`totp_state` on the next frame.
             *selected_id = items.first().map(|i| i.id.clone());
+            trash_list.invalidate();
+            None
         }
         Err(e) => {
             log::warn!("failed to delete item {} ({}): {e:?}", item.id, item.name);
             flag_reauth_if_unauthorized(ctx, needs_reauth, &e);
+            Some(list_command_failure_message(ListCommand::Delete, &item.name, &e))
         }
     }
 }
@@ -2340,21 +2394,30 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
     format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
 }
 
-/// One of the four row commands that move an item between this window's three
+/// One of the **five** commands that move an item between this window's three
 /// lists.
 ///
 /// Its own type rather than `item_list::RowCommand`, which also covers the
 /// copies, the fill and the edit -- none of which this message shape fits, and
-/// three of which cannot fail this way at all. A four-variant enum is what
-/// makes [`list_command_failure_message`] exhaustive, so a fifth command added
-/// later is a compile error here instead of a silent fall-through to somebody
-/// else's wording.
+/// three of which cannot fail this way at all. A closed enum is what makes
+/// [`list_command_failure_message`] exhaustive, so a sixth command added later
+/// is a compile error here instead of a silent fall-through to somebody else's
+/// wording.
+///
+/// **It was four until a reviewer counted.** [`Self::Delete`] is a SOFT
+/// delete -- `VaultCache::delete_item` sends no `permanent=true`, which is
+/// what `purge_item` is for -- so it takes an item out of the live vault and
+/// puts it into the Trash, which is the same kind of move the other four make
+/// and wants the same invalidation and the same message. It was left out of
+/// both for exactly as long as the comment above the archive arm said "the
+/// four commands".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListCommand {
     Archive,
     Unarchive,
     Restore,
     Purge,
+    Delete,
 }
 
 /// What a failed row command shows in the inline band.
@@ -2398,7 +2461,12 @@ fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError
         // "permanently delete", not "delete": this is the one irreversible
         // command in the window, and a message reading "Couldn't delete"
         // would leave a user unsure which of the two deletes was refused.
+        // The two really are both reachable -- `ListCommand::Delete` below is
+        // the soft one -- so the distinction is not hypothetical.
         ListCommand::Purge => ("permanently delete", "It's still in the trash."),
+        // The soft delete: a refused one leaves the item exactly where it
+        // was, in the live vault, NOT in the trash it was headed for.
+        ListCommand::Delete => ("delete", "It's still in your vault."),
     };
     format!("Couldn't {verb} \"{name}\" -- {because}. {unchanged}")
 }
@@ -4885,11 +4953,12 @@ mod list_command_failure_message_tests {
     /// fifth variant has to be brought here deliberately, and
     /// `list_command_failure_message`'s own `match` has no catch-all for the
     /// same reason.
-    const EVERY_COMMAND: [ListCommand; 4] = [
+    const EVERY_COMMAND: [ListCommand; 5] = [
         ListCommand::Archive,
         ListCommand::Unarchive,
         ListCommand::Restore,
         ListCommand::Purge,
+        ListCommand::Delete,
     ];
 
     fn every_error() -> [VaultError; 3] {
@@ -4924,7 +4993,7 @@ mod list_command_failure_message_tests {
     #[test]
     fn each_command_says_which_one_it_was() {
         // A shared "Couldn't complete that" would satisfy the test above for
-        // every command at once. These are four different actions with four
+        // every command at once. These are five different actions with five
         // different consequences, and the band is the only place the user
         // learns which one was refused.
         let e = VaultError::Http("400 Bad Request".into());
@@ -4950,6 +5019,21 @@ mod list_command_failure_message_tests {
             messages[3].contains("permanently delete \""),
             "the purge failure does not say it was the permanent one: {:?}",
             messages[3]
+        );
+        // And its opposite number: the soft delete must NOT claim to be the
+        // permanent one. These two are the pair the wording exists to keep
+        // apart, so each is asserted against the other's word.
+        assert!(
+            messages[4].contains("delete \"") && !messages[4].contains("permanently"),
+            "the soft delete's failure is not distinguishable from the purge's: {:?}",
+            messages[4]
+        );
+        // It also has to name where the item still is, and that is the live
+        // vault -- NOT the trash it was on its way to.
+        assert!(
+            messages[4].contains("still in your vault"),
+            "the soft delete's failure does not say the item is still in the vault: {:?}",
+            messages[4]
         );
     }
 
@@ -5488,30 +5572,59 @@ mod out_of_vault_wiring_tests {
         );
     }
 
-    /// The four commands that move an item between this window's three lists,
-    /// and the on-demand list each one must drop.
+    /// The **five** commands that move an item between this window's three
+    /// lists: the arm marker, the needle proving it drops the on-demand list
+    /// it moved an item into or out of, and the needle proving a refusal
+    /// reaches the user.
     ///
     /// The list is not cached anywhere, so refetching it is the cheap,
     /// always-correct answer -- but only if the command actually asks. After
     /// a Restore that does not, the restored item keeps sitting in Trash and
     /// keeps being counted there for the life of the window, because
     /// `wants_fetch` sees a list already in hand.
-    const COMMAND_ARMS: [(&str, &str); 4] = [
+    ///
+    /// **It listed four until a reviewer added the fifth and watched both
+    /// guards fail.** Delete is a SOFT delete -- `VaultCache::delete_item`
+    /// sends no `permanent=true` -- so it moves an item out of the live vault
+    /// and into the Trash, and it honoured neither rule. THIS ARRAY IS AN
+    /// ASSERTION INPUT, not a summary: an entry missing from it silently
+    /// narrows every test that reads it, which is the same way
+    /// `MENU_VOCABULARY` once filtered a real menu entry out of both sides of
+    /// an "exactly these entries" comparison.
+    ///
+    /// Delete's two needles are the delegation rather than the deed, because
+    /// its deed is in `delete_vault_item`: it has TWO doors (this menu and
+    /// the detail pane's kebab), so writing the invalidation and the message
+    /// inline here would have covered one of them. What this array pins for
+    /// Delete is that the arm hands the helper the list to drop and routes
+    /// the sentence it returns to the band;
+    /// `the_soft_delete_is_wired_at_both_of_its_doors` pins the helper itself
+    /// and the other door.
+    const COMMAND_ARMS: [(&str, &str, &str); 5] = [
+        (
+            concat!("RowCommand::Del", "ete => {"),
+            concat!("&mut trash_", "list,"),
+            concat!("move_error = Some(mes", "sage);"),
+        ),
         (
             concat!("RowCommand::Arch", "ive => {"),
             concat!("archive_list.inval", "idate();"),
+            REPORTS_THE_FAILURE,
         ),
         (
             concat!("RowCommand::Unarch", "ive => {"),
             concat!("archive_list.inval", "idate();"),
+            REPORTS_THE_FAILURE,
         ),
         (
             concat!("RowCommand::Rest", "ore => {"),
             concat!("trash_list.inval", "idate();"),
+            REPORTS_THE_FAILURE,
         ),
         (
             concat!("RowCommand::PurgeFor", "ever => {"),
             concat!("trash_list.inval", "idate();"),
+            REPORTS_THE_FAILURE,
         ),
     ];
 
@@ -5551,7 +5664,7 @@ mod out_of_vault_wiring_tests {
 
     #[test]
     fn each_list_moving_command_drops_the_list_it_moved_an_item_out_of() {
-        for (marker, invalidates) in COMMAND_ARMS {
+        for (marker, invalidates, _) in COMMAND_ARMS {
             let body = arm_body(marker);
             assert_eq!(
                 body.matches(invalidates).count(),
@@ -5565,32 +5678,121 @@ mod out_of_vault_wiring_tests {
         }
     }
 
-    /// What each arm must put in front of the user when its write is
-    /// refused. Same slicing as the invalidation guard above, and for the
-    /// same reason -- a file-wide search is satisfied by any ONE arm having
-    /// it.
+    /// What each of the four inline arms must put in front of the user when
+    /// its write is refused. Same slicing as the invalidation guard above,
+    /// and for the same reason -- a file-wide search is satisfied by any ONE
+    /// arm having it. (Delete's own needle is in `COMMAND_ARMS`: it builds
+    /// its sentence in `delete_vault_item` and the arm only forwards it.)
     const REPORTS_THE_FAILURE: &str =
         concat!("move_error = Some(list_command_", "failure_message(");
 
     #[test]
     fn each_list_moving_command_says_so_when_it_is_refused() {
-        // All four were `log::warn!` plus the re-auth flag and nothing else,
-        // on the same screen whose branch already routes aux-FETCH failures
-        // through the inline band. A refused write looked exactly like a
-        // successful one that had not refreshed yet, and the user's only
-        // signal was the item still sitting where they had just told it to
-        // leave. Archive is the one where rejection is genuinely likely
-        // rather than theoretical: re-archiving returns 400.
-        for (marker, _) in COMMAND_ARMS {
+        // All of them were `log::warn!` plus the re-auth flag and nothing
+        // else, on the same screen whose branch already routes aux-FETCH
+        // failures through the inline band. A refused write looked exactly
+        // like a successful one that had not refreshed yet, and the user's
+        // only signal was the item still sitting where they had just told it
+        // to leave. Archive is the one where rejection is genuinely likely
+        // rather than theoretical: re-archiving returns 400. Delete was left
+        // in that state for a whole commit after the other four were fixed,
+        // because it was not counted as a list-moving command at all.
+        for (marker, _, reports) in COMMAND_ARMS {
             let body = arm_body(marker);
             assert_eq!(
-                body.matches(REPORTS_THE_FAILURE).count(),
+                body.matches(reports).count(),
                 1,
-                "the {marker:?} arm does not report its failure. `flag_reauth_if_\
-                 unauthorized` covers only an expired session, and a `log::warn!` is not \
-                 a user-visible channel -- the band under the toolbar is.\n{body}"
+                "the {marker:?} arm does not report its failure with {reports:?}. \
+                 `flag_reauth_if_unauthorized` covers only an expired session, and a \
+                 `log::warn!` is not a user-visible channel -- the band under the \
+                 toolbar is.\n{body}"
             );
         }
+    }
+
+    /// `delete_vault_item`'s body: where the soft delete's invalidation and
+    /// its failure sentence actually live.
+    const DEFINES_DELETE: &str = concat!("fn delete_vault", "_item(");
+    /// The `fn` that follows it, which is where its body stops.
+    const AFTER_DELETE: &str = concat!("fn move_item_into", "_folder(");
+    /// Both doors' shared spelling of "route the sentence to the band".
+    const DELETE_REPORTS: &str = concat!("move_error = Some(mes", "sage);");
+    /// The helper's name at a call site or a definition alike.
+    const CALLS_DELETE: &str = concat!("delete_vault_", "item(");
+
+    #[test]
+    fn the_soft_delete_is_wired_at_both_of_its_doors() {
+        // The finding this closes: Delete is a SOFT delete, so it moves the
+        // item into the Trash, and it did neither of the two things the other
+        // four do. Reproduce the invalidation half by hand -- open Trash (the
+        // list is fetched and the badge reads N), switch to All items, delete
+        // an item, open Trash again: `wants_fetch` sees a list already in
+        // hand, nothing refetches, and the just-deleted item is absent from
+        // Trash with the badge still reading N for the life of the window.
+        //
+        // It has TWO doors -- the row menu and the detail pane's kebab -- and
+        // the per-arm guard above can only ever see the first. That is why
+        // the deed is in `delete_vault_item` and this checks the helper's own
+        // body: one body, so both doors are covered by construction rather
+        // than by a second needle that could be satisfied by the first door
+        // alone.
+        let source = production();
+        let at = source
+            .find(DEFINES_DELETE)
+            .unwrap_or_else(|| panic!("no {DEFINES_DELETE:?} in production code"));
+        let rest = &source[at + DEFINES_DELETE.len()..];
+        let end = rest.find(AFTER_DELETE).unwrap_or_else(|| {
+            panic!(
+                "no {AFTER_DELETE:?} after {DEFINES_DELETE:?} -- this guard slices the \
+                 helper's body up to it and cannot without it"
+            )
+        });
+        let body = &rest[..end];
+        for (needle, why) in [
+            (
+                concat!("trash_list.inval", "idate();"),
+                "the soft delete does not drop the Trash list it just moved an item \
+                 INTO. The list is not cached and is never pruned in place, so an \
+                 already-open Trash row keeps listing -- and its badge keeps counting \
+                 -- the vault as it was before the delete, for the life of the window",
+            ),
+            (
+                concat!("ListCommand::Del", "ete,"),
+                "the soft delete does not build its own failure sentence. `Purge`'s \
+                 wording says \"permanently delete\" precisely so this one can say \
+                 \"delete\"; borrowing another command's is worse than the \
+                 `log::warn!` this replaced, and a `log::warn!` is not a user-visible \
+                 channel at all",
+            ),
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "`delete_vault_item` does not do {needle:?} exactly once -- {why}.\n{body}"
+            );
+        }
+        // Positive control for the slice, and for the "one body" claim: the
+        // helper must be reached from exactly two places. Three occurrences
+        // = the definition plus two call sites; a third caller, or a call
+        // site deleted, changes the count and this guard stops being true.
+        assert_eq!(
+            production().matches(CALLS_DELETE).count(),
+            3,
+            "expected {CALLS_DELETE:?} three times in production code: the definition, \
+             the row menu's arm, and the detail pane's kebab. A fourth door would not be \
+             covered by anything here; a missing one means a Delete that no longer goes \
+             through the body checked above"
+        );
+        // And that BOTH doors forward the sentence. `#[must_use]` on the
+        // helper makes ignoring the return a warning rather than nothing, but
+        // `let _ =` silences that, and this does not.
+        assert_eq!(
+            production().matches(DELETE_REPORTS).count(),
+            2,
+            "expected {DELETE_REPORTS:?} twice in production code -- once per door. \
+             `delete_vault_item` returning a sentence that a caller drops is exactly as \
+             silent as the `log::warn!` it replaced"
+        );
     }
 
     #[test]
@@ -5600,26 +5802,31 @@ mod out_of_vault_wiring_tests {
         // on the wrong region would fail -- but for the wrong reason, and
         // with a message pointing at production code rather than at this
         // guard. These say which it is.
-        for (marker, _) in COMMAND_ARMS {
+        for (marker, _, _) in COMMAND_ARMS {
             let body = arm_body(marker);
             assert!(
                 !body.trim().is_empty(),
                 "the {marker:?} slice is empty -- the arm markers or the terminators are \
                  stale, and the guard above proved nothing"
             );
+            // `needs_reauth_for_closure` rather than `flag_reauth_if_\
+            // unauthorized(`, which four of the five call directly and the
+            // fifth reaches through `delete_vault_item`. All five name the
+            // flag itself, so this stays one needle for all of them rather
+            // than a per-arm exception that could go stale unnoticed.
             assert!(
-                body.contains(concat!("flag_reauth_if_", "unauthorized(")),
-                "the {marker:?} slice does not contain that arm's own failure handling, \
+                body.contains(concat!("needs_reauth_for", "_closure")),
+                "the {marker:?} slice does not contain that arm's own re-auth handling, \
                  so it is not the arm body.\n{body}"
             );
         }
-        // And that the four are really four distinct regions: a terminator
+        // And that the five are really five distinct regions: a terminator
         // that stopped matching would make each slice run to the end of the
         // file, and every needle would then be found in someone else's arm.
-        let mut bodies: Vec<&str> = COMMAND_ARMS.iter().map(|(m, _)| arm_body(m)).collect();
+        let mut bodies: Vec<&str> = COMMAND_ARMS.iter().map(|(m, _, _)| arm_body(m)).collect();
         bodies.sort_unstable();
         bodies.dedup();
-        assert_eq!(bodies.len(), 4, "two command arms sliced to the same text");
+        assert_eq!(bodies.len(), 5, "two command arms sliced to the same text");
     }
 }
 
