@@ -5251,7 +5251,7 @@ mod tests {
     /// and this fixture is the one that puts all three chorded rows on
     /// screen together.
     #[test]
-    fn no_copy_chord_is_painted_beside_a_row() {
+    fn every_chord_is_painted_beside_its_row_and_last_on_the_line() {
         let (item, totp) = a_login_with_a_code();
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &totp);
