@@ -1108,6 +1108,38 @@ pub fn row_button(ui: &mut Ui, label: &str) -> Response {
     .inner
 }
 
+/// A URL drawn as the link it is: the value text itself in [`BLUE`], with the
+/// pointing hand under it, reporting its own clicks.
+///
+/// **The text is the control, replacing a button beside it.** Design 2b draws
+/// the detail pane's Website row as plain 14px ink with a separate "Open"
+/// [`row_button`], which is what this app shipped; the user asked for the URL
+/// to be blue and clickable instead, so the button goes and the run of text
+/// takes its job.
+///
+/// **No underline, and that is the design's answer rather than an omission.**
+/// 2b paints no link anywhere -- no anchor, no blue body text, no underline,
+/// nothing in the whole block to copy a hover treatment from. (The only
+/// `text-decoration` in `Deskwarden.dc.html` is the specimen document's own
+/// chrome, styling the prose links around the mockups, and it sets
+/// `text-decoration: none`.) So the affordance is the two things this app
+/// already spells everywhere for a hand-painted clickable: its own colour,
+/// and the pointing hand. Inventing a hover underline would be inventing.
+///
+/// `selectable(false)` because egui's default text selection would take the
+/// press for a drag-select and the row would stop reporting clicks at all.
+pub fn link_label(ui: &mut Ui, text: &str, size: f32) -> Response {
+    let response = ui.add(
+        egui::Label::new(RichText::new(text).size(size).color(BLUE))
+            .selectable(false)
+            .sense(Sense::click()),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
 /// The vault window titlebar's Lock control (design 2b: `height: 28px;
 /// padding: 0 12px; border: 1px solid #d7d3d3; border-radius: 8px;`), with
 /// its keyboard shortcut nested *inside* the same bordered pill -- "Lock"

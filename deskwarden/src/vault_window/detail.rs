@@ -862,12 +862,16 @@ pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVau
     ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
 }
 
-/// The three values this pane offers a keyboard copy for.
+/// The values this pane offers a keyboard copy for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyShortcut {
     Username,
     Password,
     Totp,
+    /// The AUTOFILL TARGETS card's website. The one entry here that is not a
+    /// secret, and the one whose row also does something else on click --
+    /// see the Website row in [`draw_detail_read`].
+    Url,
 }
 
 /// The bindings, their keys and the chord each row's tooltip names, in ONE
@@ -901,10 +905,28 @@ pub enum CopyShortcut {
 /// nothing else. CTRL+SHIFT+B put a password on the clipboard. See
 /// [`consume_ctrl_key`], which now gates these on exact modifiers, and
 /// `an_extra_modifier_does_not_fire_a_copy`.
-const COPY_SHORTCUTS: [(CopyShortcut, egui::Key, &str); 3] = [
-    (CopyShortcut::Password, egui::Key::B, "CTRL+B"),
-    (CopyShortcut::Username, egui::Key::U, "CTRL+U"),
-    (CopyShortcut::Totp, egui::Key::T, "CTRL+T"),
+/// CTRL+SHIFT+U, the website copy, is KeePass's again: it uses CTRL+U for
+/// *open* URL and CTRL+SHIFT+U for *copy* URL. CTRL+U is already this app's
+/// copy-username, so the shifted form is the one that stays consistent with
+/// both. Checked free rather than assumed, over the whole crate: the only
+/// SHIFT chord anywhere in it is `vault_window::mod`'s CTRL+SHIFT+F, and the
+/// only other binding on `U` is the CTRL+U above.
+///
+/// **A shifted chord is only safe here because of `matches_exact`.** Under
+/// the `consume_key` this pane used to call, CTRL+SHIFT+U *was* CTRL+U and a
+/// website copy could not have been told apart from a username copy at all --
+/// which is also why the two live in the same table with their modifiers in
+/// it, rather than one of them being special-cased somewhere else.
+const COPY_SHORTCUTS: [(CopyShortcut, egui::Modifiers, egui::Key, &str); 4] = [
+    (CopyShortcut::Password, egui::Modifiers::CTRL, egui::Key::B, "CTRL+B"),
+    (CopyShortcut::Username, egui::Modifiers::CTRL, egui::Key::U, "CTRL+U"),
+    (CopyShortcut::Totp, egui::Modifiers::CTRL, egui::Key::T, "CTRL+T"),
+    (
+        CopyShortcut::Url,
+        egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        egui::Key::U,
+        "CTRL+SHIFT+U",
+    ),
 ];
 
 /// How one binding is spelled to the user, read out of [`COPY_SHORTCUTS`] and
@@ -912,8 +934,8 @@ const COPY_SHORTCUTS: [(CopyShortcut, egui::Key, &str); 3] = [
 fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
     COPY_SHORTCUTS
         .iter()
-        .find(|(candidate, _, _)| *candidate == which)
-        .map(|(_, _, chord)| *chord)
+        .find(|(candidate, _, _, _)| *candidate == which)
+        .map(|(_, _, _, chord)| *chord)
         .expect("COPY_SHORTCUTS covers every CopyShortcut variant")
 }
 
@@ -956,10 +978,20 @@ fn copy_shortcut_action(
     username: &str,
     password: &str,
     totp: &TotpState,
+    // The website exactly as the AUTOFILL TARGETS card has it -- empty
+    // whenever that card is not on screen, so the chord and the row it
+    // belongs to are gated by one expression (see `draw_detail_read`).
+    website: &str,
 ) -> Option<DetailAction> {
     match which {
         CopyShortcut::Username => (!username.is_empty()).then_some(DetailAction::CopyUsername),
         CopyShortcut::Password => (!password.is_empty()).then_some(DetailAction::CopyPassword),
+        // Through `CopyValue`, whose doc reserves it for values that are not
+        // `Zeroizing` in the model -- a URI is not, and this is the only
+        // binding here that copies something the item does not hide.
+        CopyShortcut::Url => {
+            (!website.is_empty()).then(|| DetailAction::CopyValue(website.to_string()))
+        }
         // Only when a code is really on screen. `vault_window::mod` resolves
         // `CopyTotp` out of this same state, so every other variant --
         // `NoSecret`, `Fetching`, `Unavailable`, `NoCodeReported` -- would
@@ -1036,7 +1068,7 @@ fn header_layout(content_width: f32, controls_with_hint: f32, controls_bare: f32
     }
 }
 
-/// `CTRL+key` and **nothing else held**, taken out of the event queue.
+/// `modifiers+key` and **nothing else held**, taken out of the event queue.
 ///
 /// egui's own [`egui::InputState::consume_key`] is the obvious call here and
 /// is wrong for this one: it matches with `Modifiers::matches_logically`,
@@ -1052,17 +1084,25 @@ fn header_layout(content_width: f32, controls_with_hint: f32, controls_bare: f32
 /// because egui exposes no exact-matching consumer. Consuming is still the
 /// point (see the call site): a chord that means "copy" here must not also
 /// reach whatever is underneath.
-fn consume_ctrl_key(input: &mut egui::InputState, key: egui::Key) -> bool {
+///
+/// Exactness is now load-bearing rather than merely careful: CTRL+U and
+/// CTRL+SHIFT+U are two different copies on the same key, and telling them
+/// apart is exactly what `matches_logically` cannot do.
+fn consume_chord(
+    input: &mut egui::InputState,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> bool {
     let mut found = false;
     input.events.retain(|event| {
         let is_match = matches!(
             event,
             egui::Event::Key {
                 key: event_key,
-                modifiers,
+                modifiers: held,
                 pressed: true,
                 ..
-            } if *event_key == key && modifiers.matches_exact(egui::Modifiers::CTRL)
+            } if *event_key == key && held.matches_exact(modifiers)
         );
         found |= is_match;
         !is_match
@@ -1102,6 +1142,20 @@ pub fn draw_detail_read(
         .and_then(|l| l.password.as_deref())
         .map(|p| p.as_str())
         .unwrap_or("");
+    // **One expression for the AUTOFILL TARGETS card and for CTRL+SHIFT+U.**
+    // Derived up here with the other two fields rather than beside the card
+    // it draws, because the chord is resolved before anything is drawn and
+    // the two must not be able to disagree: a chord that copied a URL the
+    // pane is not showing would be copying from a card the user cannot see.
+    //
+    // Gated on the kind as well as on there being a URI: this card is the
+    // autofill *targets* card, and advertising targets for an item the fill
+    // path will not fill is the same false promise the Fill button was.
+    let website = login
+        .and_then(|l| l.uris.first())
+        .and_then(|u| u.uri.as_deref())
+        .filter(|_| kind_offers_fill(kind))
+        .unwrap_or("");
 
     // **Consumed before anything below is drawn.** `consume_key` takes the
     // event out of the queue, so a chord that means "copy" here cannot also
@@ -1112,8 +1166,8 @@ pub fn draw_detail_read(
     let shortcut = ui.input_mut(|i| {
         COPY_SHORTCUTS
             .iter()
-            .find(|(_, key, _)| consume_ctrl_key(i, *key))
-            .map(|(which, _, _)| *which)
+            .find(|(_, modifiers, key, _)| consume_chord(i, *modifiers, *key))
+            .map(|(which, _, _, _)| *which)
     });
 
     // Whatever stacking the container handed us, kept for the body below --
@@ -1482,27 +1536,36 @@ pub fn draw_detail_read(
         ui.add_space(CARD_GAP);
     }
 
-    let website = login
-        .and_then(|l| l.uris.first())
-        .and_then(|u| u.uri.as_deref())
-        .unwrap_or("");
-    // Gated on the kind as well as on there being a URI: this card is the
-    // autofill *targets* card, and advertising targets for an item the fill
-    // path will not fill is the same false promise the Fill button was.
-    if kind_offers_fill(kind) && !website.is_empty() {
+    if !website.is_empty() {
         card(ui, "AUTOFILL TARGETS", |ui| {
-            row(
+            // **Two things one click can mean, split by where it lands.**
+            // The URL text is the link -- clicking it opens the browser --
+            // and the rest of the tile copies, like every other row on this
+            // pane. That split is safe for exactly the reason the eye's is
+            // (see `copy_row`): `row_impl` senses the tile on a `UiBuilder`
+            // background, which egui registers when the `Ui` is created and
+            // therefore *before* its children, and a click goes to the
+            // topmost widget under the pointer and to nothing else. The link
+            // is a child, so it wins its own click and does not also copy.
+            // Pinned by `clicking_the_website_link_opens_it_without_copying`,
+            // which asserts both halves in one frame.
+            let mut opened = false;
+            copy_row(
                 ui,
                 "Website",
                 |ui| {
-                    ui.label(RichText::new(website).size(ROW_VALUE_SIZE).color(theme::INK));
+                    opened = theme::link_label(ui, website, ROW_VALUE_SIZE)
+                        .on_hover_text("Open in browser")
+                        .clicked();
                 },
-                |ui| {
-                    if theme::row_button(ui, "Open").clicked() {
-                        action = DetailAction::OpenWebsite(website.to_string());
-                    }
-                },
+                |_ui| {},
+                DetailAction::CopyValue(website.to_string()),
+                Some(CopyShortcut::Url),
+                &mut action,
             );
+            if opened {
+                action = DetailAction::OpenWebsite(website.to_string());
+            }
         });
         ui.add_space(CARD_GAP);
     }
@@ -1532,7 +1595,7 @@ pub fn draw_detail_read(
 
     if matches!(action, DetailAction::None) {
         if let Some(which) = shortcut {
-            if let Some(copy) = copy_shortcut_action(which, username, password, totp) {
+            if let Some(copy) = copy_shortcut_action(which, username, password, totp, website) {
                 action = copy;
             }
         }
@@ -5026,16 +5089,20 @@ mod tests {
             seconds_left: 9,
         };
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Password, "u", "p", &code),
+            copy_shortcut_action(CopyShortcut::Password, "u", "p", &code, "w"),
             Some(DetailAction::CopyPassword)
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Username, "u", "p", &code),
+            copy_shortcut_action(CopyShortcut::Username, "u", "p", &code, "w"),
             Some(DetailAction::CopyUsername)
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Totp, "u", "p", &code),
+            copy_shortcut_action(CopyShortcut::Totp, "u", "p", &code, "w"),
             Some(DetailAction::CopyTotp)
+        );
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, "w"),
+            Some(DetailAction::CopyValue("w".to_string()))
         );
     }
 
@@ -5052,14 +5119,19 @@ mod tests {
             seconds_left: 9,
         };
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Username, "", "p", &code),
+            copy_shortcut_action(CopyShortcut::Username, "", "p", &code, "w"),
             None,
             "CTRL+U on an item with no username put something on the clipboard"
         );
         assert_eq!(
-            copy_shortcut_action(CopyShortcut::Password, "u", "", &code),
+            copy_shortcut_action(CopyShortcut::Password, "u", "", &code, "w"),
             None,
             "CTRL+B on an item with no password put something on the clipboard"
+        );
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Url, "u", "p", &code, ""),
+            None,
+            "CTRL+SHIFT+U on an item with no website put something on the clipboard"
         );
         for empty in [
             TotpState::NoSecret,
@@ -5068,7 +5140,7 @@ mod tests {
             TotpState::NoCodeReported,
         ] {
             assert_eq!(
-                copy_shortcut_action(CopyShortcut::Totp, "u", "p", &empty),
+                copy_shortcut_action(CopyShortcut::Totp, "u", "p", &empty, "w"),
                 None,
                 "CTRL+T copied something while the TOTP state was {empty:?} -- there is \
                  no code to copy in it"
@@ -5081,13 +5153,41 @@ mod tests {
     /// is worse than no hint at all.
     #[test]
     fn every_binding_has_a_chord_that_names_its_own_key() {
-        for (which, key, chord) in COPY_SHORTCUTS {
+        for (which, modifiers, key, chord) in COPY_SHORTCUTS {
             assert_eq!(copy_shortcut_chord(which), chord);
+            // Spelled from the modifiers the binding really carries, so the
+            // one shifted chord in the table cannot be spelled as if it were
+            // not -- which is the drift that would put "CTRL+U" in two
+            // tooltips for two different copies.
+            let mut spelled = "CTRL".to_string();
+            assert!(
+                modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd,
+                "{which:?} is not a plain-CTRL-based chord: {modifiers:?}"
+            );
+            if modifiers.shift {
+                spelled.push_str("+SHIFT");
+            }
             assert_eq!(
                 chord,
-                format!("CTRL+{}", key.name()),
-                "{which:?}'s chord does not spell the key it is bound to"
+                format!("{spelled}+{}", key.name()),
+                "{which:?}'s chord does not spell the keys it is bound to"
             );
+        }
+    }
+
+    /// **No two bindings are the same chord.** CTRL+U and CTRL+SHIFT+U are
+    /// one key apart from one another and a `matches_exact` apart from being
+    /// the same binding; a duplicate would resolve to whichever came first in
+    /// the table and the other would silently never fire.
+    #[test]
+    fn no_two_bindings_share_a_chord() {
+        for (i, (which, modifiers, key, _)) in COPY_SHORTCUTS.iter().enumerate() {
+            for (other, other_modifiers, other_key, _) in COPY_SHORTCUTS.iter().skip(i + 1) {
+                assert!(
+                    !(modifiers == other_modifiers && key == other_key),
+                    "{which:?} and {other:?} are both bound to {modifiers:?}+{key:?}"
+                );
+            }
         }
     }
 
@@ -5122,7 +5222,7 @@ mod tests {
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &totp);
 
-        for label in ["Username", "Password", "One-time code"] {
+        for label in ["Username", "Password", "One-time code", "Website"] {
             assert!(
                 frame.painted(label),
                 "the {label:?} row is not on this pane at all, so finding no chord on \
@@ -5130,7 +5230,7 @@ mod tests {
                 frame.strings()
             );
         }
-        for chord in ["CTRL+U", "CTRL+B", "CTRL+T"] {
+        for chord in ["CTRL+U", "CTRL+B", "CTRL+T", "CTRL+SHIFT+U"] {
             assert!(
                 !frame.painted(chord),
                 "the {chord} hint is still painted in the rows; the pane painted: {:?}",
@@ -5149,6 +5249,7 @@ mod tests {
             ("Username", "CTRL+U"),
             ("Password", "CTRL+B"),
             ("One-time code", "CTRL+T"),
+            ("Website", "CTRL+SHIFT+U"),
         ] {
             let mut pane = Pane::new();
             let laid_out = pane.idle(&item, &totp);
@@ -5166,7 +5267,7 @@ mod tests {
             );
             // The other two chords must NOT be in this frame: one tooltip
             // saying all three would satisfy the assertion above.
-            for other in ["CTRL+U", "CTRL+B", "CTRL+T"] {
+            for other in ["CTRL+U", "CTRL+B", "CTRL+T", "CTRL+SHIFT+U"] {
                 if other == chord {
                     continue;
                 }
@@ -5275,11 +5376,16 @@ mod tests {
         };
         let alt_ctrl = egui::Modifiers::CTRL | egui::Modifiers::ALT;
         let shift_ctrl = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        // CTRL+SHIFT+U is deliberately NOT in this list any more: it is the
+        // website copy now, and `the_url_chord_and_the_username_chord_are_two
+        // _different_copies` is where it belongs. CTRL+ALT+SHIFT+U replaces
+        // it here so `U` still has an unbound-modifier case of its own.
         for (name, modifiers, key) in [
             ("CTRL+ALT+B", alt_ctrl, egui::Key::B),
             ("CTRL+SHIFT+B", shift_ctrl, egui::Key::B),
             ("CTRL+ALT+U", alt_ctrl, egui::Key::U),
-            ("CTRL+SHIFT+U", shift_ctrl, egui::Key::U),
+            ("CTRL+ALT+SHIFT+U", alt_ctrl | egui::Modifiers::SHIFT, egui::Key::U),
+            ("SHIFT+U", egui::Modifiers::SHIFT, egui::Key::U),
             ("ALT+B", egui::Modifiers::ALT, egui::Key::B),
             ("plain B", egui::Modifiers::NONE, egui::Key::B),
         ] {
@@ -5304,6 +5410,290 @@ mod tests {
             DetailAction::CopyPassword,
             "no chord reaches this pane at all, so the silence above proves nothing"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The Website row: a link, and a chord of its own.
+    // -----------------------------------------------------------------
+
+    /// The URL `a_login` carries, so no test below writes it out twice.
+    const WEBSITE: &str = "app.ledgerline.com";
+
+    /// **Clicking the URL opens it, and copies NOTHING.** The link sits
+    /// inside a tile that copies on click, exactly as the eye does, and the
+    /// two must not both fire. One `DetailAction` is returned per frame, so
+    /// asserting it *is* `OpenWebsite` asserts both halves at once -- and is
+    /// its own positive control: a click that missed everything reports
+    /// `None` and fails here.
+    #[test]
+    fn clicking_the_website_link_opens_it_without_copying() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let url = laid_out.rect_of(WEBSITE);
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, url.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::OpenWebsite(WEBSITE.to_string()),
+            "clicking the URL reported {:?} -- the link must open the browser, and it \
+             must not be the tile's copy that answered",
+            clicked.action
+        );
+    }
+
+    /// And a click anywhere else in the same tile copies it. Over the LABEL
+    /// column, which is as far from the link as the row goes -- the other
+    /// half of the split, and the one that says the tile did not simply stop
+    /// being clickable when the link arrived.
+    #[test]
+    fn clicking_elsewhere_in_the_website_tile_copies_the_url() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let label = laid_out.rect_of("Website");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue(WEBSITE.to_string()),
+            "clicking the Website tile reported {:?}, so the tile is not the copy \
+             target every other row on this pane is",
+            clicked.action
+        );
+    }
+
+    /// **The link is the control, so the `Open` button is gone.** The row's
+    /// label and the URL itself are the positive control: "nothing painted
+    /// Open" is also true of a pane that drew no AUTOFILL TARGETS card, and
+    /// of one that drew no card at all.
+    #[test]
+    fn the_website_row_has_no_open_button() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert!(
+            frame.painted("Website") && frame.painted(WEBSITE),
+            "the Website row is not on this pane at all, so finding no Open button \
+             proves nothing; the pane painted: {:?}",
+            frame.strings()
+        );
+        assert!(
+            !frame.painted("Open"),
+            "the Open button is still painted beside the URL that replaced it; the \
+             pane painted: {:?}",
+            frame.strings()
+        );
+    }
+
+    /// Every painted run with the colour it was laid out in -- which
+    /// [`collect_text_rects`] and [`collect_type`] both throw away, and which
+    /// is the whole of "make the URL blue".
+    fn painted_colours(item: &VaultItem, totp: &TotpState) -> Vec<(String, egui::Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let colour = text.override_text_color.unwrap_or_else(|| {
+                        text.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|s| s.format.color)
+                            .unwrap_or_default()
+                    });
+                    out.push((text.galley.text().to_string(), colour));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &frame_shapes(item, totp, RevealState::default()) {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// **The URL paints in `BLUE`, not `INK`.** The username, painted in the
+    /// same kind of row on the same pane, is the control: it pins that this
+    /// walk reads real colours off the galleys rather than reporting one
+    /// default for everything, so "the URL is blue" cannot pass by accident.
+    #[test]
+    fn the_url_is_painted_as_a_link_and_the_values_around_it_are_not() {
+        let colours = painted_colours(&a_login(), &TotpState::NoSecret);
+        let colour_of = |needle: &str| {
+            let hits: Vec<egui::Color32> = colours
+                .iter()
+                .filter(|(text, _)| text == needle)
+                .map(|(_, colour)| *colour)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected exactly one {needle:?} on the pane, found {}; painted: {:?}",
+                hits.len(),
+                colours
+            );
+            hits[0]
+        };
+        assert_eq!(
+            colour_of(WEBSITE),
+            theme::BLUE,
+            "the URL is not painted as a link"
+        );
+        assert_eq!(
+            colour_of("a.novak@ledgerline.com"),
+            theme::INK,
+            "the username is not INK either, so this test is not reading colours"
+        );
+    }
+
+    /// **The link wins the hover as well as the click.** It says "Open in
+    /// browser"; the tile under it says "Click to copy". Both are wired, and
+    /// only the link's own can appear when the pointer is on the link --
+    /// which is the same layering the click test relies on, observed through
+    /// a second, independent channel.
+    #[test]
+    fn hovering_the_url_offers_to_open_it_rather_than_to_copy_it() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let url = laid_out.rect_of(WEBSITE);
+        let label = laid_out.rect_of("Website");
+
+        let on_link = pane.hover_settled(&item, &TotpState::NoSecret, url.center());
+        assert!(
+            on_link.painted("Open in browser"),
+            "hovering the URL offered no way to open it; the frame painted: {:?}",
+            on_link.strings()
+        );
+        assert!(
+            !on_link
+                .strings()
+                .iter()
+                .any(|t| t.starts_with("Click to copy")),
+            "hovering the URL ALSO offered the tile's copy, so the two are not \
+             layered; the frame painted: {:?}",
+            on_link.strings()
+        );
+
+        // And the rest of the tile is the copy tooltip -- the control that
+        // says the row really does carry one for the link to be winning.
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let on_tile = pane.hover_settled(&item, &TotpState::NoSecret, label.center());
+        assert!(
+            on_tile.painted("Click to copy · CTRL+SHIFT+U"),
+            "hovering the Website row's label painted no copy tooltip; the frame \
+             painted: {:?}",
+            on_tile.strings()
+        );
+    }
+
+    /// **CTRL+SHIFT+U copies the URL and CTRL+U still copies the username.**
+    /// One key, two chords, told apart only by `consume_chord`'s
+    /// `matches_exact` -- under egui's own `consume_key` these would be the
+    /// same binding and one of them would silently never fire.
+    #[test]
+    fn the_url_chord_and_the_username_chord_are_two_different_copies() {
+        let item = a_login();
+        let ctrl_shift = |key| {
+            vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }]
+        };
+
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&item, &TotpState::NoSecret, ctrl_shift(egui::Key::U))
+                .action,
+            DetailAction::CopyValue(WEBSITE.to_string()),
+            "CTRL+SHIFT+U did not copy the website"
+        );
+
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&item, &TotpState::NoSecret, ctrl(egui::Key::U))
+                .action,
+            DetailAction::CopyUsername,
+            "CTRL+U stopped copying the username when the shifted chord arrived"
+        );
+    }
+
+    /// **Neither chord fires on an item that has nothing for it, and the
+    /// clipboard is UNTOUCHED rather than emptied.** `DetailAction::None` is
+    /// the assertion: a `CopyValue("")` would also leave nothing to paste,
+    /// and would silently replace whatever the user had copied before.
+    ///
+    /// Two fixtures, because they fail differently. The login with its URI
+    /// stripped still has a username, so it is what says CTRL+SHIFT+U did
+    /// not simply fall through to the unshifted binding; the card has
+    /// neither field.
+    #[test]
+    fn a_missing_field_leaves_the_clipboard_alone_for_both_u_chords() {
+        let ctrl_shift_u = || {
+            vec![egui::Event::Key {
+                key: egui::Key::U,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            }]
+        };
+
+        let mut no_uri = a_login();
+        no_uri
+            .login
+            .as_mut()
+            .expect("a_login has login data")
+            .uris
+            .clear();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&no_uri, &TotpState::NoSecret);
+        assert!(
+            !laid_out.painted("Website"),
+            "the fixture still has a Website row, so it is not the no-URI case"
+        );
+        assert_eq!(
+            pane.frame(&no_uri, &TotpState::NoSecret, ctrl_shift_u())
+                .action,
+            DetailAction::None,
+            "CTRL+SHIFT+U on an item with no website put something on the clipboard"
+        );
+        // The positive control on the very same item: its username is still
+        // there, so the silence above is about the missing URI and not about
+        // a harness whose key events never arrive.
+        let mut pane = Pane::new();
+        let _ = pane.idle(&no_uri, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&no_uri, &TotpState::NoSecret, ctrl(egui::Key::U))
+                .action,
+            DetailAction::CopyUsername,
+            "no chord reaches this pane at all, so the silence above proves nothing"
+        );
+
+        // A card has neither field, and no AUTOFILL TARGETS card either.
+        let card = a_full_card();
+        for (name, events) in [("CTRL+SHIFT+U", ctrl_shift_u()), ("CTRL+U", ctrl(egui::Key::U))] {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&card, &TotpState::NoSecret);
+            assert_eq!(
+                pane.frame(&card, &TotpState::NoSecret, events).action,
+                DetailAction::None,
+                "{name} on a card copied something"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
