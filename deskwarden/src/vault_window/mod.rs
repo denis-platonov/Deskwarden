@@ -5396,6 +5396,24 @@ mod out_of_vault_wiring_tests {
     const DEFINES_FLATTENED: &str = concat!("fn list_", "for<'a>(");
     /// The one place a `FilterSource` may still be taken apart by hand.
     const INLINE_MATCH: &str = concat!("sidebar::FilterSource::", "Trash =>");
+    /// Every argument a selection site passes, **in the order it must pass
+    /// them**. See `every_selection_site_passes_the_arguments_it_was_given`
+    /// for why pinning the call alone was not enough.
+    const SELECTION_ARGUMENTS: [&str; 4] = [
+        concat!("filter.sou", "rce(),"),
+        concat!("&it", "ems,"),
+        concat!("trash_list.items.as_", "deref(),"),
+        concat!("archive_list.items.as_", "deref(),"),
+    ];
+    /// The item pane's own call, pinned by the BINDING it produces and not
+    /// merely by the function's name.
+    const SHOWN_BINDING: &str =
+        concat!("let shown: Option<&[VaultItem]> = list_unless_", "unfetched(");
+    /// Where an argument list stops: the call's own closing paren for the
+    /// `shown` binding, and the `.iter()` both `list_for` sites chain onto
+    /// theirs.
+    const ARGUMENTS_END: &str = ");";
+    const CHAINED_ARGUMENTS_END: &str = concat!(".it", "er()");
     /// The detail pane's out-of-vault branch: the derivation, and the
     /// condition that reads it.
     const DERIVES_OUT_OF_VAULT: &str =
@@ -5478,6 +5496,115 @@ mod out_of_vault_wiring_tests {
              the selection lookup and the row-command lookup each had, and only one of \
              them had to be wrong."
         );
+    }
+
+    /// One selection site's argument list, checked to pass
+    /// [`SELECTION_ARGUMENTS`] in order.
+    ///
+    /// `site` names it in the panic; `call` is the slice from the call's own
+    /// opening needle to its terminator.
+    fn arguments_in_order(site: &str, call: &str) {
+        let mut at = 0;
+        for argument in SELECTION_ARGUMENTS {
+            let found = call[at..].find(argument).unwrap_or_else(|| {
+                panic!(
+                    "{site} does not pass {argument:?}, or passes it out of order. \
+                     `list_unless_unfetched` takes the source first and then the three \
+                     lists positionally, so a wrong or transposed argument compiles, \
+                     counts, and takes nothing apart by hand -- which is why the two \
+                     guards above see none of it.\n{call}"
+                )
+            });
+            at += found + argument.len();
+        }
+    }
+
+    /// Slices `count` argument lists out of production code: from each
+    /// occurrence of `opens` to the next `ends`.
+    fn argument_lists(opens: &str, ends: &str, count: usize) -> Vec<&'static str> {
+        let source = production();
+        let calls: Vec<&'static str> = source
+            .match_indices(opens)
+            .map(|(at, _)| {
+                let rest = &source[at..];
+                let end = rest.find(ends).unwrap_or_else(|| {
+                    panic!("no {ends:?} after {opens:?} -- this guard slices to it")
+                });
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(
+            calls.len(),
+            count,
+            "expected {count} occurrence(s) of {opens:?} in production code, found {}. \
+             The counts above measure the same sites; if they still pass, this needle \
+             is stale rather than the code being wrong",
+            calls.len()
+        );
+        calls
+    }
+
+    #[test]
+    fn every_selection_site_passes_the_arguments_it_was_given() {
+        // THE TWO GUARDS ABOVE PIN THAT A CALL HAPPENS, NOT WHAT IT SAYS.
+        // Three mutations were demonstrated against them, each alone, each
+        // leaving the whole suite green:
+        //
+        //  * the item pane's first argument replaced with a literal
+        //    `sidebar::FilterSource::LiveVault`. The call still counts and
+        //    nothing is taken apart by hand, but the pane draws the LIVE
+        //    VAULT under Trash and Archive: the Trash row lists the user's
+        //    entire vault, and clicking a row leaves the pane on "Select an
+        //    item." because the two `list_for` sites still resolve against
+        //    the real trash list. That is the original defect, restored.
+        //  * the trash and archive arguments transposed in that same call.
+        //    Trash lists the archived items, Archive the trashed ones, and
+        //    every menu entry on those rows is a silent no-op.
+        //  * the real call kept as a `let _ =` so the count still sees two,
+        //    with a hand-rolled `match` behind a local `use ... as FS` alias
+        //    feeding `shown` instead -- invisible to a needle spelled
+        //    `sidebar::FilterSource::Trash =>`.
+        //
+        // Pinning the ARGUMENT LIST kills all three: the first two because a
+        // wrong or transposed argument is not the text that must appear, the
+        // third because the item pane's site is pinned by the BINDING it
+        // produces, so a `let _ =` in its place is not that site at all.
+        //
+        // WHAT THIS STILL DOES NOT COVER, stated rather than glossed --
+        // this file has twice carried a comment claiming more than the code
+        // did:
+        //
+        //  * a rebind. `let shown = ...` a second time, after the pinned
+        //    call, shadows it and satisfies every needle here.
+        //  * `production()` reads `include_str!("mod.rs")` only, so a
+        //    hand-rolled decision moved into `sidebar.rs` or `item_list.rs`
+        //    and called from here is out of reach of `INLINE_MATCH`. (It is
+        //    NOT out of reach of this test at the item pane's site, whose
+        //    binding must still be `list_unless_unfetched`'s -- but the two
+        //    `list_for` sites are pinned by name, so a same-named helper
+        //    elsewhere would pass.)
+        //
+        // Closing either needs a real behavioural test, and there is none to
+        // be had: all three sites are inside `run`'s update closure, which
+        // needs an event loop and cannot be called from this suite. That is
+        // the same reason `generate_failure_wiring_tests` exists. The paint
+        // harness `item_list::row_tile_tests` uses reaches `draw_item_list`
+        // and the row menu -- it is what closes the row menu's own
+        // `filter.source()` behaviourally -- but it cannot reach the caller
+        // that decides which list `draw_item_list` is handed, which is
+        // precisely the decision mutated above.
+        arguments_in_order(
+            "the item pane's `shown`",
+            argument_lists(SHOWN_BINDING, ARGUMENTS_END, 1)[0],
+        );
+        // The selection lookup that feeds the detail pane, and the lookup
+        // that resolves a right-clicked row to the item its command acts on.
+        // Both take the same four arguments in the same order, and both are
+        // as transposable as the one above: swapped here, every entry on a
+        // trashed row's menu acts on an archived item.
+        for call in argument_lists(FLATTENED, CHAINED_ARGUMENTS_END, 2) {
+            arguments_in_order("a `list_for` lookup", call);
+        }
     }
 
     #[test]
