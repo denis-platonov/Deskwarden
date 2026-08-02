@@ -1164,16 +1164,25 @@ mod tests {
 
     #[test]
     fn the_folder_dropdown_offers_exactly_the_assignable_folders() {
-        // `draw_detail_edit` needs an egui context, so no test in this crate
-        // can click that combo box -- which is precisely how the unfiltered
-        // loop survived. A source-text guard over this file instead (the
-        // same device as `settings.rs`'s
-        // `the_config_path_still_matches_the_one_main_resolves`): the pure
-        // function above is only worth anything if the dropdown is the thing
-        // calling it.
+        // A source-text guard over this file (the same device as
+        // `settings.rs`'s `the_config_path_still_matches_the_one_main_resolves`):
+        // the pure function above is only worth anything if the dropdown is
+        // the thing calling it.
+        //
+        // **Both needles are assembled rather than written out**, and the
+        // positive one is the reason this comment exists. `include_str!`
+        // pulls in this test module too, so a needle written as one literal
+        // matches *its own declaration* and `contains` is unconditionally
+        // true -- the guard passes forever and guards nothing. It was written
+        // that way, and a reviewer proved it: replacing the call below with
+        // `folders.to_vec()` restored the exact regression this test names
+        // and the whole suite stayed green. The negative needle was already
+        // assembled for this reason; the positive one was missed, which is
+        // why it is spelled out here rather than left to be re-derived.
         let source = include_str!("detail_edit.rs");
+        let call = concat!("let assignable = ", "assignable_folders(folders);");
         assert!(
-            source.contains("let assignable = assignable_folders(folders);"),
+            source.contains(call),
             "the folder combo box no longer builds its rows from `assignable_folders`, so the \
              virtual \"No Folder\" bucket is being offered as a destination again"
         );
