@@ -870,12 +870,16 @@ pub enum CopyShortcut {
     Totp,
 }
 
-/// The bindings, their keys and the hint each row paints, in ONE table.
+/// The bindings, their keys and the chord each row's tooltip names, in ONE
+/// table.
 ///
 /// One table because the third of those is a promise about the other two: a
 /// row advertising `CTRL+B` beside a handler wired to something else is
 /// worse than no hint at all, and the only way to make that impossible is
-/// for the hint and the key to be the same tuple.
+/// for the spelled chord and the key to be the same tuple. The chord used to
+/// be *painted* beside each row and is now carried by the row's hover
+/// tooltip instead ([`copy_row_tooltip`]) -- a change of surface, not of
+/// source: it is still this table's third field and nothing else.
 ///
 /// The chords are KeePass's, which password-manager users already have in
 /// their fingers. All three are free in this app, checked rather than
@@ -903,14 +907,36 @@ const COPY_SHORTCUTS: [(CopyShortcut, egui::Key, &str); 3] = [
     (CopyShortcut::Totp, egui::Key::T, "CTRL+T"),
 ];
 
-/// The hint text for one binding, read out of [`COPY_SHORTCUTS`] and never
-/// written out a second time.
-fn copy_shortcut_hint(which: CopyShortcut) -> &'static str {
+/// How one binding is spelled to the user, read out of [`COPY_SHORTCUTS`] and
+/// never written out a second time.
+fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
     COPY_SHORTCUTS
         .iter()
         .find(|(candidate, _, _)| *candidate == which)
-        .map(|(_, _, hint)| *hint)
+        .map(|(_, _, chord)| *chord)
         .expect("COPY_SHORTCUTS covers every CopyShortcut variant")
+}
+
+/// What a copy-on-click tile says when the pointer rests on it.
+///
+/// **Two invisible things, one sentence.** Neither of them is discoverable
+/// from the pane: the tile copies on click but is not drawn as a button, and
+/// the chord that copies the same value without the mouse is a chord. The
+/// chord used to be painted beside the row instead -- twelve monospace
+/// characters on the control line of every credential row -- and the user
+/// asked for that text gone from the Password row in favour of the eye. It
+/// is moved here rather than deleted, and moved for EVERY row that had one
+/// rather than only that row: a Password row with no chord beside a Username
+/// row that still had one is worse than either answer applied uniformly.
+///
+/// The wording is `theme::gear_button`'s idiom -- a plain `on_hover_text` on
+/// the response -- and the chord comes from [`COPY_SHORTCUTS`], so a row
+/// cannot name a key it is not bound to.
+fn copy_row_tooltip(hint: Option<CopyShortcut>) -> String {
+    match hint {
+        Some(which) => format!("Click to copy · {}", copy_shortcut_chord(which)),
+        None => "Click to copy".to_string(),
+    }
 }
 
 /// Which copy a chord asks for, given what the selected item actually
@@ -1607,9 +1633,14 @@ fn copy_row(
     value: impl FnOnce(&mut egui::Ui),
     controls: impl FnOnce(&mut egui::Ui),
     on_copy: DetailAction,
+    // What the tile's hover tooltip names, if this value also has a chord.
+    // Every copy row gets a tooltip; only some have a chord to add to it.
+    hint: Option<CopyShortcut>,
     action: &mut DetailAction,
 ) {
-    if row_impl(ui, label, value, controls, egui::Sense::click()).clicked() {
+    let response = row_impl(ui, label, value, controls, egui::Sense::click())
+        .on_hover_text(copy_row_tooltip(hint));
+    if response.clicked() {
         *action = on_copy;
     }
 }
@@ -1719,7 +1750,8 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
 }
 
 /// A plain value row. The whole tile copies; `hint`, when there is one, is
-/// the keyboard chord that copies the same value without the mouse.
+/// the keyboard chord that copies the same value without the mouse, named in
+/// the tile's tooltip (see [`copy_row_tooltip`]).
 fn credential_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1734,30 +1766,11 @@ fn credential_row(
         |ui| {
             ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
         },
-        |ui| shortcut_hint(ui, hint),
+        |_ui| {},
         on_copy,
+        hint,
         action,
     );
-}
-
-/// A row's keyboard-shortcut hint, right-aligned with its controls.
-///
-/// The design's own idiom for this (`Deskwarden.dc.html` 2b: the search
-/// field's `CTRL+K`, the Lock pill's `CTRL+L`) is bare 10px monospace in
-/// ghost grey -- not [`theme::kbd_chip`]'s boxed treatment, which the design
-/// reserves for the chips inside filled buttons and selected rows.
-///
-/// It exists because the explicit `Copy` buttons are gone: without a visible
-/// hint the two ways left to copy are both invisible.
-fn shortcut_hint(ui: &mut egui::Ui, hint: Option<CopyShortcut>) {
-    if let Some(which) = hint {
-        ui.label(
-            RichText::new(copy_shortcut_hint(which))
-                .size(10.0)
-                .family(egui::FontFamily::Monospace)
-                .color(theme::TEXT_GHOST),
-        );
-    }
 }
 
 fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
@@ -1822,11 +1835,11 @@ fn masked_row(
             {
                 *revealed = !*revealed;
             }
-            shortcut_hint(ui, hint);
         },
         // **Copies the real value even while masked.** The mask is a display
         // concern; it was never what the old Copy button honoured either.
         on_copy,
+        hint,
         action,
     );
 }
@@ -2127,8 +2140,9 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
                     .color(theme::TEXT_FAINT),
             );
         },
-        |ui| shortcut_hint(ui, Some(CopyShortcut::Totp)),
+        |_ui| {},
         DetailAction::CopyTotp,
+        Some(CopyShortcut::Totp),
         action,
     );
 }
@@ -2984,6 +2998,30 @@ mod tests {
         /// been reported.
         fn hover(&mut self, item: &VaultItem, totp: &TotpState, pos: egui::Pos2) -> Frame {
             self.frame(item, totp, vec![egui::Event::PointerMoved(pos)])
+        }
+
+        /// The pointer resting on `pos` **long enough for a tooltip**, and
+        /// the frame that produced.
+        ///
+        /// A tooltip is not a hover affordance: egui holds it back for
+        /// `Style::interaction::tooltip_delay` (0.5s) after the pointer
+        /// *last moved*, and only shows it while the pointer is still. So
+        /// [`Pane::hover`]'s single frame paints none, and -- this is the
+        /// part that cost an hour -- neither do forty of them: every
+        /// `PointerMoved` event resets egui's "last movement" clock, so a
+        /// pointer re-announced at the same position each pass is a pointer
+        /// that never settles.
+        ///
+        /// One move, then frames with no input at all. egui keeps the
+        /// pointer where it was and advances its own clock by one predicted
+        /// frame (1/60s) per pass, so forty of them rest it for 0.66s --
+        /// past the delay without being derived from it.
+        fn hover_settled(&mut self, item: &VaultItem, totp: &TotpState, pos: egui::Pos2) -> Frame {
+            let mut frame = self.hover(item, totp, pos);
+            for _ in 0..40 {
+                frame = self.idle(item, totp);
+            }
+            frame
         }
 
         /// Lays the pane out, clicks the kebab, and returns the frame AFTER
@@ -5038,47 +5076,107 @@ mod tests {
         }
     }
 
-    /// The hints say what the code binds, because they are the same table.
+    /// The chords say what the code binds, because they are the same table.
     /// A row advertising `CTRL+B` beside a handler wired to something else
     /// is worse than no hint at all.
     #[test]
-    fn every_binding_has_a_hint_that_names_its_own_key() {
-        for (which, key, hint) in COPY_SHORTCUTS {
-            assert_eq!(copy_shortcut_hint(which), hint);
+    fn every_binding_has_a_chord_that_names_its_own_key() {
+        for (which, key, chord) in COPY_SHORTCUTS {
+            assert_eq!(copy_shortcut_chord(which), chord);
             assert_eq!(
-                hint,
+                chord,
                 format!("CTRL+{}", key.name()),
-                "{which:?}'s hint does not spell the key it is bound to"
+                "{which:?}'s chord does not spell the key it is bound to"
             );
         }
     }
 
-    /// And the hints really paint, on the rows they belong to.
-    #[test]
-    fn the_copy_hints_paint_on_the_rows_they_belong_to() {
+    /// A login with a live one-time code -- the one fixture that has all
+    /// three chorded rows on screen at once.
+    fn a_login_with_a_code() -> (VaultItem, TotpState) {
         let mut item = a_login();
         item.login.as_mut().expect("a_login has login data").totp =
             Some("seed".to_string().into());
-        let totp = TotpState::Code {
-            code: "123456".to_string(),
-            seconds_left: 9,
-        };
+        (
+            item,
+            TotpState::Code {
+                code: "123456".to_string(),
+                seconds_left: 9,
+            },
+        )
+    }
+
+    /// **The chords are not painted beside the rows any more.** The user
+    /// asked for the `CTRL+B` text on the Password row to go, leaving the
+    /// eye as the row's only control, and the same was applied to the
+    /// Username and One-time code rows so the card does not carry one row
+    /// with a chord beside two without.
+    ///
+    /// The row labels are the positive control: "no CTRL+B anywhere" is also
+    /// true of a pane that failed to draw the LOGIN CREDENTIALS card at all,
+    /// and this fixture is the one that puts all three chorded rows on
+    /// screen together.
+    #[test]
+    fn no_copy_chord_is_painted_beside_a_row() {
+        let (item, totp) = a_login_with_a_code();
         let mut pane = Pane::new();
         let frame = pane.idle(&item, &totp);
 
-        for (label, hint) in [
+        for label in ["Username", "Password", "One-time code"] {
+            assert!(
+                frame.painted(label),
+                "the {label:?} row is not on this pane at all, so finding no chord on \
+                 it proves nothing; the pane painted: {:?}",
+                frame.strings()
+            );
+        }
+        for chord in ["CTRL+U", "CTRL+B", "CTRL+T"] {
+            assert!(
+                !frame.painted(chord),
+                "the {chord} hint is still painted in the rows; the pane painted: {:?}",
+                frame.strings()
+            );
+        }
+    }
+
+    /// **And the tooltip carries it instead.** Each of the three rows names
+    /// its own chord on hover, and it names the chord that row is bound to --
+    /// asserted per row, so a tooltip wired to one fixed string cannot pass.
+    #[test]
+    fn hovering_a_row_names_the_chord_that_copies_it() {
+        let (item, totp) = a_login_with_a_code();
+        for (label, chord) in [
             ("Username", "CTRL+U"),
             ("Password", "CTRL+B"),
             ("One-time code", "CTRL+T"),
         ] {
-            let row = frame.rect_of(label);
-            let tag = frame.rect_of(hint);
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &totp);
+            let row = laid_out.rect_of(label);
+            // The tooltip belongs to the row's own background widget, so the
+            // pointer goes over the label column -- as far from the eye and
+            // its own "Reveal" tooltip as the row goes.
+            let hovered = pane.hover_settled(&item, &totp, row.center());
+            let want = format!("Click to copy · {chord}");
             assert!(
-                (tag.center().y - row.center().y).abs() <= 2.0,
-                "the {hint} hint is not on the {label:?} row's own line; the pane \
+                hovered.painted(&want),
+                "hovering the {label:?} row painted no {want:?} tooltip; the frame \
                  painted: {:?}",
-                frame.strings()
+                hovered.strings()
             );
+            // The other two chords must NOT be in this frame: one tooltip
+            // saying all three would satisfy the assertion above.
+            for other in ["CTRL+U", "CTRL+B", "CTRL+T"] {
+                if other == chord {
+                    continue;
+                }
+                assert!(
+                    !hovered.strings().iter().any(|t| t.contains(other)),
+                    "hovering the {label:?} row also surfaced {other}; the frame \
+                     painted: {:?}",
+                    hovered.strings()
+                );
+            }
         }
     }
 

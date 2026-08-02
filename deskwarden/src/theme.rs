@@ -1500,7 +1500,9 @@ fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
 /// the state shown is the ACTION rather than the current condition.
 ///
 /// Square at [`row_button`]'s own 28px height, so it sits on the row's
-/// control line beside the shortcut hint.
+/// control line at the same size as the buttons elsewhere on the pane. It is
+/// now the only thing on that line: the `CTRL+B` text that used to sit beside
+/// it moved into the row's hover tooltip.
 pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
     const SIZE: f32 = 28.0;
     const HALF_W: f32 = 8.5;
