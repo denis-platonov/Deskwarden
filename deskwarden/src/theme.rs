@@ -1346,6 +1346,14 @@ fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
 }
 
 /// Paints the star at `center`, filled or outlined, in one colour.
+/// Stroke width for the favourite star, in both states.
+///
+/// This is a shape control, not a line weight: see the comment in
+/// [`paint_star`] for why the width is what blunts the points. 2.2 at an
+/// outer radius of 9 is roughly a quarter of the tip's own length, which is
+/// where the mark stops reading as spiky without losing the five points.
+const STAR_STROKE: f32 = 2.2;
+
 fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
     let points = star_outline(center, outer);
     let painter = ui.painter();
@@ -1373,10 +1381,20 @@ fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
     // the hairline seams anti-aliasing leaves between adjacent fan triangles.
     // It is also what [`icon_probe::stars`] finds, so both states are equally
     // visible to a test.
-    painter.add(egui::Shape::closed_line(
-        points,
-        Stroke::new(if filled { 1.0 } else { 1.4 }, color),
-    ));
+    //
+    // **The width is what rounds the tips**, and it is deliberately heavy.
+    // egui's `Stroke` exposes no join style, so there is no `linejoin: round`
+    // to ask for; what it does instead is clamp the miter length at sharp
+    // corners, which bevels them. At a hairline that bevel is invisible and
+    // the star reads as five spikes. At [`STAR_STROKE`] the bevel is a
+    // meaningful fraction of the tip, so the points blunt and the whole mark
+    // fattens -- the same thing a round join would do here, arrived at
+    // through the one control this toolkit gives.
+    //
+    // It applies to both states so the filled and outlined stars are the
+    // same silhouette. A thinner stroke under the fill would leave the "on"
+    // star visibly pointier than the "off" one, which reads as two icons.
+    painter.add(egui::Shape::closed_line(points, Stroke::new(STAR_STROKE, color)));
 }
 
 /// The detail header's favourite control: a star, filled in the design's
