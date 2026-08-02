@@ -408,7 +408,21 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
 /// "item": all four hold a mixture of kinds, so any specific noun would be wrong for
 /// most of their contents, and the sidebar already shows which scope is
 /// selected.
-pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
+///
+/// **`None` is "this app does not know yet", and it drops the number instead
+/// of printing one.** The Trash and Archive rows are on-demand queries, so
+/// between selecting the row and the fetch landing -- and permanently, if it
+/// failed -- there is no count to state. This control used to be handed
+/// `count_for(shown, filter)` over an empty placeholder list and so read
+/// "Search 0 items": the identical `0`-instead-of-unknown claim
+/// `sidebar::UNKNOWN_COUNT` was introduced to remove from the badge sitting
+/// one control to the left of it, restated by the neighbour. It says
+/// "Search items" until it has something true to say.
+///
+/// The en dash is deliberately NOT reused here. In the badge it occupies a
+/// slot the eye reads as a number, and so reads as "unknown"; in the middle
+/// of a sentence ("Search - items") it reads as a typo.
+pub fn search_hint(count: Option<usize>, filter: &SidebarFilter) -> String {
     let (singular, plural) = match filter {
         SidebarFilter::All => ("item", "items"),
         SidebarFilter::Favorites => ("favorite", "favorites"),
@@ -428,7 +442,10 @@ pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
         SidebarFilter::Folder(_) => ("item", "items"),
         SidebarFilter::Unfiled => ("item", "items"),
     };
-    format!("Search {count} {}", if count == 1 { singular } else { plural })
+    match count {
+        Some(count) => format!("Search {count} {}", if count == 1 { singular } else { plural }),
+        None => format!("Search {plural}"),
+    }
 }
 
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
@@ -470,9 +487,19 @@ const LIST_PADDING: f32 = 10.0;
 /// second is `vault_window::mod`'s `item_delete_pending`, which decides
 /// whether that row's Delete entry reads "Delete" or the armed
 /// "Delete? Click to confirm". Neither affects what a row paints.
+///
+/// **`items` is `None` when the list this row reads has not been fetched
+/// yet** -- the Trash and Archive rows are on-demand queries, so "no answer
+/// yet" is a real state and not a synonym for "empty". It reaches this
+/// function at all because the SEARCH PLACEHOLDER has to be able to tell the
+/// two apart: it read "Search 0 items" while a Trash fetch was in flight or
+/// had failed, which is the same `0`-instead-of-unknown untruth
+/// `sidebar::badge_text` exists to keep out of the badge one control to the
+/// left. The rows themselves are drawn from `unwrap_or(&[])`, because there
+/// is genuinely nothing to draw either way.
 pub fn draw_item_list(
     ui: &mut egui::Ui,
-    items: &[VaultItem],
+    items: Option<&[VaultItem]>,
     folders: &[Folder],
     filter: &SidebarFilter,
     search: &mut String,
@@ -484,6 +511,10 @@ pub fn draw_item_list(
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
+    // The rows, once. Everything below this line that draws an item reads
+    // `rows`; the one thing that reads `items` itself is the placeholder's
+    // count, which is the only control that cares about the difference.
+    let rows: &[VaultItem] = items.unwrap_or(&[]);
 
     // Design 2b's list container butts STRAIGHT against the header strip:
     // there is no gap between the two, and the list's own `padding: 10px` is
@@ -559,7 +590,10 @@ pub fn draw_item_list(
                     });
                     // "Search 180 logins" -- see `search_hint`, which owns
                     // both the count's source and the per-filter noun.
-                    let hint = search_hint(super::sidebar::count_for(items, filter), filter);
+                    let hint = search_hint(
+                        items.map(|items| super::sidebar::count_for(items, filter)),
+                        filter,
+                    );
                     theme::search_field(
                         ui,
                         search,
@@ -605,7 +639,7 @@ pub fn draw_item_list(
     }
 
     let search_lower = search.to_lowercase();
-    let filtered: Vec<&VaultItem> = items
+    let filtered: Vec<&VaultItem> = rows
         .iter()
         .filter(|item| matches_filter(item, filter, &search_lower))
         .collect();
@@ -1608,23 +1642,23 @@ mod search_hint_tests {
     fn the_noun_follows_the_active_filter() {
         // The whole reason this is a function. Hardcoding the design's
         // "logins" would put "Search 12 logins" over a list of cards.
-        assert_eq!(search_hint(180, &SidebarFilter::Logins), "Search 180 logins");
-        assert_eq!(search_hint(4, &SidebarFilter::Cards), "Search 4 cards");
-        assert_eq!(search_hint(21, &SidebarFilter::SecureNotes), "Search 21 secure notes");
-        assert_eq!(search_hint(9, &SidebarFilter::Passkeys), "Search 9 passkeys");
-        assert_eq!(search_hint(12, &SidebarFilter::Favorites), "Search 12 favorites");
-        assert_eq!(search_hint(3, &SidebarFilter::Identities), "Search 3 identities");
-        assert_eq!(search_hint(2, &SidebarFilter::SshKeys), "Search 2 SSH keys");
-        assert_eq!(search_hint(214, &SidebarFilter::All), "Search 214 items");
+        assert_eq!(search_hint(Some(180), &SidebarFilter::Logins), "Search 180 logins");
+        assert_eq!(search_hint(Some(4), &SidebarFilter::Cards), "Search 4 cards");
+        assert_eq!(search_hint(Some(21), &SidebarFilter::SecureNotes), "Search 21 secure notes");
+        assert_eq!(search_hint(Some(9), &SidebarFilter::Passkeys), "Search 9 passkeys");
+        assert_eq!(search_hint(Some(12), &SidebarFilter::Favorites), "Search 12 favorites");
+        assert_eq!(search_hint(Some(3), &SidebarFilter::Identities), "Search 3 identities");
+        assert_eq!(search_hint(Some(2), &SidebarFilter::SshKeys), "Search 2 SSH keys");
+        assert_eq!(search_hint(Some(214), &SidebarFilter::All), "Search 214 items");
     }
 
     #[test]
     fn the_mixed_scopes_keep_the_neutral_noun() {
         // Trash and a folder both hold a mixture of kinds, so any specific
         // noun is wrong for most of what is in them.
-        assert_eq!(search_hint(6, &SidebarFilter::Trash), "Search 6 items");
+        assert_eq!(search_hint(Some(6), &SidebarFilter::Trash), "Search 6 items");
         assert_eq!(
-            search_hint(64, &SidebarFilter::Folder("f-1".to_string())),
+            search_hint(Some(64), &SidebarFilter::Folder("f-1".to_string())),
             "Search 64 items"
         );
     }
@@ -1633,18 +1667,63 @@ mod search_hint_tests {
     fn one_item_is_singular_in_every_scope() {
         // The case a naive `format!("{n} {plural}")` gets wrong, and the one
         // a user with a small vault sees constantly.
-        assert_eq!(search_hint(1, &SidebarFilter::Logins), "Search 1 login");
-        assert_eq!(search_hint(1, &SidebarFilter::Identities), "Search 1 identity");
-        assert_eq!(search_hint(1, &SidebarFilter::SshKeys), "Search 1 SSH key");
-        assert_eq!(search_hint(1, &SidebarFilter::SecureNotes), "Search 1 secure note");
-        assert_eq!(search_hint(1, &SidebarFilter::All), "Search 1 item");
+        assert_eq!(search_hint(Some(1), &SidebarFilter::Logins), "Search 1 login");
+        assert_eq!(search_hint(Some(1), &SidebarFilter::Identities), "Search 1 identity");
+        assert_eq!(search_hint(Some(1), &SidebarFilter::SshKeys), "Search 1 SSH key");
+        assert_eq!(search_hint(Some(1), &SidebarFilter::SecureNotes), "Search 1 secure note");
+        assert_eq!(search_hint(Some(1), &SidebarFilter::All), "Search 1 item");
     }
 
     #[test]
     fn zero_takes_the_plural_the_way_english_does() {
         // "Search 0 login" is the other half of the same off-by-one.
-        assert_eq!(search_hint(0, &SidebarFilter::Logins), "Search 0 logins");
-        assert_eq!(search_hint(0, &SidebarFilter::All), "Search 0 items");
+        assert_eq!(search_hint(Some(0), &SidebarFilter::Logins), "Search 0 logins");
+        assert_eq!(search_hint(Some(0), &SidebarFilter::All), "Search 0 items");
+    }
+
+    #[test]
+    fn an_unfetched_list_states_no_count_at_all() {
+        // The Trash and Archive rows are on-demand queries. Between the row
+        // being selected and its fetch landing -- and permanently, if that
+        // fetch failed -- this app does not know how many items are behind
+        // it, and `0` is a claim it cannot make. It made it anyway, over an
+        // empty placeholder list, one control to the right of the badge that
+        // exists specifically to say the en dash instead.
+        assert_eq!(search_hint(None, &SidebarFilter::Trash), "Search items");
+        assert_eq!(search_hint(None, &SidebarFilter::Archive), "Search items");
+    }
+
+    #[test]
+    fn an_unfetched_list_never_claims_zero_in_any_scope() {
+        // The negative half of the pair above, over every variant: the
+        // failure being guarded against is a digit appearing in this string,
+        // and asserting the two exact sentences above would not notice a
+        // third scope that still printed one.
+        for filter in [
+            SidebarFilter::All,
+            SidebarFilter::Favorites,
+            SidebarFilter::Apps,
+            SidebarFilter::Logins,
+            SidebarFilter::Passkeys,
+            SidebarFilter::Cards,
+            SidebarFilter::Identities,
+            SidebarFilter::SecureNotes,
+            SidebarFilter::SshKeys,
+            SidebarFilter::Archive,
+            SidebarFilter::Trash,
+            SidebarFilter::Folder("f-1".to_string()),
+            SidebarFilter::Unfiled,
+        ] {
+            let hint = search_hint(None, &filter);
+            assert!(
+                !hint.contains(char::is_numeric),
+                "{filter:?} prints a count it does not have: {hint:?}"
+            );
+            // Positive control: an implementation that returned "" would
+            // satisfy the assertion above for free.
+            assert!(hint.starts_with("Search "), "{filter:?}: {hint:?}");
+            assert!(hint.len() > "Search ".len(), "{filter:?} names no scope: {hint:?}");
+        }
     }
 }
 
@@ -1796,11 +1875,26 @@ mod row_tile_tests {
         /// on the frame the button is released, and a popup only exists from
         /// the frame after the one that opened it.
         frames: Vec<Vec<egui::Event>>,
+        /// **Which sidebar row the list is being drawn under**, which is a
+        /// menu input and not merely a scope: `draw_item_list` hands
+        /// `filter.source()` to every row, and `menu_entries` uses it to pick
+        /// between three DISJOINT menus. A reviewer replaced that argument
+        /// with a literal `FilterSource::LiveVault` and the whole suite
+        /// stayed green while a trashed item offered Copy password, Move to
+        /// folder and Delete -- every one of them a click that fails or, in
+        /// the case of Delete, silently does nothing. Nothing could catch it
+        /// because this harness had the same literal baked in.
+        filter: SidebarFilter,
     }
 
     impl Menu {
         fn none() -> Self {
-            Self { folders: Vec::new(), delete_pending: None, frames: Vec::new() }
+            Self {
+                folders: Vec::new(),
+                delete_pending: None,
+                frames: Vec::new(),
+                filter: SidebarFilter::All,
+            }
         }
     }
 
@@ -1861,14 +1955,14 @@ mod row_tile_tests {
         let mut search = String::new();
         let icons = make_icons(&ctx);
         let mut action = ItemListAction::None;
-        let Menu { folders, delete_pending, mut frames } = menu;
+        let Menu { folders, delete_pending, mut frames, filter } = menu;
         let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
             ctx.run_ui(input, |ui| {
                 action = draw_item_list(
                     ui,
-                    items,
+                    Some(items),
                     &folders,
-                    &SidebarFilter::All,
+                    &filter,
                     &mut search,
                     &mut selected_id,
                     delete_pending.as_deref(),
@@ -2665,7 +2759,19 @@ mod row_tile_tests {
     /// intersect what was drawn with this vocabulary, so they are ABSOLUTE
     /// ("exactly these entries") rather than "the ones I looked for" -- a
     /// menu that also offered "Fill in app" on a card would fail them.
-    const MENU_VOCABULARY: [&str; 9] = [
+    /// Every label a row menu can paint, live or out-of-vault.
+    ///
+    /// **This is an assertion input, not a message helper**: `menu_labels`
+    /// filters painted galleys through it, so the tests that assert a menu's
+    /// entries "exactly" are blind to any label missing from here. It was
+    /// missing "Archive" -- so
+    /// `a_right_click_on_a_login_paints_exactly_that_login_s_entries` claimed
+    /// exactness over a list with a real entry filtered out of both sides,
+    /// and would not have noticed that entry disappearing. Adding the four
+    /// out-of-vault labels is what lets those same tests state that a LIVE
+    /// row offers no Restore or Unarchive, rather than being unable to see
+    /// one if it did.
+    const MENU_VOCABULARY: [&str; 14] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
@@ -2673,8 +2779,13 @@ mod row_tile_tests {
         "Open website",
         "Edit",
         MOVE_TO_FOLDER_LABEL,
+        "Archive",
         DELETE_LABEL,
         DELETE_CONFIRM_LABEL,
+        "Restore",
+        "Unarchive",
+        PURGE_LABEL,
+        PURGE_CONFIRM_LABEL,
     ];
 
     fn menu_labels(p: &Painted) -> Vec<String> {
@@ -2712,9 +2823,23 @@ mod row_tile_tests {
         tiles[row].rect.center()
     }
 
-    /// Right-clicks row `row` and returns the frame the menu is open on.
+    /// Right-clicks row `row` under the ordinary live vault and returns the
+    /// frame the menu is open on.
     fn open_menu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
-        open_menu_with(items, folders, None, row)
+        open_menu_with(items, folders, None, row, SidebarFilter::All)
+    }
+
+    /// The same, under whichever sidebar row `filter` names. The Trash and
+    /// Archive rows get a DIFFERENT menu, not the live one with entries
+    /// hidden -- see `out_of_vault_entries` -- so which row the list is drawn
+    /// under has to be something this harness can vary.
+    fn open_menu_under(
+        items: &[VaultItem],
+        folders: Vec<Folder>,
+        row: usize,
+        filter: SidebarFilter,
+    ) -> Painted {
+        open_menu_with(items, folders, None, row, filter)
     }
 
     fn open_menu_with(
@@ -2722,6 +2847,7 @@ mod row_tile_tests {
         folders: Vec<Folder>,
         delete_pending: Option<String>,
         row: usize,
+        filter: SidebarFilter,
     ) -> Painted {
         let at = row_centre(items, row);
         paint_core(
@@ -2734,6 +2860,7 @@ mod row_tile_tests {
                 folders,
                 delete_pending,
                 frames: click_frames(at, egui::PointerButton::Secondary),
+                filter,
             },
         )
     }
@@ -2763,14 +2890,30 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames },
+            Menu { folders, delete_pending: None, frames, filter: SidebarFilter::All },
         )
     }
 
     /// Right-clicks row `row`, then left-clicks the menu entry reading
     /// `label`, and returns the frame that second click resolved on.
     fn choose_entry(items: &[VaultItem], folders: Vec<Folder>, row: usize, label: &str) -> Painted {
-        let entry = text_centre(&open_menu(items, folders.clone(), row), label);
+        choose_entry_under(items, folders, row, label, SidebarFilter::All)
+    }
+
+    /// The same, under whichever sidebar row `filter` names -- the Trash and
+    /// Archive rows have their own entries, and clicking one has to come back
+    /// out as its own `RowCommand`.
+    fn choose_entry_under(
+        items: &[VaultItem],
+        folders: Vec<Folder>,
+        row: usize,
+        label: &str,
+        filter: SidebarFilter,
+    ) -> Painted {
+        let entry = text_centre(
+            &open_menu_under(items, folders.clone(), row, filter.clone()),
+            label,
+        );
         let at = row_centre(items, row);
         let mut frames = click_frames(at, egui::PointerButton::Secondary);
         let mut entry_click = click_frames(entry, egui::PointerButton::Primary);
@@ -2787,7 +2930,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames },
+            Menu { folders, delete_pending: None, frames, filter },
         )
     }
 
@@ -2840,6 +2983,7 @@ mod row_tile_tests {
                 folders: vec![],
                 delete_pending: None,
                 frames: click_frames(at, egui::PointerButton::Primary),
+                filter: SidebarFilter::All,
             },
         );
         assert_eq!(p.selected.as_deref(), Some("Ledgerline"));
@@ -2858,6 +3002,7 @@ mod row_tile_tests {
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
+                "Archive",
                 DELETE_LABEL,
             ]
         );
@@ -2871,7 +3016,7 @@ mod row_tile_tests {
         let items = [card("Visa (personal)")];
         assert_eq!(
             menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, DELETE_LABEL]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
         );
     }
 
@@ -2888,6 +3033,7 @@ mod row_tile_tests {
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
+                "Archive",
                 DELETE_LABEL,
             ]
         );
@@ -2896,7 +3042,7 @@ mod row_tile_tests {
     #[test]
     fn an_armed_delete_paints_its_confirming_label() {
         let items = [full_login("Ledgerline")];
-        let p = open_menu_with(&items, vec![], Some("Ledgerline".to_string()), 0);
+        let p = open_menu_with(&items, vec![], Some("Ledgerline".to_string()), 0, SidebarFilter::All);
         assert!(
             menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()),
             "the menu drew {:?}",
@@ -2910,7 +3056,7 @@ mod row_tile_tests {
         // `delete_pending_id` is one id, not a flag: an arm belongs to the
         // item it was set on.
         let items = [full_login("Ledgerline"), full_login("Vantage")];
-        let p = open_menu_with(&items, vec![], Some("Vantage".to_string()), 0);
+        let p = open_menu_with(&items, vec![], Some("Vantage".to_string()), 0, SidebarFilter::All);
         assert!(menu_labels(&p).contains(&DELETE_LABEL.to_string()));
         assert!(!menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()));
     }
@@ -3007,7 +3153,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames },
+            Menu { folders, delete_pending: None, frames, filter: SidebarFilter::All },
         );
         assert_eq!(
             p.action,
@@ -3082,7 +3228,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders: vec![], delete_pending: None, frames },
+            Menu { folders: vec![], delete_pending: None, frames, filter: SidebarFilter::All },
         );
 
         assert_eq!(dragging.visible, still.visible, "the laid-out row range changed mid-drag");
@@ -3120,6 +3266,7 @@ mod row_tile_tests {
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
+                "Archive",
                 DELETE_LABEL,
             ]
         );
@@ -3192,6 +3339,7 @@ mod row_tile_tests {
                 folders: vec![],
                 delete_pending: None,
                 frames: click_frames(at, egui::PointerButton::Primary),
+                filter: SidebarFilter::All,
             },
         )
     }
@@ -3261,7 +3409,7 @@ mod row_tile_tests {
                 0,
                 PANE_WIDTH,
                 |_| IconCache::default(),
-                Menu { folders: vec![], delete_pending: None, frames },
+                Menu { folders: vec![], delete_pending: None, frames, filter: SidebarFilter::All },
             );
             assert_eq!(
                 p.action,
@@ -3293,6 +3441,161 @@ mod row_tile_tests {
                 "a row tile moved while the \"+ New\" menu was open: {open:?} vs {closed:?}"
             );
         }
+    }
+
+    // ---- The menu a row gets depends on which sidebar row it was drawn
+    // under. `menu_entries` decides that from a `FilterSource` and is
+    // exhaustively tested; what was NOT tested is that `draw_item_list`
+    // passes the LIVE filter's source rather than a constant. A reviewer
+    // replaced that one argument with `FilterSource::LiveVault` and the
+    // whole suite stayed green while a trashed item offered Copy password,
+    // Move to folder, Edit, Archive and Delete -- five entries that are
+    // either rejected by the CLI or succeed at nothing.
+    //
+    // These drive the real right-click through the real widget tree, so they
+    // fail on that mutation rather than describing it.
+
+    /// Every entry the LIVE menu can offer. The negative assertions below
+    /// are written against this list rather than against a couple of
+    /// hand-picked labels, so an entry added to the live menu later cannot
+    /// quietly start appearing on a trashed item too.
+    const LIVE_ONLY_ENTRIES: [&str; 9] = [
+        "Copy username",
+        "Copy password",
+        "Copy TOTP",
+        "Fill in app",
+        "Open website",
+        "Edit",
+        MOVE_TO_FOLDER_LABEL,
+        "Archive",
+        DELETE_LABEL,
+    ];
+
+    fn painted_strings(p: &Painted) -> Vec<&str> {
+        p.texts.iter().map(|(t, _, _)| t.as_str()).collect()
+    }
+
+    /// Asserts that none of the live vault's entries were painted, having
+    /// first established that a menu was painted at all.
+    ///
+    /// The positive control is the whole point: "the menu has no Copy
+    /// password" passes trivially against a right-click that opened nothing,
+    /// which is exactly what a test written only in negatives would have
+    /// reported as success.
+    fn assert_out_of_vault_menu(p: &Painted, expected: &[&str]) {
+        let painted = painted_strings(p);
+        for entry in expected {
+            assert!(
+                painted.contains(entry),
+                "the menu did not offer {entry:?} -- so the negative assertions below \
+                 would have passed against a menu that painted nothing. Painted: {painted:?}"
+            );
+        }
+        for entry in LIVE_ONLY_ENTRIES {
+            assert!(
+                !painted.contains(&entry),
+                "an out-of-vault row offered the live vault's {entry:?}. Every entry on \
+                 that menu reads or writes through the LIVE list, which by construction \
+                 does not hold this item. Painted: {painted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trashed_rows_menu_offers_restore_and_purge_and_nothing_from_the_live_vault() {
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::Trash);
+        assert_out_of_vault_menu(&p, &["Restore", PURGE_LABEL]);
+    }
+
+    #[test]
+    fn an_archived_rows_menu_offers_unarchive_and_nothing_from_the_live_vault() {
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::Archive);
+        assert_out_of_vault_menu(&p, &["Unarchive"]);
+        // Archive's menu is the one-entry case, so the absence of Trash's own
+        // two entries is worth stating: the two rows must not share a menu
+        // either.
+        let painted = painted_strings(&p);
+        for entry in ["Restore", PURGE_LABEL] {
+            assert!(!painted.contains(&entry), "an archived row offered {entry:?}");
+        }
+    }
+
+    #[test]
+    fn the_same_row_under_the_live_vault_still_gets_the_live_menu() {
+        // The control for BOTH tests above: their negatives would also be
+        // satisfied by a `draw_item_list` that had stopped drawing the live
+        // menu at all, or by a `full_login` that had stopped carrying the
+        // fields those entries depend on.
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::All);
+        let painted = painted_strings(&p);
+        for entry in LIVE_ONLY_ENTRIES {
+            assert!(
+                painted.contains(&entry),
+                "the LIVE menu is missing {entry:?}; painted: {painted:?}"
+            );
+        }
+        for entry in ["Restore", "Unarchive", PURGE_LABEL] {
+            assert!(!painted.contains(&entry), "a live row offered {entry:?}");
+        }
+    }
+
+    #[test]
+    fn a_trashed_rows_purge_entry_arms_the_same_two_click_confirmation() {
+        // `delete_pending` reaches the out-of-vault menu too -- the one
+        // irreversible entry in this window, and the only one whose wording
+        // changes. Reaching it proves `draw_item_list` forwards both the
+        // source AND the pending id into the same call.
+        let items = vec![full_login("Ledgerline")];
+        let p = open_menu_with(
+            &items,
+            vec![],
+            Some("Ledgerline".to_string()),
+            0,
+            SidebarFilter::Trash,
+        );
+        let painted = painted_strings(&p);
+        assert!(
+            painted.contains(&PURGE_CONFIRM_LABEL),
+            "the armed \"Delete forever\" wording never reached the trash menu; \
+             painted: {painted:?}"
+        );
+        assert!(!painted.contains(&PURGE_LABEL), "both wordings were painted: {painted:?}");
+    }
+
+    #[test]
+    fn choosing_restore_on_a_trashed_row_returns_the_restore_command() {
+        // The entries are not merely painted: clicking one has to come back
+        // out of `draw_item_list` as the command `vault_window::mod`'s arm
+        // acts on. A menu that painted "Restore" and returned
+        // `ItemListAction::None` is the dead-button shape this whole feature
+        // exists to close.
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = choose_entry_under(&items, vec![], 0, "Restore", SidebarFilter::Trash);
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Ledgerline".to_string(),
+                command: RowCommand::Restore
+            },
+            "clicking Restore did not return the Restore command"
+        );
+    }
+
+    #[test]
+    fn choosing_unarchive_on_an_archived_row_returns_the_unarchive_command() {
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = choose_entry_under(&items, vec![], 0, "Unarchive", SidebarFilter::Archive);
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Ledgerline".to_string(),
+                command: RowCommand::Unarchive
+            },
+            "clicking Unarchive did not return the Unarchive command"
+        );
     }
 }
 
@@ -3372,7 +3675,7 @@ mod toolbar_strip_tests {
             ctx.run_ui(raw, |ui| {
                 draw_item_list(
                     ui,
-                    items,
+                    Some(items),
                     &[],
                     &SidebarFilter::All,
                     search,
@@ -3816,7 +4119,7 @@ mod move_error_band_tests {
             ctx.run_ui(raw, |ui| {
                 action = draw_item_list(
                     ui,
-                    items,
+                    Some(items),
                     &[],
                     &SidebarFilter::All,
                     &mut search,

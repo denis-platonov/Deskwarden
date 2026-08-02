@@ -1112,7 +1112,7 @@ mod drag_and_drop_tests {
                         |ui| {
                             draw_item_list(
                                 ui,
-                                items,
+                                Some(items),
                                 folders,
                                 &SidebarFilter::All,
                                 &mut search,

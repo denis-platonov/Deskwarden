@@ -1207,14 +1207,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // pane filtered a list that by construction holds none of
                 // its members.
                 //
-                // An unfetched list shows as empty for the one or two frames
-                // before the fetch lands; the sidebar badge says "not known
-                // yet" throughout, which is the honest half of that pair.
-                let shown: &[VaultItem] = match filter.source() {
-                    sidebar::FilterSource::LiveVault => &items,
-                    sidebar::FilterSource::Trash => trash_list.items.as_deref().unwrap_or(&[]),
-                    sidebar::FilterSource::Archive => archive_list.items.as_deref().unwrap_or(&[]),
-                };
+                // `None` is carried through to `draw_item_list` rather than
+                // flattened to `&[]` here, because the search placeholder
+                // beneath the toolbar has to be able to tell "no items" from
+                // "no answer yet" -- see `list_unless_unfetched`.
+                let shown: Option<&[VaultItem]> = list_unless_unfetched(
+                    filter.source(),
+                    &items,
+                    trash_list.items.as_deref(),
+                    archive_list.items.as_deref(),
+                );
                 match draw_item_list(
                     ui,
                     shown,
@@ -1361,15 +1363,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // -- a trashed or archived item is not in the live snapshot at
             // all, so looking it up there would find nothing and every entry
             // on those two menus would be a click that did nothing.
-            let from_list = match filter.source() {
-                sidebar::FilterSource::LiveVault => items.iter().find(|i| i.id == id),
-                sidebar::FilterSource::Trash => {
-                    trash_list.items.iter().flatten().find(|i| i.id == id)
-                }
-                sidebar::FilterSource::Archive => {
-                    archive_list.items.iter().flatten().find(|i| i.id == id)
-                }
-            };
+            let from_list = list_for(
+                filter.source(),
+                &items,
+                trash_list.items.as_deref(),
+                archive_list.items.as_deref(),
+            )
+            .iter()
+            .find(|i| i.id == id);
             if let Some(item) = from_list.cloned() {
                 let login = item.login.as_ref();
                 match command {
@@ -1579,15 +1580,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 let selected_item = selected_id
                     .as_ref()
                     .and_then(|id| {
-                        match filter.source() {
-                            sidebar::FilterSource::LiveVault => items.iter().find(|i| &i.id == id),
-                            sidebar::FilterSource::Trash => {
-                                trash_list.items.iter().flatten().find(|i| &i.id == id)
-                            }
-                            sidebar::FilterSource::Archive => {
-                                archive_list.items.iter().flatten().find(|i| &i.id == id)
-                            }
-                        }
+                        list_for(
+                            filter.source(),
+                            &items,
+                            trash_list.items.as_deref(),
+                            archive_list.items.as_deref(),
+                        )
+                        .iter()
+                        .find(|i| &i.id == id)
                     })
                     .cloned();
                 // `Some` only for Trash and Archive -- see `OutOfVault`,
@@ -2639,6 +2639,58 @@ fn apply_totp_poll_result(
 /// every frame. Without it, `wants_fetch` would be true again on the very
 /// next frame and a `bw serve` that is down would be hammered at the frame
 /// rate for as long as the row stays selected.
+/// **The list a given row actually reads**, or `None` when that list exists
+/// but has not been fetched yet.
+///
+/// This is the whole of the Trash/Archive plumbing's central decision, and it
+/// is a function rather than three copies of one `match` because it WAS three
+/// copies. `run` has to answer this question at three unrelated points -- the
+/// list the item pane draws, the item a selection resolves to, and the item a
+/// right-click command acts on -- all inside a closure no test in this crate
+/// can call. A reviewer replaced the Trash and Archive arms of the FIRST of
+/// them with `&items` and the whole suite stayed green while both rows listed
+/// nothing, which is precisely the defect the feature was written to fix,
+/// restored and invisible.
+///
+/// One function cannot make those three sites agree by itself -- a caller can
+/// still hand it the wrong arguments -- but it turns three untested decisions
+/// into one directly tested one, and `out_of_vault_wiring_tests` counts the
+/// call sites so a re-inlined `match` cannot creep back in beside it.
+///
+/// `None` is NOT `&[]`, for [`sidebar::badge_text`]'s reason: "not fetched
+/// yet" and "fetched, and empty" are different facts, and the search
+/// placeholder one control to the right of the badge was still printing `0`
+/// for the first of them. [`list_for`] is the flattening, for the callers
+/// that genuinely only want something to iterate.
+fn list_unless_unfetched<'a>(
+    source: sidebar::FilterSource,
+    live: &'a [VaultItem],
+    trash: Option<&'a [VaultItem]>,
+    archive: Option<&'a [VaultItem]>,
+) -> Option<&'a [VaultItem]> {
+    match source {
+        // The live snapshot is always "fetched": before the first load lands
+        // it is legitimately empty, and the window has its own loading state
+        // for that.
+        sidebar::FilterSource::LiveVault => Some(live),
+        sidebar::FilterSource::Trash => trash,
+        sidebar::FilterSource::Archive => archive,
+    }
+}
+
+/// [`list_unless_unfetched`] for the callers that only need something to
+/// search. An unfetched list reads as empty for the one or two frames before
+/// its fetch lands -- the sidebar badge says "not known yet" throughout,
+/// which is the honest half of that pair.
+fn list_for<'a>(
+    source: sidebar::FilterSource,
+    live: &'a [VaultItem],
+    trash: Option<&'a [VaultItem]>,
+    archive: Option<&'a [VaultItem]>,
+) -> &'a [VaultItem] {
+    list_unless_unfetched(source, live, trash, archive).unwrap_or(&[])
+}
+
 #[derive(Default)]
 struct AuxList {
     items: Option<Vec<VaultItem>>,
@@ -4830,6 +4882,307 @@ mod generate_failure_wiring_tests {
              once. Zero means the precedence `inline_notice_tests` pins is not the one \
              the window uses"
         );
+    }
+}
+
+/// The plumbing that reaches the Trash/Archive feature's pure decisions.
+///
+/// Those decisions -- `sidebar::menu_entries`, `items_for`, `badge_for`,
+/// `badge_text`, `AuxList::wants_fetch`, `SidebarFilter::source` -- are
+/// genuinely well tested. **The wiring that carries a value from the sidebar
+/// filter to each of them was not**, and all of it lives inside `run`'s
+/// update closure, which no test in this crate can call. A reviewer applied
+/// five separate mutations to it, each alone, and the entire suite stayed
+/// green through every one:
+///
+///  * the item pane read `&items` under Trash and Archive -- both rows list
+///    nothing, which is the original defect the feature was written to fix;
+///  * the detail pane's `out_of_vault` became a literal `None` -- a trashed
+///    item opens the ordinary Read pane offering Edit, Fill, Delete and the
+///    copy rows, every one of them a no-op;
+///  * the aux fetch's `selected` argument became `false` -- neither list is
+///    ever fetched, so both rows are a permanent en dash over an empty pane
+///    and the feature ships 100% dead;
+///  * the four per-command `invalidate()` calls were deleted -- a restored
+///    item keeps sitting in Trash, and keeps being counted there.
+///
+/// (The fifth, the row menu's `filter.source()`, is closed behaviourally by
+/// `item_list::row_tile_tests`, which paints the real menu under a real
+/// Trash filter and clicks a real entry in it.)
+///
+/// These are source-text guards for the same reason
+/// `generate_failure_wiring_tests` and `window_era_placement_tests` are: the
+/// code they cover is unreachable from a test, so the alternative is not a
+/// better test but no test. **Every needle is split with `concat!`**, because
+/// `include_str!("mod.rs")` pulls this module in too -- a needle written as
+/// one literal always matches, inside the const that defines it, which is how
+/// several guards in this file once passed with their regression live. The
+/// count assertions enforce the split rather than this comment.
+#[cfg(test)]
+mod out_of_vault_wiring_tests {
+    /// The `Option`-preserving selection: `run`'s `shown`, plus `list_for`'s
+    /// own delegation to it.
+    const SELECTS_A_LIST: &str = concat!("list_unless_", "unfetched(");
+    /// The flattening, called by the two sites that only need something to
+    /// search. Neither needle matches its own `fn` item, which carries a
+    /// lifetime parameter between the name and the paren.
+    const FLATTENED: &str = concat!("list_", "for(");
+    const DEFINES_SELECTS: &str = concat!("fn list_unless_unfetched", "<'a>(");
+    const DEFINES_FLATTENED: &str = concat!("fn list_", "for<'a>(");
+    /// The one place a `FilterSource` may still be taken apart by hand.
+    const INLINE_MATCH: &str = concat!("sidebar::FilterSource::", "Trash =>");
+    /// The detail pane's out-of-vault branch: the derivation, and the
+    /// condition that reads it.
+    const DERIVES_OUT_OF_VAULT: &str =
+        concat!("let out_of_vault = filter.source()", ".out_of_vault();");
+    const PANE_BRANCH: &str =
+        concat!("_ if out_of_vault.is_some() && ", "selected_item.is_some() =>");
+    const PANE_CALL: &str = concat!("detail::draw_out_of_", "vault_read(");
+    /// The aux fetch's own "is this row the one on screen?".
+    const SELECTED_SOURCE: &str =
+        concat!("let selected_source = filter.source()", ".out_of_vault();");
+    const WANTS_FETCH: &str = concat!("list.wants_fetch(selected_source == ", "Some(which))");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// Production code only. Every needle here describes a decision `run`
+    /// makes; the test modules below legitimately spell the same things while
+    /// exercising them. Same marker and same reasoning as
+    /// `window_era_placement_tests::production`, which also states why
+    /// slicing at the FIRST `#[cfg(test)]` is sound.
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    #[test]
+    fn every_list_selection_goes_through_the_one_tested_function() {
+        // Three call sites, and they are the whole of the feature's reach
+        // into `run`: the list the item pane draws, the item a selection
+        // resolves to, and the item a right-click command acts on. Each was
+        // its own hand-written `match`, and mutating the first alone left
+        // the suite green.
+        assert_eq!(
+            production().matches(SELECTS_A_LIST).count(),
+            2,
+            "expected {SELECTS_A_LIST:?} twice in production code: `run`'s `shown`, \
+             which must keep the unfetched/empty distinction so the search placeholder \
+             can tell them apart, and `list_for`'s own delegation to it. Fewer means \
+             one of them decides for itself again -- which is how the item pane came to \
+             filter `items` under Trash and list nothing."
+        );
+        assert_eq!(
+            production().matches(FLATTENED).count(),
+            2,
+            "expected {FLATTENED:?} twice in production code: the selection lookup that \
+             feeds the detail pane, and the lookup that resolves a right-clicked row to \
+             the item its command acts on. Both must read the list the row was DRAWN \
+             from -- resolved against `items`, a trashed row finds nothing and every \
+             entry on its menu is a click that does nothing."
+        );
+        // Positive controls for the two counts above: each is satisfied for
+        // free if the function it names has been deleted and its call sites
+        // now reach something else spelled the same way.
+        for definition in [DEFINES_SELECTS, DEFINES_FLATTENED] {
+            assert_eq!(
+                production().matches(definition).count(),
+                1,
+                "{definition:?} is not defined exactly once in production code -- it was \
+                 renamed or removed, so the counts above are measuring something else"
+            );
+        }
+    }
+
+    #[test]
+    fn no_call_site_takes_a_filter_source_apart_by_hand_any_more() {
+        // The mutation this catches is the re-inlining: a future edit that
+        // spells the three-way match out at a call site again compiles, is
+        // invisible to the counts above (which only notice a MISSING call),
+        // and reintroduces exactly the divergence between call sites that
+        // `list_unless_unfetched` exists to make impossible.
+        assert_eq!(
+            production().matches(INLINE_MATCH).count(),
+            1,
+            "a `FilterSource` is matched on outside `list_unless_unfetched`. That \
+             decision belongs in one place: three copies of it is what the item pane, \
+             the selection lookup and the row-command lookup each had, and only one of \
+             them had to be wrong."
+        );
+    }
+
+    #[test]
+    fn the_detail_panes_out_of_vault_branch_is_derived_from_the_live_filter() {
+        // Replacing the derivation with a literal `None` -- one line -- left
+        // the suite green while a trashed item opened the ordinary Read pane
+        // with Edit, Fill, Delete, the copy rows and the favourite star, all
+        // of which read or write through the live list and so do nothing.
+        //
+        // The pre-existing guard only proved `draw_out_of_vault_read(`
+        // appeared SOMEWHERE in the file, and said nothing about the
+        // condition that reaches it, which is why that mutation passed.
+        for (needle, why) in [
+            (
+                DERIVES_OUT_OF_VAULT,
+                "the branch condition is no longer derived from the live filter. A \
+                 constant here compiles and is invisible: the pane simply stops being \
+                 reached, and a trashed item gets the live Read pane instead",
+            ),
+            (
+                PANE_BRANCH,
+                "the out-of-vault arm's condition changed. It must be reached for \
+                 exactly a row outside the live vault that has a selection",
+            ),
+            (
+                PANE_CALL,
+                "nothing calls the out-of-vault pane -- the branch is there and inert",
+            ),
+        ] {
+            assert_eq!(
+                production().matches(needle).count(),
+                1,
+                "expected {needle:?} exactly once in production code -- {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_aux_fetch_asks_only_for_the_row_that_is_selected() {
+        // `wants_fetch(false)` is a one-word mutation that ships the feature
+        // 100% dead: neither list is ever fetched, so both rows sit at a
+        // permanent en dash over an empty pane. The suite stayed green
+        // because `wants_fetch` itself is pure and perfectly tested -- it is
+        // the ARGUMENT that was never pinned.
+        for (needle, why) in [
+            (
+                SELECTED_SOURCE,
+                "the selected row is no longer resolved to an `OutOfVault` before the \
+                 fetch loop, so nothing can tell the loop which list is on screen",
+            ),
+            (
+                WANTS_FETCH,
+                "the fetch loop does not ask `wants_fetch` about the SELECTED row. A \
+                 constant `false` never fetches either list; a constant `true` fetches \
+                 both on the first frame, which is the per-visit cost this design \
+                 exists to avoid",
+            ),
+        ] {
+            assert_eq!(
+                production().matches(needle).count(),
+                1,
+                "expected {needle:?} exactly once in production code -- {why}"
+            );
+        }
+    }
+
+    /// The four commands that move an item between this window's three lists,
+    /// and the on-demand list each one must drop.
+    ///
+    /// The list is not cached anywhere, so refetching it is the cheap,
+    /// always-correct answer -- but only if the command actually asks. After
+    /// a Restore that does not, the restored item keeps sitting in Trash and
+    /// keeps being counted there for the life of the window, because
+    /// `wants_fetch` sees a list already in hand.
+    const COMMAND_ARMS: [(&str, &str); 4] = [
+        (
+            concat!("RowCommand::Arch", "ive => {"),
+            concat!("archive_list.inval", "idate();"),
+        ),
+        (
+            concat!("RowCommand::Unarch", "ive => {"),
+            concat!("archive_list.inval", "idate();"),
+        ),
+        (
+            concat!("RowCommand::Rest", "ore => {"),
+            concat!("trash_list.inval", "idate();"),
+        ),
+        (
+            concat!("RowCommand::PurgeFor", "ever => {"),
+            concat!("trash_list.inval", "idate();"),
+        ),
+    ];
+
+    /// Where an arm body stops. The four arms are consecutive, so each ends
+    /// at the next `RowCommand::` of the same `match`; the last ends at the
+    /// panel that follows the whole block.
+    const NEXT_ARM: &str = concat!("item_list::Row", "Command::");
+    const AFTER_LAST_ARM: &str = concat!("egui::CentralPanel", "::default()");
+
+    /// The body of one command arm, from its own `=> {` to the start of the
+    /// next arm.
+    ///
+    /// **Slicing is the entire point of this guard.** The pre-existing
+    /// `both_on_demand_lists_are_dropped_when_the_vault_reloads` searches the
+    /// WHOLE file for its two needles, and the two calls at the vault-reload
+    /// site satisfy it on their own -- so all four per-command invalidations
+    /// were removable with the suite still green. A needle that must appear
+    /// within each arm's own slice is the shape that works. Same idiom as
+    /// `generate_failure_wiring_tests::arm_bodies`.
+    fn arm_body(marker: &str) -> &'static str {
+        let source = production();
+        let at = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("no {marker:?} arm in this file"));
+        let rest = &source[at + marker.len()..];
+        let end = rest
+            .find(NEXT_ARM)
+            .or_else(|| rest.find(AFTER_LAST_ARM))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {NEXT_ARM:?} or {AFTER_LAST_ARM:?} after the {marker:?} arm -- \
+                     this guard slices the arm body up to one of them and cannot without it"
+                )
+            });
+        &rest[..end]
+    }
+
+    #[test]
+    fn each_list_moving_command_drops_the_list_it_moved_an_item_out_of() {
+        for (marker, invalidates) in COMMAND_ARMS {
+            let body = arm_body(marker);
+            assert_eq!(
+                body.matches(invalidates).count(),
+                1,
+                "the {marker:?} arm does not call {invalidates:?}. That on-demand list is \
+                 not cached anywhere and is never pruned in place, so without this the row \
+                 keeps showing -- and counting -- an item that is no longer in it, for the \
+                 life of the window: `wants_fetch` sees a list already in hand and never \
+                 asks again.\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_command_arm_slices_are_the_arms_they_claim_to_be() {
+        // Positive control for the test above. Every needle it checks is an
+        // "appears once" count, which a slice that came out empty or landed
+        // on the wrong region would fail -- but for the wrong reason, and
+        // with a message pointing at production code rather than at this
+        // guard. These say which it is.
+        for (marker, _) in COMMAND_ARMS {
+            let body = arm_body(marker);
+            assert!(
+                !body.trim().is_empty(),
+                "the {marker:?} slice is empty -- the arm markers or the terminators are \
+                 stale, and the guard above proved nothing"
+            );
+            assert!(
+                body.contains(concat!("flag_reauth_if_", "unauthorized(")),
+                "the {marker:?} slice does not contain that arm's own failure handling, \
+                 so it is not the arm body.\n{body}"
+            );
+        }
+        // And that the four are really four distinct regions: a terminator
+        // that stopped matching would make each slice run to the end of the
+        // file, and every needle would then be found in someone else's arm.
+        let mut bodies: Vec<&str> = COMMAND_ARMS.iter().map(|(m, _)| arm_body(m)).collect();
+        bodies.sort_unstable();
+        bodies.dedup();
+        assert_eq!(bodies.len(), 4, "two command arms sliced to the same text");
     }
 }
 
