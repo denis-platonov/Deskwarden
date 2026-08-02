@@ -2123,3 +2123,383 @@ mod tests {
         }
     }
 }
+
+/// The generator row's **widget bindings**, which none of the tests above can
+/// see.
+///
+/// `generator_request` and `set_generated_password` are pure, directly tested,
+/// and were never the risk. What was untested is what the three widgets beside
+/// the password box hand them, and a reviewer proved the gap with three
+/// mutations that left the whole suite green: deleting the Generate button
+/// outright (the feature ships inert, and `EditAction::GeneratePassword` being
+/// `pub` means not even a dead-code warning), binding the combo's "Password"
+/// entry to `true` (picking Password yields a passphrase), and pointing the
+/// "N words" spinner at `generator.length` (setting "8 words" edits the
+/// character count instead).
+///
+/// These are **behavioural**, not source-text guards. `draw_detail_edit` takes
+/// a `&mut Ui` and returns its action, so a headless `egui::Context` really can
+/// press these widgets -- the same harness `prefs_ui`, `detail.rs` and
+/// `item_list.rs` already run. The file's one source guard,
+/// `the_folder_dropdown_offers_exactly_the_assignable_folders`, says "no test
+/// in this crate can click that combo box"; that was true of the loop it
+/// guards, whose input is assembled outside the closure, but it is not true of
+/// a click, and a guard that watches the pixels is worth more than one that
+/// watches the spelling.
+///
+/// Every assertion is paired with a positive control, because each of these
+/// tests has a way to pass while seeing nothing: a click that misses every
+/// widget also leaves the action `None`, and a combo that never opened also
+/// paints no entry to click.
+#[cfg(test)]
+mod generator_row_tests {
+    use super::*;
+    use eframe::egui::{Pos2, Rect};
+
+    /// Wide enough that the generator row is not wrapped and tall enough that
+    /// the combo's popup opens *downward*, which `popup_entry` relies on.
+    const BODY: egui::Vec2 = egui::vec2(560.0, 900.0);
+
+    #[derive(Default)]
+    struct Painted {
+        texts: Vec<(String, Rect)>,
+    }
+
+    impl Painted {
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn rects_of(&self, label: &str) -> Vec<Rect> {
+            self.texts.iter().filter(|(t, _)| t == label).map(|(_, r)| *r).collect()
+        }
+
+        /// The one rect painting `label`, or a failure naming everything that
+        /// *was* painted -- which is what turns "the button is gone" into a
+        /// readable message instead of a silent no-op click.
+        fn rect_of(&self, label: &str) -> Rect {
+            let found = self.rects_of(label);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} in the edit form, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
+        /// The combo BUTTON showing `label`: the last rect painting it, since
+        /// this form paints the field label "Password" above the row and the
+        /// combo's own `selected_text` may spell the same word.
+        fn combo_button(&self, label: &str) -> Rect {
+            *self.rects_of(label).last().unwrap_or_else(|| {
+                panic!(
+                    "the generator combo is not showing {label:?}; painted: {:?}",
+                    self.strings()
+                )
+            })
+        }
+
+        /// The combo popup's entry for `label`: the one painted BELOW the
+        /// closed combo button, so it cannot be confused with the button's own
+        /// `selected_text` (which spells one of the same two words).
+        fn popup_entry(&self, label: &str, button: Rect) -> Rect {
+            let found: Vec<Rect> = self
+                .rects_of(label)
+                .into_iter()
+                .filter(|r| r.center().y > button.bottom())
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} row in the open generator combo, found {}; \
+                 painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+    }
+
+    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => painted.texts.push((
+                text.galley.text().to_string(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, painted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn raw_input(events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY)),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A context with `theme::apply`'s fonts live. The two throwaway frames are
+    /// the ones every other harness in this crate runs: a font set registered
+    /// during a frame is only usable from the start of the next one.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
+        ctx
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        draft: &mut EditDraft,
+        events: &[egui::Event],
+    ) -> (EditAction, Painted) {
+        let mut action = EditAction::None;
+        let output = ctx.run_ui(raw_input(events), |ui| {
+            action = draw_detail_edit(ui, draft, &[], false);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        (action, painted)
+    }
+
+    /// A full press-and-release, which is what egui needs before it will report
+    /// `Response::clicked` -- a press alone is not a click.
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// A login draft with both sizes set to numbers neither default nor equal,
+    /// so a spinner wired to the wrong field paints a visibly wrong number
+    /// rather than a coincidentally right one.
+    fn login_draft(passphrase: bool) -> EditDraft {
+        let mut draft = EditDraft::empty();
+        draft.generator = GeneratorDraft { passphrase, length: 33, words: 7 };
+        draft
+    }
+
+    // -- the Generate button -----------------------------------------------
+
+    #[test]
+    fn clicking_generate_is_what_asks_the_caller_to_generate() {
+        // Mutation this catches: delete the button. Nothing else in the crate
+        // notices -- `EditAction::GeneratePassword` is `pub`, so its remaining
+        // producers being zero is not even a warning, and every test of the
+        // conversion functions keeps passing while the feature is inert.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+
+        let (idle, first) = frame(&ctx, &mut draft, &[]);
+        assert_eq!(
+            idle,
+            EditAction::None,
+            "the form reported an action on a frame with no input at all"
+        );
+        let button = first.rect_of("Generate");
+
+        let (action, _) = frame(&ctx, &mut draft, &click(button.center()));
+        assert_eq!(
+            action,
+            EditAction::GeneratePassword,
+            "clicking Generate did not ask for a password; the button is decoration"
+        );
+    }
+
+    #[test]
+    fn a_click_that_misses_the_generate_button_generates_nothing() {
+        // The positive control for the test above: if a click anywhere in the
+        // form produced `GeneratePassword`, that test would pass with the
+        // button deleted and Cancel under the cursor.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+        let (_, first) = frame(&ctx, &mut draft, &[]);
+        let button = first.rect_of("Generate");
+
+        let miss = Pos2::new(button.center().x, button.top() - 40.0);
+        let (action, _) = frame(&ctx, &mut draft, &click(miss));
+        assert_eq!(action, EditAction::None, "a click that hit nothing still generated");
+    }
+
+    // -- the kind combo ----------------------------------------------------
+
+    /// Opens the combo and clicks the entry named `entry`, returning the draft
+    /// afterwards. Four frames, and the shape is egui's: the popup only PAINTS
+    /// on the frame after the button that opened it was clicked, so the frame
+    /// that locates a row and the frame that clicks the button cannot be the
+    /// same one.
+    fn pick_generator_kind(start: bool, entry: &str) -> GeneratorDraft {
+        let ctx = styled_context();
+        let mut draft = login_draft(start);
+
+        let (_, closed) = frame(&ctx, &mut draft, &[]);
+        let button = closed.combo_button(if start { "Passphrase" } else { "Password" });
+
+        let _ = frame(&ctx, &mut draft, &click(button.center()));
+        let (_, open) = frame(&ctx, &mut draft, &[]);
+        let row = open.popup_entry(entry, button);
+
+        let _ = frame(&ctx, &mut draft, &click(row.center()));
+        draft.generator.clone()
+    }
+
+    #[test]
+    fn picking_password_in_the_combo_asks_for_a_password() {
+        // Mutation this catches: `selectable_value(&mut draft.generator
+        // .passphrase, true, "Password")`. The conversion test
+        // `a_passphrase_and_a_password_do_not_share_one_number` keeps passing
+        // through that -- it guards the conversion, and this is the binding.
+        let generator = pick_generator_kind(true, "Password");
+        assert!(
+            !generator.passphrase,
+            "the combo's \"Password\" row does not select a password"
+        );
+    }
+
+    #[test]
+    fn picking_passphrase_in_the_combo_asks_for_a_passphrase() {
+        // The other direction, and the positive control for the one above: a
+        // combo whose rows were both bound to `false` would satisfy that test
+        // alone, as would one whose rows were inert with the draft already
+        // holding the expected value.
+        let generator = pick_generator_kind(false, "Passphrase");
+        assert!(
+            generator.passphrase,
+            "the combo's \"Passphrase\" row does not select a passphrase"
+        );
+    }
+
+    // -- the size spinner --------------------------------------------------
+
+    /// The number a `DragValue` is showing, and the rect to grab it by.
+    ///
+    /// egui paints the value and the suffix as two separate galleys ("7" and
+    /// " words"), so neither half alone identifies the widget and no assertion
+    /// can match the joined string. This pairs them by adjacency: the text
+    /// ending immediately left of the suffix, on the suffix's own line.
+    fn spinner(painted: &Painted, suffix: &str) -> (String, Rect) {
+        let suffix_rect = painted.rect_of(suffix);
+        let mut left: Vec<&(String, Rect)> = painted
+            .texts
+            .iter()
+            .filter(|(_, r)| {
+                r.max.x <= suffix_rect.min.x + 1.0
+                    && r.center().y > suffix_rect.top()
+                    && r.center().y < suffix_rect.bottom()
+            })
+            .collect();
+        left.sort_by(|a, b| a.1.max.x.total_cmp(&b.1.max.x));
+        let (value, rect) = left.last().unwrap_or_else(|| {
+            panic!(
+                "nothing is painted left of the {suffix:?} suffix, so that spinner is showing \
+                 no number at all; painted: {:?}",
+                painted.strings()
+            )
+        });
+        (value.clone(), rect.union(suffix_rect))
+    }
+
+    #[test]
+    fn the_words_spinner_shows_and_edits_the_word_count() {
+        // Mutation this catches: `DragValue::new(&mut draft.generator.length)`
+        // under the passphrase arm. The suffix still reads " words" while the
+        // number is the character count, so setting "8 words" silently retunes
+        // the password length and the word count stays pinned at its default.
+        let ctx = styled_context();
+        let mut draft = login_draft(true);
+
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let (shown, rect) = spinner(&painted, " words");
+        assert_eq!(
+            shown, "7",
+            "the words spinner is showing {shown:?}, not `generator.words` (7) -- it is bound \
+             to the wrong number"
+        );
+
+        drag(&ctx, &mut draft, rect.center());
+        assert_ne!(draft.generator.words, 7, "dragging the words spinner changed no word count");
+        assert_eq!(
+            draft.generator.length, 33,
+            "dragging the words spinner moved the password's character count"
+        );
+    }
+
+    #[test]
+    fn the_chars_spinner_shows_and_edits_the_character_count() {
+        // The mirror, and the positive control: without it, both spinners
+        // could be bound to `words` and the test above would still pass.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let (shown, rect) = spinner(&painted, " chars");
+        assert_eq!(
+            shown, "33",
+            "the chars spinner is showing {shown:?}, not `generator.length` (33) -- it is bound \
+             to the wrong number"
+        );
+
+        drag(&ctx, &mut draft, rect.center());
+        assert_ne!(
+            draft.generator.length, 33,
+            "dragging the chars spinner changed no character count"
+        );
+        assert_eq!(
+            draft.generator.words, 7,
+            "dragging the chars spinner moved the passphrase's word count"
+        );
+    }
+
+    /// Press on a `DragValue` and pull it right across three frames. The
+    /// distance is far more than one step at any drag speed egui picks, and
+    /// the tests assert only *which* field moved, never by how much.
+    fn drag(ctx: &egui::Context, draft: &mut EditDraft, from: Pos2) {
+        let _ = frame(
+            ctx,
+            draft,
+            &[
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let to = from + egui::vec2(120.0, 0.0);
+        let _ = frame(ctx, draft, &[egui::Event::PointerMoved(to)]);
+        let _ = frame(
+            ctx,
+            draft,
+            &[egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+    }
+}
