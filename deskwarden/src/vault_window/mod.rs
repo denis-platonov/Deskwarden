@@ -5208,9 +5208,51 @@ mod generate_failure_wiring_tests {
     const DIES_WITH_THE_DRAFT: &str =
         concat!("let editor_is_closed = matches!(mode, DetailMode::", "Read);");
     const CLEARS_GENERATE: &str = concat!("generate_error = ", "None;");
+    /// The condition that SPENDS the binding, and the exact inverse of it.
+    ///
+    /// Naming the binding pins that the frame knows whether an editor is
+    /// open; it says nothing about which way the clear is hung off it. One
+    /// `!` here left all 854 tests green while clearing `generate_error` on
+    /// exactly the frames where the editor is OPEN -- so the failure is
+    /// wiped on the frame it is set, before the band that renders it next
+    /// frame ever sees it: the Generate band becomes permanently invisible
+    /// AND the stale band this clear exists to end comes straight back.
+    const GUARDED_BY: &str = concat!("if editor_is_", "closed {");
+    const INVERTED: &str = concat!("if !editor_is_", "closed");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
+    }
+
+    /// The text between a `{` that has just been consumed and its matching
+    /// `}`.
+    ///
+    /// Depth-counted rather than "up to the next `}`" for one reason: an
+    /// EMPTY block must come back as an empty slice. The guarded block left
+    /// empty with the clear moved out below it is the other half of the
+    /// polarity dodge -- it clears unconditionally, every frame -- and a
+    /// proximity window, or a slice that ran past the closing brace, cannot
+    /// tell it from the fix.
+    ///
+    /// (Neither this doc nor the ones below may SPELL the condition: the
+    /// needles are counted over `include_str!("mod.rs")`, which is this
+    /// module too, so a literal here would be an extra match. That is the
+    /// same rule the `concat!` splits obey, in comment form.)
+    fn braced_body(after_open: &str) -> &str {
+        let mut depth = 1usize;
+        for (at, ch) in after_open.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &after_open[..at];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after {GUARDED_BY:?} -- this guard slices the block it opens")
     }
 
     /// The body of each Generate arm: from the arm's own `=> {` up to the
@@ -5407,9 +5449,24 @@ mod generate_failure_wiring_tests {
         // click, which is the whole of what the band exists to prevent.
         //
         // The fix is one condition on `mode` rather than a clear at each of
-        // the five exits, so this guard is one needle: a future edit that
-        // deletes it, or moves the clear back to enumerating doors, fails
-        // here.
+        // the five exits, so this guard is three needles: the binding, the
+        // condition that spends it, and the clear INSIDE that condition's
+        // block. A future edit that deletes any of them, or moves the clear
+        // back to enumerating doors, fails here.
+        //
+        // An earlier form counted the binding and looked for the clear
+        // within the next 160 bytes, and so could not tell the fix from its
+        // exact inverse. Both of these passed it (neither is spelled out
+        // here -- see `braced_body`'s note on why a literal in this module
+        // would be an extra match):
+        //
+        //  * the condition NEGATED -- one character. Clears on exactly the
+        //    frames where the editor is OPEN, which is the frame a Generate
+        //    failure is set, so the band is never rendered at all and the
+        //    stale-band bug comes back with it.
+        //  * the condition's block left EMPTY with the clear moved below it
+        //    -- same two spellings, same distance apart, clearing
+        //    unconditionally every frame.
         let source = source();
         assert_eq!(
             source.matches(DIES_WITH_THE_DRAFT).count(),
@@ -5420,13 +5477,35 @@ mod generate_failure_wiring_tests {
              away -- on a screen where the row they acted on has not moved, which is the \
              same ambiguity `list_command_failure_message` was written to end."
         );
+        // Polarity, stated twice over: the un-negated condition is present
+        // exactly once, and the negated one is nowhere. Either count also
+        // enforces the `concat!` split -- re-joined, each needle would find
+        // itself in the const that defines it.
+        assert_eq!(
+            source.matches(GUARDED_BY).count(),
+            1,
+            "the clear is no longer hung off {GUARDED_BY:?}. That condition, un-negated, \
+             is the whole of the rule: a Generate failure belongs to an open draft, so it \
+             dies on the first frame there is no editor -- and never on the frame it was \
+             set, which is what would make the band invisible instead of transient."
+        );
+        assert_eq!(
+            source.matches(INVERTED).count(),
+            0,
+            "the clear is guarded by {INVERTED:?} -- the exact inverse of the fix. That \
+             clears `generate_error` on the frames where the editor is OPEN, i.e. on the \
+             frame the failure is set, so the band never renders; and it clears nothing \
+             once the draft is gone, so the stale band that outranks every later \
+             \"Couldn't archive ...\" is back."
+        );
         let at = source.find(DIES_WITH_THE_DRAFT).expect("counted above");
-        let after = &source[at..];
-        let window = &after[..after.len().min(160)];
+        let opens = at + source[at..].find(GUARDED_BY).expect("counted above");
+        let body = braced_body(&source[opens + GUARDED_BY.len()..]);
         assert!(
-            window.contains(CLEARS_GENERATE),
-            "the {DIES_WITH_THE_DRAFT:?} condition no longer clears the generate error. \
-             It is the only thing that condition is for.\n{window}"
+            body.contains(CLEARS_GENERATE),
+            "the {GUARDED_BY:?} block no longer clears the generate error. It is the only \
+             thing that condition is for, and the clear must be INSIDE the block: moved \
+             out below it, it runs every frame.\n{body}"
         );
     }
 }
@@ -5495,6 +5574,22 @@ mod out_of_vault_wiring_tests {
     /// theirs.
     const ARGUMENTS_END: &str = ");";
     const CHAINED_ARGUMENTS_END: &str = concat!(".it", "er()");
+    /// The two selection helpers as BARE names, for the shadowing guard.
+    /// Every needle above pins one of these names; none of them pins the
+    /// function it resolves to.
+    const SELECTION_HELPERS: [&str; 2] = [
+        concat!("list_unless_", "unfetched"),
+        concat!("list_", "for"),
+    ];
+    /// The only three things that may follow one of those names in
+    /// production: a call's own paren, the definition's lifetime parameter,
+    /// and the closing backtick of a doc link. Every way of BINDING the
+    /// name instead -- `use ...::name;`, `use {name}`, `use x as name;`,
+    /// `let name = ...`, a local `fn name(` -- leaves something else there,
+    /// or is caught by the call counts above.
+    const HELPER_MAY_BE_FOLLOWED_BY: [char; 3] = ['(', '<', '`'];
+    /// The one shadowing form that never spells the name at all.
+    const GLOB_IMPORT: &str = concat!("::", "*;");
     /// The detail pane's out-of-vault branch: the derivation, and the
     /// condition that reads it.
     const DERIVES_OUT_OF_VAULT: &str =
@@ -5625,6 +5720,73 @@ mod out_of_vault_wiring_tests {
         calls
     }
 
+    /// The index of the `)` that closes a `(` which has just been consumed.
+    ///
+    /// Depth-counted, because the argument lists here nest three levels
+    /// (`trash_list.items.as_deref()`), and the point is to land on the
+    /// call's OWN closing paren rather than on any `);` after it.
+    fn matching_paren(site: &str, after_open: &str) -> usize {
+        let mut depth = 1usize;
+        for (at, ch) in after_open.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return at;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parens after {site} -- this guard slices the call it opens")
+    }
+
+    #[test]
+    fn neither_selection_helper_can_be_shadowed_out_from_under_its_callers() {
+        // EVERY NEEDLE IN THIS MODULE PINS A NAME, NOT A FUNCTION. Adding a
+        // `pub fn list_unless_unfetched` to `sidebar.rs` that always answers
+        // `Some(live)`, plus a scope-local `use sidebar::list_unless_
+        // unfetched;` immediately above the `shown` binding, redirects the
+        // item pane's call for the whole of `run` -- the inner import
+        // shadows the module-level fn, `DEFINES_SELECTS` still finds the
+        // real definition, every count and every argument above still holds,
+        // and the suite stays green. The two `list_for` sites take the same
+        // edit.
+        //
+        // A shadow has to BIND the bare name, and no binding form puts a
+        // call's `(` or the definition's `<'a>` immediately after it. So the
+        // check is the complement: in production, every occurrence of either
+        // name is a call, the definition, or a doc link. A local `fn name(`
+        // slips past that one and is caught instead by the call counts in
+        // `every_list_selection_goes_through_the_one_tested_function`, which
+        // would see three occurrences where they require two.
+        for name in SELECTION_HELPERS {
+            for (at, _) in production().match_indices(name) {
+                let next = production()[at + name.len()..].chars().next();
+                assert!(
+                    next.is_some_and(|c| HELPER_MAY_BE_FOLLOWED_BY.contains(&c)),
+                    "{name:?} appears in production followed by {next:?}, which is neither \
+                     a call, the definition, nor a doc link -- so it is a BINDING of that \
+                     name, and every guard in this module that pins the name now pins the \
+                     binding instead of the function. Here: {:?}",
+                    production()[at..].chars().take(48).collect::<String>()
+                );
+            }
+        }
+        // The one shadowing form the loop above cannot see, because it never
+        // spells either name: a glob import in an inner scope shadows the
+        // module's own items for the rest of that scope. Production has none
+        // and does not need one.
+        assert_eq!(
+            production().matches(GLOB_IMPORT).count(),
+            0,
+            "production code has a glob import. A `use ...::*;` inside `run` shadows this \
+             module's own `list_unless_unfetched`/`list_for` for the rest of that scope, \
+             which is the one redirection the name check above cannot see."
+        );
+    }
+
     #[test]
     fn every_selection_site_passes_the_arguments_it_was_given() {
         // THE TWO GUARDS ABOVE PIN THAT A CALL HAPPENS, NOT WHAT IT SAYS.
@@ -5659,11 +5821,17 @@ mod out_of_vault_wiring_tests {
         //    call, shadows it and satisfies every needle here.
         //  * `production()` reads `include_str!("mod.rs")` only, so a
         //    hand-rolled decision moved into `sidebar.rs` or `item_list.rs`
-        //    and called from here is out of reach of `INLINE_MATCH`. (It is
-        //    NOT out of reach of this test at the item pane's site, whose
-        //    binding must still be `list_unless_unfetched`'s -- but the two
-        //    `list_for` sites are pinned by name, so a same-named helper
-        //    elsewhere would pass.)
+        //    and called from here is out of reach of `INLINE_MATCH`. All
+        //    three sites here are pinned by NAME -- the item pane's by the
+        //    binding it produces, the other two by `list_for` -- and a name
+        //    is not a function: a same-named helper in another module,
+        //    imported into scope, satisfies all of them.
+        //    `neither_selection_helper_can_be_shadowed_out_from_under_its_callers`
+        //    closes that second half by forbidding any BINDING of either
+        //    name in production; the hand-rolled-decision half stays open,
+        //    because a helper `sidebar.rs` exports under a DIFFERENT name
+        //    and this file merely calls is out of reach of every needle in
+        //    this module.
         //
         // Closing either needs a real behavioural test, and there is none to
         // be had: all three sites are inside `run`'s update closure, which
@@ -5677,6 +5845,35 @@ mod out_of_vault_wiring_tests {
         arguments_in_order(
             "the item pane's `shown`",
             argument_lists(SHOWN_BINDING, ARGUMENTS_END, 1)[0],
+        );
+        // AND THAT THE CALL IS THE WHOLE OF THE BINDING. `ARGUMENTS_END`
+        // stops at the call's own `);`, so anything CHAINED onto the result
+        // sits outside every needle above while all four still match, in
+        // order -- a fourth dodge past the pin:
+        //
+        //     )
+        //     .or(Some(items.as_slice()));
+        //
+        // which is the obvious wrong "fix" for a momentarily blank pane and
+        // makes Trash and Archive list the user's ENTIRE LIVE VAULT for
+        // every frame before the on-demand fetch lands: the original defect,
+        // restored for exactly the window `list_unless_unfetched` returns
+        // `None` to describe.
+        let at = production()
+            .find(SHOWN_BINDING)
+            .expect("`argument_lists` counted this exactly once just above");
+        let after = &production()[at + SHOWN_BINDING.len()..];
+        let close = matching_paren("the item pane's `shown`", after);
+        let tail = after[close + 1..].trim_start();
+        assert!(
+            tail.starts_with(';'),
+            "the item pane's `shown` chains onto `list_unless_unfetched`'s answer instead \
+             of being it. Everything past the call's closing paren is outside every needle \
+             above, and the `None` it may return is the search placeholder's only way to \
+             tell \"nothing in this list\" from \"no answer yet\" -- so a `.or(...)` here \
+             lists the live vault under Trash and Archive until the fetch lands. Found: \
+             {:?}",
+            tail.chars().take(60).collect::<String>()
         );
         // The selection lookup that feeds the detail pane, and the lookup
         // that resolves a right-clicked row to the item its command acts on.
@@ -5927,6 +6124,34 @@ mod out_of_vault_wiring_tests {
     const DELETE_REPORTS: &str = concat!("move_error = Some(mes", "sage);");
     /// The helper's name at a call site or a definition alike.
     const CALLS_DELETE: &str = concat!("delete_vault_", "item(");
+    /// The SECOND door: the detail pane's kebab, and the arm that follows it.
+    /// The row menu's door is `COMMAND_ARMS[0]`, sliced by `arm_body`.
+    const KEBAB_DOOR: &str = concat!("DetailAction::Del", "ete => {");
+    const AFTER_KEBAB_DOOR: &str = concat!("DetailAction::No", "ne => {}");
+
+    /// The detail pane's kebab arm, from its own `=> {` to the arm after it.
+    ///
+    /// Same idiom, and the same reason, as [`arm_body`]: a file-wide count
+    /// cannot tell which door supplied a match. `DELETE_REPORTS` counted 2
+    /// across the whole file while the kebab door was `let _ =
+    /// delete_vault_item(...)` and one unrelated `move_error =
+    /// Some(message);` elsewhere in `run` made up the difference -- which is
+    /// a plausible spelling for any future arm that gets a sentence back
+    /// from a helper.
+    fn kebab_delete_body() -> &'static str {
+        let source = production();
+        let at = source
+            .find(KEBAB_DOOR)
+            .unwrap_or_else(|| panic!("no {KEBAB_DOOR:?} arm in production code"));
+        let rest = &source[at + KEBAB_DOOR.len()..];
+        let end = rest.find(AFTER_KEBAB_DOOR).unwrap_or_else(|| {
+            panic!(
+                "no {AFTER_KEBAB_DOOR:?} after the {KEBAB_DOOR:?} arm -- this guard slices \
+                 the arm body up to it and cannot without it"
+            )
+        });
+        &rest[..end]
+    }
 
     #[test]
     fn the_soft_delete_is_wired_at_both_of_its_doors() {
@@ -5994,12 +6219,34 @@ mod out_of_vault_wiring_tests {
         // And that BOTH doors forward the sentence. `#[must_use]` on the
         // helper makes ignoring the return a warning rather than nothing, but
         // `let _ =` silences that, and this does not.
+        //
+        // ONCE IN EACH DOOR'S OWN SLICE, not twice in the file. The file-wide
+        // count let one door supply the other's needle: the kebab as `let _ =
+        // delete_vault_item(...)` plus one unrelated `if let Some(message) =
+        // ... { move_error = Some(message); }` anywhere else in `run` counts
+        // 2, keeps `CALLS_DELETE` at 3, and passes with the kebab door
+        // silent. Same shape as `COMMAND_ARMS`, which has always sliced the
+        // row menu's door for exactly this reason.
+        for (door, body) in [
+            ("the row menu's arm", arm_body(COMMAND_ARMS[0].0)),
+            ("the detail pane's kebab", kebab_delete_body()),
+        ] {
+            assert_eq!(
+                body.matches(DELETE_REPORTS).count(),
+                1,
+                "{door} does not do {DELETE_REPORTS:?} exactly once. `delete_vault_item` \
+                 returning a sentence that this door drops is exactly as silent as the \
+                 `log::warn!` it replaced -- and the other door having it proves nothing \
+                 about this one.\n{body}"
+            );
+        }
+        // And that there is no THIRD reporting site: two doors, two forwards.
         assert_eq!(
             production().matches(DELETE_REPORTS).count(),
             2,
-            "expected {DELETE_REPORTS:?} twice in production code -- once per door. \
-             `delete_vault_item` returning a sentence that a caller drops is exactly as \
-             silent as the `log::warn!` it replaced"
+            "expected {DELETE_REPORTS:?} twice in production code -- once per door, and \
+             the two slices above account for both. A third is either an undiscovered \
+             door onto the soft delete or a second spelling of the same forward"
         );
     }
 

@@ -4861,6 +4861,32 @@ mod tests {
             frame.header_strip()
         );
 
+        // THE FOURTH THING THE DOC ABOVE CLAIMS, which for four commits this
+        // body did not do. `rect_of` reads `texts`, which is the galley's
+        // SOURCE string -- the exact channel the doc says this avoids -- so
+        // the state this test was written for (the title elided to a lone
+        // "…" at x = 5.6..27.2) reported the full 26-character name and
+        // satisfied every rect assertion above. `header_layout`'s final
+        // branch with `stacked: false` restores that state at 298pt;
+        // `the_title_is_never_reduced_to_an_ellipsis_at_any_width` fails on
+        // it and, until this, nothing here did.
+        //
+        // Same threshold as that sweep, so the two agree on what "still a
+        // name" means: the ellipsis and the spaces do not count, and "…",
+        // " …" and "L…" are all the same failure.
+        let rendered = frame.rendered_glyphs("Ledgerline Treasury Portal");
+        let readable = rendered
+            .chars()
+            .filter(|c| *c != '\u{2026}' && !c.is_whitespace())
+            .count();
+        assert!(
+            readable >= 6,
+            "at the {MIN_PANE}pt minimum pane the header DREW {rendered:?} for a title of \
+             {:?} -- the name has been truncated past the point of being a name, and the \
+             rect assertions above pass precisely because it collapsed",
+            item.name
+        );
+
         // The positive control. Without it, a pane that painted no header at
         // all would satisfy every assertion above by vacuity -- and
         // `rect_of` would have caught that, but only for the two strings;
