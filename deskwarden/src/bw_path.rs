@@ -196,6 +196,118 @@ fn resolve_bw_exe_with(exe_dir: Option<&Path>, path_var: &OsStr) -> Option<PathB
     Some(install_bin_candidate(exe_dir))
 }
 
+/// The `bitwarden-cli` directory the CLI looks for *beside its own
+/// executable* — its `relativeDataDir`.
+///
+/// The CLI resolves its profile directory in this order:
+///
+/// ```ts
+/// if (fs.existsSync(relativeDataDir)) { p = relativeDataDir; }    // FIRST
+/// else if (process.env.BITWARDENCLI_APPDATA_DIR) { ... }
+/// ```
+///
+/// so while this directory exists, `BITWARDENCLI_APPDATA_DIR` is **ignored
+/// entirely** — see [`multi_account_from`] for why that is fatal to multiple
+/// accounts rather than merely inconvenient.
+///
+/// Joined onto the directory of `bw.exe` itself, never deskwarden's own
+/// directory and never the working directory: the CLI computes it from
+/// `__dirname`, and deskwarden's installer puts `bw.exe` one level down in
+/// `bin\`, so the two are genuinely different directories here.
+pub fn relative_data_dir(bw_exe: &Path) -> Option<PathBuf> {
+    bw_exe.parent().map(|dir| dir.join("bitwarden-cli"))
+}
+
+/// Whether deskwarden may offer more than one account at all.
+///
+/// Not a `bool`, because the two ways of saying "no" need different
+/// explanations and the user can only act on one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiAccountAvailability {
+    Available,
+    /// A `bitwarden-cli` directory exists beside `bw.exe`, so the CLI ignores
+    /// `BITWARDENCLI_APPDATA_DIR` and every account would share one profile.
+    BlockedByPortableProfile { relative_data_dir: PathBuf },
+    /// Startup verification never produced a path, so whether the trap above
+    /// is present cannot be checked at all.
+    BlockedByUnknownCliPath,
+}
+
+/// The decision, as a pure function of the two facts it needs.
+///
+/// Split out from [`multi_account_availability`] so it can be asserted in both
+/// directions without a filesystem: "blocked" and "available" are each one
+/// mutation apart from the other, and only a test that pins both can tell a
+/// working check from a check that always says no.
+///
+/// `relative == None` blocks. "We do not know where the CLI is" must never be
+/// read as "there is no portable profile beside it" — the whole hazard is a
+/// directory we would then never look for, and the failure it causes is silent
+/// state-mixing rather than an error.
+pub fn multi_account_from(
+    relative: Option<PathBuf>,
+    relative_exists: bool,
+) -> MultiAccountAvailability {
+    match relative {
+        None => MultiAccountAvailability::BlockedByUnknownCliPath,
+        Some(dir) if relative_exists => MultiAccountAvailability::BlockedByPortableProfile {
+            relative_data_dir: dir,
+        },
+        Some(_) => MultiAccountAvailability::Available,
+    }
+}
+
+/// The impure half: probes the real filesystem for the `bw.exe` it is given.
+///
+/// Takes the executable as an argument rather than reading
+/// [`verified_bw_exe`] itself so the `.exists()` call — the part a pure
+/// function cannot cover — is reachable from a test that plants a real
+/// directory. A test that rebuilt this expression itself would leave the
+/// production one unexercised.
+pub fn multi_account_availability_from_exe(bw_exe: Option<&Path>) -> MultiAccountAvailability {
+    let relative = bw_exe.and_then(relative_data_dir);
+    let exists = relative.as_ref().is_some_and(|dir| dir.exists());
+    multi_account_from(relative, exists)
+}
+
+/// Whether this process may offer multiple accounts, against the one verified
+/// `bw.exe`.
+pub fn multi_account_availability() -> MultiAccountAvailability {
+    multi_account_availability_from_exe(verified_bw_exe())
+}
+
+impl MultiAccountAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// Why multiple accounts are unavailable, or `None` when they are not.
+    ///
+    /// The portable-profile message names the directory: it is the one thing
+    /// the user can actually do something about, and without it the message is
+    /// unactionable.
+    pub fn explanation(&self) -> Option<String> {
+        match self {
+            Self::Available => None,
+            Self::BlockedByPortableProfile { relative_data_dir } => Some(format!(
+                "The Bitwarden CLI is using the profile directory beside itself:\n{}\n\n\
+                 While that directory exists the CLI ignores the per-account directory \
+                 Deskwarden would point it at, so every account would share one profile. \
+                 Deskwarden is staying a single-account app rather than mixing two accounts' \
+                 state together.\n\nRemove or rename that directory to enable multiple \
+                 accounts.",
+                relative_data_dir.display()
+            )),
+            Self::BlockedByUnknownCliPath => Some(
+                "Deskwarden could not work out where the Bitwarden CLI is, so it cannot check \
+                 whether the CLI is using a profile directory beside itself. Multiple accounts \
+                 are unavailable."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +465,169 @@ mod tests {
 
         assert_eq!(verified_bw_exe(), Some(first.as_path()));
         assert!(bw_command().is_ok());
+    }
+
+    #[test]
+    fn the_relative_data_dir_is_bitwarden_cli_beside_the_exe() {
+        assert_eq!(
+            relative_data_dir(Path::new(
+                r"C:\Users\me\AppData\Local\Deskwarden\bin\bw.exe"
+            )),
+            Some(PathBuf::from(
+                r"C:\Users\me\AppData\Local\Deskwarden\bin\bitwarden-cli"
+            )),
+        );
+        // Not the app directory one level up, and not the CWD: the CLI joins
+        // it onto the directory of its OWN executable, and deskwarden's
+        // installer puts `bw.exe` in `bin\` -- so looking one level up would
+        // check a directory the CLI never consults and miss the real trap.
+        assert_ne!(
+            relative_data_dir(Path::new(r"C:\a\bin\bw.exe")),
+            Some(PathBuf::from(r"C:\a\bitwarden-cli")),
+        );
+    }
+
+    #[test]
+    fn a_bitwarden_cli_directory_beside_the_exe_blocks_multi_account() {
+        let dir = PathBuf::from(r"C:\a\bin\bitwarden-cli");
+        assert_eq!(
+            multi_account_from(Some(dir.clone()), true),
+            MultiAccountAvailability::BlockedByPortableProfile {
+                relative_data_dir: dir
+            },
+            "BITWARDENCLI_APPDATA_DIR is IGNORED when this directory exists, so every \
+             account would silently share one profile"
+        );
+    }
+
+    #[test]
+    fn no_such_directory_means_multi_account_is_available() {
+        // The positive control. Without it, `multi_account_from` returning
+        // Blocked unconditionally passes the test above.
+        assert_eq!(
+            multi_account_from(Some(PathBuf::from(r"C:\a\bin\bitwarden-cli")), false),
+            MultiAccountAvailability::Available,
+        );
+    }
+
+    #[test]
+    fn an_unknown_cli_path_blocks_rather_than_assuming_it_is_fine() {
+        // `verified_bw_exe()` is `None` in examples and unit tests, and would
+        // be `None` if startup verification had not run. "We do not know where
+        // the CLI is" cannot be read as "there is no portable profile beside
+        // it".
+        assert_eq!(
+            multi_account_from(None, false),
+            MultiAccountAvailability::BlockedByUnknownCliPath,
+        );
+        assert_eq!(
+            multi_account_from(None, true),
+            MultiAccountAvailability::BlockedByUnknownCliPath,
+        );
+    }
+
+    #[test]
+    fn the_live_probe_sees_a_directory_planted_beside_a_real_exe() {
+        // Drives the production impure half -- not a reconstruction of it --
+        // against a directory that really exists, so the `.exists()` call
+        // itself is exercised rather than only the decision it feeds. Both
+        // orders are asserted around one `create_dir_all`, so a probe wired to
+        // a constant fails whichever constant it is.
+        let dir = scratch_dir("relative-data-dir");
+        let exe = dir.join("bw.exe");
+        touch(&exe);
+        let portable = dir.join("bitwarden-cli");
+
+        assert_eq!(
+            multi_account_availability_from_exe(Some(&exe)),
+            MultiAccountAvailability::Available,
+            "nothing has been planted beside {} yet",
+            exe.display()
+        );
+
+        std::fs::create_dir_all(&portable).unwrap();
+        assert_eq!(
+            multi_account_availability_from_exe(Some(&exe)),
+            MultiAccountAvailability::BlockedByPortableProfile {
+                relative_data_dir: portable
+            },
+        );
+
+        assert_eq!(
+            multi_account_availability_from_exe(None),
+            MultiAccountAvailability::BlockedByUnknownCliPath,
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn multi_account_availability_asks_the_verified_exe_and_nothing_else() {
+        // WIRING, not a decision. `multi_account_availability()` is what every
+        // later consumer calls; if it stopped consulting `verified_bw_exe()`
+        // -- or answered from a constant -- every test above would stay green
+        // while the trap went undetected in the running app.
+        //
+        // First-wins, so this only guarantees *some* path is recorded, which
+        // is all this test needs: the assertion is agreement with the
+        // production probe applied to whatever that path is.
+        remember_verified_bw_exe(PathBuf::from(r"C:\deskwarden-test\first\bw.exe"));
+        let exe = verified_bw_exe().expect("a verified path was just recorded");
+
+        assert_eq!(
+            multi_account_availability(),
+            multi_account_availability_from_exe(Some(exe)),
+            "multi_account_availability() did not answer for the verified bw.exe ({})",
+            exe.display()
+        );
+        assert_ne!(
+            multi_account_availability(),
+            MultiAccountAvailability::BlockedByUnknownCliPath,
+            "the CLI path IS known here, so the unknown-path state is wrong"
+        );
+    }
+
+    #[test]
+    fn the_availability_probe_is_wired_to_the_pure_decision_it_documents() {
+        // The other half of the wiring, and unavoidably a source guard: the
+        // expressions below cannot be observed from outside the two functions.
+        // Needles are `concat!`-split so none can match its own declaration
+        // here, and single-line so a CRLF checkout does not turn them into
+        // false passes. Each is a *required* needle, so the assertion is
+        // itself the proof that it matches live code.
+        let source = include_str!("bw_path.rs");
+        for required in [
+            concat!("multi_account_availability_from_exe(", "verified_bw_exe())"),
+            concat!("bw_exe.and_then(", "relative_data_dir)"),
+            concat!("dir.", "exists()"),
+            concat!("multi_account_from(", "relative, exists)"),
+        ] {
+            assert!(
+                source.contains(required),
+                "`{required}` is gone: the availability probe no longer reaches the \
+                 filesystem check and the pure decision through the documented path"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_blocked_variants_explain_themselves_and_they_name_the_directory() {
+        assert_eq!(MultiAccountAvailability::Available.explanation(), None);
+        assert!(MultiAccountAvailability::Available.is_available());
+
+        let dir = PathBuf::from(r"C:\a\bin\bitwarden-cli");
+        let blocked = MultiAccountAvailability::BlockedByPortableProfile {
+            relative_data_dir: dir.clone(),
+        };
+        assert!(!blocked.is_available());
+        let text = blocked.explanation().expect("a blocked state must say why");
+        assert!(
+            text.contains(r"C:\a\bin\bitwarden-cli"),
+            "the one directory the user has to go and delete is not in the message: {text}"
+        );
+
+        assert!(!MultiAccountAvailability::BlockedByUnknownCliPath.is_available());
+        assert!(MultiAccountAvailability::BlockedByUnknownCliPath
+            .explanation()
+            .is_some());
     }
 }
