@@ -954,51 +954,10 @@ fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
 /// The wording is `theme::gear_button`'s idiom -- a plain `on_hover_text` on
 /// the response -- and the chord comes from [`COPY_SHORTCUTS`], so a row
 /// cannot name a key it is not bound to.
-fn copy_row_tooltip(hint: ChordHint) -> String {
-    match hint.chord() {
+fn copy_row_tooltip(hint: Option<CopyShortcut>) -> String {
+    match hint {
         Some(which) => format!("Click to copy · {}", copy_shortcut_chord(which)),
         None => "Click to copy".to_string(),
-    }
-}
-
-/// Where a row's copy chord is told to the user.
-///
-/// **Three states, not a bool beside an `Option`.** The chord being painted
-/// on the row and the chord existing at all are different questions, and the
-/// combination that a bool would allow -- "paint it, but there is no chord"
-/// -- has no meaning. Splitting them here makes it unrepresentable.
-///
-/// The Password row is the one [`TooltipOnly`](ChordHint::TooltipOnly): the
-/// user asked for its control line to carry the eye instead of the text. An
-/// earlier pass took that to mean every row's chord should move to its
-/// tooltip, and stripped `CTRL+U` and `CTRL+T` from the screen as well. That
-/// was not what was asked, and the user said so. The chords are painted
-/// again; only the Password row keeps its line clear.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ChordHint {
-    /// Painted on the row AND named in the tooltip.
-    OnRow(CopyShortcut),
-    /// Named in the tooltip only.
-    TooltipOnly(CopyShortcut),
-    /// This value has no chord bound to it; the tile still copies on click.
-    NoChord,
-}
-
-impl ChordHint {
-    /// The chord this row has, however it is shown. Drives the tooltip.
-    fn chord(self) -> Option<CopyShortcut> {
-        match self {
-            ChordHint::OnRow(which) | ChordHint::TooltipOnly(which) => Some(which),
-            ChordHint::NoChord => None,
-        }
-    }
-
-    /// The chord to PAINT on the row, if any.
-    fn painted(self) -> Option<CopyShortcut> {
-        match self {
-            ChordHint::OnRow(which) => Some(which),
-            ChordHint::TooltipOnly(_) | ChordHint::NoChord => None,
-        }
     }
 }
 
@@ -1009,8 +968,8 @@ impl ChordHint {
 /// `theme::kbd_chip`'s boxed treatment, which the design reserves for the
 /// menu. The text comes from [`COPY_SHORTCUTS`], so a row cannot paint a key
 /// it is not bound to.
-fn shortcut_hint(ui: &mut egui::Ui, hint: ChordHint) {
-    if let Some(which) = hint.painted() {
+fn shortcut_hint(ui: &mut egui::Ui, hint: Option<CopyShortcut>) {
+    if let Some(which) = hint {
         ui.label(
             RichText::new(copy_shortcut_chord(which))
                 .size(10.0)
@@ -1515,7 +1474,7 @@ pub fn draw_detail_read(
                     ui,
                     "Username",
                     username,
-                    ChordHint::OnRow(CopyShortcut::Username),
+                    Some(CopyShortcut::Username),
                     &mut action,
                     DetailAction::CopyUsername,
                 );
@@ -1619,7 +1578,7 @@ pub fn draw_detail_read(
                 },
                 |_ui| {},
                 DetailAction::CopyValue(website.to_string()),
-                ChordHint::OnRow(CopyShortcut::Url),
+                Some(CopyShortcut::Url),
                 &mut action,
             );
             if opened {
@@ -1757,17 +1716,24 @@ fn copy_row(
     on_copy: DetailAction,
     // Where this row's chord is told to the user, if it has one. Every copy
     // row gets a tooltip; only some have a chord, and only some of those
-    // paint it on the row -- see [`ChordHint`].
-    hint: ChordHint,
+    // paint it on the row; the chord is drawn to the right of them.
+    hint: Option<CopyShortcut>,
     action: &mut DetailAction,
 ) {
-    // The chord paints on the control line, to the LEFT of the row's own
-    // controls: the group packs right-to-left, so a widget added after them
-    // lands further left. That keeps the eye hard against the row's edge
-    // where it was, instead of shunting it inwards behind the text.
+    // **The chord is added FIRST, which puts it at the far RIGHT.** The
+    // control group packs right-to-left, so the earliest widget is the
+    // rightmost one. The user asked for the keys to be "always in the end",
+    // and for the Password row specifically to read eye-then-chord: adding
+    // the chord first and the row's own controls after it gives exactly
+    // that, on every row, without any row needing to know the rule.
+    //
+    // The previous arrangement (controls first, chord after) put the chord
+    // to the LEFT of the eye, so the key drifted inwards on rows that had a
+    // control and sat at the edge on rows that did not -- the ragged result
+    // this ordering exists to avoid.
     let controls = |ui: &mut egui::Ui| {
-        controls(ui);
         shortcut_hint(ui, hint);
+        controls(ui);
     };
     let response = row_impl(ui, label, value, controls, egui::Sense::click())
         .on_hover_text(copy_row_tooltip(hint));
@@ -1887,7 +1853,7 @@ fn credential_row(
     ui: &mut egui::Ui,
     label: &str,
     value: &str,
-    hint: ChordHint,
+    hint: Option<CopyShortcut>,
     action: &mut DetailAction,
     on_copy: DetailAction,
 ) {
@@ -1912,7 +1878,7 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
         revealed,
         action,
         DetailAction::CopyPassword,
-        ChordHint::TooltipOnly(CopyShortcut::Password),
+        Some(CopyShortcut::Password),
     );
 }
 
@@ -1929,7 +1895,7 @@ fn masked_row(
     revealed: &mut bool,
     action: &mut DetailAction,
     on_copy: DetailAction,
-    hint: ChordHint,
+    hint: Option<CopyShortcut>,
 ) {
     let shown = if *revealed {
         value.to_string()
@@ -2042,23 +2008,23 @@ fn card_rows(
     };
     if let Some(v) = &cardholder {
         separate(ui, &mut first);
-        credential_row(ui, "Cardholder name", v, ChordHint::NoChord, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Cardholder name", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &brand {
         separate(ui, &mut first);
-        credential_row(ui, "Brand", v, ChordHint::NoChord, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Brand", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &number {
         separate(ui, &mut first);
-        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber, ChordHint::NoChord);
+        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber, None);
     }
     if let Some(v) = &expiry {
         separate(ui, &mut first);
-        credential_row(ui, "Expiry", v, ChordHint::NoChord, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Expiry", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &code {
         separate(ui, &mut first);
-        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode, ChordHint::NoChord);
+        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode, None);
     }
 }
 
@@ -2111,7 +2077,7 @@ fn history_rows(
             &mut reveal.password_history[index],
             action,
             DetailAction::CopyPasswordHistory(index),
-            ChordHint::NoChord,
+            None,
         );
     }
     // Truncation is STATED, never silent. A previous password the pane simply
@@ -2184,15 +2150,15 @@ fn ssh_key_rows(
     };
     if let Some(v) = &public_key {
         separate(ui, &mut first);
-        credential_row(ui, "Public key", v, ChordHint::NoChord, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Public key", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &fingerprint {
         separate(ui, &mut first);
-        credential_row(ui, "Fingerprint", v, ChordHint::NoChord, action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Fingerprint", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &private_key {
         separate(ui, &mut first);
-        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey, ChordHint::NoChord);
+        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey, None);
     }
 }
 
@@ -2232,7 +2198,7 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
             if row_index > 0 {
                 theme::row_rule(ui);
             }
-            credential_row(ui, label, value, ChordHint::NoChord, action, DetailAction::CopyValue(value.clone()));
+            credential_row(ui, label, value, None, action, DetailAction::CopyValue(value.clone()));
         }
     }
 }
@@ -2273,7 +2239,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
         },
         |_ui| {},
         DetailAction::CopyTotp,
-        ChordHint::OnRow(CopyShortcut::Totp),
+        Some(CopyShortcut::Totp),
         action,
     );
 }
@@ -5298,24 +5264,37 @@ mod tests {
                 frame.strings()
             );
         }
-        // Painted, and this is the positive half: without it, the negative
-        // assertion below would pass against a pane that had stopped drawing
-        // chords entirely -- which is the state the user objected to.
-        for chord in ["CTRL+U", "CTRL+T", "CTRL+SHIFT+U"] {
+        // EVERY row with a chord paints it, the Password row included.
+        for chord in ["CTRL+U", "CTRL+B", "CTRL+T", "CTRL+SHIFT+U"] {
             assert!(
                 frame.painted(chord),
                 "the {chord} hint is not painted beside its row; the pane painted: {:?}",
                 frame.strings()
             );
         }
-        // The one exception, and the only thing the user actually asked for:
-        // the Password row's control line carries the eye instead of the
-        // text. `CTRL+B` still works and is still named in that row's
-        // tooltip -- see `hovering_a_row_names_the_chord_that_copies_it`.
+
+        // **And the chord is the last thing on the line.** The user asked
+        // for the keys to be "always in the end", and for the Password row
+        // to read eye-then-chord. The Password row is the one that can get
+        // this wrong, because it is the only chord-bearing row that also has
+        // a control -- so the eye is what the chord has to clear.
+        // The eye is a stroked shape, not text, so it is found through
+        // `icon_probe` rather than by string. Positive control first: an
+        // empty eye list would make the comparison below vacuous.
+        let eyes = &frame.eyes;
         assert!(
-            !frame.painted("CTRL+B"),
-            "the Password row still paints CTRL+B; the eye was asked to take that line: {:?}",
-            frame.strings()
+            !eyes.is_empty(),
+            "no eye was painted at all, so 'the chord clears the eye' proves nothing"
+        );
+        let chord = frame.rect_of("CTRL+B");
+        let eye = eyes
+            .iter()
+            .min_by(|a, b| a.center().y.total_cmp(&b.center().y))
+            .expect("checked non-empty above");
+        assert!(
+            chord.left() >= eye.right(),
+            "the Password row paints CTRL+B at {chord:?}, to the LEFT of the eye at \
+             {eye:?} -- the chord is meant to be the last thing on the line"
         );
     }
 
