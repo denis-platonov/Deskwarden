@@ -1286,9 +1286,18 @@ const GEAR_HUB_RADIUS: f32 = 3.2;
 /// anchoring by the circle's centre leaves it sitting visibly high in a
 /// square hit target.
 fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
-    // 1/φ² -- the ratio between a regular pentagram's valleys and its points.
-    // Anything larger reads as a flower, anything smaller as a spider.
-    let inner = outer * 0.382;
+    // Deliberately NOT 1/φ² (0.382), the regular pentagram's valley-to-point
+    // ratio. That is the geometrically pure star, and at 18px it reads as
+    // thin and dated -- the points are long spikes with very little body.
+    // 0.50 fills them out while keeping the tips sharp, which is the whole
+    // point of choosing it over a rounded-join treatment: fatter, not softer.
+    //
+    // The old comment here claimed anything larger than 0.382 "reads as a
+    // flower". That is only true much further up -- a star does not round off
+    // into a flower until the valleys are shallow enough to lose the tips,
+    // which is well past 0.5. Recorded because the claim was the reason the
+    // ratio went unquestioned.
+    let inner = outer * 0.50;
     let local: Vec<Vec2> = (0..STAR_VERTICES)
         .map(|i| {
             let radius = if i % 2 == 0 { outer } else { inner };
