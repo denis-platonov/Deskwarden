@@ -487,6 +487,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // whenever a new drag begins -- an explanation of the last gesture must
     // not still be sitting there describing the next one.
     let mut move_error: Option<String> = None;
+    // The inline "that Generate did not happen" message, shown in the same
+    // band as `move_error` (see `inline_notice`, which decides between them).
+    // Set by a failed generate in either detail-pane draft, cleared when the
+    // user clicks it away and at the start of every fresh attempt -- an
+    // explanation of the last click must not still be sitting there
+    // describing the next one, exactly as for `move_error`.
+    //
+    // It lives out here, per window rather than per draft, because the draft
+    // is `detail_edit`'s and the failure is not: `draw_detail_edit` has no
+    // backend handle and cannot know a request failed. See
+    // `EditAction::GeneratePassword`'s doc, which states that reporting is
+    // the caller's job.
+    let mut generate_error: Option<String> = None;
 
     let mut styled = false;
     // Where this window was when it was last closed, re-homed onto the
@@ -1164,8 +1177,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             Some(OutOfVault::Archive) => archive_list.error.clone(),
             None => None,
         };
-        // The inline move-error band was clicked away. Applied after the
-        // closure for the same reason: `move_error` is borrowed by it.
+        // The one message the inline band shows this frame, and which of the
+        // three sources it came from -- see `inline_notice` for the order and
+        // why Generate is first. Computed out here so the dismissal below can
+        // clear exactly the source that was on screen.
+        let notice = inline_notice(
+            generate_error.as_deref(),
+            aux_error.as_deref(),
+            move_error.as_deref(),
+        );
+        let notice_source = notice.map(|(source, _)| source);
+        // The inline band was clicked away. Applied after the closure for the
+        // same reason its message is computed before it: the three `Option`s
+        // the band reads are borrowed for the length of the call.
         let mut dismiss_move_error = false;
         egui::Panel::left("vault-item-list")
             .exact_size(LIST_WIDTH)
@@ -1198,12 +1222,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
                     &icons,
                     &mut visible_ids,
-                    // The inline band shows whichever explanation this frame
-                    // has. A failed Trash/Archive fetch is the more urgent of
-                    // the two -- the pane it explains is the one on screen.
-                    aux_error
-                        .as_deref()
-                        .or(move_error.as_deref()),
+                    notice.map(|(_, message)| message),
                 ) {
                     // The kind the `+ New` menu was clicked on -- `empty_of`,
                     // not `empty`, which would open a login form whatever row
@@ -1223,16 +1242,30 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 }
             });
 
+        // Only the source that was actually on screen is cleared. Clearing
+        // all three -- which is what this did while the band had two sources
+        // and no name for either -- meant waving away one message also fired
+        // the Trash/Archive refetch below on a frame where the user had not
+        // seen that failure at all.
         if dismiss_move_error {
-            move_error = None;
-            // Dismissing a Trash/Archive failure is also the retry: clearing
-            // `error` is exactly what makes `AuxList::wants_fetch` true
-            // again, so the next frame asks the server. A band that could
-            // only be waved away, leaving the row at an en dash with no way
-            // to try again short of a full Sync, would be a dead affordance.
-            match filter.source().out_of_vault() {
-                Some(OutOfVault::Trash) => trash_list.error = None,
-                Some(OutOfVault::Archive) => archive_list.error = None,
+            match notice_source {
+                Some(NoticeSource::Generate) => generate_error = None,
+                Some(NoticeSource::Move) => move_error = None,
+                // Dismissing a Trash/Archive failure is also the retry:
+                // clearing `error` is exactly what makes `AuxList::wants_fetch`
+                // true again, so the next frame asks the server. A band that
+                // could only be waved away, leaving the row at an en dash with
+                // no way to try again short of a full Sync, would be a dead
+                // affordance.
+                Some(NoticeSource::Aux) => match filter.source().out_of_vault() {
+                    Some(OutOfVault::Trash) => trash_list.error = None,
+                    Some(OutOfVault::Archive) => archive_list.error = None,
+                    None => {}
+                },
+                // The band reported a dismissal in a frame that drew no band.
+                // Not reachable through `draw_item_list`, which only returns
+                // `DismissMoveError` from inside the `if let Some(message)`
+                // that draws it.
                 None => {}
             }
         }
@@ -1909,19 +1942,34 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 }
                             }
                             // The box is left unchanged on failure, so a
-                            // swallowed error here would read as a dead
-                            // button. `generator_request` carries the form's
-                            // own kind and size choices.
+                            // swallowed error here reads as a dead button --
+                            // which is what `log::warn!` alone made of it,
+                            // against `EditAction::GeneratePassword`'s own
+                            // doc putting the reporting here.
+                            // `generator_request` carries the form's own kind
+                            // and size choices.
+                            //
+                            // The sentence goes to the item list's inline
+                            // band via `generate_error`; `generate_failure`
+                            // decides both it and, for a 401, a re-auth that
+                            // deliberately does NOT close the window out from
+                            // under a half-typed form the way every other
+                            // write's `flag_reauth_if_unauthorized` does. The
+                            // band is painted by a panel drawn earlier in
+                            // this same frame, so it appears on the next one
+                            // -- which always comes: the closure schedules a
+                            // repaint unconditionally at its top.
                             EditAction::GeneratePassword => {
+                                generate_error = None;
                                 match cache.bridge().generate(&draft.generator_request()) {
                                     Ok(generated) => draft.set_generated_password(&generated),
                                     Err(e) => {
                                         log::warn!("could not generate a password: {e:?}");
-                                        flag_reauth_if_unauthorized(
-                                            ui.ctx(),
-                                            &needs_reauth_for_closure,
-                                            &e,
-                                        );
+                                        let failure = generate_failure(&e);
+                                        if failure.needs_reauth {
+                                            *needs_reauth_for_closure.borrow_mut() = true;
+                                        }
+                                        generate_error = Some(failure.message);
                                     }
                                 }
                             }
@@ -1961,19 +2009,34 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 }
                             }
                             // The box is left unchanged on failure, so a
-                            // swallowed error here would read as a dead
-                            // button. `generator_request` carries the form's
-                            // own kind and size choices.
+                            // swallowed error here reads as a dead button --
+                            // which is what `log::warn!` alone made of it,
+                            // against `EditAction::GeneratePassword`'s own
+                            // doc putting the reporting here.
+                            // `generator_request` carries the form's own kind
+                            // and size choices.
+                            //
+                            // The sentence goes to the item list's inline
+                            // band via `generate_error`; `generate_failure`
+                            // decides both it and, for a 401, a re-auth that
+                            // deliberately does NOT close the window out from
+                            // under a half-typed form the way every other
+                            // write's `flag_reauth_if_unauthorized` does. The
+                            // band is painted by a panel drawn earlier in
+                            // this same frame, so it appears on the next one
+                            // -- which always comes: the closure schedules a
+                            // repaint unconditionally at its top.
                             EditAction::GeneratePassword => {
+                                generate_error = None;
                                 match cache.bridge().generate(&draft.generator_request()) {
                                     Ok(generated) => draft.set_generated_password(&generated),
                                     Err(e) => {
                                         log::warn!("could not generate a password: {e:?}");
-                                        flag_reauth_if_unauthorized(
-                                            ui.ctx(),
-                                            &needs_reauth_for_closure,
-                                            &e,
-                                        );
+                                        let failure = generate_failure(&e);
+                                        if failure.needs_reauth {
+                                            *needs_reauth_for_closure.borrow_mut() = true;
+                                        }
+                                        generate_error = Some(failure.message);
                                     }
                                 }
                             }
@@ -2193,6 +2256,106 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
     };
     format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
+}
+
+/// What a failed **Generate** does: the sentence the inline band shows, and
+/// whether the session it failed against should be re-authenticated.
+///
+/// A decision rather than a `match` arm because the arm it replaces is inside
+/// `run`'s update closure, which no test in this crate can call -- a reviewer
+/// proved the three action arms wired by `6c40075` are invisible to the suite
+/// by replacing all three bodies with `{}` and watching it stay green. The
+/// wording and the re-auth policy are the whole of what this fix decides, so
+/// they live where `generate_failure_tests` can reach them; the arm keeps
+/// only the plumbing, pinned by `generate_failure_wiring_tests`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerateFailure {
+    /// The band's sentence. Never empty -- see [`generate_failure`].
+    message: String,
+    /// True only for [`VaultError::Unauthorized`]: the session really is gone
+    /// and the window records it, so `open_vault_window` runs the same
+    /// recovery a Lock does **when this window closes**.
+    ///
+    /// Deliberately NOT `flag_reauth_if_unauthorized`, which closes the window
+    /// immediately. That is right for Save -- a terminal gesture whose whole
+    /// point was to write -- and wrong here: Generate is a mid-composition
+    /// convenience click that changes nothing on failure, so closing the
+    /// window on it discards every field the user has typed into a half-filled
+    /// new-item form in exchange for nothing. The flag alone keeps the
+    /// recovery and drops the eviction: the draft survives, the user is told
+    /// they need to sign in again, and the re-auth happens the moment they are
+    /// done with the window either way.
+    needs_reauth: bool,
+}
+
+/// The band sentence and re-auth policy for a Generate that failed.
+///
+/// Exhaustive with no catch-all, for the reason [`move_failure_message`] is: a
+/// new `VaultError` variant must be given its own wording and its own policy
+/// rather than silently inheriting someone else's. The error's own payload
+/// stays in the log for the same reason too.
+///
+/// Every sentence says the box is unchanged. That is the actual question a
+/// user has after clicking Generate and seeing the password box look exactly
+/// as it did -- "did it half-work?" -- and the answer is always no.
+fn generate_failure(e: &VaultError) -> GenerateFailure {
+    let because = match e {
+        VaultError::Unauthorized => "the vault backend no longer accepts this session",
+        VaultError::Http(_) => "the vault backend refused the request",
+        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+    };
+    let tail = match e {
+        // The only variant that has something further to ask of the user: the
+        // draft is intact but nothing will save until the session is renewed.
+        VaultError::Unauthorized => " You'll need to sign in again before saving.",
+        VaultError::Http(_) | VaultError::Parse(_) => "",
+    };
+    GenerateFailure {
+        message: format!(
+            "Couldn't generate a password -- {because}. Nothing in this form has changed.{tail}"
+        ),
+        needs_reauth: matches!(e, VaultError::Unauthorized),
+    }
+}
+
+/// Which of the window's three unrelated failures the one inline band is
+/// showing this frame.
+///
+/// Three, because the band under the item list's toolbar is the only inline
+/// user-visible channel this window has, and it already carried two before
+/// this fix (a refused drag-to-folder, and a Trash/Archive fetch that failed).
+/// Naming the source is what lets the dismissal clear *that* one rather than
+/// all of them -- dismissing an Archive failure is also its retry, and firing
+/// that retry because someone waved away a generate message would be a
+/// surprise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoticeSource {
+    Generate,
+    Aux,
+    Move,
+}
+
+/// Which message the single inline band shows, given the three that might be
+/// waiting, and where it came from.
+///
+/// **Generate outranks the other two**, and that is a deliberate reversal of
+/// the order the aux band arrived with. The other two describe standing
+/// conditions -- a list that is still empty, an item that is still where it
+/// was -- and both are still true, and still shown, a frame after this one is
+/// dismissed. A generate failure answers a click the user made this instant,
+/// and if it loses the band it is not deferred but *lost*: the box is
+/// unchanged and there is nothing else on screen that a click happened at all.
+/// That is precisely the dead-button failure this fix exists to close, so it
+/// must not be reintroduced by a Trash fetch that failed ten minutes ago.
+fn inline_notice<'a>(
+    generate: Option<&'a str>,
+    aux: Option<&'a str>,
+    moved: Option<&'a str>,
+) -> Option<(NoticeSource, &'a str)> {
+    generate
+        .map(|m| (NoticeSource::Generate, m))
+        .or_else(|| aux.map(|m| (NoticeSource::Aux, m)))
+        .or_else(|| moved.map(|m| (NoticeSource::Move, m)))
 }
 
 fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bool>>, e: &VaultError) {
@@ -4392,6 +4555,277 @@ mod folder_drop_tests {
         // The developer-facing payload stays in the log, not in the band.
         assert!(!messages[1].contains("500"));
         assert!(!messages[2].contains("bad json"));
+    }
+}
+
+/// What a failed Generate says, and what it does about the session.
+///
+/// The behaviour these pin is the whole of the fix for "Generate swallows
+/// every non-401 failure": before it, the only report was a `log::warn!` the
+/// user never sees, so a 500, a parse failure, a dead `bw serve` or the
+/// request deadline all left the password box unchanged with nothing on
+/// screen -- indistinguishable from a button that does nothing.
+#[cfg(test)]
+mod generate_failure_tests {
+    use super::{generate_failure, VaultError};
+
+    /// Every variant, spelled out rather than iterated: `generate_failure`
+    /// has no catch-all, so a new `VaultError` must be brought here
+    /// deliberately.
+    fn all() -> [super::GenerateFailure; 3] {
+        [
+            generate_failure(&VaultError::Unauthorized),
+            generate_failure(&VaultError::Http("500 Internal Server Error".into())),
+            generate_failure(&VaultError::Parse("expected value at line 1".into())),
+        ]
+    }
+
+    #[test]
+    fn every_failure_has_a_message_of_its_own_that_says_the_form_is_untouched() {
+        let failures = all();
+        for failure in &failures {
+            assert!(
+                failure.message.contains("Couldn't generate"),
+                "{:?} does not say what failed",
+                failure.message
+            );
+            // The question a user has when the box looks exactly as it did.
+            assert!(
+                failure.message.contains("Nothing in this form has changed"),
+                "{:?} does not say the draft is intact",
+                failure.message
+            );
+        }
+        let unique: std::collections::BTreeSet<&String> =
+            failures.iter().map(|f| &f.message).collect();
+        assert_eq!(
+            unique.len(),
+            failures.len(),
+            "two failures share one wording: {failures:?}"
+        );
+    }
+
+    #[test]
+    fn the_backend_s_own_error_payload_stays_in_the_log() {
+        let failures = all();
+        assert!(
+            !failures[1].message.contains("500"),
+            "{:?} puts a transport string in a user's sentence",
+            failures[1].message
+        );
+        assert!(
+            !failures[2].message.contains("line 1"),
+            "{:?} puts a serde message in a user's sentence",
+            failures[2].message
+        );
+    }
+
+    #[test]
+    fn only_an_unauthorized_generate_asks_for_re_authentication() {
+        let failures = all();
+        // Positive control first: without it the two negatives below pass
+        // against a function that returns `false` unconditionally.
+        assert!(
+            failures[0].needs_reauth,
+            "a 401 on Generate must still flag the session as needing re-auth -- the \
+             backend really has stopped accepting it, and the window's caller is what \
+             recovers"
+        );
+        assert!(!failures[1].needs_reauth, "a 500 is not an expired session");
+        assert!(
+            !failures[2].needs_reauth,
+            "an unreadable answer is not an expired session"
+        );
+    }
+
+    #[test]
+    fn the_unauthorized_message_is_the_only_one_that_asks_the_user_to_sign_in() {
+        let failures = all();
+        assert!(
+            failures[0].message.contains("sign in again"),
+            "{:?} flags re-auth without telling the user why saving will fail",
+            failures[0].message
+        );
+        assert!(!failures[1].message.contains("sign in"));
+        assert!(!failures[2].message.contains("sign in"));
+    }
+}
+
+/// Which of the three failures the window's one inline band shows.
+#[cfg(test)]
+mod inline_notice_tests {
+    use super::{inline_notice, NoticeSource};
+
+    #[test]
+    fn nothing_waiting_shows_no_band() {
+        assert_eq!(inline_notice(None, None, None), None);
+    }
+
+    #[test]
+    fn each_source_reaches_the_band_on_its_own() {
+        // The positive control for the precedence tests below: each of the
+        // three really is shown when it is the only one waiting, so a
+        // `inline_notice` that returned `None` for two of them could not pass
+        // the precedence tests by default.
+        assert_eq!(
+            inline_notice(Some("g"), None, None),
+            Some((NoticeSource::Generate, "g"))
+        );
+        assert_eq!(inline_notice(None, Some("a"), None), Some((NoticeSource::Aux, "a")));
+        assert_eq!(inline_notice(None, None, Some("m")), Some((NoticeSource::Move, "m")));
+    }
+
+    #[test]
+    fn a_generate_failure_outranks_both_standing_ones() {
+        // The regression this exists to prevent: a Trash fetch that failed ten
+        // minutes ago holding the band means the Generate click the user made
+        // one second ago produces nothing at all on screen -- the dead button,
+        // back again, in the one case where the band was already occupied.
+        assert_eq!(
+            inline_notice(Some("g"), Some("a"), Some("m")),
+            Some((NoticeSource::Generate, "g"))
+        );
+        assert_eq!(
+            inline_notice(Some("g"), Some("a"), None),
+            Some((NoticeSource::Generate, "g"))
+        );
+        assert_eq!(
+            inline_notice(Some("g"), None, Some("m")),
+            Some((NoticeSource::Generate, "g"))
+        );
+    }
+
+    #[test]
+    fn a_failed_aux_fetch_still_outranks_a_refused_move() {
+        // Unchanged from before Generate existed as a source: the pane the
+        // aux error explains is the one on screen.
+        assert_eq!(
+            inline_notice(None, Some("a"), Some("m")),
+            Some((NoticeSource::Aux, "a"))
+        );
+    }
+}
+
+/// Source-text guards on the two `EditAction::GeneratePassword` arms.
+///
+/// They exist because those arms live inside `run`'s update closure, which
+/// needs a real event loop and so is unreachable from this suite -- a
+/// reviewer demonstrated that by replacing three of its action arms with `{}`
+/// and watching all 784 tests stay green. `generate_failure` and
+/// `inline_notice` carry the decisions precisely so they can be tested
+/// directly; what is left in the arms is plumbing, and this is what pins the
+/// plumbing.
+///
+/// **What they do not guarantee**, stated so the doc does not imply coverage
+/// it lacks: they see spellings and counts, not behaviour. A `generate_error`
+/// that is set here and then never read would pass. What they catch is the
+/// edit that quietly puts a swallowed error back -- which is exactly the
+/// regression that happened, twice, with a commit message claiming otherwise.
+#[cfg(test)]
+mod generate_failure_wiring_tests {
+    // EVERY NEEDLE IS SPLIT WITH `concat!`, AND THAT IS LOAD-BEARING:
+    // `include_str!("mod.rs")` pulls this module in too, so a needle written
+    // as one literal always matches -- inside the const that defines it --
+    // which is how the equivalent guards elsewhere in this file once passed
+    // with their regression live. The count assertions ENFORCE the split, not
+    // this comment: re-joining a needle makes it appear one extra time and
+    // fails.
+    const ARM: &str = concat!("EditAction::GeneratePassword", " => {");
+    const NEXT_ARM: &str = concat!("EditAction::Cancel", " =>");
+    const DECIDES: &str = concat!("generate_failure", "(&e)");
+    const REPORTS: &str = concat!("generate_error = Some(", "failure.message)");
+    const CLOSES_THE_WINDOW: &str = concat!("flag_reauth_if_", "unauthorized(");
+    const BAND_FEED: &str = concat!("let notice = ", "inline_notice(");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// The body of each Generate arm: from the arm's own `=> {` up to the
+    /// next arm of the same `match`. Slicing rather than searching the whole
+    /// file is the point -- `flag_reauth_if_unauthorized` is still correct
+    /// everywhere else in this closure, and a file-wide count could not tell
+    /// a Generate arm apart from a Save one.
+    fn arm_bodies() -> Vec<&'static str> {
+        let source = source();
+        source
+            .match_indices(ARM)
+            .map(|(at, _)| {
+                let rest = &source[at..];
+                let end = rest.find(NEXT_ARM).unwrap_or_else(|| {
+                    panic!(
+                        "no {NEXT_ARM:?} after a Generate arm -- these guards slice the arm \
+                         body between the two and cannot without it"
+                    )
+                });
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn there_are_exactly_two_generate_arms() {
+        // The Edit draft's and the Create draft's. This is what makes the
+        // "exactly twice" counts below meaningful rather than arbitrary: a
+        // third draft form added later fails here first, with the reason.
+        assert_eq!(
+            source().matches(ARM).count(),
+            2,
+            "expected {ARM:?} exactly twice -- once in the Edit draft's match and once in \
+             the Create draft's. A new one must be wired to report its failures too"
+        );
+    }
+
+    #[test]
+    fn both_arms_route_their_failure_through_the_tested_decision() {
+        for body in arm_bodies() {
+            assert_eq!(
+                body.matches(DECIDES).count(),
+                1,
+                "a Generate arm does not call {DECIDES:?}. Without it the failure is \
+                 log-only again: the password box is unchanged, so nothing on screen \
+                 distinguishes a failed generate from a dead button.\n{body}"
+            );
+            assert_eq!(
+                body.matches(REPORTS).count(),
+                1,
+                "a Generate arm computes a message and never shows it -- {REPORTS:?} is \
+                 what puts it in the inline band.\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn neither_arm_closes_the_window_on_an_expired_session() {
+        for body in arm_bodies() {
+            assert_eq!(
+                body.matches(CLOSES_THE_WINDOW).count(),
+                0,
+                "a Generate arm calls {CLOSES_THE_WINDOW:?}, which sends \
+                 `ViewportCommand::Close`. On a half-filled new-item form that discards \
+                 every field the user typed, in exchange for a request that changed \
+                 nothing. `GenerateFailure::needs_reauth` is the divergence -- flag the \
+                 session, keep the window.\n{body}"
+            );
+            // Positive control: an arm body that failed to slice (empty, or
+            // the wrong region) would satisfy the count above for free.
+            assert!(
+                body.contains(DECIDES),
+                "sliced a Generate arm body that does not call {DECIDES:?} -- the slice \
+                 is wrong, so the assertion above proved nothing.\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_band_is_fed_by_the_tested_precedence_function() {
+        assert_eq!(
+            source().matches(BAND_FEED).count(),
+            1,
+            "expected the item list's band message to come from `inline_notice` exactly \
+             once. Zero means the precedence `inline_notice_tests` pins is not the one \
+             the window uses"
+        );
     }
 }
 
