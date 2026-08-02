@@ -485,12 +485,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
     let mut folder_edit: Option<FolderEditState> = None;
-    // The inline "that move did not happen" message, shown under the item
+    // The inline "that write did not happen" message, shown under the item
     // list's toolbar. Set by a drag-to-folder that the sidebar refused (the
     // virtual "No Folder" bucket, or the folder the item is already in) or
-    // that the backend rejected; cleared when the user clicks it away, and
-    // whenever a new drag begins -- an explanation of the last gesture must
-    // not still be sitting there describing the next one.
+    // that the backend rejected, and by any of the four row commands that
+    // move an item between this window's three lists -- see
+    // `list_command_failure_message`. Cleared when the user clicks it away,
+    // and whenever a new drag begins -- an explanation of the last gesture
+    // must not still be sitting there describing the next one.
+    //
+    // Still named `move_error` while carrying more than a folder move: every
+    // one of its sources is a write that was supposed to move an item
+    // somewhere and did not, they all take the same precedence
+    // (`NoticeSource::Move`, below Generate), and they all want the same
+    // dismissal -- a plain clear with no side effect, unlike the Aux band's,
+    // whose dismissal is also its retry.
     let mut move_error: Option<String> = None;
     // The inline "that Generate did not happen" message, shown in the same
     // band as `move_error` (see `inline_notice`, which decides between them).
@@ -1263,10 +1272,21 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             });
 
         // Only the source that was actually on screen is cleared. Clearing
-        // all three -- which is what this did while the band had two sources
-        // and no name for either -- meant waving away one message also fired
-        // the Trash/Archive refetch below on a frame where the user had not
-        // seen that failure at all.
+        // all three would mean waving away one message also fired the
+        // Trash/Archive refetch below, on a frame where the user had not seen
+        // that failure at all.
+        //
+        // **That is a hazard going forward, not a bug that was here.** An
+        // earlier version of this comment said clearing all three "meant"
+        // exactly that, and it did not: while the band was
+        // `aux_error.or(move_error)`, a move message reached the screen only
+        // when `aux_error` was `None`, so `trash_list.error = None` was a
+        // no-op and no refetch could fire. What makes the scenario reachable
+        // for the first time is `inline_notice`'s precedence -- Generate
+        // outranks Aux, so a generate failure can now be the message on
+        // screen while a real `AuxList::error` sits behind it, and a
+        // clear-all dismissal would fire that row's refetch on a click that
+        // was about something else entirely.
         if dismiss_move_error {
             match notice_source {
                 Some(NoticeSource::Generate) => generate_error = None,
@@ -1540,6 +1560,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             }
                             Err(e) => {
                                 log::warn!("failed to archive item {}: {e:?}", item.id);
+                                move_error = Some(list_command_failure_message(
+                                    ListCommand::Archive,
+                                    &item.name,
+                                    &e,
+                                ));
                                 flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                             }
                         }
@@ -1557,6 +1582,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             }
                             Err(e) => {
                                 log::warn!("failed to unarchive item {}: {e:?}", item.id);
+                                move_error = Some(list_command_failure_message(
+                                    ListCommand::Unarchive,
+                                    &item.name,
+                                    &e,
+                                ));
                                 flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                             }
                         }
@@ -1578,6 +1608,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             }
                             Err(e) => {
                                 log::warn!("failed to restore item {}: {e:?}", item.id);
+                                move_error = Some(list_command_failure_message(
+                                    ListCommand::Restore,
+                                    &item.name,
+                                    &e,
+                                ));
                                 flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                             }
                         }
@@ -1595,6 +1630,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 }
                                 Err(e) => {
                                     log::warn!("failed to purge item {}: {e:?}", item.id);
+                                    move_error = Some(list_command_failure_message(
+                                        ListCommand::Purge,
+                                        &item.name,
+                                        &e,
+                                    ));
                                     flag_reauth_if_unauthorized(
                                         ui.ctx(),
                                         &needs_reauth_for_closure,
@@ -2298,6 +2338,69 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
     };
     format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
+}
+
+/// One of the four row commands that move an item between this window's three
+/// lists.
+///
+/// Its own type rather than `item_list::RowCommand`, which also covers the
+/// copies, the fill and the edit -- none of which this message shape fits, and
+/// three of which cannot fail this way at all. A four-variant enum is what
+/// makes [`list_command_failure_message`] exhaustive, so a fifth command added
+/// later is a compile error here instead of a silent fall-through to somebody
+/// else's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListCommand {
+    Archive,
+    Unarchive,
+    Restore,
+    Purge,
+}
+
+/// What a failed row command shows in the inline band.
+///
+/// **These four used to be `log::warn!` and nothing else.** The re-auth flag
+/// was set and the failure was otherwise silent -- on the same screen whose
+/// branch already routes aux-FETCH failures through the band -- so a rejected
+/// write looked exactly like a successful one that had not refreshed yet, and
+/// the user's only signal was the item still sitting where they had just told
+/// it to leave.
+///
+/// Archive is the one where rejection is genuinely likely rather than
+/// theoretical: re-archiving an already-archived item returns 400, which is
+/// what `vault_cache`'s own
+/// `a_rejected_archive_is_an_error_not_a_silent_success` exists for.
+///
+/// This reuses the existing band (`NoticeSource::Move`) rather than inventing
+/// a fourth source. Every one of these is a write that was supposed to move an
+/// item between lists and did not, which is the same thing a refused
+/// drag-to-folder is; they want the same precedence and the same dismissal --
+/// a plain clear, NOT the Aux band's dismissal-is-also-the-retry. A fourth
+/// `NoticeSource` would need a fourth precedence rule with nothing to derive
+/// it from.
+///
+/// Every sentence names the state the item is actually in, for
+/// [`generate_failure`]'s reason: the question a user has after clicking
+/// Restore and seeing the row unchanged is "did it half-work?", and the answer
+/// is always no.
+fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError) -> String {
+    // The same three, worded the same way as `move_failure_message`'s: one
+    // vocabulary for "the backend said no" across this window, not two.
+    let because = match e {
+        VaultError::Unauthorized => "the vault backend no longer accepts this session",
+        VaultError::Http(_) => "the vault backend refused the write",
+        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+    };
+    let (verb, unchanged) = match command {
+        ListCommand::Archive => ("archive", "It's still in your vault."),
+        ListCommand::Unarchive => ("unarchive", "It's still in the archive."),
+        ListCommand::Restore => ("restore", "It's still in the trash."),
+        // "permanently delete", not "delete": this is the one irreversible
+        // command in the window, and a message reading "Couldn't delete"
+        // would leave a user unsure which of the two deletes was refused.
+        ListCommand::Purge => ("permanently delete", "It's still in the trash."),
+    };
+    format!("Couldn't {verb} \"{name}\" -- {because}. {unchanged}")
 }
 
 /// What a failed **Generate** does: the sentence the inline band shows, and
@@ -4766,6 +4869,121 @@ mod generate_failure_tests {
     }
 }
 
+/// What a failed Archive / Unarchive / Restore / Delete-forever tells the
+/// user.
+///
+/// Before this, nothing: the four arms called `log::warn!`, set the re-auth
+/// flag on a 401, and were otherwise silent -- on the same screen whose
+/// branch already routes aux-FETCH failures through the inline band. A
+/// rejected write was indistinguishable from a successful one that had not
+/// refreshed yet.
+#[cfg(test)]
+mod list_command_failure_message_tests {
+    use super::{list_command_failure_message, ListCommand, VaultError};
+
+    /// Every command, spelled out rather than derived: the point is that a
+    /// fifth variant has to be brought here deliberately, and
+    /// `list_command_failure_message`'s own `match` has no catch-all for the
+    /// same reason.
+    const EVERY_COMMAND: [ListCommand; 4] = [
+        ListCommand::Archive,
+        ListCommand::Unarchive,
+        ListCommand::Restore,
+        ListCommand::Purge,
+    ];
+
+    fn every_error() -> [VaultError; 3] {
+        [
+            VaultError::Unauthorized,
+            VaultError::Http("400 Bad Request".into()),
+            VaultError::Parse("expected value at line 1".into()),
+        ]
+    }
+
+    #[test]
+    fn every_message_names_the_item_and_says_it_did_not_move() {
+        for command in EVERY_COMMAND {
+            for e in every_error() {
+                let message = list_command_failure_message(command, "Ledgerline", &e);
+                assert!(
+                    message.contains("\"Ledgerline\""),
+                    "{command:?}/{e:?} does not name the item: {message:?}"
+                );
+                // The actual question a user has after clicking Restore and
+                // seeing the row unchanged is "did it half-work?". Every
+                // sentence has to answer it, and the answer is always no.
+                assert!(
+                    message.contains("It's still in"),
+                    "{command:?}/{e:?} does not say where the item still is: {message:?}"
+                );
+                assert!(message.starts_with("Couldn't "), "{command:?}/{e:?}: {message:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_command_says_which_one_it_was() {
+        // A shared "Couldn't complete that" would satisfy the test above for
+        // every command at once. These are four different actions with four
+        // different consequences, and the band is the only place the user
+        // learns which one was refused.
+        let e = VaultError::Http("400 Bad Request".into());
+        let messages: Vec<String> = EVERY_COMMAND
+            .iter()
+            .map(|c| list_command_failure_message(*c, "Ledgerline", &e))
+            .collect();
+        let mut distinct = messages.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            EVERY_COMMAND.len(),
+            "two commands share a sentence: {messages:?}"
+        );
+        assert!(messages[0].contains("archive \""), "{:?}", messages[0]);
+        assert!(messages[1].contains("unarchive \""), "{:?}", messages[1]);
+        assert!(messages[2].contains("restore \""), "{:?}", messages[2]);
+        // NOT bare "delete": this is the one irreversible command in the
+        // window, and the ordinary Delete sits two entries away on the live
+        // menu. "Couldn't delete" would leave a user unsure which refused.
+        assert!(
+            messages[3].contains("permanently delete \""),
+            "the purge failure does not say it was the permanent one: {:?}",
+            messages[3]
+        );
+    }
+
+    #[test]
+    fn each_error_says_why_in_the_windows_one_vocabulary() {
+        // The same three reasons `move_failure_message` gives, worded
+        // identically: one vocabulary for "the backend said no" across this
+        // window, not two that drift.
+        for command in EVERY_COMMAND {
+            let named = |e: &VaultError| list_command_failure_message(command, "L", e);
+            assert!(named(&VaultError::Unauthorized).contains("no longer accepts this session"));
+            assert!(named(&VaultError::Http("400".into())).contains("refused the write"));
+            assert!(named(&VaultError::Parse("x".into())).contains("answer couldn't be read"));
+        }
+    }
+
+    #[test]
+    fn the_backends_own_payload_stays_out_of_the_users_sentence() {
+        // `move_failure_message`'s rule, restated because the same mistake is
+        // one interpolation away: a `ureq` transport string or a serde
+        // message is a developer's sentence in the middle of a user's, and
+        // the log line at the call site already carries the whole thing.
+        let message = list_command_failure_message(
+            ListCommand::Archive,
+            "Ledgerline",
+            &VaultError::Http("400 Bad Request: cipher already archived".into()),
+        );
+        assert!(
+            !message.contains("400") && !message.contains("cipher already archived"),
+            "the backend's payload leaked into the band: {message:?}"
+        );
+    }
+}
+
 /// Which of the three failures the window's one inline band shows.
 #[cfg(test)]
 mod inline_notice_tests {
@@ -4850,7 +5068,17 @@ mod generate_failure_wiring_tests {
     const DECIDES: &str = concat!("generate_failure", "(&e)");
     const REPORTS: &str = concat!("generate_error = Some(", "failure.message)");
     const CLOSES_THE_WINDOW: &str = concat!("flag_reauth_if_", "unauthorized(");
+    const FLAGS_THE_SESSION: &str = concat!("*needs_reauth_for_closure.borrow_mut()", " = true;");
     const BAND_FEED: &str = concat!("let notice = ", "inline_notice(");
+    const DISMISS_BLOCK: &str = concat!("if dismiss_move_", "error {");
+    /// The favicon loop that follows the dismissal, which is the last thing
+    /// in its own block.
+    const DISMISS_BLOCK_END: &str = concat!("for id in &visible", "_ids {");
+    const DISMISS_MATCHES_SOURCE: &str = concat!("match notice", "_source {");
+    const DISMISS_GENERATE: &str = concat!("NoticeSource::Generate) => generate", "_error = None,");
+    const DISMISS_MOVE: &str = concat!("NoticeSource::Move) => move", "_error = None,");
+    const DISMISS_AUX: &str =
+        concat!("NoticeSource::Aux) => match filter.source()", ".out_of_vault()");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -4933,6 +5161,37 @@ mod generate_failure_wiring_tests {
     }
 
     #[test]
+    fn both_arms_record_an_expired_session_for_the_close_to_recover_from() {
+        // The other half of `neither_arm_closes_the_window_on_an_expired_
+        // session`, and the half that commit's safety argument actually rests
+        // on. Dropping `ViewportCommand::Close` is only safe BECAUSE the flag
+        // still routes through `open_vault_window`, which reads it
+        // unconditionally when the window closes and runs the same recovery a
+        // Lock does. Deleting this line from BOTH arms left the whole suite
+        // green -- and it is strictly worse than the bug it replaced: an
+        // expired session shows its message, keeps the draft, and then closes
+        // with no path back to a sign-in at all.
+        for body in arm_bodies() {
+            assert_eq!(
+                body.matches(FLAGS_THE_SESSION).count(),
+                1,
+                "a Generate arm never sets {FLAGS_THE_SESSION:?}. `generate_failure` \
+                 decided `needs_reauth` and the arm dropped it on the floor, so an \
+                 expired session is reported and then forgotten: the window closes \
+                 without `open_vault_window` ever learning it must re-authenticate.\n{body}"
+            );
+            // Positive control, as above: a mis-sliced (or empty) body would
+            // fail the count rather than pass it, but this says which of the
+            // two possible causes it is.
+            assert!(
+                body.contains(DECIDES),
+                "sliced a Generate arm body that does not call {DECIDES:?} -- the slice \
+                 is wrong, so the assertion above proved nothing.\n{body}"
+            );
+        }
+    }
+
+    #[test]
     fn the_band_is_fed_by_the_tested_precedence_function() {
         assert_eq!(
             source().matches(BAND_FEED).count(),
@@ -4940,6 +5199,69 @@ mod generate_failure_wiring_tests {
             "expected the item list's band message to come from `inline_notice` exactly \
              once. Zero means the precedence `inline_notice_tests` pins is not the one \
              the window uses"
+        );
+    }
+
+    /// The band's message is only half the wiring. `inline_notice` also
+    /// reports WHICH of the three sources it came from, and the dismissal has
+    /// to clear exactly that one -- a fact
+    /// `the_band_is_fed_by_the_tested_precedence_function` says nothing
+    /// about, because it counts a call and stops there.
+    ///
+    /// Two mutations were demonstrated against it, both green:
+    ///
+    ///  * making the Generate arm's dismissal `=> {}` renders the generate
+    ///    band **permanently undismissable** -- it is recomputed from the
+    ///    same `generate_error` on every subsequent frame, so the click does
+    ///    nothing and the band never leaves;
+    ///  * restoring the old clear-all dismissal reintroduces the silent
+    ///    refetch: waving away a Generate or Move message also clears the
+    ///    selected row's `AuxList::error`, which is exactly what makes
+    ///    `wants_fetch` true again, so the next frame asks the server on
+    ///    behalf of a failure the user never saw.
+    #[test]
+    fn the_dismissal_clears_exactly_the_source_that_was_on_screen() {
+        let source = source();
+        let at = source.find(DISMISS_BLOCK).unwrap_or_else(|| {
+            panic!("no {DISMISS_BLOCK:?} in this file -- this guard slices the dismissal from it")
+        });
+        let rest = &source[at..];
+        let end = rest
+            .find(DISMISS_BLOCK_END)
+            .unwrap_or_else(|| panic!("no {DISMISS_BLOCK_END:?} after the dismissal"));
+        let block = &rest[..end];
+        for (needle, why) in [
+            (
+                DISMISS_GENERATE,
+                "a dismissed Generate band is recomputed from the same `generate_error` \
+                 next frame, so the band cannot be waved away at all",
+            ),
+            (
+                DISMISS_MOVE,
+                "a dismissed Move band is recomputed from the same `move_error` next \
+                 frame, so the band cannot be waved away at all",
+            ),
+            (
+                DISMISS_AUX,
+                "the Aux dismissal must be keyed on the SELECTED row's list. Clearing \
+                 both -- or clearing all three sources -- is the silent-refetch \
+                 regression: clearing `AuxList::error` is what re-arms `wants_fetch`",
+            ),
+        ] {
+            assert_eq!(
+                block.matches(needle).count(),
+                1,
+                "the band's dismissal does not do {needle:?} exactly once -- {why}.\n{block}"
+            );
+        }
+        // Positive control: the block must be keyed on the SOURCE at all. A
+        // dismissal that cleared the three unconditionally satisfies none of
+        // the needles above, but a future one that matched on something else
+        // entirely could.
+        assert!(
+            block.contains(DISMISS_MATCHES_SOURCE),
+            "the dismissal no longer matches on {DISMISS_MATCHES_SOURCE:?}, so it is not \
+             clearing the source that was on screen.\n{block}"
         );
     }
 }
@@ -5239,6 +5561,34 @@ mod out_of_vault_wiring_tests {
                  keeps showing -- and counting -- an item that is no longer in it, for the \
                  life of the window: `wants_fetch` sees a list already in hand and never \
                  asks again.\n{body}"
+            );
+        }
+    }
+
+    /// What each arm must put in front of the user when its write is
+    /// refused. Same slicing as the invalidation guard above, and for the
+    /// same reason -- a file-wide search is satisfied by any ONE arm having
+    /// it.
+    const REPORTS_THE_FAILURE: &str =
+        concat!("move_error = Some(list_command_", "failure_message(");
+
+    #[test]
+    fn each_list_moving_command_says_so_when_it_is_refused() {
+        // All four were `log::warn!` plus the re-auth flag and nothing else,
+        // on the same screen whose branch already routes aux-FETCH failures
+        // through the inline band. A refused write looked exactly like a
+        // successful one that had not refreshed yet, and the user's only
+        // signal was the item still sitting where they had just told it to
+        // leave. Archive is the one where rejection is genuinely likely
+        // rather than theoretical: re-archiving returns 400.
+        for (marker, _) in COMMAND_ARMS {
+            let body = arm_body(marker);
+            assert_eq!(
+                body.matches(REPORTS_THE_FAILURE).count(),
+                1,
+                "the {marker:?} arm does not report its failure. `flag_reauth_if_\
+                 unauthorized` covers only an expired session, and a `log::warn!` is not \
+                 a user-visible channel -- the band under the toolbar is.\n{body}"
             );
         }
     }
