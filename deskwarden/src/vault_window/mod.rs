@@ -434,12 +434,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let mut totp_poll_failing = false;
     // The TOTP poll used to run inline on this thread (a real HTTP call to
     // `bw serve` via `ureq`), which stalled the whole window -- input,
-    // repaint, everything -- for however long that call took. `ureq`'s read
-    // timeout bounds a single read *syscall*, not the response as a whole, so
-    // a `bw serve` that accepts a connection and then trickles bytes (or
-    // stalls between them) can hold a read well past the configured timeout;
-    // against that, a poll every `TOTP_POLL_INTERVAL` could freeze the window
-    // for a large fraction of every second it was open. Backgrounded the same
+    // repaint, everything -- for however long that call took. Since `4058e1c`
+    // and `665a645` that is a bounded stall rather than an open-ended one:
+    // the bridge's read agent is `http_agent::bounded_total`, so
+    // `READ_DEADLINE` (10s) covers the whole request, body included, and a
+    // `bw serve` that accepts a connection and then trickles bytes is cut off
+    // at it. Ten seconds of frozen window is still ten seconds, and this poll
+    // fires once per `TOTP_POLL_INTERVAL` against a backend nothing else
+    // would notice had gone slow, so the bound is not a substitute for the
+    // thread. Backgrounded the same
     // way `spawn_vault_load`/`spawn_vault_sync` already are: `should_start_totp_poll`
     // below gates spawning a one-shot thread that reports over `totp_tx`, and
     // the non-blocking `totp_rx` drain applies whatever it sends back.
@@ -1702,12 +1705,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // than called inline, the same reason
                                 // `spawn_vault_load`/`spawn_vault_sync` are:
                                 // `get_totp` is a real HTTP round-trip to
-                                // `bw serve`, and `ureq`'s read timeout bounds
-                                // one read syscall, not the response as a
-                                // whole, so a trickling or stalled `bw serve`
-                                // could hold this call -- and this window's
-                                // entire UI thread with it -- well past that
-                                // timeout, once per `TOTP_POLL_INTERVAL`. The
+                                // `bw serve`, and a stalled backend holds it
+                                // -- and this window's entire UI thread with
+                                // it -- for as long as the bridge's whole-
+                                // request `READ_DEADLINE` allows, up to 10s,
+                                // once per `TOTP_POLL_INTERVAL`. Bounded is
+                                // not the same as short. The
                                 // result lands on `totp_rx`, drained further
                                 // up (see that drain's doc for why it isn't
                                 // nested in this same block); the actual
@@ -2402,7 +2405,7 @@ fn current_totp_seconds_left() -> u8 {
 /// over `totp_rx` -- so without this promotion, a freshly selected item with
 /// a real secret rendered no row at all (`NoSecret` draws nothing, see
 /// `detail::draw_detail_read`) for as long as the fetch took, up to the
-/// ~10s `ureq` read timeout if a *different*, since-deselected item's poll
+/// ~10s `READ_DEADLINE` if a *different*, since-deselected item's poll
 /// was still outstanding and holding `totp_poll_in_flight`. A `Code` or
 /// `Unavailable` previous state is left untouched either way -- there is
 /// already something honest to show, and a fresh poll (once one starts) is
@@ -2673,9 +2676,10 @@ impl AuxList {
 /// Fetches one of the two on-demand lists on a background thread.
 ///
 /// Backgrounded for the reason every other backend call this window makes
-/// off-thread is: a real HTTP round-trip to `bw serve`, and `ureq`'s read
-/// timeout bounds one read syscall rather than the whole response, so a
-/// stalled backend would hold the UI thread well past it. This window
+/// off-thread is: a real HTTP round-trip to `bw serve`, which a stalled
+/// backend can hold for the whole of the bridge's `READ_DEADLINE` -- 10s of
+/// frozen window, bounded but not short, and this pays it on a click. This
+/// window
 /// already runs nine calls synchronously in the render closure -- a known,
 /// recorded debt -- and this deliberately does not become the tenth.
 ///
@@ -3836,10 +3840,10 @@ mod apply_totp_poll_result_tests {
 #[cfg(test)]
 mod should_start_totp_poll_tests {
     // The TOTP poll moved off the UI thread onto a one-shot background
-    // thread (see `totp_poll_in_flight`'s declaration in `run`) because
-    // `ureq`'s read timeout bounds one read syscall, not `get_totp`'s
-    // response as a whole -- a trickling or stalled `bw serve` could freeze
-    // this window for well past that timeout, once per `TOTP_POLL_INTERVAL`.
+    // thread (see `totp_poll_in_flight`'s declaration in `run`) because a
+    // trickling or stalled `bw serve` freezes this window for as long as
+    // `get_totp` takes -- up to the bridge's whole-request `READ_DEADLINE`
+    // of 10s -- once per `TOTP_POLL_INTERVAL`.
     // These pin the two-way gate that replaced the old unconditional call:
     // a poll only starts when the interval has actually elapsed, and --
     // the new condition -- no poll is already outstanding, so a hung backend
@@ -3871,8 +3875,8 @@ mod should_start_totp_poll_tests {
     #[test]
     fn does_not_start_a_second_poll_while_one_is_already_in_flight() {
         // The regression this exists to prevent: without this gate, a hung
-        // `bw serve` (one read syscall away from `ureq`'s timeout, forever)
-        // would still spawn a fresh background thread every
+        // `bw serve` (every poll running the full `READ_DEADLINE` before it
+        // fails) would still spawn a fresh background thread every
         // `TOTP_POLL_INTERVAL`, piling up indefinitely instead of the single
         // outstanding poll this is meant to bound it to.
         assert!(!should_start_totp_poll(true, true, true));

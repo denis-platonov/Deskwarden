@@ -138,8 +138,9 @@ pub enum TotpState {
     /// code is a background thread now (see `totp_poll_in_flight`'s doc in
     /// `vault_window::mod`) and hasn't reported back yet -- typically just
     /// the first frame or two after selecting this item, but as long as
-    /// ~10s (`ureq`'s read timeout) if a *different* item's poll is still
-    /// outstanding and holding the one-poll-at-a-time gate. Distinct from
+    /// ~10s (the bridge's whole-request `READ_DEADLINE`) if a *different*
+    /// item's poll is still outstanding and holding the one-poll-at-a-time
+    /// gate. Distinct from
     /// `NoSecret` for the same reason `Unavailable` is (review 12's
     /// Important 3): rendering no row at all here is pixel-identical to "no
     /// TOTP configured", when this item plainly has one -- the code just
