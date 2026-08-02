@@ -8349,3 +8349,158 @@ mod new_item_kind_placement_tests {
         );
     }
 }
+
+/// The titlebar's settings gear: where it sits, and what its click does.
+///
+/// Source guards rather than click tests, and the reason is structural: the
+/// gear lives in a closure passed to `draw_window_chrome_with_extra` from
+/// inside `run`, which is the eframe application itself. No harness in this
+/// crate can call `run`, so the closure's contents cannot be pressed the way
+/// `detail.rs`'s star and kebab can be. Rebuilding the strip in a test would
+/// assert the replica, not the code -- the shape of dead test this project
+/// has shipped repeatedly.
+///
+/// The needles are `concat!`-split and single-line: a needle written as one
+/// literal can match its own declaration, and a needle containing a newline
+/// passes on LF and fails on CRLF (this repo has files in both states).
+#[cfg(test)]
+mod settings_gear_placement_tests {
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// Production code only -- sliced at the first test marker, the same way
+    /// `window_era_placement_tests::production` is, and sound for the same
+    /// reason: every `fn` and `impl` in this file sits above it.
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    fn gear_needle() -> String {
+        concat!("theme::gear_", "button(ui).clicked()").to_string()
+    }
+
+    fn avatar_needle() -> String {
+        concat!("draw_circle_", "avatar(ui,").to_string()
+    }
+
+    /// **The gear must be added BEFORE the avatar**, because the strip packs
+    /// right-to-left: `right_to_left` puts each new widget just to the LEFT
+    /// of the previous one, so the widget added earlier ends up further
+    /// right. The user asked for the gear to the right of the avatar, and
+    /// reasoning about that inversion is precisely how it lands on the wrong
+    /// side -- so it is pinned rather than argued.
+    #[test]
+    fn the_settings_gear_sits_to_the_right_of_the_avatar() {
+        let production = production();
+        let gear = gear_needle();
+        let avatar = avatar_needle();
+
+        // Positive controls. Without these, a rename of either call would
+        // leave both `find`s returning `None` and the ordering assertion
+        // below comparing nothing at all.
+        let gear_at = production
+            .find(&gear)
+            .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
+        let avatar_at = production.find(&avatar).unwrap_or_else(|| {
+            panic!("no {avatar:?} in production code -- the titlebar avatar is gone")
+        });
+        assert_eq!(
+            production.matches(&gear).count(),
+            1,
+            "expected exactly one titlebar gear; more than one and this ordering says nothing"
+        );
+
+        assert!(
+            gear_at < avatar_at,
+            "the settings gear is added AFTER the avatar, so the right-to-left strip paints it \
+             to the LEFT of the avatar -- the opposite of what was asked for"
+        );
+    }
+
+    /// The click has to do both halves. Setting the flag without closing
+    /// leaves the request sitting in a cell nobody reads until the user
+    /// closes the window by hand; closing without setting it loses the
+    /// request entirely and reads as a window that shut for no reason.
+    #[test]
+    fn the_gear_asks_for_preferences_and_then_closes_the_window() {
+        let body = gear_click_body();
+        let sets_flag = concat!("*open_preferences_for_", "closure.borrow_mut() = true;");
+        let closes = concat!("ViewportCommand::", "Close");
+
+        assert!(
+            body.contains(sets_flag),
+            "the gear's click does not record the request; `main` has nothing to act on: {body:?}"
+        );
+        assert!(
+            body.contains(closes),
+            "the gear's click does not close the window, so `prefs_ui::run` -- which is its own \
+             eframe window on this thread -- can never be reached: {body:?}"
+        );
+    }
+
+    /// **A Settings request is not a lock and not an expired session.** Both
+    /// of those run the full recovery sequence: stop the backend,
+    /// re-authenticate, restart, repopulate. Folding the gear into either
+    /// would make every visit to Preferences demand the master password.
+    /// That is why `open_preferences` is its own field, and this is what
+    /// stops a later tidy-up from collapsing the three.
+    #[test]
+    fn asking_for_preferences_is_neither_a_lock_nor_an_expired_session() {
+        let body = gear_click_body();
+        let locks = concat!("*locked_for_", "closure.borrow_mut()");
+        let reauths = concat!("needs_reauth_for_", "closure");
+
+        assert!(
+            !body.contains(locks),
+            "the gear's click also sets the LOCK flag, so opening Preferences tears down the \
+             backend and demands the master password on the way back: {body:?}"
+        );
+        assert!(
+            !body.contains(reauths),
+            "the gear's click also flags an expired session, so opening Preferences runs the \
+             re-authentication path: {body:?}"
+        );
+    }
+
+    /// The body of the gear's `if ... clicked()` block, depth-counted to its
+    /// matching brace. Slicing matters: a file-wide search would find the
+    /// Lock arm's flag a few lines below and report it as the gear's.
+    fn gear_click_body() -> &'static str {
+        let production = production();
+        let gear = gear_needle();
+        let at = production
+            .find(&gear)
+            .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
+        let after_open = &production[at..];
+        let open = after_open
+            .find('{')
+            .expect("the gear's click has no block to slice");
+        let after_open = &after_open[open + 1..];
+
+        let mut depth = 1usize;
+        for (offset, ch) in after_open.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let body = &after_open[..offset];
+                        assert!(
+                            !body.trim().is_empty(),
+                            "the gear's click block is empty, so every assertion over it would \
+                             pass against nothing"
+                        );
+                        return body;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after the gear's click -- this guard slices the block it opens")
+    }
+}
