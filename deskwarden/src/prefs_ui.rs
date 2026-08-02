@@ -5,8 +5,10 @@
 //! app version pinned to the bottom of the nav. This file builds that shell,
 //! and populates it **only where a setting genuinely exists**.
 //!
-//! What exists today is two fields on [`Settings`]: `keep_backend_running` and
-//! `auto_lock_minutes`. Both live on General. Every other section in 3e -- its
+//! What exists today is three fields on [`Settings`]: `keep_backend_running`,
+//! `auto_lock_enabled` and `auto_lock_minutes`. All three live on General --
+//! the last two as a toggle and the number it governs, the number greyed out
+//! while the toggle is off. Every other section in 3e -- its
 //! five autofill toggles, the per-app table, Touch ID, the overlay-position
 //! segmented control -- has no backing behaviour anywhere in this crate, so
 //! those sections say so in one line rather than showing a switch that flips
@@ -115,6 +117,10 @@ const STEPPER_FIELD_ID: &str = "prefs-auto-lock-minutes";
 const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
      while the vault window is open; autofill is unaffected either way.";
+
+const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
+const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
+    "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
 
 const AUTO_LOCK_LABEL: &str = "Lock the vault after";
 const AUTO_LOCK_DESCRIPTION: &str = "Minutes of no activity before the vault window locks itself. \
@@ -228,9 +234,12 @@ struct PrefsState {
 impl PrefsState {
     /// Clamps the loaded value up front, deliberately.
     ///
-    /// `settings.json` can contain `auto_lock_minutes: 0` (it is the natural
-    /// hand-written value for "never lock"), and `Settings::auto_lock_timeout`
-    /// silently uses 1 minute for it. Showing the stored `0` in the field would
+    /// `settings.json` can contain `auto_lock_minutes: 0` (it was, before the
+    /// `auto_lock_enabled` toggle existed, the only hand-written way to say
+    /// "never lock"), and `settings::auto_lock_policy` still uses 1 minute for
+    /// it -- deliberately, see `MIN_AUTO_LOCK_MINUTES`'s doc: "never" is now
+    /// the toggle's job and a legacy `0` is not retro-fitted to mean it.
+    /// Showing the stored `0` in the field would
     /// make this window display a number that is not the number in effect --
     /// so the window opens on the value that *is* in effect. The cost is that
     /// opening Preferences on such a file makes `edited != settings` true in
@@ -281,16 +290,35 @@ fn increment_minutes(value: u64) -> u64 {
 
 /// `[-] [ 15 ] [+]` in 3e's segmented-control box. Returns the value after this
 /// frame; `buffer` is the caller's persistent text state.
-fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String) -> u64 {
+///
+/// `enabled == false` is the auto-lock toggle being off, and it is a *disabled*
+/// control rather than a hidden one: the number stays on screen (greyed, so it
+/// reads as inert) because it is still the number that comes back when the
+/// toggle is turned on again, and a control that disappears takes its value's
+/// visibility with it. Nothing in here is merely painted differently --
+/// neither step button senses a click, and the text field is replaced by a
+/// painted galley rather than a read-only `TextEdit`, so there is no widget
+/// left to focus, click into, or type at. "Looks disabled" and "is disabled"
+/// are the pair this codebase keeps having to reunite.
+fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String, enabled: bool) -> u64 {
     let (outer, _) = ui.allocate_exact_size(
         Vec2::new(STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, STEPPER_HEIGHT),
         Sense::hover(),
     );
+    // 3e has no disabled variant of its segmented control, so the greyed
+    // treatment is built from 3e's own two lighter greys: the card's hairline
+    // border in place of the control border, on the canvas grey in place of
+    // white. No new colour is introduced for it.
+    let (fill, border) = if enabled {
+        (theme::CARD, theme::BORDER_STRONG)
+    } else {
+        (theme::CANVAS, theme::HAIRLINE)
+    };
     ui.painter().rect(
         outer,
         CornerRadius::same(STEPPER_RADIUS),
-        theme::CARD,
-        Stroke::new(1.0, theme::BORDER_STRONG),
+        fill,
+        Stroke::new(1.0, border),
         StrokeKind::Inside,
     );
 
@@ -307,7 +335,7 @@ fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String) -> u64 {
         ui.painter().rect_filled(
             Rect::from_min_max(Pos2::new(x, outer.min.y), Pos2::new(x + 1.0, outer.max.y)),
             CornerRadius::ZERO,
-            theme::BORDER_STRONG,
+            border,
         );
     }
 
@@ -324,16 +352,43 @@ fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String) -> u64 {
     let mut next = value;
     // The floor is shown, not merely enforced: at the minimum there is nothing
     // below to step to, and a `-` that accepts the click and refuses the change
-    // is the same lie as a switch that does nothing.
-    if step_button(ui, minus, "-", shown > decrement_minutes(shown)) {
+    // is the same lie as a switch that does nothing. `enabled &&` in front of
+    // both, so an off toggle disables the ends for the same reason.
+    if step_button(ui, minus, "-", enabled && shown > decrement_minutes(shown)) {
         next = decrement_minutes(shown);
     }
-    if step_button(ui, plus, "+", shown < increment_minutes(shown)) {
+    if step_button(ui, plus, "+", enabled && shown < increment_minutes(shown)) {
         next = increment_minutes(shown);
     }
     let stepped = next != value;
     if stepped {
         *buffer = next.to_string();
+    }
+
+    if !enabled {
+        // A painted galley, not a disabled/read-only `TextEdit`: egui's
+        // read-only text edit still takes focus, still shows a caret and
+        // still accepts a click, which is precisely the "greyed out but
+        // secretly live" state this is meant not to be. Nothing here is
+        // interactive because there is no widget here at all.
+        let galley = ui.painter().layout_no_wrap(
+            value.to_string(),
+            FontId::new(12.0, FontFamily::Proportional),
+            theme::TEXT_GHOST,
+        );
+        ui.painter().galley(
+            Pos2::new(
+                field.center().x - galley.size().x / 2.0,
+                field.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            theme::TEXT_GHOST,
+        );
+        // Kept in step with the committed value while the control is off, so
+        // turning the toggle back on hands the live field the number that has
+        // been on screen all along rather than a stale mid-edit fragment.
+        *buffer = value.to_string();
+        return value;
     }
 
     // Frameless: the box around it is painted above, so `TextEdit`'s own frame
@@ -667,11 +722,24 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.keep_backend_running,
         );
         row_separator(ui);
+        // The toggle sits above the number it governs, in 3e's own 40x22
+        // pill, and the number's row stays put below it -- greyed, not
+        // removed. A row that vanished would reflow the card on every click
+        // and would hide the value the toggle is about to restore.
+        state.settings.auto_lock_enabled = toggle_row(
+            ui,
+            AUTO_LOCK_ENABLED_LABEL,
+            AUTO_LOCK_ENABLED_DESCRIPTION,
+            state.settings.auto_lock_enabled,
+        );
+        row_separator(ui);
+        let enabled = state.settings.auto_lock_enabled;
         control_row(ui, AUTO_LOCK_LABEL, AUTO_LOCK_DESCRIPTION, |ui| {
             state.settings.auto_lock_minutes = minutes_stepper(
                 ui,
                 state.settings.auto_lock_minutes,
                 &mut state.auto_lock_text,
+                enabled,
             );
         });
     });
@@ -726,8 +794,8 @@ fn draw_not_yet(ui: &mut Ui, detail: &str) {
 /// actually changed and persists them; this function never touches disk itself.
 ///
 /// The returned `Settings` differs from the argument in at most
-/// `keep_backend_running` and `auto_lock_minutes` -- the two fields
-/// `Settings::persist_preferences` owns. `vault_window` is carried through
+/// `keep_backend_running`, `auto_lock_enabled` and `auto_lock_minutes` -- the
+/// three fields `Settings::persist_preferences` owns. `vault_window` is carried through
 /// untouched, which is what makes `main.rs`'s stale copy of it harmless.
 pub fn run(settings: Settings) -> Settings {
     let state = Rc::new(RefCell::new(PrefsState::new(settings)));
@@ -835,15 +903,46 @@ mod tests {
                 .count()
         }
 
-        /// The one rectangle of exactly this size, for finding a control that
-        /// paints no text of its own (the toggle pill).
+        /// Every rectangle of exactly this size, top to bottom -- how a
+        /// control that paints no text of its own (the toggle pill) is
+        /// located now that the General card holds two of them.
+        ///
+        /// Sorted by the painted y, not by paint order: "the pill in the
+        /// second row" is a claim about where it is on screen, and a test
+        /// that indexed paint order would keep passing if the rows were
+        /// drawn in one order and laid out in another.
+        fn rects_of_size(&self, size: Vec2) -> Vec<Rect> {
+            let mut found: Vec<Rect> = self
+                .rects
+                .iter()
+                .filter(|r| {
+                    (r.rect.width() - size.x).abs() < 0.5
+                        && (r.rect.height() - size.y).abs() < 0.5
+                })
+                .map(|r| r.rect)
+                .collect();
+            found.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            found
+        }
+
+        /// The one rectangle of exactly this size, for a control there is
+        /// only ever one of.
         fn only_rect_of_size(&self, size: Vec2) -> Rect {
+            let found = self.rects_of_size(size);
+            assert_eq!(found.len(), 1, "expected exactly one rectangle of size {size:?}");
+            found[0]
+        }
+
+        /// The stroke colour of the one rectangle of exactly this size --
+        /// how "greyed out" is read back, since the stepper's box paints no
+        /// text of its own.
+        fn stroke_of_only_rect_of_size(&self, size: Vec2) -> egui::Color32 {
             let mut found = self.rects.iter().filter(|r| {
                 (r.rect.width() - size.x).abs() < 0.5 && (r.rect.height() - size.y).abs() < 0.5
             });
-            let rect = found.next().expect("no rectangle of that size was painted").rect;
+            let stroke = found.next().expect("no rectangle of that size was painted").stroke;
             assert!(found.next().is_none(), "more than one rectangle of that size");
-            rect
+            stroke.color
         }
 
         fn count_filled(&self, fill: egui::Color32) -> usize {
@@ -1003,9 +1102,11 @@ mod tests {
     // -- General -----------------------------------------------------------
 
     #[test]
-    fn general_paints_both_settings_that_actually_exist() {
+    fn general_paints_every_setting_that_actually_exists() {
         let painted = paint(Section::General);
         assert!(painted.contains("Keep the Bitwarden backend running"));
+        assert!(painted.contains("Lock the vault when idle"));
+        assert!(painted.contains(AUTO_LOCK_ENABLED_DESCRIPTION), "got {:?}", painted.strings());
         assert!(painted.contains("Lock the vault after"));
         // The descriptions too: a row whose right-hand control squeezes the
         // text column to nothing still paints its title, so asserting only on
@@ -1024,12 +1125,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_one_toggle_and_one_stepper() {
+    fn general_paints_exactly_two_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            1,
-            "one 40x22 pill: `keep_backend_running`, and nothing else"
+            2,
+            "two 40x22 pills: `keep_backend_running` and `auto_lock_enabled`, and nothing else"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -1060,12 +1161,150 @@ mod tests {
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.only_rect_of_size(Vec2::new(40.0, 22.0)).center();
+        // The first pill top-to-bottom is the backend row's; the auto-lock
+        // one is below it. Clicking one must not move the other, which is
+        // what the two `auto_lock_enabled` assertions here pin.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
 
         frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
+        assert!(state.settings.auto_lock_enabled);
+    }
+
+    #[test]
+    fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
+        // The user's actual request. `auto_lock_enabled` starts true, and
+        // the second pill down is the one wired to it.
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(state.settings.auto_lock_enabled, "the default");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        // What the toggle is FOR, asserted on the value the vault window
+        // actually consumes rather than on the flag: a field that flips
+        // without reaching `auto_lock` is a switch that does nothing.
+        assert_eq!(state.settings.auto_lock(), crate::settings::AutoLock::Never);
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(state.settings.auto_lock_enabled, "and back on again");
+        assert_eq!(
+            state.settings.auto_lock(),
+            crate::settings::AutoLock::After(std::time::Duration::from_secs(15 * 60)),
+            "turning it back on must restore the minutes that were on screen the whole time"
+        );
+    }
+
+    #[test]
+    fn the_minutes_stepper_is_greyed_while_auto_lock_is_off() {
+        // "Greyed" is the visible half; the click tests below are the half
+        // that matters. Read back off the stepper box's own stroke, with the
+        // enabled case as the positive control -- without it, a stepper that
+        // painted `HAIRLINE` in both states would pass.
+        let off = paint_settings(
+            Section::General,
+            Settings { auto_lock_enabled: false, ..Settings::default() },
+        );
+        let on = paint_settings(Section::General, Settings::default());
+        let stepper = Vec2::new(112.0, 28.0);
+        assert_eq!(
+            on.stroke_of_only_rect_of_size(stepper),
+            theme::BORDER_STRONG,
+            "with auto-lock on the stepper is 3e's ordinary segmented control"
+        );
+        assert_eq!(
+            off.stroke_of_only_rect_of_size(stepper),
+            theme::HAIRLINE,
+            "with auto-lock off the stepper must read as disabled"
+        );
+        assert_ne!(theme::BORDER_STRONG, theme::HAIRLINE, "the two greys have to differ at all");
+    }
+
+    #[test]
+    fn the_minutes_stepper_still_shows_its_value_while_auto_lock_is_off() {
+        // Greyed, not hidden: the number the toggle will restore has to stay
+        // legible, so this is not satisfied by a row that disappears.
+        let painted = paint_settings(
+            Section::General,
+            Settings { auto_lock_enabled: false, auto_lock_minutes: 42, ..Settings::default() },
+        );
+        assert!(painted.contains("Lock the vault after"), "got {:?}", painted.strings());
+        assert!(painted.contains("42"), "got {:?}", painted.strings());
+        assert_eq!(
+            painted.count_of_size(Vec2::new(112.0, 28.0)),
+            1,
+            "the stepper box is still drawn"
+        );
+    }
+
+    #[test]
+    fn the_steppers_buttons_are_inert_while_auto_lock_is_off() {
+        // A click test, not a colour check: a control that is painted grey
+        // and still responds is the exact defect this repo keeps re-writing.
+        // Every assertion here is paired with the same click on an enabled
+        // stepper, so "the stepper never works" cannot pass it.
+        let ctx = styled_context();
+        let mut off =
+            PrefsState::new(Settings { auto_lock_enabled: false, ..Settings::default() });
+        let painted = frame(&ctx, &mut off, &[]);
+        let plus = painted.rect_of("+").center();
+        let minus = painted.rect_of("-").center();
+
+        frame(&ctx, &mut off, &click(plus));
+        assert_eq!(off.settings.auto_lock_minutes, 15, "the disabled + stepped the value");
+        frame(&ctx, &mut off, &click(minus));
+        assert_eq!(off.settings.auto_lock_minutes, 15, "the disabled - stepped the value");
+
+        let mut on = PrefsState::new(Settings::default());
+        let painted = frame(&ctx, &mut on, &[]);
+        assert_eq!(
+            (painted.rect_of("+").center(), painted.rect_of("-").center()),
+            (plus, minus),
+            "the two states must put their buttons in the same place, or the clicks above \
+             missed rather than being refused"
+        );
+        frame(&ctx, &mut on, &click(plus));
+        assert_eq!(on.settings.auto_lock_minutes, 16, "positive control: the + does work");
+        frame(&ctx, &mut on, &click(minus));
+        assert_eq!(on.settings.auto_lock_minutes, 15, "positive control: the - does work");
+    }
+
+    #[test]
+    fn the_minutes_field_cannot_be_typed_into_while_auto_lock_is_off() {
+        // The other half of "non-interactive": the buttons are inert above,
+        // and there is no text widget left in the middle either -- clicking
+        // it takes no focus, so the keystrokes go nowhere.
+        let ctx = styled_context();
+        let mut off =
+            PrefsState::new(Settings { auto_lock_enabled: false, ..Settings::default() });
+        let painted = frame(&ctx, &mut off, &[]);
+        // The middle cell of the 112x28 box, i.e. where the value sits.
+        let field = painted.only_rect_of_size(Vec2::new(112.0, 28.0)).center();
+        frame(&ctx, &mut off, &click(field));
+        frame(&ctx, &mut off, &[egui::Event::Text("7".into())]);
+        frame(&ctx, &mut off, &[]);
+        assert_eq!(off.settings.auto_lock_minutes, 15, "the disabled field accepted typing");
+        assert_eq!(off.auto_lock_text, "15", "and its buffer must not drift either");
+
+        let mut on = PrefsState::new(Settings::default());
+        let painted = frame(&ctx, &mut on, &[]);
+        let field = painted.only_rect_of_size(Vec2::new(112.0, 28.0)).center();
+        frame(&ctx, &mut on, &click(field));
+        frame(&ctx, &mut on, &[egui::Event::Text("7".into())]);
+        frame(&ctx, &mut on, &[]);
+        assert!(
+            on.auto_lock_text.contains('7') && on.auto_lock_text != "15",
+            "positive control: with auto-lock on the same click and keystroke DO reach the \
+             field (so the assertion above is about the disabled state, not about the harness \
+             being unable to type at all); the buffer is {:?}",
+            on.auto_lock_text
+        );
     }
 
     #[test]

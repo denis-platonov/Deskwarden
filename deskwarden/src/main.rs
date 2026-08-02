@@ -1770,7 +1770,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         icon_cache_dir.to_path_buf(),
         // Read fresh on every pass, so a timeout changed in the preferences
         // window below governs the window this loop is about to reopen.
-        settings.auto_lock_timeout(),
+        settings.auto_lock(),
         backend_already_running,
     );
 

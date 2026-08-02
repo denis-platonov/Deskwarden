@@ -14,24 +14,88 @@ use std::time::Duration;
 /// until the 3e preferences window exists".
 const DEFAULT_AUTO_LOCK_MINUTES: u64 = 15;
 
-/// Floor applied to `auto_lock_minutes` by `auto_lock_timeout`, regardless of
+/// Floor applied to `auto_lock_minutes` by [`auto_lock_policy`], regardless of
 /// what's stored on disk.
 ///
-/// `0` is the natural value to hand-write into `settings.json` for "never
-/// lock", but `auto_lock_timeout`'s result feeds `vault_window::run`'s
-/// `last_activity.elapsed() >= auto_lock` check, where a zero-length timeout
-/// is true on the very first frame -- the window would close itself with
+/// The hazard is unchanged by the arrival of [`Settings::auto_lock_enabled`]:
+/// a *number* of minutes ends up in `vault_window::run`'s
+/// `last_activity.elapsed() >= timeout` check, and a zero-length timeout is
+/// true on the very first frame -- the window would close itself with
 /// `locked = true` before the user can do anything, on every single open,
-/// forcing a fresh master-password re-auth each time. There's no "never
-/// lock" mode in this app (see the design spec), so a zero or corrupt value
-/// is clamped up to the shortest lock period that's still usable rather than
-/// being treated as meaningful.
+/// forcing a fresh master-password re-auth each time. So while auto-lock is
+/// *on*, a zero or corrupt minutes value is still clamped up to the shortest
+/// lock period that is actually usable.
+///
+/// **What a pre-existing `auto_lock_minutes: 0` means now.** Before the
+/// toggle existed, `0` was the only way to hand-write "never lock" into
+/// `settings.json`, and this clamp turned it into one minute regardless. It
+/// still does. `0` is *not* retro-fitted to mean "never": there is now a real
+/// field for that, and re-reading an existing file's `0` as "never" would
+/// silently turn off auto-lock for a vault whose owner never asked -- a
+/// weakening of the file's current behaviour, applied without their
+/// knowledge, on upgrade. "Never" is [`Settings::auto_lock_enabled`] set to
+/// `false` and nothing else; a `0` still on disk keeps doing exactly what it
+/// has always done, which is lock after a minute.
+/// `a_pre_existing_zero_still_means_one_minute_and_not_never` pins that.
 const MIN_AUTO_LOCK_MINUTES: u64 = 1;
 
-/// The auto-lock period that will *actually* be used for a stored
-/// `auto_lock_minutes` -- [`MIN_AUTO_LOCK_MINUTES`] applied, and nothing else.
+/// When -- if ever -- the vault window locks itself, as
+/// `vault_window::run` consumes it.
 ///
-/// Public and pure, and separate from [`Settings::auto_lock_timeout`], because
+/// Two variants rather than a `Duration` with a magic value, because "never
+/// lock" and "lock instantly" are the two *most* confusable states here and
+/// the difference between them is the whole security posture of the window.
+/// Every sentinel available in a bare `Duration` gets one of them wrong:
+/// `Duration::ZERO` is already elapsed on frame one (lock instantly and
+/// permanently -- the exact defect [`MIN_AUTO_LOCK_MINUTES`] exists to
+/// prevent), and a very large `Duration` means "never" only until someone
+/// multiplies it (`u64::MAX` minutes is not representable in seconds at all).
+/// [`Never`](AutoLock::Never) is not a duration, so no arithmetic can turn it
+/// into a short one, and the consumer cannot forget to handle it -- the
+/// `match` will not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoLock {
+    /// The vault window stays open until the user locks it by hand or quits.
+    Never,
+    /// Lock after this much inactivity. Never zero-length: it comes only from
+    /// [`auto_lock_policy`], which applies [`MIN_AUTO_LOCK_MINUTES`] first.
+    After(Duration),
+}
+
+/// The whole auto-lock decision, as a pure function of the two stored fields:
+/// given the toggle and the minutes, what does the app actually do?
+///
+/// Public and separate from [`Settings::auto_lock`] for the same reason
+/// [`clamp_auto_lock_minutes`] is separate: this is the answer to "what will
+/// these two values really do?", and it is the thing worth testing, so it must
+/// be reachable without constructing a `Settings` or opening a window.
+///
+/// * `enabled == false` is [`AutoLock::Never`] **whatever the minutes say**.
+///   The minutes are deliberately not consulted, not zeroed and not forgotten:
+///   the preferences window greys the stepper out rather than hiding it, so
+///   the number stays legible and comes straight back when the toggle is
+///   turned on again.
+/// * `enabled == true` is the old behaviour exactly -- the floor applied, then
+///   converted to seconds with `saturating_mul`, because a hand-edited or
+///   corrupt `settings.json` can hold any `u64` and `* 60` on the largest of
+///   those would overflow (panic in debug, wrap to a tiny -- i.e.
+///   lock-immediately -- duration in release).
+pub const fn auto_lock_policy(enabled: bool, minutes: u64) -> AutoLock {
+    if enabled {
+        AutoLock::After(Duration::from_secs(
+            clamp_auto_lock_minutes(minutes).saturating_mul(60),
+        ))
+    } else {
+        AutoLock::Never
+    }
+}
+
+/// The auto-lock period that will *actually* be used for a stored
+/// `auto_lock_minutes` **while auto-lock is on** -- [`MIN_AUTO_LOCK_MINUTES`]
+/// applied, and nothing else. Whether it is on at all is
+/// [`auto_lock_policy`]'s question, not this one's.
+///
+/// Public and pure, and separate from [`Settings::auto_lock`], because
 /// the preferences window has to be able to ask the question "what will this
 /// number really do?" before it offers the number to the user. A spinner that
 /// accepted `0` would display `0` while the vault locked after a minute --
@@ -42,7 +106,7 @@ const MIN_AUTO_LOCK_MINUTES: u64 = 1;
 /// screen and the number `auto_lock_timeout` uses are the same number by
 /// construction rather than by two matching `.max()` calls that could drift.
 ///
-/// A floor only: there is deliberately no ceiling. `auto_lock_timeout`
+/// A floor only: there is deliberately no ceiling. [`auto_lock_policy`]
 /// saturates rather than overflowing, so every `u64` above the floor is a
 /// meaningful timeout, and inventing a maximum here would mean a hand-written
 /// `settings.json` silently losing its value the first time the preferences
@@ -250,7 +314,24 @@ pub struct Settings {
     /// vault window is open; reads come from `VaultCache` either way, so
     /// autofill is unaffected.
     pub keep_backend_running: bool,
-    /// Idle minutes before the vault window locks itself.
+    /// Whether the vault window locks itself at all.
+    ///
+    /// `true` (the default, and what an older `settings.json` without this
+    /// field parses as) is the behaviour that has always existed: lock after
+    /// [`Self::auto_lock_minutes`] of no activity. `false` means never --
+    /// the vault stays unlocked until the user locks it by hand or quits.
+    ///
+    /// That is a real reduction in what this app guarantees, and it is the
+    /// user's explicit choice rather than an oversight: it was asked for, the
+    /// alternatives (a minimum that cannot be disabled, a confirmation
+    /// dialog) were offered, and this is the one that was picked. Nothing
+    /// here quietly keeps a hidden floor under it -- see [`auto_lock_policy`],
+    /// where "off" is a variant that carries no duration at all.
+    pub auto_lock_enabled: bool,
+    /// Idle minutes before the vault window locks itself, when
+    /// [`Self::auto_lock_enabled`]. Retained while auto-lock is off (the
+    /// preferences window greys its stepper out rather than clearing it), so
+    /// turning the toggle back on restores the number the user last chose.
     pub auto_lock_minutes: u64,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
@@ -274,6 +355,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             keep_backend_running: true,
+            auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             vault_window: None,
         }
@@ -351,24 +433,23 @@ impl Settings {
     /// whoever adds it to say which of the two writers owns it, instead of
     /// silently joining the set this one drops.
     pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
-        let Settings { keep_backend_running, auto_lock_minutes, vault_window: _ } = self;
+        let Settings {
+            keep_backend_running,
+            auto_lock_enabled,
+            auto_lock_minutes,
+            vault_window: _,
+        } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
+        on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.save(path)
     }
 
-    pub fn auto_lock_timeout(&self) -> Duration {
-        // The floor is applied to the stored value itself rather than to a
-        // possibly-already-overflowed product; see
-        // [`clamp_auto_lock_minutes`] for why there is a floor at all.
-        // `saturating_mul` handles the separate case of an absurdly large
-        // stored value (a corrupt or hand-edited file): plain `* 60` would
-        // overflow `u64` and panic in a debug build (or silently wrap to a
-        // tiny duration in release), where saturating to
-        // `Duration::from_secs(u64::MAX)` -- effectively forever -- is a far
-        // safer failure mode for a *lock* timeout to have.
-        Duration::from_secs(clamp_auto_lock_minutes(self.auto_lock_minutes).saturating_mul(60))
+    /// What this settings file means for the vault window's idle timer. All
+    /// of the reasoning is in [`auto_lock_policy`]; this is only the lookup.
+    pub fn auto_lock(&self) -> AutoLock {
+        auto_lock_policy(self.auto_lock_enabled, self.auto_lock_minutes)
     }
 }
 
@@ -387,7 +468,8 @@ mod tests {
     fn the_default_preserves_todays_behaviour() {
         let s = Settings::default();
         assert!(s.keep_backend_running);
-        assert_eq!(s.auto_lock_timeout(), Duration::from_secs(15 * 60));
+        assert!(s.auto_lock_enabled, "auto-lock is on unless it is turned off");
+        assert_eq!(s.auto_lock(), AutoLock::After(Duration::from_secs(15 * 60)));
     }
 
     #[test]
@@ -395,6 +477,7 @@ mod tests {
         let path = temp_path("round-trip");
         let written = Settings {
             keep_backend_running: false,
+            auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: None,
         };
@@ -437,15 +520,133 @@ mod tests {
         // re-auth on every open.
         let s = Settings { auto_lock_minutes: 0, ..Settings::default() };
         assert_eq!(
-            s.auto_lock_timeout(),
-            Duration::from_secs(MIN_AUTO_LOCK_MINUTES * 60)
+            s.auto_lock(),
+            AutoLock::After(Duration::from_secs(MIN_AUTO_LOCK_MINUTES * 60))
         );
     }
 
     #[test]
     fn a_normal_value_is_used_as_is() {
         let s = Settings { auto_lock_minutes: 5, ..Settings::default() };
-        assert_eq!(s.auto_lock_timeout(), Duration::from_secs(5 * 60));
+        assert_eq!(s.auto_lock(), AutoLock::After(Duration::from_secs(5 * 60)));
+    }
+
+    #[test]
+    fn the_toggle_off_means_never_which_is_not_a_short_timeout() {
+        // The whole point of `AutoLock` being an enum. "Never" must be
+        // unrepresentable as a duration, because every duration is a lock
+        // that eventually fires and the shortest of them fires on frame one.
+        let off = Settings { auto_lock_enabled: false, auto_lock_minutes: 15, ..Settings::default() };
+        assert_eq!(off.auto_lock(), AutoLock::Never);
+        // The negative assertion the variant makes possible, spelled out:
+        // whatever `Never` is, it is not "already elapsed", and it is not
+        // the configured 15 minutes either.
+        assert_ne!(off.auto_lock(), AutoLock::After(Duration::ZERO));
+        assert_ne!(off.auto_lock(), AutoLock::After(Duration::from_secs(15 * 60)));
+        // Positive control on the same minutes: flipping only the toggle is
+        // what changed the answer, so a `Never` returned unconditionally
+        // fails here.
+        let on = Settings { auto_lock_enabled: true, ..off };
+        assert_eq!(on.auto_lock(), AutoLock::After(Duration::from_secs(15 * 60)));
+    }
+
+    #[test]
+    fn the_policy_is_a_pure_function_of_the_toggle_and_the_minutes() {
+        // Absolute expectations, so this passes for exactly one
+        // implementation. Note the two `false` rows: the minutes are NOT
+        // consulted when the toggle is off, including the zero that would
+        // otherwise be floored, and including a value that could overflow.
+        assert_eq!(auto_lock_policy(true, 15), AutoLock::After(Duration::from_secs(900)));
+        assert_eq!(auto_lock_policy(true, 1), AutoLock::After(Duration::from_secs(60)));
+        assert_eq!(
+            auto_lock_policy(true, 0),
+            AutoLock::After(Duration::from_secs(60)),
+            "the floor still applies while auto-lock is ON"
+        );
+        assert_eq!(auto_lock_policy(false, 15), AutoLock::Never);
+        assert_eq!(auto_lock_policy(false, 0), AutoLock::Never);
+        assert_eq!(auto_lock_policy(false, u64::MAX), AutoLock::Never);
+    }
+
+    #[test]
+    fn a_pre_existing_zero_still_means_one_minute_and_not_never() {
+        // A `settings.json` written before the toggle existed could contain
+        // `auto_lock_minutes: 0` -- which used to be the only way to
+        // hand-write "never lock", and which has always been clamped to one
+        // minute. It still is. Reinterpreting it as `Never` now that a real
+        // toggle exists would silently disable auto-lock, on upgrade, for a
+        // vault whose owner is still expecting it to lock.
+        let path = temp_path("legacy-zero");
+        std::fs::write(&path, r#"{"auto_lock_minutes": 0}"#).unwrap();
+        let loaded = Settings::load(&path);
+        assert!(loaded.auto_lock_enabled, "an absent toggle field is ON");
+        assert_eq!(
+            loaded.auto_lock(),
+            AutoLock::After(Duration::from_secs(60)),
+            "a legacy `auto_lock_minutes: 0` must keep locking after one minute; \
+             turning it into AutoLock::Never would disable auto-lock behind the user's back"
+        );
+        assert_ne!(loaded.auto_lock(), AutoLock::Never);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_written_before_the_toggle_existed_defaults_the_toggle_to_on() {
+        // Stated in the name because it is the decision, not an incidental:
+        // the DEFAULT for `auto_lock_enabled` is `true`, so every existing
+        // settings.json keeps locking exactly as it did before this feature.
+        let path = temp_path("pre-toggle");
+        std::fs::write(&path, r#"{"keep_backend_running": false, "auto_lock_minutes": 7}"#).unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.keep_backend_running, "the fields it does carry still land");
+        assert_eq!(loaded.auto_lock_minutes, 7);
+        assert!(loaded.auto_lock_enabled);
+        assert_eq!(loaded.auto_lock(), AutoLock::After(Duration::from_secs(7 * 60)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn both_auto_lock_fields_round_trip_through_settings_json() {
+        // Serialised and read back through the real file, not just through
+        // `PartialEq` on a struct: a field that is written but not read (or
+        // renamed on one side only) would look fine in memory.
+        let path = temp_path("auto-lock-round-trip");
+        let written = Settings {
+            keep_backend_running: true,
+            auto_lock_enabled: false,
+            auto_lock_minutes: 42,
+            vault_window: None,
+        };
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("auto_lock_enabled"), "not in the file at all: {text}");
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded, written);
+        assert!(!loaded.auto_lock_enabled, "the toggle survived the round trip");
+        assert_eq!(loaded.auto_lock_minutes, 42, "and so did the minutes it is hiding");
+        assert_eq!(loaded.auto_lock(), AutoLock::Never);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisting_preferences_carries_the_toggle_as_well_as_the_minutes() {
+        // `persist_preferences` writes a named list of fields; a new field
+        // that is destructured but never assigned compiles and silently
+        // never persists.
+        let path = temp_path("prefs-toggle");
+        Settings::default().save(&path).unwrap();
+        Settings { auto_lock_enabled: false, auto_lock_minutes: 20, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.auto_lock_enabled, "the toggle was dropped by persist_preferences");
+        assert_eq!(loaded.auto_lock_minutes, 20);
+        // ...and back on again, so "always writes false" fails too.
+        Settings { auto_lock_enabled: true, auto_lock_minutes: 20, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(Settings::load(&path).auto_lock_enabled);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -453,6 +654,7 @@ mod tests {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             keep_backend_running: false,
+            auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
         };
@@ -468,7 +670,7 @@ mod tests {
         // `Settings` it built itself would silently reset
         // `keep_backend_running` every time the vault window closed.
         let path = temp_path("geometry-preserves");
-        Settings { keep_backend_running: false, auto_lock_minutes: 7, vault_window: None }
+        Settings { keep_backend_running: false, auto_lock_minutes: 7, ..Settings::default() }
             .save(&path)
             .unwrap();
         Settings::persist_vault_window_geometry(
@@ -539,10 +741,10 @@ mod tests {
         // says about a preference, the value the user just chose is the one
         // that must survive.
         let path = temp_path("prefs-win");
-        Settings { keep_backend_running: true, auto_lock_minutes: 15, vault_window: None }
+        Settings { keep_backend_running: true, auto_lock_minutes: 15, ..Settings::default() }
             .save(&path)
             .unwrap();
-        Settings { keep_backend_running: false, auto_lock_minutes: 30, vault_window: None }
+        Settings { keep_backend_running: false, auto_lock_minutes: 30, ..Settings::default() }
             .persist_preferences(&path)
             .unwrap();
         let loaded = Settings::load(&path);
@@ -592,12 +794,12 @@ mod tests {
 
     #[test]
     fn the_timeout_is_the_clamped_minutes_in_seconds() {
-        // Ties the two together, so `auto_lock_timeout` cannot quietly grow a
+        // Ties the two together, so `auto_lock_policy` cannot quietly grow a
         // second, different floor from the one the UI bounds its input with.
         for minutes in [0u64, 1, 5, 15, 600] {
             assert_eq!(
-                Settings { auto_lock_minutes: minutes, ..Settings::default() }.auto_lock_timeout(),
-                Duration::from_secs(clamp_auto_lock_minutes(minutes) * 60)
+                Settings { auto_lock_minutes: minutes, ..Settings::default() }.auto_lock(),
+                AutoLock::After(Duration::from_secs(clamp_auto_lock_minutes(minutes) * 60))
             );
         }
     }
@@ -608,7 +810,7 @@ mod tests {
         // that fits in a u64; `* 60` on the largest of those would overflow
         // rather than produce a meaningful timeout.
         let s = Settings { auto_lock_minutes: u64::MAX, ..Settings::default() };
-        assert_eq!(s.auto_lock_timeout(), Duration::from_secs(u64::MAX));
+        assert_eq!(s.auto_lock(), AutoLock::After(Duration::from_secs(u64::MAX)));
     }
 }
 

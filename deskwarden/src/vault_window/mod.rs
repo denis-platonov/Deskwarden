@@ -15,6 +15,7 @@ use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
+use crate::settings::AutoLock;
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultError, VaultItem};
 use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra, VaultSnapshot, VaultUnavailable};
@@ -28,6 +29,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
+
+/// What the sidebar shows where the "Locks in m:ss" countdown normally goes,
+/// when auto-lock has been turned off in Preferences.
+///
+/// Not an empty string: the countdown occupying that corner is how the user
+/// knows the idle timer is running at all, so a blank space there is
+/// indistinguishable from a timer that has stopped working. Saying so out
+/// loud also means the one place this window can tell you the vault will not
+/// lock itself is the same place it otherwise tells you when it will.
+const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
 
 const WINDOW_TITLE: &str = "Deskwarden";
 /// The size this window opens at the very first time, before it has ever been
@@ -212,10 +223,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // `project_dirs.cache_dir().join("icons")`). Not created here --
     // `favicon::write_cached_icon` creates it lazily on first write.
     icon_cache_dir: std::path::PathBuf,
-    // Idle timeout before this window locks itself. Was a hardcoded
+    // When -- if ever -- this window locks itself. Was a hardcoded
     // module-level constant ("until the 3e preferences window exists"); now
-    // that `Settings` exists, `main.rs` loads it once and passes it in here.
-    auto_lock: Duration,
+    // that `Settings` exists, `main.rs` reads it on every pass and passes it
+    // in here. `AutoLock::Never` rather than a very large `Duration` because
+    // the two are not the same thing: a duration is compared against
+    // `last_activity.elapsed()` every frame, and any arithmetic on it can
+    // produce a short one, whereas the variant simply has no comparison to
+    // make. See `settings::AutoLock`.
+    auto_lock: AutoLock,
     // Whether `bw serve` was already running (`backend_is_running`, checked
     // in `main.rs`'s `open_vault_window` -- the only owner of
     // `bw_serve_child`) at the moment this window session started, before
@@ -670,17 +686,27 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
             last_activity = Instant::now();
         }
-        if last_activity.elapsed() >= auto_lock {
-            *locked_for_closure.borrow_mut() = true;
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        let remaining = auto_lock.saturating_sub(last_activity.elapsed());
-        let lock_countdown = format!(
-            "Locks in {}:{:02}",
-            remaining.as_secs() / 60,
-            remaining.as_secs() % 60
-        );
+        // `Never` is handled by there being no timeout to compare against at
+        // all -- not by a comparison against a large number. The sidebar
+        // still gets a line, because a countdown that simply vanished would
+        // read as the timer having broken rather than as a setting the user
+        // themselves turned off.
+        let lock_countdown = match auto_lock {
+            AutoLock::Never => AUTO_LOCK_OFF_LABEL.to_owned(),
+            AutoLock::After(timeout) => {
+                if last_activity.elapsed() >= timeout {
+                    *locked_for_closure.borrow_mut() = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                let remaining = timeout.saturating_sub(last_activity.elapsed());
+                format!(
+                    "Locks in {}:{:02}",
+                    remaining.as_secs() / 60,
+                    remaining.as_secs() % 60
+                )
+            }
+        };
 
         while let Ok(result) = favicon_rx.try_recv() {
             if let Some((w, h, rgba)) = result.pixels {
