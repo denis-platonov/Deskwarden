@@ -54,20 +54,20 @@ const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// different *kinds* of bound and ureq 2.12.1 can express only one per agent.
 /// They used to share one agent with both settings applied, which meant one of
 /// the settings silently did nothing; see [`crate::http_agent`].
-pub fn build_api_agent() -> ureq::Agent {
+pub fn build_api_agent() -> crate::http_agent::TotalBounded {
     crate::http_agent::bounded_total(CONNECT_TIMEOUT, API_DEADLINE)
 }
 
 /// Agent for [`download_and_verify`]: a multi-megabyte stream, bounded by time
 /// without progress. See [`build_api_agent`] for why this is its own agent.
-pub fn build_download_agent() -> ureq::Agent {
+pub fn build_download_agent() -> crate::http_agent::StallBounded {
     crate::http_agent::bounded_stall(CONNECT_TIMEOUT, DOWNLOAD_STALL_TIMEOUT)
 }
 
 pub fn check_for_update(
     base_url: &str,
     current_version: &Version,
-    agent: &ureq::Agent,
+    agent: &crate::http_agent::TotalBounded,
 ) -> Result<Option<ReleaseInfo>, String> {
     let url = format!("{base_url}/repos/denis-platonov/deskwarden/releases/latest");
     let body: serde_json::Value = agent
@@ -158,15 +158,19 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
 /// Streams the release installer to `dest_dir` and refuses anything not signed
 /// by the expected signer.
 ///
-/// `agent` must come from [`build_download_agent`], not [`build_api_agent`]:
-/// this is the one caller in the crate whose bound is "time without progress"
-/// rather than "total time", and an agent of the wrong shape would either
-/// abort a legitimately slow download or leave the stall unbounded.
+/// `agent` comes from [`build_download_agent`], and the type says so rather
+/// than the comment: this is the one caller in the crate whose bound is "time
+/// without progress" rather than "total time". That used to be prose only,
+/// with both functions taking a bare `ureq::Agent`, so swapping the two
+/// arguments at their `main.rs` call sites compiled -- and nothing tests
+/// `main.rs`. The wrong direction is not cosmetic: [`build_api_agent`]'s 30s
+/// *total* cap applied to a 6 MB stream aborts every legitimately slow
+/// download, which is worse than the 600s cap this shape exists to remove.
 pub fn download_and_verify(
     release: &ReleaseInfo,
     expected_thumbprint: &str,
     dest_dir: &Path,
-    agent: &ureq::Agent,
+    agent: &crate::http_agent::StallBounded,
 ) -> Result<PathBuf, String> {
     // Created here rather than assumed to exist: this is a dedicated cache
     // subdirectory (see `main.rs`), not the config directory the rest of the
@@ -181,7 +185,18 @@ pub fn download_and_verify(
         .map_err(|e| format!("failed to download installer: {e}"))?;
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(&dest_path).map_err(|e| e.to_string())?;
-    std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
+    // A stalled transfer aborts here, part-written, and the partial file must
+    // not be left behind -- same cleanup the signature-failure branch below
+    // does, for the same reason. `cleanup_stale_downloads` would eventually
+    // catch it at the next startup, but this path stopped being near-
+    // unreachable when the bound went from a 600s total to a 15s stall: a
+    // flaky link now produces a partial installer every retry, and each one
+    // sits in the cache directory until the app is next restarted.
+    if let Err(e) = std::io::copy(&mut reader, &mut file) {
+        drop(file);
+        let _ = std::fs::remove_file(&dest_path);
+        return Err(e.to_string());
+    }
     drop(file);
 
     let info = verify_authenticode(&dest_path)?;
@@ -437,6 +452,70 @@ mod tests {
             2,
             "the download agent pooled a connection, so its stall bound is not in force"
         );
+    }
+
+    /// A download that stalls part-way must not leave the partial installer
+    /// behind.
+    ///
+    /// `cleanup_stale_downloads` would eventually collect it, but only at the
+    /// *next* startup -- and this path stopped being near-unreachable when the
+    /// bound became a 15s stall rather than a 600s total, so on a flaky link
+    /// every retry now leaves another partial file in the cache directory for
+    /// the rest of the session. The signature-failure branch already cleaned
+    /// up after itself; this is the same courtesy on the branch that got
+    /// common.
+    ///
+    /// Stalls the body rather than the head on purpose: a failure before the
+    /// response arrives never reaches `File::create` and so proves nothing
+    /// about the file. The stall bound here is the test's own 1s, not the
+    /// production 15s, so this costs about a second.
+    #[test]
+    fn a_stalled_download_leaves_no_partial_installer_behind() {
+        use std::io::{Read as _, Write as _};
+        use std::net::{TcpListener, TcpStream};
+
+        fn read_head(stream: &mut TcpStream) -> bool {
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    return true;
+                }
+            }
+            false
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_head(&mut stream);
+            // Promise a megabyte, send ten bytes, then hold the socket open
+            // and silent: a stalled transfer, not a closed one.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n0123456789");
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(10));
+        });
+
+        let dir = scratch_dir("partial");
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: format!("http://127.0.0.1:{port}/installer.exe"),
+        };
+        let agent =
+            crate::http_agent::bounded_stall(Duration::from_secs(1), Duration::from_secs(1));
+
+        let result = download_and_verify(&release, "irrelevant-thumbprint", &dir, &agent);
+
+        assert!(result.is_err(), "a transfer that stopped moving must not look like success");
+        let partial = dir.join(installer_file_name(&release.version));
+        assert!(
+            !partial.exists(),
+            "a stalled download left {} on disk; it would sit there until the next startup",
+            partial.display()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Pins the two production numbers against the failure each was chosen to

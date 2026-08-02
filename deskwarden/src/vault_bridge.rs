@@ -1113,7 +1113,12 @@ fn bool_param(value: bool) -> String {
 #[derive(Clone)]
 pub struct VaultBridge {
     base_url: String,
-    agent: ureq::Agent,
+    /// For the routes `bw serve` answers out of its own local vault. See
+    /// [`READ_DEADLINE`].
+    read_agent: crate::http_agent::TotalBounded,
+    /// For the routes that push to `vault.bitwarden.com` before answering.
+    /// See [`WRITE_DEADLINE`].
+    write_agent: crate::http_agent::TotalBounded,
 }
 
 /// Connect timeout for `agent` below. `bw serve` is a local process on
@@ -1123,8 +1128,8 @@ pub struct VaultBridge {
 /// slow network the benefit of the doubt.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Total-time bound for `agent` below: the longest a single vault call may
-/// take before it is treated as failed.
+/// Total-time bound for [`VaultBridge::read_agent`]: the longest a single
+/// *read* may take before it is treated as failed.
 ///
 /// **This is a freeze budget, not a patience budget.** Nine bridge calls are
 /// still made synchronously on the eframe UI thread, including the
@@ -1132,12 +1137,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// whole app is unresponsive", and every second of it is paid by the user
 /// watching a frozen window.
 ///
+/// **It applies only to the routes `bw serve` answers by itself.** `GET
+/// /list/object/items`, `/list/object/folders`, `/object/item/{id}`,
+/// `/object/totp/{id}` and `/generate` are all served out of the local vault
+/// file (or computed locally, for a TOTP code and a generated password) with
+/// no network hop of any kind. That is what makes a 10s cap on them fair: the
+/// only thing on the other end is a Node process on loopback that is either
+/// answering or broken. The writes do *not* have that property and do not use
+/// this constant -- see [`WRITE_DEADLINE`].
+///
 /// 10s. Derived from what the call actually costs, not from another
-/// constant: `/list/object/items` -- the slowest call this bridge makes --
+/// constant: `/list/object/items` -- the slowest read this bridge makes --
 /// measures 1.1s cold and 1.2s warm against this app's largest observed vault
 /// (1654 items), so this is roughly 8x headroom for a bigger vault on a loaded
-/// machine, over loopback, against a process that is either answering or
-/// broken.
+/// machine.
 ///
 /// It is deliberately **not** [`crate::bw_serve::READINESS_DEADLINE`], which
 /// an earlier version of this comment cited. That 30s is the total budget for
@@ -1148,9 +1161,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// exists precisely because 30s is too *short* for a backend start or sync.
 /// Neither of those runs through this agent (`bw sync` is a separate CLI
 /// process), so borrowing either number would import reasoning that does not
-/// apply. Adopting 30s here also tripled the UI-thread worst case on a fresh
-/// connection, which used to be bounded at 10s and was never reported as too
-/// tight.
+/// apply.
+///
+/// One caveat this budget does not cover, and it is the caller's to know:
+/// [`crate::vault_cache::VaultCache::populate`] makes **two** bounded calls in
+/// sequence (`list_items` then `list_folders`, documented as two round-trips
+/// on that method), so `vault_window`'s populate path can freeze for 2 x this,
+/// not this. No single call exceeds the budget; the sequence is not one call.
 ///
 /// Whole-request rather than per-read, and that is what closes the v0.3.0
 /// hang: a per-read timeout does not survive connection reuse, and this agent
@@ -1158,20 +1175,58 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`crate::http_agent`] for the full trace. Bounding the body along with the
 /// head costs nothing here -- every response is JSON from a process on
 /// loopback, not a bulk transfer.
-const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+const READ_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Total-time bound for [`VaultBridge::write_agent`]: the longest a single
+/// *write* may take before it is treated as failed.
+///
+/// **Separate from [`READ_DEADLINE`] because the two are not the same
+/// situation, however similar the code looks.** `bw serve`'s POST/PUT/DELETE
+/// routes re-encrypt the item and push it to `vault.bitwarden.com`
+/// synchronously before answering -- this crate already states that at
+/// `vault_cache.rs`'s `set_app_match` doc ("the user has been told the save
+/// succeeded. It had -- server-side"). So a write is bounded by the user's
+/// link to Bitwarden's API, not by loopback, and the 1.2s measurement that
+/// justifies the read budget is no evidence about it whatsoever. Sharing one
+/// constant between them would be the same mistake [`crate::http_agent`]
+/// exists to undo, one level down: two distinct situations averaged into one
+/// number, with a doc comment describing only the friendlier of them.
+///
+/// What a wrong value costs here is also asymmetric, and it is why this is the
+/// larger number. A read that times out is a stale list and a retry. A write
+/// that times out is a **lie**: the push may well have completed at the server
+/// and the user is shown a failure for a save that happened. The cache's own
+/// write-through reasoning is built on that asymmetry.
+///
+/// 30s. Not derived from [`READ_DEADLINE`] and not from `bw_serve`'s
+/// lifecycle numbers; it is the same length this crate already gives its other
+/// call over the public internet to a third-party API,
+/// `updater::API_DEADLINE`, which is the closest comparable situation it has
+/// (small request, external host, unknown link). It is a real cost: a write
+/// still runs on the UI thread, so 30s is 30s of frozen window in the worst
+/// case. That is accepted rather than hidden, on the grounds that a write is
+/// user-initiated and expected to take a moment, whereas the TOTP poll that
+/// dominates the read path is neither.
+///
+/// **Not bounded by anything here**: how long Bitwarden's API itself takes.
+/// If a save legitimately needs more than 30s the user still sees a failure
+/// for a write that may land later. No time-based rule can tell that apart
+/// from a dead link, and this says so rather than implying otherwise.
+const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
 impl VaultBridge {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, REQUEST_DEADLINE),
+            read_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, READ_DEADLINE),
+            write_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, WRITE_DEADLINE),
         }
     }
 
     pub fn list_items(&self) -> Result<Vec<VaultItem>, VaultError> {
         let url = format!("{}/list/object/items", self.base_url);
         let body: Envelope<ItemList> = self
-            .agent
+            .read_agent
             .get(&url)
             .call()
             .map_err(map_http_err)?
@@ -1187,7 +1242,7 @@ impl VaultBridge {
     pub fn get_item(&self, id: &str) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, id);
         let body: Envelope<VaultItem> = self
-            .agent
+            .read_agent
             .get(&url)
             .call()
             .map_err(map_http_err)?
@@ -1199,7 +1254,7 @@ impl VaultBridge {
     pub fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         let url = format!("{}/list/object/folders", self.base_url);
         let body: Envelope<FolderList> = self
-            .agent
+            .read_agent
             .get(&url)
             .call()
             .map_err(map_http_err)?
@@ -1215,7 +1270,7 @@ impl VaultBridge {
     pub fn create_folder(&self, name: &str) -> Result<Folder, VaultError> {
         let url = format!("{}/object/folder", self.base_url);
         let body: Envelope<Folder> = self
-            .agent
+            .write_agent
             .post(&url)
             .send_json(serde_json::json!({ "name": name }))
             .map_err(map_http_err)?
@@ -1229,7 +1284,7 @@ impl VaultBridge {
     pub fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError> {
         let url = format!("{}/object/folder/{}", self.base_url, id);
         let body: Envelope<Folder> = self
-            .agent
+            .write_agent
             .put(&url)
             .send_json(serde_json::json!({ "name": name }))
             .map_err(map_http_err)?
@@ -1240,7 +1295,7 @@ impl VaultBridge {
 
     pub fn delete_folder(&self, id: &str) -> Result<(), VaultError> {
         let url = format!("{}/object/folder/{}", self.base_url, id);
-        self.agent
+        self.write_agent
             .delete(&url)
             .call()
             .map_err(map_http_err)?;
@@ -1253,7 +1308,7 @@ impl VaultBridge {
     pub fn create_item(&self, new_item: &NewItem) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item", self.base_url);
         let body: Envelope<VaultItem> = self
-            .agent
+            .write_agent
             .post(&url)
             .send_json(new_item.to_payload())
             .map_err(map_http_err)?
@@ -1267,7 +1322,7 @@ impl VaultBridge {
     /// its own copy of it.
     pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, item.id);
-        self.agent
+        self.write_agent
             .put(&url)
             .send_json(item)
             .map_err(map_http_err)?;
@@ -1293,7 +1348,7 @@ impl VaultBridge {
         folder_id: Option<&str>,
     ) -> Result<(), VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, item.id);
-        self.agent
+        self.write_agent
             .put(&url)
             .send_json(folder_move_body(item, folder_id)?)
             .map_err(map_http_err)?;
@@ -1302,7 +1357,7 @@ impl VaultBridge {
 
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, id);
-        self.agent
+        self.write_agent
             .delete(&url)
             .call()
             .map_err(map_http_err)?;
@@ -1336,7 +1391,7 @@ impl VaultBridge {
     pub fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
         let url = format!("{}/list/object/items", self.base_url);
         let body: Envelope<ItemList> = self
-            .agent
+            .read_agent
             .get(&url)
             .query("trash", "true")
             .call()
@@ -1359,7 +1414,7 @@ impl VaultBridge {
     /// gains the item the server just un-deleted.
     pub fn restore_item(&self, id: &str) -> Result<(), VaultError> {
         let url = format!("{}/restore/item/{}", self.base_url, id);
-        self.agent
+        self.write_agent
             .post(&url)
             .call()
             .map_err(map_http_err)?;
@@ -1380,7 +1435,7 @@ impl VaultBridge {
     /// VERIFIED against the live backend: the item leaves the trash list.
     pub fn purge_item(&self, id: &str) -> Result<(), VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, id);
-        self.agent
+        self.write_agent
             .delete(&url)
             .query("permanent", "true")
             .call()
@@ -1417,7 +1472,7 @@ impl VaultBridge {
     /// and 5xx could log a false "recovered".
     pub fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let url = format!("{}/object/totp/{}", self.base_url, id);
-        match self.agent.get(&url).call() {
+        match self.read_agent.get(&url).call() {
             Ok(response) => {
                 let body: Envelope<TotpData> = response
                     .into_json()
@@ -1450,7 +1505,7 @@ impl VaultBridge {
     /// "this item has no TOTP secret", so every failure really is one.
     pub fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         let url = format!("{}/generate", self.base_url);
-        let mut call = self.agent.get(&url);
+        let mut call = self.read_agent.get(&url);
         for (key, value) in request.query() {
             call = call.query(key, &value);
         }
@@ -2213,25 +2268,28 @@ mod tests {
         assert_eq!(items[1].name, "Mabl");
     }
 
-    /// Pins [`REQUEST_DEADLINE`] as a UI-thread freeze budget derived from
+    /// Pins [`READ_DEADLINE`] as a UI-thread freeze budget derived from
     /// measured call cost, and specifically *not* re-derived from
     /// `bw_serve`'s constants -- which is how it drifted to 30s and tripled
     /// the worst-case freeze on a fresh connection.
     ///
     /// That the deadline is applied *at all*, and that it survives connection
     /// reuse, is pinned separately and by timing in
-    /// `http_agent::a_total_bounded_agent_bounds_a_pooled_connection_that_never_answers`
-    /// -- `VaultBridge::new` cannot build an agent without passing this
-    /// constant to `bounded_total`, so there is no way to drop the bound here
-    /// without a compile error.
+    /// `http_agent::a_total_bounded_agent_bounds_a_pooled_connection_that_never_answers`.
+    /// That `VaultBridge` cannot hold an agent built any other way is now the
+    /// type's job: both fields are `http_agent::TotalBounded`, whose only
+    /// constructor is `bounded_total`. The previous version of this comment
+    /// claimed that property for a bare `ureq::Agent` field, and a reviewer
+    /// disproved it by replacing the constructor call with a bare, unbounded
+    /// ureq agent -- which compiled, and left all 747 tests green.
     #[test]
-    fn the_ui_thread_deadline_is_a_single_call_budget_not_a_backend_lifecycle_one() {
-        // The slowest call this bridge makes, measured: /list/object/items
+    fn the_ui_thread_read_deadline_is_a_single_call_budget_not_a_backend_lifecycle_one() {
+        // The slowest read this bridge makes, measured: /list/object/items
         // over 1654 items, 1.1s cold / 1.2s warm.
         const SLOWEST_MEASURED_CALL: Duration = Duration::from_millis(1_200);
 
         assert!(
-            REQUEST_DEADLINE >= SLOWEST_MEASURED_CALL * 5,
+            READ_DEADLINE >= SLOWEST_MEASURED_CALL * 5,
             "not enough headroom over the slowest real call"
         );
         // Both of `bw_serve`'s numbers describe backend *lifecycle* waits --
@@ -2239,8 +2297,120 @@ mod tests {
         // operation -- neither of which runs through this agent. Borrowing
         // either as this bound is what made the UI freeze longer than it had
         // to; the assertion is that this stays strictly the smaller quantity.
-        assert!(REQUEST_DEADLINE < crate::bw_serve::READINESS_DEADLINE);
-        assert!(REQUEST_DEADLINE < crate::bw_serve::BACKEND_OP_TIMEOUT);
+        assert!(READ_DEADLINE < crate::bw_serve::READINESS_DEADLINE);
+        assert!(READ_DEADLINE < crate::bw_serve::BACKEND_OP_TIMEOUT);
+    }
+
+    /// The read budget is measured over loopback; the write budget is not, and
+    /// this fails if the two are ever collapsed back into one number.
+    ///
+    /// `bw serve`'s POST/PUT/DELETE routes push to `vault.bitwarden.com`
+    /// before answering, so a write is bounded by the user's internet link
+    /// while a read is bounded by a local Node process. The 1.2s
+    /// `/list/object/items` measurement that justifies [`READ_DEADLINE`] is no
+    /// evidence at all about a write, and a single shared constant is exactly
+    /// how that gets forgotten.
+    #[test]
+    fn a_write_gets_a_longer_budget_than_a_loopback_read() {
+        assert!(
+            WRITE_DEADLINE > READ_DEADLINE,
+            "a write traverses the internet and a read does not; giving them the same budget \
+             means the write budget was set by loopback evidence that does not apply to it"
+        );
+        // Not `> READ_DEADLINE` alone: 10s and 11s would satisfy that while
+        // being, in substance, the one averaged number this split exists to
+        // undo. The gap has to be big enough to represent a different
+        // situation.
+        assert!(
+            WRITE_DEADLINE >= READ_DEADLINE * 2,
+            "the gap is too small to be a different situation rather than a nudge"
+        );
+        // And still bounded: a write is on the UI thread too, so this is a
+        // frozen-window budget however justified it is.
+        assert!(
+            WRITE_DEADLINE <= Duration::from_secs(60),
+            "a save must not be able to freeze the window for a minute"
+        );
+    }
+
+    /// The hole finding 1 found, closed for this file: a constants test proves
+    /// nothing about which agent the production methods actually reach for.
+    ///
+    /// So this reads the source of every method above the test module and
+    /// checks the pairing structurally, by HTTP verb rather than by a list of
+    /// method names -- a method that mutates (`post`/`put`/`delete`) must use
+    /// `write_agent`, a method that reads (`get`) must use `read_agent`. A
+    /// tenth write added later, wired to the read agent out of habit, fails
+    /// here without anyone having to remember to extend a list.
+    #[test]
+    fn every_mutating_route_uses_the_write_agent_and_every_read_the_read_one() {
+        // SPLIT ACROSS `concat!` ARGUMENTS, DELIBERATELY: `include_str!` pulls
+        // this test module in as well, so a needle written as one literal
+        // would match its own declaration here. Splitting the production text
+        // rather than the field name is what keeps that from happening; the
+        // `impl_source` slice below is the belt to this test's braces.
+        const READ_FIELD: &str = concat!("read_", "agent");
+        const WRITE_FIELD: &str = concat!("write_", "agent");
+        // `(&url)` is part of every needle on purpose: `.get(` alone also
+        // matches `HashMap::get` and `serde_json::Value::get`, which several
+        // free functions in this file use and which have nothing to do with
+        // HTTP. Every route on this type builds a `url` local first, so this
+        // is the shape that means "issues a request". A future route that
+        // names the local something else escapes the needle -- which is what
+        // the two count assertions at the bottom are for.
+        const MUTATING_VERBS: [&str; 3] = [".post(&url)", ".put(&url)", ".delete(&url)"];
+
+        let source = include_str!("vault_bridge.rs");
+        // Everything before the test module -- production code only, so a
+        // mockito `.post(` in a test fixture cannot be mistaken for a route.
+        // Split on the module header rather than on `#[cfg(test)]`, which also
+        // sits on a test-facing helper *inside* the production half and would
+        // cut the impl block in two (found by this test failing with 0 routes,
+        // not reasoned about in advance).
+        let impl_source = source
+            .split(concat!("mod ", "tests {"))
+            .next()
+            .expect("split always yields at least one part");
+        assert!(
+            impl_source.len() < source.len(),
+            "the test-module marker was not found, so this guard is scanning its own fixtures"
+        );
+
+        // One chunk per method: `pub fn` is how every route on this type is
+        // declared, and each chunk runs to the start of the next one.
+        let mut checked_writes = 0;
+        let mut checked_reads = 0;
+        for chunk in impl_source.split("pub fn ").skip(1) {
+            let name = chunk.split('(').next().unwrap_or("<unnamed>").trim();
+            let mutates = MUTATING_VERBS.iter().any(|verb| chunk.contains(verb));
+            if mutates {
+                assert!(
+                    chunk.contains(WRITE_FIELD),
+                    "`{name}` issues a mutating request but does not use `{WRITE_FIELD}`. \
+                     That route pushes to vault.bitwarden.com synchronously, so bounding it \
+                     with the loopback read budget hard-fails saves on a slow link"
+                );
+                checked_writes += 1;
+            } else if chunk.contains(".get(&url)") {
+                assert!(
+                    chunk.contains(READ_FIELD),
+                    "`{name}` issues a read but does not use `{READ_FIELD}`"
+                );
+                checked_reads += 1;
+            }
+        }
+
+        // Positive control: without these, a rename that made every chunk
+        // match neither branch would leave this test passing vacuously.
+        assert_eq!(
+            checked_writes, 9,
+            "expected 9 mutating routes on VaultBridge, found {checked_writes} -- if a route \
+             was genuinely added or removed, update this number deliberately"
+        );
+        assert_eq!(
+            checked_reads, 6,
+            "expected 6 read routes on VaultBridge, found {checked_reads}"
+        );
     }
 
     #[test]

@@ -1352,7 +1352,10 @@ fn process_foreground_event(
 /// sites), so the worst case is that a check is skipped until the next
 /// cycle, not that the app goes down (or hangs) over a transient GitHub API
 /// problem.
-fn check_for_update_logged(current_version: &Version, agent: &ureq::Agent) -> Option<ReleaseInfo> {
+fn check_for_update_logged(
+    current_version: &Version,
+    agent: &deskwarden::http_agent::TotalBounded,
+) -> Option<ReleaseInfo> {
     match updater::check_for_update(GITHUB_API_BASE, current_version, agent) {
         Ok(Some(release)) => {
             log::info!(

@@ -89,8 +89,8 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// thread -- see `vault_window::favicon_loader` for the async wrapper the UI
 /// actually uses.
 ///
-/// Bounded on purpose. This used to be a bare `ureq::get(url).call()` with no
-/// agent and no timeouts of any kind; because it runs on a detached thread it
+/// Bounded on purpose. This used to be one of ureq's bare free functions, with
+/// no agent and no timeouts of any kind; because it runs on a detached thread it
 /// never froze the UI, but an unreachable icon host leaked that thread and its
 /// socket permanently, one per icon. Three such stuck connections to the icon
 /// CDN were found alive in a hung v0.3.0 process.
@@ -98,7 +98,7 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
     // One shared agent, not one per call: icons are fetched in bursts against
     // a single host, and a fresh agent per call would throw away connection
     // reuse (and open a new TCP+TLS handshake for every icon in the list).
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    static AGENT: OnceLock<crate::http_agent::TotalBounded> = OnceLock::new();
     let agent =
         AGENT.get_or_init(|| crate::http_agent::bounded_total(CONNECT_TIMEOUT, REQUEST_DEADLINE));
     let response = agent.get(url).call().ok()?;

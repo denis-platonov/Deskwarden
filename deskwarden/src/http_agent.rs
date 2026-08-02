@@ -40,8 +40,75 @@
 //! nothing, with a doc comment claiming otherwise. Each constructor below sets
 //! only the knob that is actually live for its shape, and the dead one is not
 //! set at all.
+//!
+//! # Why the two shapes are two types
+//!
+//! The first version of this module returned a bare [`ureq::Agent`] from both
+//! constructors, and its commit message claimed "no caller can drop its bound
+//! without a compile error." That was false, and a reviewer demonstrated it in
+//! two edits: `agent: ureq::AgentBuilder::new().build()` in `vault_bridge`,
+//! and `ureq::get(url).call()` in `favicon`. Both compiled; all 747 tests
+//! stayed green. That is the v0.3.0 hang reintroduced verbatim with nothing
+//! going red -- because the tests had moved to the *constructors*, and nothing
+//! observed that the call sites still went through them.
+//!
+//! Two mechanisms close that, and they cover different halves of it:
+//!
+//! * [`TotalBounded`] and [`StallBounded`] are newtypes with a private field
+//!   and no public constructor other than the two functions below. A caller
+//!   that wants an agent has to name one of the two shapes, so the first edit
+//!   no longer type-checks -- and neither does passing the wrong shape to
+//!   `updater::download_and_verify`, whose "must come from
+//!   `build_download_agent`" used to be prose only.
+//! * `bare_ureq_calls_are_confined_to_this_module` scans the crate's sources
+//!   for `AgentBuilder` and for ureq's free functions, which construct their
+//!   own unbounded agent internally and so route around the types entirely.
+//!   That is the second edit, and no type can catch it.
 
 use std::time::Duration;
+
+/// An agent bounded by **total elapsed time**, as its own type.
+///
+/// The wrapped [`ureq::Agent`] is private and there is no other way to build
+/// one: [`bounded_total`] is the only constructor. So "this call site is
+/// bounded, and bounded by *this* shape" is a fact the compiler checks rather
+/// than a fact a doc comment asserts. See the module docs for what that is
+/// worth here -- the previous version of this module made exactly that claim
+/// in prose and was wrong.
+#[derive(Clone)]
+pub struct TotalBounded(ureq::Agent);
+
+impl TotalBounded {
+    pub fn get(&self, url: &str) -> ureq::Request {
+        self.0.get(url)
+    }
+
+    pub fn post(&self, url: &str) -> ureq::Request {
+        self.0.post(url)
+    }
+
+    pub fn put(&self, url: &str) -> ureq::Request {
+        self.0.put(url)
+    }
+
+    pub fn delete(&self, url: &str) -> ureq::Request {
+        self.0.delete(url)
+    }
+}
+
+/// An agent bounded by **time without progress**, as its own type.
+///
+/// Only `get` is forwarded: the one caller is the installer download. Adding a
+/// verb here should mean a new streamed transfer exists, not that a
+/// total-bounded caller found this type more convenient.
+#[derive(Clone)]
+pub struct StallBounded(ureq::Agent);
+
+impl StallBounded {
+    pub fn get(&self, url: &str) -> ureq::Request {
+        self.0.get(url)
+    }
+}
 
 /// An agent whose requests are bounded by **total elapsed time**.
 ///
@@ -57,11 +124,13 @@ use std::time::Duration;
 /// `timeout_read` is deliberately **not** set: with `timeout` in force ureq
 /// never applies it (see the module docs), so setting it would only produce a
 /// knob that reads as protection and is not.
-pub fn bounded_total(connect: Duration, total: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(connect)
-        .timeout(total)
-        .build()
+pub fn bounded_total(connect: Duration, total: Duration) -> TotalBounded {
+    TotalBounded(
+        ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout(total)
+            .build(),
+    )
 }
 
 /// An agent whose requests are bounded by **time without progress**.
@@ -83,12 +152,14 @@ pub fn bounded_total(connect: Duration, total: Duration) -> ureq::Agent {
 ///
 /// `timeout` is deliberately **not** set: setting it is what would make
 /// `timeout_read` inert, which is the regression this shape exists to undo.
-pub fn bounded_stall(connect: Duration, stall: Duration) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(connect)
-        .timeout_read(stall)
-        .max_idle_connections(0)
-        .build()
+pub fn bounded_stall(connect: Duration, stall: Duration) -> StallBounded {
+    StallBounded(
+        ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout_read(stall)
+            .max_idle_connections(0)
+            .build(),
+    )
 }
 
 #[cfg(test)]
@@ -99,6 +170,107 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Instant;
+
+    /// Every `.rs` file under `src/`, as (path relative to `src/`, contents).
+    ///
+    /// Relative path rather than bare file name so the exemption below names
+    /// exactly one file: `vault_window/mod.rs` and a future
+    /// `something/http_agent.rs` would otherwise be indistinguishable from
+    /// this one, and the second would be silently exempt.
+    ///
+    /// Walked off disk rather than pulled in with `include_str!` on a hand-
+    /// written list, which is the idiom the rest of this crate's source guards
+    /// use. The difference matters exactly here: the defect this guards
+    /// against is a *future* module reaching for ureq directly, and a
+    /// hand-written list is a list that new module would not be on.
+    fn crate_source_files() -> Vec<(String, String)> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("src/ is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    // Forward slashes so the exemption below reads the same on
+                    // every platform, even though this crate only builds on
+                    // Windows.
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("walked from root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, std::fs::read_to_string(&path).expect("source is UTF-8")));
+                }
+            }
+        }
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    /// The half of the enforcement no type can carry: ureq's free functions
+    /// (`ureq::get`, `ureq::post`, ...) build their own agent internally, with
+    /// no timeouts of any kind, so they route around [`TotalBounded`] and
+    /// [`StallBounded`] entirely. `favicon::fetch_icon_bytes` shipped exactly
+    /// that in v0.3.0 and leaked a thread and a socket per unreachable icon
+    /// host; a reviewer reproduced it under the current code by putting one
+    /// line back, and everything compiled and every test passed.
+    ///
+    /// `AgentBuilder` is guarded for the mirror-image case: constructing an
+    /// agent with whatever bounds (or none) a module felt like, rather than
+    /// naming one of the two shapes this module defines.
+    ///
+    /// Needles are SPLIT ACROSS `concat!` ARGUMENTS, deliberately -- and the
+    /// positive control below is what enforces it. A needle written as one
+    /// literal would match its own declaration, and this crate has shipped
+    /// that dead guard for real (`picker_ui.rs`'s note on the same trap).
+    #[test]
+    fn bare_ureq_calls_are_confined_to_this_module() {
+        const BUILDER: &str = concat!("Agent", "Builder");
+        const FREE_FNS: [&str; 6] = [
+            concat!("ureq:", ":get("),
+            concat!("ureq:", ":post("),
+            concat!("ureq:", ":put("),
+            concat!("ureq:", ":delete("),
+            concat!("ureq:", ":request("),
+            concat!("ureq:", ":agent("),
+        ];
+
+        let files = crate_source_files();
+        // Positive control, two things at once: the walk really found this
+        // crate's sources, and the needle spellings really match live code
+        // rather than being a typo that can never fire. `http_agent.rs` is the
+        // one file allowed to contain them, and it does.
+        let this_file = files
+            .iter()
+            .find(|(path, _)| path == "http_agent.rs")
+            .expect("the walk did not reach http_agent.rs");
+        assert!(
+            this_file.1.contains(BUILDER),
+            "needle {BUILDER:?} no longer matches the one place that is supposed to use it"
+        );
+        assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
+
+        let mut offenders = Vec::new();
+        for (path, text) in &files {
+            if path == "http_agent.rs" {
+                continue;
+            }
+            for needle in std::iter::once(BUILDER).chain(FREE_FNS) {
+                if text.contains(needle) {
+                    offenders.push(format!("{path}: {needle}"));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these files reach around `http_agent` to build or use an unbounded ureq agent: \
+             {offenders:?}. Every HTTP call in this crate goes through `bounded_total` or \
+             `bounded_stall`; a bare agent has no connect, read or total timeout at all, which \
+             is the v0.3.0 UI hang and the leaked favicon threads"
+        );
+    }
 
     /// Reads exactly one request head off `stream`, so the next one can be
     /// read separately -- several tests below turn on two requests arriving
