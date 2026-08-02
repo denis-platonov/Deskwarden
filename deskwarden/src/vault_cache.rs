@@ -1225,6 +1225,68 @@ impl VaultCache {
         self.bridge.list_archive()
     }
 
+    /// [`Self::list_trash`], **discarded if a [`Self::clear`] began a new
+    /// [`VaultEra`] while the fetch was in flight** -- `Ok(None)`.
+    ///
+    /// This is the on-demand lists' half of the guarantee
+    /// [`Self::snapshot_unless_superseded`] gives the live load, and it exists
+    /// because the on-demand fetch had no equivalent at all. Its only guard
+    /// was the vault window's `load_generation`, which is a SPAWN TAG: it is
+    /// incremented when a vault load is spawned, and `clear` does not touch
+    /// it. So a Trash fetch outstanding across a `clear` and a re-populate
+    /// under a different account came back carrying the same generation it
+    /// left with, matched, and was applied -- account B's trashed item names
+    /// under account A's chrome.
+    ///
+    /// No reachable path produces that today: both the lock and the re-auth
+    /// that would `clear` the cache also close the window, so the drain is
+    /// gone before the result lands. **This is defence in depth, and it is
+    /// worth the six lines for the reason [`VaultEra`]'s own doc gives** --
+    /// the era machinery was introduced specifically so this window would
+    /// stop resting on "every production `clear` happens to run on the main
+    /// thread", and an unguarded fetch beside it quietly restores that
+    /// reliance for one more path.
+    ///
+    /// The era is checked **after** the fetch, never before. Before, it would
+    /// answer "is this still the session that existed one instruction ago?" --
+    /// yes, by construction -- which is the same non-question
+    /// `window_era_placement_tests` exists to keep out of the load spawns. The
+    /// only useful moment to ask is once the slow part is over.
+    ///
+    /// A superseded fetch that also FAILED reports `Ok(None)` rather than its
+    /// error, deliberately: the error describes a vault this window has
+    /// already left, and surfacing it would put "Trash could not be read" in
+    /// front of a user whose session was merely replaced.
+    pub fn list_trash_unless_superseded(
+        &self,
+        era: VaultEra,
+    ) -> Result<Option<Vec<VaultItem>>, VaultError> {
+        self.list_unless_superseded(era, |bridge| bridge.list_trash())
+    }
+
+    /// [`Self::list_archive`] under [`Self::list_trash_unless_superseded`]'s
+    /// guard, for its reasons.
+    pub fn list_archive_unless_superseded(
+        &self,
+        era: VaultEra,
+    ) -> Result<Option<Vec<VaultItem>>, VaultError> {
+        self.list_unless_superseded(era, |bridge| bridge.list_archive())
+    }
+
+    /// The one copy of the check above, so the two lists cannot come to
+    /// disagree about when a result is still current.
+    fn list_unless_superseded(
+        &self,
+        era: VaultEra,
+        fetch: impl FnOnce(&VaultBridge) -> Result<Vec<VaultItem>, VaultError>,
+    ) -> Result<Option<Vec<VaultItem>>, VaultError> {
+        let fetched = fetch(&self.bridge);
+        if self.epoch().era() != era {
+            return Ok(None);
+        }
+        fetched.map(Some)
+    }
+
     /// Puts `item` into the archive and takes it out of the live snapshot.
     ///
     /// The snapshot side is [`Self::delete_item`]'s, and for the same reason:
@@ -3100,6 +3162,156 @@ mod tests {
     }
 
     #[test]
+    fn an_on_demand_list_is_handed_back_while_its_era_still_stands() {
+        // The half that must keep working. `list_trash_unless_superseded` is
+        // a guard, and a guard that refused everything would satisfy the
+        // test below on its own.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+
+        let era = cache.epoch().era();
+        let fetched = cache
+            .list_trash_unless_superseded(era)
+            .expect("the fetch succeeded")
+            .expect("nothing superseded this era");
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].id, "t1");
+    }
+
+    #[test]
+    fn an_on_demand_list_fetched_across_a_clear_is_discarded() {
+        // **The account-A/account-B hole, for the on-demand lists.** The
+        // vault window's only guard on these fetches was `load_generation`,
+        // which is a SPAWN TAG: it is incremented when a vault load is
+        // spawned and `clear` does not touch it. So a Trash fetch outstanding
+        // across a lock-and-reauth into a different account came back
+        // carrying the generation it left with, matched, and was applied --
+        // account B's trashed item names under account A's chrome.
+        //
+        // `window_era` was introduced (review 29) to close exactly this for
+        // the live load, and its doc explicitly refuses to rest on "every
+        // production `clear` runs on the main thread". This path re-imposed
+        // that reliance until the era check reached it too.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+
+        // The era the window captured when it opened, before the vault
+        // underneath it was replaced.
+        let era = cache.epoch().era();
+        cache.clear();
+
+        assert!(
+            cache.list_trash_unless_superseded(era).expect("the fetch itself succeeded").is_none(),
+            "a trash list fetched against a vault session that has since been cleared \
+             was handed back anyway"
+        );
+        // ...and repopulating for the NEW account does not make the old era
+        // applicable again. This is the cross-account case, and it is the
+        // whole reason the era rather than a populate count is the question.
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        assert!(
+            cache.list_trash_unless_superseded(era).expect("the fetch itself succeeded").is_none(),
+            "a repopulate under a new account revived a superseded era"
+        );
+        // The control: the era the cache is in NOW is still served, so the
+        // refusals above are about the era and not about `clear` having
+        // broken the door outright.
+        assert!(
+            cache
+                .list_trash_unless_superseded(cache.epoch().era())
+                .expect("the fetch itself succeeded")
+                .is_some(),
+            "the current era's fetch was refused too -- the guard refuses everything"
+        );
+    }
+
+    #[test]
+    fn a_superseded_on_demand_list_reports_no_error_even_when_the_fetch_failed() {
+        // The error describes a vault this window has already left, so
+        // surfacing it would put "Trash could not be read" in front of a user
+        // whose session was merely replaced. The era check runs after the
+        // fetch and swallows both outcomes alike.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(500)
+            .create();
+
+        let era = cache.epoch().era();
+        cache.clear();
+        assert!(
+            cache.list_trash_unless_superseded(era).expect("a superseded fetch reports no error").is_none()
+        );
+    }
+
+    #[test]
+    fn a_failed_on_demand_list_in_its_own_era_is_still_an_error() {
+        // The control for the test above: swallowing errors is right ONLY
+        // because the era moved. In the ordinary case the failure has to
+        // reach the band, which is what `AuxLoadError` and the inline notice
+        // are for.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(500)
+            .create();
+
+        assert!(
+            cache.list_trash_unless_superseded(cache.epoch().era()).is_err(),
+            "a failed fetch in the current era was reported as a successful non-answer"
+        );
+    }
+
+    #[test]
+    fn the_archive_list_is_guarded_by_the_same_era_check() {
+        // The two lists go through one private helper precisely so they
+        // cannot come to disagree about when a result is still current --
+        // asserted rather than left to the shared call.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _a = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body())
+            .create();
+
+        assert!(
+            cache
+                .list_archive_unless_superseded(cache.epoch().era())
+                .expect("the fetch succeeded")
+                .is_some(),
+            "the current era's archive fetch was refused"
+        );
+
+        let era = cache.epoch().era();
+        cache.clear();
+        assert!(
+            cache.list_archive_unless_superseded(era).expect("the fetch itself succeeded").is_none(),
+            "an archive list fetched against a cleared vault session was handed back"
+        );
+    }
+
+    #[test]
     fn a_successful_restore_puts_the_item_into_the_live_snapshot() {
         let mut server = mockito::Server::new();
         let cache = populated_cache(&mut server);
@@ -3382,9 +3594,16 @@ mod tests {
     fn an_archive_survives_a_populate_whose_fetch_predates_it() {
         // The pending-write log is the whole reason `archive_item` records
         // anything at all. Without it, a sync started before the user
-        // archived (a window the vault window's 30s auto-sync makes ordinary)
-        // lands afterwards carrying the item as live, and the archive is
-        // silently undone in this process.
+        // archived lands afterwards carrying the item as live, and the
+        // archive is silently undone in this process.
+        //
+        // THE WINDOW THAT HAPPENS IN IS NOT A TIMER. An earlier version of
+        // this comment called it "a window the vault window's 30s auto-sync
+        // makes ordinary"; there is no 30s auto-sync and there never was.
+        // The vault window syncs once, on its first frame (`auto_synced`),
+        // and otherwise only when the user clicks the Sync pill -- which
+        // `vault_window::mod`'s pill comment states outright. The window is
+        // opened by those two events, and by nothing else.
         let mut server = mockito::Server::new();
         let cache = populated_cache(&mut server);
         let _a = server.mock("POST", "/archive/item/1").with_status(200).create();

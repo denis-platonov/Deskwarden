@@ -385,9 +385,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // and dropped whenever the live vault is reloaded; see `AuxList`.
     let mut trash_list = AuxList::default();
     let mut archive_list = AuxList::default();
+    // `Option` inside the `Ok`: `None` is a fetch that completed against a
+    // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
-        mpsc::Sender<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
-        Receiver<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
+        mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+        Receiver<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
     ) = mpsc::channel();
     let mut search = String::new();
     // Nothing to select yet -- set from the first item once the load lands.
@@ -705,9 +707,22 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 log::info!("dropped a stale {label} list fetched against generation {generation}");
             } else {
                 match result {
-                    Ok(fetched) => {
+                    Ok(Some(fetched)) => {
                         list.items = Some(fetched);
                         list.error = None;
+                    }
+                    // Fetched against a vault SESSION this window has since
+                    // left -- a `clear` began a new era while the request was
+                    // in flight. Dropped exactly like a stale generation, and
+                    // for a stronger reason: the generation check above says
+                    // this window asked for a reload, this says the vault
+                    // underneath was replaced, possibly by another account's.
+                    // No error is shown, because nothing failed. See
+                    // `spawn_aux_load`.
+                    Ok(None) => {
+                        log::info!(
+                            "dropped a {label} list fetched against a superseded vault session"
+                        );
                     }
                     // Straight onto the same re-auth path every other backend
                     // call in this window takes -- through the SAME helper,
@@ -1092,7 +1107,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         ] {
             if list.wants_fetch(selected_source == Some(which)) {
                 list.in_flight = true;
-                spawn_aux_load(cache.clone(), which, load_generation, aux_tx.clone());
+                spawn_aux_load(cache.clone(), which, load_generation, window_era, aux_tx.clone());
             }
         }
         egui::Panel::left("vault-sidebar")
@@ -1487,9 +1502,33 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     // state changed -- an item archived immediately after
                     // creation answered 200 and stayed in the default list
                     // until a ~1.5s settle -- so a read taken here would race
-                    // that settle and report a failure that did not happen.
-                    // The refetch that does happen is the next time the row
-                    // is opened, which is far past it.
+                    // that settle and report a failure that did not happen,
+                    // and the caller would undo a correct archive. The
+                    // refetch that does happen is the next time the row is
+                    // opened, which is far past it.
+                    //
+                    // WHAT THAT COSTS, stated rather than glossed. If an
+                    // archive genuinely did not take -- the measured
+                    // 200-without-effect, as opposed to the settle -- the
+                    // item is removed from `items` and from the cache
+                    // snapshot and logged `deleted:true`, so it is in NEITHER
+                    // the live rows nor the Archive row, and it stays
+                    // invisible **until the user clicks Sync or reopens the
+                    // window**. Nothing reconciles it before that: this app
+                    // has no timed auto-sync (see the Sync pill's own comment
+                    // further up, which says so outright), and the window's
+                    // single first-frame `auto_synced` sync has long since
+                    // fired by the time a row can be right-clicked. An
+                    // earlier version of this reasoning leaned on "the vault
+                    // window's 30s auto-sync", which does not exist.
+                    //
+                    // The item is not lost -- the next populate's
+                    // `seq > since` retirement restores it correctly -- and a
+                    // reload is deliberately NOT triggered from this arm: one
+                    // fired here would land inside the very ~1.5s settle the
+                    // no-read-back decision exists to avoid, fetch the item as
+                    // still-live, and put it straight back into the list the
+                    // user just archived it out of.
                     item_list::RowCommand::Archive => {
                         match cache.archive_item(&item) {
                             Ok(()) => {
@@ -2738,16 +2777,36 @@ impl AuxList {
 /// The result is tagged with the `load_generation` it was started against,
 /// so a vault reload that lands first can drop it rather than have a list
 /// fetched against the old vault overwrite one fetched against the new.
+///
+/// **`era` is the second, independent question, and the generation cannot
+/// answer it.** `load_generation` is a SPAWN TAG -- `run` increments it when
+/// it spawns a vault load, and `VaultCache::clear` does not touch it -- so it
+/// answers "has this window asked for a reload since?" and nothing else. A
+/// `clear` and a re-populate under a different account leave it untouched, so
+/// a fetch outstanding across one comes back matching and is applied: account
+/// B's trashed item names under account A's chrome. That is the hole
+/// `window_era` was introduced (review 29) to close for the live load, and
+/// this path is why it was still open beside it -- `window_era`'s own doc
+/// explicitly refuses to rest on "every production `cache.clear()` runs on
+/// the main thread", which is precisely what an unguarded fetch here
+/// reinstates.
+///
+/// No reachable path produces it today: both the lock and the re-auth that
+/// would `clear` the cache also close the window. **Defence in depth**, and
+/// six lines of it -- see `VaultCache::list_trash_unless_superseded`, which
+/// performs the check where the fetch happens, and returns a superseded
+/// result as `Ok(None)`.
 fn spawn_aux_load(
     cache: std::sync::Arc<VaultCache>,
     which: OutOfVault,
     generation: u64,
-    tx: mpsc::Sender<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
+    era: crate::vault_cache::VaultEra,
+    tx: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
 ) {
     std::thread::spawn(move || {
         let result = match which {
-            OutOfVault::Trash => cache.list_trash(),
-            OutOfVault::Archive => cache.list_archive(),
+            OutOfVault::Trash => cache.list_trash_unless_superseded(era),
+            OutOfVault::Archive => cache.list_archive_unless_superseded(era),
         };
         let _ = tx.send((generation, which, result.map_err(AuxLoadError::of)));
     });
@@ -5079,6 +5138,34 @@ mod out_of_vault_wiring_tests {
         }
     }
 
+    /// The aux spawn's era argument -- `window_era`, the one value captured
+    /// before the loop, not a fresh read.
+    const AUX_SPAWN_ERA: &str = concat!("load_generation, window", "_era, aux_tx");
+
+    #[test]
+    fn the_aux_fetch_is_checked_against_the_windows_one_era() {
+        // `load_generation` alone cannot answer this. It is a SPAWN TAG --
+        // incremented when a vault load is spawned, untouched by
+        // `VaultCache::clear` -- so a fetch outstanding across a clear and a
+        // re-populate under a DIFFERENT ACCOUNT comes back carrying the tag
+        // it left with, matches, and is applied.
+        //
+        // `window_era` is the value that answers it, and it must be the one
+        // captured before the loop rather than a fresh `cache.epoch().era()`
+        // here: a per-spawn read equals the current era by construction and
+        // proves nothing, which is the whole subject of
+        // `window_era_placement_tests` (whose "read exactly once" count is
+        // also what stops this spawn from acquiring its own).
+        assert_eq!(
+            production().matches(AUX_SPAWN_ERA).count(),
+            1,
+            "the on-demand fetch is not tagged with `window_era`. Without it the only \
+             guard on the result is `load_generation`, which a `clear` does not touch -- \
+             so a list fetched under one account can be applied under another's chrome. \
+             The check itself lives in `VaultCache::list_trash_unless_superseded`."
+        );
+    }
+
     /// The four commands that move an item between this window's three lists,
     /// and the on-demand list each one must drop.
     ///
@@ -7076,10 +7163,18 @@ mod draw_read_arm_tests {
                  was not reached for it; painted: {texts:?}",
                 kind.label()
             );
-            assert!(
-                contains(&texts, "Delete"),
-                "{kind:?}: the read arm painted no Delete button; painted: {texts:?}"
-            );
+            // NO "Delete" ASSERTION HERE ANY MORE. `2616427` moved Edit and
+            // Delete behind the header's kebab menu, so neither paints until
+            // that menu is opened, and this arm draws one closed frame.
+            //
+            // Dropping it costs this test nothing, which was checked rather
+            // than assumed: with the `item_type != Some(1)` early return
+            // reinstated, the placeholder pane paints the item's NAME and the
+            // sentence below, so the subtitle assertion above and the
+            // placeholder assertion below each fail on their own for every
+            // non-login kind. Both were re-run against that mutation. What
+            // the kebab now contains is `detail.rs`'s to prove, and it has
+            // its own tests for it.
             assert!(
                 !contains(&texts, "isn't editable in Deskwarden yet"),
                 "{kind:?}: the read arm is short-circuiting to a placeholder again; \
