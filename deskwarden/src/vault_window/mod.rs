@@ -23,7 +23,7 @@ use detail_edit::{draw_detail_edit, EditAction, EditDraft};
 use eframe::egui::{self, Margin};
 use folder_modal::{draw_folder_edit_modal, FolderEditAction, FolderEditState};
 use item_list::{draw_item_list, IconCache, ItemListAction};
-use sidebar::{draw_sidebar, SidebarAction, SidebarFilter};
+use sidebar::{draw_sidebar, OutOfVault, SidebarAction, SidebarFilter};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
@@ -380,6 +380,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // describes.
     let mut vault_load_error: Option<String> = None;
     let mut filter = SidebarFilter::All;
+    // The two lists that are NOT the live snapshot -- the trash and the
+    // archive. Each is fetched off-thread the first time its row is selected
+    // and dropped whenever the live vault is reloaded; see `AuxList`.
+    let mut trash_list = AuxList::default();
+    let mut archive_list = AuxList::default();
+    let (aux_tx, aux_rx): (
+        mpsc::Sender<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
+        Receiver<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
+    ) = mpsc::channel();
     let mut search = String::new();
     // Nothing to select yet -- set from the first item once the load lands.
     let mut selected_id: Option<String> = None;
@@ -649,6 +658,64 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 &mut sync_status,
                 &mut totp_state,
             );
+            // A vault that has just been re-read makes both on-demand lists
+            // suspect: the same `bw sync` that changed `items` can have
+            // trashed, restored, archived or unarchived something elsewhere.
+            // Dropped rather than refetched -- the fetch happens when a row
+            // that needs one is actually selected, which for these two rows
+            // is rare.
+            trash_list.invalidate();
+            archive_list.invalidate();
+        }
+
+        // The on-demand trash/archive fetch reporting back. Non-blocking like
+        // every other drain here.
+        //
+        // `in_flight` is cleared BEFORE the generation check, deliberately
+        // and for the reason the TOTP drain gives: a dropped result still
+        // means the thread that set the flag has finished, and gating the
+        // clear on currency is how a flag like this latches forever.
+        if let Ok((generation, which, result)) = aux_rx.try_recv() {
+            let list = match which {
+                OutOfVault::Trash => &mut trash_list,
+                OutOfVault::Archive => &mut archive_list,
+            };
+            list.in_flight = false;
+            let label = which.label();
+            if generation != load_generation {
+                // Fetched against a vault this window has since reloaded.
+                // Dropped, and the list stays unfetched, so selecting the row
+                // asks again against the vault that is now on screen.
+                log::info!("dropped a stale {label} list fetched against generation {generation}");
+            } else {
+                match result {
+                    Ok(fetched) => {
+                        list.items = Some(fetched);
+                        list.error = None;
+                    }
+                    // Straight onto the same re-auth path every other backend
+                    // call in this window takes -- through the SAME helper,
+                    // so a `401` from here cannot behave differently from a
+                    // `401` anywhere else.
+                    Err(AuxLoadError::Unauthorized) => {
+                        flag_reauth_if_unauthorized(
+                            ui.ctx(),
+                            &needs_reauth_for_closure,
+                            &VaultError::Unauthorized,
+                        );
+                        list.error = Some(format!("{label} could not be read: the vault session expired."));
+                    }
+                    Err(AuxLoadError::Other(message)) => {
+                        log::warn!("could not read the {label} list: {message}");
+                        // STATED, not swallowed. The alternative is a row
+                        // that sits at an en dash forever with no reason,
+                        // which is indistinguishable from a slow fetch.
+                        list.error = Some(format!(
+                            "{label} could not be read from the vault. Click here to try again."
+                        ));
+                    }
+                }
+            }
         }
 
         // Non-blocking, like the favicon drain above: the sync thread
@@ -996,6 +1063,22 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // `Err` a refusal the sidebar already decided. Drained after the
         // panel, for the same reason `row_command` is.
         let mut folder_drop: Option<Result<(String, String), &'static str>> = None;
+
+        // The on-demand lists, started here -- BEFORE the panels draw, and
+        // off-thread. The selected row is what asks for one, so a user who
+        // never opens Trash or Archive never pays for either query, and a
+        // user who does pays once per vault load rather than once per frame
+        // (see `AuxList::wants_fetch`).
+        let selected_source = filter.source().out_of_vault();
+        for (which, list) in [
+            (OutOfVault::Trash, &mut trash_list),
+            (OutOfVault::Archive, &mut archive_list),
+        ] {
+            if list.wants_fetch(selected_source == Some(which)) {
+                list.in_flight = true;
+                spawn_aux_load(cache.clone(), which, load_generation, aux_tx.clone());
+            }
+        }
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -1004,7 +1087,18 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             // the opposite order CSS shorthand uses).
             .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
             .show(ui, |ui| {
-                match draw_sidebar(ui, &items, &folders, &mut filter, &lock_countdown) {
+                // Every list this window holds, in the one shape the sidebar
+                // and the item pane both read -- so a row's badge and its
+                // contents cannot come from different places. Built at each
+                // of the two call sites rather than once above them: it
+                // borrows `items`, and the folder-drop handler between the
+                // two panels has to be able to write to it.
+                let lists = sidebar::VaultLists {
+                    live: &items,
+                    trash: trash_list.items.as_deref(),
+                    archive: archive_list.items.as_deref(),
+                };
+                match draw_sidebar(ui, lists, &folders, &mut filter, &lock_countdown) {
                     SidebarAction::NewFolder => match cache.create_folder("New folder") {
                         Ok(folder) => folders.push(folder),
                         Err(e) => {
@@ -1062,6 +1156,14 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // Set by an item row's right-click menu below, and drained further
         // down once the selection that right-click made has been reacted to.
         let mut row_command: Option<(String, item_list::RowCommand)> = None;
+        // A failed Trash/Archive fetch, for the row that is selected right
+        // now. Cloned out of the `AuxList` so the panel closure below does
+        // not hold it borrowed while the dismissal writes to it.
+        let aux_error: Option<String> = match filter.source().out_of_vault() {
+            Some(OutOfVault::Trash) => trash_list.error.clone(),
+            Some(OutOfVault::Archive) => archive_list.error.clone(),
+            None => None,
+        };
         // The inline move-error band was clicked away. Applied after the
         // closure for the same reason: `move_error` is borrowed by it.
         let mut dismiss_move_error = false;
@@ -1070,9 +1172,25 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             .resizable(false)
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
+                // THE LIST THE SELECTED ROW ACTUALLY READS, which for Trash
+                // and Archive is not `items` at all -- those two rows are
+                // separate queries whose results are disjoint from the live
+                // vault (see `sidebar::FilterSource`). Passing `items` here
+                // regardless is what made the Trash row list nothing: the
+                // pane filtered a list that by construction holds none of
+                // its members.
+                //
+                // An unfetched list shows as empty for the one or two frames
+                // before the fetch lands; the sidebar badge says "not known
+                // yet" throughout, which is the honest half of that pair.
+                let shown: &[VaultItem] = match filter.source() {
+                    sidebar::FilterSource::LiveVault => &items,
+                    sidebar::FilterSource::Trash => trash_list.items.as_deref().unwrap_or(&[]),
+                    sidebar::FilterSource::Archive => archive_list.items.as_deref().unwrap_or(&[]),
+                };
                 match draw_item_list(
                     ui,
-                    &items,
+                    shown,
                     &folders,
                     &filter,
                     &mut search,
@@ -1080,7 +1198,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
                     &icons,
                     &mut visible_ids,
-                    move_error.as_deref(),
+                    // The inline band shows whichever explanation this frame
+                    // has. A failed Trash/Archive fetch is the more urgent of
+                    // the two -- the pane it explains is the one on screen.
+                    aux_error
+                        .as_deref()
+                        .or(move_error.as_deref()),
                 ) {
                     // The kind the `+ New` menu was clicked on -- `empty_of`,
                     // not `empty`, which would open a login form whatever row
@@ -1102,6 +1225,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 
         if dismiss_move_error {
             move_error = None;
+            // Dismissing a Trash/Archive failure is also the retry: clearing
+            // `error` is exactly what makes `AuxList::wants_fetch` true
+            // again, so the next frame asks the server. A band that could
+            // only be waved away, leaving the row at an en dash with no way
+            // to try again short of a full Sync, would be a dead affordance.
+            match filter.source().out_of_vault() {
+                Some(OutOfVault::Trash) => trash_list.error = None,
+                Some(OutOfVault::Archive) => archive_list.error = None,
+                None => {}
+            }
         }
 
         // Load favicons for whatever `draw_item_list` actually drew this
@@ -1188,7 +1321,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // `selected_id`. They agree -- the right-click selected this row --
         // and that is exactly why neither has to be trusted to.
         if let Some((id, command)) = row_command.take() {
-            if let Some(item) = items.iter().find(|i| i.id == id).cloned() {
+            // Resolved from the list the row was DRAWN from, not from `items`
+            // -- a trashed or archived item is not in the live snapshot at
+            // all, so looking it up there would find nothing and every entry
+            // on those two menus would be a click that did nothing.
+            let from_list = match filter.source() {
+                sidebar::FilterSource::LiveVault => items.iter().find(|i| i.id == id),
+                sidebar::FilterSource::Trash => {
+                    trash_list.items.iter().flatten().find(|i| i.id == id)
+                }
+                sidebar::FilterSource::Archive => {
+                    archive_list.items.iter().flatten().find(|i| i.id == id)
+                }
+            };
+            if let Some(item) = from_list.cloned() {
                 let login = item.login.as_ref();
                 match command {
                     // No reveal and no confirmation on either copy, matching
@@ -1290,6 +1436,98 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                             );
                         }
                     }
+                    // The four commands that move an item between this
+                    // window's three lists. All of them go through
+                    // `VaultCache`, never the bridge, so the snapshot and its
+                    // pending-write log move with the server -- and all of
+                    // them drop the on-demand list they touched rather than
+                    // editing it in place, because that list is not cached
+                    // anywhere and refetching it is the cheap, always-correct
+                    // answer (`VaultCache::list_trash`'s recorded decision).
+                    //
+                    // NOTHING HERE READS A LIST BACK TO CONFIRM THE WRITE.
+                    // A 200 from `/archive/item/{id}` does not prove the
+                    // state changed -- an item archived immediately after
+                    // creation answered 200 and stayed in the default list
+                    // until a ~1.5s settle -- so a read taken here would race
+                    // that settle and report a failure that did not happen.
+                    // The refetch that does happen is the next time the row
+                    // is opened, which is far past it.
+                    item_list::RowCommand::Archive => {
+                        match cache.archive_item(&item) {
+                            Ok(()) => {
+                                items.retain(|i| i.id != item.id);
+                                if selected_id.as_deref() == Some(item.id.as_str()) {
+                                    selected_id = items.first().map(|i| i.id.clone());
+                                }
+                                archive_list.invalidate();
+                            }
+                            Err(e) => {
+                                log::warn!("failed to archive item {}: {e:?}", item.id);
+                                flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                            }
+                        }
+                    }
+                    item_list::RowCommand::Unarchive => {
+                        match cache.unarchive_item(&item) {
+                            Ok(()) => {
+                                // The item is live again, so the window's own
+                                // copy of the live list gains it -- exactly
+                                // what the cache just did to its snapshot.
+                                if !items.iter().any(|i| i.id == item.id) {
+                                    items.push(item.clone());
+                                }
+                                archive_list.invalidate();
+                            }
+                            Err(e) => {
+                                log::warn!("failed to unarchive item {}: {e:?}", item.id);
+                                flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                            }
+                        }
+                    }
+                    item_list::RowCommand::Restore => {
+                        match cache.restore_item(&item) {
+                            Ok(()) => {
+                                // `without_deleted_date` is the cache's, and
+                                // it is load-bearing: an item put back into a
+                                // live list still carrying `deletedDate`
+                                // would PUT that key on its next ordinary
+                                // edit, at a backend whose handling of it is
+                                // unverified.
+                                let restored = crate::vault_bridge::without_deleted_date(&item);
+                                if !items.iter().any(|i| i.id == item.id) {
+                                    items.push(restored);
+                                }
+                                trash_list.invalidate();
+                            }
+                            Err(e) => {
+                                log::warn!("failed to restore item {}: {e:?}", item.id);
+                                flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                            }
+                        }
+                    }
+                    // The only irreversible command in this window, on the
+                    // same two-click confirmation as Delete.
+                    item_list::RowCommand::PurgeForever => {
+                        if confirm_click(&mut item_delete_pending, &item.id) {
+                            match cache.purge_item(&item.id) {
+                                Ok(()) => {
+                                    if selected_id.as_deref() == Some(item.id.as_str()) {
+                                        selected_id = None;
+                                    }
+                                    trash_list.invalidate();
+                                }
+                                Err(e) => {
+                                    log::warn!("failed to purge item {}: {e:?}", item.id);
+                                    flag_reauth_if_unauthorized(
+                                        ui.ctx(),
+                                        &needs_reauth_for_closure,
+                                        &e,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1297,7 +1535,29 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
             .show(ui, |ui| {
-                let selected_item = selected_id.as_ref().and_then(|id| items.iter().find(|i| &i.id == id)).cloned();
+                // Resolved from the list the selection was made in, for the
+                // reason the row menu is: a row clicked under Trash or
+                // Archive is not in `items`, so looking it up there would
+                // leave the pane on "Select an item." for a row the user just
+                // clicked.
+                let selected_item = selected_id
+                    .as_ref()
+                    .and_then(|id| {
+                        match filter.source() {
+                            sidebar::FilterSource::LiveVault => items.iter().find(|i| &i.id == id),
+                            sidebar::FilterSource::Trash => {
+                                trash_list.items.iter().flatten().find(|i| &i.id == id)
+                            }
+                            sidebar::FilterSource::Archive => {
+                                archive_list.items.iter().flatten().find(|i| &i.id == id)
+                            }
+                        }
+                    })
+                    .cloned();
+                // `Some` only for Trash and Archive -- see `OutOfVault`,
+                // which exists so this branch cannot be taken for a live
+                // item.
+                let out_of_vault = filter.source().out_of_vault();
 
                 // The detail pane wants its own icon regardless of whether
                 // the selected item also happens to be part of this frame's
@@ -1317,6 +1577,26 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 }
 
                 match &mut mode {
+                    // AN ITEM OUTSIDE THE LIVE VAULT GETS ITS OWN PANE, not
+                    // the ordinary read pane with some buttons hidden. Every
+                    // action that pane offers -- Edit, Fill, Delete, the copy
+                    // rows, the favourite star, the TOTP poll -- reads or
+                    // writes through the LIVE list, which by definition does
+                    // not hold this item, so each of them would be a control
+                    // that quietly did nothing. The state is stated instead,
+                    // with the one action that works named.
+                    //
+                    // Checked before `mode` rather than inside the Read arm:
+                    // an Edit draft cannot be open on an item that was never
+                    // editable, and the selection-change reset has already
+                    // put `mode` back to Read for the row that was clicked.
+                    _ if out_of_vault.is_some() && selected_item.is_some() => {
+                        detail::draw_out_of_vault_read(
+                            ui,
+                            selected_item.as_ref().expect("guarded above"),
+                            out_of_vault.expect("guarded above"),
+                        );
+                    }
                     DetailMode::Read => {
                         if let Some(item) = &selected_item {
                             // There is deliberately no `item_type != Some(1)`
@@ -2175,6 +2455,108 @@ fn apply_totp_poll_result(
 /// reads `run`'s poll bookkeeping, and its rendering is already pinned from
 /// both directions in `detail.rs`. Moving it would restructure the one part
 /// of this pane with five findings and a redesign behind it.
+/// One of the vault window's two on-demand item lists -- the trash and the
+/// archive.
+///
+/// Neither lives in `VaultCache`'s snapshot, and that is a recorded decision
+/// with reasons (see `VaultCache::list_trash`), so the window holds them
+/// itself. Both are fetched off the UI thread the first time their row is
+/// selected.
+///
+/// **`items: None` is "never fetched", which is NOT "empty".** That
+/// distinction is the whole point of the `Option`: a badge that printed `0`
+/// for a list nobody had asked for yet is exactly the untruth the Trash row
+/// shipped with for months, and `sidebar::badge_text` draws an en dash for
+/// `None` rather than a number this app does not have.
+///
+/// `error` exists so a failed fetch is reported ONCE rather than retried
+/// every frame. Without it, `wants_fetch` would be true again on the very
+/// next frame and a `bw serve` that is down would be hammered at the frame
+/// rate for as long as the row stays selected.
+#[derive(Default)]
+struct AuxList {
+    items: Option<Vec<VaultItem>>,
+    in_flight: bool,
+    error: Option<String>,
+}
+
+impl AuxList {
+    /// Whether the window should start a fetch for this list this frame.
+    ///
+    /// A pure predicate rather than three conditions spelled out inside the
+    /// render closure: the whole decision is four booleans, and inside that
+    /// closure no test in this crate could reach it. Its failure modes are
+    /// all "reachable but wrong" rather than "does not compile" -- a missing
+    /// `in_flight` check spawns a thread per frame, a missing `error` check
+    /// retries a dead backend at 60Hz, and a missing `items` check refetches
+    /// a list it already has on every frame the row is open.
+    fn wants_fetch(&self, selected: bool) -> bool {
+        selected && self.items.is_none() && !self.in_flight && self.error.is_none()
+    }
+
+    /// Forget everything: the list, any failure, and the right to be
+    /// considered fetched. Called whenever the live vault is reloaded or
+    /// written to, so the next visit to the row asks the server again.
+    ///
+    /// `in_flight` is deliberately NOT cleared -- a thread is still running
+    /// and clearing it would let a second one start. The result of the
+    /// in-flight fetch is dropped by the generation check instead.
+    fn invalidate(&mut self) {
+        self.items = None;
+        self.error = None;
+    }
+}
+
+/// Fetches one of the two on-demand lists on a background thread.
+///
+/// Backgrounded for the reason every other backend call this window makes
+/// off-thread is: a real HTTP round-trip to `bw serve`, and `ureq`'s read
+/// timeout bounds one read syscall rather than the whole response, so a
+/// stalled backend would hold the UI thread well past it. This window
+/// already runs nine calls synchronously in the render closure -- a known,
+/// recorded debt -- and this deliberately does not become the tenth.
+///
+/// The result is tagged with the `load_generation` it was started against,
+/// so a vault reload that lands first can drop it rather than have a list
+/// fetched against the old vault overwrite one fetched against the new.
+fn spawn_aux_load(
+    cache: std::sync::Arc<VaultCache>,
+    which: OutOfVault,
+    generation: u64,
+    tx: mpsc::Sender<(u64, OutOfVault, Result<Vec<VaultItem>, AuxLoadError>)>,
+) {
+    std::thread::spawn(move || {
+        let result = match which {
+            OutOfVault::Trash => cache.list_trash(),
+            OutOfVault::Archive => cache.list_archive(),
+        };
+        let _ = tx.send((generation, which, result.map_err(AuxLoadError::of)));
+    });
+}
+
+/// Why an on-demand list could not be fetched.
+///
+/// `Unauthorized` keeps its own variant all the way to the UI thread rather
+/// than being flattened into the message, because the window's
+/// re-authentication path keys off it -- and re-detecting it by matching on a
+/// `{:?}`-formatted string is exactly the re-parsing this crate keeps having
+/// to un-write. `VaultError` itself is not sent because it is not `Send`-
+/// friendly to keep around and only these two facts are wanted here: is it a
+/// dead session, and what does the user get told.
+enum AuxLoadError {
+    Unauthorized,
+    Other(String),
+}
+
+impl AuxLoadError {
+    fn of(e: VaultError) -> Self {
+        match e {
+            VaultError::Unauthorized => AuxLoadError::Unauthorized,
+            e => AuxLoadError::Other(format!("{e:?}")),
+        }
+    }
+}
+
 fn draw_read_arm(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -5515,6 +5897,162 @@ mod totp_state_after_reload_tests {
             seconds_left: 9,
         });
         assert_eq!(super::totp_state_for_secret_presence(false, kept), TotpState::NoSecret);
+    }
+}
+
+#[cfg(test)]
+mod aux_list_tests {
+    //! The on-demand trash/archive fetch decision.
+    use super::AuxList;
+
+    /// Every combination of the four inputs, because each of the three
+    /// guards fails in its own visible-but-wrong way: without the `selected`
+    /// check the window fetches both lists on every vault it ever opens,
+    /// without `items` it refetches a list it already has on every frame,
+    /// without `in_flight` it starts a thread per frame while the first is
+    /// running, and without `error` it retries a dead backend at the frame
+    /// rate.
+    #[test]
+    fn a_fetch_starts_only_for_the_selected_row_that_has_no_list_no_fetch_and_no_failure() {
+        let fresh = AuxList::default();
+        assert!(fresh.wants_fetch(true), "the selected row never asked for its list");
+        assert!(!fresh.wants_fetch(false), "an unselected row fetched anyway");
+
+        let fetched = AuxList { items: Some(Vec::new()), ..AuxList::default() };
+        assert!(
+            !fetched.wants_fetch(true),
+            "a list that has already answered was fetched again -- note the answer was EMPTY, \
+             which is the case a `Vec::is_empty` check instead of an `Option` would get wrong"
+        );
+
+        let running = AuxList { in_flight: true, ..AuxList::default() };
+        assert!(!running.wants_fetch(true), "a second fetch started while one was in flight");
+
+        let failed = AuxList { error: Some("boom".into()), ..AuxList::default() };
+        assert!(!failed.wants_fetch(true), "a failed fetch was retried immediately");
+    }
+
+    /// Invalidating is what makes a failed row recoverable and a stale row
+    /// re-read -- and it must NOT clear `in_flight`, or a vault reload that
+    /// lands while a fetch is running starts a second one.
+    #[test]
+    fn invalidating_forgets_the_list_and_the_failure_but_not_the_thread() {
+        let mut list = AuxList {
+            items: Some(vec![]),
+            error: Some("boom".into()),
+            in_flight: true,
+        };
+        list.invalidate();
+        assert!(list.items.is_none());
+        assert!(list.error.is_none());
+        assert!(list.in_flight, "invalidating let a second fetch start over a running one");
+
+        // ...and with the thread finished, the row asks again. Without this
+        // the two assertions above are compatible with a list that can never
+        // be fetched at all.
+        list.in_flight = false;
+        assert!(list.wants_fetch(true));
+    }
+}
+
+#[cfg(test)]
+mod out_of_vault_pane_placement_tests {
+    //! The detail pane's out-of-vault branch, and the four row commands that
+    //! move an item between this window's three lists.
+    //!
+    //! SOURCE-TEXT GUARDS, and stated plainly. Everything below lives inside
+    //! `run`'s eframe closure, which opens an OS window and which no test in
+    //! this crate can call -- the same reason
+    //! `item_pane_frame_placement_tests` and `reveal_state_placement_tests`
+    //! are written this way. What they pin is the wiring: the decisions
+    //! themselves (`menu_entries`, `detail::out_of_vault_text`,
+    //! `AuxList::wants_fetch`, `sidebar::items_for`) are all pure and tested
+    //! directly, and every one of them can be correct while nothing calls
+    //! it -- which is this repository's most-repeated defect and the reason
+    //! these exist at all.
+    //!
+    //! Needles are split with `concat!` so they cannot match their own
+    //! declaration here. Do not re-join them.
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    #[test]
+    fn the_read_pane_branches_to_the_out_of_vault_pane() {
+        let needle = concat!("detail::draw_out_of_vault", "_read(");
+        assert!(
+            source().contains(needle),
+            "nothing calls the out-of-vault detail pane. A trashed or archived row would open \
+             the ordinary read pane, whose Edit/Fill/Delete/copy controls all act through the \
+             LIVE item list -- which does not hold that item -- so every one of them would be \
+             a control that quietly did nothing"
+        );
+    }
+
+    #[test]
+    fn each_of_the_four_list_commands_calls_the_cache() {
+        // One needle per command, each naming the cache method it must
+        // reach. A missing arm is a compile error (the match is exhaustive);
+        // an arm that logs and does nothing is not, and that is what this
+        // catches.
+        for (command, call) in [
+            (
+                concat!("RowCommand::Arch", "ive =>"),
+                concat!("cache.archive", "_item(&item)"),
+            ),
+            (
+                concat!("RowCommand::Unarch", "ive =>"),
+                concat!("cache.unarchive", "_item(&item)"),
+            ),
+            (
+                concat!("RowCommand::Rest", "ore =>"),
+                concat!("cache.restore", "_item(&item)"),
+            ),
+            (
+                concat!("RowCommand::PurgeFor", "ever =>"),
+                concat!("cache.purge", "_item(&item.id)"),
+            ),
+        ] {
+            let at = source()
+                .find(command)
+                .unwrap_or_else(|| panic!("no {command:?} arm in this file"));
+            let arm = &source()[at..at + 1400];
+            assert!(
+                arm.contains(call),
+                "the {command:?} arm no longer calls {call:?} -- the menu entry is inert"
+            );
+        }
+    }
+
+    #[test]
+    fn the_permanent_delete_is_still_behind_the_two_click_confirmation() {
+        // The one irreversible action in this window. A `purge_item` reached
+        // without `confirm_click` deletes the user's item on the first click
+        // of a menu entry.
+        let at = source().find(concat!("RowCommand::PurgeFor", "ever =>")).expect("the arm");
+        let arm = &source()[at..at + 1400];
+        assert!(
+            arm.contains(concat!("confirm_", "click(&mut item_delete_pending")),
+            "\"Delete forever\" is no longer two-click confirmed"
+        );
+    }
+
+    #[test]
+    fn both_on_demand_lists_are_dropped_when_the_vault_reloads() {
+        // Without this a Trash list fetched before a sync stays on screen
+        // afterwards, showing items the user has since restored elsewhere --
+        // and, because `wants_fetch` sees a list already in hand, it is never
+        // asked for again for the life of the window.
+        for needle in [
+            concat!("trash_list.inval", "idate()"),
+            concat!("archive_list.inval", "idate()"),
+        ] {
+            assert!(
+                source().contains(needle),
+                "nothing calls {needle:?} -- an on-demand list is never refreshed"
+            );
+        }
     }
 }
 

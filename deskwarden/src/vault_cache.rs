@@ -1219,6 +1219,79 @@ impl VaultCache {
         self.bridge.list_trash()
     }
 
+    /// The vault's archive, fetched fresh every time -- [`Self::list_trash`]'s
+    /// decision, for [`Self::list_trash`]'s reasons.
+    pub fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
+        self.bridge.list_archive()
+    }
+
+    /// Puts `item` into the archive and takes it out of the live snapshot.
+    ///
+    /// The snapshot side is [`Self::delete_item`]'s, and for the same reason:
+    /// an archived item is gone from `GET /list/object/items` (measured), so
+    /// as far as every consumer of this snapshot is concerned -- the item
+    /// list, the match engine, autofill -- archiving is a removal. Recording
+    /// it in the pending-write log is what stops a populate that was already
+    /// in flight from putting it straight back.
+    ///
+    /// **This does NOT read a list back to confirm the archive**, and that is
+    /// deliberate rather than an omission. A 200 from `/archive/item/{id}`
+    /// does not prove the state changed: an item archived immediately after
+    /// creation answered 200 and stayed in the default list until a ~1.5s
+    /// settle had passed (`.superpowers/sdd/item-shapes-capture.md`). A read
+    /// taken here would race that settle and report a failure that did not
+    /// happen -- worse than the write it was meant to police, because the
+    /// caller would then undo a correct archive. The next ordinary refresh
+    /// reconciles instead.
+    pub fn archive_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+        // Bridge call BEFORE `self.lock()`: no lock may be held across HTTP.
+        self.bridge.archive_item(&item.id)?;
+        let mut snapshot = self.lock();
+        if snapshot.populated {
+            snapshot.items.retain(|i| i.id != item.id);
+            // Recorded even when the snapshot did not hold the item, exactly
+            // as `delete_item` and `purge_item` do: what it has to survive is
+            // a fetch that predates the archive and DOES hold it.
+            snapshot.note_item_write(&item.id, true);
+        }
+        Ok(())
+    }
+
+    /// Takes `item` out of the archive and puts it back in the live snapshot.
+    ///
+    /// The snapshot side is [`Self::restore_item`]'s exactly -- the item
+    /// reappears in `GET /list/object/items`, and the `deleted: true` entry
+    /// [`Self::archive_item`] left in the pending-write log has to be
+    /// overwritten or `replay_writes` strips the id out of every later fetch
+    /// for the rest of the session.
+    ///
+    /// [`without_deleted_date`] is NOT applied here, and that is the one
+    /// difference from `restore_item`: an archived item never carried a
+    /// `deletedDate` in the first place (its keys are an ordinary item's --
+    /// measured), so removing one would be removing a key that is not there.
+    /// An item that is somehow BOTH is not a state this backend has been
+    /// observed to produce, and inventing handling for it would be modelling
+    /// from memory.
+    pub fn unarchive_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+        self.bridge.unarchive_item(&item.id)?;
+        let mut snapshot = self.lock();
+        if !snapshot.populated {
+            drop(snapshot);
+            log::warn!(
+                "took vault item {} out of the archive but the cache holds no snapshot to write \
+                 it through to; the vault has it live and any populate will bring it in",
+                item.id
+            );
+            return Ok(());
+        }
+        match snapshot.items.iter().position(|i| i.id == item.id) {
+            Some(at) => snapshot.items[at] = item.clone(),
+            None => snapshot.items.push(item.clone()),
+        }
+        snapshot.note_item_write(&item.id, false);
+        Ok(())
+    }
+
     /// Takes `item` out of the trash and puts it back in the live snapshot.
     ///
     /// Takes the whole trashed item, not just its id, for the reason
@@ -3226,6 +3299,181 @@ mod tests {
             cache.items().iter().any(|i| i.id == "1"),
             "a failed purge removed the item from the cache anyway"
         );
+    }
+
+    // --- Archive -----------------------------------------------------------
+
+    /// The archive as `bw serve` answers `?archived=true`: one item that is
+    /// NOT among the two in `items_body` and carries NO `deletedDate` -- an
+    /// archived item's keys are an ordinary item's (measured).
+    fn archive_body() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"a1","name":"Put aside","fields":[],"type":1,
+             "login":{"username":"u","password":"p"}}
+        ]}}"#
+    }
+
+    fn mock_archive_list(server: &mut mockito::Server) {
+        server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(archive_body())
+            .create();
+    }
+
+    #[test]
+    fn listing_the_archive_does_not_disturb_the_live_snapshot() {
+        // The same property the trash list has, asserted for the same reason:
+        // an archived item that leaked into `items` would reappear in the
+        // item list, the match engine and autofill -- the three consumers
+        // whose exclusion this app gets for free precisely BECAUSE the
+        // archive is a separate query.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        mock_archive_list(&mut server);
+
+        let archived = cache.list_archive().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "a1");
+
+        let live = cache.items();
+        assert_eq!(live.len(), 2, "the archive fetch changed the live snapshot: {live:?}");
+        assert!(!live.iter().any(|i| i.id == "a1"), "an archived item leaked into the snapshot");
+    }
+
+    #[test]
+    fn archiving_an_item_takes_it_out_of_the_live_snapshot() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let archive = server.mock("POST", "/archive/item/1").with_status(200).expect(1).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").expect("the premise");
+        cache.archive_item(&item).unwrap();
+        archive.assert();
+
+        let live = cache.items();
+        assert_eq!(live.len(), 1, "archiving did not remove the item: {live:?}");
+        assert!(!live.iter().any(|i| i.id == "1"));
+        // POSITIVE CONTROL: the OTHER item is untouched, so this cannot pass
+        // against an `archive_item` that emptied the snapshot.
+        assert!(live.iter().any(|i| i.id == "2"));
+    }
+
+    #[test]
+    fn a_failed_archive_leaves_the_snapshot_alone() {
+        // Re-archiving an already-archived item is a 400 on the live backend,
+        // so this path is reachable. Removing the item locally on a write the
+        // server refused would hide an item the vault still has.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _a = server.mock("POST", "/archive/item/1").with_status(400).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(cache.archive_item(&item).is_err(), "a rejected archive came back Ok");
+        assert!(
+            cache.items().iter().any(|i| i.id == "1"),
+            "a failed archive removed the item from the cache anyway"
+        );
+    }
+
+    #[test]
+    fn an_archive_survives_a_populate_whose_fetch_predates_it() {
+        // The pending-write log is the whole reason `archive_item` records
+        // anything at all. Without it, a sync started before the user
+        // archived (a window the vault window's 30s auto-sync makes ordinary)
+        // lands afterwards carrying the item as live, and the archive is
+        // silently undone in this process.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _a = server.mock("POST", "/archive/item/1").with_status(200).create();
+
+        let mark = cache.epoch();
+        let fetched = cache.items();
+        assert!(fetched.iter().any(|i| i.id == "1"), "the fetch must predate the archive");
+
+        let item = fetched.iter().find(|i| i.id == "1").unwrap().clone();
+        cache.archive_item(&item).unwrap();
+
+        assert_eq!(cache.populate_with(fetched, mark).unwrap(), PopulateOutcome::Populated);
+        assert!(
+            !cache.items().iter().any(|i| i.id == "1"),
+            "a populate resurrected an archived item: {:?}",
+            cache.items()
+        );
+    }
+
+    #[test]
+    fn unarchiving_puts_the_item_back_and_overrides_the_pending_archive() {
+        // Both halves of the round trip, in one walk, because the second is
+        // invisible without the first: `archive_item` leaves a
+        // `deleted: true` entry in the pending-write log, and if the
+        // unarchive does not overwrite it `replay_writes` strips the item out
+        // of EVERY later fetch -- the item comes back on the server and stays
+        // invisible here for the rest of the session.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _a = server.mock("POST", "/archive/item/1").with_status(200).create();
+        let unarchive = server.mock("POST", "/restore/item/1").with_status(200).expect(1).create();
+
+        let mark = cache.epoch();
+        let fetched = cache.items();
+        let item = fetched.iter().find(|i| i.id == "1").unwrap().clone();
+
+        cache.archive_item(&item).unwrap();
+        assert!(!cache.items().iter().any(|i| i.id == "1"), "the archive must have landed");
+
+        cache.unarchive_item(&item).unwrap();
+        unarchive.assert();
+        assert!(
+            cache.items().iter().any(|i| i.id == "1"),
+            "an unarchived item did not reach the live snapshot: {:?}",
+            cache.items()
+        );
+
+        // ...and a fetch that predates the whole sequence no longer has the
+        // item stripped out of it.
+        assert_eq!(cache.populate_with(fetched, mark).unwrap(), PopulateOutcome::Populated);
+        assert!(
+            cache.items().iter().any(|i| i.id == "1"),
+            "a populate stripped an UNARCHIVED item back out, because the unarchive left the \
+             pending archive in place: {:?}",
+            cache.items()
+        );
+    }
+
+    #[test]
+    fn a_failed_unarchive_leaves_the_snapshot_alone() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        mock_archive_list(&mut server);
+        let _u = server.mock("POST", "/restore/item/a1").with_status(500).create();
+
+        let item = cache.list_archive().unwrap().into_iter().next().unwrap();
+        assert!(cache.unarchive_item(&item).is_err(), "a rejected unarchive came back Ok");
+        assert!(
+            !cache.items().iter().any(|i| i.id == "a1"),
+            "a failed unarchive put the item into the live snapshot anyway"
+        );
+    }
+
+    #[test]
+    fn a_401_on_an_archive_call_reaches_the_caller_as_unauthorized() {
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(401)
+            .create();
+        let _a = server.mock("POST", "/archive/item/1").with_status(401).create();
+        let _u = server.mock("POST", "/restore/item/1").with_status(401).create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert!(matches!(cache.list_archive(), Err(VaultError::Unauthorized)));
+        assert!(matches!(cache.archive_item(&item), Err(VaultError::Unauthorized)));
+        assert!(matches!(cache.unarchive_item(&item), Err(VaultError::Unauthorized)));
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! display + copy actions; edit mode owns a draft `VaultItem` and validates
 //! it), and the read-mode file was already large enough on its own.
 
+use super::sidebar::OutOfVault;
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
@@ -772,6 +773,69 @@ pub fn metadata_line_for(
     } else {
         updated_text(updated_days_ago)
     }
+}
+
+/// What the detail pane says about an item that is in the Trash or the
+/// Archive: the heading, and the sentence explaining what can be done with
+/// it.
+///
+/// A pure function returning the strings, so the wording is testable without
+/// a frame and so the pane below cannot say one thing while a test asserts
+/// another. Takes [`OutOfVault`], which has no "live" variant, so there is no
+/// case here to get wrong for an ordinary item.
+pub fn out_of_vault_text(out: OutOfVault) -> (&'static str, &'static str) {
+    match out {
+        OutOfVault::Trash => (
+            "This item is in the Trash.",
+            "Deskwarden does not edit, fill or copy from a trashed item -- the vault would \
+             reject the write and the fill would have nothing to type. Right-click its row to \
+             Restore it, or to delete it forever.",
+        ),
+        OutOfVault::Archive => (
+            "This item is archived.",
+            "Archived items are kept out of the vault list, out of app matching and out of \
+             autofill -- which is what archiving them is for. Right-click its row to Unarchive \
+             it, and everything it can normally do comes back.",
+        ),
+    }
+}
+
+/// The detail pane for an item that is not in the live vault.
+///
+/// **Deliberately not [`draw_detail_read`] with its buttons hidden.** Every
+/// action that pane offers reads or writes through the live item list, which
+/// by definition does not hold this item, so each one would be a control that
+/// quietly did nothing -- the failure this window keeps having to un-write.
+/// This pane has no controls at all: it states which of the two places the
+/// item is in and where the action that works lives.
+///
+/// It paints the same surface and the same header strip as the read pane, so
+/// the column does not change shape as the user moves between rows.
+pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVault) {
+    let (heading, body) = out_of_vault_text(out);
+    let pane = ui.clip_rect();
+    ui.painter()
+        .rect_filled(pane, CornerRadius::ZERO, theme::WINDOW_BG);
+    let mut pane_ui = ui.new_child(egui::UiBuilder::new().max_rect(pane));
+    let ui = &mut pane_ui;
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                RichText::new(&item.name)
+                    .size(TITLE_SIZE)
+                    .family(egui::FontFamily::Name(theme::BOLD.into()))
+                    .color(theme::INK),
+            );
+            ui.add_space(6.0);
+            ui.label(RichText::new(heading).size(12.0).color(theme::TEXT_MUTED));
+        });
+    ui.add_space(18.0);
+    ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
 }
 
 pub fn draw_detail_read(
@@ -1809,6 +1873,89 @@ mod tests {
             collect_text(&clipped.shape, &mut texts);
         }
         texts
+    }
+
+    /// The same, for the pane an out-of-vault item gets.
+    fn painted_out_of_vault(item: &VaultItem, out: OutOfVault) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let output = ctx.run_ui(input(), |ui| draw_out_of_vault_read(ui, item, out));
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// The out-of-vault pane names the item, says which of the two places it
+    /// is in, and offers NO control.
+    ///
+    /// The negative half is the point and it is paired with a positive
+    /// control, because "the pane has no Edit button" is also true of a pane
+    /// that painted nothing at all: the item's own name and the state
+    /// sentence are asserted present in the same test.
+    #[test]
+    fn the_out_of_vault_pane_states_where_the_item_is_and_offers_no_controls() {
+        let item = VaultItem {
+            id: "t1".into(),
+            name: "Ledgerline".into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+
+        for (out, expected) in [
+            (OutOfVault::Trash, "This item is in the Trash."),
+            (OutOfVault::Archive, "This item is archived."),
+        ] {
+            let painted = painted_out_of_vault(&item, out);
+            assert!(painted.iter().any(|t| t == "Ledgerline"), "the pane did not name the item");
+            assert!(
+                painted.iter().any(|t| t == expected),
+                "the pane never said {expected:?}; it painted {painted:?}"
+            );
+            for control in ["Edit", "Fill in app", "Delete", "Copy"] {
+                assert!(
+                    !painted.iter().any(|t| t == control),
+                    "the out-of-vault pane offers {control:?}, which acts through the live item \
+                     list and would do nothing for this item"
+                );
+            }
+        }
+    }
+
+    /// The two states say different things. Without this, one message reused
+    /// for both would pass every "the pane said something" assertion above.
+    #[test]
+    fn trash_and_archive_are_explained_differently() {
+        let trash = out_of_vault_text(OutOfVault::Trash);
+        let archive = out_of_vault_text(OutOfVault::Archive);
+        assert_ne!(trash.0, archive.0);
+        assert_ne!(trash.1, archive.1);
+        // Each names the action that actually works for it, which is the
+        // whole job of the sentence.
+        assert!(trash.1.contains("Restore"), "the trash pane does not name Restore: {trash:?}");
+        assert!(
+            archive.1.contains("Unarchive"),
+            "the archive pane does not name Unarchive: {archive:?}"
+        );
     }
 
     fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {

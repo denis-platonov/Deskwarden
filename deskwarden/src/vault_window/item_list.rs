@@ -6,7 +6,7 @@
 
 use super::detail::{kind_offers_edit, kind_offers_fill};
 use super::detail_edit::assignable_folders;
-use super::sidebar::SidebarFilter;
+use super::sidebar::{FilterSource, OutOfVault, SidebarFilter};
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
@@ -66,6 +66,16 @@ pub enum RowCommand {
     /// see [`move_menu`].
     MoveToFolder(String),
     Delete,
+    /// Put a live item into the archive.
+    Archive,
+    /// Take an archived item back out. The backend route is `restore`, not
+    /// `unarchive` -- see `VaultBridge::unarchive_item` -- but the user-facing
+    /// action is its own thing and is named for what it does.
+    Unarchive,
+    /// Take a trashed item out of the trash.
+    Restore,
+    /// Delete a trashed item for good. Two-click confirmed, like [`Self::Delete`].
+    PurgeForever,
 }
 
 /// What an item row puts on egui's drag-and-drop clipboard while it is being
@@ -160,6 +170,13 @@ const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
 const DELETE_LABEL: &str = "Delete";
 const DELETE_CONFIRM_LABEL: &str = "Delete? Click to confirm";
 
+/// The Trash row's permanent delete, in the same two-click shape -- the same
+/// mechanism, so there is one confirmation idiom in this menu and not two.
+/// The wording says "forever" in both states because that is the difference
+/// between this entry and the one above it, and it is not recoverable.
+const PURGE_LABEL: &str = "Delete forever";
+const PURGE_CONFIRM_LABEL: &str = "Delete forever? Click to confirm";
+
 /// Trimmed text, or `None` when there is nothing worth an entry -- the same
 /// rule `detail::non_empty` applies to that pane's rows, restated here
 /// because it is private there.
@@ -179,17 +196,28 @@ fn menu_non_empty(value: Option<&str>) -> Option<&str> {
 /// `delete_pending` is `vault_window::mod`'s `item_delete_pending` for THIS
 /// item; it only changes the Delete entry's wording.
 ///
-/// **Archive is deliberately not here.** The feature does not exist, and an
-/// entry that does nothing is worse than a missing one. It joins the list
-/// when Archive lands.
+/// `source` is which list the row was drawn from, and it selects between
+/// three DISJOINT menus rather than adding or removing a line from one.
+/// That is the point: an item in the trash cannot be edited, filled, moved
+/// between folders or soft-deleted again, and offering those on it would be
+/// six silent no-ops in a row -- the failure this file's own comments keep
+/// naming. See [`out_of_vault_entries`].
 ///
-/// **Nor is a "No folder" / un-file entry.** `bw serve` (CLI 2026.7.0)
+/// **No "No folder" / un-file entry** in any of the three. `bw serve` (CLI 2026.7.0)
 /// cannot clear a folder assignment at all -- omitting the key, `null`, `""`
 /// and a fully round-tripped object were each proven against a control field
 /// that did change in the same request
 /// (`.superpowers/sdd/put-semantics-capture.md`). Offering it would write
 /// successfully and do nothing.
-pub fn menu_entries(item: &VaultItem, folders: &[Folder], delete_pending: bool) -> Vec<MenuEntry> {
+pub fn menu_entries(
+    item: &VaultItem,
+    folders: &[Folder],
+    delete_pending: bool,
+    source: FilterSource,
+) -> Vec<MenuEntry> {
+    if let Some(out) = source.out_of_vault() {
+        return out_of_vault_entries(out, delete_pending);
+    }
     let kind = ItemKind::of(item);
     let login = item.login.as_ref();
     let mut entries = Vec::new();
@@ -245,11 +273,57 @@ pub fn menu_entries(item: &VaultItem, folders: &[Folder], delete_pending: bool) 
         disabled_reason: (!editable).then_some(EDIT_DISABLED_REASON),
     }));
     entries.push(MenuEntry::MoveToFolder(move_menu(item, folders)));
+    // Above Delete, below everything else: Archive is the gentler of the two
+    // ways to take an item out of the working vault, and the design lists
+    // the two rows in that order too.
+    entries.push(enabled_command("Archive", RowCommand::Archive));
     entries.push(enabled_command(
         if delete_pending { DELETE_CONFIRM_LABEL } else { DELETE_LABEL },
         RowCommand::Delete,
     ));
     entries
+}
+
+/// The menu for an item that is NOT in the live vault -- one listed under
+/// Trash or Archive.
+///
+/// **Nothing from the live menu appears here, and that is the whole design.**
+/// A trashed item cannot be edited (the CLI rejects a PUT of a deleted
+/// cipher), cannot be filled (it is not in the list the fill path reads),
+/// cannot be moved between folders, and cannot be soft-deleted a second time.
+/// Offering any of them would produce an entry that either fails or, worse,
+/// succeeds at nothing -- and this file already carries three comments about
+/// exactly that shape. Each of these two states has one or two things that
+/// genuinely work, and those are what the menu holds.
+///
+/// Copy username/password are absent too, which is a judgement rather than a
+/// technical limit: the values are in hand and copying them would work. They
+/// are left out because an archived or trashed credential is one the user has
+/// put away, and the two rows exist to get it back or get rid of it. Restore
+/// it and every copy action returns.
+///
+/// Takes [`OutOfVault`] rather than a [`FilterSource`], so it cannot be
+/// called for a live item at all.
+fn out_of_vault_entries(out: OutOfVault, delete_pending: bool) -> Vec<MenuEntry> {
+    match out {
+        OutOfVault::Trash => vec![
+            enabled_command("Restore", RowCommand::Restore),
+            // The two-click confirmation, and the only entry in this file
+            // that is not undoable. It uses the SAME `confirm_click`
+            // mechanism the ordinary Delete does rather than a second
+            // confirmation idiom.
+            enabled_command(
+                if delete_pending { PURGE_CONFIRM_LABEL } else { PURGE_LABEL },
+                RowCommand::PurgeForever,
+            ),
+        ],
+        // One entry, because there is exactly one thing to do with an
+        // archived item. "Delete" is deliberately not offered: archiving is
+        // the user putting something aside, and the route from aside to gone
+        // goes back through the vault, where the ordinary Delete lives with
+        // its confirmation.
+        OutOfVault::Archive => vec![enabled_command("Unarchive", RowCommand::Unarchive)],
+    }
 }
 
 /// A plain, clickable entry.
@@ -330,20 +404,26 @@ pub fn matches_filter(item: &VaultItem, filter: &SidebarFilter, search_lower: &s
 /// grammar breaks on: 1 (no plural "s") and 0 (which takes the plural, as
 /// English does).
 ///
-/// `Trash`, `Folder` and `Unfiled` deliberately keep the neutral "item": all
-/// three hold a mixture of kinds, so any specific noun would be wrong for
+/// `Archive`, `Trash`, `Folder` and `Unfiled` deliberately keep the neutral
+/// "item": all four hold a mixture of kinds, so any specific noun would be wrong for
 /// most of their contents, and the sidebar already shows which scope is
 /// selected.
 pub fn search_hint(count: usize, filter: &SidebarFilter) -> String {
     let (singular, plural) = match filter {
         SidebarFilter::All => ("item", "items"),
         SidebarFilter::Favorites => ("favorite", "favorites"),
+        // Named after the row, like every other specific noun here
+        // (Favorites -> favorites, Logins -> logins). "Search 12 apps" is
+        // the scope the sidebar shows as selected, so the two read as one
+        // thing rather than the placeholder inventing a second name for it.
+        SidebarFilter::Apps => ("app", "apps"),
         SidebarFilter::Logins => ("login", "logins"),
         SidebarFilter::Passkeys => ("passkey", "passkeys"),
         SidebarFilter::Cards => ("card", "cards"),
         SidebarFilter::Identities => ("identity", "identities"),
         SidebarFilter::SecureNotes => ("secure note", "secure notes"),
         SidebarFilter::SshKeys => ("SSH key", "SSH keys"),
+        SidebarFilter::Archive => ("item", "items"),
         SidebarFilter::Trash => ("item", "items"),
         SidebarFilter::Folder(_) => ("item", "items"),
         SidebarFilter::Unfiled => ("item", "items"),
@@ -586,6 +666,7 @@ pub fn draw_item_list(
                                     selected,
                                     delete_pending_id == Some(item.id.as_str()),
                                     icons.textures.get(&item.id),
+                                    filter.source(),
                                 )
                             })
                             .inner;
@@ -695,6 +776,9 @@ fn item_row(
     selected: bool,
     delete_pending: bool,
     icon: Option<&egui::TextureHandle>,
+    // Which list this row was drawn from -- the row's menu is entirely
+    // different for a trashed or archived item. See `menu_entries`.
+    source: FilterSource,
 ) -> RowOutcome {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
     // Design 2b's two trailing chips. Neither is decorative and neither is
@@ -883,7 +967,7 @@ fn item_row(
     // here.
     let mut command = None;
     response.context_menu(|ui| {
-        for entry in menu_entries(item, folders, delete_pending) {
+        for entry in menu_entries(item, folders, delete_pending, source) {
             match entry {
                 MenuEntry::Command(entry) => {
                     if menu_command(ui, &entry) {
@@ -1100,6 +1184,29 @@ mod tests {
         assert!(!matches_filter(&it, &SidebarFilter::Logins, ""));
         assert!(!matches_filter(&it, &SidebarFilter::Logins, "ledgerline"));
     }
+
+    /// Under Trash and Archive this pane is handed the list from that row's
+    /// own query, which is already exactly the row's contents -- so every
+    /// item in it is listed, and the search box still narrows it.
+    ///
+    /// The second half is the one that can regress unnoticed: a Trash scope
+    /// that short-circuited to "everything matches" would leave the search
+    /// box on screen doing nothing, which is a silent no-op in a control the
+    /// user is actively typing into.
+    #[test]
+    fn the_trash_and_archive_scopes_list_what_their_query_returned_and_still_search_it() {
+        let ledgerline = item("Ledgerline", None, Some(1));
+        let vantage = item("Vantage", None, Some(3));
+        for scope in [SidebarFilter::Trash, SidebarFilter::Archive] {
+            assert!(matches_filter(&ledgerline, &scope, ""));
+            // ...including a CARD, which no type row would list -- these two
+            // scopes hold a mixture of kinds and must not have quietly
+            // acquired a type test.
+            assert!(matches_filter(&vantage, &scope, ""));
+            assert!(matches_filter(&ledgerline, &scope, "ledger"));
+            assert!(!matches_filter(&ledgerline, &scope, "vantage"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1192,7 +1299,7 @@ mod menu_entry_tests {
     #[test]
     fn a_full_login_offers_every_entry_in_the_agreed_order() {
         assert_eq!(
-            labels(&menu_entries(&full_login(), &[], false)),
+            labels(&menu_entries(&full_login(), &[], false, FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -1201,19 +1308,73 @@ mod menu_entry_tests {
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
+                "Archive",
                 "Delete",
             ]
         );
     }
 
+    /// The two menus for an item that is NOT in the live vault, whole.
+    ///
+    /// Asserted as the COMPLETE list, not as "Restore is present": the point
+    /// of these menus is what they leave out. Every live entry -- Edit, Fill,
+    /// the copies, Move to folder, Delete -- reads or writes through the live
+    /// item list, which by definition does not hold a trashed or archived
+    /// item, so any of them appearing here would be a click that does
+    /// nothing. A `contains` assertion passes happily against exactly that.
     #[test]
-    fn archive_is_not_offered_anywhere() {
-        // Deliberately absent until the feature exists: an entry that does
-        // nothing is worse than a missing one. Asserted rather than left to
-        // the order test above so that its intent survives a relabelling.
-        for entry in labels(&menu_entries(&full_login(), &[folder("f1", "Work")], true)) {
-            assert!(!entry.to_lowercase().contains("archive"), "{entry:?} offers Archive");
-        }
+    fn a_trashed_or_archived_item_offers_only_what_actually_works() {
+        assert_eq!(
+            labels(&menu_entries(
+                &full_login(),
+                &[folder("f1", "Work")],
+                false,
+                FilterSource::Trash,
+            )),
+            vec!["Restore", "Delete forever"]
+        );
+        assert_eq!(
+            labels(&menu_entries(
+                &full_login(),
+                &[folder("f1", "Work")],
+                false,
+                FilterSource::Archive,
+            )),
+            vec!["Unarchive"]
+        );
+    }
+
+    /// The source, not the item, is what selects the menu.
+    ///
+    /// The SAME item is passed to all three calls above and here, so nothing
+    /// about these menus can be coming from the item's own contents -- which
+    /// matters because a trashed item's JSON is an ordinary item's plus one
+    /// key, and a menu keyed off that key would silently offer the live menu
+    /// for any archived item (they carry no marker at all).
+    #[test]
+    fn the_menu_follows_the_list_the_row_was_drawn_from_not_the_item() {
+        let item = full_login();
+        let live = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
+        let trashed = labels(&menu_entries(&item, &[], false, FilterSource::Trash));
+        assert!(live.contains(&"Delete".to_string()));
+        assert!(!trashed.contains(&"Delete".to_string()));
+        assert!(!live.contains(&"Restore".to_string()));
+        assert!(trashed.contains(&"Restore".to_string()));
+    }
+
+    /// The permanent delete is armed by the same two-click confirmation the
+    /// ordinary Delete uses, and its wording changes to say so.
+    ///
+    /// Both states are asserted: a label that read "Delete forever? Click to
+    /// confirm" unconditionally would pass a test that only looked at the
+    /// armed one, and it would mean the menu asking for confirmation of a
+    /// click the user has not made yet.
+    #[test]
+    fn delete_forever_states_when_it_is_armed() {
+        let unarmed = labels(&menu_entries(&full_login(), &[], false, FilterSource::Trash));
+        let armed = labels(&menu_entries(&full_login(), &[], true, FilterSource::Trash));
+        assert_eq!(unarmed, vec!["Restore", "Delete forever"]);
+        assert_eq!(armed, vec!["Restore", "Delete forever? Click to confirm"]);
     }
 
     #[test]
@@ -1222,23 +1383,23 @@ mod menu_entry_tests {
         // form is still login-shaped (`detail::kind_offers_edit`) -- but
         // those two are expressed differently on purpose: filling is ABSENT,
         // editing is PRESENT AND GREYED.
-        let entries = menu_entries(&of_kind(Some(3)), &[], false);
-        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Delete"]);
-        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Delete"]);
+        let entries = menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault);
+        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
     }
 
     #[test]
     fn a_secure_note_offers_the_same_three_as_a_card() {
-        let entries = menu_entries(&of_kind(Some(2)), &[], false);
-        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Delete"]);
-        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Delete"]);
+        let entries = menu_entries(&of_kind(Some(2)), &[], false, FilterSource::LiveVault);
+        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
     }
 
     #[test]
     fn the_greyed_edit_entry_says_why() {
         // Greying without a reason is the failure this is guarding: the user
         // sees the action they came for, unavailable, and no explanation.
-        let entries = menu_entries(&of_kind(Some(4)), &[], false);
+        let entries = menu_entries(&of_kind(Some(4)), &[], false, FilterSource::LiveVault);
         let edit = entries
             .iter()
             .find_map(|e| match e {
@@ -1257,7 +1418,7 @@ mod menu_entry_tests {
         // entry here without anyone having to remember this file exists.
         for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
             let item = of_kind(item_type);
-            let entries = menu_entries(&item, &[], false);
+            let entries = menu_entries(&item, &[], false, FilterSource::LiveVault);
             let edit = entries
                 .iter()
                 .find_map(|e| match e {
@@ -1280,9 +1441,9 @@ mod menu_entry_tests {
             login: Some(LoginData { totp: None, ..with_seed.login.clone().unwrap() }),
             ..full_login()
         };
-        assert!(labels(&menu_entries(&with_seed, &[], false)).contains(&"Copy TOTP".to_string()));
+        assert!(labels(&menu_entries(&with_seed, &[], false, FilterSource::LiveVault)).contains(&"Copy TOTP".to_string()));
         assert_eq!(
-            labels(&menu_entries(&without, &[], false)),
+            labels(&menu_entries(&without, &[], false, FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -1290,6 +1451,7 @@ mod menu_entry_tests {
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
+                "Archive",
                 "Delete",
             ],
             "removing the seed changed more than the TOTP entry"
@@ -1311,14 +1473,14 @@ mod menu_entry_tests {
             ..of_kind(Some(1))
         };
         assert_eq!(
-            labels(&menu_entries(&empty, &[], false)),
-            vec!["Fill in app", "Edit", MOVE_TO_FOLDER_LABEL, "Delete"]
+            labels(&menu_entries(&empty, &[], false, FilterSource::LiveVault)),
+            vec!["Fill in app", "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
     #[test]
     fn open_website_carries_the_url_the_detail_pane_would_open() {
-        let entries = menu_entries(&full_login(), &[], false);
+        let entries = menu_entries(&full_login(), &[], false, FilterSource::LiveVault);
         let opens: Vec<&RowCommand> = entries
             .iter()
             .filter_map(|e| match e {
@@ -1340,7 +1502,7 @@ mod menu_entry_tests {
         // out of every sidebar row -- a Critical fixed in the edit form, and
         // this menu must not reintroduce it.
         let folders = [folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
         else {
             panic!("the submenu reported no assignable folders when two exist");
         };
@@ -1363,7 +1525,7 @@ mod menu_entry_tests {
         // user may own a folder actually called "No Folder", and matching on
         // the name would lock them out of it.
         let folders = [folder("f9", "No Folder")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
         else {
             panic!("a real folder named \"No Folder\" was dropped");
         };
@@ -1375,7 +1537,7 @@ mod menu_entry_tests {
     fn a_vault_with_no_assignable_folder_says_so_instead_of_opening_an_empty_box() {
         let folders = [folder("", "No Folder")];
         assert_eq!(
-            move_menu_of(&menu_entries(&full_login(), &folders, false)),
+            move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault)),
             MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS)
         );
     }
@@ -1384,7 +1546,7 @@ mod menu_entry_tests {
     fn the_folder_the_item_already_lives_in_is_greyed_not_dropped() {
         let folders = [folder("f1", "Work"), folder("f2", "Personal")];
         let item = VaultItem { folder_id: Some("f1".into()), ..full_login() };
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, false)) else {
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, false, FilterSource::LiveVault)) else {
             panic!("the submenu reported no assignable folders when two exist");
         };
         assert_eq!(
@@ -1400,7 +1562,7 @@ mod menu_entry_tests {
         // write succeeds and does nothing. Every destination this menu
         // offers must therefore name a real folder.
         let folders = [folder("", "No Folder"), folder("f1", "Work")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
         else {
             panic!("the submenu reported no assignable folders when one exists");
         };
@@ -1418,11 +1580,11 @@ mod menu_entry_tests {
         // uses (`vault_window::mod`'s `confirm_click`), not a second idiom:
         // the first click arms, the label changes, the second confirms.
         assert_eq!(
-            labels(&menu_entries(&of_kind(Some(3)), &[], false)).last().unwrap(),
+            labels(&menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault)).last().unwrap(),
             DELETE_LABEL
         );
         assert_eq!(
-            labels(&menu_entries(&of_kind(Some(3)), &[], true)).last().unwrap(),
+            labels(&menu_entries(&of_kind(Some(3)), &[], true, FilterSource::LiveVault)).last().unwrap(),
             DELETE_CONFIRM_LABEL
         );
     }
@@ -1430,8 +1592,8 @@ mod menu_entry_tests {
     #[test]
     fn arming_the_delete_changes_nothing_else_about_the_menu() {
         let folders = [folder("f1", "Work")];
-        let armed = menu_entries(&full_login(), &folders, true);
-        let idle = menu_entries(&full_login(), &folders, false);
+        let armed = menu_entries(&full_login(), &folders, true, FilterSource::LiveVault);
+        let idle = menu_entries(&full_login(), &folders, false, FilterSource::LiveVault);
         assert_eq!(labels(&armed).len(), labels(&idle).len());
         assert_eq!(labels(&armed)[..labels(&idle).len() - 1], labels(&idle)[..labels(&idle).len() - 1]);
         assert_eq!(move_menu_of(&armed), move_menu_of(&idle));

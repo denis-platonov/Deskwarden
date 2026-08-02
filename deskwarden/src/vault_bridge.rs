@@ -1401,6 +1401,77 @@ impl VaultBridge {
         Ok(body.data.data)
     }
 
+    /// The items in the vault's archive, and only those.
+    ///
+    /// Same shape as [`Self::list_trash`], and the same trap in a nastier
+    /// form. VERIFIED against the live backend
+    /// (`.superpowers/sdd/item-shapes-capture.md`): `?archived=true` returns
+    /// only archived items, while **`?archive=true` -- the same word without
+    /// the "d" -- is silently ignored and answers 200 with the entire live
+    /// vault.** A typo here does not fail; it fills the Archive row with all
+    /// 1654 of the user's items. `list_archive_asks_for_only_the_archived_items`
+    /// therefore asserts the REQUEST's query string, not the parsed response,
+    /// because a test written against a mock that answers regardless of query
+    /// passes for both spellings.
+    ///
+    /// Deliberately NOT cached, for [`crate::vault_cache::VaultCache::list_trash`]'s
+    /// reasons exactly.
+    pub fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
+        let url = format!("{}/list/object/items", self.base_url);
+        let body: Envelope<ItemList> = self
+            .read_agent
+            .get(&url)
+            .query("archived", "true")
+            .call()
+            .map_err(map_http_err)?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data.data)
+    }
+
+    /// Puts an item into the archive: `POST /archive/item/{id}`.
+    ///
+    /// **A 200 here does not prove the state changed.** Measured: an item
+    /// archived immediately after being created answered 200, stayed in the
+    /// default list, and never appeared under `?archived=true`; the same
+    /// sequence with a ~1.5s settle worked. Nothing in this crate may
+    /// therefore read a list back to "confirm" an archive -- a read that
+    /// races the settle reports a failure that did not happen, which is worse
+    /// than not checking. The window instead moves the item between its own
+    /// lists and lets the next ordinary refresh reconcile; see
+    /// [`crate::vault_cache::VaultCache::archive_item`].
+    pub fn archive_item(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/archive/item/{}", self.base_url, id);
+        self.write_agent.post(&url).call().map_err(map_http_err)?;
+        Ok(())
+    }
+
+    /// Takes an item back OUT of the archive -- and the route is
+    /// `POST /restore/item/{id}`, the same one [`Self::restore_item`] uses.
+    ///
+    /// **There is no "unarchive" endpoint.** `POST /unarchive/item/{id}` is
+    /// 404 and `DELETE /archive/item/{id}` is 405, and an earlier pass
+    /// concluded from those two that archiving was a one-way door. It is not:
+    /// the CLI wires unarchiving into its *restore* command
+    /// (`restore.command.ts` calls `unarchiveWithServer`), so `bw serve`
+    /// exposes one `POST /restore/:object/:id` that both un-trashes and
+    /// un-archives, selected by the item's current state. VERIFIED against
+    /// the live backend with a control that asserted the item really was
+    /// archived first -- without that control the test passes while proving
+    /// nothing, which is how it went wrong the first time.
+    ///
+    /// A separate function from `restore_item` rather than a call site
+    /// reusing it, even though the request is byte-identical: the two are
+    /// different operations to the user and to the caller, and a shared name
+    /// would make "restore" mean two things at every call site instead of at
+    /// this one. `unarchiving_and_untrashing_hit_the_same_route` pins that
+    /// they stay identical.
+    pub fn unarchive_item(&self, id: &str) -> Result<(), VaultError> {
+        let url = format!("{}/restore/item/{}", self.base_url, id);
+        self.write_agent.post(&url).call().map_err(map_http_err)?;
+        Ok(())
+    }
+
     /// Takes a trashed item out of the trash: `POST /restore/item/{id}`.
     ///
     /// A different path shape from every other item call in this file
@@ -2402,14 +2473,20 @@ mod tests {
 
         // Positive control: without these, a rename that made every chunk
         // match neither branch would leave this test passing vacuously.
+        // 11 = the 9 this test was written against, plus `archive_item` and
+        // `unarchive_item`; 7 = the 6 plus `list_archive`. Raised deliberately
+        // when the Archive sidebar row merged, having checked each of the
+        // three against the rule above rather than to make the test go green:
+        // the two POSTs mutate and take the write agent, the archived-items
+        // query is a read and takes the read one.
         assert_eq!(
-            checked_writes, 9,
-            "expected 9 mutating routes on VaultBridge, found {checked_writes} -- if a route \
+            checked_writes, 11,
+            "expected 11 mutating routes on VaultBridge, found {checked_writes} -- if a route \
              was genuinely added or removed, update this number deliberately"
         );
         assert_eq!(
-            checked_reads, 6,
-            "expected 6 read routes on VaultBridge, found {checked_reads}"
+            checked_reads, 7,
+            "expected 7 read routes on VaultBridge, found {checked_reads}"
         );
     }
 
@@ -3392,6 +3469,106 @@ mod tests {
         let bridge = VaultBridge::new(server.url());
         assert_eq!(bridge.list_items().unwrap().len(), 1);
         m.assert();
+    }
+
+    #[test]
+    fn list_archive_asks_for_only_the_archived_items() {
+        // THE ASSERTION IS ON THE REQUEST, and the reason is worse here than
+        // it is for the trash: `?archive=true` -- the same word without the
+        // "d" -- was measured against the live backend and is SILENTLY
+        // IGNORED, answering 200 with the entire live vault. So the wrong
+        // spelling parses fine and fills the Archive row with every item the
+        // user has. `Matcher::Exact` rejects an absent query, that spelling,
+        // and an extra parameter, each as a mockito 501 that fails the
+        // `unwrap` below.
+        let mut server = mockito::Server::new();
+        let m = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"success":true,"data":{"data":[
+                    {"id":"a1","name":"Archived","object":"item","type":1,"fields":[],
+                     "login":{"username":"u","password":"p"}}
+                ]}}"#,
+            )
+            .expect(1)
+            .create();
+
+        let bridge = VaultBridge::new(server.url());
+        let archived = bridge.list_archive().unwrap();
+        m.assert();
+
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, "a1");
+    }
+
+    #[test]
+    fn archiving_an_item_posts_to_the_archive_endpoint() {
+        // Another path shape of its own (`/archive/item/{id}`, not
+        // `/object/item/{id}`), so mockito answering only that exact POST is
+        // the test.
+        let mut server = mockito::Server::new();
+        let m = server.mock("POST", "/archive/item/a1").with_status(200).expect(1).create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.archive_item("a1").unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn unarchiving_and_untrashing_hit_the_same_route() {
+        // THE CORRECTED FACT. `POST /unarchive/item/{id}` is a 404 and
+        // `DELETE /archive/item/{id}` a 405, and an earlier pass read those
+        // as "archiving is a one-way door". The CLI wires unarchiving into
+        // its *restore* command, so one `POST /restore/item/{id}` serves both
+        // meanings, selected by the item's state.
+        //
+        // The mock deliberately allows ONLY that path: a `unarchive_item`
+        // that guessed `/unarchive/item/a1` gets a 501 here and fails, which
+        // is the regression this exists to catch. The two calls are then
+        // asserted to be indistinguishable on the wire -- that is the claim
+        // the doc makes, and it would otherwise be only a comment.
+        let mut server = mockito::Server::new();
+        let m = server.mock("POST", "/restore/item/a1").with_status(200).expect(2).create();
+
+        let bridge = VaultBridge::new(server.url());
+        bridge.unarchive_item("a1").unwrap();
+        bridge.restore_item("a1").unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn a_401_on_any_archive_call_maps_to_unauthorized() {
+        // Same rule as the trash calls: the window's re-auth path keys off
+        // `Unauthorized`, so a locked vault must not reach the Archive row as
+        // a generic failure.
+        let mut server = mockito::Server::new();
+        let _list = server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(401)
+            .create();
+        let _archive = server.mock("POST", "/archive/item/a1").with_status(401).create();
+        let _unarchive = server.mock("POST", "/restore/item/a1").with_status(401).create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.list_archive(), Err(VaultError::Unauthorized)));
+        assert!(matches!(bridge.archive_item("a1"), Err(VaultError::Unauthorized)));
+        assert!(matches!(bridge.unarchive_item("a1"), Err(VaultError::Unauthorized)));
+    }
+
+    #[test]
+    fn a_rejected_archive_is_an_error_not_a_silent_success() {
+        // Re-POSTing `/archive` on an already-archived item is a 400 on the
+        // live backend. If that arrived as `Ok(())` the window would move the
+        // item out of its live list on a write that never happened.
+        let mut server = mockito::Server::new();
+        let _archive = server.mock("POST", "/archive/item/a1").with_status(400).create();
+
+        let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.archive_item("a1"), Err(VaultError::Http(_))));
     }
 
     #[test]

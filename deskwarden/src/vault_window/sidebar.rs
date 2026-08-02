@@ -13,12 +13,41 @@ use eframe::egui::{self, CornerRadius};
 pub enum SidebarFilter {
     All,
     Favorites,
+    /// The items this app can fill into a Windows application -- the ones
+    /// carrying an app match.
+    ///
+    /// **Membership is [`crate::vault_bridge::extract_app_match`] and nothing
+    /// else.** That function reads one custom field
+    /// (`APP_MATCH_FIELD_NAME`) out of `item.fields` and parses it, and it is
+    /// already the single definition the picker, the match engine and the
+    /// detail pane's AUTOFILL TARGETS card all use. A second notion of "has
+    /// an app" here -- "any field whose name looks like ours", "a non-empty
+    /// value", "the field exists" -- would be a row that disagreed with the
+    /// pane it sends the user to, which is the two-copies-that-happen-to-
+    /// agree hazard [`SidebarFilter::scope_contains`]'s own doc names. A
+    /// field this build cannot PARSE is deliberately not on this row: the
+    /// rest of the app cannot fill from it either, so listing it would
+    /// promise an autofill that will not happen.
+    Apps,
     Logins,
     Passkeys,
     Cards,
     Identities,
     SecureNotes,
     SshKeys,
+    /// Bitwarden's Archive: items the user has put aside. Design 2b lists it
+    /// directly above Trash, which is where it is drawn.
+    ///
+    /// Its own [`FilterSource`], not a predicate over the live vault, and
+    /// that is measured rather than chosen: archiving an item REMOVES it from
+    /// `GET /list/object/items`, so there is nothing in the list this window
+    /// reads to filter for. The row's contents come from
+    /// `?archived=true`, a disjoint query, fetched on demand.
+    ///
+    /// The same measurement is why no exclusion code exists anywhere else in
+    /// this app: archived items never reach the match engine, the item list
+    /// or autofill, because they are not in the only list any of them read.
+    Archive,
     Trash,
     /// A real, server-side folder, by id.
     Folder(String),
@@ -42,7 +71,164 @@ pub enum SidebarFilter {
     Unfiled,
 }
 
+/// Which of `bw serve`'s three item queries a sidebar row draws from.
+///
+/// Its own type, and the reason is the defect this file's history is made of.
+/// Trash was written as `scope_contains(..) => false` with a comment
+/// concluding it was "not implementable from the endpoint this window reads",
+/// and that shape can express only one idea: *this row is a predicate over
+/// the live vault*. It is not, and neither is Archive -- both read a
+/// SEPARATE query whose results are disjoint from the live list, so "no live
+/// item is in the trash" is true, and useless, and reads as an empty row.
+///
+/// Splitting "which list" from "which items within it" is what makes the two
+/// answerable at all. [`SidebarFilter::source`] answers the first,
+/// [`SidebarFilter::scope_contains`] the second, and [`items_for`] is the one
+/// place they are combined -- so no caller has to remember to ask the first
+/// question before the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterSource {
+    /// `GET /list/object/items` -- the snapshot this window already holds and
+    /// keeps up to date. Every type/favourite/folder row reads it.
+    LiveVault,
+    /// `GET /list/object/items?trash=true`. Returns ONLY trashed items, each
+    /// carrying `deletedDate`: 14 against a vault whose live list held 1654,
+    /// with zero overlap.
+    Trash,
+    /// `GET /list/object/items?archived=true`. Returns ONLY archived items.
+    ///
+    /// The spelling matters and is not guessable: `?archive=true`, without
+    /// the "d", is SILENTLY IGNORED and answers 200 with the whole live
+    /// vault -- so that typo does not surface as an error, it surfaces as an
+    /// Archive row showing the user's entire vault. `list_archive`'s test
+    /// therefore asserts the query string on the wire.
+    Archive,
+}
+
+/// A row whose items are not in the live vault at all.
+///
+/// Two variants and no "live" one, deliberately: this is what the detail
+/// pane's out-of-vault branch takes, so that branch **cannot be drawn for an
+/// ordinary item**. The alternative -- passing a [`FilterSource`] and
+/// trusting every call site to have checked it first -- is the same
+/// "remember to ask the first question" the split above exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutOfVault {
+    Trash,
+    Archive,
+}
+
+impl OutOfVault {
+    /// The row's own name, for messages about it. A method rather than
+    /// `{:?}` at each call site: `Debug` is for developers and happens to
+    /// read well here, which is exactly the coincidence that stops holding
+    /// the first time a variant is renamed.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutOfVault::Trash => "Trash",
+            OutOfVault::Archive => "Archive",
+        }
+    }
+}
+
+impl FilterSource {
+    /// `Some` when this source is one of the two queries outside the live
+    /// vault, `None` for the live vault itself.
+    pub fn out_of_vault(self) -> Option<OutOfVault> {
+        match self {
+            FilterSource::LiveVault => None,
+            FilterSource::Trash => Some(OutOfVault::Trash),
+            FilterSource::Archive => Some(OutOfVault::Archive),
+        }
+    }
+}
+
+/// Every item list the vault window holds at once, so one function can pick
+/// the one a given row reads.
+///
+/// `trash` and `archive` are `Option` because "not fetched yet" is a real,
+/// visible state and not a synonym for "empty": both are fetched on demand,
+/// off the UI thread, the first time their row is selected. A badge that
+/// printed `0` for an unfetched list would state a fact this app does not
+/// have -- and it is the exact untruth the Trash row shipped for months.
+/// See [`badge_text`].
+#[derive(Clone, Copy)]
+pub struct VaultLists<'a> {
+    pub live: &'a [VaultItem],
+    pub trash: Option<&'a [VaultItem]>,
+    pub archive: Option<&'a [VaultItem]>,
+}
+
+impl<'a> VaultLists<'a> {
+    /// A window that holds only the live vault -- neither on-demand query has
+    /// answered yet. What every caller starts from.
+    pub fn live_only(live: &'a [VaultItem]) -> Self {
+        VaultLists { live, trash: None, archive: None }
+    }
+}
+
+/// The items on `filter`'s row, or `None` when the query that row reads has
+/// not answered yet.
+///
+/// **The single place "which list" and "which items in it" are combined.**
+/// The live rows filter the snapshot through
+/// [`SidebarFilter::scope_contains`]; the two query-backed rows return their
+/// list whole, because the query already scoped it. Both the sidebar's badge
+/// and the item pane's contents go through here, so a row cannot count one
+/// thing and list another.
+pub fn items_for<'a>(filter: &SidebarFilter, lists: VaultLists<'a>) -> Option<Vec<&'a VaultItem>> {
+    let source = filter.source();
+    let list = match source {
+        FilterSource::LiveVault => Some(lists.live),
+        FilterSource::Trash => lists.trash,
+        FilterSource::Archive => lists.archive,
+    }?;
+    Some(list.iter().filter(|item| filter.scope_contains(item)).collect())
+}
+
+/// How many items are on `filter`'s row, or `None` when its list has not been
+/// fetched yet. Straight off [`items_for`], so the badge and the pane cannot
+/// disagree.
+pub fn badge_for(filter: &SidebarFilter, lists: VaultLists<'_>) -> Option<usize> {
+    items_for(filter, lists).map(|items| items.len())
+}
+
+/// What an unfetched count is drawn as: an en dash, never `0`.
+///
+/// `0` is a claim -- "this row is empty" -- and until the query has answered
+/// this app does not know whether it is. The Trash row printed exactly that
+/// claim for months while fourteen items sat behind it.
+pub const UNKNOWN_COUNT: &str = "\u{2013}";
+
+/// The badge string for a possibly-unfetched count. Pure, so the
+/// distinction above is testable without a frame.
+pub fn badge_text(count: Option<usize>) -> String {
+    match count {
+        Some(count) => count.to_string(),
+        None => UNKNOWN_COUNT.to_string(),
+    }
+}
+
 impl SidebarFilter {
+    /// Which query this row's items come from. See [`FilterSource`].
+    pub fn source(&self) -> FilterSource {
+        match self {
+            SidebarFilter::Trash => FilterSource::Trash,
+            SidebarFilter::Archive => FilterSource::Archive,
+            SidebarFilter::All
+            | SidebarFilter::Favorites
+            | SidebarFilter::Apps
+            | SidebarFilter::Logins
+            | SidebarFilter::Passkeys
+            | SidebarFilter::Cards
+            | SidebarFilter::Identities
+            | SidebarFilter::SecureNotes
+            | SidebarFilter::SshKeys
+            | SidebarFilter::Folder(_)
+            | SidebarFilter::Unfiled => FilterSource::LiveVault,
+        }
+    }
+
     /// Whether `item` falls under this filter. The single place that
     /// encodes "what does each filter variant mean" -- both `count_for`
     /// (this file) and `item_list::matches_filter` delegate to it, rather
@@ -60,16 +246,28 @@ impl SidebarFilter {
     /// left it out of every type filter while the rest of the app was
     /// already treating it as a login.
     ///
-    /// `Trash` always returns `false`: this codebase has no confirmed
-    /// knowledge of `bw serve`'s trash/deletedDate JSON shape, so rather
-    /// than guess at it (and risk silently misclassifying real data), Trash
-    /// is left as an explicit "not implemented" no-op. There is no prior
-    /// task that wired this up to real trash state -- if you're looking for
-    /// one, it doesn't exist yet.
+    /// **PRECONDITION: `item` came from [`Self::source`]'s query.** For every
+    /// row but two that is the live snapshot and there is nothing to get
+    /// wrong. For `Trash` and `Archive` it is a different list entirely, and
+    /// this function cannot tell -- so reach it through [`items_for`], which
+    /// picks the list first.
+    ///
+    /// What used to be here instead: a `Trash => false` arm under a comment
+    /// asserting Trash was "not implementable from the endpoint this window
+    /// reads ... no `deletedDate` field to filter on (verified against a real
+    /// 1657-item vault)". Both halves of that evidence were true and the
+    /// conclusion did not follow, because the query parameter was never
+    /// tried: `GET /list/object/items?trash=true` answers with 14 items, all
+    /// carrying `deletedDate`, against the same vault whose default list has
+    /// 1654 and none. The row was not unimplementable; it was reading the
+    /// wrong list. See [`FilterSource`].
     pub(crate) fn scope_contains(&self, item: &VaultItem) -> bool {
         match self {
             SidebarFilter::All => true,
             SidebarFilter::Favorites => item.favorite,
+            // The EXISTING definition of "this item has an app", not a
+            // second one -- see the variant's doc.
+            SidebarFilter::Apps => crate::vault_bridge::extract_app_match(item).is_some(),
             SidebarFilter::Logins => ItemKind::of(item) == ItemKind::Login,
             // Passkeys are not their own item type -- Bitwarden stores them
             // as `fido2Credentials` on ordinary login items, so this is a
@@ -93,14 +291,19 @@ impl SidebarFilter {
             SidebarFilter::Identities => ItemKind::of(item) == ItemKind::Identity,
             SidebarFilter::SecureNotes => ItemKind::of(item) == ItemKind::SecureNote,
             SidebarFilter::SshKeys => ItemKind::of(item) == ItemKind::SshKey,
-            // Not implementable from the endpoint this window reads:
-            // `/list/object/items` returns no trashed items and carries no
-            // `deletedDate` field to filter on (verified against a real
-            // 1657-item vault). Kept as a visible-but-empty row because both
-            // the design and the official client list it; it is not a bug
-            // that its count is always 0, and no filtering here can change
-            // that without a different endpoint.
-            SidebarFilter::Trash => false,
+            // THE QUERY IS THE FILTER for these two, so there is nothing
+            // left for this function to test -- see [`FilterSource`].
+            // `?trash=true` and `?archived=true` each return a set that is
+            // DISJOINT from the default list and contains exactly this row's
+            // items (measured, `.superpowers/sdd/item-shapes-capture.md`), so
+            // every item that reaches here from one of them is on the row.
+            //
+            // This is where the precondition in this function's doc bites: an
+            // item from the LIVE list handed to these two arms gets `true`
+            // and is wrong. That is why nothing calls this directly for them
+            // -- [`items_for`] picks the list FIRST, from
+            // [`SidebarFilter::source`], and only then filters.
+            SidebarFilter::Trash | SidebarFilter::Archive => true,
             SidebarFilter::Folder(id) => item.folder_id.as_deref() == Some(id.as_str()),
             // `None`, and *only* `None`. `Some("")` is deliberately not
             // treated as unfiled: nothing produces it. `bw serve` sends
@@ -151,8 +354,28 @@ pub fn is_virtual_folder(folder: &Folder) -> bool {
 
 /// How many of `items` fall under `filter`. Pure and separate from drawing
 /// so the sidebar's counts are testable without an egui context.
+/// **`items` must be `filter`'s own source list** -- see
+/// [`SidebarFilter::scope_contains`]'s precondition. The sidebar's badges go
+/// through [`badge_for`] instead, which picks the list itself; this remains
+/// for the item pane, which is already handed the right list.
 pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
     items.iter().filter(|item| filter.scope_contains(item)).count()
+}
+
+/// Whether design 2b paints this row's label in [`theme::TEXT_MUTED`]
+/// (`#605d5d`) rather than the ordinary [`theme::INK`].
+///
+/// One rule covering every row the design mutes, rather than a colour spelled
+/// out beside each new row: 2b greys exactly Archive, Trash and "No folder",
+/// which is the same idea in all three cases -- a row that is not part of the
+/// working vault. Adding Archive while leaving "No folder" as it was would
+/// have left the panel with two rows the design mutes and one it does not,
+/// for no reason a reader could recover.
+fn is_muted(filter: &SidebarFilter) -> bool {
+    matches!(
+        filter,
+        SidebarFilter::Archive | SidebarFilter::Trash | SidebarFilter::Unfiled
+    )
 }
 
 /// Reserved width for a folder row's edit-pencil icon, subtracted from
@@ -209,7 +432,7 @@ fn glyph_column_center_x(sidebar_right: f32) -> f32 {
 
 pub fn draw_sidebar(
     ui: &mut egui::Ui,
-    items: &[VaultItem],
+    lists: VaultLists<'_>,
     folders: &[Folder],
     selected: &mut SidebarFilter,
     lock_countdown: &str,
@@ -234,17 +457,28 @@ pub fn draw_sidebar(
         for (label, filter) in [
             ("All items", SidebarFilter::All),
             ("Favorites", SidebarFilter::Favorites),
+            // Directly after Favorites, by the user's explicit instruction
+            // ("it is our main feature"). Design 2b has no such row -- it
+            // predates app matching -- so the placement is theirs and the
+            // styling is the neighbouring rows'.
+            ("Apps", SidebarFilter::Apps),
             ("Logins", SidebarFilter::Logins),
             ("Passkeys", SidebarFilter::Passkeys),
             ("Cards", SidebarFilter::Cards),
             ("Identities", SidebarFilter::Identities),
             ("Secure notes", SidebarFilter::SecureNotes),
             ("SSH keys", SidebarFilter::SshKeys),
+            // Design 2b's order for the last two: Archive above Trash.
+            ("Archive", SidebarFilter::Archive),
             ("Trash", SidebarFilter::Trash),
         ] {
-            let count = count_for(items, &filter);
+            // NOT `count_for(items, ..)`: Archive and Trash read a different
+            // list, and counting them against the live snapshot is precisely
+            // the always-zero badge this row shipped with. `badge_for` picks
+            // the list, and returns `None` while it has not been fetched.
+            let count = badge_for(&filter, lists);
             let width = ui.available_width();
-            if sidebar_row(ui, label, count, *selected == filter, width).clicked() {
+            if sidebar_row(ui, label, count, *selected == filter, is_muted(&filter), width).clicked() {
                 *selected = filter;
             }
         }
@@ -312,11 +546,21 @@ pub fn draw_sidebar(
             } else {
                 SidebarFilter::Folder(folder.id.clone())
             };
-            let count = count_for(items, &filter);
+            // Every FOLDERS row reads the live vault, so this count is always
+            // knowable -- `badge_for` is used anyway, so there is one path
+            // from a filter to its badge rather than two.
+            let count = badge_for(&filter, lists);
             // Reserve the edit icon's width *before* the row claims the
             // rest of the available width -- see `FOLDER_EDIT_BUTTON_WIDTH`.
             let row_width = (ui.available_width() - FOLDER_EDIT_BUTTON_WIDTH).max(0.0);
-            let response = sidebar_row(ui, &folder.name, count, *selected == filter, row_width);
+            let response = sidebar_row(
+                ui,
+                &folder.name,
+                count,
+                *selected == filter,
+                is_muted(&filter),
+                row_width,
+            );
             if response.clicked() {
                 *selected = filter.clone();
             }
@@ -574,7 +818,14 @@ fn inset_hairline(ui: &mut egui::Ui, inset: f32) {
 /// own top, and the next row started roughly half a row too high. Painting
 /// touches no cursor at all, so the single `allocate_exact_size` below is
 /// the only thing that moves it -- by exactly `ROW_HEIGHT` + `ROW_GAP`.
-fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool, width: f32) -> egui::Response {
+fn sidebar_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: Option<usize>,
+    selected: bool,
+    muted: bool,
+    width: f32,
+) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -587,7 +838,7 @@ fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool, wid
 
     // Count first: it's right-aligned, and its measured width is what bounds
     // how far the label may run before it would collide with it.
-    let count_text = count.to_string();
+    let count_text = badge_text(count);
     let count_galley = ui.painter().layout_no_wrap(
         count_text,
         egui::FontId::new(11.0, egui::FontFamily::Proportional),
@@ -609,7 +860,14 @@ fn sidebar_row(ui: &mut egui::Ui, label: &str, count: usize, selected: bool, wid
             theme::BLUE_DEEP,
         )
     } else {
-        (egui::FontId::new(13.0, egui::FontFamily::Proportional), theme::INK)
+        (
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            // Design 2b's `color: #605d5d` on the rows that are not part of
+            // the working vault -- see `is_muted`. A SELECTED muted row is
+            // still `BLUE_DEEP`: the selection wash is the same on every row,
+            // and greying the label inside it would read as disabled.
+            if muted { theme::TEXT_MUTED } else { theme::INK },
+        )
     };
     // Clipped to the space left of the count, so a long folder name is cut
     // off rather than running underneath its own count.
@@ -839,7 +1097,13 @@ mod drag_and_drop_tests {
                         egui::vec2(SIDEBAR_WIDTH, HEIGHT),
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
-                            action = draw_sidebar(ui, items, folders, &mut filter, "Locks in 11:42");
+                            action = draw_sidebar(
+                                ui,
+                                VaultLists::live_only(items),
+                                folders,
+                                &mut filter,
+                                "Locks in 11:42",
+                            );
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -1166,7 +1430,7 @@ mod tests {
                 // `selected: false` keeps this on the default proportional
                 // font -- `theme::apply`'s Archivo families are not
                 // installed in this bare test context.
-                let response = sidebar_row(ui, "Row", i, false, 180.0);
+                let response = sidebar_row(ui, "Row", Some(i), false, false, 180.0);
                 rects.push(response.rect);
             }
         });
@@ -1219,6 +1483,77 @@ mod tests {
 
         let items = vec![with_passkey, empty_array, key_absent, not_a_login];
         assert_eq!(count_for(&items, &SidebarFilter::Passkeys), 1);
+    }
+
+    /// The Apps row, against the storage the rest of the app already uses.
+    ///
+    /// The three items are built by `vault_bridge::with_app_match` -- the
+    /// function the picker writes an app match with -- rather than by hand-
+    /// assembling a `VaultField`, so this test fails if the row's predicate
+    /// and the writer ever stop agreeing about the field's name or value
+    /// format. A hand-built fixture would keep passing against exactly that
+    /// break.
+    #[test]
+    fn apps_counts_the_items_carrying_an_app_match() {
+        use crate::app_match::{AppMatch, TriggerMode};
+        use crate::vault_bridge::with_app_match;
+
+        let matched = with_app_match(
+            &item(Some(1), false, None),
+            &AppMatch { process: "Ledgerline.exe".into(), trigger: TriggerMode::Prompt },
+        );
+        let also_matched = with_app_match(
+            &item(Some(3), false, None),
+            &AppMatch { process: "Vantage.exe".into(), trigger: TriggerMode::Auto },
+        );
+        let plain = item(Some(1), false, None);
+
+        let items = vec![matched.clone(), also_matched, plain.clone()];
+        // Absolute: 2 of the 3 fixture items were given an app match.
+        assert_eq!(count_for(&items, &SidebarFilter::Apps), 2);
+        // ...and per item, so a count that happened to come out right for the
+        // wrong reason cannot pass.
+        assert!(SidebarFilter::Apps.scope_contains(&matched));
+        assert!(!SidebarFilter::Apps.scope_contains(&plain));
+        // The row cuts across kinds -- a card with an app match is on it --
+        // so it must not have quietly become "logins that have a field".
+        assert_eq!(count_for(&items, &SidebarFilter::Logins), 2);
+        assert_eq!(count_for(&items, &SidebarFilter::All), 3);
+    }
+
+    /// A field with the right NAME but a value this build cannot parse is not
+    /// on the Apps row.
+    ///
+    /// This is what pins the row to `extract_app_match` rather than to "does
+    /// a field called `deskwarden:app-match` exist": the two differ only
+    /// here, and the difference is the point. Nothing else in this app can
+    /// fill from an unparseable match, so a row that listed it would send the
+    /// user to a pane that offers an autofill which cannot happen.
+    #[test]
+    fn a_field_with_our_name_but_an_unreadable_value_is_not_an_app() {
+        use crate::app_match::APP_MATCH_FIELD_NAME;
+        use crate::vault_bridge::VaultField;
+
+        let mut broken = item(Some(1), false, None);
+        broken.fields = vec![VaultField {
+            name: Some(APP_MATCH_FIELD_NAME.to_string()),
+            value: Some("not json".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        assert!(!SidebarFilter::Apps.scope_contains(&broken));
+        assert_eq!(crate::vault_bridge::extract_app_match(&broken), None);
+
+        // POSITIVE CONTROL: the same fixture with a value the app CAN read is
+        // on the row, so this is not a test that passes against a row which
+        // matches nothing at all.
+        let readable = crate::vault_bridge::with_app_match(
+            &broken,
+            &crate::app_match::AppMatch {
+                process: "Ledgerline.exe".into(),
+                trigger: crate::app_match::TriggerMode::Prompt,
+            },
+        );
+        assert!(SidebarFilter::Apps.scope_contains(&readable));
     }
 
     #[test]
@@ -1365,6 +1700,17 @@ mod tests {
         items: Vec<VaultItem>,
         folders: Vec<Folder>,
     ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
+        painted_sidebar_lists(lock_countdown, VaultLists::live_only(&items), &folders)
+    }
+
+    /// [`painted_sidebar_fixture`] over a caller-supplied set of ALL THREE
+    /// lists, so a test about the Archive or Trash badge can hand in a vault
+    /// where those queries have (or have not) answered.
+    fn painted_sidebar_lists(
+        lock_countdown: &str,
+        lists: VaultLists<'_>,
+        folders: &[Folder],
+    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, egui::Rect) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1382,7 +1728,7 @@ mod tests {
         let mut bounds = egui::Rect::NOTHING;
         let output = ctx.run_ui(input(), |ui| {
             bounds = ui.max_rect();
-            draw_sidebar(ui, &items, &folders, &mut selected, lock_countdown);
+            draw_sidebar(ui, lists, folders, &mut selected, lock_countdown);
         });
 
         let mut rects = Vec::new();
@@ -1488,6 +1834,68 @@ mod tests {
             plus.center().x,
             pencil.center().x,
             (pencil.center().x - plus.center().x).abs()
+        );
+    }
+
+    /// Every VAULT-section row label, in the order they are painted down the
+    /// panel -- read off a real frame, so this is the order the user sees and
+    /// not a restatement of the array `draw_sidebar` loops over.
+    fn vault_row_labels_in_painted_order(painted: &[(String, egui::Rect)]) -> Vec<String> {
+        let folders_header_y = painted
+            .iter()
+            .find(|(text, _)| text == "FOLDERS")
+            .map(|(_, rect)| rect.top())
+            .expect("the sidebar painted no FOLDERS header");
+        let mut rows: Vec<(f32, String)> = painted
+            .iter()
+            // Above the FOLDERS header (so folder rows are excluded), below
+            // the VAULT one, and not a count badge: the badges are the only
+            // other strings in that band, and they are digits.
+            .filter(|(text, rect)| {
+                rect.top() < folders_header_y
+                    && text != "VAULT"
+                    // The FOLDERS header's "+" is painted centred on that
+                    // header's band, and its 18px glyph box starts a hair
+                    // above the band's own top -- so it slips under the
+                    // `top()` cut. Excluded by name rather than by widening
+                    // the cut, which would start swallowing the SSH keys row.
+                    && text != "+"
+                    // A badge: a number, or the en dash an unfetched count
+                    // is drawn as (Archive and Trash, in this fixture).
+                    && text != UNKNOWN_COUNT
+                    && !text.chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|(text, rect)| (rect.top(), text.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// The user's explicit instruction: Apps sits **directly after
+    /// Favorites**, and it is "our main feature".
+    ///
+    /// Asserted against the whole painted VAULT column rather than "Apps is
+    /// somewhere below Favorites": a relative check passes just as happily
+    /// for a row that landed at the bottom of the section, and the whole
+    /// point of the instruction was the position.
+    #[test]
+    fn the_apps_row_is_painted_directly_after_favorites() {
+        let (painted, _, _) = painted_sidebar_and_bounds("Locks in 11:42");
+        assert_eq!(
+            vault_row_labels_in_painted_order(&painted),
+            vec![
+                "All items",
+                "Favorites",
+                "Apps",
+                "Logins",
+                "Passkeys",
+                "Cards",
+                "Identities",
+                "Secure notes",
+                "SSH keys",
+                "Archive",
+                "Trash",
+            ]
         );
     }
 
@@ -1678,6 +2086,222 @@ mod tests {
         assert_eq!(count_for(&items, &SidebarFilter::Folder("f1".to_string())), 2);
         assert_eq!(count_for(&items, &SidebarFilter::Folder(String::new())), 0);
         assert_eq!(count_for(&items, &SidebarFilter::All), 5);
+    }
+
+    // --- Trash and Archive: which list a row reads ---------------------------
+
+    fn trashed(id: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"{id}","name":"Gone","fields":[],"type":1,
+                "deletedDate":"2026-07-30T09:15:00.000Z"}}"#
+        ))
+        .unwrap()
+    }
+
+    /// The defect, at the level it was reported: the Trash row's badge read 0
+    /// and it listed nothing.
+    ///
+    /// The expected numbers are the fixtures' own sizes -- 2 trashed, 1
+    /// archived, 5 live -- not restatements of what the code computes. The
+    /// live count is asserted in the same breath so a change that pointed
+    /// every row at the same list could not pass.
+    #[test]
+    fn trash_and_archive_count_their_own_lists_and_not_the_live_vault() {
+        let live = three_unfiled_and_two_filed();
+        let trash = vec![trashed("t1"), trashed("t2")];
+        let archive = vec![item(Some(1), false, None)];
+        let lists = VaultLists {
+            live: &live,
+            trash: Some(&trash),
+            archive: Some(&archive),
+        };
+
+        assert_eq!(badge_for(&SidebarFilter::Trash, lists), Some(2));
+        assert_eq!(badge_for(&SidebarFilter::Archive, lists), Some(1));
+        assert_eq!(badge_for(&SidebarFilter::All, lists), Some(5));
+    }
+
+    /// ...and the row LISTS them, which is a separate claim from counting
+    /// them: the badge and the pane used to come from different places.
+    #[test]
+    fn the_trash_row_lists_the_trashed_items_themselves() {
+        let live = three_unfiled_and_two_filed();
+        let trash = vec![trashed("t1"), trashed("t2")];
+        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None };
+
+        let listed: Vec<&str> = items_for(&SidebarFilter::Trash, lists)
+            .expect("the trash list was fetched")
+            .iter()
+            .map(|i| i.id.as_str())
+            .collect();
+        assert_eq!(listed, vec!["t1", "t2"]);
+    }
+
+    /// An unfetched list is `None` -- NOT an empty list -- everywhere it is
+    /// asked about, and it draws as an en dash rather than a `0`.
+    ///
+    /// `0` is a claim this app cannot make before the query has answered, and
+    /// it is exactly the claim the old Trash row made forever. The positive
+    /// half is asserted alongside it: a list that HAS answered and is empty
+    /// really does read `0`, so this is not a test that would pass against a
+    /// badge which never showed a number at all.
+    #[test]
+    fn an_unfetched_list_reads_as_unknown_and_an_empty_one_reads_as_zero() {
+        let live = three_unfiled_and_two_filed();
+
+        let unfetched = VaultLists::live_only(&live);
+        assert_eq!(badge_for(&SidebarFilter::Trash, unfetched), None);
+        assert!(items_for(&SidebarFilter::Trash, unfetched).is_none());
+        assert_eq!(badge_text(None), UNKNOWN_COUNT);
+
+        let empty: Vec<VaultItem> = Vec::new();
+        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None };
+        assert_eq!(badge_for(&SidebarFilter::Trash, fetched), Some(0));
+        assert_eq!(badge_text(Some(0)), "0");
+    }
+
+    /// The painted proof of the same thing: with neither query answered, both
+    /// rows show the en dash, and every live row still shows a number.
+    #[test]
+    fn the_archive_and_trash_badges_are_drawn_unknown_until_their_query_answers() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let (painted, _, _) =
+            painted_sidebar_lists("Locks in 11:42", VaultLists::live_only(&live), &folders);
+
+        assert_eq!(badge_beside(&painted, "Archive"), UNKNOWN_COUNT);
+        assert_eq!(badge_beside(&painted, "Trash"), UNKNOWN_COUNT);
+        // The control: a row whose list IS in hand still prints a number, so
+        // this cannot pass against a sidebar that stopped drawing counts.
+        assert_eq!(badge_beside(&painted, "All items"), "5");
+    }
+
+    /// ...and once the queries answer, both rows show their real counts.
+    #[test]
+    fn the_archive_and_trash_badges_show_their_counts_once_fetched() {
+        let live = three_unfiled_and_two_filed();
+        let trash = vec![trashed("t1"), trashed("t2")];
+        let archive = vec![item(Some(1), false, None)];
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let (painted, _, _) = painted_sidebar_lists(
+            "Locks in 11:42",
+            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive) },
+            &folders,
+        );
+
+        assert_eq!(badge_beside(&painted, "Trash"), "2");
+        assert_eq!(badge_beside(&painted, "Archive"), "1");
+        assert_eq!(badge_beside(&painted, "All items"), "5");
+    }
+
+    /// Which query each row reads, stated for every variant.
+    ///
+    /// Exhaustive rather than "Trash is Trash": a row that quietly fell back
+    /// to `LiveVault` would show an empty list and a `0` badge with nothing
+    /// to indicate anything was wrong -- which is the defect this whole
+    /// type exists to make unrepresentable.
+    #[test]
+    fn every_row_states_which_query_it_reads() {
+        for filter in [
+            SidebarFilter::All,
+            SidebarFilter::Favorites,
+            SidebarFilter::Apps,
+            SidebarFilter::Logins,
+            SidebarFilter::Passkeys,
+            SidebarFilter::Cards,
+            SidebarFilter::Identities,
+            SidebarFilter::SecureNotes,
+            SidebarFilter::SshKeys,
+            SidebarFilter::Folder("f1".into()),
+            SidebarFilter::Unfiled,
+        ] {
+            assert_eq!(
+                filter.source(),
+                FilterSource::LiveVault,
+                "{filter:?} stopped reading the live vault"
+            );
+            assert_eq!(filter.source().out_of_vault(), None);
+        }
+        assert_eq!(SidebarFilter::Trash.source(), FilterSource::Trash);
+        assert_eq!(SidebarFilter::Archive.source(), FilterSource::Archive);
+        assert_eq!(
+            SidebarFilter::Trash.source().out_of_vault(),
+            Some(OutOfVault::Trash)
+        );
+        assert_eq!(
+            SidebarFilter::Archive.source().out_of_vault(),
+            Some(OutOfVault::Archive)
+        );
+    }
+
+    /// Design 2b paints Archive, Trash and "No folder" in `#605d5d` and every
+    /// other row in the ordinary ink.
+    ///
+    /// Read off the painted galleys, and BOTH directions are asserted: a
+    /// `sidebar_row` that muted everything would satisfy the first half
+    /// alone.
+    #[test]
+    fn the_rows_design_2b_greys_are_painted_muted_and_the_rest_are_not() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(212.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let mut selected = SidebarFilter::All;
+        let output = ctx.run_ui(input(), |ui| {
+            draw_sidebar(
+                ui,
+                VaultLists::live_only(&live),
+                &folders,
+                &mut selected,
+                "Locks in 11:42",
+            );
+        });
+
+        /// Every painted string with the colour it was painted in.
+        fn colours(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((text.galley.text().to_string(), text.fallback_color))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        colours(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut painted = Vec::new();
+        for clipped in &output.shapes {
+            colours(&clipped.shape, &mut painted);
+        }
+        let colour_of = |label: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("the sidebar painted no {label:?}"))
+                .1
+        };
+
+        for muted in ["Archive", "Trash", "No Folder"] {
+            assert_eq!(colour_of(muted), theme::TEXT_MUTED, "{muted:?} is not muted");
+        }
+        for ink in ["Favorites", "Apps", "Logins", "Engineering"] {
+            assert_eq!(colour_of(ink), theme::INK, "{ink:?} was muted and should not be");
+        }
+        // The selected row ("All items", here) is neither: selection wins
+        // over both, which is what stops a selected Archive or Trash row
+        // reading as disabled.
+        assert_eq!(colour_of("All items"), theme::BLUE_DEEP);
     }
 
     /// Pins `ROW_INSET_X` and `SECTION_LABEL_INSET` to the actual numbers in
