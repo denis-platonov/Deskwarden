@@ -980,34 +980,13 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
 /// silently follows the other when the design moves.
 const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 
-/// The detail pane's outlined header button (design 2b's "Edit": `height:
-/// 34px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px;
-/// font-size: 13px; font-weight: 600`, with no fill of its own).
-///
-/// A near-miss for [`secondary_button`], and kept separate for the reason
-/// [`primary_button_matching_field`] is: that one is 32px tall with a 7px
-/// radius, which is right everywhere it is already used and wrong beside a
-/// 34px primary.
-pub fn header_button(ui: &mut Ui, label: &str) -> Response {
-    header_button_tinted(ui, label, INK, BORDER_STRONG)
-}
-
-/// [`header_button`] in a colour of its own -- the detail pane's Delete turns
-/// [`ERROR`] once a first click has armed it.
-pub fn header_button_tinted(ui: &mut Ui, label: &str, fg: Color32, border: Color32) -> Response {
-    ui.scope(|ui| {
-        // `padding: 0 14px`; the vertical half is whatever `min_size` needs.
-        ui.spacing_mut().button_padding = Vec2::new(14.0, 6.0);
-        ui.add(
-            egui::Button::new(semibold(label, 13.0).color(fg))
-                .fill(CARD)
-                .stroke(Stroke::new(1.0, border))
-                .corner_radius(CornerRadius::same(8))
-                .min_size(Vec2::new(0.0, HEADER_BUTTON_HEIGHT)),
-        )
-    })
-    .inner
-}
+// The outlined 34px header button that used to stand beside the primary
+// (design 2b's "Edit") is gone with the words it carried: Edit and Delete
+// moved into `star_toggle`/`kebab_button`'s menu at the user's direction,
+// and nothing else in the app is 34px-outlined. It is deleted rather than
+// left `pub` and unused -- a lib crate raises no dead-code warning for it,
+// so it would have sat here indefinitely with a doc comment describing a
+// control that no longer exists.
 
 /// The detail pane's filled header button (design 2b's "Fill in app":
 /// `height: 34px; padding: 0 14px; border-radius: 8px; background: #1b3fa0;
@@ -1183,6 +1162,345 @@ fn close_glyph(ui: &mut Ui) -> Response {
     painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
     painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
     response.on_hover_text("Dismiss")
+}
+
+// ---------------------------------------------------------------------------
+// The detail pane's drawn icons: the favourite star, the kebab that carries
+// Edit and Delete, and the reveal eye on every masked row.
+//
+// STROKES, NOT GLYPHS -- measured rather than assumed, and the measurement
+// is not the answer that was assumed.
+// `the_icon_codepoints_are_not_carried_by_this_apps_own_typeface` asks the
+// resolved font stack for each of them: ⋮ (U+22EE) resolves to nothing,
+// exactly like the U+2715 `close_glyph` records, so the kebab could only
+// ever have been drawn. ★ ☆ 👁 DO resolve -- out of egui's bundled
+// emoji/icon fallback behind Archivo, not out of this app's own face, which
+// that test pins by the one advance width all three share. They are drawn
+// anyway: a mark from a fallback nobody here chose brings its own weight,
+// optical size and baseline next to controls measured from the design, and
+// ★/☆ are two unrelated marks where the on/off pair has to be one
+// silhouette in two weights.
+//
+// A shape paints no galley, which is the other half of the cost: the
+// headless tests that used to find these controls by their label ("Reveal",
+// "Favourite", "Edit") now find them by their geometry. That lookup is
+// [`icon_probe`], and it lives HERE, next to the code that draws them, so a
+// retuned shape cannot leave a stale copy of its vertex count in another
+// module's test.
+// ---------------------------------------------------------------------------
+
+/// Vertices in the star's outline: five points and five valleys.
+pub const STAR_VERTICES: usize = 10;
+
+/// Samples along the eye's upper lid.
+const EYE_LID_SEGMENTS: usize = 12;
+
+/// Vertices in the eye's almond outline: the upper lid sampled
+/// `EYE_LID_SEGMENTS + 1` times, and the lower lid the `EYE_LID_SEGMENTS - 1`
+/// times strictly between the two corners it shares with it.
+pub const EYE_VERTICES: usize = EYE_LID_SEGMENTS * 2;
+
+/// The kebab's dot radius. Also what tells its three circles apart from the
+/// eye's pupil, which is deliberately a different size.
+pub const KEBAB_DOT_RADIUS: f32 = 1.7;
+
+/// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
+const EYE_PUPIL_RADIUS: f32 = 2.4;
+
+/// The five-pointed star's outline, starting at the top point.
+///
+/// Built around the origin and then translated so its own BOUNDING BOX --
+/// not the circle its points lie on -- is centred on `center`, exactly as
+/// [`pencil_glyph_at`] does and for the same reason: a pentagram has one
+/// point above and two below, so its extent is 9 up and 7.3 down, and
+/// anchoring by the circle's centre leaves it sitting visibly high in a
+/// square hit target.
+fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
+    // 1/φ² -- the ratio between a regular pentagram's valleys and its points.
+    // Anything larger reads as a flower, anything smaller as a spider.
+    let inner = outer * 0.382;
+    let local: Vec<Vec2> = (0..STAR_VERTICES)
+        .map(|i| {
+            let radius = if i % 2 == 0 { outer } else { inner };
+            // -90° so a POINT is at the top, not a valley.
+            let angle = -std::f32::consts::FRAC_PI_2
+                + i as f32 * std::f32::consts::TAU / STAR_VERTICES as f32;
+            Vec2::new(radius * angle.cos(), radius * angle.sin())
+        })
+        .collect();
+    let top = local.iter().fold(f32::INFINITY, |a, p| a.min(p.y));
+    let bottom = local.iter().fold(f32::NEG_INFINITY, |a, p| a.max(p.y));
+    let offset = Vec2::new(0.0, -(top + bottom) / 2.0);
+    local.into_iter().map(|p| center + p + offset).collect()
+}
+
+/// Paints the star at `center`, filled or outlined, in one colour.
+fn paint_star(ui: &Ui, center: Pos2, outer: f32, filled: bool, color: Color32) {
+    let points = star_outline(center, outer);
+    let painter = ui.painter();
+    if filled {
+        // A pentagram is CONCAVE, so `convex_polygon` over its ten vertices
+        // would tessellate to garbage. It is star-shaped about its own
+        // centre, though, so a triangle fan from there is exact -- and every
+        // triangle in it is convex. The apex is the mean of the outline's
+        // own vertices, NOT `center`, which `star_outline` has offset away
+        // from the star's geometric middle.
+        let apex = points
+            .iter()
+            .fold(Vec2::ZERO, |a, p| a + p.to_vec2())
+            .to_pos2()
+            / points.len() as f32;
+        for i in 0..points.len() {
+            painter.add(egui::Shape::convex_polygon(
+                vec![apex, points[i], points[(i + 1) % points.len()]],
+                color,
+                Stroke::NONE,
+            ));
+        }
+    }
+    // Always, in both states: outlined it IS the star, and filled it covers
+    // the hairline seams anti-aliasing leaves between adjacent fan triangles.
+    // It is also what [`icon_probe::stars`] finds, so both states are equally
+    // visible to a test.
+    painter.add(egui::Shape::closed_line(
+        points,
+        Stroke::new(if filled { 1.0 } else { 1.4 }, color),
+    ));
+}
+
+/// The detail header's favourite control: a star, filled in the design's
+/// primary blue when the item IS a favourite and outlined when it is not.
+///
+/// Square at the strip's own control height, so its hit target matches the
+/// 34px buttons beside it rather than being only as big as the mark.
+pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // BLUE is this palette's "on"; ERROR is reserved for failures, so the on
+    // state cannot borrow it. Same rule the old worded button followed.
+    let color = if on {
+        BLUE
+    } else if response.hovered() {
+        INK
+    } else {
+        TEXT_FAINT
+    };
+    paint_star(ui, rect.center(), 9.0, on, color);
+    response
+}
+
+/// The detail header's overflow control: three dots stacked vertically, the
+/// menu affordance every desktop app spells the same way.
+///
+/// `armed` turns them [`ERROR`] red: the Delete inside this menu keeps its
+/// two-click confirmation, and once the first click has armed it the menu
+/// may well be closed -- so the state has to be legible on the button that
+/// opens it, not only on the entry inside.
+pub fn kebab_button(ui: &mut Ui, armed: bool) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if armed {
+        ERROR
+    } else if response.hovered() {
+        INK
+    } else {
+        TEXT_SECONDARY
+    };
+    const PITCH: f32 = 6.0;
+    let painter = ui.painter();
+    for step in [-1.0_f32, 0.0, 1.0] {
+        painter.circle_filled(
+            rect.center() + Vec2::new(0.0, step * PITCH),
+            KEBAB_DOT_RADIUS,
+            color,
+        );
+    }
+    response
+}
+
+/// The eye's almond outline: two parabolic lids meeting at the corners.
+fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
+    let lid = |t: f32, sign: f32| {
+        center + Vec2::new(t * half_w, sign * half_h * (1.0 - t * t))
+    };
+    let step = |i: usize| -1.0 + 2.0 * i as f32 / EYE_LID_SEGMENTS as f32;
+    let mut points: Vec<Pos2> = (0..=EYE_LID_SEGMENTS).map(|i| lid(step(i), -1.0)).collect();
+    // The lower lid, back from just inside the right corner to just inside
+    // the left one -- the corners themselves are already in the list.
+    points.extend((1..EYE_LID_SEGMENTS).rev().map(|i| lid(step(i), 1.0)));
+    debug_assert_eq!(points.len(), EYE_VERTICES);
+    points
+}
+
+/// A masked row's reveal control: an open eye while the value is hidden
+/// ("click to see it"), struck through once it is showing ("click to hide
+/// it"). The same way every password manager spells this, and the reason
+/// the state shown is the ACTION rather than the current condition.
+///
+/// Square at [`row_button`]'s own 28px height, so it sits on the row's
+/// control line beside the shortcut hint.
+pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
+    const SIZE: f32 = 28.0;
+    const HALF_W: f32 = 8.5;
+    const HALF_H: f32 = 5.0;
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let color = if response.hovered() { INK } else { TEXT_FAINT };
+    let center = rect.center();
+    let painter = ui.painter();
+    painter.add(egui::Shape::closed_line(
+        eye_outline(center, HALF_W, HALF_H),
+        Stroke::new(1.3, color),
+    ));
+    painter.circle_filled(center, EYE_PUPIL_RADIUS, color);
+    if revealed {
+        // The strike, corner to corner and a little past the lids, so it
+        // reads as "struck through" rather than as a lash.
+        let arm = Vec2::new(HALF_W - 0.5, HALF_H + 2.5);
+        painter.line_segment(
+            [center - arm, center + arm],
+            Stroke::new(1.5, color),
+        );
+    }
+    response
+}
+
+/// Finds the icons above in a frame's shape list, for tests that can no
+/// longer look them up by a painted string because they paint none.
+///
+/// Deliberately in this module: the identifying features are the vertex
+/// counts and the dot radius declared right above, and a test in another
+/// file that spelled them out again would keep passing against a retuned
+/// shape it had stopped finding.
+#[cfg(test)]
+pub mod icon_probe {
+    use super::*;
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<Rect>, keep: &dyn Fn(&egui::Shape) -> bool) {
+        if keep(shape) {
+            out.push(shape.visual_bounding_rect());
+        }
+        if let egui::Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                walk(shape, out, keep);
+            }
+        }
+    }
+
+    fn closed_paths(shape: &egui::Shape, vertices: usize) -> Vec<Rect> {
+        let mut out = Vec::new();
+        walk(shape, &mut out, &|s| {
+            matches!(s, egui::Shape::Path(p) if p.closed && p.points.len() == vertices)
+        });
+        out
+    }
+
+    /// One favourite star: where it is, what colour it was stroked in, and
+    /// whether it is FILLED -- which is the whole visible difference between
+    /// a favourited item and one that is not.
+    #[derive(Debug, Clone, Copy)]
+    pub struct Star {
+        pub rect: Rect,
+        pub stroke: Color32,
+        pub filled: bool,
+    }
+
+    /// The favourite stars this shape tree paints, in both states -- the
+    /// filled star carries the same outline the outlined one does, plus the
+    /// triangle fan that fills it (see `paint_star`).
+    pub fn stars(shape: &egui::Shape) -> Vec<Star> {
+        let mut triangles = Vec::new();
+        walk(shape, &mut triangles, &|s| {
+            matches!(s, egui::Shape::Path(p) if p.points.len() == 3 && p.fill != Color32::TRANSPARENT)
+        });
+        let mut strokes = Vec::new();
+        walk_paths(shape, STAR_VERTICES, &mut strokes);
+        strokes
+            .into_iter()
+            .map(|(rect, stroke)| Star {
+                rect,
+                stroke,
+                filled: triangles.iter().any(|t| rect.expand(1.0).contains_rect(*t)),
+            })
+            .collect()
+    }
+
+    fn walk_paths(shape: &egui::Shape, vertices: usize, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Path(p) if p.closed && p.points.len() == vertices => {
+                let color = match p.stroke.color {
+                    egui::epaint::ColorMode::Solid(color) => color,
+                    // Nothing here paints a gradient stroke; if something
+                    // starts to, this should be looked at rather than
+                    // silently reported as transparent.
+                    egui::epaint::ColorMode::UV(_) => Color32::TRANSPARENT,
+                };
+                out.push((shape.visual_bounding_rect(), color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk_paths(shape, vertices, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The reveal eyes this shape tree paints, in both states -- the strike
+    /// is a separate segment, so the almond is found either way.
+    pub fn eyes(shape: &egui::Shape) -> Vec<Rect> {
+        closed_paths(shape, EYE_VERTICES)
+    }
+
+    /// The strikes through the eyes above -- the ONLY thing that tells the
+    /// revealed state from the masked one on screen, so without a way to see
+    /// it `eye_toggle` could ignore its argument entirely and look correct.
+    ///
+    /// Every line segment, left to the caller to intersect with [`eyes`]:
+    /// keeping the geometry test at the call site is what stops this from
+    /// silently answering "yes" about some unrelated line drawn nearby.
+    pub fn line_segments(shape: &egui::Shape) -> Vec<Rect> {
+        let mut out = Vec::new();
+        walk(shape, &mut out, &|s| {
+            matches!(s, egui::Shape::LineSegment { .. })
+        });
+        out
+    }
+
+    /// The kebab's individual dots, each with the colour it was filled in --
+    /// which is how `armed` is visible to a test at all.
+    ///
+    /// Three of them is one kebab; the count is left to the caller so "the
+    /// header paints exactly three" is an assertion a test can make rather
+    /// than one this helper hides.
+    pub fn kebab_dots(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        collect_dots(shape, &mut out);
+        out
+    }
+
+    fn collect_dots(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
+        match shape {
+            egui::Shape::Circle(c) if (c.radius - KEBAB_DOT_RADIUS).abs() < 0.01 => {
+                out.push((shape.visual_bounding_rect(), c.fill));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_dots(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A small edit-pencil glyph (sidebar folder rows' edit affordance): a
@@ -1712,6 +2030,81 @@ mod tests {
         apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
         ctx
+    }
+
+    /// **The measured evidence behind drawing the detail pane's icons as
+    /// shapes, and it is not the answer that was assumed.**
+    ///
+    /// `close_glyph` records that U+2715 is a tofu box in this app's font
+    /// set, and the star, the eye and the kebab were expected to be in the
+    /// same position. Measured against the *resolved* stack `apply`
+    /// installs, only the kebab is: U+22EE resolves to nothing, so three
+    /// stacked dots could only ever have been a shape. ★, ☆ and 👁 DO
+    /// resolve -- but not from this app's own typeface. They come out of
+    /// egui's bundled emoji/icon fallback behind Archivo, and the tell is
+    /// asserted below: all three lay out to one identical advance width,
+    /// which is what a uniform-advance icon face does and what a
+    /// proportional text face never does.
+    ///
+    /// That is why they are drawn too. A mark from a fallback face this app
+    /// never chose has a weight, an optical size and a baseline nobody here
+    /// set, next to 34px controls whose every other measurement comes from
+    /// the design; and ★/☆ are two unrelated marks rather than one
+    /// silhouette in two weights, which is exactly what the on/off pair has
+    /// to be.
+    ///
+    /// Deterministic despite `font_definitions` pulling Consolas off the
+    /// system: that only ever joins the *Monospace* family, and everything
+    /// asked here is Proportional.
+    #[test]
+    fn the_icon_codepoints_are_not_carried_by_this_apps_own_typeface() {
+        let ctx = ctx_with_fonts();
+        let font = FontId::new(13.0, FontFamily::Proportional);
+        let width = |s: &str| {
+            ctx.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), INK))
+                .size()
+                .x
+        };
+
+        assert!(
+            !ctx.fonts_mut(|f| f.has_glyph(&font, '\u{22EE}')),
+            "U+22EE VERTICAL ELLIPSIS now resolves; the kebab is three drawn dots \
+             because it did not"
+        );
+        // The positive control for that: `has_glyph` is not simply answering
+        // "no" to everything, and the fonts really did load.
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font, 'A')),
+            "the font set resolves no 'A' either, so the assertion above proves nothing"
+        );
+
+        let star = width("\u{2605}");
+        assert_eq!(
+            star,
+            width("\u{2606}"),
+            "★ and ☆ no longer share one advance, so they may now come from a real \
+             text face -- re-measure before trusting the drawn star's justification"
+        );
+        assert_eq!(
+            star,
+            width("\u{1F441}"),
+            "★ and 👁 no longer share one advance; see above"
+        );
+        assert_ne!(
+            star,
+            width("A"),
+            "the icon codepoints now advance like Archivo's own letters, which is what \
+             they would do if the bundled faces had gained them"
+        );
+        // The positive control for the three above: Archivo is proportional,
+        // so equal advances are evidence of an icon face and not just of how
+        // this stack measures everything.
+        assert_ne!(
+            width("A"),
+            width("W"),
+            "'A' and 'W' advance identically, so the equal-advance argument above is \
+             about the measurement, not about the face"
+        );
     }
 
     /// The design renders the Lock pill's shortcut in `ui-monospace`, a

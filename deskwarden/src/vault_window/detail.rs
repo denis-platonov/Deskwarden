@@ -839,6 +839,74 @@ pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVau
     ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
 }
 
+/// The three values this pane offers a keyboard copy for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyShortcut {
+    Username,
+    Password,
+    Totp,
+}
+
+/// The bindings, their keys and the hint each row paints, in ONE table.
+///
+/// One table because the third of those is a promise about the other two: a
+/// row advertising `CTRL+B` beside a handler wired to something else is
+/// worse than no hint at all, and the only way to make that impossible is
+/// for the hint and the key to be the same tuple.
+///
+/// The chords are KeePass's, which password-manager users already have in
+/// their fingers. All three are free in this app, checked rather than
+/// assumed: `vault_window::mod` takes CTRL+K, CTRL+L and CTRL+N, the fill
+/// button takes CTRL+SHIFT+F, the login window takes CTRL+H, and the global
+/// fill hotkey is CTRL+ALT+B -- a different chord from CTRL+B, and owned by
+/// the OS rather than by egui.
+const COPY_SHORTCUTS: [(CopyShortcut, egui::Key, &str); 3] = [
+    (CopyShortcut::Password, egui::Key::B, "CTRL+B"),
+    (CopyShortcut::Username, egui::Key::U, "CTRL+U"),
+    (CopyShortcut::Totp, egui::Key::T, "CTRL+T"),
+];
+
+/// The hint text for one binding, read out of [`COPY_SHORTCUTS`] and never
+/// written out a second time.
+fn copy_shortcut_hint(which: CopyShortcut) -> &'static str {
+    COPY_SHORTCUTS
+        .iter()
+        .find(|(candidate, _, _)| *candidate == which)
+        .map(|(_, _, hint)| *hint)
+        .expect("COPY_SHORTCUTS covers every CopyShortcut variant")
+}
+
+/// Which copy a chord asks for, given what the selected item actually
+/// carries -- or `None`, meaning the chord does nothing at all.
+///
+/// **`None` rather than a fallback is the whole point.** The clipboard is a
+/// global the user is about to paste somewhere, and both of the obvious
+/// wrong answers are silent: an empty string looks like a failed paste, and
+/// "copy the password because there is no username" hands over a secret
+/// nobody asked for. So each binding copies its own field or nothing.
+///
+/// Pure, and separate from the closure that calls it, for this codebase's
+/// standing reason: logic reachable only through an eframe closure is logic
+/// that will not be tested.
+fn copy_shortcut_action(
+    which: CopyShortcut,
+    username: &str,
+    password: &str,
+    totp: &TotpState,
+) -> Option<DetailAction> {
+    match which {
+        CopyShortcut::Username => (!username.is_empty()).then_some(DetailAction::CopyUsername),
+        CopyShortcut::Password => (!password.is_empty()).then_some(DetailAction::CopyPassword),
+        // Only when a code is really on screen. `vault_window::mod` resolves
+        // `CopyTotp` out of this same state, so every other variant --
+        // `NoSecret`, `Fetching`, `Unavailable`, `NoCodeReported` -- would
+        // have it copy nothing, or an empty string, without this gate.
+        CopyShortcut::Totp => {
+            matches!(totp, TotpState::Code { .. }).then_some(DetailAction::CopyTotp)
+        }
+    }
+}
+
 pub fn draw_detail_read(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -846,8 +914,9 @@ pub fn draw_detail_read(
     totp: &TotpState,
     // Whether *this* item currently has a delete armed (its first click
     // already happened and the confirm window hasn't expired) -- purely for
-    // what the Delete button shows; `vault_window::mod`'s `confirm_click` is
-    // what actually decides whether a click here is arming or confirming.
+    // what the kebab and its Delete entry show; `vault_window::mod`'s
+    // `confirm_click` is what actually decides whether a click here is
+    // arming or confirming.
     delete_pending: bool,
     // Owned by `vault_window::mod`'s `run` and reset on selection change --
     // see `RevealState`'s doc for why it cannot live inside this function.
@@ -870,6 +939,19 @@ pub fn draw_detail_read(
         .and_then(|l| l.password.as_deref())
         .map(|p| p.as_str())
         .unwrap_or("");
+
+    // **Consumed before anything below is drawn.** `consume_key` takes the
+    // event out of the queue, so a chord that means "copy" here cannot also
+    // reach a text field or a button underneath. What it resolves to is
+    // `copy_shortcut_action`'s decision and not this closure's; applied at
+    // the very end of this function so a click in the same frame -- which is
+    // a deliberate act on a specific row -- wins over a keystroke.
+    let shortcut = ui.input_mut(|i| {
+        COPY_SHORTCUTS
+            .iter()
+            .find(|(_, key, _)| i.consume_key(egui::Modifiers::CTRL, *key))
+            .map(|(which, _, _)| *which)
+    });
 
     // Whatever stacking the container handed us, kept for the body below --
     // the cards there still lay themselves out with it.
@@ -915,15 +997,91 @@ pub fn draw_detail_read(
                     None => theme::avatar(ui, &theme::initials(&item.name), HEADER_AVATAR, true),
                 }
                 ui.add_space(HEADER_GAP);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = TITLE_GAP;
-                    ui.label(theme::pane_title(&item.name, TITLE_SIZE, theme::INK));
-                    ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT));
-                });
+                // **The controls claim their width FIRST, and the title gets
+                // what is left.** Laid out the other way round -- title,
+                // then a right-aligned group in the remainder -- the title
+                // takes as much room as its text wants and the strip
+                // overflows: at the app's own minimum window size the detail
+                // column is 298pt, and "Fill in app" was measured painting at
+                // x = -34.5, entirely off the pane, under a title that ran
+                // straight through the buttons.
+                //
+                // So the whole rest of the row is one right-to-left group.
+                // The controls are placed from the right edge inward, and the
+                // title column is a left-to-right child of that group, which
+                // egui hands exactly the rect the controls did not take.
+                // Pinned by
+                // `every_header_control_fits_inside_the_minimum_width_pane`.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = HEADER_GAP;
-                    if kind_offers_edit(kind) && theme::header_button(ui, "Edit").clicked() {
-                        action = DetailAction::Edit;
+                    // **The overflow menu, rightmost.** Edit and Delete both
+                    // live in here, at the user's explicit direction: four
+                    // worded buttons across this strip did not fit the app's
+                    // own minimum window size -- at 900px wide the detail
+                    // column is 298pt and "Fill in app" was measured painting
+                    // at x = -34.5, entirely off the pane, with "Favourite"
+                    // overlapping the title. A star, one primary button and a
+                    // kebab is what fits, and
+                    // `every_header_control_fits_inside_the_minimum_width_pane`
+                    // pins it at that width rather than at the 900pt every
+                    // other geometry test here uses.
+                    //
+                    // Drawn ALWAYS, not gated: Delete means the same thing for
+                    // every kind (see `every_kind_can_still_be_deleted`), so
+                    // there is no kind whose menu would be empty. Edit inside
+                    // it is still `kind_offers_edit`'s decision.
+                    let kebab = theme::kebab_button(ui, delete_pending)
+                        .on_hover_text("More actions for this item");
+                    egui::Popup::menu(&kebab).show(|ui| {
+                        if kind_offers_edit(kind) && ui.button("Edit").clicked() {
+                            action = DetailAction::Edit;
+                            ui.close();
+                        }
+                        // **Still two clicks, and the menu stays open between
+                        // them.** Burying Delete does not remove the reason
+                        // `vault_window::mod`'s `confirm_click` gates it: one
+                        // misclick permanently deletes. So the armed state is
+                        // expressed exactly as the header button expressed it
+                        // -- the same two labels, the same `ERROR` red -- and
+                        // no `ui.close()` on the arming click, because a menu
+                        // that shut itself would hide the state it just
+                        // entered. The kebab itself also turns red (see
+                        // `kebab_button`) so an armed delete is visible after
+                        // a click elsewhere closes the menu.
+                        let (delete_label, delete_hover) = if delete_pending {
+                            (
+                                "Delete? Click to confirm",
+                                "Click again to delete this item. It may still be recoverable \
+                                 from bitwarden.com or another Bitwarden client afterward.",
+                            )
+                        } else {
+                            ("Delete", "Delete this item")
+                        };
+                        let delete = ui.add(
+                            egui::Button::new(
+                                RichText::new(delete_label).color(theme::ERROR),
+                            )
+                            .fill(theme::CARD),
+                        );
+                        if delete.on_hover_text(delete_hover).clicked() {
+                            action = DetailAction::Delete;
+                        }
+                    });
+                    // **Stays in the strip, and stays worded.** It is this
+                    // app's primary action, not one of the items the user
+                    // asked to have relocated into the kebab. Laid out
+                    // between the star and the kebab -- right-to-left, so
+                    // what reads left-to-right is ★, "Fill in app", ⋮.
+                    //
+                    // Not drawn for a kind that cannot be filled: the fill
+                    // path resolves exactly a username and a password, so this
+                    // button on a card would type two empty strings into
+                    // whatever window happens to be focused. See
+                    // `kind_offers_fill`.
+                    if kind_offers_fill(kind)
+                        && theme::header_primary_button(ui, "Fill in app", "CTRL+SHIFT+F").clicked()
+                    {
+                        action = DetailAction::Fill;
                     }
                     // **In the header, and gated on no kind at all.** Every
                     // other control in this strip is per-kind because it acts
@@ -944,64 +1102,47 @@ pub fn draw_detail_read(
                     // would read as a field of the login/card/identity rather
                     // than of the item.
                     //
-                    // WORDS, NOT A STAR GLYPH: this app installs its own font
-                    // set (`theme::apply`) and a missing glyph renders as
-                    // tofu, so the one control whose entire meaning is its
-                    // icon would be the one control that could come out
-                    // blank. The label states the resulting state, and the
-                    // hover text states the action.
-                    let (favourite_label, favourite_hover) = if item.favorite {
-                        ("Favourited", "Remove this item from Favorites")
+                    // A STAR, and drawn rather than typed. The earlier version
+                    // of this control was two words ("Favourite"/"Favourited")
+                    // on the argument that a missing glyph renders as tofu --
+                    // correct about the risk, and `theme.rs`'s
+                    // `the_icon_codepoints_are_not_carried_by_this_apps_own
+                    // _typeface` now measures the actual answer: ★ resolves,
+                    // but only out of egui's fallback icon face, and ★/☆ are
+                    // two unrelated marks rather than one shape in two
+                    // weights. `theme::star_toggle` strokes it instead, so
+                    // both states are the same silhouette and the on state is
+                    // the palette's own BLUE.
+                    let favourite_hover = if item.favorite {
+                        "Remove this item from Favorites"
                     } else {
-                        ("Favourite", "Add this item to Favorites")
+                        "Add this item to Favorites"
                     };
-                    let favourite = if item.favorite {
-                        // The design's primary blue, which is the palette's
-                        // "this is on" colour (`theme::BLUE` is the primary
-                        // button's fill and the focus border). Delete's armed
-                        // state uses `ERROR` the same way, and red is
-                        // reserved for failures, so the ON state cannot
-                        // borrow it.
-                        theme::header_button_tinted(ui, favourite_label, theme::BLUE, theme::BLUE)
-                    } else {
-                        theme::header_button(ui, favourite_label)
-                    };
-                    if favourite.on_hover_text(favourite_hover).clicked() {
+                    if theme::star_toggle(ui, item.favorite)
+                        .on_hover_text(favourite_hover)
+                        .clicked()
+                    {
                         // The TARGET state, computed here from the item this
                         // pane actually drew -- see `DetailAction::ToggleFavorite`.
                         action = DetailAction::ToggleFavorite(!item.favorite);
                     }
-                    // Not drawn for a kind that cannot be filled: the fill
-                    // path resolves exactly a username and a password, so this
-                    // button on a card would type two empty strings into
-                    // whatever window happens to be focused. See
-                    // `kind_offers_fill`.
-                    if kind_offers_fill(kind)
-                        && theme::header_primary_button(ui, "Fill in app", "CTRL+SHIFT+F").clicked()
-                    {
-                        action = DetailAction::Fill;
-                    }
-                    // Design 2b's strip carries no Delete. This app's does, so
-                    // it keeps its established place (leftmost of the three)
-                    // and its two-click arming, and is drawn in the strip's own
-                    // button shape rather than given a shape of its own.
-                    let (delete_label, delete_hover) = if delete_pending {
-                        (
-                            "Delete? Click to confirm",
-                            "Click again to delete this item. It may still be recoverable from \
-                             bitwarden.com or another Bitwarden client afterward.",
-                        )
-                    } else {
-                        ("Delete", "Delete this item")
-                    };
-                    let delete = if delete_pending {
-                        theme::header_button_tinted(ui, delete_label, theme::ERROR, theme::ERROR)
-                    } else {
-                        theme::header_button(ui, delete_label)
-                    };
-                    if delete.on_hover_text(delete_hover).clicked() {
-                        action = DetailAction::Delete;
-                    }
+                    // The title column, in whatever the controls left. It
+                    // TRUNCATES rather than wrapping: the design draws one
+                    // line, and a name long enough to wrap would push the
+                    // 44px avatar off its own 20px top padding and make the
+                    // strip's height a function of the item's name.
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = TITLE_GAP;
+                            let mut title = theme::pane_title(&item.name, TITLE_SIZE, theme::INK);
+                            title.wrap =
+                                egui::text::TextWrapping::truncate_at_width(ui.available_width());
+                            ui.label(title);
+                            ui.label(
+                                RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT),
+                            );
+                        });
+                    });
                 });
             });
         });
@@ -1033,7 +1174,14 @@ pub fn draw_detail_read(
     match detail_body_for(kind) {
         DetailBody::LoginCredentials => {
             card(ui, "LOGIN CREDENTIALS", |ui| {
-                credential_row(ui, "Username", username, "Copy", &mut action, DetailAction::CopyUsername);
+                credential_row(
+                    ui,
+                    "Username",
+                    username,
+                    Some(CopyShortcut::Username),
+                    &mut action,
+                    DetailAction::CopyUsername,
+                );
                 theme::row_rule(ui);
                 password_row(ui, password, &mut reveal.password, &mut action);
                 // Whether there is a row at all is decided by `totp_row_for` and
@@ -1158,6 +1306,13 @@ pub fn draw_detail_read(
             );
         });
 
+    if matches!(action, DetailAction::None) {
+        if let Some(which) = shortcut {
+            if let Some(copy) = copy_shortcut_action(which, username, password, totp) {
+                action = copy;
+            }
+        }
+    }
     action
 }
 
@@ -1227,6 +1382,82 @@ fn row(
     value: impl FnOnce(&mut egui::Ui),
     controls: impl FnOnce(&mut egui::Ui),
 ) {
+    row_impl(ui, label, value, controls, egui::Sense::hover());
+}
+
+/// [`row`], plus: **clicking anywhere in the tile copies its value.**
+///
+/// The user's own words -- "all those username, pass, code, username etc
+/// should copy the value on click anywhere within the tile". Only rows that
+/// have something to copy get this; a row that reacted to a click and copied
+/// nothing would be worse than an inert one, because there is no way to tell
+/// from the outside that it did nothing.
+///
+/// **The eye keeps its own click, and it is the layout that guarantees it,
+/// not a rect exclusion.** `row_impl` senses the tile on the *background* of
+/// a `Ui`, and egui registers that widget when the `Ui` is created -- before
+/// any of its children. The controls inside are therefore registered later,
+/// which puts them on top, and egui hands a click to exactly one widget: the
+/// topmost under the pointer. So a click on the eye reveals and does not
+/// copy, and a click anywhere else in the tile copies. Pinned by
+/// `clicking_the_eye_reveals_without_copying`, which asserts BOTH halves --
+/// the flag flipped, and no copy reported -- because the negative alone
+/// passes against a click that missed everything.
+fn copy_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+    on_copy: DetailAction,
+    action: &mut DetailAction,
+) {
+    if row_impl(ui, label, value, controls, egui::Sense::click()).clicked() {
+        *action = on_copy;
+    }
+}
+
+fn row_impl(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+    sense: egui::Sense,
+) -> egui::Response {
+    let clickable = sense == egui::Sense::click();
+    let scope = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
+        // The hover tint's slot, reserved BEFORE anything paints into this
+        // row: the response that decides whether to fill it only exists once
+        // the row has been laid out, and a fill added then would cover the
+        // row's own text.
+        let tint = ui.painter().add(egui::Shape::Noop);
+        row_body(ui, label, value, controls);
+        tint
+    });
+    let response = scope.response;
+    if clickable && response.hovered() {
+        // The affordance. Design 2b has no hovered-row style of its own --
+        // it draws no hover states at all -- so this borrows the tint the
+        // design already uses for a raised surface (`CARD_TINT`, the same
+        // one `toolbar_button_with_shortcut` and egui's `faint_bg_color`
+        // use) rather than inventing a colour. The pointing hand is the
+        // other half: this app already gives every hand-painted clickable
+        // one, and a tile that copies on click must not look like the text
+        // beside it.
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().set(
+            scope.inner,
+            egui::Shape::rect_filled(response.rect, CornerRadius::ZERO, theme::CARD_TINT),
+        );
+    }
+    response
+}
+
+fn row_body(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
@@ -1289,30 +1520,58 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
         });
 }
 
+/// A plain value row. The whole tile copies; `hint`, when there is one, is
+/// the keyboard chord that copies the same value without the mouse.
 fn credential_row(
     ui: &mut egui::Ui,
     label: &str,
     value: &str,
-    copy_label: &str,
+    hint: Option<CopyShortcut>,
     action: &mut DetailAction,
     on_copy: DetailAction,
 ) {
-    row(
+    copy_row(
         ui,
         label,
         |ui| {
             ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
         },
-        |ui| {
-            if theme::row_button(ui, copy_label).clicked() {
-                *action = on_copy;
-            }
-        },
+        |ui| shortcut_hint(ui, hint),
+        on_copy,
+        action,
     );
 }
 
+/// A row's keyboard-shortcut hint, right-aligned with its controls.
+///
+/// The design's own idiom for this (`Deskwarden.dc.html` 2b: the search
+/// field's `CTRL+K`, the Lock pill's `CTRL+L`) is bare 10px monospace in
+/// ghost grey -- not [`theme::kbd_chip`]'s boxed treatment, which the design
+/// reserves for the chips inside filled buttons and selected rows.
+///
+/// It exists because the explicit `Copy` buttons are gone: without a visible
+/// hint the two ways left to copy are both invisible.
+fn shortcut_hint(ui: &mut egui::Ui, hint: Option<CopyShortcut>) {
+    if let Some(which) = hint {
+        ui.label(
+            RichText::new(copy_shortcut_hint(which))
+                .size(10.0)
+                .family(egui::FontFamily::Monospace)
+                .color(theme::TEXT_GHOST),
+        );
+    }
+}
+
 fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
-    masked_row(ui, "Password", password, revealed, action, DetailAction::CopyPassword);
+    masked_row(
+        ui,
+        "Password",
+        password,
+        revealed,
+        action,
+        DetailAction::CopyPassword,
+        Some(CopyShortcut::Password),
+    );
 }
 
 /// A secret row: monospace, bullets until revealed, with Reveal and Copy.
@@ -1328,13 +1587,14 @@ fn masked_row(
     revealed: &mut bool,
     action: &mut DetailAction,
     on_copy: DetailAction,
+    hint: Option<CopyShortcut>,
 ) {
     let shown = if *revealed {
         value.to_string()
     } else {
         "•".repeat(MASKED_BULLETS)
     };
-    row(
+    copy_row(
         ui,
         label,
         |ui| {
@@ -1349,13 +1609,27 @@ fn masked_row(
             ));
         },
         |ui| {
-            if theme::row_button(ui, "Copy").clicked() {
-                *action = on_copy;
-            }
-            if theme::row_button(ui, if *revealed { "Hide" } else { "Reveal" }).clicked() {
+            // AN EYE, not the words "Reveal"/"Hide". The state it shows is
+            // the ACTION, the way every password manager spells it: an open
+            // eye while the value is masked, struck through while it is
+            // showing. Drawn rather than typed -- see `theme::eye_toggle` and
+            // the font measurement its module header cites.
+            //
+            // The row around it copies on click; this does not. Registered
+            // after the tile's own background widget, so egui gives it the
+            // click instead -- see `copy_row`.
+            if theme::eye_toggle(ui, *revealed)
+                .on_hover_text(if *revealed { "Hide" } else { "Reveal" })
+                .clicked()
+            {
                 *revealed = !*revealed;
             }
+            shortcut_hint(ui, hint);
         },
+        // **Copies the real value even while masked.** The mask is a display
+        // concern; it was never what the old Copy button honoured either.
+        on_copy,
+        action,
     );
 }
 
@@ -1426,23 +1700,23 @@ fn card_rows(
     };
     if let Some(v) = &cardholder {
         separate(ui, &mut first);
-        credential_row(ui, "Cardholder name", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Cardholder name", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &brand {
         separate(ui, &mut first);
-        credential_row(ui, "Brand", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Brand", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &number {
         separate(ui, &mut first);
-        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber);
+        masked_row(ui, "Number", v, &mut reveal.card_number, action, DetailAction::CopyCardNumber, None);
     }
     if let Some(v) = &expiry {
         separate(ui, &mut first);
-        credential_row(ui, "Expiry", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Expiry", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &code {
         separate(ui, &mut first);
-        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode);
+        masked_row(ui, "Security code", v, &mut reveal.card_code, action, DetailAction::CopyCardCode, None);
     }
 }
 
@@ -1495,6 +1769,7 @@ fn history_rows(
             &mut reveal.password_history[index],
             action,
             DetailAction::CopyPasswordHistory(index),
+            None,
         );
     }
     // Truncation is STATED, never silent. A previous password the pane simply
@@ -1567,15 +1842,15 @@ fn ssh_key_rows(
     };
     if let Some(v) = &public_key {
         separate(ui, &mut first);
-        credential_row(ui, "Public key", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Public key", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &fingerprint {
         separate(ui, &mut first);
-        credential_row(ui, "Fingerprint", v, "Copy", action, DetailAction::CopyValue(v.clone()));
+        credential_row(ui, "Fingerprint", v, None, action, DetailAction::CopyValue(v.clone()));
     }
     if let Some(v) = &private_key {
         separate(ui, &mut first);
-        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey);
+        masked_row(ui, "Private key", v, &mut reveal.ssh_private_key, action, DetailAction::CopySshPrivateKey, None);
     }
 }
 
@@ -1615,13 +1890,13 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
             if row_index > 0 {
                 theme::row_rule(ui);
             }
-            credential_row(ui, label, value, "Copy", action, DetailAction::CopyValue(value.clone()));
+            credential_row(ui, label, value, None, action, DetailAction::CopyValue(value.clone()));
         }
     }
 }
 
 fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
-    row(
+    copy_row(
         ui,
         "One-time code",
         |ui| {
@@ -1654,11 +1929,9 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
                     .color(theme::TEXT_FAINT),
             );
         },
-        |ui| {
-            if theme::row_button(ui, "Copy").clicked() {
-                *action = DetailAction::CopyTotp;
-            }
-        },
+        |ui| shortcut_hint(ui, Some(CopyShortcut::Totp)),
+        DetailAction::CopyTotp,
+        action,
     );
 }
 
@@ -1877,7 +2150,9 @@ mod tests {
     }
 
     /// The same, for the pane an out-of-vault item gets.
-    fn painted_out_of_vault(item: &VaultItem, out: OutOfVault) -> Vec<String> {
+    /// Everything the out-of-vault pane painted: its strings, and -- as a
+    /// [`Frame`] -- the drawn icons, which paint no string at all.
+    fn painted_out_of_vault(item: &VaultItem, out: OutOfVault) -> (Vec<String>, Frame) {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1892,10 +2167,24 @@ mod tests {
 
         let output = ctx.run_ui(input(), |ui| draw_out_of_vault_read(ui, item, out));
         let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            collect_text(&clipped.shape, &mut texts);
-        }
-        texts
+        let mut frame = Frame {
+            action: DetailAction::None,
+            texts: Vec::new(),
+            stars: Vec::new(),
+            eyes: Vec::new(),
+            kebab_dots: Vec::new(),
+            segments: Vec::new(),
+        };
+        // One tree -- see `Pane::frame`, which explains why per-clipped-shape
+        // probing cannot see a filled star.
+        let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+        collect_text(&all, &mut texts);
+        collect_text_rects(&all, &mut frame.texts);
+        frame.stars = theme::icon_probe::stars(&all);
+        frame.eyes = theme::icon_probe::eyes(&all);
+        frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
+        frame.segments = theme::icon_probe::line_segments(&all);
+        (texts, frame)
     }
 
     /// The out-of-vault pane names the item, says which of the two places it
@@ -1926,19 +2215,37 @@ mod tests {
             (OutOfVault::Trash, "This item is in the Trash."),
             (OutOfVault::Archive, "This item is archived."),
         ] {
-            let painted = painted_out_of_vault(&item, out);
+            let (painted, frame) = painted_out_of_vault(&item, out);
             assert!(painted.iter().any(|t| t == "Ledgerline"), "the pane did not name the item");
             assert!(
                 painted.iter().any(|t| t == expected),
                 "the pane never said {expected:?}; it painted {painted:?}"
             );
-            for control in ["Edit", "Fill in app", "Delete", "Copy"] {
-                assert!(
-                    !painted.iter().any(|t| t == control),
-                    "the out-of-vault pane offers {control:?}, which acts through the live item \
-                     list and would do nothing for this item"
-                );
-            }
+            // "Fill in app" is still a word. The read pane's other controls
+            // are DRAWN now -- the favourite star, the kebab that carries
+            // Edit and Delete, the reveal eye -- so their absence has to be
+            // asserted against the shapes. Asserting the old strings here
+            // would be a test that cannot fail: no pane in this app paints
+            // the word "Delete" outside an open menu any more.
+            assert!(
+                !painted.iter().any(|t| t == "Fill in app"),
+                "the out-of-vault pane offers Fill, which acts through the live item list \
+                 and would do nothing for this item"
+            );
+            assert!(
+                frame.stars.is_empty(),
+                "the out-of-vault pane draws a favourite star, which writes through the \
+                 live item list"
+            );
+            assert!(
+                frame.kebab_dots.is_empty(),
+                "the out-of-vault pane draws the kebab, which carries Edit and Delete"
+            );
+            assert!(
+                frame.eyes.is_empty(),
+                "the out-of-vault pane draws a reveal eye, so it is rendering rows it \
+                 cannot act on"
+            );
         }
     }
 
@@ -2110,6 +2417,269 @@ mod tests {
         .shapes
     }
 
+    /// The detail column's width at this app's own MINIMUM window size --
+    /// the width the header strip actually has to survive, and the one no
+    /// geometry test here used to try.
+    ///
+    /// Derived from the three constants that produce it (900 - 212 - 390 =
+    /// 298pt) rather than written out, because a hardcoded 298 would stop
+    /// being the minimum the moment any of them moved and would then be
+    /// checking a width the app can no longer be resized to.
+    const MIN_PANE: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+        - crate::vault_window::SIDEBAR_WIDTH
+        - crate::vault_window::LIST_WIDTH;
+
+    /// A full press AND release, which is what egui needs before it reports
+    /// `Response::clicked` -- a press alone is not a click.
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    fn ctrl(key: egui::Key) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        }]
+    }
+
+    /// **The click harness.** Everything below that has to press a control
+    /// rather than read a string goes through this.
+    ///
+    /// Modelled on `detail_edit.rs`'s `generator_row_tests` (commit
+    /// `6020489`), including its two hard-won details: a press *and* a
+    /// release is what egui counts as a click, and a popup only PAINTS on
+    /// the frame after the click that opened it -- so the frame that finds
+    /// a menu entry and the frame that opened the menu can never be the
+    /// same one.
+    ///
+    /// It carries the `RevealState` and the `delete_pending` flag across
+    /// frames the way `vault_window::mod`'s `run` does, which is the only
+    /// way a toggle can be observed outliving the frame it happened in.
+    struct Pane {
+        ctx: egui::Context,
+        width: f32,
+        reveal: RevealState,
+        delete_pending: bool,
+    }
+
+    /// One frame's output: what it returned, every string it painted with
+    /// the rect it landed in, and the three drawn icons -- which paint no
+    /// string at all and can therefore only be found by their geometry (see
+    /// `theme::icon_probe`, which owns that lookup).
+    struct Frame {
+        action: DetailAction,
+        texts: Vec<(String, egui::Rect)>,
+        stars: Vec<theme::icon_probe::Star>,
+        eyes: Vec<egui::Rect>,
+        kebab_dots: Vec<(egui::Rect, egui::Color32)>,
+        segments: Vec<egui::Rect>,
+    }
+
+    impl Frame {
+        /// How many of this frame's eyes are struck through -- the only
+        /// visible difference between a revealed row and a masked one.
+        fn struck_eyes(&self) -> usize {
+            self.eyes
+                .iter()
+                .filter(|eye| {
+                    self.segments
+                        .iter()
+                        .any(|seg| eye.expand(4.0).contains_rect(*seg))
+                })
+                .count()
+        }
+
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn painted(&self, label: &str) -> bool {
+            self.texts.iter().any(|(t, _)| t == label)
+        }
+
+        /// The one rect painting `label`, or a failure naming everything
+        /// that *was* painted -- which turns "the control is gone" into a
+        /// readable message instead of a click that silently hits nothing.
+        fn rect_of(&self, label: &str) -> egui::Rect {
+            let found: Vec<egui::Rect> = self
+                .texts
+                .iter()
+                .filter(|(t, _)| t == label)
+                .map(|(_, r)| *r)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} in the pane, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
+        /// The header's favourite star. Exactly one, in either state.
+        fn star(&self) -> theme::icon_probe::Star {
+            assert_eq!(
+                self.stars.len(),
+                1,
+                "expected exactly one star in the header, found {}; the pane painted: {:?}",
+                self.stars.len(),
+                self.strings()
+            );
+            self.stars[0]
+        }
+
+        /// The header's kebab, as the union of its three dots. Three is the
+        /// assertion: two would be an ellipsis and four a different control.
+        fn kebab(&self) -> egui::Rect {
+            assert_eq!(
+                self.kebab_dots.len(),
+                3,
+                "expected exactly three kebab dots in the header, found {}; the pane \
+                 painted: {:?}",
+                self.kebab_dots.len(),
+                self.strings()
+            );
+            self.kebab_dots
+                .iter()
+                .skip(1)
+                .fold(self.kebab_dots[0].0, |a, (b, _)| a.union(*b))
+        }
+
+        /// The colour the kebab's three dots were filled in -- one colour,
+        /// or a failure, so "the kebab is red" cannot be satisfied by one
+        /// red dot out of three.
+        fn kebab_colour(&self) -> egui::Color32 {
+            let _ = self.kebab();
+            let first = self.kebab_dots[0].1;
+            assert!(
+                self.kebab_dots.iter().all(|(_, c)| *c == first),
+                "the kebab's dots are not all one colour: {:?}",
+                self.kebab_dots
+            );
+            first
+        }
+
+        /// Every reveal eye, top-down -- the order the rows are drawn in, so
+        /// `eyes()[0]` is the first masked row on the pane.
+        fn eyes(&self) -> Vec<egui::Rect> {
+            let mut eyes = self.eyes.clone();
+            eyes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            eyes
+        }
+    }
+
+    impl Pane {
+        fn new() -> Self {
+            Self::wide(PANE)
+        }
+
+        fn wide(width: f32) -> Self {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, PANE),
+                )),
+                ..Default::default()
+            };
+            // The same two throwaway frames every harness in this crate
+            // runs: a font set registered during a frame is only usable
+            // from the start of the next one.
+            let _ = ctx.run_ui(input.clone(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input, |_ui| {});
+            Self {
+                ctx,
+                width,
+                reveal: RevealState::default(),
+                delete_pending: false,
+            }
+        }
+
+        fn frame(&mut self, item: &VaultItem, totp: &TotpState, events: Vec<egui::Event>) -> Frame {
+            let mut action = DetailAction::None;
+            let output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(self.width, PANE),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    action = draw_detail_read(
+                        ui,
+                        item,
+                        3,
+                        totp,
+                        self.delete_pending,
+                        &mut self.reveal,
+                        None,
+                    );
+                },
+            );
+            let mut frame = Frame {
+                action,
+                texts: Vec::new(),
+                stars: Vec::new(),
+                eyes: Vec::new(),
+                kebab_dots: Vec::new(),
+                segments: Vec::new(),
+            };
+            // ONE tree, not one call per clipped shape: `paint_star` adds
+            // the star's outline and its ten fill triangles as separate
+            // top-level shapes, so a probe run per clipped shape could never
+            // see both and would report every filled star as an outline.
+            let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+            collect_text_rects(&all, &mut frame.texts);
+            frame.stars = theme::icon_probe::stars(&all);
+            frame.eyes = theme::icon_probe::eyes(&all);
+            frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
+            frame.segments = theme::icon_probe::line_segments(&all);
+            frame
+        }
+
+        fn idle(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
+            self.frame(item, totp, Vec::new())
+        }
+
+        fn click(&mut self, item: &VaultItem, totp: &TotpState, pos: egui::Pos2) -> Frame {
+            self.frame(item, totp, click_at(pos))
+        }
+
+        /// Lays the pane out, clicks the kebab, and returns the frame AFTER
+        /// that click -- the first one on which the menu paints.
+        fn open_kebab(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
+            let closed = self.idle(item, totp);
+            assert!(
+                closed.stars.len() == 1,
+                "the pane did not lay out at all, so opening its menu proves nothing"
+            );
+            let kebab = closed.kebab().center();
+            let _ = self.click(item, totp, kebab);
+            self.idle(item, totp)
+        }
+    }
+
     fn painted(item: &VaultItem, totp: &TotpState) -> Vec<String> {
         painted_text(item, totp, false, RevealState::default())
     }
@@ -2186,17 +2756,153 @@ mod tests {
     }
 
     /// Delete is the one action that means the same thing for every kind, so
-    /// gating fill must not take it with it.
+    /// gating fill must not take it with it -- and moving it into the kebab
+    /// must not either.
+    ///
+    /// Behavioural, because it has to be: Delete is no longer a word painted
+    /// on the strip. The menu is really opened and the entry really clicked,
+    /// so what is pinned is that the action still *reaches the caller* for
+    /// every kind rather than that a string is somewhere on screen.
     #[test]
     fn every_kind_can_still_be_deleted() {
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
-            let texts = painted(&item, &TotpState::NoSecret);
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
             assert!(
-                contains(&texts, "Delete"),
-                "{kind:?} lost its Delete button; painted: {texts:?}"
+                open.painted("Delete"),
+                "{kind:?}'s kebab menu carries no Delete; it painted: {:?}",
+                open.strings()
+            );
+            let entry = open.rect_of("Delete");
+            let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+            assert_eq!(
+                clicked.action,
+                DetailAction::Delete,
+                "{kind:?}'s Delete entry is decoration -- clicking it reported {:?}",
+                clicked.action
             );
         }
+    }
+
+    /// The positive control for the test above, and for
+    /// `the_rendered_chrome_matches_the_chrome_decision_for_every_kind`'s
+    /// menu half: the entries are only reachable once the kebab is clicked.
+    /// Without this, "Edit is in the menu" would pass just as well against a
+    /// menu that is permanently open, and the decluttering the user asked
+    /// for would be undone without a single test noticing.
+    #[test]
+    fn the_kebab_menu_is_closed_until_the_kebab_is_clicked() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let closed = pane.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            closed.kebab_dots.len(),
+            3,
+            "no kebab painted at all, so this proves nothing: {:?}",
+            closed.strings()
+        );
+        for entry in ["Edit", "Delete"] {
+            assert!(
+                !closed.painted(entry),
+                "{entry:?} is on the header strip with the menu shut: {:?}",
+                closed.strings()
+            );
+        }
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        for entry in ["Edit", "Delete"] {
+            assert!(
+                open.painted(entry),
+                "the opened kebab menu does not carry {entry:?}: {:?}",
+                open.strings()
+            );
+        }
+    }
+
+    /// Clicking Edit in the menu is what asks the caller to edit. Nothing
+    /// else in the crate notices if that binding is dropped:
+    /// `DetailAction::Edit` is `pub`, so its producers falling to zero is
+    /// not even a warning, and every test of `kind_offers_edit` keeps
+    /// passing while the feature is inert.
+    #[test]
+    fn clicking_edit_in_the_kebab_menu_asks_the_caller_to_edit() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let entry = open.rect_of("Edit");
+        let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::Edit,
+            "clicking the menu's Edit reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **Delete still takes two clicks, and the menu still says so.**
+    /// `vault_window::mod`'s `confirm_click` is what actually gates the
+    /// deletion; what this pane owes it is an armed state the user can see.
+    /// Burying the control in a menu is exactly the change that could have
+    /// dropped it -- and a menu that closed itself on the arming click would
+    /// hide the state it had just entered.
+    ///
+    /// Both directions, so this cannot pass against an entry hardcoded to
+    /// either label.
+    #[test]
+    fn an_armed_delete_says_so_in_the_menu_and_on_the_kebab() {
+        let item = a_login();
+
+        let mut idle = Pane::new();
+        let unarmed = idle.open_kebab(&item, &TotpState::NoSecret);
+        assert!(
+            unarmed.painted("Delete") && !unarmed.painted("Delete? Click to confirm"),
+            "an unarmed delete already asks for confirmation: {:?}",
+            unarmed.strings()
+        );
+
+        let mut armed = Pane::new();
+        armed.delete_pending = true;
+        let open = armed.open_kebab(&item, &TotpState::NoSecret);
+        assert!(
+            open.painted("Delete? Click to confirm"),
+            "an armed delete reads exactly like an unarmed one, so the confirmation \
+             step is invisible: {:?}",
+            open.strings()
+        );
+        // And it is still reported, so the SECOND click can confirm.
+        let entry = open.rect_of("Delete? Click to confirm");
+        let clicked = armed.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::Delete,
+            "the armed Delete entry is inert, so a delete can be armed but never confirmed"
+        );
+    }
+
+    /// The armed state has to be legible with the menu SHUT, because a click
+    /// anywhere else closes it while `confirm_click`'s window is still open.
+    /// The kebab's own dots turn `ERROR` red for that.
+    #[test]
+    fn the_kebab_itself_shows_that_a_delete_is_armed() {
+        let item = a_login();
+        let colour = |delete_pending: bool| {
+            let mut pane = Pane::new();
+            pane.delete_pending = delete_pending;
+            pane.idle(&item, &TotpState::NoSecret).kebab_colour()
+        };
+        assert_eq!(
+            colour(true),
+            theme::ERROR,
+            "an armed delete leaves the kebab looking exactly like an unarmed one, so \
+             closing the menu hides the confirmation entirely"
+        );
+        // Both directions, so this cannot pass against a kebab that is
+        // always red -- which would be a permanent alarm instead of a state.
+        assert_ne!(
+            colour(false),
+            theme::ERROR,
+            "the kebab is red with nothing armed"
+        );
     }
 
     /// Notes were invisible for every kind, logins included, because the
@@ -2449,14 +3155,32 @@ mod tests {
                 "{kind:?}: the autofill card disagrees with kind_offers_fill"
             );
             assert_eq!(
-                contains(&texts, "Edit"),
-                kind_offers_edit(kind),
-                "{kind:?}: the Edit button disagrees with kind_offers_edit"
-            );
-            assert_eq!(
                 contains(&texts, "Strength"),
                 kind_offers_fill(kind),
                 "{kind:?}: the metadata strip disagrees with kind_offers_fill"
+            );
+
+            // Edit lives in the kebab now, so the drift guard has to open it.
+            // Same predicate, same drift caught -- a fix correct in
+            // `kind_offers_edit` and inert in `draw_detail_read` still fails
+            // here -- but the menu really is opened, which the old string
+            // check could not distinguish from a permanently-visible button.
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            assert_eq!(
+                open.painted("Edit"),
+                kind_offers_edit(kind),
+                "{kind:?}: the menu's Edit entry disagrees with kind_offers_edit; the \
+                 menu painted: {:?}",
+                open.strings()
+            );
+            // The positive control: the menu really did open, so a `false`
+            // above is Edit being gated and not the menu failing to appear.
+            assert!(
+                open.painted("Delete"),
+                "{kind:?}: the kebab menu did not open at all, so the Edit assertion \
+                 above proves nothing: {:?}",
+                open.strings()
             );
         }
     }
@@ -2644,9 +3368,16 @@ mod tests {
             !contains(&texts, "123"),
             "the security code was painted in the clear by default: {texts:?}"
         );
-        assert!(
-            contains(&texts, "Reveal"),
-            "the card pane offers no way to reveal what it masked: {texts:?}"
+        // The positive control, and the one thing "Reveal" used to say: the
+        // pane really does offer a way to unmask what it hid. Two eyes,
+        // because both masked rows must have one -- an assertion the old
+        // `contains(.., "Reveal")` could not make, since one string is
+        // enough to satisfy `contains`.
+        let mut pane = Pane::new();
+        assert_eq!(
+            pane.idle(&a_full_card(), &TotpState::NoSecret).eyes.len(),
+            2,
+            "the card pane offers no way to reveal what it masked"
         );
     }
 
@@ -2670,7 +3401,6 @@ mod tests {
              reveal state: {texts:?}"
         );
         assert!(contains(&texts, "123"), "a revealed security code did not paint: {texts:?}");
-        assert!(contains(&texts, "Hide"), "a revealed row still offers Reveal: {texts:?}");
     }
 
     /// **The toggle survives the frame it was clicked in.** Everything else in
@@ -2689,66 +3419,26 @@ mod tests {
     #[test]
     fn a_reveal_click_in_one_frame_is_still_revealed_in_the_next() {
         let item = a_full_card();
-        let ctx = egui::Context::default();
-        let input = |events: Vec<egui::Event>| egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 900.0),
-            )),
-            events,
-            ..Default::default()
-        };
-        // Same two throwaway frames `painted_text` runs, and for the same
-        // reason: `theme::apply`'s fonts only exist from the next frame on.
-        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        let mut pane = Pane::new();
 
-        let mut reveal = RevealState::default();
-        let frame = |events: Vec<egui::Event>, reveal: &mut RevealState| {
-            let output = ctx.run_ui(input(events), |ui| {
-                draw_detail_read(ui, &item, 3, &TotpState::NoSecret, false, reveal, None);
-            });
-            let mut rects = Vec::new();
-            for clipped in &output.shapes {
-                collect_text_rects(&clipped.shape, &mut rects);
-            }
-            rects
-        };
-
-        let laid_out = frame(Vec::new(), &mut reveal);
-        // The topmost "Reveal" is the Number row's: the security code's row is
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        // The topmost eye is the Number row's: the security code's row is
         // drawn below it, and both are inside the same card.
-        let reveal_button = laid_out
-            .iter()
-            .filter(|(text, _)| text == "Reveal")
-            .min_by(|a, b| a.1.top().total_cmp(&b.1.top()))
-            .map(|(_, rect)| rect.center())
-            .unwrap_or_else(|| panic!("the card pane painted no Reveal control: {laid_out:?}"));
-
-        let click = |pos: egui::Pos2| {
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ]
-        };
-        let _ = frame(click(reveal_button), &mut reveal);
+        let eyes = laid_out.eyes();
+        assert_eq!(
+            eyes.len(),
+            2,
+            "the card pane painted {} reveal controls, not the two masked rows it has; \
+             it painted: {:?}",
+            eyes.len(),
+            laid_out.strings()
+        );
+        let _ = pane.click(&item, &TotpState::NoSecret, eyes[0].center());
 
         // The click reached the caller's struct, and reached the field that
         // belongs to the row it landed on.
         assert_eq!(
-            reveal,
+            pane.reveal,
             RevealState {
                 password: false,
                 card_number: true,
@@ -2756,21 +3446,157 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
             },
-            "clicking the card number's Reveal did not write through to the caller's \
+            "clicking the card number's eye did not write through to the caller's \
              RevealState, or wrote through to the wrong field"
         );
 
         // And a frame with no input at all still paints the digits.
-        let after = frame(Vec::new(), &mut reveal);
-        let texts: Vec<String> = after.into_iter().map(|(text, _)| text).collect();
+        let after = pane.idle(&item, &TotpState::NoSecret);
+        let texts: Vec<String> = after.texts.iter().map(|(t, _)| t.clone()).collect();
         assert!(
             contains(&texts, "4242424242424242"),
-            "the frame after the Reveal click painted the number masked again -- the \
+            "the frame after the reveal click painted the number masked again -- the \
              toggle did not outlive the frame it happened in: {texts:?}"
         );
         assert!(
             !contains(&texts, "123"),
-            "the security code was revealed by a click on the number's Reveal: {texts:?}"
+            "the security code was revealed by a click on the number's eye: {texts:?}"
+        );
+        assert_eq!(
+            after.struck_eyes(),
+            1,
+            "exactly one of the two eyes should now be struck through"
+        );
+    }
+
+    /// **Clicking the eye reveals, and copies NOTHING.**
+    ///
+    /// The eye sits inside a tile that copies on click, and the value behind
+    /// it is a secret. "Clicking the eye also put the password on the
+    /// clipboard" is silent, user-visible and would be caught by no other
+    /// test here -- so both halves are asserted in one frame: the flag
+    /// flipped, and no action was reported. The positive half is what stops
+    /// the negative one passing against a click that missed everything.
+    #[test]
+    fn clicking_the_eye_reveals_without_copying() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let eye = laid_out.eyes();
+        assert_eq!(eye.len(), 1, "a login has exactly one masked row");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, eye[0].center());
+        assert!(
+            pane.reveal.password,
+            "clicking the eye did not reveal the password, so the assertion below is \
+             about a click that hit nothing"
+        );
+        assert_eq!(
+            clicked.action,
+            DetailAction::None,
+            "clicking the eye ALSO copied the password to the clipboard -- a secret the \
+             user never asked for"
+        );
+    }
+
+    /// The tile copies when the click lands anywhere else in it. Over the
+    /// LABEL column, which is as far from the eye as the row goes.
+    #[test]
+    fn clicking_a_password_tile_copies_it_without_revealing_it() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let label = laid_out.rect_of("Password");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyPassword,
+            "clicking the password tile reported {:?}, so the tile is not the copy \
+             target the user asked for",
+            clicked.action
+        );
+        assert!(
+            !pane.reveal.password,
+            "copying by tile click also unmasked the password on screen"
+        );
+    }
+
+    /// The username tile too -- a second row, so a `copy_row` wired to one
+    /// fixed action cannot pass both this and the test above.
+    #[test]
+    fn clicking_a_username_tile_copies_the_username() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let value = laid_out.rect_of("a.novak@ledgerline.com");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, value.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyUsername,
+            "clicking the username tile reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **A row with nothing to copy stays inert.** The user's rule was
+    /// "those username, pass, code" tiles, not the whole pane: a tile that
+    /// reacted and copied nothing is worse than one that does not react,
+    /// because there is no way to tell from outside that it did nothing.
+    ///
+    /// The TOTP status rows are the real case -- same `row` shape, same
+    /// place, no value.
+    #[test]
+    fn a_row_with_nothing_to_copy_reports_nothing_when_clicked() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::Unavailable);
+        let row = laid_out.rect_of("Unavailable right now");
+
+        let clicked = pane.click(&item, &TotpState::Unavailable, row.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::None,
+            "the TOTP row with no code copied {:?} when clicked",
+            clicked.action
+        );
+
+        // The positive control: the same click, one row up, on a tile that
+        // DOES have something to copy. Without it this test passes against a
+        // harness whose clicks never land anywhere.
+        let password = laid_out.rect_of("Password");
+        let clicked = pane.click(&item, &TotpState::Unavailable, password.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyPassword,
+            "no tile on this pane copies, so the inert assertion above proves nothing"
+        );
+    }
+
+    /// The live code's row DOES copy -- the `Unavailable` row above is inert
+    /// because it has no code, not because TOTP rows are inert.
+    #[test]
+    fn clicking_the_one_time_code_tile_copies_the_code() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let totp = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 21,
+        };
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &totp);
+        let row = laid_out.rect_of("One-time code");
+
+        let clicked = pane.click(&item, &totp, row.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyTotp,
+            "clicking the one-time code tile reported {:?}",
+            clicked.action
         );
     }
 
@@ -2955,12 +3781,22 @@ mod tests {
             contains(&texts, "No card details"),
             "an empty card drew a heading over nothing: {texts:?}"
         );
-        for absent in ["Cardholder name", "Number", "Security code", "Reveal"] {
+        for absent in ["Cardholder name", "Number", "Security code"] {
             assert!(
                 !contains(&texts, absent),
                 "an empty card drew a {absent:?} row it has no data for: {texts:?}"
             );
         }
+        // "Reveal" used to be in that list; the control paints no string
+        // now, so the shape has to be asserted instead -- leaving the word
+        // there would be an assertion that can no longer fail. Paired with
+        // `the_card_number_and_security_code_are_masked_by_default`, which
+        // shows a populated card really does paint two.
+        let mut pane = Pane::new();
+        assert!(
+            pane.idle(&an_item(Some(3)), &TotpState::NoSecret).eyes.is_empty(),
+            "an empty card drew a masked row it has no data for"
+        );
     }
 
     #[test]
@@ -3103,9 +3939,22 @@ mod tests {
             !contains(&texts, PRIVATE_KEY_BODY),
             "the SSH private key was painted in the clear by default: {texts:?}"
         );
-        assert!(
-            contains(&texts, "Reveal"),
-            "the SSH pane offers no way to reveal what it masked: {texts:?}"
+        // The positive control, and what "Reveal" used to stand for: the
+        // masked key still offers a way to see it. Exactly one eye, and
+        // unstruck -- an open eye is what says "click to reveal".
+        let mut pane = Pane::new();
+        let frame = pane.idle(&an_ssh_key_item(), &TotpState::NoSecret);
+        assert_eq!(
+            frame.eyes.len(),
+            1,
+            "the SSH pane offers no way to reveal what it masked -- this test's whole \
+             point is that a masked private key still has one"
+        );
+        assert_eq!(
+            frame.struck_eyes(),
+            0,
+            "the masked key's eye is already struck through, so it is showing the wrong \
+             state and 'click to hide' is what the user reads"
         );
     }
 
@@ -3130,7 +3979,18 @@ mod tests {
             "a revealed SSH private key did not paint, so the pane ignores the caller's \
              reveal state: {texts:?}"
         );
-        assert!(contains(&texts, "Hide"), "a revealed row still offers Reveal: {texts:?}");
+        // The other direction of the same state: revealed, the eye is struck
+        // through. Without this pair, `eye_toggle` could ignore its argument
+        // and both states would look identical.
+        let mut pane = Pane::new();
+        pane.reveal.ssh_private_key = true;
+        let frame = pane.idle(&an_ssh_key_item(), &TotpState::NoSecret);
+        assert_eq!(
+            frame.struck_eyes(),
+            1,
+            "a revealed private key's eye is not struck through, so the row still reads \
+             as 'click to reveal' with the key on screen"
+        );
     }
 
     /// Nothing but the private key is masked: a fingerprint behind bullets
@@ -3213,12 +4073,21 @@ mod tests {
             contains(&texts, "No SSH key details"),
             "an empty SSH key drew a heading over nothing: {texts:?}"
         );
-        for absent in ["Public key", "Fingerprint", "Private key", "Reveal"] {
+        for absent in ["Public key", "Fingerprint", "Private key"] {
             assert!(
                 !contains(&texts, absent),
                 "an empty SSH key drew a {absent:?} row it has no data for: {texts:?}"
             );
         }
+        // See `a_card_with_no_card_object_...`: the reveal control paints no
+        // string, so its absence is asserted against the shape. Paired with
+        // `the_ssh_private_key_is_not_painted_by_default`, where a populated
+        // SSH key really does paint one.
+        let mut pane = Pane::new();
+        assert!(
+            pane.idle(&an_item(Some(5)), &TotpState::NoSecret).eyes.is_empty(),
+            "an empty SSH key drew a masked row it has no data for"
+        );
     }
 
     /// The emptiness rule, expressed once and tested per field -- the same
@@ -3444,33 +4313,336 @@ mod tests {
         );
     }
 
-    /// `height: 34px` for both, one filled `#1b3fa0` and one outline-only,
-    /// with the primary's shortcut hint at 10px monospace beside its 13px
-    /// label rather than appended to it at the label's own size.
+    /// The strip's one remaining button is the design's `height: 34px`
+    /// filled primary, with its shortcut hint at 10px monospace beside its
+    /// 13px label rather than appended to it at the label's own size.
+    ///
+    /// The outlined half of the old pair is gone with Edit; what stands
+    /// beside the primary now is the star and the kebab, and
+    /// `the_star_and_the_kebab_share_the_strips_34px_hit_target` pins those
+    /// to the same height so the strip still sits on one line.
     #[test]
-    fn the_header_buttons_are_the_designs_34px_filled_and_outlined_pair() {
+    fn the_header_primary_button_is_the_designs_34px_filled_control() {
         let item = an_item(Some(1));
         let rects = painted_rects(&item, &TotpState::NoSecret);
-        let tall: Vec<_> = rects.iter().filter(|(r, _)| r.height() == 34.0).collect();
         assert!(
-            tall.iter().any(|(_, fill)| *fill == theme::BLUE),
+            rects
+                .iter()
+                .any(|(r, fill)| r.height() == 34.0 && *fill == theme::BLUE),
             "no 34px blue-filled \"Fill in app\" button: {rects:?}"
-        );
-        assert!(
-            tall.iter().any(|(_, fill)| *fill == theme::CARD),
-            "no 34px outline-only header button: {rects:?}"
         );
 
         let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        assert_eq!(
-            only(&painted, "Edit").1.size,
-            13.0,
-            "Edit is not the design's 13px"
-        );
         assert_eq!(only(&painted, "Fill in app").1.size, 13.0);
         let (_, hint) = only(&painted, "CTRL+SHIFT+F");
         assert_eq!(hint.size, 10.0, "the shortcut hint is not the design's 10px");
         assert_eq!(hint.family, egui::FontFamily::Monospace);
+    }
+
+    /// The two drawn controls are square at the strip's own 34px control
+    /// height, so their HIT TARGETS match the button between them rather
+    /// than being only as big as the marks they paint.
+    ///
+    /// A star drawn at its own 18px would look identical in a screenshot and
+    /// be half as easy to hit, which is exactly the kind of regression a
+    /// shape-drawn control invites: nothing about the painted geometry says
+    /// how big the clickable area is.
+    #[test]
+    fn the_star_and_the_kebab_share_the_strips_34px_hit_target() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let star = frame.star().rect;
+        let kebab = frame.kebab();
+        let primary = painted_rects(&item, &TotpState::NoSecret)
+            .into_iter()
+            .find(|(r, fill)| r.height() == 34.0 && *fill == theme::BLUE)
+            .map(|(r, _)| r)
+            .expect("no 34px primary button to measure the icons against");
+
+        // The marks are smaller than the band they sit in, so the painted
+        // geometry alone cannot say how big the hit target is. Two things
+        // can: that both sit on the primary's own centre line, and that a
+        // click near the TOP EDGE of the primary's 34px band -- well outside
+        // the marks themselves -- still activates each of them.
+        for (name, mark) in [("star", star), ("kebab", kebab)] {
+            assert!(
+                (mark.center().y - primary.center().y).abs() <= 0.5,
+                "the {name} is not on the primary button's centre line"
+            );
+            assert!(
+                mark.height() < primary.height(),
+                "the {name}'s painted mark already fills the whole 34px band, so the \
+                 edge click below proves nothing about its hit target"
+            );
+        }
+
+        let corner = |mark: egui::Rect| egui::pos2(mark.center().x, primary.top() + 2.0);
+
+        let mut star_pane = Pane::new();
+        let _ = star_pane.idle(&item, &TotpState::NoSecret);
+        let poked = star_pane.click(&item, &TotpState::NoSecret, corner(star));
+        assert_eq!(
+            poked.action,
+            DetailAction::ToggleFavorite(true),
+            "a click 2pt below the strip's top edge, over the star's column, missed the \
+             star -- its target is smaller than the 34px control beside it"
+        );
+
+        let mut kebab_pane = Pane::new();
+        let _ = kebab_pane.idle(&item, &TotpState::NoSecret);
+        let _ = kebab_pane.click(&item, &TotpState::NoSecret, corner(kebab));
+        assert!(
+            kebab_pane.idle(&item, &TotpState::NoSecret).painted("Delete"),
+            "a click 2pt below the strip's top edge, over the kebab's column, did not \
+             open the menu -- its target is smaller than the 34px control beside it"
+        );
+    }
+
+    /// **The strip fits at the width the app can actually be shrunk to, and
+    /// this is the defect that motivated the whole change.**
+    ///
+    /// Every other geometry test in this file lays the pane out at
+    /// [`PANE`] -- 900pt, which is a ~1500px window. The app's own minimum
+    /// is 900px WIDE IN TOTAL, and at that size the detail column is
+    /// [`MIN_PANE`]: 298pt. With four worded buttons in this strip,
+    /// "Fill in app" was measured painting at x = -34.5..21.9 -- entirely
+    /// off the pane -- and "Favourite" overlapping the item's own title.
+    /// Nothing caught it, because nothing tried that width.
+    ///
+    /// So: every header control fully inside the pane, and none of them
+    /// touching the title. Two properties, and the second is not implied by
+    /// the first -- a strip can fit and still be printed over the name.
+    #[test]
+    fn every_header_control_fits_inside_the_minimum_width_pane() {
+        let mut item = a_login();
+        // A name long enough to want the room, since a short one leaves
+        // slack that would hide exactly the overlap this pins.
+        item.name = "Ledgerline Treasury Portal".to_string();
+
+        let mut pane = Pane::wide(MIN_PANE);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let bounds = egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(MIN_PANE, PANE),
+        );
+
+        let title = frame.rect_of("Ledgerline Treasury Portal");
+        let fill = frame.rect_of("Fill in app");
+        let controls = [
+            ("the favourite star", frame.star().rect),
+            ("the Fill in app button", fill),
+            ("the kebab", frame.kebab()),
+        ];
+
+        for (name, rect) in controls {
+            assert!(
+                bounds.contains_rect(rect),
+                "{name} is painted at x = {}..{} on a {MIN_PANE}pt pane -- outside it",
+                rect.left(),
+                rect.right()
+            );
+            assert!(
+                rect.left() >= title.right(),
+                "{name} starts at x = {} while the title runs to x = {} -- they overlap",
+                rect.left(),
+                title.right()
+            );
+        }
+
+        // The positive control. Without it, a pane that painted no header at
+        // all would satisfy every assertion above by vacuity -- and
+        // `rect_of` would have caught that, but only for the two strings;
+        // the star and the kebab are found by shape, and "no star" is not
+        // distinguishable from "a star that fits" without this.
+        assert_eq!(frame.stars.len(), 1, "no star painted at the minimum width");
+        assert_eq!(frame.kebab_dots.len(), 3, "no kebab painted at the minimum width");
+    }
+
+    /// The minimum width is the app's, not this test's. If
+    /// `MIN_VAULT_WINDOW_SIZE` or either side panel moves, the assertion
+    /// above follows it -- and this is what says so out loud, so a future
+    /// reader does not have to re-derive 298 to know what is being checked.
+    #[test]
+    fn the_minimum_detail_pane_is_the_window_minimum_less_both_side_panels() {
+        assert_eq!(MIN_PANE, 298.0);
+        assert!(
+            MIN_PANE < PANE,
+            "the minimum-width test is laying out a WIDER pane than the ordinary one"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The keyboard copies (CTRL+B / CTRL+U / CTRL+T)
+    // -----------------------------------------------------------------
+
+    /// The three chords, and the three fields, as a table -- so a
+    /// `copy_shortcut_action` that returned one fixed answer cannot pass.
+    #[test]
+    fn each_binding_copies_its_own_field() {
+        let code = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Password, "u", "p", &code),
+            Some(DetailAction::CopyPassword)
+        );
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Username, "u", "p", &code),
+            Some(DetailAction::CopyUsername)
+        );
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Totp, "u", "p", &code),
+            Some(DetailAction::CopyTotp)
+        );
+    }
+
+    /// **A binding whose field is missing copies NOTHING.** Not an empty
+    /// string, and not some other field: the clipboard is a global the user
+    /// is about to paste, and both wrong answers are silent.
+    ///
+    /// Each case leaves the *other* two fields populated, so "returns None
+    /// for everything" is not what makes it pass.
+    #[test]
+    fn a_binding_whose_field_is_absent_copies_nothing() {
+        let code = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Username, "", "p", &code),
+            None,
+            "CTRL+U on an item with no username put something on the clipboard"
+        );
+        assert_eq!(
+            copy_shortcut_action(CopyShortcut::Password, "u", "", &code),
+            None,
+            "CTRL+B on an item with no password put something on the clipboard"
+        );
+        for empty in [
+            TotpState::NoSecret,
+            TotpState::Fetching,
+            TotpState::Unavailable,
+            TotpState::NoCodeReported,
+        ] {
+            assert_eq!(
+                copy_shortcut_action(CopyShortcut::Totp, "u", "p", &empty),
+                None,
+                "CTRL+T copied something while the TOTP state was {empty:?} -- there is \
+                 no code to copy in it"
+            );
+        }
+    }
+
+    /// The hints say what the code binds, because they are the same table.
+    /// A row advertising `CTRL+B` beside a handler wired to something else
+    /// is worse than no hint at all.
+    #[test]
+    fn every_binding_has_a_hint_that_names_its_own_key() {
+        for (which, key, hint) in COPY_SHORTCUTS {
+            assert_eq!(copy_shortcut_hint(which), hint);
+            assert_eq!(
+                hint,
+                format!("CTRL+{}", key.name()),
+                "{which:?}'s hint does not spell the key it is bound to"
+            );
+        }
+    }
+
+    /// And the hints really paint, on the rows they belong to.
+    #[test]
+    fn the_copy_hints_paint_on_the_rows_they_belong_to() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let totp = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &totp);
+
+        for (label, hint) in [
+            ("Username", "CTRL+U"),
+            ("Password", "CTRL+B"),
+            ("One-time code", "CTRL+T"),
+        ] {
+            let row = frame.rect_of(label);
+            let tag = frame.rect_of(hint);
+            assert!(
+                (tag.center().y - row.center().y).abs() <= 2.0,
+                "the {hint} hint is not on the {label:?} row's own line; the pane \
+                 painted: {:?}",
+                frame.strings()
+            );
+        }
+    }
+
+    /// **The chords are wired.** The decision above is pure and tested
+    /// directly; this is the other half -- that `draw_detail_read` actually
+    /// consults it, with a real key event rather than a source-text guard.
+    #[test]
+    fn pressing_each_chord_asks_for_that_chords_copy() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let totp = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        for (key, want) in [
+            (egui::Key::B, DetailAction::CopyPassword),
+            (egui::Key::U, DetailAction::CopyUsername),
+            (egui::Key::T, DetailAction::CopyTotp),
+        ] {
+            let mut pane = Pane::new();
+            let idle = pane.idle(&item, &totp);
+            assert_eq!(
+                idle.action,
+                DetailAction::None,
+                "the pane reported an action on a frame with no input at all"
+            );
+            let pressed = pane.frame(&item, &totp, ctrl(key));
+            assert_eq!(
+                pressed.action, want,
+                "CTRL+{} reported {:?}",
+                key.name(),
+                pressed.action
+            );
+        }
+    }
+
+    /// The same chord on an item that has nothing for it stays silent all
+    /// the way through the closure, not just in the pure function.
+    #[test]
+    fn a_chord_with_no_field_behind_it_reports_nothing_through_the_pane() {
+        // A card: no username, no password, no TOTP.
+        let item = a_full_card();
+        for key in [egui::Key::B, egui::Key::U, egui::Key::T] {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            let pressed = pane.frame(&item, &TotpState::NoSecret, ctrl(key));
+            assert_eq!(
+                pressed.action,
+                DetailAction::None,
+                "CTRL+{} on a card copied {:?}",
+                key.name(),
+                pressed.action
+            );
+        }
+        // The positive control: the same harness, the same chords, on an
+        // item that DOES carry the fields. Without it this test passes
+        // against a harness whose key events never arrive.
+        let login = a_login();
+        let mut pane = Pane::new();
+        let _ = pane.idle(&login, &TotpState::NoSecret);
+        assert_eq!(
+            pane.frame(&login, &TotpState::NoSecret, ctrl(egui::Key::B))
+                .action,
+            DetailAction::CopyPassword,
+            "no chord reaches this pane at all, so the silence above proves nothing"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -3554,34 +4726,36 @@ mod tests {
         );
     }
 
-    /// Every copyable row carries its own control, on that row's own centred
-    /// line -- not one Copy for the card. 28px tall, per the design.
+    /// **Every copyable row copies its OWN value.**
+    ///
+    /// The previous version of this test asserted that each row painted a
+    /// "Copy" button on its own centred line -- one per row rather than one
+    /// per card. The buttons are gone (the user asked for keys and a tile
+    /// click instead), so the same property is asserted where it actually
+    /// matters: a click on each row reports that row's copy and not its
+    /// neighbour's. That is strictly stronger. The old test passed against
+    /// five buttons all wired to `CopyValue(cardholder)`; this one does not.
     #[test]
-    fn every_copyable_row_has_a_28px_copy_control_on_its_own_line() {
+    fn every_copyable_row_copies_its_own_value() {
         let item = a_full_card();
-        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        for label in [
-            "Cardholder name",
-            "Brand",
-            "Number",
-            "Expiry",
-            "Security code",
-        ] {
-            let (row, _) = only(&painted, label);
-            assert!(
-                painted
-                    .iter()
-                    .any(|(t, r, _)| t == "Copy" && (r.center().y - row.center().y).abs() <= 2.0),
-                "the {label:?} row has no Copy control on its own line: {painted:?}"
+        let expected = [
+            ("Cardholder name", DetailAction::CopyValue("John Doe".to_string())),
+            ("Brand", DetailAction::CopyValue("visa".to_string())),
+            ("Number", DetailAction::CopyCardNumber),
+            ("Expiry", DetailAction::CopyValue("04/2023".to_string())),
+            ("Security code", DetailAction::CopyCardCode),
+        ];
+        for (label, want) in expected {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let clicked = pane.click(&item, &TotpState::NoSecret, row.center());
+            assert_eq!(
+                clicked.action, want,
+                "clicking the {label:?} row reported {:?}",
+                clicked.action
             );
         }
-        let rects = painted_rects(&item, &TotpState::NoSecret);
-        assert!(
-            rects
-                .iter()
-                .any(|(r, fill)| r.height() == 28.0 && *fill == theme::CARD),
-            "no 28px row control anywhere on the card pane: {rects:?}"
-        );
     }
 
     /// The password row goes through the same `masked_row` the two card
@@ -3596,9 +4770,11 @@ mod tests {
             !contains(&masked, "hunter2"),
             "the password was painted in the clear by default: {masked:?}"
         );
-        assert!(
-            contains(&masked, "Reveal"),
-            "the password row offers no way to reveal what it masked: {masked:?}"
+        let mut pane = Pane::new();
+        assert_eq!(
+            pane.idle(&item, &TotpState::NoSecret).eyes.len(),
+            1,
+            "the password row offers no way to reveal what it masked"
         );
 
         let revealed = painted_with_reveal(
@@ -3646,28 +4822,41 @@ mod tests {
     // Favourites
     // -----------------------------------------------------------------
 
+    /// **The star states the current state, and both states are drawn.**
+    ///
+    /// This used to read the words "Favourite"/"Favourited" off the header.
+    /// The control paints no words now, so what is asserted is the only
+    /// thing left that distinguishes the two: a favourited item's star is
+    /// FILLED, in the palette's own "on" blue, and an un-favourited one's is
+    /// an outline that is not blue.
+    ///
+    /// Both directions, exactly as before -- one alone would pass against a
+    /// star hardcoded to whichever state the test happened to expect, which
+    /// is the same defect the two labels were guarding against.
     #[test]
-    fn the_header_offers_a_favourite_control_whose_label_states_the_current_state() {
-        // Both directions. One alone would pass against a control hardcoded
-        // to whichever label the test happened to expect.
+    fn the_header_star_is_filled_exactly_when_the_item_is_a_favourite() {
         let mut item = a_login();
 
         item.favorite = false;
-        let off = painted(&item, &TotpState::NoSecret);
+        let off = Pane::new().idle(&item, &TotpState::NoSecret).star();
         assert!(
-            off.iter().any(|t| t == "Favourite"),
-            "an un-favourited item's header offers no Favourite control: {off:?}"
+            !off.filled,
+            "an un-favourited item's star is filled, so it claims the item already is one"
         );
-        assert!(
-            !off.iter().any(|t| t == "Favourited"),
-            "an un-favourited item's header claims it is already a favourite: {off:?}"
+        assert_ne!(
+            off.stroke,
+            theme::BLUE,
+            "an un-favourited item's star is drawn in the palette's ON colour"
         );
 
         item.favorite = true;
-        let on = painted(&item, &TotpState::NoSecret);
-        assert!(
-            on.iter().any(|t| t == "Favourited"),
-            "a favourited item's header does not say so: {on:?}"
+        let on = Pane::new().idle(&item, &TotpState::NoSecret).star();
+        assert!(on.filled, "a favourited item's star is not filled, so it does not say so");
+        assert_eq!(
+            on.stroke,
+            theme::BLUE,
+            "a favourited item's star is not the design's primary blue -- ERROR red is \
+             reserved for failures and cannot be borrowed for an ON state"
         );
     }
 
@@ -3680,10 +4869,12 @@ mod tests {
         // sidebar offers unreachable for four of the five kinds.
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
-            let texts = painted(&item, &TotpState::NoSecret);
-            assert!(
-                texts.iter().any(|t| t == "Favourite"),
-                "{kind:?} has no favourite control: {texts:?}"
+            let frame = Pane::new().idle(&item, &TotpState::NoSecret);
+            assert_eq!(
+                frame.stars.len(),
+                1,
+                "{kind:?} has no favourite control; the pane painted: {:?}",
+                frame.strings()
             );
         }
     }
@@ -3696,71 +4887,24 @@ mod tests {
         // so `vault_window::mod` never re-derives `!favorite` from a copy that
         // could differ. A bare `ToggleFavorite` would pass a weaker version of
         // this test and reintroduce that gap.
+        //
+        // The star is found by its geometry rather than by a label now (see
+        // `theme::icon_probe`), which is the only change: a drawn control is
+        // exactly as clickable as a worded one, and this test is what proves
+        // it stayed so.
         for starting_state in [false, true] {
             let mut item = a_login();
             item.favorite = starting_state;
 
-            let ctx = egui::Context::default();
-            let input = |events: Vec<egui::Event>| egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(PANE, PANE),
-                )),
-                events,
-                ..Default::default()
-            };
-            let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
-            theme::apply(&ctx);
-            let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            let control = laid_out.star().rect.center();
 
-            let mut reveal = RevealState::default();
-            let mut frame = |events: Vec<egui::Event>| {
-                let mut seen = DetailAction::None;
-                let output = ctx.run_ui(input(events), |ui| {
-                    seen = draw_detail_read(
-                        ui,
-                        &item,
-                        3,
-                        &TotpState::NoSecret,
-                        false,
-                        &mut reveal,
-                        None,
-                    );
-                });
-                let mut rects = Vec::new();
-                for clipped in &output.shapes {
-                    collect_text_rects(&clipped.shape, &mut rects);
-                }
-                (seen, rects)
-            };
-
-            let label = if starting_state { "Favourited" } else { "Favourite" };
-            let (_, laid_out) = frame(Vec::new());
-            let control = laid_out
-                .iter()
-                .find(|(text, _)| text == label)
-                .map(|(_, rect)| rect.center())
-                .unwrap_or_else(|| panic!("no {label:?} control painted: {laid_out:?}"));
-
-            let (action, _) = frame(vec![
-                egui::Event::PointerMoved(control),
-                egui::Event::PointerButton {
-                    pos: control,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-                egui::Event::PointerButton {
-                    pos: control,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ]);
+            let clicked = pane.click(&item, &TotpState::NoSecret, control);
             assert_eq!(
-                action,
+                clicked.action,
                 DetailAction::ToggleFavorite(!starting_state),
-                "clicking the favourite control on an item whose favorite is \
+                "clicking the favourite star on an item whose favorite is \
                  {starting_state} did not ask for {}",
                 !starting_state
             );
@@ -3820,9 +4964,16 @@ mod tests {
             !contains(&texts, "old-secret-1"),
             "a previous password was painted in the clear by default: {texts:?}"
         );
-        assert!(
-            contains(&texts, "Reveal"),
-            "the history card offers no way to reveal what it masked: {texts:?}"
+        // One eye per history row, plus the login's own password row. Two
+        // history entries here, so three -- a count, not a `contains`, so a
+        // card that grew a heading and lost its rows fails.
+        let mut pane = Pane::new();
+        assert_eq!(
+            pane.idle(&a_login_with_history(2), &TotpState::NoSecret)
+                .eyes
+                .len(),
+            3,
+            "the history card offers no way to reveal what it masked"
         );
     }
 
