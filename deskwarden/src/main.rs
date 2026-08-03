@@ -8455,15 +8455,22 @@ mod tests {
             .split_once("(None, None)")
             .expect("the account-less arm must still evaluate to no account and no state")
             .0;
+        // From the `message_box(` onwards, NOT the whole arm. The arm already
+        // holds a `log::warn!("{reason}; ...")`, so an assertion over the arm
+        // is satisfied by the log line this test exists to say is not enough.
+        let notice = arm
+            .split_once(concat!("message", "_box("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the account-less startup shows the user nothing: the app has no switcher, \
+                     no accounts submenu and a signed-out CLI, and the only trace is a log line"
+                )
+            })
+            .1;
         assert!(
-            arm.contains(concat!("message", "_box(")),
-            "the account-less startup shows the user nothing: the app has no switcher, no \
-             accounts submenu and a signed-out CLI, and the only trace is a log line"
-        );
-        assert!(
-            arm.contains("{reason}"),
+            notice.contains("{reason}"),
             "a notice is shown but the refusal's own reason is not in it — which is the half \
-             that names the directories holding the user's vaults"
+             that names the directories holding the user's vaults. It reads: {notice:?}"
         );
         // Positive controls: the region really is that arm, and it is an arm
         // rather than the rest of the file.
