@@ -2753,7 +2753,6 @@ fn resettle_session_with(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Constructed by the caller that owns the `authenticate` closure, which is the
 // tray wiring in Task 11; until then only this file's tests build one.
-#[allow(dead_code)]
 enum ResettleReport {
     /// [`ResettleOutcome::BackendStarted`]: the account is live.
     Settled,
@@ -2767,7 +2766,6 @@ enum ResettleReport {
 /// Where an account switch left the app.
 #[derive(Debug, Clone, PartialEq, Eq)]
 // Returned to the tray wiring in Task 11; see `ResettleReport` above.
-#[allow(dead_code)]
 enum SwitchOutcome {
     /// The target account is live: its backend is up, its cache is populated
     /// from its own vault and its matches are armed from those items.
@@ -3152,7 +3150,6 @@ fn add_account(
 /// user declines -- a switch authenticates through `run_login_flow_for`, which
 /// can answer `None`, and that `None` is this function's `Declined`.
 // Called by the tray wiring in Task 11; see `ResettleReport` above.
-#[allow(dead_code)]
 fn switch_to_account(
     config_dir: &Path,
     from: &Account,
@@ -5797,7 +5794,16 @@ mod tests {
             .split_once(concat!("fn confirm_account", "_removal(label: &str) -> bool {"))
             .expect("the confirmation must still exist")
             .1;
-        let body = body.split_once("\r\n}").expect("its body must be closed").0;
+        // Ending-agnostic: a `"\r\n}"` needle here silently stopped matching
+        // the moment a tool rewrote this file with LF endings, and the test
+        // then failed for a reason that had nothing to do with what it
+        // guards. The repo has files in both states, so no needle in it may
+        // carry a line ending.
+        let body = body
+            .split_once("\n}")
+            .expect("its body must be closed")
+            .0
+            .trim_end_matches('\r');
         assert!(
             body.contains(concat!("MB_DEF", "BUTTON2")),
             "the removal prompt defaults to Yes: {body:?}"
