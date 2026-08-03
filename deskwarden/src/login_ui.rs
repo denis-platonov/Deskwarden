@@ -479,6 +479,7 @@ pub const FOOTER_RESERVE: f32 = 62.0;
 /// The OS-level window title stays "Log in to Deskwarden" -- that is what the
 /// taskbar and `round_window_corners` see, and it is what tells the two
 /// windows apart to everything outside this process.
+const WINDOW_TITLE: &str = "Log in to Deskwarden";
 const VAULT_WINDOW_TITLE: &str = crate::vault_window::WINDOW_TITLE;
 
 /// The login card's width -- unchanged. The card's composition is the design's
@@ -2010,7 +2011,7 @@ pub fn run_login_flow_for(
 
     let mut styled = false;
 
-    let _ = eframe::run_ui_native("Log in to Deskwarden", options, move |ui, _frame| {
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
@@ -2019,7 +2020,15 @@ pub fn run_login_flow_for(
             // starts on the next one, once the fonts are actually live.
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
-            round_window_corners("Log in to Deskwarden");
+            round_window_corners(WINDOW_TITLE);
+            // Same hook, same reason as every other window this app opens:
+            // this is the first frame on which the OS window exists, so it
+            // is the first moment it can be asked to come forward. Without
+            // it the login window can land behind whatever the user was
+            // doing while `bw serve` started -- and the Hello prompt this
+            // window raises is itself parented to nothing, so a login
+            // window that is already behind takes the prompt down with it.
+            let _ = crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;

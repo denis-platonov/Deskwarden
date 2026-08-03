@@ -554,8 +554,13 @@ mod tests {
     #[test]
     fn every_window_this_crate_opens_asks_to_be_brought_to_the_front() {
         // (name, source, the title identifier it opens under, how many windows)
-        let sites: [(&str, &str, &str, usize); 4] = [
+        let sites: [(&str, &str, &str, usize); 5] = [
             ("vault_window/mod.rs", include_str!("vault_window/mod.rs"), "WINDOW_TITLE", 1),
+            // Added when the login window got its raise. It was excluded
+            // while another agent owned that file, and an excluded site is
+            // an unguarded one: the raise was applied there and nothing in
+            // this test would have noticed it being deleted again.
+            ("login_ui.rs", include_str!("login_ui.rs"), "WINDOW_TITLE", 1),
             ("prefs_ui.rs", include_str!("prefs_ui.rs"), "WINDOW_TITLE", 1),
             ("loading_ui.rs", include_str!("loading_ui.rs"), "WINDOW_TITLE", 1),
             // Two windows, two titles; the second is checked just below the
