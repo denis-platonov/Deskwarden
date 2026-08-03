@@ -38,8 +38,14 @@ const ID_LEN: usize = 32;
 /// goes through `parse` as well (see the hand-written `Deserialize` impl below
 /// — a derived one on a transparent newtype would accept whatever string was
 /// in the file).
+///
+/// Deliberately **no** `#[serde(transparent)]`: serde's derive already
+/// serializes a newtype as its inner value, so the attribute is a no-op here.
+/// It was removed after a mutation run showed it could be deleted with the
+/// whole suite still green — a decoration a later reader would have taken for
+/// a load-bearing guarantee. What actually holds the wire format is
+/// `an_id_serializes_as_a_bare_string_so_settings_json_stays_readable`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
-#[serde(transparent)]
 pub struct AccountId(String);
 
 impl AccountId {
@@ -334,9 +340,12 @@ mod tests {
 
     #[test]
     fn an_id_serializes_as_a_bare_string_so_settings_json_stays_readable() {
-        // Pins `#[serde(transparent)]`. Without it the id would round-trip as
-        // `{"0":"..."}` against a `Deserialize` that expects a string, so
-        // every saved account would fail to load on the next launch.
+        // Pins the wire format Task 5's settings file will hold: a bare JSON
+        // string. Verified failable by mutation -- a `Serialize` that emits
+        // `{"value":"..."}`, or one that "normalises" the id to uppercase,
+        // both fail here and in the round-trip below. (It does NOT pin
+        // `#[serde(transparent)]`; that attribute is a no-op for a newtype and
+        // has been removed rather than left looking load-bearing.)
         assert_eq!(serde_json::to_string(&id(A)).unwrap(), format!("\"{A}\""));
         assert_eq!(
             serde_json::from_str::<AccountId>(&serde_json::to_string(&id(A)).unwrap()).unwrap(),
