@@ -1264,11 +1264,12 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(
-                scanned,
-                MUST_NOT_DECIDE_FOR_THEMSELVES.len(),
-                "the scan did not read every file it names"
-            );
+            // A literal, not `MUST_NOT_DECIDE_FOR_THEMSELVES.len()`: a test
+            // that re-derives its expectation from the constant under test
+            // passes for every value that constant could hold, including an
+            // empty list -- which is what deleting this guard looks like from
+            // the outside.
+            assert_eq!(scanned, 6, "the scan did not read every file it names");
             // Positive controls, on the same needles and the same reader: they
             // ARE spelled that way, and they DO appear in the file that is
             // allowed to name them.
