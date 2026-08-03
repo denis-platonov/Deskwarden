@@ -379,6 +379,26 @@ pub struct Settings {
     /// that is no longer in the list is resolvable to "none", where a stale
     /// index is not.
     pub active_account: Option<crate::accounts::AccountId>,
+    /// The file exists, is not empty, and could not be read back as settings.
+    ///
+    /// **Never serialized** (`#[serde(skip)]`): it is a fact about *this read*,
+    /// not a preference.
+    ///
+    /// [`Self::load`] has always answered a failed parse with
+    /// [`Self::default`], and for the preference fields that is right — a
+    /// corrupt file is not a reason to refuse to start. For
+    /// [`Self::accounts`] it is not, and the reason is the meaning that field
+    /// carries: an empty list is *"the migration has not run yet"*. So a
+    /// single unparseable account id — a hand edit, a truncated write — would
+    /// otherwise present as a machine that has never migrated, and startup
+    /// would mint a fresh account and [`Self::persist_accounts`] would write
+    /// it over the list it could not read. The vault would still be in
+    /// `accounts/<old-id>/`, and nothing on disk would still say so.
+    ///
+    /// So the distinction is kept and acted on twice: startup refuses to
+    /// migrate while it is set, and [`Self::save`] refuses to write at all.
+    #[serde(skip)]
+    pub accounts_unreadable: bool,
 }
 
 impl Default for Settings {
@@ -390,16 +410,31 @@ impl Default for Settings {
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
+            accounts_unreadable: false,
         }
     }
 }
 
 impl Settings {
+    /// Reads the file, falling back to the defaults for anything it cannot
+    /// read — but *recording* whether there was a file it failed on, in
+    /// [`Self::accounts_unreadable`]. See that field for why the difference
+    /// between "no file" and "a file I could not parse" is load-bearing here
+    /// and nowhere else in this struct.
+    ///
+    /// A file that is present but empty is treated as absent: that is what a
+    /// crashed write leaves, and there is nothing in it to lose.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        if let Ok(parsed) = serde_json::from_str::<Self>(&text) {
+            return parsed;
+        }
+        Self {
+            accounts_unreadable: !text.trim().is_empty(),
+            ..Self::default()
+        }
     }
 
     /// Writes this whole struct out, field for field.
@@ -414,7 +449,23 @@ impl Settings {
     /// which re-reads the file and overwrites only what it owns. A
     /// whole-struct save reachable from outside this module is exactly how the
     /// geometry came to be reverted by an unrelated preferences edit.
+    ///
+    /// Refuses outright when the copy it is about to write came from a read
+    /// that failed ([`Self::accounts_unreadable`]). All three writers below
+    /// are read-modify-writes over `Self::load`, so this one check covers
+    /// every one of them: without it, changing a single preference while
+    /// `settings.json` holds one unparseable account id would replace the
+    /// whole file with the defaults, and the account list — the only record of
+    /// which directory the user's vault is in — would be gone.
     fn save(&self, path: &Path) -> std::io::Result<()> {
+        if self.accounts_unreadable {
+            return Err(std::io::Error::other(format!(
+                "{} exists but could not be read as settings, so writing this copy back would \
+                 replace whatever is in it -- including an account list naming the directory \
+                 the vault is actually in. Nothing was written.",
+                path.display()
+            )));
+        }
         std::fs::write(path, serde_json::to_string_pretty(self)?)
     }
 
@@ -478,6 +529,10 @@ impl Settings {
             vault_window: _,
             accounts: _,
             active_account: _,
+            // Not a preference and not owned by anyone: it describes the read
+            // that produced `self`, and the copy this function writes is the
+            // one `Self::load` just made below, which carries its own.
+            accounts_unreadable: _,
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
@@ -565,6 +620,7 @@ mod tests {
             // function `persist_preferences`'s destructuring provides.
             accounts: Vec::new(),
             active_account: None,
+            accounts_unreadable: false,
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
@@ -593,7 +649,18 @@ mod tests {
     fn a_malformed_file_yields_defaults_rather_than_failing() {
         let path = temp_path("malformed");
         std::fs::write(&path, "{not json").unwrap();
-        assert_eq!(Settings::load(&path), Settings::default());
+        // Every *preference* still falls back to its default -- a corrupt file
+        // is not a reason to refuse to start. What is no longer defaulted away
+        // is the knowledge that a file was there and could not be read; see
+        // `accounts_unreadable` and
+        // `one_unparseable_account_id_is_not_read_as_a_machine_that_never_migrated`.
+        assert_eq!(
+            Settings::load(&path),
+            Settings {
+                accounts_unreadable: true,
+                ..Settings::default()
+            }
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -703,6 +770,7 @@ mod tests {
             vault_window: None,
             accounts: Vec::new(),
             active_account: None,
+            accounts_unreadable: false,
         };
         written.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -746,6 +814,7 @@ mod tests {
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),
             active_account: None,
+            accounts_unreadable: false,
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
@@ -1004,6 +1073,87 @@ mod tests {
     }
 
     #[test]
+    fn one_unparseable_account_id_is_not_read_as_a_machine_that_never_migrated() {
+        // Task 5 pinned "the whole file is discarded" as current behaviour and
+        // left narrowing it to whoever wired migration up. This is that, and
+        // the reason it could not stay: an empty account list MEANS "migration
+        // has not run", so a corrupt id would send startup to mint a fresh
+        // account and persist it over the list -- while the vault stayed in
+        // `accounts/<old-id>/` with nothing on disk still naming it.
+        let path = temp_path("bad-account-id");
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running":false,"accounts":[{"id":"NOT-AN-ID","email":"me@example.com","server_url":null}],"active_account":null}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load(&path);
+        assert!(
+            loaded.accounts_unreadable,
+            "an unreadable account list reads as a first install, which is what re-runs the \
+             migration and overwrites it"
+        );
+        assert!(loaded.accounts.is_empty(), "control: it still parsed as nothing");
+
+        // And the file is protected from every writer, because all three go
+        // through `load` then `save`.
+        let err = Settings::persist_accounts(&path, &[], None)
+            .expect_err("persisting an empty list over an unreadable one must be refused");
+        assert!(
+            err.to_string().contains("could not be read as settings"),
+            "unexpected refusal: {err}"
+        );
+        assert!(
+            loaded.persist_preferences(&path).is_err(),
+            "a preference edit would have replaced the whole file with the defaults"
+        );
+        let still_there = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            still_there.contains("NOT-AN-ID"),
+            "the file was rewritten anyway: {still_there}"
+        );
+
+        // Positive controls on all three, on the same file made valid: none of
+        // this is a writer that simply always refuses, and none of it is a
+        // loader that always reports trouble.
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running":false,"accounts":[],"active_account":null}"#,
+        )
+        .unwrap();
+        let good = Settings::load(&path);
+        assert!(!good.accounts_unreadable);
+        Settings::persist_accounts(&path, &[], None).expect("a readable file must be writable");
+        good.persist_preferences(&path)
+            .expect("a readable file must take a preference edit");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_absent_or_empty_settings_file_is_still_a_first_launch_rather_than_trouble() {
+        // The other side of the distinction above, and the one that must NOT
+        // move: no file at all is a first launch, and so is the zero-byte file
+        // a crashed write leaves. Reporting either as unreadable would refuse
+        // to migrate on the machine the migration exists for.
+        let path = temp_path("absent");
+        let _ = std::fs::remove_file(&path);
+        assert!(!Settings::load(&path).accounts_unreadable, "no file at all");
+
+        std::fs::write(&path, "").unwrap();
+        assert!(!Settings::load(&path).accounts_unreadable, "an empty file");
+        std::fs::write(&path, "   \r\n ").unwrap();
+        assert!(!Settings::load(&path).accounts_unreadable, "whitespace only");
+
+        // Positive control on the same reader and the same path: content that
+        // really is there and really is broken does report.
+        std::fs::write(&path, "{").unwrap();
+        assert!(Settings::load(&path).accounts_unreadable);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn the_account_list_round_trips_through_settings_json() {
         let path = temp_path("accounts-round-trip");
         let a = AccountId::parse("0123456789abcdef0123456789abcdef").unwrap();
@@ -1191,14 +1341,16 @@ mod tests {
 
     #[test]
     fn an_id_that_is_not_an_id_falls_the_whole_file_back_to_defaults() {
-        // Documenting what `Settings::load`'s existing "any parse failure is
-        // defaults" rule now means for a hand-edited account list, because it
-        // is no longer only a preference that is lost: an id that
-        // `AccountId::parse` rejects makes the whole file unparseable, the
-        // list reads as empty, and an empty list is the migration trigger.
-        // Narrowing that (dropping just the bad entry) is a change to `load`
-        // and a decision for whoever wires migration up, not for this task --
-        // but it must not be discovered by surprise.
+        // An id that `AccountId::parse` rejects still makes the whole file
+        // unparseable and the list still reads as empty -- that has not
+        // changed, and it is what keeps a traversal out of `data_dir_for`.
+        //
+        // What Task 11 added is the second half: an empty list is the
+        // migration trigger, so the read now also REPORTS that it failed, and
+        // startup refuses to migrate (and `save` refuses to write) while it
+        // says so. Task 5 flagged narrowing this as the decision belonging to
+        // whoever wired migration up; this is it, and it was narrowed by
+        // keeping the distinction rather than by accepting the bad entry.
         let path = temp_path("accounts-bad-id");
         std::fs::write(
             &path,
@@ -1207,7 +1359,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             Settings::load(&path),
-            Settings::default(),
+            Settings {
+                accounts_unreadable: true,
+                ..Settings::default()
+            },
             "a rejected id is not quietly turned into a usable account"
         );
 

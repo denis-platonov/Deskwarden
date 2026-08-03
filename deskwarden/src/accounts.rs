@@ -192,6 +192,158 @@ pub fn next_active_after_removal<'a>(
     accounts.iter().find(|a| &a.id != removed)
 }
 
+/// Creates an account's data directory if it is not there yet, and hands back
+/// the path.
+///
+/// Exists because [`session_path_for`] and [`hello_blob_path_for`] both name
+/// files *inside* it and neither writer creates it:
+/// [`SessionStore::new`](crate::session_store::SessionStore::new) is explicit
+/// that "its parent directory must already exist — the account directory is
+/// created when the account is". For a migrated account the copy created it;
+/// for an account this app mints (a first install, where there was no profile
+/// to migrate) nothing has, and without this call the very first `store.save`
+/// fails with "the system cannot find the path specified" — logged, survivable,
+/// and invisible except as a master-password prompt on every launch forever.
+///
+/// Idempotent, so startup can call it unconditionally rather than deciding
+/// which of the two cases it is in.
+pub fn ensure_account_dir(config_dir: &Path, id: &AccountId) -> std::io::Result<PathBuf> {
+    let dir = data_dir_for(config_dir, id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+// -------------------------------------------------- what startup resolves to
+
+/// What this launch is pointed at, once the migration has had its turn.
+///
+/// Exactly two shapes, because `main` has exactly two: an app pointed at an
+/// account directory, and *today's* app pointed at whatever profile the CLI
+/// would use by itself. The second is a fallback to existing behaviour, not a
+/// second implementation of anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupAccounts {
+    /// The normal case: at least one account, one of them active.
+    Ready {
+        active: Account,
+        accounts: Vec<Account>,
+        /// Whether the resolution changed something `settings.json` has to be
+        /// told about — a migrated or freshly minted account, or an active id
+        /// that named nobody.
+        needs_persist: bool,
+    },
+    /// Migration did not produce an account list. The app runs as a
+    /// single-account app against the CLI's own default directory, exactly as
+    /// it does today, and `reason` is what
+    /// [`AccountsState::blocked_reason`] reports wherever a switch would have
+    /// been.
+    ///
+    /// **This is the only state in which the app has no [`Account`] at all**,
+    /// and it is a startup condition rather than an account variant — see this
+    /// module's header on why `AccountLocation` does not exist.
+    Unmigrated { reason: String },
+}
+
+/// Which account this launch runs as, given what is stored and what the
+/// migration just did.
+///
+/// Pure, and deliberately given the migration's *answer* rather than the
+/// config directory: every effect belongs to the caller, so this can be driven
+/// through every branch without a `%APPDATA%` anywhere near it.
+///
+/// The one decision worth spelling out is which migration states may mint an
+/// account and which may not:
+///
+/// * [`Blocked`](crate::migration::MigrationState::Blocked) with nothing
+///   stored means the pre-existing profile is still sitting where it always
+///   was, untouched. Inventing an account here would point the CLI at an
+///   **empty** directory, and the app would present as signed out while the
+///   real vault sat a few directories away — the symptom a user reports as
+///   "the update deleted my vault".
+/// * [`Blocked`](crate::migration::MigrationState::Blocked) with accounts
+///   already stored is the opposite case and takes the opposite answer:
+///   migration ran on some earlier launch and a `bitwarden-cli` directory has
+///   appeared beside `bw.exe` since. The vault is in the account directory
+///   now, so the app is still `Ready` and points at it;
+///   [`AccountsState`] is what refuses the *switch*.
+/// * [`NothingToMigrate`](crate::migration::MigrationState::NothingToMigrate)
+///   with nothing stored is a new machine, not a failure. It gets one account
+///   directory to sign in to.
+pub fn resolve_startup(
+    stored: &[Account],
+    stored_active: Option<&AccountId>,
+    migration: &crate::migration::MigrationState,
+) -> StartupAccounts {
+    use crate::migration::MigrationState;
+
+    let mut accounts = stored.to_vec();
+    let mut needs_persist = false;
+    // The account this resolution is *introducing*, which is the one that then
+    // becomes active. `None` when nothing new arrived, in which case the
+    // stored active account is resumed and nothing is rewritten.
+    let mut introduced: Option<AccountId> = None;
+
+    if let MigrationState::Completed { account, .. } = migration {
+        // Only when it is not already there. `Completed` is reported by the
+        // launch that migrated, and a resumed `VerifyAndFinish` can report it
+        // again after the list was already written; appending twice would put
+        // two entries on one directory, and re-activating would silently drag
+        // the user off whichever account they had switched to.
+        if account_for(&accounts, &account.id).is_none() {
+            introduced = Some(account.id.clone());
+            accounts.push(account.clone());
+            needs_persist = true;
+        }
+    }
+
+    if accounts.is_empty() {
+        match migration {
+            MigrationState::Blocked { reason } => {
+                return StartupAccounts::Unmigrated {
+                    reason: reason.clone(),
+                };
+            }
+            // `Completed` cannot reach here — it pushed above — but it is
+            // spelled out rather than caught by a wildcard so that a later
+            // variant has to be thought about instead of silently minting an
+            // account.
+            MigrationState::NothingToMigrate | MigrationState::Completed { .. } => {
+                let fresh = Account {
+                    id: AccountId::generate(),
+                    // Not known yet: nobody has signed in. Filled in by
+                    // whoever completes a sign-in against this directory.
+                    email: String::new(),
+                    server_url: None,
+                };
+                introduced = Some(fresh.id.clone());
+                accounts.push(fresh);
+                needs_persist = true;
+            }
+        }
+    }
+
+    let active = introduced
+        .as_ref()
+        .or(stored_active)
+        .and_then(|id| account_for(&accounts, id))
+        // A stored active id naming no stored account is a hand-edited
+        // `settings.json`, or a removal that crashed between the two writes.
+        // Falling through to "no active account" would leave the app with no
+        // directory to point the CLI at at all.
+        .or_else(|| accounts.first())
+        .expect("the account list is non-empty by construction above")
+        .clone();
+    if Some(&active.id) != stored_active {
+        needs_persist = true;
+    }
+
+    StartupAccounts::Ready {
+        active,
+        accounts,
+        needs_persist,
+    }
+}
+
 // ------------------------------------------- may this process switch at all?
 
 /// The one door for "may I offer another account, and which one am I on?".
@@ -1282,6 +1434,232 @@ mod tests {
                      above proves nothing"
                 );
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- 11.1
+
+    mod startup_resolution {
+        use super::*;
+        use crate::migration::MigrationState;
+
+        fn completed(account: &Account) -> MigrationState {
+            MigrationState::Completed {
+                account: account.clone(),
+                hello_needs_reenrolment: false,
+            }
+        }
+
+        #[test]
+        fn a_completed_migration_on_this_launch_becomes_the_active_account() {
+            let migrated = account(A);
+            let r = resolve_startup(
+                &[],
+                None,
+                &MigrationState::Completed {
+                    account: migrated.clone(),
+                    hello_needs_reenrolment: true,
+                },
+            );
+            let StartupAccounts::Ready {
+                active,
+                accounts,
+                needs_persist,
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(active.id, migrated.id);
+            assert_eq!(accounts.len(), 1);
+            assert!(
+                needs_persist,
+                "the migrated account must be written before the next launch"
+            );
+        }
+
+        #[test]
+        fn the_stored_active_account_is_resumed_on_a_later_launch() {
+            let (a, b) = (account(A), account(B));
+            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&a));
+            let StartupAccounts::Ready {
+                active,
+                accounts,
+                needs_persist,
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(
+                active.id, b.id,
+                "a restart must resume the account that was last active"
+            );
+            assert_eq!(accounts.len(), 2, "and must not drop the others");
+            assert!(!needs_persist, "nothing changed, so nothing is rewritten");
+        }
+
+        #[test]
+        fn an_active_id_naming_no_stored_account_falls_back_to_the_first() {
+            // A hand-edited settings.json, or an account removed by a build
+            // that crashed mid-write. Falling through to "no active account"
+            // would leave the app with nothing to point the CLI at.
+            let a = account(A);
+            let ghost = AccountId::parse(&"9".repeat(32)).unwrap();
+            let r = resolve_startup(&[a.clone()], Some(&ghost), &completed(&a));
+            let StartupAccounts::Ready {
+                active,
+                needs_persist,
+                ..
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(active.id, a.id);
+            assert!(
+                needs_persist,
+                "the dangling active id must be corrected on disk"
+            );
+        }
+
+        #[test]
+        fn a_blocked_migration_leaves_the_app_unmigrated_rather_than_inventing_an_account() {
+            // The failure path that keeps the app working. Inventing an
+            // `Account` here would point the CLI at an EMPTY directory and
+            // present as "signed out", while the real profile sat untouched a
+            // few directories away -- the exact symptom a user would report as
+            // "the update deleted my vault".
+            let r = resolve_startup(
+                &[],
+                None,
+                &MigrationState::Blocked {
+                    reason: "the copy could not be verified".into(),
+                },
+            );
+            let StartupAccounts::Unmigrated { reason } = r else {
+                panic!("{r:?}")
+            };
+            assert!(reason.contains("could not be verified"));
+        }
+
+        #[test]
+        fn a_first_install_gets_one_fresh_account_rather_than_running_unmigrated() {
+            // `NothingToMigrate` is not a failure: there was no profile
+            // because this is a new machine. Give it an account directory and
+            // let the user sign in there.
+            let r = resolve_startup(&[], None, &MigrationState::NothingToMigrate);
+            let StartupAccounts::Ready {
+                active,
+                accounts,
+                needs_persist,
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(accounts.len(), 1);
+            assert!(needs_persist);
+            assert_eq!(
+                accounts[0].id, active.id,
+                "the minted account is the one that becomes active"
+            );
+        }
+
+        #[test]
+        fn a_block_that_appears_after_the_migration_still_resumes_the_migrated_account() {
+            // Not in the plan, and the inverse of the test above it. A
+            // `bitwarden-cli` directory appearing beside `bw.exe` AFTER the
+            // profile was migrated blocks the migration report on every later
+            // launch -- and reading that as `Unmigrated` would point the CLI
+            // at its own default profile while the vault sits in
+            // `accounts/<id>/`. That is the same "signed out on upgrade"
+            // symptom the empty-list case exists to avoid, arrived at from the
+            // opposite direction: refusing to migrate is safe, refusing to
+            // RESUME is not.
+            let a = account(A);
+            let r = resolve_startup(
+                &[a.clone()],
+                Some(&a.id),
+                &MigrationState::Blocked {
+                    reason: "a bitwarden-cli directory sits beside bw.exe".into(),
+                },
+            );
+            let StartupAccounts::Ready {
+                active,
+                needs_persist,
+                ..
+            } = r
+            else {
+                panic!("a migrated account was dropped when a later launch was blocked: {r:?}")
+            };
+            assert_eq!(active.id, a.id);
+            assert!(!needs_persist);
+        }
+
+        #[test]
+        fn a_completed_migration_reported_twice_neither_duplicates_nor_re_activates() {
+            // A crash between deleting the source and clearing the marker
+            // leaves `VerifyAndFinish`, so a LATER launch can report
+            // `Completed` for an account that is already stored -- and by then
+            // the user may have added and switched to a second one. Appending
+            // again would put two menu entries on one directory; re-activating
+            // would silently drag them back.
+            let (a, b) = (account(A), account(B));
+            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&a));
+            let StartupAccounts::Ready {
+                active,
+                accounts,
+                needs_persist,
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(accounts.len(), 2, "the migrated account was added twice");
+            assert_eq!(active.id, b.id, "the user was dragged back off their pick");
+            assert!(!needs_persist);
+            // Positive control on the same call shape: an account the list
+            // does NOT hold really is added and really does become active.
+            let fresh = account(&"c".repeat(32));
+            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&fresh));
+            let StartupAccounts::Ready {
+                active, accounts, ..
+            } = r
+            else {
+                panic!("{r:?}")
+            };
+            assert_eq!(accounts.len(), 3);
+            assert_eq!(active.id, fresh.id);
+        }
+
+        #[test]
+        fn ensure_account_dir_creates_the_directory_a_session_token_needs_and_repeats_safely() {
+            // `SessionStore::new`'s contract is that the parent directory
+            // already exists; nothing else on the first-install path creates
+            // it. Scratch directory under %TEMP% -- never the real config
+            // directory.
+            let root = std::env::temp_dir().join(format!(
+                "deskwarden-ensure-dir-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let id = AccountId::generate();
+            assert!(
+                !data_dir_for(&root, &id).is_dir(),
+                "control: the directory is not there before the call"
+            );
+
+            let made = ensure_account_dir(&root, &id).expect("the directory must be created");
+            assert_eq!(made, data_dir_for(&root, &id));
+            assert!(made.is_dir());
+
+            // Idempotent, and it does not clear what is already inside: a
+            // second launch calls this before reading the session token.
+            std::fs::write(session_path_for(&root, &id), b"wrapped").unwrap();
+            ensure_account_dir(&root, &id).expect("the second call must succeed too");
+            assert!(
+                session_path_for(&root, &id).is_file(),
+                "the second call threw away the account's session token"
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
         }
     }
 }

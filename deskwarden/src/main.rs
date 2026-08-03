@@ -51,8 +51,8 @@ use deskwarden::vault_cache::{
     VaultUnavailable,
 };
 use deskwarden::{
-    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui, prefs_ui,
-    session_store, settings, tray, vault_window, window_watch,
+    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, migration, picker_ui,
+    prefs_ui, session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
 use std::path::Path;
@@ -61,8 +61,9 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK,
-    MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
+    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE,
 };
 
 /// How often to poll GitHub for a newer release. Checked on startup and then
@@ -200,12 +201,6 @@ fn main() {
         Err(e) => log::warn!("could not clean up stale update downloads: {e}"),
     }
 
-    let session_path = config_dir.join("session.bin");
-    let store = session_store::SessionStore::new(session_path);
-
-    let fill_stats_path = config_dir.join("fill-stats.json");
-    let fill_stats = fill_stats::FillStats::new(fill_stats_path);
-
     // User preferences (backend lifecycle, auto-lock timeout). A missing or
     // corrupt file falls back to defaults -- see `Settings::load` -- so this
     // is never a reason startup fails.
@@ -226,6 +221,170 @@ fn main() {
     // precisely so a stale copy of it can never be written back.
     let settings_path = config_dir.join("settings.json");
     let mut settings = settings::Settings::load(&settings_path);
+
+    // ------------------------------------------------------------------
+    // Which account is this launch?
+    //
+    // The order below is the whole of it, and every step of it is load-
+    // bearing:
+    //
+    //   1. migrate    -- the pre-existing profile moves into `accounts/<id>/`
+    //                    (once, ever). Resolving first would resolve against a
+    //                    profile that is about to move.
+    //   2. resolve    -- which account this process runs as, given what is
+    //                    stored and what step 1 just did. Pure; see
+    //                    `accounts::resolve_startup`.
+    //   3. point      -- `BITWARDENCLI_APPDATA_DIR` and the token store are
+    //                    aimed at that account, BEFORE anything reads a token
+    //                    or spawns `bw`. The first launch after a migration
+    //                    would otherwise validate a token against the wrong
+    //                    profile and silently re-authenticate, which reads as
+    //                    "the update lost my login".
+    //
+    // Nothing here may kill the app. A migration that cannot run leaves the
+    // pre-existing profile exactly as it was and the app runs against it, as
+    // it does today -- so there is no `fatal_startup_error` anywhere in this
+    // block.
+    //
+    // `remember_verified_bw_exe` above is a prerequisite, not an ordering
+    // nicety: `multi_account_availability` looks beside the *verified*
+    // `bw.exe` for the `bitwarden-cli` directory that makes the CLI ignore
+    // `BITWARDENCLI_APPDATA_DIR`.
+    let availability = bw_path::multi_account_availability();
+    let migration = if settings.accounts_unreadable {
+        // `settings.json` is there and could not be read (see
+        // `Settings::accounts_unreadable`). Its account list therefore parsed
+        // as empty, and an empty list is what `migrate` reads as "this has
+        // never run" -- so migrating now would copy, verify and DELETE a
+        // profile on the strength of a list we know we cannot see. Refuse, and
+        // say so where the user will find it.
+        let reason = format!(
+            "{} could not be read, so Deskwarden cannot tell which accounts are already set up",
+            settings_path.display()
+        );
+        log::error!("{reason}; not migrating anything on this launch");
+        migration::MigrationState::Blocked { reason }
+    } else {
+        migration::migrate(
+            &config_dir,
+            migration::migration_source().as_deref(),
+            &availability,
+            !settings.accounts.is_empty(),
+            login_ui::check_bw_status_details_in,
+            || bw_serve::port_in_use(bw_serve::BW_SERVE_PORT),
+        )
+    };
+    if let migration::MigrationState::Completed {
+        hello_needs_reenrolment: true,
+        ..
+    } = &migration
+    {
+        // The one moment we know the user is at the machine: they just
+        // launched the app. A tray app has no window, and a quick-unlock panel
+        // that is silently absent is indistinguishable from Windows Hello
+        // never having been set up in the first place.
+        message_box(
+            "Deskwarden",
+            "Your Bitwarden profile has been moved so Deskwarden can hold more than one \
+             account.\n\nWindows Hello quick unlock has to be set up again -- tick \"Use \
+             Windows Hello\" the next time you enter your master password.",
+            MB_ICONINFORMATION | MB_OK,
+        );
+    }
+
+    let startup = accounts::resolve_startup(
+        &settings.accounts,
+        settings.active_account.as_ref(),
+        &migration,
+    );
+    // `accounts_state` is the one door for "may I switch accounts, and to
+    // what" (Task 10). It is built HERE and nowhere else, because this is the
+    // only place both of its inputs exist -- and every later reader asks it
+    // rather than recomputing either half. That includes the Hello notice
+    // below: `hello_needs_reenrolment` is a fact about the migration that has
+    // to survive into the window that shows it.
+    let (active_account, accounts_state) = match &startup {
+        accounts::StartupAccounts::Ready {
+            active,
+            accounts,
+            needs_persist,
+        } => {
+            if *needs_persist {
+                if let Err(e) =
+                    settings::Settings::persist_accounts(&settings_path, accounts, Some(&active.id))
+                {
+                    // Survivable: this launch is correctly pointed either way,
+                    // and the next one re-resolves from whatever is on disk.
+                    log::warn!("could not persist the account list: {e}");
+                }
+            }
+            let state = accounts::AccountsState::new(
+                availability,
+                migration,
+                accounts.clone(),
+                active.id.clone(),
+            );
+            (Some(active.clone()), state)
+        }
+        accounts::StartupAccounts::Unmigrated { reason } => {
+            log::warn!(
+                "{reason}; running as a single-account app against the CLI's default profile"
+            );
+            (None, None)
+        }
+    };
+    let hello_needs_reenrolment = accounts_state
+        .as_ref()
+        .is_some_and(accounts::AccountsState::hello_needs_reenrolment);
+    if let Some(why) = accounts_state
+        .as_ref()
+        .and_then(accounts::AccountsState::blocked_reason)
+    {
+        log::warn!("switching and adding accounts are unavailable on this machine: {why}");
+    }
+
+    // The two arms are "today's app" and "the account-aware app". This is a
+    // FALLBACK to existing behaviour, not a second implementation of anything:
+    // the switch, the resettle and the cache are untouched by it, and the
+    // `Unmigrated` arm reaches none of them because `AccountsState` is `None`
+    // there and so nothing offers a switch at all.
+    //
+    // The directory is created, not assumed. A migrated account's directory
+    // was made by the copy; an account this app minted on a first install has
+    // none, and `SessionStore` is explicit that it will not create its own
+    // parent -- so without this the very first `store.save` fails and the user
+    // retypes their master password on every launch, forever, with nothing
+    // else to see.
+    let (session_path, active_dir) = match &active_account {
+        Some(a) => {
+            if let Err(e) = accounts::ensure_account_dir(&config_dir, &a.id) {
+                log::error!(
+                    "could not create the data directory for the active account ({e}); its \
+                     session token and Windows Hello enrolment cannot be stored"
+                );
+            }
+            (
+                accounts::session_path_for(&config_dir, &a.id),
+                Some(accounts::data_dir_for(&config_dir, &a.id)),
+            )
+        }
+        None => (config_dir.join("session.bin"), None),
+    };
+    bw_path::set_active_data_dir(active_dir);
+    let store = session_store::SessionStore::new(session_path);
+
+    // What every login window this process opens is scoped to. Built once,
+    // here, so no call site can quietly go back to passing `None` and losing
+    // quick unlock -- see `login_ui::run_login_flow_for`.
+    let login = LoginContext {
+        account: active_account
+            .as_ref()
+            .map(|a| (config_dir.as_path(), a)),
+        hello_needs_reenrolment,
+    };
+
+    let fill_stats_path = config_dir.join("fill-stats.json");
+    let fill_stats = fill_stats::FillStats::new(fill_stats_path);
 
     // Every child process we spawn joins this job object, which is configured
     // to kill its members when the last handle closes. Our handles close when
@@ -263,12 +422,12 @@ fn main() {
             }
             other => {
                 log::warn!("cached session token reports {other:?}; re-authenticating");
-                reauthenticate(&store)
+                reauthenticate(&store, login)
             }
         },
         None => {
             log::info!("no cached session token; showing login flow");
-            reauthenticate(&store)
+            reauthenticate(&store, login)
         }
     };
 
@@ -329,6 +488,7 @@ fn main() {
                     &job,
                     &store,
                     &config_dir,
+                    login,
                 ),
                 VaultReadyOutcome::Failed(e) => recover_from_failed_vault_wait(
                     &e,
@@ -339,6 +499,7 @@ fn main() {
                     &job,
                     &store,
                     &config_dir,
+                    login,
                 ),
             }
         }
@@ -351,6 +512,7 @@ fn main() {
             &job,
             &store,
             &config_dir,
+            login,
         ),
     };
 
@@ -610,6 +772,7 @@ fn main() {
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
+                    login,
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -923,6 +1086,7 @@ fn main() {
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
+                    login,
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -1716,6 +1880,11 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // instead of being computed once by the caller, which is what lets a
     // timeout edited in that window apply to the very next vault window
     // rather than only to the next app launch.
+    // What the lock/re-auth prompt this window can raise is scoped to: the
+    // account this process is signed into. Threaded through rather than
+    // rebuilt here so there is exactly one place that decides which account a
+    // login window seals a master password for.
+    login: LoginContext<'_>,
     settings: &mut settings::Settings,
     settings_path: &std::path::Path,
     tray: &tray::AppTray,
@@ -1863,7 +2032,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             backend_task_in_progress,
             cached_status_details,
             session_token,
-            || Some(reauthenticate(store)),
+            || Some(reauthenticate(store, login)),
         );
     }
 
@@ -3146,13 +3315,14 @@ fn recover_from_failed_vault_wait(
     job: &Arc<Option<job_object::KillOnCloseJob>>,
     store: &session_store::SessionStore,
     config_dir: &std::path::Path,
+    login: LoginContext<'_>,
 ) -> Vec<deskwarden::vault_bridge::VaultItem> {
     log::error!("{reason}");
     log::warn!("retrying once after a fresh login, in case the session was rejected");
     if let Some(child) = bw_serve_child.as_mut() {
         bw_serve::stop_bw_serve(child);
     }
-    *session_token = reauthenticate(store);
+    *session_token = reauthenticate(store, login);
     // The longer grace: we just killed our own `bw serve`, and the user just
     // retyped their master password. Give the socket real time to come free
     // rather than aborting on them.
@@ -3200,8 +3370,26 @@ fn recover_from_failed_vault_wait(
 }
 
 /// Runs the login/unlock UI and persists the resulting session token.
-fn reauthenticate(store: &session_store::SessionStore) -> String {
-    let token = login_ui::run_login_flow();
+/// Everything a login window this process opens needs in order to be scoped to
+/// an account, carried as one `Copy` value so it can be threaded through
+/// `open_vault_window` and `recover_from_failed_vault_wait` without either of
+/// them growing two more parameters it does nothing with.
+///
+/// `account` is `None` in exactly one state --
+/// `accounts::StartupAccounts::Unmigrated`, where this app has no `Account` at
+/// all -- and the window then offers no Windows Hello quick unlock. It never
+/// falls back to an account-less enrolment: the only key derivation available
+/// without an account id is the empty KDF suffix
+/// (`accounts::hello_kdf_suffix_for`'s doc), and one account sealed under that
+/// is one account's master password every other account can open.
+#[derive(Clone, Copy)]
+struct LoginContext<'a> {
+    account: Option<(&'a Path, &'a Account)>,
+    hello_needs_reenrolment: bool,
+}
+
+fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) -> String {
+    let token = login_ui::run_login_flow(login.account, login.hello_needs_reenrolment);
     if let Err(e) = store.save(&token) {
         log::error!("failed to persist session token: {e}");
     }

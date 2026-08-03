@@ -88,7 +88,20 @@ pub fn check_bw_status() -> BwStatus {
 /// `BW_SESSION`. `None` when the CLI could not be run at all (no verified
 /// `bw.exe`, or the spawn failed) -- both already logged here.
 fn bw_status_stdout(session_token: Option<&str>) -> Option<String> {
-    let mut cmd = match bw_command() {
+    bw_status_stdout_in(crate::bw_path::active_data_dir().as_deref(), session_token)
+}
+
+/// [`bw_status_stdout`] against a **named** profile directory rather than the
+/// active account's.
+///
+/// `Some(dir)` is the only interesting case and the only one migration uses:
+/// asking the CLI "whose vault is in *this* directory?" is how a copy is
+/// verified before the original is deleted, and it has to be a different
+/// directory from the one this process is currently pointed at. `None` keeps
+/// `bw_command_in`'s meaning -- no override, so the child inherits whatever
+/// `BITWARDENCLI_APPDATA_DIR` the environment already had.
+fn bw_status_stdout_in(data_dir: Option<&Path>, session_token: Option<&str>) -> Option<String> {
+    let mut cmd = match crate::bw_path::bw_command_in(data_dir) {
         Ok(cmd) => cmd,
         Err(e) => {
             log::error!("cannot run `bw status`: {e}");
@@ -131,7 +144,20 @@ pub fn check_bw_status_with_session(session_token: Option<&str>) -> BwStatus {
 /// [`check_bw_status`] plus the account email and server URL, for the login
 /// window's 3h chrome.
 pub fn check_bw_status_details() -> BwStatusDetails {
-    bw_status_stdout(None)
+    check_bw_status_details_in(crate::bw_path::active_data_dir().as_deref())
+}
+
+/// [`check_bw_status_details`] asked of a **named** profile directory.
+///
+/// This is `migration::migrate`'s `status` parameter in production: the whole
+/// of "was the copy verified?" is this function answering, for the copy's own
+/// directory, with the email the source reported before anything was copied.
+/// A `status` that ignored its argument would answer for whatever profile this
+/// process happens to be pointed at -- which is how a verification passes
+/// while proving nothing, and the user's original profile is then deleted on
+/// the strength of it.
+pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
+    bw_status_stdout_in(data_dir, None)
         .map(|stdout| parse_bw_status_details(&stdout))
         .unwrap_or(BwStatusDetails {
             status: BwStatus::Unauthenticated,
@@ -1503,13 +1529,14 @@ fn spawn_auth(
 /// re-auth calls this and handles `None`.
 ///
 /// `account` is the account this window's Windows Hello enrollment belongs
-/// to, with the config directory it lives under. `None` means "no account
-/// has been resolved yet", which is the state `main.rs` is still in until
-/// startup is rewritten to resolve one; the window then simply offers no
-/// quick unlock, because there is no account whose blob it could read or
-/// write. It never falls back to a shared, account-less enrollment -- that
-/// path is gone, and reviving it would hand one account's sealed master
-/// password to another.
+/// to, with the config directory it lives under. `None` is the one startup
+/// condition in which this app has no account at all --
+/// `accounts::StartupAccounts::Unmigrated`, a machine where the migration was
+/// refused -- and the window then simply offers no quick unlock, because there
+/// is no account whose blob it could read or write. It never falls back to a
+/// shared, account-less enrollment: the only derivation available without an
+/// account is the empty KDF suffix, which would make one account's sealed
+/// master password openable by every other one.
 ///
 /// `hello_needs_reenrolment` draws [`HELLO_REENROLMENT_NOTICE`]; see
 /// [`draw_login_window`].
@@ -1524,13 +1551,6 @@ pub fn run_login_flow_for(
     // function's borrows are gone.
     let hello_scope: Option<(PathBuf, AccountId)> = account
         .map(|(config_dir, account)| (config_dir.to_path_buf(), account.id.clone()));
-    if hello_scope.is_none() {
-        log::warn!(
-            "login window opened without an account, so Windows Hello quick unlock is not \
-             offered in it: there is no account whose sealed master password could be read \
-             or written"
-        );
-    }
 
     // The update closure is FnMut + 'static and must move-capture its
     // state, so a plain local `Option<String>` can't be read back by this
@@ -1844,12 +1864,13 @@ pub fn run_login_flow_for(
 /// the master-password prompt during a switch would kill an app that was
 /// running perfectly well with a vault already open.
 ///
-/// It takes no account for now: `main.rs` has not been given one to pass yet
-/// (that is the startup rewrite's job), so this window offers no Windows
-/// Hello quick unlock in the meantime -- see [`run_login_flow_for`] on why
-/// there is no account-less fallback.
-pub fn run_login_flow() -> String {
-    match run_login_flow_for(None, false) {
+/// `account` and `hello_needs_reenrolment` are passed straight through to
+/// [`run_login_flow_for`]; this function decides what a closed window costs
+/// and nothing else. It takes them rather than hard-coding `None` because a
+/// hard-coded `None` is an app whose *startup* login window silently has no
+/// quick unlock -- which is the one login window every user meets.
+pub fn run_login_flow(account: Option<(&Path, &Account)>, hello_needs_reenrolment: bool) -> String {
+    match run_login_flow_for(account, hello_needs_reenrolment) {
         Some(session_token) => session_token,
         None => {
             // Exit cleanly with a logged reason rather than a raw panic
@@ -2462,7 +2483,7 @@ mod login_entry_point_tests {
         // compiling -- which is the failure. Task 9's switch is built on that
         // `Option` being there.
         let cancellable: fn(Option<(&Path, &Account)>, bool) -> Option<String> = run_login_flow_for;
-        let fatal: fn() -> String = run_login_flow;
+        let fatal: fn(Option<(&Path, &Account)>, bool) -> String = run_login_flow;
         assert!(
             !std::ptr::eq(cancellable as *const (), fatal as *const ()),
             "positive control: these must be two distinct functions"
