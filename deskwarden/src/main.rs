@@ -374,12 +374,25 @@ fn main() {
             // reported by `blocked_reason` where the switch is offered; a
             // modal on every launch for those would be nagging about
             // something the user can already see.
+            //
+            // NOT "Nothing has been deleted", which this said. One `Blocked`
+            // is reachable on a launch where the user's original profile is
+            // already gone: a resumed migration whose re-verification failed
+            // after an earlier run had verified and removed the source. The
+            // blanket claim was printed on precisely the launch it was least
+            // true of. `migration::rollback` says what is on disk and what was
+            // kept, in the same branch that decides it, so the modal states
+            // only what holds in every `Blocked` this arm can be reached from
+            // -- that no profile of the USER'S was removed on this launch; a
+            // failed first migration does delete the copy Deskwarden itself
+            // made -- and lets `reason` carry the rest.
             message_box(
                 "Deskwarden",
                 &format!(
                     "Deskwarden could not set up its accounts on this machine, so it is running \
                      with no account of its own -- there is no account switcher and the \
-                     Bitwarden CLI is signed out.\n\nNothing has been deleted.\n\n{reason}\n\nThe \
+                     Bitwarden CLI is signed out.\n\nNo Bitwarden profile of yours has been \
+                     deleted on this launch. What is on disk is described below.\n\n{reason}\n\nThe \
                      directories named above are under your Deskwarden configuration folder.",
                 ),
                 MB_ICONWARNING | MB_OK,

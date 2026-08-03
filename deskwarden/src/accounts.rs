@@ -396,11 +396,17 @@ pub fn claimed_ids(stored: &[Account]) -> Vec<AccountId> {
 /// account and which may not:
 ///
 /// * [`Blocked`](crate::migration::MigrationState::Blocked) with nothing
-///   stored means the pre-existing profile is still sitting where it always
-///   was, untouched. Inventing an account here would point the CLI at an
-///   **empty** directory, and the app would present as signed out while the
-///   real vault sat a few directories away — the symptom a user reports as
-///   "the update deleted my vault".
+///   stored means the user's vault is somewhere this launch did not put an
+///   account on. Usually that is the pre-existing profile, still sitting where
+///   it always was and untouched. It is **not** always: a resumed migration
+///   whose re-verification failed after an earlier run had already verified
+///   and deleted the source is `Blocked` too, and there the only copy is the
+///   one `migration::rollback` kept at `accounts/<id>` — which the next launch
+///   adopts, the marker having been cleared. Either way the answer is the
+///   same, and it is the answer that matters here: inventing an account would
+///   point the CLI at an **empty** directory, and the app would present as
+///   signed out while the real vault sat a few directories away — the symptom
+///   a user reports as "the update deleted my vault".
 /// * [`Blocked`](crate::migration::MigrationState::Blocked) with accounts
 ///   already stored is the opposite case and takes the opposite answer:
 ///   migration ran on some earlier launch and a `bitwarden-cli` directory has

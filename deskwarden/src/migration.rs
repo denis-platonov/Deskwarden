@@ -23,14 +23,29 @@
 //!    pass for a copy with a truncated `data.json`; the CLI refusing to
 //!    recognise the account is exactly the failure that must be caught while
 //!    the old copy still exists.
-//! 4. **Rollback on any failure.** Because nothing of the user's is deleted
-//!    before rule 3 passes, rollback is always "delete what we created, clear
-//!    the marker" — it can never need to *restore* anything.
+//! 4. **Rollback on any failure, and never delete the last copy.** Rollback
+//!    can never need to *restore* anything — nothing is restorable, so the
+//!    rule has to be stated as a bound on deletion instead. On the *first*
+//!    pass rule 3 is what carries it: nothing of the user's has been deleted
+//!    yet, so "delete what we created, clear the marker" is safe. On a
+//!    *resumed* pass it is not: rule 3 may have passed on a previous run, and
+//!    the marker does not record that, so `<id>` can be the only copy left
+//!    while the marker still says [`Stage::Promoted`]. [`rollback`] therefore
+//!    counts copies rather than trusting the stage, and keeps `accounts/<id>`
+//!    whenever the source no longer holds a [`PROFILE_FILE`]. The same bound
+//!    covers the staging directory: `<id>.incoming` is ours to delete only
+//!    while something else holds the vault.
 //! 5. **No on-disk state loses a real vault directory in silence.** Every
 //!    `accounts/<id>/` that holds a [`PROFILE_FILE`] is either *named by the
 //!    account list*, or *adopted into it*, or — when adopting would have to
 //!    guess — **refused, with every one of them named in the refusal**.
-//!    Nothing is ever left unreferenced and unmentioned.
+//!    Nothing is ever left unreferenced and unmentioned. That holds for the
+//!    two refusals that are decided *before* the set difference is computed
+//!    too — the `relativeDataDir` trap and the busy backend port — because
+//!    [`unclaimed_note`] is appended to both, and to the availability
+//!    explanation `main` substitutes for the first. Without that the trap,
+//!    which persists across every launch, would hide an orphaned vault
+//!    forever.
 //!
 //!    The marker covers the migration; it does not cover the *account list*,
 //!    which `main` writes only after [`migrate`] has returned. So the window
@@ -391,15 +406,57 @@ const REFUSE_PORT: &str =
 /// unreferenced vault the user is never told about is the loss the rule is
 /// about, and `main` puts this string in front of them.
 fn refuse_ambiguous_unclaimed(unclaimed: &[AccountId]) -> String {
-    let names = unclaimed
+    format!(
+        "{} each hold a Bitwarden profile that Deskwarden's account list does not name, and \
+         nothing on disk says which of them this app was signed in to; taking one would hide the \
+         others, so nothing has been adopted and nothing has been removed. To get past this, move \
+         all but one of those directories somewhere outside the accounts folder -- keep them, do \
+         not delete them -- and start Deskwarden again; the one left behind will be adopted.",
+        unclaimed_names(unclaimed)
+    )
+}
+
+/// The unclaimed directories, named the way the user sees them on disk.
+fn unclaimed_names(unclaimed: &[AccountId]) -> String {
+    unclaimed
         .iter()
         .map(|id| format!("accounts\\{id}"))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+/// Which `accounts/<id>/` hold a profile that the account list does not name —
+/// the set difference rule 5 is about.
+fn unclaimed_ids(observed: &Observed) -> Vec<AccountId> {
+    observed
+        .account_dirs_with_profile
+        .iter()
+        .filter(|id| !observed.claimed_account_ids.contains(id))
+        .cloned()
+        .collect()
+}
+
+/// What rule 5 makes the two *pre-decision* refusals say.
+///
+/// [`resume_action`]'s availability and port refusals return before the set
+/// difference is even computed, so on their own they cannot name a single
+/// directory — and `main` then replaces the availability reason wholesale with
+/// [`MultiAccountAvailability::explanation`], which knows nothing about the
+/// accounts tree at all. The port case is transient and would be forgiven; the
+/// `relativeDataDir` trap is not, because a `bitwarden-cli` directory beside
+/// `bw.exe` persists across every launch, so an orphaned vault would stay
+/// unreferenced *and* unmentioned indefinitely. That is precisely the loss rule
+/// 5 names, so both refusals carry the list and rule 5 stays true as written.
+///
+/// Empty when nothing is unclaimed, so the common refusal is unchanged.
+fn unclaimed_note(unclaimed: &[AccountId]) -> String {
+    if unclaimed.is_empty() {
+        return String::new();
+    }
     format!(
-        "{names} each hold a Bitwarden profile that Deskwarden's account list does not name, and \
-         nothing on disk says which of them this app was signed in to; taking one would hide the \
-         others, so nothing has been adopted and nothing has been removed"
+        " Separately: {} hold a Bitwarden profile that Deskwarden's account list does not name. \
+         Nothing has been done to them, and nothing will be until this is resolved.",
+        unclaimed_names(unclaimed)
     )
 }
 
@@ -413,14 +470,20 @@ fn refuse_ambiguous_unclaimed(unclaimed: &[AccountId]) -> String {
 /// Refusing leaves the marker and both directories exactly as they are, to be
 /// resumed on a launch where the trap is gone.
 pub fn resume_action(observed: &Observed) -> ResumeAction {
+    // Both of these refuse before any of the state below is looked at, so
+    // rule 5's half -- "named in the refusal" -- has to be attached here or it
+    // is not said at all. See [`unclaimed_note`].
     if !observed.multi_account_available {
         return ResumeAction::Refuse {
-            reason: REFUSE_UNAVAILABLE.to_string(),
+            reason: format!(
+                "{REFUSE_UNAVAILABLE}{}",
+                unclaimed_note(&unclaimed_ids(observed))
+            ),
         };
     }
     if observed.backend_port_in_use {
         return ResumeAction::Refuse {
-            reason: REFUSE_PORT.to_string(),
+            reason: format!("{REFUSE_PORT}{}", unclaimed_note(&unclaimed_ids(observed))),
         };
     }
 
@@ -436,12 +499,7 @@ pub fn resume_action(observed: &Observed) -> ResumeAction {
         // account list that names nothing and no unclaimed directory — which
         // is a first install and nothing else.
         None => {
-            let unclaimed: Vec<AccountId> = observed
-                .account_dirs_with_profile
-                .iter()
-                .filter(|id| !observed.claimed_account_ids.contains(id))
-                .cloned()
-                .collect();
+            let unclaimed = unclaimed_ids(observed);
             match unclaimed.as_slice() {
                 [] if observed.claimed_account_ids.is_empty() && observed.source_has_data_json => {
                     ResumeAction::StartFresh
@@ -467,11 +525,17 @@ pub fn resume_action(observed: &Observed) -> ResumeAction {
         // `<id>` may be the promoted copy. It is NOT yet trusted: verification
         // has not passed, and the source is still authoritative.
         //
-        // `<id>` present with no source is still `VerifyAndFinish`, and it is
-        // idempotent: verification runs against `<id>`, the source deletion is
-        // a no-op, the marker is removed. That is exactly the state a crash
-        // between "delete source" and "delete marker" produces, and reading it
-        // as an error would restart a migration that had already succeeded.
+        // `<id>` present with no source is still `VerifyAndFinish`. That is
+        // exactly the state a crash between "delete source" and "delete
+        // marker" produces, and reading it as an error would restart a
+        // migration that had already succeeded.
+        //
+        // It is idempotent only when the re-verification PASSES, and this arm
+        // cannot tell whether it will: every way `bw status` can fail short of
+        // a missing exe answers `Unauthenticated`. So the no-source case is
+        // resumable because `finish`'s failure path is bounded -- `rollback`
+        // keeps `<id>` when the source is gone -- and not because the second
+        // verification is assumed to agree with the first.
         Some(Stage::Promoted) => {
             if observed.incoming_exists {
                 ResumeAction::DiscardPartialCopyAndRetry
@@ -739,8 +803,17 @@ pub fn migrate_with_probe(
         match resume_action(&observed) {
             ResumeAction::Refuse { reason } => {
                 // The availability explanation names the directory the user has
-                // to go and remove, which the pure decision cannot know.
-                let reason = availability.explanation().unwrap_or(reason);
+                // to go and remove, which the pure decision cannot know. It
+                // does not know about the accounts tree, though, so the
+                // unclaimed list has to survive the substitution -- replacing
+                // the reason wholesale is how an orphaned vault came to be
+                // unmentioned on every launch under the `relativeDataDir` trap.
+                let reason = match availability.explanation() {
+                    Some(explanation) => {
+                        format!("{explanation}{}", unclaimed_note(&unclaimed_ids(&observed)))
+                    }
+                    None => reason,
+                };
                 log::warn!("not migrating the Bitwarden profile: {reason}");
                 return MigrationState::Blocked { reason };
             }
@@ -774,8 +847,20 @@ pub fn migrate_with_probe(
                 // defeated is a copy the CLI refused, and adopting it would
                 // make `settings.json` non-empty forever and strand the
                 // original.
+                //
+                // The gate is `source_has_data_json` and NOTHING else. It used
+                // to also require an empty account list, which is no part of
+                // the hazard: the hazard is "an unclaimed directory the CLI
+                // refuses, sitting beside an intact source", and a defeated
+                // `discard_prepared_account` in `main`'s `add_account` leaves
+                // exactly that beside an account list that already names A. The
+                // extra conjunct skipped the check for every multi-account
+                // user, adopted the refused copy, and stranded the intact
+                // source forever. See
+                // `an_unclaimed_directory_the_cli_refuses_is_not_adopted_
+                // beside_a_source_while_another_account_is_claimed`.
                 let dir = accounts::data_dir_for(config_dir, &id);
-                if observed.claimed_account_ids.is_empty() && observed.source_has_data_json {
+                if observed.source_has_data_json {
                     let source = effective_source
                         .as_deref()
                         .expect("source_has_data_json implies a source directory");
@@ -832,6 +917,27 @@ pub fn migrate_with_probe(
                     .marker
                     .expect("DiscardPartialCopyAndRetry is only reachable with a marker");
                 let incoming = incoming_path(config_dir, &marker.id);
+                // The staging copy is ours and is normally worthless -- but
+                // "worthless" assumes something else holds the vault. If the
+                // source no longer holds a profile and `<id>` does not either,
+                // these bytes are every byte the user has left, and a possibly
+                // incomplete copy still beats none. Same invariant as
+                // [`rollback`]'s: never delete the last copy.
+                if !observed.source_has_data_json
+                    && !observed.account_dirs_with_profile.contains(&marker.id)
+                {
+                    let reason = format!(
+                        "an interrupted migration left a partial copy at {}, and the profile it \
+                         was copying from ({}) is no longer there -- so that copy may be the only \
+                         one left. It has NOT been removed and nothing else has been touched; it \
+                         may be incomplete, so open it with the Bitwarden CLI before you rely on \
+                         it.",
+                        incoming.display(),
+                        marker.source.display()
+                    );
+                    log::error!("not discarding a staging copy that may be the last one: {reason}");
+                    return MigrationState::Blocked { reason };
+                }
                 log::warn!(
                     "discarding an interrupted migration's staging copy at {}",
                     incoming.display()
@@ -891,15 +997,65 @@ pub fn migrate_with_probe(
 
 /// Rule 4, in one place: delete only what *we* made, and clear the marker.
 ///
-/// Never touches the source. It cannot need to — nothing of the user's has
-/// been deleted at any point this is reachable from.
-fn rollback(config_dir: &Path, id: &AccountId, why: &str) -> MigrationState {
+/// Never touches the source — and, since the marker cannot say whether the
+/// source *deletion* already happened, never deletes `accounts/<id>` unless it
+/// can see that the source is still there to fall back on.
+///
+/// That second half is not belt-and-braces, it is the whole of rule 4 on the
+/// resume path. [`finish`] deletes the source and *then* removes the marker,
+/// and a failed marker removal only warns — so "marker at [`Stage::Promoted`],
+/// `<id>` present, source gone" is reachable by a crash, a power loss or an
+/// ignored error, and it re-enters `finish`, which re-runs verification. Every
+/// way [`login_ui::bw_status_stdout_in`] can fail — a `bw.exe` that is found
+/// but will not run, a garbled stdout, a momentarily locked `data.json` —
+/// answers `Unauthenticated`, which [`verification_passed`] rejects, which
+/// lands here. Deleting `accounts/<id>` at that point deletes the user's only
+/// remaining copy of their vault.
+///
+/// So the branch is on **how many copies exist**, not on how far the migration
+/// is believed to have got. It is the stronger question of the two: it stays
+/// right even where the inference "no source means verification already
+/// passed" would be wrong (a source the user deleted by hand mid-migration),
+/// because "the last copy is not deleted" does not depend on why it is the
+/// last one.
+///
+/// The marker is cleared either way. With the copy kept, that is what lets the
+/// next launch see `accounts/<id>` as an unclaimed directory with no source
+/// beside it and adopt it — the ungated half of
+/// [`AdoptUnclaimedAccount`](ResumeAction::AdoptUnclaimedAccount), which is
+/// the recovery for exactly this shape.
+///
+/// [`login_ui::bw_status_stdout_in`]: crate::login_ui
+fn rollback(config_dir: &Path, marker: &Marker, why: &str) -> MigrationState {
     log::error!("rolling back the Bitwarden profile migration: {why}");
-    let _ = std::fs::remove_dir_all(incoming_path(config_dir, id));
-    let _ = std::fs::remove_dir_all(accounts::data_dir_for(config_dir, id));
-    let _ = std::fs::remove_file(marker_path(config_dir, id));
+    let final_dir = accounts::data_dir_for(config_dir, &marker.id);
+    // The same predicate `Observed::source_has_data_json` uses: a source
+    // directory that no longer holds a profile is not a copy to fall back on.
+    let source_is_whole = marker.source.join(PROFILE_FILE).is_file();
+
+    let _ = std::fs::remove_dir_all(incoming_path(config_dir, &marker.id));
+    let disposition = if source_is_whole {
+        let _ = std::fs::remove_dir_all(&final_dir);
+        format!(
+            "the original profile at {} has been left exactly as it was, and the copy at {} has \
+             been removed",
+            marker.source.display(),
+            final_dir.display()
+        )
+    } else {
+        format!(
+            "the original profile at {} is already gone, so the copy at {} is the only one left \
+             and has been KEPT rather than removed -- an earlier run of this migration deleted \
+             the original, which it only does after this same check passed against it. Nothing \
+             of yours has been deleted on this launch. Deskwarden will offer that directory as \
+             your account on the next launch",
+            marker.source.display(),
+            final_dir.display()
+        )
+    };
+    let _ = std::fs::remove_file(marker_path(config_dir, &marker.id));
     MigrationState::Blocked {
-        reason: why.to_string(),
+        reason: format!("{why}; {disposition}"),
     }
 }
 
@@ -948,7 +1104,7 @@ fn start_fresh(
     if let Err(e) = copy_dir_all(source, &incoming) {
         return rollback(
             config_dir,
-            &id,
+            &marker,
             &format!(
                 "copying {} to {} failed: {e}",
                 source.display(),
@@ -966,7 +1122,7 @@ fn start_fresh(
     if let Err(e) = write_marker(config_dir, &promoted) {
         return rollback(
             config_dir,
-            &id,
+            &promoted,
             &format!("the migration marker could not be advanced ({e})"),
         );
     }
@@ -975,7 +1131,7 @@ fn start_fresh(
     if let Err(e) = std::fs::rename(&incoming, &final_dir) {
         return rollback(
             config_dir,
-            &id,
+            &promoted,
             &format!(
                 "promoting {} to {} failed: {e}",
                 incoming.display(),
@@ -1003,12 +1159,16 @@ fn finish(
     let details = status(Some(&final_dir));
 
     if !verification_passed(&details, &marker.source_email) {
+        // What was then done about it is [`rollback`]'s to say: on a RESUMED
+        // verification the original may already be gone, and this arm cannot
+        // see that. Asserting "left exactly as it was" here is how the message
+        // came to be printed on the launch that deleted the last copy.
         return rollback(
             config_dir,
-            &marker.id,
+            marker,
             &format!(
                 "the Bitwarden CLI did not recognise the copied profile in {} as {} (it reported \
-                 {:?}/{:?}); the original profile has been left exactly as it was",
+                 {:?}/{:?})",
                 final_dir.display(),
                 marker.source_email.as_deref().unwrap_or("<unknown>"),
                 details.status,
