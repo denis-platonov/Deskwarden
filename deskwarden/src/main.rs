@@ -1836,128 +1836,262 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             log::info!("vault window locked itself; re-authenticating");
         }
 
-        // A backend operation kicked off above (or a tray Sync click that
-        // landed while the window was open) may still be in flight. Unlike
-        // `main`'s own non-blocking drain, this path is about to tear the
-        // backend down and start a fresh one right now, so it has to wait
-        // for that operation to actually finish first -- otherwise the two
-        // attempts race to bind the same port. The user is already looking
-        // at a blocking re-authentication flow at this point, so a few more
-        // seconds here is not a new freeze, just a longer instance of one
-        // that was already happening.
+        // The recovery itself is `resettle_session`, which a lock/re-auth and
+        // an account switch share whole rather than each spelling out (see
+        // its doc). The only thing this caller contributes is where the new
+        // session token comes from: the master-password prompt for the
+        // account this app is already signed into.
         //
-        // Bounded, not a plain `recv()`: `backend_op_tx` lives in `main` for
-        // the whole process, so the channel never disconnects on its own --
-        // if the worker thread that owns the other end ever panicked before
-        // sending, an unbounded `recv()` here would block this thread
-        // forever, with no message pump running to keep the tray, hotkey, or
-        // window-watching alive (review Minor). Giving up after
-        // `BACKEND_OP_TIMEOUT` and proceeding anyway is strictly safer: the
-        // worst case is racing a start/sync that eventually does land (see
-        // `apply_backend_op`'s callers), not an unkillable app.
-        if backend_task_in_progress.is_some() {
-            log::info!("waiting for an in-flight backend operation before handling the lock");
-            match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
-                Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
-                Err(_) => {
-                    log::warn!(
-                        "in-flight backend operation did not report back within \
-                         {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway. If it \
-                         later reports back late (see `apply_backend_op`'s child-adoption \
-                         guard), its child is stopped rather than allowed to overwrite the one \
-                         this recovery is about to start."
-                    );
-                    // Review 11's Important 3: whatever operation was in
-                    // flight may have disabled the tray's "Sync" item before
-                    // stalling (the `tray.add_app_id` handler does, for its
-                    // own `EnsureRunning`), and `apply_backend_op` -- the
-                    // only other place that re-enables it -- is never going
-                    // to run for an operation that gave up waiting on
-                    // instead of receiving. Left disabled, a hung `bw sync`
-                    // right here permanently kills Sync for the rest of the
-                    // session. A no-op if nothing had disabled it.
-                    //
-                    // Review 18's Minor: all the way back to idle, not just
-                    // re-enabled. THIS is the site where the two disagreed --
-                    // the operation being abandoned here is very often the
-                    // tray `Sync` that set the label to "Syncing...", and its
-                    // thread is by definition never going to report back and
-                    // relabel it. The stand-down message a few lines below
-                    // names "Sync"; leaving the item saying "Syncing..."
-                    // means the menu contains no item by that name, and the
-                    // one that is there reads as busy.
-                    tray::set_sync_idle(tray);
-                }
-            }
-            *backend_task_in_progress = None;
-        }
-
-        // The account the *next* unlock lands on may not be this one (a
-        // "Log out" followed by a different sign-in), so the snapshot built
-        // from this account must not survive into that one. Left populated,
-        // the next window open -- or the next autofill, straight from
-        // `cache.items()` -- would silently serve this account's items and
-        // passwords under the new session, indefinitely if `bw sync` then
-        // fails offline.
-        cache.clear();
-        if backend_is_running(bw_serve_child) {
-            if let Some(child) = bw_serve_child.as_mut() {
-                bw_serve::stop_bw_serve(child);
-            }
-        }
-        *bw_serve_child = None;
-        *session_token = reauthenticate(store);
-        // Drop the cached email/server too, for the same reason: the *next*
-        // open must re-fetch rather than show a stale account in the
-        // toolbar.
-        *cached_status_details = None;
-
-        // Same lifecycle as startup: the backend has to come up -- blocking,
-        // with a spinner, since there is nothing useful to show without it
-        // -- to re-populate the cache. `main`'s idle reconciliation tears it
-        // back down afterwards if the policy says to, exactly as it does
-        // after startup's own unconditional start; this function no longer
-        // needs to know or care what the policy says.
-        //
-        // A failure to start it is survivable here, and standing down is the
-        // whole of the recovery: see `restart_backend_after_unlock`. There is
-        // nothing left to probe once no backend came up, so this returns
-        // rather than spending the ~30s readiness deadline on a port nothing
-        // is listening on.
-        let Some(child) = restart_backend_after_unlock(engine, || {
-            try_start_backend(
-                session_token,
-                job_ref(job),
-                bw_serve::PORT_RELEASE_GRACE_RESTART,
-            )
-        }) else {
-            return;
-        };
-        *bw_serve_child = Some(child);
-        // Captured here, *before* the readiness probe below, for the same
-        // reason startup captures `startup_epoch` before its own probe: that
-        // probe's `list_items()` is the fetch whose result seeds the cache
-        // via `populate_with`, and the epoch guard can only cover the window
-        // it is handed (review 14's Minor 3). It has to be taken after the
-        // `cache.clear()` further up -- that clear is the one this recovery
-        // is repopulating from, not one to discard against. Nothing between
-        // here and there clears the cache today (every `clear` site in the
-        // crate runs on this same, currently blocked, main thread), so this
-        // is inert; it is written this way so it stays correct if any of it
-        // moves onto a background thread.
-        let unlock_epoch = cache.epoch();
-        settle_vault_after_unlock(cache, engine, unlock_epoch, |message| {
-            wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message)
-        });
+        // `reauthenticate` never returns `None` -- it exits the process
+        // rather than hand back a failure -- so the `BackendNotStarted`
+        // outcome is reached from here only by a backend that would not
+        // start, which is why the outcome is not branched on. Both outcomes
+        // leave this function the same way, through the `return` below; the
+        // `BackendNotStarted` arm used to be an early `return` from inside
+        // this block, which was only ever a jump to that same statement.
+        resettle_session(
+            cache,
+            engine,
+            bw_serve_child,
+            job,
+            schedule,
+            tray,
+            backend_op_rx,
+            backend_task_in_progress,
+            cached_status_details,
+            session_token,
+            || Some(reauthenticate(store)),
+        );
     }
 
     // The only way out that is not the `continue` above. Every non-
-    // preferences outcome -- a plain close, a lock, a re-auth, and the
-    // lock path's own early `return` when the backend could not be
-    // restarted -- leaves the loop here, so this function still runs the
-    // window exactly once for all of them.
+    // preferences outcome -- a plain close, a lock, a re-auth, and a
+    // re-auth whose backend could not be restarted (which used to `return`
+    // from inside the block above and now simply falls through to here) --
+    // leaves the loop here, so this function still runs the window exactly
+    // once for all of them.
     return;
     }
+}
+
+/// What a resettle left the app in, for a caller that has to decide whether
+/// the thing it was resettling *for* actually happened.
+///
+/// Task 9's account switch is that caller: `BackendNotStarted` is what it
+/// rolls back from. The lock/re-auth path has nothing to roll back to and
+/// ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResettleOutcome {
+    /// The backend came up and the settle ran. The settle itself may still
+    /// have stood autofill down -- a survivable outcome this app already
+    /// ships (see [`settle_vault_after_unlock`]), and not a reason to undo
+    /// whatever the resettle was for.
+    BackendStarted,
+    /// Nothing authenticated, or the backend would not start.
+    /// [`stand_down_after_unlock`] has run: the cache is cleared,
+    /// `bw_serve_child` is `None`, the engine is empty, and the tray's
+    /// "Sync" is the recovery the user is told about.
+    BackendNotStarted,
+}
+
+/// The one teardown-and-repopulate sequence in this crate: drain whatever
+/// backend operation is in flight, stop `bw serve`, clear the cache,
+/// authenticate, start a fresh backend, wait for it to answer, repopulate,
+/// and rebuild the match engine.
+///
+/// This used to be inlined in `open_vault_window`'s `locked || needs_reauth`
+/// block, and it is a function now because it has a second caller coming: an
+/// account switch is *this* sequence with a different data directory, and the
+/// spec is explicit that it must reuse this rather than grow a second
+/// teardown path beside it. `authenticate` is the only thing that differs
+/// between the two -- a lock/re-auth prompts for the password of the account
+/// already signed in, a switch first points the CLI at the target account's
+/// profile and then prompts. It runs AFTER the old backend is stopped and the
+/// cache is cleared and BEFORE the new backend is started, which is the
+/// ordering that makes a half-switched app unreachable, and returning `None`
+/// from it (a declined switch) stands autofill down rather than starting a
+/// backend for a session nobody authenticated.
+///
+/// The split with [`resettle_session_with`] is where the untestable parts
+/// stop. Everything this function itself does needs a real tray icon (which
+/// `tray::build_tray` can only make against a live message loop), a real
+/// `bw` process, or a real spinner window; everything the sequence *decides*
+/// lives in `resettle_session_with` behind injected `start` and `probe`
+/// closures, the same shape `settle_vault_after_unlock`'s own `probe` already
+/// proved. What is left here is wiring, and it is pinned by
+/// `the_resettle_wiring_passes_the_real_backend_and_spinner`.
+#[allow(clippy::too_many_arguments)]
+fn resettle_session(
+    cache: &Arc<VaultCache>,
+    engine: &mut MatchEngine,
+    bw_serve_child: &mut Option<Child>,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &[Duration],
+    tray: &tray::AppTray,
+    backend_op_rx: &mpsc::Receiver<BackendOp>,
+    backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
+    cached_status_details: &mut Option<login_ui::BwStatusDetails>,
+    session_token: &mut String,
+    authenticate: impl FnOnce() -> Option<String>,
+) -> ResettleOutcome {
+    // A backend operation kicked off above (or a tray Sync click that
+    // landed while the window was open) may still be in flight. Unlike
+    // `main`'s own non-blocking drain, this path is about to tear the
+    // backend down and start a fresh one right now, so it has to wait
+    // for that operation to actually finish first -- otherwise the two
+    // attempts race to bind the same port. The user is already looking
+    // at a blocking re-authentication flow at this point, so a few more
+    // seconds here is not a new freeze, just a longer instance of one
+    // that was already happening.
+    //
+    // Bounded, not a plain `recv()`: `backend_op_tx` lives in `main` for
+    // the whole process, so the channel never disconnects on its own --
+    // if the worker thread that owns the other end ever panicked before
+    // sending, an unbounded `recv()` here would block this thread
+    // forever, with no message pump running to keep the tray, hotkey, or
+    // window-watching alive (review Minor). Giving up after
+    // `BACKEND_OP_TIMEOUT` and proceeding anyway is strictly safer: the
+    // worst case is racing a start/sync that eventually does land (see
+    // `apply_backend_op`'s callers), not an unkillable app.
+    if backend_task_in_progress.is_some() {
+        log::info!("waiting for an in-flight backend operation before handling the lock");
+        match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
+            Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
+            Err(_) => {
+                log::warn!(
+                    "in-flight backend operation did not report back within \
+                     {BACKEND_OP_TIMEOUT:?}; proceeding with lock recovery anyway. If it \
+                     later reports back late (see `apply_backend_op`'s child-adoption \
+                     guard), its child is stopped rather than allowed to overwrite the one \
+                     this recovery is about to start."
+                );
+                // Review 11's Important 3: whatever operation was in
+                // flight may have disabled the tray's "Sync" item before
+                // stalling (the `tray.add_app_id` handler does, for its
+                // own `EnsureRunning`), and `apply_backend_op` -- the
+                // only other place that re-enables it -- is never going
+                // to run for an operation that gave up waiting on
+                // instead of receiving. Left disabled, a hung `bw sync`
+                // right here permanently kills Sync for the rest of the
+                // session. A no-op if nothing had disabled it.
+                //
+                // Review 18's Minor: all the way back to idle, not just
+                // re-enabled. THIS is the site where the two disagreed --
+                // the operation being abandoned here is very often the
+                // tray `Sync` that set the label to "Syncing...", and its
+                // thread is by definition never going to report back and
+                // relabel it. The stand-down message a few lines below
+                // names "Sync"; leaving the item saying "Syncing..."
+                // means the menu contains no item by that name, and the
+                // one that is there reads as busy.
+                tray::set_sync_idle(tray);
+            }
+        }
+        *backend_task_in_progress = None;
+    }
+
+    resettle_session_with(
+        cache,
+        engine,
+        bw_serve_child,
+        cached_status_details,
+        session_token,
+        authenticate,
+        |token| try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE_RESTART),
+        |message| wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message),
+    )
+}
+
+/// The sequence itself, with the two things that need a machine injected:
+/// `start` is `try_start_backend` and `probe` is the readiness wait behind
+/// its spinner window.
+///
+/// Nothing here is new -- it is `open_vault_window`'s lock/re-auth block,
+/// moved -- with one arm added that the old code had no way to express: an
+/// `authenticate` that answers `None`. That cannot happen on the lock/re-auth
+/// path (`reauthenticate` exits instead of failing), and it is how a declined
+/// account switch will arrive.
+#[allow(clippy::too_many_arguments)]
+fn resettle_session_with(
+    cache: &VaultCache,
+    engine: &mut MatchEngine,
+    bw_serve_child: &mut Option<Child>,
+    cached_status_details: &mut Option<login_ui::BwStatusDetails>,
+    session_token: &mut String,
+    authenticate: impl FnOnce() -> Option<String>,
+    start: impl FnOnce(&str) -> Result<Child, BackendStartError>,
+    probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+) -> ResettleOutcome {
+    // The account the *next* unlock lands on may not be this one (a
+    // "Log out" followed by a different sign-in), so the snapshot built
+    // from this account must not survive into that one. Left populated,
+    // the next window open -- or the next autofill, straight from
+    // `cache.items()` -- would silently serve this account's items and
+    // passwords under the new session, indefinitely if `bw sync` then
+    // fails offline.
+    cache.clear();
+    if backend_is_running(bw_serve_child) {
+        if let Some(child) = bw_serve_child.as_mut() {
+            bw_serve::stop_bw_serve(child);
+        }
+    }
+    *bw_serve_child = None;
+    // Drop the cached email/server too, for the same reason: the *next*
+    // open must re-fetch rather than show a stale account in the
+    // toolbar. Unconditional, and therefore hoisted above the
+    // authentication rather than left after it, so a declined
+    // authentication does not leave the previous account's address in the
+    // toolbar of a window that is no longer signed into it. Nothing can
+    // observe the move: this function holds the only `&mut` to it, so
+    // `authenticate` cannot read it.
+    *cached_status_details = None;
+
+    // Not reachable from the lock/re-auth path -- `reauthenticate` exits the
+    // process rather than return a failure -- and the whole point of an
+    // account switch, where it means "the user closed the master-password
+    // prompt". There is no session, so there is nothing to start a backend
+    // for; standing down is the same recovery the arms below use, and it is
+    // what leaves the engine empty rather than armed with the matches of an
+    // account this process is no longer talking to.
+    let Some(token) = authenticate() else {
+        stand_down_after_unlock(
+            engine,
+            "nothing was authenticated, so the Bitwarden backend was not restarted",
+        );
+        return ResettleOutcome::BackendNotStarted;
+    };
+    *session_token = token;
+
+    // Same lifecycle as startup: the backend has to come up -- blocking,
+    // with a spinner, since there is nothing useful to show without it
+    // -- to re-populate the cache. `main`'s idle reconciliation tears it
+    // back down afterwards if the policy says to, exactly as it does
+    // after startup's own unconditional start; this function no longer
+    // needs to know or care what the policy says.
+    //
+    // A failure to start it is survivable here, and standing down is the
+    // whole of the recovery: see `restart_backend_after_unlock`. There is
+    // nothing left to probe once no backend came up, so this returns
+    // rather than spending the ~30s readiness deadline on a port nothing
+    // is listening on.
+    let Some(child) = restart_backend_after_unlock(engine, || start(session_token)) else {
+        return ResettleOutcome::BackendNotStarted;
+    };
+    *bw_serve_child = Some(child);
+    // Captured here, *before* the readiness probe below, for the same
+    // reason startup captures `startup_epoch` before its own probe: that
+    // probe's `list_items()` is the fetch whose result seeds the cache
+    // via `populate_with`, and the epoch guard can only cover the window
+    // it is handed (review 14's Minor 3). It has to be taken after the
+    // `cache.clear()` further up -- that clear is the one this recovery
+    // is repopulating from, not one to discard against. Nothing between
+    // here and there clears the cache today (every `clear` site in the
+    // crate runs on this same, currently blocked, main thread), so this
+    // is inert; it is written this way so it stays correct if any of it
+    // moves onto a background thread.
+    let unlock_epoch = cache.epoch();
+    settle_vault_after_unlock(cache, engine, unlock_epoch, probe);
+    ResettleOutcome::BackendStarted
 }
 
 /// Borrows the job object out of its `Arc` wrapper for a synchronous call.
