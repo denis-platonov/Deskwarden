@@ -1932,7 +1932,14 @@ pub fn run_login_flow_for(
                             }
                         }
                     }
-                    Some(LoginAction::LogOut) => match bw_logout() {
+                    // `bw_logout_in(this window's directory)`, never the
+                    // active-profile `bw_logout()`. The two lines below
+                    // unenroll Hello for THIS window's account, so the global
+                    // form logged one account out and dropped another
+                    // account's sealed master password. Unreachable today only
+                    // by accident -- three conditions have to line up -- and
+                    // it is the same defect `profile_dir_for` exists to close.
+                    Some(LoginAction::LogOut) => match bw_logout_in(profile_dir.as_deref()) {
                         Ok(()) => {
                             log::info!("logged out at the user's request; showing sign-in");
                             // A sealed master password for an account the
@@ -2637,8 +2644,9 @@ mod login_entry_point_tests {
     ///
     /// Fails without the fix: make `profile_dir_for` answer
     /// `crate::bw_path::active_data_dir()` and the first block fails, because
-    /// no active directory is set in a test. Put `bw_command()` back into
-    /// `run_bw_with_password` and the second block names it.
+    /// no active directory is set in a test. Put `bw_logout()` back into the
+    /// log-out arm — where it really was, for as long as this guard was a ban
+    /// list that did not name it — and the allowlist block fails.
     #[test]
     fn the_login_window_names_the_profile_directory_it_acts_on() {
         let cfg = Path::new(r"C:\cfg");
@@ -2661,26 +2669,54 @@ mod login_entry_point_tests {
              than leaving the CLI to resolve its own"
         );
 
-        // The spawns themselves. `concat!`-split and single-line, this file's
-        // usual two reasons -- a whole literal matches its own declaration,
-        // and a needle carrying a line ending passes under one and fails
-        // under the other.
-        for global in [
-            concat!("bw_command", "()"),
-            concat!("check_bw_status_details", "()"),
-            concat!("active_data_dir", "()"),
-        ] {
+        // The spawns themselves, as an ALLOWLIST rather than a ban list.
+        //
+        // This was three banned spellings -- `bw_command()`,
+        // `check_bw_status_details()`, `active_data_dir()` -- and it missed
+        // the fourth, `bw_logout()`, which sat in the log-out arm two lines
+        // above a `hello::unenroll_for` on THIS window's account. A
+        // hand-enumerated ban list is only ever as complete as the last
+        // reviewer who read the whole file; this repo has now been bitten by
+        // that shape twice. Inverted, the default is refusal: every
+        // profile-sensitive call the body makes has to be one this window is
+        // permitted to make, so a form nobody has thought of yet fails on the
+        // commit that introduces it.
+        //
+        // Permitted = takes the directory it acts on. `run_bw_with_password`
+        // is here because it takes `data_dir` as an argument (asserted below);
+        // the other three are the `_in` forms.
+        const ALLOWED: &[&str] = &[
+            concat!("check_bw_status_details", "_in"),
+            concat!("bw_logout", "_in"),
+            concat!("configure_server", "_in"),
+            concat!("run_bw_with", "_password"),
+        ];
+        let code = window_body_code();
+        let found = profile_sensitive_calls(&code);
+        for call in &found {
             assert!(
-                !window_body().contains(global),
-                "the login window still reaches for the active-profile form {global}: for the \
-                 account `add_account` opens it for, that names the EXISTING account's vault"
+                ALLOWED.contains(&call.as_str()),
+                "the login window calls {call}(), which is not one of the forms that take the \
+                 profile directory they act on ({ALLOWED:?}). For the account `add_account` \
+                 opens this window for, an active-profile form names the EXISTING account's \
+                 vault -- it signs the wrong account out, or reads the wrong one's status. \
+                 Either give it a directory-taking form, or add it here on purpose."
             );
         }
-        // Positive controls: the region really is the window's body, and the
-        // directory-taking forms really are what it calls.
+        // Positive controls for that negative. The scan found real calls (an
+        // empty `found` would pass the loop vacuously), the region really is
+        // the window's body, and the predicate really does catch a global
+        // form when one is there.
+        assert!(
+            found.len() >= 3,
+            "control: only {} profile-sensitive calls were found in the window body, so the \
+             loop above is passing against almost nothing: {found:?}",
+            found.len()
+        );
         for required in [
             concat!("check_bw_status_details", "_in("),
             concat!("configure_server", "_in("),
+            concat!("bw_logout", "_in("),
             concat!("profile_dir", "_for(account)"),
         ] {
             assert!(
@@ -2689,12 +2725,84 @@ mod login_entry_point_tests {
                  about the wrong text"
             );
         }
+        assert_eq!(
+            profile_sensitive_calls(concat!(
+                "let a = bw_command", "(); let b = active_data_dir", "();\n",
+                "let c = check_bw_status_details", "(); let d = format!(\"x\");"
+            )),
+            vec![
+                concat!("bw_command").to_string(),
+                concat!("active_data", "_dir").to_string(),
+                concat!("check_bw_status", "_details").to_string(),
+            ],
+            "control: the predicate does not catch the global forms it exists to catch, so the \
+             loop above cannot fail for the reason it claims"
+        );
         // And the one spawn that is not in that region: the worker thread.
         assert!(
             SOURCE.contains(concat!("run_bw_with_password(&arg_refs, &password, data_dir", ".")),
             "control: the `bw login`/`bw unlock` worker still takes its directory as an \
              argument rather than reading a global"
         );
+    }
+
+    /// Every call in `code` that decides *which profile directory* a `bw`
+    /// child reads, named without its `(`, in source order.
+    ///
+    /// A **pattern**, not a list of names, and that is the whole point: the
+    /// list it replaced named three spellings and missed a fourth that had
+    /// been there all along. `bw_*` catches `bw_command`, `bw_logout`,
+    /// `bw_status_stdout` and anything spelled like them; the three
+    /// remaining prefixes cover the entry points in this file that spawn `bw`
+    /// under some other name. A form that matches none of these is not a `bw`
+    /// spawn, and a form that does has to earn its place in `ALLOWED`.
+    fn profile_sensitive_calls(code: &str) -> Vec<String> {
+        let bytes = code.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if !(bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            // A call, not a mention: the identifier is immediately followed
+            // by its open paren.
+            if bytes.get(i) != Some(&b'(') {
+                continue;
+            }
+            let name = &code[start..i];
+            let sensitive = name.starts_with("bw_")
+                || name.starts_with("check_bw")
+                || name.starts_with("run_bw")
+                || name.starts_with("configure_server")
+                || name == "active_data_dir";
+            if sensitive {
+                out.push(name.to_string());
+            }
+        }
+        out
+    }
+
+    /// [`window_body`] with `//` line comments removed.
+    ///
+    /// Prose is not a call. Without this, a comment explaining *why*
+    /// `bw_logout()` must not appear would itself trip the guard -- and the
+    /// fix for that would be to stop writing the explanation, which is the
+    /// wrong direction. `://` is left alone so a URL in a string literal is
+    /// not mistaken for a comment.
+    fn window_body_code() -> String {
+        window_body()
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) if !line[..at].ends_with(':') => &line[..at],
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// `run_login_flow_for`'s body, from its declaration to the fatal

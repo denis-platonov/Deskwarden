@@ -369,6 +369,22 @@ pub enum StartupAccounts {
     Unmigrated { reason: String },
 }
 
+/// The ids a stored account list claims — what
+/// [`migration::resume_action`](crate::migration::resume_action) subtracts the
+/// directories on disk from.
+///
+/// Here rather than spelled out at the call site for the reason
+/// `nothing_offers_an_account_without_going_through_accounts_state` exists:
+/// `settings.accounts.iter()` in `main.rs` is banned, because in every *other*
+/// place it is the raw list bypassing [`AccountsState`]'s four refusals. This
+/// one read is legitimate and cannot go through `AccountsState` — it runs
+/// *before* the migration whose answer `AccountsState` is built from — so it
+/// lives beside [`resolve_startup`], the other function that is given the same
+/// raw list for the same reason.
+pub fn claimed_ids(stored: &[Account]) -> Vec<AccountId> {
+    stored.iter().map(|a| a.id.clone()).collect()
+}
+
 /// Which account this launch runs as, given what is stored and what the
 /// migration just did.
 ///

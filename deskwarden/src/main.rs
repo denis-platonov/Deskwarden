@@ -265,11 +265,18 @@ fn main() {
         log::error!("{reason}; not migrating anything on this launch");
         migration::MigrationState::Blocked { reason }
     } else {
+        // The account list's IDS, not `!is_empty()`. `migrate` adopts the set
+        // difference between "directories holding a vault" and "directories
+        // the list names", and a bool collapses that to "is anything
+        // claimed" -- under which `add_account`'s failed `persist_accounts`
+        // leaves a signed-in vault no launch can ever reach. See
+        // `migration`'s rule 5.
+        let claimed = accounts::claimed_ids(&settings.accounts);
         migration::migrate(
             &config_dir,
             migration::migration_source().as_deref(),
             &availability,
-            !settings.accounts.is_empty(),
+            &claimed,
             login_ui::check_bw_status_details_in,
             || bw_serve::port_in_use(bw_serve::BW_SERVE_PORT),
         )
@@ -352,6 +359,30 @@ fn main() {
                 "{reason}; running with no account of our own: the CLI is left on whatever \
                  profile it resolves by itself, which is a signed-out one if the migration \
                  already ran"
+            );
+            // On SCREEN, and not only in the log. This is the app's worst
+            // survivable startup: no switcher, no accounts submenu, a
+            // signed-out CLI -- and it repeats identically every launch, so a
+            // user who never opens `deskwarden.log` has no way to learn that
+            // anything is wrong, let alone what. The refusal that reaches here
+            // with two unclaimed account directories is holding two real
+            // vaults hostage and names both of them in `reason`; the app pops
+            // a modal for the Hello re-enrolment nicety and said nothing here.
+            //
+            // Only in this arm. The other refusals -- a `Blocked` beside an
+            // account list that still works -- leave a usable app and are
+            // reported by `blocked_reason` where the switch is offered; a
+            // modal on every launch for those would be nagging about
+            // something the user can already see.
+            message_box(
+                "Deskwarden",
+                &format!(
+                    "Deskwarden could not set up its accounts on this machine, so it is running \
+                     with no account of its own -- there is no account switcher and the \
+                     Bitwarden CLI is signed out.\n\nNothing has been deleted.\n\n{reason}\n\nThe \
+                     directories named above are under your Deskwarden configuration folder.",
+                ),
+                MB_ICONWARNING | MB_OK,
             );
             (None, None)
         }
@@ -5787,8 +5818,12 @@ mod tests {
         fn every_way_into_the_vault_window_rebuilds_the_submenu_on_the_way_out() {
             let production = production_half_of_this_file();
             // `concat!`-split and single-line, this file's usual two reasons.
-            // The call needle does not match `rebuild_after_vault_window(`, and
-            // the declaration is skipped by the `fn ` test below.
+            // The call needle does not match `rebuild_after_vault_window(`,
+            // and it does not match the DECLARATION either -- that is
+            // `fn open_vault_window<A: UiAutomationFiller...>(`, whose `(`
+            // comes after the generics. There was an `ends_with("fn ")` skip
+            // here claiming to be what excluded it; it could never fire, so it
+            // was a guard that read as protection and was not one.
             let call = concat!("open_vault", "_window(");
             let rebuild = concat!("rebuild_after_vault", "_window(");
             // The end of each call's statement. Both sites forget the last
@@ -5802,9 +5837,6 @@ mod tests {
             while let Some(offset) = production[from..].find(call) {
                 let at = from + offset;
                 from = at + call.len();
-                if production[..at].ends_with("fn ") {
-                    continue; // the declaration, not a call
-                }
                 sites += 1;
                 let rest = &production[from..];
                 let end = rest.find(end_of_statement).unwrap_or_else(|| {
@@ -5827,10 +5859,17 @@ mod tests {
 
             // Controls for that loop: it examined real call sites, and the
             // needles are spelled the way the production code spells them.
-            assert_eq!(
-                sites, 2,
-                "control: the two ways of opening the vault window -- the tray menu's \"Open \
-                 Vault\" item and a left click on the tray icon -- are what this walked; \
+            // `>=`, not `== 2`. A count is what let the omission look
+            // deliberate for two reviews, and an equality here recreates it
+            // from the other side: a legitimate THIRD way into the window,
+            // one that does rebuild, fails a test whose only green is editing
+            // the number -- which is the pressure `72dfc90` removed. This
+            // cannot go vacuous: `sites == 0` fails here, and an empty slice
+            // fails the `contains` control below.
+            assert!(
+                sites >= 2,
+                "control: the two known ways of opening the vault window -- the tray menu's \
+                 \"Open Vault\" item and a left click on the tray icon -- are what this walked; \
                  finding {sites} means the needle stopped matching"
             );
             assert!(
