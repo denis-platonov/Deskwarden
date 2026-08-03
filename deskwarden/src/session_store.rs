@@ -6,11 +6,26 @@ use windows::Win32::Security::Cryptography::{
 };
 use zeroize::Zeroize;
 
+/// The DPAPI-wrapped Bitwarden session token for **one account**, at a path its
+/// caller chooses.
+///
+/// Taking the path rather than resolving it is what makes this per-account: the
+/// path is `accounts::session_path_for(config_dir, id)`, inside that account's
+/// own directory. There is deliberately no constructor that resolves the config
+/// directory itself — a `SessionStore` that knew where to put its own file
+/// would be a second definition of the layout, and any account whose copy
+/// resolved back to the old `<config_dir>\session.bin` would find, overwrite
+/// and delete every other account's token.
 pub struct SessionStore {
     path: PathBuf,
 }
 
 impl SessionStore {
+    /// `path` is one account's `session.bin`; see the type's own doc. Its
+    /// parent directory must already exist — the account directory is created
+    /// when the account is (`accounts`/`migration`), not lazily here, so that
+    /// a token can never be the thing that brings an account directory into
+    /// being.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
