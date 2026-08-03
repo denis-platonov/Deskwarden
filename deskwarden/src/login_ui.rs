@@ -1,8 +1,10 @@
+use crate::accounts::{Account, AccountId};
 use crate::bw_path::bw_command;
 use crate::hello::{self, HelloState};
 use crate::theme;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use zeroize::Zeroize;
 
@@ -994,6 +996,29 @@ pub enum LoginAction {
 /// primitive). The Hello panel appears once quick unlock is enrolled
 /// (`hello.enrolled`); the mock's static "Bitwarden · EU" footer is a live
 /// server dropdown while signing in.
+/// What the window says when a migration has just cost this account its
+/// Windows Hello enrollment.
+///
+/// One of the three channels the migration announces that through; the other
+/// two are elsewhere. Worded as a consequence of something the user agreed to
+/// rather than as an error, because nothing has gone wrong -- but it is said
+/// out loud, because a quick unlock that quietly stops existing reads as a
+/// bug in the app.
+pub const HELLO_REENROLMENT_NOTICE: &str =
+    "Your vault moved into its own profile, so Windows Hello quick unlock has to be set up again.";
+
+/// Paints [`HELLO_REENROLMENT_NOTICE`]. One definition, two call sites (with
+/// the Hello panel, and standing alone when there is no panel), so the two
+/// cannot drift into saying different things.
+fn draw_reenrolment_notice(ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new(HELLO_REENROLMENT_NOTICE)
+            .size(11.0)
+            .color(theme::TEXT_MUTED),
+    );
+    ui.add_space(8.0);
+}
+
 pub fn draw_login_window(
     ui: &mut egui::Ui,
     status: BwStatus,
@@ -1006,6 +1031,14 @@ pub fn draw_login_window(
     // answers. Disables every control that could start a second sign-in and
     // shows the spinner beside Continue.
     auth_in_progress: bool,
+    // This account's vault was just moved into its own profile, which left
+    // its Windows Hello enrollment behind (the sealed blob is derived from
+    // the account's identity, so it cannot be carried over). Draws
+    // [`HELLO_REENROLMENT_NOTICE`]. Not something the window infers: the
+    // fact travels from the migration, and without it the user's only
+    // signal is a quick unlock panel that offers "first use" again --
+    // indistinguishable from never having set it up.
+    hello_needs_reenrolment: bool,
 ) -> Option<LoginAction> {
     let mut action = None;
 
@@ -1113,6 +1146,12 @@ pub fn draw_login_window(
     // is one click.
     let needs_setup = !hello.enrolled;
     let show_panel = hello.available && (needs_setup || status != BwStatus::Unauthenticated);
+    // Deliberately NOT nested inside `show_panel`. If Hello has since been
+    // turned off on this machine there is no panel to hang the line from,
+    // and the line is then the only thing that says the quick unlock the
+    // user had is gone. `needs_setup` because a re-enrolled account has
+    // nothing left to be told.
+    let show_reenrolment_notice = hello_needs_reenrolment && needs_setup;
     if show_panel {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1122,6 +1161,10 @@ pub fn draw_login_window(
             hairline_segment(ui, half);
         });
         ui.add_space(10.0);
+
+        if show_reenrolment_notice {
+            draw_reenrolment_notice(ui);
+        }
 
         let subtitle = if needs_setup {
             "First use: enter your master password, then click here"
@@ -1148,6 +1191,9 @@ pub fn draw_login_window(
                 action = Some(LoginAction::Submit);
             }
         }
+    } else if show_reenrolment_notice {
+        ui.add_space(10.0);
+        draw_reenrolment_notice(ui);
     }
 
     // Enter submits from anywhere in the form, same as clicking Continue --
@@ -1404,18 +1450,33 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
 /// sealed for Windows Hello has to be one that provably opened the vault. A
 /// failed enrollment is logged rather than surfaced — the unlock itself
 /// succeeded and the window is about to close.
+/// The Hello state for the account this window belongs to, or "no quick
+/// unlock at all" when there is no account -- there is no account-less blob
+/// to fall back to. Named rather than inlined so the two re-probes the window
+/// does after a Hello failure or a log-out cannot disagree with the first.
+fn probe_hello(scope: &Option<(PathBuf, AccountId)>) -> HelloState {
+    match scope {
+        Some((config_dir, id)) => hello::state_for(config_dir, id),
+        None => HelloState::unavailable(),
+    }
+}
+
 fn spawn_auth(
     tx: std::sync::mpsc::Sender<Result<String, String>>,
     args: Vec<String>,
     mut password: String,
-    enroll_hello: bool,
+    // `Some` when the user asked for quick unlock this submit: the account
+    // whose blob the password gets sealed into, owned because the worker
+    // outlives this frame. Enrollment is per-account (`hello::enroll_for`) --
+    // there is no such thing as enrolling "the app".
+    enroll_hello: Option<(PathBuf, AccountId)>,
 ) {
     std::thread::spawn(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let result = run_bw_with_password(&arg_refs, &password);
 
-        if result.is_ok() && enroll_hello {
-            match hello::enroll(&password) {
+        if let (true, Some((config_dir, id))) = (result.is_ok(), &enroll_hello) {
+            match hello::enroll_for(config_dir, id, &password) {
                 Ok(()) => log::info!("Windows Hello quick unlock enrolled"),
                 Err(e) => log::warn!("could not enroll Windows Hello quick unlock: {e}"),
             }
@@ -1429,9 +1490,47 @@ fn spawn_auth(
 /// Opens a blocking egui window that shows a server-choice + email field
 /// when the CLI reports `Unauthenticated`, or just a password field when
 /// `Locked`/`Unlocked`; runs `bw login`/`bw unlock` accordingly and returns
-/// the resulting session token.
-pub fn run_login_flow() -> String {
+/// the resulting session token -- or `None` if the user closed the window
+/// without producing one.
+///
+/// **Returning `None` is the entire point of this function existing
+/// separately from [`run_login_flow`].** Closing this window is fatal only
+/// for the callers that have nothing to go back to (startup, and the
+/// lock/re-auth recovery). An account switch does have somewhere to go back
+/// to -- the account the user is already signed into, with its vault intact
+/// -- and declining the prompt there is an ordinary gesture that must leave
+/// the running app exactly as it was. Anything that is not startup or
+/// re-auth calls this and handles `None`.
+///
+/// `account` is the account this window's Windows Hello enrollment belongs
+/// to, with the config directory it lives under. `None` means "no account
+/// has been resolved yet", which is the state `main.rs` is still in until
+/// startup is rewritten to resolve one; the window then simply offers no
+/// quick unlock, because there is no account whose blob it could read or
+/// write. It never falls back to a shared, account-less enrollment -- that
+/// path is gone, and reviving it would hand one account's sealed master
+/// password to another.
+///
+/// `hello_needs_reenrolment` draws [`HELLO_REENROLMENT_NOTICE`]; see
+/// [`draw_login_window`].
+pub fn run_login_flow_for(
+    account: Option<(&Path, &Account)>,
+    hello_needs_reenrolment: bool,
+) -> Option<String> {
     let details = check_bw_status_details();
+
+    // Owned, because the update closure is `'static` and both the Hello
+    // re-probes and the enrollment handed to `spawn_auth` need it after this
+    // function's borrows are gone.
+    let hello_scope: Option<(PathBuf, AccountId)> = account
+        .map(|(config_dir, account)| (config_dir.to_path_buf(), account.id.clone()));
+    if hello_scope.is_none() {
+        log::warn!(
+            "login window opened without an account, so Windows Hello quick unlock is not \
+             offered in it: there is no account whose sealed master password could be read \
+             or written"
+        );
+    }
 
     // The update closure is FnMut + 'static and must move-capture its
     // state, so a plain local `Option<String>` can't be read back by this
@@ -1458,7 +1557,7 @@ pub fn run_login_flow() -> String {
     form.server_url = url;
     // Probed once: Hello support doesn't change mid-dialog, and enrollment
     // changes only through the actions handled below.
-    let mut hello_state = hello::state();
+    let mut hello_state = probe_hello(&hello_scope);
 
     // Remeasured every frame and applied when it changes: the content
     // stack differs per state (self-hosted URL field, Hello panel, wrapped
@@ -1557,6 +1656,7 @@ pub fn run_login_flow() -> String {
                     &mut form,
                     &mut flow_bottom,
                     auth_in_progress,
+                    hello_needs_reenrolment,
                 );
 
                 // Content height + the footer row and the bottom margin the
@@ -1632,9 +1732,15 @@ pub fn run_login_flow() -> String {
                                     vec!["unlock".to_string(), "--raw".to_string()]
                                 }
                             };
-                            let enroll_hello = form.enable_hello
+                            // `None` unless the user asked for quick unlock
+                            // AND there is an account to enrol it for: the
+                            // sealed password belongs to one account's blob
+                            // or to nothing.
+                            let enroll_hello = (form.enable_hello
                                 && hello_state.available
-                                && !hello_state.enrolled;
+                                && !hello_state.enrolled)
+                                .then(|| hello_scope.clone())
+                                .flatten();
 
                             // Handed to the worker, then wiped from the form
                             // immediately -- the buffer has served its
@@ -1656,7 +1762,16 @@ pub fn run_login_flow() -> String {
                         // follows -- a CLI spawn plus a network round trip --
                         // moves to the worker, which is the part that was
                         // freezing the window.
-                        match hello::unlock_password() {
+                        let opened = match &hello_scope {
+                            Some((config_dir, id)) => hello::unlock_password_for(config_dir, id),
+                            // Unreachable through the UI -- with no account
+                            // the panel and its Ctrl+H shortcut are never
+                            // drawn -- but stated rather than unwrapped: the
+                            // alternative would be an account-less blob.
+                            None => Err("There is no account to unlock with Windows Hello."
+                                .to_string()),
+                        };
+                        match opened {
                             Ok(password) => {
                                 spawn_auth(
                                     auth_tx.clone(),
@@ -1667,7 +1782,9 @@ pub fn run_login_flow() -> String {
                                     // end of this arm, and `spawn_auth` wipes
                                     // the worker's.
                                     (*password).clone(),
-                                    false,
+                                    // Already enrolled -- that is where this
+                                    // password came from.
+                                    None,
                                 );
                                 form.error = None;
                                 auth_in_progress = true;
@@ -1676,10 +1793,10 @@ pub fn run_login_flow() -> String {
                                 log::warn!("Windows Hello quick unlock failed: {e}");
                                 form.error = Some(e);
                                 // A failed open deletes the blob (see
-                                // hello::unlock_password); re-probe so the
-                                // panel disappears rather than erroring
+                                // `hello::unlock_password_for`); re-probe so
+                                // the panel disappears rather than erroring
                                 // forever.
-                                hello_state = hello::state();
+                                hello_state = probe_hello(&hello_scope);
                             }
                         }
                     }
@@ -1688,9 +1805,13 @@ pub fn run_login_flow() -> String {
                             log::info!("logged out at the user's request; showing sign-in");
                             // A sealed master password for an account the
                             // CLI no longer knows is a liability: drop the
-                            // enrollment with the account.
-                            hello::unenroll();
-                            hello_state = hello::state();
+                            // enrollment with the account. THIS account's
+                            // only -- logging out here says nothing about
+                            // any other account's enrollment.
+                            if let Some((config_dir, id)) = &hello_scope {
+                                hello::unenroll_for(config_dir, id);
+                            }
+                            hello_state = probe_hello(&hello_scope);
                             status = BwStatus::Unauthenticated;
                             account_email = None;
                             form.error = None;
@@ -1705,14 +1826,34 @@ pub fn run_login_flow() -> String {
             });
     });
 
+    // `None` means the user closed the window with the X button rather than
+    // completing the flow. What that *costs* is the caller's to decide, and
+    // is decided in exactly one place: [`run_login_flow`].
     let produced = token.borrow_mut().take();
-    match produced {
+    produced
+}
+
+/// The login flow for the two callers that genuinely cannot continue without
+/// a session: startup, and the lock/re-auth recovery. A closed window ends
+/// the process.
+///
+/// Everything else -- an account switch, adding an account -- must call
+/// [`run_login_flow_for`] and handle `None`. That distinction is the whole
+/// reason these are two functions and not one: declining a switch is an
+/// ordinary gesture, and if the process-level exit lived in the body, closing
+/// the master-password prompt during a switch would kill an app that was
+/// running perfectly well with a vault already open.
+///
+/// It takes no account for now: `main.rs` has not been given one to pass yet
+/// (that is the startup rewrite's job), so this window offers no Windows
+/// Hello quick unlock in the meantime -- see [`run_login_flow_for`] on why
+/// there is no account-less fallback.
+pub fn run_login_flow() -> String {
+    match run_login_flow_for(None, false) {
         Some(session_token) => session_token,
         None => {
-            // The user closed the window with the X button rather than
-            // completing the flow. There is nothing sensible to continue with
-            // -- every downstream operation needs a session -- so exit
-            // cleanly with a logged reason instead of a raw panic backtrace.
+            // Exit cleanly with a logged reason rather than a raw panic
+            // backtrace: every downstream operation needs a session.
             log::error!("login window was closed without producing a session token; exiting");
             std::process::exit(1);
         }
@@ -2243,5 +2384,273 @@ Cryptography error, The decryption operation failed";
         // deliberately not trimmed -- rejecting it would lock out anyone
         // whose password legitimately starts or ends with one.
         assert_eq!(missing_credential_message(BwStatus::Locked, "", " "), None);
+    }
+}
+
+#[cfg(test)]
+mod login_entry_point_tests {
+    //! Which of the two login entry points may end the process, and which
+    //! `hello::` functions this window is allowed to call.
+    //!
+    //! Source guards, and unavoidably so: `run_login_flow_for` opens a real
+    //! eframe window and the `hello::` calls pop OS dialogs, so neither can be
+    //! driven from a test. What they pin is not cosmetic -- it is the
+    //! difference between a declined account switch that leaves the app
+    //! running and one that kills it, and between a log-out that drops this
+    //! account's sealed master password and one that drops another account's.
+
+    use super::*;
+
+    const SOURCE: &str = include_str!("login_ui.rs");
+
+    #[test]
+    fn only_the_fatal_entry_point_can_end_the_process() {
+        // Needle assembled at compile time so it cannot match its own
+        // declaration, and kept to one line so it reads the same under LF and
+        // CRLF.
+        let needle = concat!("std::process", "::exit(1)");
+        assert_eq!(
+            SOURCE.matches(needle).count(),
+            1,
+            "there must be exactly one process exit in this file"
+        );
+
+        let wrapper = SOURCE
+            .split_once("pub fn run_login_flow(")
+            .expect("the fatal wrapper must exist")
+            .1;
+        assert!(
+            wrapper.contains(needle),
+            "the exit left the fatal wrapper, so some other caller now ends \
+             the process"
+        );
+        assert!(
+            wrapper.len() < SOURCE.len(),
+            "positive control: the split actually isolated a region"
+        );
+
+        // And the cancellable body -- from its definition up to the
+        // wrapper's -- has none of it. Implied by the count above, but stated
+        // separately so an exit put back into the body fails with the message
+        // that says what it costs.
+        let body = SOURCE
+            .split_once("pub fn run_login_flow_for(")
+            .expect("the cancellable entry point must exist")
+            .1;
+        let body = body
+            .split_once("pub fn run_login_flow(")
+            .expect("the wrapper must follow it")
+            .0;
+        assert!(
+            !body.contains(needle),
+            "the cancellable login flow ends the process; a declined account \
+             switch would kill a running app"
+        );
+        // Positive controls for that negative: the isolated region is really
+        // the flow's body, and the needle is findable in text containing it.
+        assert!(
+            body.contains("run_ui_native"),
+            "the region searched is not the login flow's body"
+        );
+        assert_eq!(format!("{needle} {needle}").matches(needle).count(), 2);
+    }
+
+    #[test]
+    fn the_two_entry_points_differ_in_exactly_what_a_closed_window_costs() {
+        // A compile-time pin: if `run_login_flow_for` goes back to returning
+        // `String`, or the fatal wrapper starts returning `Option`, this stops
+        // compiling -- which is the failure. Task 9's switch is built on that
+        // `Option` being there.
+        let cancellable: fn(Option<(&Path, &Account)>, bool) -> Option<String> = run_login_flow_for;
+        let fatal: fn() -> String = run_login_flow;
+        assert!(
+            !std::ptr::eq(cancellable as *const (), fatal as *const ()),
+            "positive control: these must be two distinct functions"
+        );
+    }
+
+    #[test]
+    fn the_login_window_uses_only_the_per_account_hello_entry_points() {
+        for stale in [
+            concat!("hello", "::unenroll()"),
+            concat!("hello", "::state()"),
+            concat!("hello", "::unlock_password()"),
+            concat!("hello", "::enroll("),
+            concat!("hello", "::blob_path()"),
+        ] {
+            assert!(
+                !SOURCE.contains(stale),
+                "an account-less hello entry point is still called here: {stale}"
+            );
+        }
+        for required in [
+            concat!("hello", "::unenroll_for("),
+            concat!("hello", "::state_for("),
+            concat!("hello", "::unlock_password_for("),
+            concat!("hello", "::enroll_for("),
+        ] {
+            assert!(
+                SOURCE.contains(required),
+                "this window no longer calls {required} at all"
+            );
+        }
+        // The `enroll(` needle must not be satisfiable by `enroll_for(`, or
+        // the two halves above would contradict each other and one of them
+        // would be inert. Same for `state(` against `state_for(`.
+        assert!(!concat!("hello", "::enroll_for(").contains(concat!("hello", "::enroll(")));
+        assert!(!concat!("hello", "::state_for(").contains(concat!("hello", "::state(")));
+    }
+}
+
+#[cfg(test)]
+mod hello_notice_tests {
+    //! The line that says a migration cost this account its quick unlock.
+    //!
+    //! Driven through real frames with a headless `egui::Context`, the way the
+    //! rest of this crate's windows are tested: what can go wrong here is not
+    //! the wording, it is the window never painting it -- or painting it at
+    //! someone who never migrated.
+
+    use super::*;
+
+    const WINDOW: Vec2 = egui::vec2(470.0, 588.0);
+
+    /// A context with `theme::apply`'s fonts actually live -- a font set
+    /// registered during a frame only becomes usable at the start of the next
+    /// one, so the throwaway frames are load-bearing.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        ctx
+    }
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        }
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            // Everything else is geometry this module does not assert on.
+            _ => {}
+        }
+    }
+
+    /// Every string the login window paints in one frame of a `Locked` vault
+    /// -- which is the state a just-migrated account comes back in.
+    fn painted(hello: HelloState, hello_needs_reenrolment: bool) -> Vec<String> {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let mut flow_bottom = 0.0f32;
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let _ = draw_login_window(
+                ui,
+                BwStatus::Locked,
+                Some("a.novak@ledgerline.com"),
+                "bitwarden.com",
+                hello,
+                &mut form,
+                &mut flow_bottom,
+                false,
+                hello_needs_reenrolment,
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn says_set_up_again(texts: &[String]) -> bool {
+        texts
+            .iter()
+            .any(|t| t.to_lowercase().contains("set up again"))
+    }
+
+    /// The Hello panel's own first-use subtitle: the positive control for
+    /// every "the notice is absent" assertion below. Without it, a window that
+    /// painted nothing at all would pass them.
+    fn shows_the_hello_panel(texts: &[String]) -> bool {
+        texts.iter().any(|t| t.contains("First use"))
+    }
+
+    const ENROLLED: HelloState = HelloState {
+        available: true,
+        enrolled: true,
+    };
+    const NOT_ENROLLED: HelloState = HelloState {
+        available: true,
+        enrolled: false,
+    };
+
+    #[test]
+    fn a_migrated_account_is_told_its_quick_unlock_has_to_be_set_up_again() {
+        let texts = painted(NOT_ENROLLED, true);
+        assert!(
+            says_set_up_again(&texts),
+            "the migration's re-enrolment line was never painted; got: {texts:?}"
+        );
+        assert!(
+            shows_the_hello_panel(&texts),
+            "positive control: this state must still draw the Hello panel"
+        );
+    }
+
+    #[test]
+    fn a_user_who_did_not_migrate_is_told_nothing() {
+        let texts = painted(NOT_ENROLLED, false);
+        assert!(
+            shows_the_hello_panel(&texts),
+            "positive control: the window drew nothing, so the assertion below \
+             would pass for the wrong reason; got: {texts:?}"
+        );
+        assert!(
+            !says_set_up_again(&texts),
+            "the re-enrolment line is painted unconditionally; got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn an_account_that_has_already_re_enrolled_is_not_told_again() {
+        let texts = painted(ENROLLED, true);
+        assert!(
+            !texts.is_empty(),
+            "positive control: the window painted nothing at all"
+        );
+        assert!(
+            !says_set_up_again(&texts),
+            "an enrolled account is still being told to set Hello up again; \
+             got: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_notice_survives_hello_being_switched_off_on_the_machine() {
+        // The case the line exists for. With Hello unavailable there is no
+        // panel, so a notice nested inside the panel would vanish with it --
+        // and the user's only signal that their quick unlock is gone would be
+        // the silence this whole task is about.
+        let texts = painted(HelloState::unavailable(), true);
+        assert!(
+            !shows_the_hello_panel(&texts),
+            "positive control: no Hello panel may be drawn in this state; \
+             got: {texts:?}"
+        );
+        assert!(
+            says_set_up_again(&texts),
+            "the notice is nested inside the Hello panel, so it disappeared \
+             with it; got: {texts:?}"
+        );
     }
 }

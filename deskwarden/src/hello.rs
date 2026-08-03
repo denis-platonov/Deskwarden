@@ -88,20 +88,6 @@ pub fn blob_path_for(config_dir: &Path, id: &AccountId) -> PathBuf {
     accounts::hello_blob_path_for(config_dir, id)
 }
 
-/// **Pre-accounts single-account path**, `<config_dir>/hello.bin`.
-///
-/// Kept only for the call sites the login window has not been converted yet
-/// (that conversion is its own change, and doing it here would mean editing a
-/// file this change does not own). It is *not* an account: it derives under an
-/// empty suffix, which is precisely the derivation that
-/// `no_account_reproduces_the_pre_migration_derivation` forbids every account
-/// from reaching, so an existing enrolment written before accounts existed
-/// keeps working and no account can open it. It goes away with the last caller.
-pub fn blob_path() -> Option<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "deskwarden", "deskwarden")?;
-    Some(dirs.config_dir().join("hello.bin"))
-}
-
 /// What the login window needs to know to draw 3h's Hello panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HelloState {
@@ -141,14 +127,6 @@ pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
         .and_then(|op| op.get())
         .unwrap_or(false);
     state_from(available, blob_path_for(config_dir, id).exists())
-}
-
-/// Pre-accounts form of [`state_for`]; see [`blob_path`].
-pub fn state() -> HelloState {
-    let available = KeyCredentialManager::IsSupportedAsync()
-        .and_then(|op| op.get())
-        .unwrap_or(false);
-    state_from(available, blob_path().map(|p| p.exists()).unwrap_or(false))
 }
 
 /// Runs the Hello-gated signature and derives `account_suffix`'s AES key from
@@ -364,26 +342,6 @@ pub fn unlock_password_for(config_dir: &Path, id: &AccountId) -> Result<Zeroizin
 /// feature). Touches only that account's file.
 pub fn unenroll_for(config_dir: &Path, id: &AccountId) {
     let _ = std::fs::remove_file(blob_path_for(config_dir, id));
-}
-
-/// Pre-accounts form of [`enroll_for`]; see [`blob_path`].
-pub fn enroll(master_password: &str) -> Result<(), String> {
-    let path = blob_path().ok_or("could not resolve the config directory")?;
-    let key = hello_derived_key(true, &[])?;
-    store_blob(&path, &key, master_password)
-}
-
-/// Pre-accounts form of [`unlock_password_for`]; see [`blob_path`].
-pub fn unlock_password() -> Result<Zeroizing<String>, String> {
-    let path = blob_path().ok_or("could not resolve the config directory")?;
-    open_blob(&path, || hello_derived_key(false, &[]))
-}
-
-/// Pre-accounts form of [`unenroll_for`]; see [`blob_path`].
-pub fn unenroll() {
-    if let Some(path) = blob_path() {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 #[cfg(test)]
@@ -749,9 +707,14 @@ mod tests {
         assert_eq!(count(concat!("hello_derived_key(true, ", "&suffix)")), 1);
         assert_eq!(count(concat!("hello_derived_key(false, ", "&suffix)")), 1);
 
-        // ...and the empty suffix is reachable ONLY from the two pre-accounts
-        // entry points, which is the whole of what `&[]` may ever be used for.
-        assert_eq!(count(concat!("hello_derived_key(true, ", "&[])")), 1);
-        assert_eq!(count(concat!("hello_derived_key(false, ", "&[])")), 1);
+        // ...and the empty suffix is now reachable from NOWHERE. The two
+        // pre-accounts entry points that used it are gone with their last
+        // caller, so an empty-suffix derivation could only come back as a
+        // fallback for "no account" -- which would seal one account's master
+        // password where every account can open it. The `_for(id)` count above
+        // is this pair's positive control: it proves the counter finds real
+        // needles, so a zero here is an absence and not a broken mechanism.
+        assert_eq!(count(concat!("hello_derived_key(true, ", "&[])")), 0);
+        assert_eq!(count(concat!("hello_derived_key(false, ", "&[])")), 0);
     }
 }
