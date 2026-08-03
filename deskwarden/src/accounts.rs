@@ -213,6 +213,74 @@ pub fn ensure_account_dir(config_dir: &Path, id: &AccountId) -> std::io::Result<
     Ok(dir)
 }
 
+/// Mints an account and creates its directory, ready for a sign-in that has
+/// not happened yet.
+///
+/// The email is empty *by construction*, not by oversight: nobody has signed
+/// in, so there is nothing to record. Whoever completes the sign-in fills it
+/// in by asking the CLI about **this** directory
+/// ([`login_ui::check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in)),
+/// which is the only source that knows. Left empty, the account is a blank row
+/// in the switcher that the user cannot tell from any other.
+///
+/// The directory is created with `create_dir` rather than `create_dir_all`, so
+/// an id whose directory already exists is an **error** rather than a silent
+/// adoption. [`discard_prepared_account`] deletes the whole directory when the
+/// sign-in is abandoned, and deleting a directory this call did not create
+/// would take a working account's vault with it. Unreachable in practice --
+/// the id is 128 bits from the OS CSPRNG -- and it is the consequence of being
+/// wrong, not the odds, that decides the shape here.
+pub fn prepare_new_account(config_dir: &Path) -> Result<Account, String> {
+    let root = accounts_root(config_dir);
+    std::fs::create_dir_all(&root)
+        .map_err(|e| format!("could not create {}: {e}", root.display()))?;
+    let id = AccountId::generate();
+    let dir = data_dir_for(config_dir, &id);
+    std::fs::create_dir(&dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    log::info!("prepared a new account directory at {}", dir.display());
+    Ok(Account {
+        id,
+        email: String::new(),
+        server_url: None,
+    })
+}
+
+/// Undoes [`prepare_new_account`]: deletes the account's directory and
+/// everything an abandoned sign-in left in it.
+///
+/// Deleting the *directory* rather than a list of files by name is the point.
+/// A sign-in that got as far as ticking "Use Windows Hello" leaves a
+/// `hello.bin` sealing a master password for an account that is about to stop
+/// existing, and a `bw login` that succeeded before the switch failed leaves a
+/// whole CLI profile. What must not survive is an account directory nothing
+/// names -- or, worse, an entry naming a directory with no profile in it,
+/// which presents as an account that is permanently signed out.
+///
+/// Infallible by design: this runs on a path where something has already gone
+/// wrong and there is no second recovery to offer, so a failure is logged and
+/// the caller gets on with restoring the account the user was already using.
+pub fn discard_prepared_account(config_dir: &Path, id: &AccountId) {
+    let dir = data_dir_for(config_dir, id);
+    // Belt and braces over `AccountId::parse`, because this is a
+    // `remove_dir_all` on a path built from an id. If one ever escaped the
+    // accounts root, this call would take `settings.json`, the log, and every
+    // other account's migrated profile with it.
+    if !dir.starts_with(accounts_root(config_dir)) {
+        log::error!(
+            "refusing to delete {}: it is not under {}",
+            dir.display(),
+            accounts_root(config_dir).display()
+        );
+        return;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => log::info!("discarded the prepared account directory {}", dir.display()),
+        // Nothing to undo is the goal state, however we got there.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("could not discard {}: {e}", dir.display()),
+    }
+}
+
 // -------------------------------------------------- what startup resolves to
 
 /// What this launch is pointed at, once the migration has had its turn.
@@ -418,20 +486,7 @@ impl AccountsState {
             (None, MigrationState::Completed { .. } | MigrationState::NothingToMigrate) => None,
         };
 
-        let mut switchable: Vec<Account> = Vec::new();
-        if blocked_reason.is_none() {
-            for account in &accounts {
-                // Never the active account: "switch to where you already are"
-                // still tears the backend down and demands a master password.
-                // Never a repeat of one already offered either — two entries
-                // for one id are two doors onto one directory, and a
-                // hand-edited file can contain them.
-                let already = switchable.iter().any(|a: &Account| a.id == account.id);
-                if account.id != active.id && !already {
-                    switchable.push(account.clone());
-                }
-            }
-        }
+        let switchable = switch_targets(&accounts, &active, blocked_reason.is_some());
 
         let hello_needs_reenrolment = matches!(
             migration,
@@ -486,6 +541,51 @@ impl AccountsState {
     pub fn hello_needs_reenrolment(&self) -> bool {
         self.hello_needs_reenrolment
     }
+
+    /// Records the account this process has just moved onto, appending it to
+    /// the list if it is not there yet.
+    ///
+    /// This is how an *added* account reaches the state every window reads.
+    /// It is a mutation rather than a rebuild because [`new`](Self::new)'s two
+    /// inputs — the CLI's availability and the migration's outcome — are not
+    /// re-derivable here, and re-deriving them would be a second reading of
+    /// the two facts this type exists to be the single answer to. Neither is
+    /// changed by adding an account: whether switching is blocked was settled
+    /// at startup, so it is *carried*, and a blocked state that adopts one
+    /// still offers no switch targets.
+    pub fn adopt(&mut self, account: Account) {
+        if account_for(&self.accounts, &account.id).is_none() {
+            self.accounts.push(account.clone());
+        }
+        self.active = account;
+        self.switchable =
+            switch_targets(&self.accounts, &self.active, self.blocked_reason.is_some());
+    }
+}
+
+/// The accounts a user may switch **to**, given the whole list and the one
+/// they are on.
+///
+/// One definition, used by [`AccountsState::new`] and [`AccountsState::adopt`]
+/// alike. A second copy would be a second rule, and the two would first
+/// disagree exactly where it matters least visibly: an account added at
+/// runtime is the only one that ever reaches `adopt`.
+fn switch_targets(accounts: &[Account], active: &Account, blocked: bool) -> Vec<Account> {
+    let mut targets: Vec<Account> = Vec::new();
+    if blocked {
+        return targets;
+    }
+    for account in accounts {
+        // Never the active account: "switch to where you already are" still
+        // tears the backend down and demands a master password. Never a repeat
+        // of one already offered either — two entries for one id are two doors
+        // onto one directory, and a hand-edited file can contain them.
+        let already = targets.iter().any(|a: &Account| a.id == account.id);
+        if account.id != active.id && !already {
+            targets.push(account.clone());
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
@@ -1660,6 +1760,266 @@ mod tests {
             );
 
             let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // ---------------------------------------------------------------- 12
+
+    mod preparing_an_account {
+        use super::*;
+
+        /// A scratch config directory under `%TEMP%`. **Never** the real one:
+        /// these tests call `remove_dir_all`.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "deskwarden-prepare-{tag}-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                Self(dir)
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn names_under(dir: &Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn a_prepared_account_gets_a_real_directory_and_names_nobody_yet() {
+            let cfg = Scratch::new("made");
+            assert!(
+                !accounts_root(cfg.path()).exists(),
+                "control: the accounts root is not there before the call, so the assertions \
+                 below are about what this created"
+            );
+
+            let first = prepare_new_account(cfg.path()).expect("a new account must be preparable");
+
+            // The directory must exist BEFORE anything writes into it:
+            // `SessionStore::new` will not create its own parent, so without
+            // this the very first `store.save` fails and the account presents
+            // as a master-password prompt on every launch, forever.
+            assert!(
+                data_dir_for(cfg.path(), &first.id).is_dir(),
+                "the account has no directory to hold its session token"
+            );
+            assert!(
+                session_path_for(cfg.path(), &first.id)
+                    .parent()
+                    .is_some_and(Path::is_dir),
+                "the session token's parent directory does not exist"
+            );
+            // Empty by construction: nobody has signed in, so there is no
+            // address to record and the sign-in is what fills it in.
+            assert_eq!(first.email, "");
+            assert_eq!(first.server_url, None);
+
+            // Two prepares are two accounts, not one directory shared.
+            let second = prepare_new_account(cfg.path()).expect("a second one too");
+            assert_ne!(first.id, second.id);
+            assert_eq!(
+                names_under(&accounts_root(cfg.path())),
+                {
+                    let mut both = vec![first.id.to_string(), second.id.to_string()];
+                    both.sort();
+                    both
+                },
+                "the two prepared accounts are not two directories"
+            );
+        }
+
+        #[test]
+        fn a_prepare_that_cannot_create_the_directory_reports_it_rather_than_inventing_an_account()
+        {
+            // A file where the accounts root should be: the same shape as a
+            // read-only or otherwise unwritable config directory. An `Account`
+            // returned here would be persisted and switched to, and the switch
+            // would point the CLI at a directory that does not exist.
+            let cfg = Scratch::new("blocked");
+            std::fs::write(accounts_root(cfg.path()), b"not a directory").unwrap();
+
+            let e = prepare_new_account(cfg.path())
+                .expect_err("an account was minted with nowhere to put it");
+            assert!(
+                e.contains("accounts"),
+                "the failure must name the path that could not be made, got: {e}"
+            );
+            assert!(
+                accounts_root(cfg.path()).is_file(),
+                "control: the obstruction is still a file, so the call really did fail on it"
+            );
+        }
+
+        #[test]
+        fn discarding_a_prepared_account_takes_its_secrets_and_only_its_own() {
+            let cfg = Scratch::new("discard");
+            let doomed = prepare_new_account(cfg.path()).expect("prepared");
+            let keeper = prepare_new_account(cfg.path()).expect("prepared");
+            // What an abandoned sign-in can leave behind: a CLI profile, a
+            // session token, and -- if the user ticked "Use Windows Hello"
+            // before the switch failed -- a blob sealing a master password for
+            // an account that is about to stop existing.
+            for id in [&doomed.id, &keeper.id] {
+                std::fs::write(session_path_for(cfg.path(), id), b"wrapped").unwrap();
+                std::fs::write(hello_blob_path_for(cfg.path(), id), b"sealed").unwrap();
+                std::fs::create_dir_all(data_dir_for(cfg.path(), id).join("bw")).unwrap();
+            }
+
+            discard_prepared_account(cfg.path(), &doomed.id);
+
+            assert!(!data_dir_for(cfg.path(), &doomed.id).exists());
+            assert!(!session_path_for(cfg.path(), &doomed.id).exists());
+            assert!(!hello_blob_path_for(cfg.path(), &doomed.id).exists());
+            // The positive controls, without which every assertion above
+            // passes against a call that deleted the whole accounts root:
+            assert!(
+                data_dir_for(cfg.path(), &keeper.id).is_dir(),
+                "the OTHER account's profile went with it"
+            );
+            assert!(
+                hello_blob_path_for(cfg.path(), &keeper.id).exists(),
+                "the other account's sealed master password went with it"
+            );
+            assert!(
+                accounts_root(cfg.path()).is_dir(),
+                "the accounts root was deleted"
+            );
+            assert!(cfg.path().is_dir(), "the config directory was deleted");
+
+            // Idempotent: a discard runs on a path where something already
+            // went wrong, and "already gone" is the goal state.
+            discard_prepared_account(cfg.path(), &doomed.id);
+            assert!(!data_dir_for(cfg.path(), &doomed.id).exists());
+        }
+    }
+
+    mod adopting_an_account {
+        use super::*;
+        use crate::bw_path::MultiAccountAvailability;
+        use crate::migration::MigrationState;
+
+        fn state(
+            availability: MultiAccountAvailability,
+            list: Vec<Account>,
+            active: &AccountId,
+        ) -> AccountsState {
+            AccountsState::new(
+                availability,
+                MigrationState::NothingToMigrate,
+                list,
+                active.clone(),
+            )
+            .expect("these accounts are not empty")
+        }
+
+        fn switch_ids(state: &AccountsState) -> Vec<AccountId> {
+            state.switchable().iter().map(|x| x.id.clone()).collect()
+        }
+
+        #[test]
+        fn an_adopted_account_becomes_active_and_the_one_it_left_becomes_a_target() {
+            let a = account(A);
+            let mut s = state(MultiAccountAvailability::Available, vec![a.clone()], &a.id);
+            assert!(
+                s.switchable().is_empty(),
+                "control: there was nowhere to switch to before the add"
+            );
+
+            let added = Account {
+                id: id(B),
+                email: "new@example.com".to_string(),
+                server_url: Some("https://vault.example.com".to_string()),
+            };
+            s.adopt(added.clone());
+
+            assert_eq!(s.active(), &added, "the add did not settle onto the account it added");
+            assert_eq!(s.all().len(), 2);
+            assert_eq!(
+                s.all().last(), Some(&added),
+                "the added account is not in the list the switcher shows"
+            );
+            assert_eq!(
+                switch_ids(&s),
+                vec![a.id.clone()],
+                "the account the user came from is not offered as somewhere to go back to"
+            );
+            assert!(
+                !switch_ids(&s).contains(&added.id),
+                "the account just switched onto is offered as somewhere to switch to"
+            );
+            assert!(s.can_add(), "a second add is barred by the first");
+        }
+
+        #[test]
+        fn adopting_the_account_already_active_neither_duplicates_it_nor_offers_it() {
+            // Not reachable from an add -- the id is fresh -- and exactly what
+            // a resumed switch would do. Appending would put two menu entries
+            // on one directory.
+            let (a, b) = (account(A), account(B));
+            let mut s = state(
+                MultiAccountAvailability::Available,
+                vec![a.clone(), b.clone()],
+                &a.id,
+            );
+            s.adopt(b.clone());
+            assert_eq!(s.all().len(), 2, "the account was added a second time");
+            assert_eq!(s.active().id, b.id);
+            assert_eq!(switch_ids(&s), vec![a.id]);
+        }
+
+        #[test]
+        fn adopting_does_not_unblock_a_state_that_was_blocked() {
+            // `adopt` carries the two facts rather than re-deriving them, and
+            // this is what that has to mean: an add cannot talk its way past
+            // the `relativeDataDir` trap by mutating the state afterwards.
+            let (a, b) = (account(A), account(B));
+            let mut s = state(
+                MultiAccountAvailability::BlockedByUnknownCliPath,
+                vec![a.clone()],
+                &a.id,
+            );
+            assert!(!s.can_add());
+            s.adopt(b.clone());
+            assert!(
+                !s.can_add(),
+                "a blocked state was unblocked by adopting an account into it"
+            );
+            assert!(
+                s.switchable().is_empty(),
+                "a blocked state offered a switch target after an adopt: {:?}",
+                switch_ids(&s)
+            );
+            assert!(s.blocked_reason().is_some());
+            // The positive control on the same call: the unblocked state DOES
+            // offer one, so the emptiness above is the block rather than
+            // `adopt` never computing targets at all.
+            let mut open = state(MultiAccountAvailability::Available, vec![a.clone()], &a.id);
+            open.adopt(b.clone());
+            assert_eq!(switch_ids(&open), vec![a.id]);
         }
     }
 }

@@ -2315,6 +2315,151 @@ enum SwitchOutcome {
     StoodDown { reason: String },
 }
 
+/// Adds a Bitwarden account: mints one, signs in to it, and then settles onto
+/// it with the **same** switch every other account change goes through — or
+/// leaves the app exactly where it started, with nothing left behind.
+///
+/// **The gate is asked, not answered.** `state.can_add()` combines the two
+/// independent reasons multi-account may be unavailable (see
+/// [`accounts::AccountsState`]), and an account added under either is a profile
+/// this app cannot reliably reach again: one the CLI ignores
+/// `BITWARDENCLI_APPDATA_DIR` for, so every account shares one profile, or one
+/// beside a migration that never populated the account directories.
+///
+/// **The sign-in runs in the new account's own directory.** `bw login` signs in
+/// to whatever profile `BITWARDENCLI_APPDATA_DIR` names and *replaces* whatever
+/// was there, so a sign-in that ran before the re-point would not add an
+/// account — it would sign the existing one out and overwrite it, and after the
+/// migration that existing one is the user's only vault. No end state
+/// distinguishes the two, which is why
+/// `the_sign_in_runs_with_the_cli_pointed_at_the_new_accounts_directory`
+/// records what the sign-in could *see* rather than what it left behind.
+///
+/// **A sign-in that does not happen leaves nothing.** `sign_in` answers `None`
+/// when the user closes the window ([`login_ui::run_login_flow_for`], the
+/// cancellable form), and the whole of the response is
+/// [`accounts::discard_prepared_account`]: no directory, no entry, no change of
+/// active account. The state to avoid is an entry naming a directory with no
+/// profile in it, which presents as an account that is permanently signed out.
+///
+/// **The list is written after the switch lands, not before.** The plan has it
+/// the other way round, and the difference is what a failure costs. Written
+/// first, a rolled-back add needs a *second* write to undo, and if that one
+/// fails the entry outlives the directory it names — the permanently
+/// signed-out account above, and until account removal exists the user cannot
+/// even delete it. Written last, a failed persist costs them the account on the
+/// next launch with its directory orphaned but intact, which is the same
+/// survivable shape startup's own `needs_persist` failure already has.
+///
+/// `sign_in` and `account_details` are injected for the reason every other
+/// window and `bw` spawn in this file is: neither can run in a test. That
+/// injection is also what
+/// `adding_an_account_opens_no_window_and_asks_the_cli_nothing_by_itself`
+/// protects — a body that *also* called the real ones directly would make the
+/// observations above a lie while every test stayed green.
+#[allow(clippy::too_many_arguments)]
+// The live caller is the switcher in Task 14; until then only this file's
+// tests build one.
+#[allow(dead_code)]
+fn add_account(
+    config_dir: &Path,
+    settings_path: &Path,
+    state: &mut accounts::AccountsState,
+    active_account: &mut Account,
+    store: &mut session_store::SessionStore,
+    mut sign_in: impl FnMut(&Account) -> Option<String>,
+    mut account_details: impl FnMut(Option<&Path>) -> login_ui::BwStatusDetails,
+    resettle: impl FnMut(&Path, &Account, &session_store::SessionStore) -> ResettleReport,
+) -> SwitchOutcome {
+    if !state.can_add() {
+        log::warn!(
+            "refusing to add an account: {}",
+            state
+                .blocked_reason()
+                .unwrap_or("multiple accounts are unavailable on this machine")
+        );
+        return SwitchOutcome::Declined;
+    }
+
+    let from = state.active().clone();
+    let prepared = match accounts::prepare_new_account(config_dir) {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            log::error!("could not prepare a new account: {reason}");
+            // Nothing was touched, so the app is already where it started.
+            return SwitchOutcome::RolledBack { reason };
+        }
+    };
+    let prepared_dir = accounts::data_dir_for(config_dir, &prepared.id);
+
+    let previous_dir = bw_path::active_data_dir();
+    bw_path::set_active_data_dir(Some(prepared_dir.clone()));
+    let token = sign_in(&prepared);
+    // Back before the switch runs, and unconditionally: `switch_to_account`
+    // reads the active directory as the one to roll BACK to, so leaving it on
+    // the new account's directory would make a failed add restore the app onto
+    // the directory it is about to discard.
+    bw_path::set_active_data_dir(previous_dir);
+
+    let Some(token) = token else {
+        log::info!("the sign-in for the new account was closed; nothing was added");
+        accounts::discard_prepared_account(config_dir, &prepared.id);
+        return SwitchOutcome::Declined;
+    };
+
+    // The label the switcher shows, asked of the new account's OWN directory
+    // rather than of whatever profile this process is pointed at — which is the
+    // previous account's again by now. An account minted by
+    // `prepare_new_account` carries an empty email until exactly here, and a
+    // blank row is one the user cannot tell from any other.
+    let details = account_details(Some(&prepared_dir));
+    if details.user_email.is_none() {
+        log::warn!(
+            "the new account signed in but `bw status` named no address for it, so it will \
+             appear in the account list with no address on it"
+        );
+    }
+    let added = Account {
+        id: prepared.id.clone(),
+        email: details.user_email.unwrap_or_default(),
+        server_url: details.server_url,
+    };
+
+    // Into the new account's own file, before the switch, because the switch's
+    // sequence is what authenticates and it starts by looking for a token it
+    // can still use. Without this the user types their master password, watches
+    // the window close, and is asked for it again immediately.
+    let prepared_store =
+        session_store::SessionStore::new(accounts::session_path_for(config_dir, &added.id));
+    if let Err(e) = prepared_store.save(&token) {
+        log::warn!(
+            "could not store the new account's session token at {}: {e}",
+            prepared_store.path().display()
+        );
+    }
+
+    match switch_to_account(config_dir, &from, &added, active_account, store, resettle) {
+        SwitchOutcome::Switched => {
+            state.adopt(added.clone());
+            if let Err(e) =
+                settings::Settings::persist_accounts(settings_path, state.all(), Some(&added.id))
+            {
+                log::error!(
+                    "the new account is live but could not be written to {}: {e}; it will not \
+                     be there on the next launch",
+                    settings_path.display()
+                );
+            }
+            SwitchOutcome::Switched
+        }
+        other => {
+            log::warn!("the new account did not settle ({other:?}); discarding it");
+            accounts::discard_prepared_account(config_dir, &added.id);
+            other
+        }
+    }
+}
+
 /// Switches the app from one account to another, or leaves it exactly where it
 /// started.
 ///
@@ -4429,13 +4574,21 @@ mod tests {
 
     impl ScratchConfig {
         fn new(tag: &str) -> Self {
+            Self::with_accounts(tag, &[ACCOUNT_A, ACCOUNT_B])
+        }
+
+        /// The same, for the tests where the *number* of account directories
+        /// is the assertion: an add starts from one account and must end with
+        /// either one or two, never one and a half.
+        fn with_accounts(tag: &str, ids: &[&str]) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "deskwarden-switch-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
-            for id in [ACCOUNT_A, ACCOUNT_B] {
+            std::fs::create_dir_all(&dir).unwrap();
+            for id in ids {
                 let account_dir =
                     accounts::data_dir_for(&dir, &deskwarden::accounts::AccountId::parse(id).unwrap());
                 std::fs::create_dir_all(&account_dir).unwrap();
@@ -4922,6 +5075,513 @@ mod tests {
                 !body.contains(banned),
                 "the switch does `{banned}` itself: that is a second teardown-and-repopulate \
                  path, and it does not have the tests the first one has"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 12 -- adding an account.
+    // ---------------------------------------------------------------------
+
+    /// The names directly under a directory, sorted. Missing directory reads as
+    /// empty, so "nothing was left behind" and "the root was never made" are
+    /// the same answer -- which is why every test below pairs the count with
+    /// the surviving account's own name rather than only with a length.
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn accounts_state(
+        availability: deskwarden::bw_path::MultiAccountAvailability,
+        list: Vec<Account>,
+        active: &Account,
+    ) -> accounts::AccountsState {
+        accounts::AccountsState::new(
+            availability,
+            migration::MigrationState::NothingToMigrate,
+            list,
+            active.id.clone(),
+        )
+        .expect("a non-empty account list")
+    }
+
+    fn signed_in_as(email: &str) -> login_ui::BwStatusDetails {
+        login_ui::BwStatusDetails {
+            status: login_ui::BwStatus::Locked,
+            user_email: Some(email.to_string()),
+            server_url: Some("https://vault.example.com".to_string()),
+        }
+    }
+
+    /// The whole of a cancelled sign-in: no directory, no entry, no change of
+    /// active account, and nothing written to `settings.json`.
+    ///
+    /// Every assertion here is a negative, and negatives pass trivially against
+    /// a build that never creates anything -- so the sign-in closure asserts,
+    /// from inside, that the directory really was there while it ran.
+    #[test]
+    fn a_declined_sign_in_removes_the_directory_and_persists_no_account() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-declined", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        let mut state = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "precondition: exactly one account directory, so the count below is about cleanup"
+        );
+
+        let mut asked = 0usize;
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &mut active,
+            &mut store,
+            |prepared| {
+                asked += 1;
+                // The positive control the negatives below need: the directory
+                // was there while the sign-in ran, so "gone afterwards" means
+                // it was removed rather than never created.
+                assert!(
+                    accounts::data_dir_for(cfg.path(), &prepared.id).is_dir(),
+                    "the sign-in ran with no directory to sign in to, so the very first \
+                     `store.save` would fail"
+                );
+                None
+            },
+            |_| panic!("`bw status` was asked about an account nobody signed in to"),
+            |_, _, _| panic!("the app was resettled for an account nobody signed in to"),
+        );
+
+        assert_eq!(asked, 1, "the sign-in never ran at all");
+        assert_eq!(outcome, SwitchOutcome::Declined);
+        assert_eq!(
+            state.all().len(),
+            1,
+            "a half-created account was left in the list"
+        );
+        assert_eq!(state.active().id, a.id);
+        assert_eq!(active.id, a.id);
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "an empty profile directory was left behind, which presents as an account that is \
+             permanently signed out"
+        );
+        assert!(
+            !settings_path.exists(),
+            "settings.json was written for an account that was never added"
+        );
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "the CLI was left pointing at the discarded account's directory"
+        );
+        assert!(
+            accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "the existing account's session token went with the cancelled sign-in"
+        );
+    }
+
+    /// WIRING, and the one that decides whether "Add account" ADDS an account
+    /// or LOGS THE EXISTING ONE OUT. `bw login` signs in to whatever profile
+    /// `BITWARDENCLI_APPDATA_DIR` names and replaces what was there -- and
+    /// after the migration that profile is the user's only vault.
+    #[test]
+    fn the_sign_in_runs_with_the_cli_pointed_at_the_new_accounts_directory() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-pointed", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        let mut state = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        let seen = std::cell::RefCell::new(None);
+        let asked_about = std::cell::RefCell::new(None);
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &mut active,
+            &mut store,
+            |_prepared| {
+                *seen.borrow_mut() = Some(bw_path::active_data_dir());
+                Some("session-token".to_string())
+            },
+            |dir| {
+                *asked_about.borrow_mut() = Some(dir.map(Path::to_path_buf));
+                signed_in_as("new@example.com")
+            },
+            |_, _, _| ResettleReport::Settled,
+        );
+
+        assert_eq!(outcome, SwitchOutcome::Switched);
+        let seen = seen.into_inner().expect("the sign-in never ran");
+        assert_eq!(
+            seen,
+            Some(accounts::data_dir_for(cfg.path(), &state.active().id)),
+            "the sign-in ran in {seen:?}, not in the new account's own directory"
+        );
+        assert!(
+            seen.is_some(),
+            "the sign-in ran in the CLI's DEFAULT profile -- this would sign the existing \
+             account out and replace it"
+        );
+        assert_ne!(
+            seen,
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "the sign-in ran in the EXISTING account's profile: `bw login` there does not add \
+             an account, it replaces the one already in it"
+        );
+
+        // And the email came from asking the CLI about that same directory,
+        // rather than about whatever profile this process happens to be on.
+        assert_eq!(
+            asked_about.into_inner().expect("the status was never read"),
+            Some(accounts::data_dir_for(cfg.path(), &state.active().id)),
+            "`bw status` was asked about the wrong profile, so the account would be labelled \
+             with somebody else's address"
+        );
+    }
+
+    /// The successful add, end to end: the account is on disk, it is active,
+    /// it carries the address the sign-in produced, and it survives a restart.
+    #[test]
+    fn a_successful_add_persists_the_account_and_makes_it_active() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-ok", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        let mut state = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &mut active,
+            &mut store,
+            |_| Some("session-token".to_string()),
+            |_| signed_in_as("new@example.com"),
+            |_, _, _| ResettleReport::Settled,
+        );
+
+        assert_eq!(outcome, SwitchOutcome::Switched);
+        assert_eq!(state.all().len(), 2);
+        let added = state.active().clone();
+        assert_ne!(added.id, a.id, "the add settled back onto the old account");
+        assert_eq!(active.id, added.id, "the app still reports itself as A");
+        assert!(accounts::data_dir_for(cfg.path(), &added.id).is_dir());
+        assert_eq!(
+            added.email, "new@example.com",
+            "the new account is a blank row in the switcher"
+        );
+        assert_eq!(added.server_url.as_deref(), Some("https://vault.example.com"));
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &added.id)),
+            "the CLI is not pointed at the account the app says it is on"
+        );
+        assert_eq!(
+            store.path(),
+            accounts::session_path_for(cfg.path(), &added.id),
+            "the next token would be written over the account the user just left"
+        );
+        // The token from the sign-in is where the switch's authentication
+        // looks, so the user is not asked for the master password twice.
+        assert_eq!(
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &added.id))
+                .load()
+                .as_deref(),
+            Some("session-token"),
+            "the token the user just typed their master password for was thrown away"
+        );
+        // The old account is still offered, so the add did not replace it.
+        assert_eq!(
+            state.switchable().iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            vec![a.id.clone()]
+        );
+
+        let loaded = settings::Settings::load(&settings_path);
+        assert_eq!(loaded.accounts.len(), 2, "persisted, not just held in memory");
+        assert_eq!(loaded.active_account.as_ref(), Some(&added.id));
+        assert_eq!(
+            loaded.accounts.last().map(|x| x.email.as_str()),
+            Some("new@example.com"),
+            "the address was held in memory but never written, so the next launch shows a \
+             blank row"
+        );
+    }
+
+    /// The `relativeDataDir` trap and an unfinished migration both reach here,
+    /// and adding an account under either would write a profile the app cannot
+    /// reliably reach again.
+    #[test]
+    fn add_is_refused_while_accounts_state_says_it_cannot_be_done() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-blocked", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        let mut blocked = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::BlockedByUnknownCliPath,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        assert!(!blocked.can_add());
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut blocked,
+            &mut active,
+            &mut store,
+            |_| panic!("a sign-in was opened for an account that may not be added"),
+            |_| panic!("`bw status` was run for an account that may not be added"),
+            |_, _, _| panic!("the app was resettled for an account that may not be added"),
+        );
+        assert_eq!(outcome, SwitchOutcome::Declined);
+        assert_eq!(blocked.all().len(), 1);
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "a profile directory was created for an account that may not be added"
+        );
+        assert!(!settings_path.exists());
+
+        // The positive control on the same call, same fixture: an unblocked
+        // state really does get through, so the refusal above is the gate
+        // rather than an `add_account` that refuses everything.
+        let mut open = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        assert_eq!(
+            add_account(
+                cfg.path(),
+                &settings_path,
+                &mut open,
+                &mut active,
+                &mut store,
+                |_| Some("session-token".to_string()),
+                |_| signed_in_as("new@example.com"),
+                |_, _, _| ResettleReport::Settled,
+            ),
+            SwitchOutcome::Switched
+        );
+        assert_eq!(open.all().len(), 2);
+    }
+
+    /// An add whose switch fails must end exactly where it started -- and the
+    /// rollback has to land on the ORIGINAL directory, not on the one that is
+    /// about to be deleted. `switch_to_account` reads the active data directory
+    /// as the place to roll back to, so an add that left it pointing at the new
+    /// account would restore the app into a directory it then removes: a
+    /// running app pointed at nothing, and no end-state list assertion sees it.
+    #[test]
+    fn an_add_whose_switch_fails_leaves_the_app_and_the_disk_exactly_as_they_were() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-failed", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        // What the existing account has that must survive: its own quick-unlock
+        // blob, beside its token.
+        std::fs::write(accounts::hello_blob_path_for(cfg.path(), &a.id), b"sealed").unwrap();
+        let mut state = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        let minted = std::cell::RefCell::new(None);
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &mut active,
+            &mut store,
+            |prepared| {
+                *minted.borrow_mut() = Some(prepared.id.clone());
+                // The user ticked "Use Windows Hello" on the way through, so
+                // there is now a blob sealing a master password for an account
+                // that is about to stop existing.
+                std::fs::write(
+                    accounts::hello_blob_path_for(cfg.path(), &prepared.id),
+                    b"sealed",
+                )
+                .unwrap();
+                Some("session-token".to_string())
+            },
+            |_| signed_in_as("new@example.com"),
+            |_, to, _| {
+                if to.id == a.id {
+                    ResettleReport::Settled
+                } else {
+                    ResettleReport::NotStarted
+                }
+            },
+        );
+
+        let minted = minted.into_inner().expect("the sign-in never ran");
+        assert!(
+            matches!(outcome, SwitchOutcome::RolledBack { .. }),
+            "expected a rollback, got {outcome:?}"
+        );
+        assert_eq!(state.all().len(), 1, "a failed add was left in the list");
+        assert_eq!(state.active().id, a.id);
+        assert_eq!(active.id, a.id);
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "the app was restored onto the directory the failed add then deleted"
+        );
+        assert_eq!(
+            store.path(),
+            accounts::session_path_for(cfg.path(), &a.id),
+            "the token store was left on the discarded account's file"
+        );
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "the failed add's profile directory is still there"
+        );
+        assert!(
+            !accounts::hello_blob_path_for(cfg.path(), &minted).exists(),
+            "a Windows Hello blob sealing a master password outlived the account it belongs to"
+        );
+        assert!(!settings_path.exists(), "a failed add was written to disk");
+        // Positive controls: the existing account kept everything it had, so
+        // the four negatives above are about the new account rather than about
+        // a rollback that wiped the accounts root.
+        assert!(
+            accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "the failed add cost the user their existing session"
+        );
+        assert!(
+            accounts::hello_blob_path_for(cfg.path(), &a.id).exists(),
+            "the failed add took the existing account's quick unlock with it"
+        );
+    }
+
+    /// `add_account`'s own body, for the source guard below.
+    ///
+    /// Both ends are named and both are controlled: it starts at the function
+    /// and stops at the first line of the next item's doc comment, rather than
+    /// at a closing brace -- a `"\n}"` needle passes on LF and fails on CRLF,
+    /// and this file is CRLF throughout.
+    fn the_add_body() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("fn add_", "account("))
+            .expect("`add_account` must still exist")
+            .1;
+        let body = after
+            .split_once(concat!(
+                "/// Switches the app from one account",
+                " to another, or leaves it exactly where it"
+            ))
+            .expect("`switch_to_account`'s doc comment must still follow `add_account`")
+            .0;
+        assert!(
+            body.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            body.contains(concat!("discard_prepared", "_account(")),
+            "control: the region really is the add's own body"
+        );
+        assert!(
+            !body.contains(concat!("SwitchOutcome::Stood", "Down")),
+            "control: the region really stops before `switch_to_account`'s body"
+        );
+        body
+    }
+
+    /// The sign-in window and the `bw status` read are injected, and the tests
+    /// above observe them to decide whether an add ADDS or REPLACES. A body
+    /// that also called the real ones directly would make those observations a
+    /// lie -- two sign-in windows in production, one of them in the wrong
+    /// profile -- with every test still green.
+    ///
+    /// `fatal_startup_error` and `start_backend` are banned for the same reason
+    /// they are banned from the switch: a second account that will not come up
+    /// is not a reason to take a running app down.
+    #[test]
+    fn adding_an_account_opens_no_window_and_asks_the_cli_nothing_by_itself() {
+        let body = the_add_body();
+        let production = production_half_of_this_file();
+        // `run_login_flow_for(` is not spelled with a paren anywhere in this
+        // file, so its control has to be the module that declares it.
+        let login_ui_source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("login_ui.rs"),
+        )
+        .expect("cannot read login_ui.rs");
+
+        for (banned, control) in [
+            (concat!("run_login_flow", "_for("), login_ui_source.as_str()),
+            (concat!("run_login", "_flow("), production),
+            // No trailing paren on this one: `check_bw_status_details_in` is
+            // spelled without one where startup hands it to `migrate` as a
+            // function item, and handing it on is as much a direct call as
+            // making one. The needle covers the active-profile form
+            // (`check_bw_status_details`) too, which is worse still -- it would
+            // label the new account with whatever profile this process is on.
+            (concat!("check_bw_status_", "details"), production),
+            (concat!("fatal_startup", "_error("), production),
+            (concat!("start_", "backend("), production),
+        ] {
+            assert!(
+                control.contains(banned),
+                "control: `{banned}` is really spelled that way, so the ban below is not vacuous"
+            );
+            assert!(
+                !body.contains(banned),
+                "`{banned}` is reachable from `add_account`: the sign-in and the status read \
+                 are injected precisely so a test can see WHICH PROFILE they run against, and \
+                 a second, direct call is invisible to every one of them"
             );
         }
     }
