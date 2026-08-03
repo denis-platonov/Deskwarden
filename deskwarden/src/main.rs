@@ -3022,14 +3022,25 @@ fn remove_account(
 /// `BITWARDENCLI_APPDATA_DIR` for, so every account shares one profile, or one
 /// beside a migration that never populated the account directories.
 ///
-/// **The sign-in runs in the new account's own directory.** `bw login` signs in
-/// to whatever profile `BITWARDENCLI_APPDATA_DIR` names and *replaces* whatever
-/// was there, so a sign-in that ran before the re-point would not add an
-/// account — it would sign the existing one out and overwrite it, and after the
-/// migration that existing one is the user's only vault. No end state
+/// **The sign-in runs in the new account's own directory, and the way it gets
+/// there is an argument, not a global.** `bw login` signs in to whatever
+/// profile `BITWARDENCLI_APPDATA_DIR` names and *replaces* whatever was there,
+/// so a sign-in aimed at the active account's directory would not add an
+/// account — it would sign the existing one out and overwrite it, and after
+/// the migration that existing one is the user's only vault. No end state
 /// distinguishes the two, which is why
 /// `the_sign_in_runs_with_the_cli_pointed_at_the_new_accounts_directory`
 /// records what the sign-in could *see* rather than what it left behind.
+///
+/// Until review 13 this body got there by pointing
+/// `bw_path::set_active_data_dir` at the new directory across the whole of
+/// `sign_in` and restoring it after — a temporary mutation of exactly the
+/// process-global [`remove_account`]'s doc bans, over a window as long as the
+/// user takes to type a master password, while `bw_serve`'s background threads
+/// read that global to spawn `bw`. `login_ui::profile_dir_for` now derives the
+/// directory from the account the window was already handed and passes it to
+/// `bw_command_in`, so the global never moves and there is no window to get
+/// wrong. The invariant is one rule for both functions again.
 ///
 /// **A sign-in that does not happen leaves nothing.** `sign_in` answers `None`
 /// when the user closes the window ([`login_ui::run_login_flow_for`], the
@@ -3087,14 +3098,17 @@ fn add_account(
     };
     let prepared_dir = accounts::data_dir_for(config_dir, &prepared.id);
 
-    let previous_dir = bw_path::active_data_dir();
-    bw_path::set_active_data_dir(Some(prepared_dir.clone()));
+    // **No temporary mutation of `bw_path::set_active_data_dir`.** This used
+    // to point the process-global at `prepared_dir`, run `sign_in` -- a
+    // blocking, user-paced window -- and put it back, which is precisely what
+    // `remove_account`'s doc bans four hundred lines up: `bw_serve.rs` reads
+    // that global from background threads, so the window in which it names
+    // another account's profile is a window in which a sync can land in the
+    // wrong vault. The global does not move here at all now; the directory
+    // reaches the CLI as an argument instead, through
+    // `login_ui::profile_dir_for`, which derives it from the account the
+    // window was already handed.
     let token = sign_in(&prepared);
-    // Back before the switch runs, and unconditionally: `switch_to_account`
-    // reads the active directory as the one to roll BACK to, so leaving it on
-    // the new account's directory would make a failed add restore the app onto
-    // the directory it is about to discard.
-    bw_path::set_active_data_dir(previous_dir);
 
     let Some(token) = token else {
         log::info!("the sign-in for the new account was closed; nothing was added");
@@ -6709,6 +6723,21 @@ mod tests {
     /// or LOGS THE EXISTING ONE OUT. `bw login` signs in to whatever profile
     /// `BITWARDENCLI_APPDATA_DIR` names and replaces what was there -- and
     /// after the migration that profile is the user's only vault.
+    ///
+    /// **Two halves, and review 13 moved the boundary between them.** The
+    /// sign-in must reach the NEW account's directory, and the process-global
+    /// must not move to get it there: `bw_serve` spawns `bw` off that global
+    /// from background threads, so a window in which it names another
+    /// account's profile is a window in which a sync can land in the wrong
+    /// vault -- the rule `remove_account`'s doc states and this function used
+    /// to break, for as long as a user takes to type a master password.
+    ///
+    /// So what is observed is the account handed to `sign_in`, which is what
+    /// `login_ui::profile_dir_for` turns into the directory the CLI is told
+    /// about, plus `bw_path::active_data_dir()` read from inside the sign-in
+    /// and asserted UNCHANGED. `login_ui`'s own
+    /// `the_login_window_names_the_profile_directory_it_acts_on` covers the
+    /// other end of that argument.
     #[test]
     fn the_sign_in_runs_with_the_cli_pointed_at_the_new_accounts_directory() {
         let _guard = lock_active_dir();
@@ -6725,7 +6754,12 @@ mod tests {
             session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
         bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
 
+        // What the sign-in is TOLD to act on: the account it is handed, which
+        // `login_ui::profile_dir_for` turns into a directory for
+        // `bw_command_in`.
         let seen = std::cell::RefCell::new(None);
+        // And what the rest of the process can see while it runs.
+        let global_during = std::cell::RefCell::new(None);
         let asked_about = std::cell::RefCell::new(None);
         let outcome = add_account(
             cfg.path(),
@@ -6733,8 +6767,10 @@ mod tests {
             &mut state,
             &mut active,
             &mut store,
-            |_prepared| {
-                *seen.borrow_mut() = Some(bw_path::active_data_dir());
+            |prepared| {
+                *seen.borrow_mut() =
+                    Some(Some(accounts::data_dir_for(cfg.path(), &prepared.id)));
+                *global_during.borrow_mut() = Some(bw_path::active_data_dir());
                 Some("session-token".to_string())
             },
             |dir| {
@@ -6761,6 +6797,25 @@ mod tests {
             Some(accounts::data_dir_for(cfg.path(), &a.id)),
             "the sign-in ran in the EXISTING account's profile: `bw login` there does not add \
              an account, it replaces the one already in it"
+        );
+
+        // **And the process-global never named it.** This is the half review
+        // 13 added: a temporary `set_active_data_dir` across a blocking,
+        // user-paced window is a window in which `bw_serve`'s background
+        // threads spawn `bw` against the new account's empty profile. The two
+        // assertions above pass either way -- that is exactly why this one is
+        // separate.
+        assert_eq!(
+            global_during.into_inner().expect("the sign-in never ran"),
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "the active data directory moved off the account this process is on while the \
+             sign-in window was up; a background sync in that window lands in the wrong vault"
+        );
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &state.active().id)),
+            "control: the global does move -- once, when the switch lands -- so the assertion \
+             above is about the window and not about a global that never changes"
         );
 
         // And the email came from asking the CLI about that same directory,

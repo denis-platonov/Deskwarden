@@ -1,5 +1,9 @@
 use crate::accounts::{Account, AccountId};
-use crate::bw_path::bw_command;
+// No `bw_command` import. Every `bw` this window spawns names its profile
+// directory (`bw_command_in`), because this window is also the one
+// `main`'s `add_account` opens for an account that is NOT the active one --
+// and the active-profile form there would sign the existing account out and
+// replace it. See `profile_dir_for`.
 use crate::hello::{self, HelloState};
 use crate::theme;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
@@ -224,14 +228,23 @@ fn logout_command_in(data_dir: Option<&Path>) -> Result<std::process::Command, S
     Ok(cmd)
 }
 
-/// Points the Bitwarden CLI at a self-hosted server.
+/// Points the Bitwarden CLI at a self-hosted server, in a **named** profile
+/// directory.
+///
+/// The directory is a parameter for the same reason
+/// [`check_bw_status_details_in`]'s and [`bw_logout_in`]'s are, and it matters
+/// more here than the name suggests: `bw config server` is not process state,
+/// it is a **write into that profile's `data.json`**. Aimed at the wrong
+/// directory it re-points the account the user is already signed into at
+/// somebody else's server. Adding a self-hosted account is exactly the case
+/// where the two directories differ.
 ///
 /// Returns `Err` rather than panicking: a typo in a self-hosted URL is
 /// ordinary user error and belongs inline in the login window (the same way
 /// `run_bw_with_password` failures already are), not as a process-killing
 /// panic with a Rust backtrace.
-pub fn configure_server(url: &str) -> Result<(), String> {
-    let output = bw_command()?
+pub fn configure_server_in(url: &str, data_dir: Option<&Path>) -> Result<(), String> {
+    let output = crate::bw_path::bw_command_in(data_dir)?
         .args(["config", "server", url])
         .output()
         .map_err(|e| {
@@ -259,11 +272,25 @@ pub fn configure_server(url: &str) -> Result<(), String> {
 /// via the OS process list.
 ///
 /// The binary this spawns is the one startup resolved *and* verified as
-/// Bitwarden-signed (`bw_path::bw_command`), never a freshly-resolved one:
+/// Bitwarden-signed (`bw_path::bw_command_in`), never a freshly-resolved one:
 /// this is the single call site that hands over the master password, so it
 /// must not be able to pick up a `bw.exe` that appeared after that check.
-fn run_bw_with_password(args: &[&str], password: &str) -> Result<String, String> {
-    let mut cmd = bw_command()?;
+///
+/// `data_dir` names the profile the `bw login`/`bw unlock` acts on. It is a
+/// parameter rather than `bw_path::active_data_dir()` because of what the
+/// caller would otherwise have to do to sign in to a *new* account: point the
+/// process-global at that account's directory across a blocking, user-paced
+/// window and put it back afterwards. Background threads spawn `bw` against
+/// that global (`bw_serve::start_bw_serve`, `bw_serve::sync_now`), so a
+/// window in which it names another account's profile is a window in which a
+/// sync can land in the wrong vault -- the rule `main`'s `remove_account`
+/// already states and `bw_logout_in` already obeys.
+fn run_bw_with_password(
+    args: &[&str],
+    password: &str,
+    data_dir: Option<&Path>,
+) -> Result<String, String> {
+    let mut cmd = crate::bw_path::bw_command_in(data_dir)?;
     cmd.args(args);
     cmd.args(["--passwordenv", "DESKWARDEN_BW_PASSWORD"]);
     cmd.env("DESKWARDEN_BW_PASSWORD", password);
@@ -1517,6 +1544,31 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
 /// unlock at all" when there is no account -- there is no account-less blob
 /// to fall back to. Named rather than inlined so the two re-probes the window
 /// does after a Hello failure or a log-out cannot disagree with the first.
+/// Which profile directory this window's `bw` calls act on.
+///
+/// **Derived from the account the window belongs to, never from
+/// `bw_path::active_data_dir()`.** Those two agree for every login window
+/// except the one that matters: `main`'s `add_account` opens this window for
+/// an account that has just been minted and is not the active one, and its
+/// `bw login` *replaces* whatever profile it lands in -- which, after the
+/// migration, is the user's only vault.
+///
+/// The alternative is what `add_account` used to do: set the process-global
+/// to the new directory, run the window, set it back. `bw_serve.rs` reads that
+/// global from background threads, so the window in which it names another
+/// account's profile is a window in which a sync can land in the wrong vault.
+/// `main`'s `remove_account` states that rule in its own doc; taking the
+/// directory here is what lets the function beside it obey the same one.
+///
+/// `None` is the one startup condition with no account at all
+/// (`accounts::StartupAccounts::Unmigrated`), and it keeps `bw_command_in`'s
+/// meaning: no override, so the child resolves the profile the CLI would by
+/// itself. That is also what the global held in that state, so nothing about
+/// it changed.
+fn profile_dir_for(account: Option<(&Path, &Account)>) -> Option<PathBuf> {
+    account.map(|(config_dir, account)| crate::accounts::data_dir_for(config_dir, &account.id))
+}
+
 fn probe_hello(scope: &Option<(PathBuf, AccountId)>) -> HelloState {
     match scope {
         Some((config_dir, id)) => hello::state_for(config_dir, id),
@@ -1533,10 +1585,15 @@ fn spawn_auth(
     // outlives this frame. Enrollment is per-account (`hello::enroll_for`) --
     // there is no such thing as enrolling "the app".
     enroll_hello: Option<(PathBuf, AccountId)>,
+    // The profile directory the `bw login`/`bw unlock` acts on, owned because
+    // the worker outlives this frame. `None` only when this window belongs to
+    // no account at all (`StartupAccounts::Unmigrated`), where there is no
+    // override to set and the CLI resolves its own.
+    data_dir: Option<PathBuf>,
 ) {
     std::thread::spawn(move || {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let result = run_bw_with_password(&arg_refs, &password);
+        let result = run_bw_with_password(&arg_refs, &password, data_dir.as_deref());
 
         if let (true, Some((config_dir, id))) = (result.is_ok(), &enroll_hello) {
             match hello::enroll_for(config_dir, id, &password) {
@@ -1581,7 +1638,12 @@ pub fn run_login_flow_for(
     account: Option<(&Path, &Account)>,
     hello_needs_reenrolment: bool,
 ) -> Option<String> {
-    let details = check_bw_status_details();
+    // **Every `bw` this window runs is aimed at THIS account's directory**,
+    // derived from the account it was already given rather than read off the
+    // process-global. See `profile_dir_for`, which says what that buys and
+    // what the alternative cost.
+    let profile_dir = profile_dir_for(account);
+    let details = check_bw_status_details_in(profile_dir.as_deref());
 
     // Owned, because the update closure is `'static` and both the Hello
     // re-probes and the enrollment handed to `spawn_auth` need it after this
@@ -1764,7 +1826,13 @@ pub fn run_login_flow_for(
                                 choice => choice.config_url().map(str::to_string),
                             };
                             match target {
-                                Some(url) => match configure_server(&url) {
+                                // Into THIS account's `data.json`, not
+                                // whatever profile the process is pointed at:
+                                // `bw config server` is a write, and aimed at
+                                // the wrong directory it re-points the account
+                                // the user is already signed into.
+                                Some(url) => match configure_server_in(&url, profile_dir.as_deref())
+                                {
                                     Ok(()) => true,
                                     Err(e) => {
                                         log::warn!("bw config server failed: {e}");
@@ -1806,7 +1874,13 @@ pub fn run_login_flow_for(
                             // the CLI runs is strictly better. On failure
                             // this also clears the field, which the user has
                             // to retype anyway.
-                            spawn_auth(auth_tx.clone(), args, form.password.clone(), enroll_hello);
+                            spawn_auth(
+                                auth_tx.clone(),
+                                args,
+                                form.password.clone(),
+                                enroll_hello,
+                                profile_dir.clone(),
+                            );
                             form.password.zeroize();
                             form.error = None;
                             auth_in_progress = true;
@@ -1842,6 +1916,7 @@ pub fn run_login_flow_for(
                                     // Already enrolled -- that is where this
                                     // password came from.
                                     None,
+                                    profile_dir.clone(),
                                 );
                                 form.error = None;
                                 auth_in_progress = true;
@@ -2547,6 +2622,100 @@ mod login_entry_point_tests {
     use super::*;
 
     const SOURCE: &str = include_str!("login_ui.rs");
+
+    /// **Every `bw` this window runs names the profile directory it acts on,
+    /// derived from the account the window belongs to.**
+    ///
+    /// `main`'s `add_account` opens this window for an account that has just
+    /// been minted and is NOT the active one. It used to get the CLI there by
+    /// pointing `bw_path::set_active_data_dir` at the new directory across the
+    /// whole blocking window and putting it back afterwards -- a temporary
+    /// mutation of a process-global that `bw_serve` spawns `bw` off from
+    /// background threads, which `remove_account`'s own doc bans in as many
+    /// words. Removing it is only safe if the window reaches that directory
+    /// some other way, and this is that way.
+    ///
+    /// Fails without the fix: make `profile_dir_for` answer
+    /// `crate::bw_path::active_data_dir()` and the first block fails, because
+    /// no active directory is set in a test. Put `bw_command()` back into
+    /// `run_bw_with_password` and the second block names it.
+    #[test]
+    fn the_login_window_names_the_profile_directory_it_acts_on() {
+        let cfg = Path::new(r"C:\cfg");
+        let account = Account {
+            id: AccountId::parse("0123456789abcdef0123456789abcdef").expect("a valid id"),
+            email: "a@example.com".to_string(),
+            server_url: None,
+        };
+        assert_eq!(
+            profile_dir_for(Some((cfg, &account))),
+            Some(crate::accounts::data_dir_for(cfg, &account.id)),
+            "the window's `bw` calls do not name the account they belong to, so a sign-in for \
+             a NEW account lands in whatever profile this process happens to be on -- which \
+             `bw login` then replaces"
+        );
+        assert_eq!(
+            profile_dir_for(None),
+            None,
+            "an account-less window (StartupAccounts::Unmigrated) invented a directory rather \
+             than leaving the CLI to resolve its own"
+        );
+
+        // The spawns themselves. `concat!`-split and single-line, this file's
+        // usual two reasons -- a whole literal matches its own declaration,
+        // and a needle carrying a line ending passes under one and fails
+        // under the other.
+        for global in [
+            concat!("bw_command", "()"),
+            concat!("check_bw_status_details", "()"),
+            concat!("active_data_dir", "()"),
+        ] {
+            assert!(
+                !window_body().contains(global),
+                "the login window still reaches for the active-profile form {global}: for the \
+                 account `add_account` opens it for, that names the EXISTING account's vault"
+            );
+        }
+        // Positive controls: the region really is the window's body, and the
+        // directory-taking forms really are what it calls.
+        for required in [
+            concat!("check_bw_status_details", "_in("),
+            concat!("configure_server", "_in("),
+            concat!("profile_dir", "_for(account)"),
+        ] {
+            assert!(
+                window_body().contains(required),
+                "control: {required} is not in the sliced region, so the negatives above are \
+                 about the wrong text"
+            );
+        }
+        // And the one spawn that is not in that region: the worker thread.
+        assert!(
+            SOURCE.contains(concat!("run_bw_with_password(&arg_refs, &password, data_dir", ".")),
+            "control: the `bw login`/`bw unlock` worker still takes its directory as an \
+             argument rather than reading a global"
+        );
+    }
+
+    /// `run_login_flow_for`'s body, from its declaration to the fatal
+    /// wrapper's -- the same slice `only_the_fatal_entry_point_can_end_the_
+    /// process` uses, named once so the two cannot disagree.
+    fn window_body() -> &'static str {
+        let body = SOURCE
+            .split_once("pub fn run_login_flow_for(")
+            .expect("the cancellable entry point must exist")
+            .1
+            .split_once("pub fn run_login_flow(")
+            .expect("the wrapper must follow it")
+            .0;
+        assert!(
+            body.len() > 5000,
+            "the sliced window body is {} bytes, which is not the window: every assertion over \
+             it would pass against nothing",
+            body.len()
+        );
+        body
+    }
 
     #[test]
     fn only_the_fatal_entry_point_can_end_the_process() {
