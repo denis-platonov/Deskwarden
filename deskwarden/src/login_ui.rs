@@ -1048,6 +1048,9 @@ pub fn monitor_work_areas() -> Vec<crate::settings::WorkArea> {
 }
 
 /// The login window's form state, owned by the caller across frames.
+///
+/// It holds a live master password for as long as the window is open, so it
+/// wipes it on drop -- see the [`Drop`] impl below.
 #[derive(Default)]
 pub struct LoginForm {
     pub server_choice: ServerChoice,
@@ -1058,6 +1061,72 @@ pub struct LoginForm {
     /// The opt-in for Windows Hello quick unlock (see `hello::enroll`).
     pub enable_hello: bool,
     pub error: Option<String>,
+}
+
+/// **Wipes the master password whichever way the window ends.**
+///
+/// This is the counterpart of moving the `zeroize` off the submit path and
+/// into [`apply_auth_result`]'s failure arm. Wiping at submission time meant
+/// the buffer was empty within a frame of the CLI being handed it, on every
+/// path; wiping only on failure leaves it live through a *successful* attempt
+/// -- and on success this window closes, so without this the plaintext would
+/// be released to the allocator unwiped.
+///
+/// On drop rather than at some chosen point in `run_login_flow_for`, because
+/// the form is move-captured by the frame closure and this function can no
+/// longer reach it after the event loop returns. Drop covers every exit: a
+/// completed sign-in, a window the user closed, and an unwind.
+impl Drop for LoginForm {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+/// What an in-flight sign-in's answer does to the form, and what the window
+/// should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// The CLI produced a session token. The window is finished.
+    Succeeded(String),
+    /// The CLI refused. The window stays open showing the message.
+    Failed,
+}
+
+/// Applies the answer from an in-flight `bw login`/`bw unlock` to the form.
+///
+/// **The password is wiped on failure and ONLY on failure**, which is the
+/// user's instruction ("clear if unsuccessful only") and not an incidental
+/// detail of where the `zeroize` call sits. It used to happen at the moment
+/// of *submission*, one line after `spawn_auth` -- so the field emptied
+/// while the CLI was still running, and the window spent the whole attempt
+/// showing a blank master-password box that the user had just filled in. That
+/// is what `theme::disabled_password_field`'s fixed mask covers on screen;
+/// this is the other half, and the two have to agree, or the mask is painting
+/// over a buffer that was cleared for no reason anybody can see.
+///
+/// Extracted from `run_login_flow_for`'s frame closure so it can be tested at
+/// all: that closure runs only inside a live eframe event loop, and the
+/// difference between "cleared on failure" and "cleared on both" is invisible
+/// from outside it -- on success the window closes, so nothing ever repaints
+/// to show which happened.
+pub fn apply_auth_result(result: Result<String, String>, form: &mut LoginForm) -> AuthOutcome {
+    match result {
+        Ok(session_token) => {
+            form.error = None;
+            AuthOutcome::Succeeded(session_token)
+        }
+        Err(e) => {
+            // Raw CLI output to the log (it's the only diagnostic channel
+            // this console-less binary has), one actionable line to the
+            // window.
+            log::warn!("bw login/unlock failed: {e}");
+            form.error = Some(friendly_auth_error(&e));
+            // The retype the user has to do anyway, and the one moment where
+            // emptying the buffer costs them nothing they still wanted.
+            form.password.zeroize();
+            AuthOutcome::Failed
+        }
+    }
 }
 
 /// What the user asked the login window to do this frame.
@@ -1176,23 +1245,48 @@ pub fn draw_login_window(
             // undifferentiated stack.
             ui.spacing_mut().item_spacing.y = 0.0;
 
+            // **While an attempt is in flight the whole credential zone is
+            // greyed and inert**, at the user's direction: the credentials
+            // are with the CLI, and a field that still takes typing during
+            // that is a field whose contents cannot affect the answer coming
+            // back. `theme::disabled_text_field` and
+            // `theme::disabled_password_field` paint the box and a galley
+            // with no `TextEdit` in it at all -- see their docs for why a
+            // read-only `TextEdit` is not the same thing.
+            //
+            // Continue is disabled by `add_enabled_ui` further down and Enter
+            // and the Hello panel are gated below that. This is the third
+            // door, and the one the user actually named.
+            let label = if auth_in_progress {
+                theme::disabled_field_label
+            } else {
+                theme::field_label
+            };
             if status == BwStatus::Unauthenticated {
                 if form.server_choice == ServerChoice::SelfHosted {
-                    theme::field_label(ui, "Server URL");
+                    label(ui, "Server URL");
                     ui.add_space(LABEL_GAP);
-                    theme::text_field(ui, &mut form.server_url, false);
+                    if auth_in_progress {
+                        theme::disabled_text_field(ui, &form.server_url);
+                    } else {
+                        theme::text_field(ui, &mut form.server_url, false);
+                    }
                     ui.add_space(GROUP_GAP);
                 }
-                theme::field_label(ui, "Email");
+                label(ui, "Email");
                 ui.add_space(LABEL_GAP);
-                theme::text_field(ui, &mut form.email, false);
+                if auth_in_progress {
+                    theme::disabled_text_field(ui, &form.email);
+                } else {
+                    theme::text_field(ui, &mut form.email, false);
+                }
                 ui.add_space(GROUP_GAP);
             }
 
             // 3h's label row: field name left, account email right, so the
             // user can see whose vault they're about to open.
             ui.horizontal(|ui| {
-                theme::field_label(ui, "Master password");
+                label(ui, "Master password");
                 if let Some(email) = account_email {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new(email).size(11.0).color(theme::TEXT_GHOST));
@@ -1200,7 +1294,17 @@ pub fn draw_login_window(
                 }
             });
             ui.add_space(LABEL_GAP);
-            theme::password_field(ui, &mut form.password, &mut form.reveal_password);
+            if auth_in_progress {
+                // **Takes no value**, so the bullets cannot track the buffer
+                // -- see `theme::MASKED_BULLETS`. The user's words were "keep
+                // showing masked password (even if there is nothing
+                // already)": a mask that shortened as the field emptied would
+                // announce the emptying, which is the one thing it is here to
+                // avoid.
+                theme::disabled_password_field(ui);
+            } else {
+                theme::password_field(ui, &mut form.password, &mut form.reveal_password);
+            }
             ui.add_space(GROUP_GAP);
 
             // While the credentials are with the server, Continue is
@@ -1759,19 +1863,15 @@ pub fn run_login_flow_for(
                 // painting (and animating its spinner) until it does.
                 if let Ok(result) = auth_rx.try_recv() {
                     auth_in_progress = false;
-                    match result {
-                        Ok(session_token) => {
-                            *token_for_closure.borrow_mut() = Some(session_token);
-                            form.error = None;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        Err(e) => {
-                            // Raw CLI output to the log (it's the only
-                            // diagnostic channel this console-less binary
-                            // has), one actionable line to the window.
-                            log::warn!("bw login/unlock failed: {e}");
-                            form.error = Some(friendly_auth_error(&e));
-                        }
+                    // Every decision this answer implies -- the message, and
+                    // whether the master-password buffer is wiped -- lives in
+                    // `apply_auth_result`, where it can be tested. All that
+                    // is left here is the two things that need the window.
+                    if let AuthOutcome::Succeeded(session_token) =
+                        apply_auth_result(result, &mut form)
+                    {
+                        *token_for_closure.borrow_mut() = Some(session_token);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                 }
 
@@ -1877,13 +1977,18 @@ pub fn run_login_flow_for(
                                 .then(|| hello_scope.clone())
                                 .flatten();
 
-                            // Handed to the worker, then wiped from the form
-                            // immediately -- the buffer has served its
-                            // purpose here either way, and not leaving a
-                            // second live copy sitting in the widget while
-                            // the CLI runs is strictly better. On failure
-                            // this also clears the field, which the user has
-                            // to retype anyway.
+                            // Handed to the worker, which wipes its own copy
+                            // when it is done with it (see `spawn_auth`).
+                            //
+                            // **The form's copy is NOT wiped here**, and it
+                            // used to be. Emptying it at the moment of
+                            // submission is what put a blank master-password
+                            // box on screen for the length of the attempt --
+                            // the state the user described as needing to keep
+                            // showing a mask. The buffer is now wiped by
+                            // `apply_auth_result`, on failure and only on
+                            // failure; on success this window is closing and
+                            // `form` drops with it.
                             spawn_auth(
                                 auth_tx.clone(),
                                 args,
@@ -1891,7 +1996,6 @@ pub fn run_login_flow_for(
                                 enroll_hello,
                                 profile_dir.clone(),
                             );
-                            form.password.zeroize();
                             form.error = None;
                             auth_in_progress = true;
                         }
@@ -3116,6 +3220,476 @@ mod first_run_notice_tests {
             says_why_it_is_asking(&texts),
             "the notice is nested inside the Hello panel, so it disappeared \
              with it; got: {texts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod auth_in_flight_tests {
+    //! **The credential zone while a sign-in is with the CLI.**
+    //!
+    //! The user's instruction was three things at once: keep a mask on the
+    //! password field, grey the whole user/password zone out, and clear the
+    //! password only when the attempt fails. All three are invisible from
+    //! outside a live frame, so these drive real ones -- including real
+    //! clicks and real keystrokes, because "the field is disabled" is a claim
+    //! about what typing into it does, not about what colour it is.
+
+    use super::*;
+    use egui::Rect;
+
+    const WINDOW: Vec2 = egui::vec2(470.0, 700.0);
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        }
+    }
+
+    /// A context with `theme::apply`'s fonts actually live (see
+    /// `first_run_notice_tests::styled_context`, which does this for the same
+    /// reason).
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        ctx
+    }
+
+    /// One frame of the sign-in window, drawn the way `run_login_flow_for`
+    /// draws it: `BwStatus::Unauthenticated`, so the email field is on screen
+    /// alongside the password one.
+    fn frame(
+        ctx: &egui::Context,
+        form: &mut LoginForm,
+        auth_in_progress: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut flow_bottom = 0.0f32;
+        ctx.run_ui(
+            egui::RawInput { events, ..raw_input() },
+            |ui| {
+                egui::Frame::new().inner_margin(Margin::same(26)).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let _ = draw_login_window(
+                        ui,
+                        BwStatus::Unauthenticated,
+                        None,
+                        "bitwarden.com",
+                        HelloState { available: false, enrolled: false },
+                        form,
+                        &mut flow_bottom,
+                        auth_in_progress,
+                        false,
+                    );
+                });
+            },
+        )
+    }
+
+    /// Every 38px input box the frame painted, in top-to-bottom order, with
+    /// the fill and border colour each was painted in.
+    ///
+    /// Found by [`theme::FIELD_HEIGHT`] -- the one measurement a live field
+    /// and a greyed one still share -- so the greyed treatment cannot make
+    /// these invisible to a test by changing what it is looking for.
+    fn field_boxes(output: &egui::FullOutput) -> Vec<(Rect, Color32, Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(Rect, Color32, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) if (r.rect.height() - theme::FIELD_HEIGHT).abs() < 0.01 => {
+                    out.push((r.rect, r.fill, r.stroke.color));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out.sort_by(|a, b| a.0.top().total_cmp(&b.0.top()));
+        out
+    }
+
+    /// The characters actually RENDERED inside `within`, glyph by glyph.
+    ///
+    /// Not `Galley::text()`, which answers with the SOURCE string and is
+    /// therefore blind to truncation -- and, more to the point here, would
+    /// answer with the real password rather than with the bullets a masked
+    /// `TextEdit` puts on screen.
+    fn rendered_glyphs_in(output: &egui::FullOutput, within: Rect) -> String {
+        fn walk(shape: &egui::Shape, within: Rect, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let rect = shape.visual_bounding_rect();
+                    if rect.is_finite() && within.expand(2.0).contains_rect(rect) {
+                        for row in &text.galley.rows {
+                            for glyph in &row.glyphs {
+                                out.push(glyph.chr);
+                            }
+                        }
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, within, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, within, &mut out);
+        }
+        out
+    }
+
+    fn click(at: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// Settles the layout, clicks the middle of the `nth` input box, types
+    /// `typed`, and hands back the form and the context it happened in.
+    fn click_the_field_and_type(
+        auth_in_progress: bool,
+        nth: usize,
+        typed: &str,
+        mut form: LoginForm,
+    ) -> (LoginForm, egui::Context) {
+        let ctx = styled_context();
+        // Two settling frames: egui resolves an interaction against the
+        // widget rects registered in the PREVIOUS pass.
+        for _ in 0..2 {
+            let _ = frame(&ctx, &mut form, auth_in_progress, Vec::new());
+        }
+        let boxes = field_boxes(&frame(&ctx, &mut form, auth_in_progress, Vec::new()));
+        let target = boxes
+            .get(nth)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the window painted {} input boxes, so there is no box {nth} to click -- \
+                     this harness has stopped finding the credential fields",
+                    boxes.len()
+                )
+            })
+            .0;
+        let _ = frame(&ctx, &mut form, auth_in_progress, click(target.center()));
+        let _ = frame(
+            &ctx,
+            &mut form,
+            auth_in_progress,
+            vec![egui::Event::Text(typed.to_string())],
+        );
+        (form, ctx)
+    }
+
+    /// **The positive control for every "it takes no input" assertion below.**
+    /// Without it, a window that painted no fields at all -- or a harness that
+    /// clicked the wrong pixel -- would satisfy them all.
+    #[test]
+    fn the_email_field_takes_typing_when_no_attempt_is_in_flight() {
+        let (form, ctx) = click_the_field_and_type(false, 0, "n", LoginForm::default());
+        assert_eq!(
+            form.email, "n",
+            "clicking the first input box and typing did not reach the email field at all, so \
+             this harness is not driving the window and proves nothing about the disabled case"
+        );
+        assert!(
+            ctx.memory(|m| m.focused()).is_some(),
+            "no widget took focus, so the click never landed on a text field"
+        );
+    }
+
+    /// The same click and the same keystroke, with an attempt in flight.
+    #[test]
+    fn the_credential_fields_take_no_typing_while_an_attempt_is_in_flight() {
+        for (nth, what) in [(0usize, "email"), (1, "password")] {
+            let mut seeded = LoginForm::default();
+            seeded.email = "a.novak@ledgerline.com".to_string();
+            seeded.password = "correct horse".to_string();
+            let (form, ctx) = click_the_field_and_type(true, nth, "X", seeded);
+            assert_eq!(
+                form.email, "a.novak@ledgerline.com",
+                "clicking the {what} box during an attempt and typing changed the email"
+            );
+            assert_eq!(
+                form.password, "correct horse",
+                "clicking the {what} box during an attempt and typing changed the password"
+            );
+            assert!(
+                ctx.memory(|m| m.focused()).is_none(),
+                "a widget took focus when the {what} box was clicked during an attempt -- a \
+                 greyed field that still focuses shows a caret and swallows the click"
+            );
+        }
+    }
+
+    /// **The mask must not track the buffer.** "Keep showing masked password
+    /// (even if there is nothing already)": bullets that shortened as the
+    /// field emptied would announce the emptying, and bullets that counted
+    /// the real characters would announce the length.
+    #[test]
+    fn the_masked_password_reads_the_same_whether_the_buffer_is_empty_or_long() {
+        let read = |password: &str| {
+            let ctx = styled_context();
+            let mut form = LoginForm::default();
+            form.password = password.to_string();
+            for _ in 0..2 {
+                let _ = frame(&ctx, &mut form, true, Vec::new());
+            }
+            let output = frame(&ctx, &mut form, true, Vec::new());
+            let boxes = field_boxes(&output);
+            assert_eq!(
+                boxes.len(),
+                2,
+                "expected the email and password boxes; found {}",
+                boxes.len()
+            );
+            rendered_glyphs_in(&output, boxes[1].0)
+        };
+
+        let empty = read("");
+        let long = read("a-master-password-of-some-considerable-length");
+
+        assert_eq!(
+            empty, long,
+            "the password field renders {empty:?} for an empty buffer and {long:?} for a long \
+             one, so what is on screen leaks what is behind it"
+        );
+        // The positive control for that: the bullets really are the field's
+        // own and not an empty reading of an empty rect, and the count is the
+        // one this app declares rather than whatever happened to be painted.
+        assert_eq!(
+            empty.matches('\u{2022}').count(),
+            theme::MASKED_BULLETS,
+            "the password field rendered {empty:?}, which is not {} bullets",
+            theme::MASKED_BULLETS
+        );
+    }
+
+    /// **Greyed means the box moved too**, not just that the text stopped
+    /// accepting input. Asserted in both directions, so "the fields are
+    /// greyed" cannot pass against a window that painted nothing.
+    #[test]
+    fn the_credential_zone_is_greyed_only_while_an_attempt_is_in_flight() {
+        let boxes = |auth_in_progress: bool| {
+            let ctx = styled_context();
+            let mut form = LoginForm::default();
+            for _ in 0..2 {
+                let _ = frame(&ctx, &mut form, auth_in_progress, Vec::new());
+            }
+            field_boxes(&frame(&ctx, &mut form, auth_in_progress, Vec::new()))
+                .into_iter()
+                .map(|(_, fill, stroke)| (fill, stroke))
+                .collect::<Vec<_>>()
+        };
+
+        let live = boxes(false);
+        let in_flight = boxes(true);
+        assert_eq!(
+            live.len(),
+            2,
+            "the resting window painted {} input boxes, not the email and password pair",
+            live.len()
+        );
+        assert_eq!(
+            in_flight.len(),
+            live.len(),
+            "the window in flight painted {} input boxes against the resting window's {} -- \
+             the fields did not grey out, they vanished",
+            in_flight.len(),
+            live.len()
+        );
+        for (fill, stroke) in &live {
+            assert_eq!(
+                (*fill, *stroke),
+                (theme::CARD, theme::BORDER_STRONG),
+                "a resting field is not painted in the live treatment, so the comparison \
+                 below says nothing"
+            );
+        }
+        for (fill, stroke) in &in_flight {
+            assert_eq!(
+                (*fill, *stroke),
+                (theme::CANVAS, theme::BORDER),
+                "a field in flight is still painted in the live treatment -- it reads as a \
+                 field that can be typed into"
+            );
+        }
+    }
+
+    /// The labels above those boxes grey with them. "Gray out the whole
+    /// user/pass zone" is not satisfied by a pale box under a black label.
+    #[test]
+    fn the_field_labels_grey_out_with_their_fields() {
+        fn walk(shape: &egui::Shape, found: &mut Vec<(String, Color32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|s| s.format.color)
+                        .unwrap_or(text.fallback_color);
+                    found.push((text.galley.text().to_string(), color));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, found);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let label_colors = |auth_in_progress: bool| {
+            let ctx = styled_context();
+            let mut form = LoginForm::default();
+            for _ in 0..2 {
+                let _ = frame(&ctx, &mut form, auth_in_progress, Vec::new());
+            }
+            let output = frame(&ctx, &mut form, auth_in_progress, Vec::new());
+            let mut found = Vec::new();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut found);
+            }
+            found
+        };
+
+        for (auth_in_progress, expected, described) in [
+            (false, theme::TEXT_MUTED, "resting"),
+            (true, theme::TEXT_GHOST, "in flight"),
+        ] {
+            let found = label_colors(auth_in_progress);
+            for wanted in ["Email", "Master password"] {
+                let color = found
+                    .iter()
+                    .find(|(text, _)| text == wanted)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the {described} window painted no {wanted:?} label at all, so its \
+                             colour cannot be asserted; painted: {:?}",
+                            found.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                        )
+                    })
+                    .1;
+                assert_eq!(
+                    color, expected,
+                    "the {described} window paints its {wanted:?} label in {color:?}"
+                );
+            }
+        }
+    }
+
+    /// **Cleared on failure, and only on failure.** The user's words. A
+    /// success that also cleared would look identical on screen -- the window
+    /// is closing -- which is exactly why this is a value test on the decision
+    /// rather than an observation of the window.
+    #[test]
+    fn a_failed_attempt_clears_the_password_and_a_successful_one_does_not() {
+        let mut form = LoginForm::default();
+        form.password = "correct horse".to_string();
+        let outcome = apply_auth_result(Ok("session-token".to_string()), &mut form);
+        assert_eq!(
+            outcome,
+            AuthOutcome::Succeeded("session-token".to_string()),
+            "a successful attempt did not hand its session token back"
+        );
+        assert_eq!(
+            form.password, "correct horse",
+            "a SUCCESSFUL attempt wiped the master password -- the field it is behind is \
+             masked, so nothing on screen would ever have shown this"
+        );
+        assert!(form.error.is_none(), "a successful attempt left an error on screen");
+
+        let mut form = LoginForm::default();
+        form.password = "correct horse".to_string();
+        let outcome = apply_auth_result(Err("Invalid master password.".to_string()), &mut form);
+        assert_eq!(outcome, AuthOutcome::Failed);
+        assert!(
+            form.password.is_empty(),
+            "a FAILED attempt left the master password in the field: {:?}",
+            form.password
+        );
+        assert!(
+            form.error.is_some(),
+            "a failed attempt said nothing about why -- and the assertion above would then \
+             pass against a function that only ever clears"
+        );
+    }
+
+    /// The half of this that no harness can reach: `run_login_flow_for`'s
+    /// frame closure runs only inside a live eframe event loop, so "the
+    /// window routes its answer through `apply_auth_result`" and "submitting
+    /// no longer wipes the field on the spot" are source guards.
+    ///
+    /// The needles are `concat!`-split and single-line, the house shape: a
+    /// needle written as one literal matches its own declaration, and one
+    /// carrying a newline passes on LF and fails on CRLF.
+    #[test]
+    fn the_window_routes_its_answer_through_the_tested_decision_and_does_not_wipe_on_submit() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub fn run_login_flow", "_for("))
+            .expect("`run_login_flow_for` is gone")
+            .1
+            .split_once(concat!("pub fn run_login", "_flow("))
+            .expect("`run_login_flow` no longer follows it, so this slice is unbounded")
+            .0;
+
+        let routed = concat!("apply_auth_", "result(result, &mut form)");
+        assert!(
+            body.contains(routed),
+            "the window no longer applies its auth result through the one function that \
+             decides what a failure costs, so every assertion about clearing is about dead \
+             code"
+        );
+
+        let spawn = concat!("spawn_", "auth(");
+        let spawn_at = body
+            .find(spawn)
+            .expect("the window no longer spawns an auth at all");
+        // From the submit's `spawn_auth` to the end of that arm. Bounded by
+        // the NEXT arm's own marker rather than by a byte count, which is how
+        // a fixed window ends up reading someone else's code.
+        let after_submit = &body[spawn_at..];
+        let arm_end = after_submit
+            .find(concat!("Some(LoginAction::Hello", "Unlock) =>"))
+            .expect("the Hello arm no longer follows the submit arm, so this slice is unbounded");
+        let submit_tail = &after_submit[..arm_end];
+        let wipe = concat!("form.password.zero", "ize()");
+        assert!(
+            !submit_tail.contains(wipe),
+            "submitting wipes the master password on the spot again, so the window spends the \
+             whole attempt masking a buffer it already emptied: {submit_tail:?}"
+        );
+        // Positive control for that absence: the needle is one this file
+        // really does contain, elsewhere.
+        assert!(
+            source.contains(wipe),
+            "no {wipe:?} anywhere in this file -- the needle has drifted and the assertion \
+             above proves nothing"
         );
     }
 }

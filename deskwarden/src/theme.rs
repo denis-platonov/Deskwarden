@@ -2019,6 +2019,13 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
 }
 
+/// [`field_label`], greyed, for a field that cannot be typed into right now
+/// -- see [`disabled_text_field`]. A label left at [`TEXT_MUTED`] over a
+/// greyed box reads as a live field whose box happens to be pale.
+pub fn disabled_field_label(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(TEXT_GHOST));
+}
+
 /// Height of design 2b's search box (`height: 34px`), which is shorter than
 /// the form fields' [`FIELD_HEIGHT`] and is its own value for that reason.
 pub const SEARCH_FIELD_HEIGHT: f32 = 34.0;
@@ -2213,7 +2220,11 @@ pub fn search_field(
 }
 
 /// The design's input-box height (sections 2a/3a/3b/3h).
-const FIELD_HEIGHT: f32 = 38.0;
+///
+/// Public so a test can find these boxes in a painted frame by the one
+/// measurement every one of them shares, live or greyed, rather than by a
+/// number written out again beside the assertion.
+pub const FIELD_HEIGHT: f32 = 38.0;
 
 /// A full-width single-line text field with the design's focused-state halo
 /// (`box-shadow: 0 0 0 3px #dbe4f7` in the mockup, sections 2a/3a/3b) --
@@ -2249,6 +2260,120 @@ pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> R
     }
 
     response
+}
+
+/// How many bullets a masked readout shows, **regardless of how long the real
+/// value is -- or whether there is one at all**.
+///
+/// `vault_window::detail` declares its own copy of this number for exactly
+/// this reason, and the two are deliberately separate: that one masks a
+/// stored password in the detail pane, this one masks a password field while
+/// a sign-in is in flight, and neither wants to move because the other did.
+/// What they must not do is either of the things a length-tracking mask does:
+/// tell a shoulder-surfer how many characters to expect, or -- the case the
+/// login window actually hits -- collapse to nothing and announce that the
+/// buffer behind it has already been emptied.
+pub const MASKED_BULLETS: usize = 10;
+
+/// The mask itself: [`MASKED_BULLETS`] bullets, always the same string.
+pub fn masked_readout() -> String {
+    "\u{2022}".repeat(MASKED_BULLETS)
+}
+
+/// [`text_field`]'s box with **no `TextEdit` in it at all**: the 38px box
+/// painted in the greyed treatment, and `text` painted as a galley.
+///
+/// Returns the box, so a caller can put an (equally inert) in-field
+/// affordance on it -- which is what [`disabled_password_field`] does.
+///
+/// **A galley, not `TextEdit::interactive(false)`**, and the difference is
+/// visible: egui's read-only `TextEdit` still takes focus, still draws a
+/// caret, and still eats the click that lands on it. A field that greys out
+/// and then blinks a cursor at you is not disabled, it is broken -- the same
+/// conclusion the minutes stepper in `prefs_ui` reached, and it is solved the
+/// same way here. Nothing is allocated with a `Sense::click`, so the pointer
+/// passes over this box as if it were background.
+pub fn disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
+    disabled_field_box(ui, text, 10.0)
+}
+
+/// [`password_field`]'s box while an attempt is in flight: [`masked_readout`]
+/// in the greyed treatment, with the reveal toggle painted greyed and inert
+/// beside it.
+///
+/// **It takes no value.** The mask does not depend on one -- that is
+/// [`MASKED_BULLETS`]'s whole point -- and not taking one means this cannot
+/// later be "improved" into something that leaks the length.
+///
+/// The toggle reads "Show" rather than whatever the field was on: what is on
+/// screen underneath it IS masked, whichever way the user had it set before
+/// they submitted, so "Hide" would be offering to hide something already
+/// hidden.
+pub fn disabled_password_field(ui: &mut Ui) -> Rect {
+    let box_rect = disabled_field_box(ui, &masked_readout(), 52.0);
+    let label = ui.painter().layout_no_wrap(
+        "Show".to_string(),
+        FontId::new(11.0, FontFamily::Name(SEMIBOLD.into())),
+        TEXT_GHOST,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            box_rect.right() - 50.0,
+            box_rect.center().y - label.size().y / 2.0,
+        ),
+        label,
+        TEXT_GHOST,
+    );
+    box_rect
+}
+
+/// The shared body of [`disabled_text_field`] and [`disabled_password_field`]:
+/// the same 38px box [`field_box`] allocates, painted greyed, with `text` sat
+/// on the same baseline a live field's text would be.
+///
+/// Greyed means all three of fill, border and ink move together --
+/// [`CANVAS`] instead of [`CARD`], [`BORDER`] instead of [`BORDER_STRONG`],
+/// [`TEXT_GHOST`] instead of the ambient body colour. Any one of them alone
+/// reads as a styling accident rather than as a control that is switched off.
+fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32) -> Rect {
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), FIELD_HEIGHT),
+        // Hover, NOT click: this box is not a control, and giving it a click
+        // sense is how a disabled field starts swallowing the clicks meant
+        // for whatever is behind or beside it.
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        outer,
+        CornerRadius::same(8),
+        CANVAS,
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Middle,
+    );
+    // Laid out at [`field_box`]'s own font and inside its own text width, and
+    // TRUNCATED there rather than wrapped: this box is one line tall, and an
+    // email long enough to wrap would otherwise paint its second line
+    // straight through the bottom border and on down the card.
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_string(),
+        egui::TextFormat::simple(FontId::new(14.0, FontFamily::Proportional), TEXT_GHOST),
+    );
+    job.wrap = egui::text::TextWrapping::truncate_at_width(
+        (outer.width() - 10.0 - right_pad).max(0.0),
+    );
+    let galley = ui.painter().layout_job(job);
+    // `field_box`'s own optical nudge, for its reason: a row box is
+    // ascent+descent tall and typical field text fills only the upper part,
+    // so geometric centring reads as text sitting high.
+    ui.painter().galley(
+        Pos2::new(
+            outer.min.x + 10.0,
+            outer.center().y - galley.size().y / 2.0 + galley.size().y * 0.09,
+        ),
+        galley,
+        TEXT_GHOST,
+    );
+    outer
 }
 
 /// Allocates the design's full 38px input box, places a frameless `TextEdit`
