@@ -826,6 +826,7 @@ fn main() {
                     &backend_op_rx,
                     &mut backend_task_in_progress,
                 );
+                rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
                 last_dispatched_hwnd = None;
             }
 
@@ -1385,6 +1386,7 @@ fn main() {
                     &backend_op_rx,
                     &mut backend_task_in_progress,
                 );
+                rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
                 last_dispatched_hwnd = None;
             }
         }
@@ -2136,6 +2138,33 @@ fn stand_down_after_unlock(engine: &mut MatchEngine, reason: &str) {
          \"Sync\" in the tray menu to rebuild them. Reopening the vault window refills the item \
          cache but does NOT rebuild the app matches."
     );
+}
+
+/// Rebuilds the tray's "Accounts" submenu after the vault window has closed.
+///
+/// **`open_vault_window` can switch accounts and cannot rebuild the menu
+/// itself.** Its titlebar switcher runs the same `switch_to_account` the tray
+/// does and calls `state.adopt(...)` on the way out, but it takes `&tray` --
+/// `resettle_session` needs the tray to set the "Sync" item's state -- so it
+/// has no `&mut` to rebuild with. Both of its call sites therefore rebuild on
+/// the way out, through this one name.
+///
+/// Without it the submenu still holds the rows built while A was active. Two
+/// things are then wrong at once: it offers a switch to the account the app is
+/// now ON, and its "Remove a@example.com..." row does not remove A. That row
+/// carries no id -- the removal reads `state.active().id`, which is B by now --
+/// so the label names one vault and the deletion takes another. The
+/// confirmation dialog does name B, so it takes one unread dialog rather than
+/// none, which is why this is not the only guard on that path; it is the one
+/// that keeps the label honest.
+///
+/// Unconditional rather than gated on "did the active account change?", for
+/// the reason the submenu action's own rebuild is: every `MenuId` is minted
+/// with its item, so a menu rebuilt only on the paths that changed something
+/// is a menu whose ids sometimes outlive the state they name -- and
+/// "sometimes" is the shape nothing catches.
+fn rebuild_after_vault_window(tray: &mut tray::AppTray, state: Option<&accounts::AccountsState>) {
+    tray.rebuild_accounts_menu(state);
 }
 
 /// Opens the vault window and handles it locking itself before returning.
@@ -5699,12 +5728,16 @@ mod tests {
         fn the_submenu_is_rebuilt_outside_the_action_that_changed_it() {
             let production = production_half_of_this_file();
             let rebuild = concat!("rebuild_accounts", "_menu(");
-            assert_eq!(
-                production.matches(rebuild).count(),
-                2,
-                "expected exactly two rebuilds in production: one at startup, before the user \
-                 can open the menu, and one after an account action"
-            );
+            // NOT a count of the call sites. This asserted "exactly two" until
+            // review 13 found the third one missing -- the vault window's own
+            // titlebar switcher -- and a count is what made that omission look
+            // deliberate: the only way to add the missing rebuild was to edit
+            // the number the guard checked, which is how a guard stops
+            // guarding. What is actually being protected is *where* the
+            // rebuild sits relative to the action, and that is asserted
+            // directly below and, for the vault window, in
+            // `every_way_into_the_vault_window_rebuilds_the_submenu_on_the_
+            // way_out`.
             assert!(
                 !tray_block().contains(rebuild),
                 "the rebuild is INSIDE the action's own block, so it is reachable only on the \
@@ -5720,6 +5753,75 @@ mod tests {
             assert!(
                 production.contains(rebuild),
                 "control: the rebuild is still called at all"
+            );
+        }
+
+        /// **Every way into the vault window rebuilds the submenu on the way
+        /// out**, because the window can switch accounts from its own titlebar
+        /// (`state.adopt(...)` in `open_vault_window`) and takes `&tray`, so it
+        /// cannot rebuild anything itself.
+        ///
+        /// The bug this closes: after a titlebar switch from A to B the tray
+        /// still offered `Remove a@example.com...`, and the removal reads
+        /// `state.active().id` -- which is B. The row named one vault and the
+        /// deletion took another.
+        ///
+        /// Per call site, not a count. A count is what let the omission look
+        /// deliberate for two reviews; a new `open_vault_window(` that forgets
+        /// the rebuild fails this test with nothing to "update".
+        #[test]
+        fn every_way_into_the_vault_window_rebuilds_the_submenu_on_the_way_out() {
+            let production = production_half_of_this_file();
+            // `concat!`-split and single-line, this file's usual two reasons.
+            // The call needle does not match `rebuild_after_vault_window(`, and
+            // the declaration is skipped by the `fn ` test below.
+            let call = concat!("open_vault", "_window(");
+            let rebuild = concat!("rebuild_after_vault", "_window(");
+            // The end of each call's statement. Both sites forget the last
+            // dispatched window after any of our own windows steals focus, so
+            // this is a real boundary in the code rather than a byte count --
+            // the shape that already overran an arm in this file once.
+            let end_of_statement = concat!("last_dispatched_hwnd", " = None;");
+
+            let mut sites = 0usize;
+            let mut from = 0usize;
+            while let Some(offset) = production[from..].find(call) {
+                let at = from + offset;
+                from = at + call.len();
+                if production[..at].ends_with("fn ") {
+                    continue; // the declaration, not a call
+                }
+                sites += 1;
+                let rest = &production[from..];
+                let end = rest.find(end_of_statement).unwrap_or_else(|| {
+                    panic!(
+                        "the vault-window call at byte {at} is not followed by \
+                         {end_of_statement:?}, so this test cannot tell where its statement \
+                         ends -- give it one, or reshape this boundary"
+                    )
+                });
+                let statement = &rest[..end];
+                assert!(
+                    statement.contains(rebuild),
+                    "the vault-window call at byte {at} does not rebuild the accounts submenu \
+                     afterwards. The window can switch accounts from its titlebar, so the tray \
+                     is left offering a switch to the account the app is now ON and a \
+                     \"Remove <the account just left>...\" that removes the OTHER one. The \
+                     statement reads: {statement:?}"
+                );
+            }
+
+            // Controls for that loop: it examined real call sites, and the
+            // needles are spelled the way the production code spells them.
+            assert_eq!(
+                sites, 2,
+                "control: the two ways of opening the vault window -- the tray menu's \"Open \
+                 Vault\" item and a left click on the tray icon -- are what this walked; \
+                 finding {sites} means the needle stopped matching"
+            );
+            assert!(
+                production.contains(concat!("fn rebuild_after_vault", "_window(")),
+                "control: the rebuild helper is still declared here"
             );
         }
 
