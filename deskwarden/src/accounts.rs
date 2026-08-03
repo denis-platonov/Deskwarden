@@ -192,6 +192,150 @@ pub fn next_active_after_removal<'a>(
     accounts.iter().find(|a| &a.id != removed)
 }
 
+// ------------------------------------------- may this process switch at all?
+
+/// The one door for "may I offer another account, and which one am I on?".
+///
+/// Two *independent* reasons a switch may be unavailable, and every UI entry
+/// point needs the same answer to both:
+///
+/// * [`MultiAccountAvailability`](crate::bw_path::MultiAccountAvailability) —
+///   a `bitwarden-cli` directory beside `bw.exe` makes the CLI ignore
+///   `BITWARDENCLI_APPDATA_DIR`, so every account would silently share one
+///   profile; and "we do not know where the CLI is" is the same refusal,
+///   because the trap cannot be ruled out.
+/// * [`MigrationState`](crate::migration::MigrationState) — a migration that
+///   was refused or could not be verified means the account directories do not
+///   hold what the account list says they do.
+///
+/// They are combined here and nowhere else. A window that asked one of them
+/// and not the other would offer a switch that shares a profile, or one into a
+/// directory that was never populated — neither of which reports an error, so
+/// neither is visible in an end state.
+///
+/// [`switchable`](Self::switchable) is a *field*, computed once in
+/// [`new`](Self::new), rather than a filter a caller could be tempted to
+/// rebuild from [`all`](Self::all).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountsState {
+    accounts: Vec<Account>,
+    active: Account,
+    switchable: Vec<Account>,
+    blocked_reason: Option<String>,
+    hello_needs_reenrolment: bool,
+}
+
+impl AccountsState {
+    /// `None` when `accounts` is empty, which is the *only* way this can fail.
+    ///
+    /// An account list with no accounts is not a state this app has: before
+    /// migration produces one there is no `Account` at all, and that is a
+    /// startup condition (`StartupAccounts::Unmigrated`, Task 11) rather than
+    /// an `AccountsState` with nothing in it. Making that unrepresentable is
+    /// what lets [`active`](Self::active) return `&Account` instead of an
+    /// `Option` every caller would have to unwrap somewhere.
+    ///
+    /// `active` naming an id that is not in `accounts` falls back to the first
+    /// configured account rather than being refused. `settings.json` is a
+    /// user-editable file and a removal that crashed mid-write leaves exactly
+    /// this state; the alternative — no active account — would leave the app
+    /// with no directory to point the CLI at.
+    pub fn new(
+        availability: crate::bw_path::MultiAccountAvailability,
+        migration: crate::migration::MigrationState,
+        accounts: Vec<Account>,
+        active: AccountId,
+    ) -> Option<Self> {
+        use crate::migration::MigrationState;
+
+        let active = account_for(&accounts, &active)
+            .or_else(|| accounts.first())?
+            .clone();
+
+        // The CLI's refusal outranks the migration's: with the trap present a
+        // migration is refused *because of* it, and the availability
+        // explanation is the one that names the directory the user can go and
+        // remove.
+        let blocked_reason = match (availability.explanation(), &migration) {
+            (Some(why), _) => Some(why),
+            (None, MigrationState::Blocked { reason }) => Some(reason.clone()),
+            // `NothingToMigrate` is not "not yet migrated": it is what every
+            // launch after the first one reports, because an existing account
+            // list is itself the reason there is nothing to do. Treating it as
+            // pending would refuse every switch from the second launch onward.
+            (None, MigrationState::Completed { .. } | MigrationState::NothingToMigrate) => None,
+        };
+
+        let mut switchable: Vec<Account> = Vec::new();
+        if blocked_reason.is_none() {
+            for account in &accounts {
+                // Never the active account: "switch to where you already are"
+                // still tears the backend down and demands a master password.
+                // Never a repeat of one already offered either — two entries
+                // for one id are two doors onto one directory, and a
+                // hand-edited file can contain them.
+                let already = switchable.iter().any(|a: &Account| a.id == account.id);
+                if account.id != active.id && !already {
+                    switchable.push(account.clone());
+                }
+            }
+        }
+
+        let hello_needs_reenrolment = matches!(
+            migration,
+            MigrationState::Completed {
+                hello_needs_reenrolment: true,
+                ..
+            }
+        );
+
+        Some(Self {
+            accounts,
+            active,
+            switchable,
+            blocked_reason,
+            hello_needs_reenrolment,
+        })
+    }
+
+    /// The account this process is pointed at.
+    pub fn active(&self) -> &Account {
+        &self.active
+    }
+
+    /// Every configured account, including the active one — the list is still
+    /// *shown* when switching is refused; it is switching that is refused.
+    pub fn all(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    /// The accounts a user may switch **to** right now. Empty when multi-account
+    /// is blocked or the migration is, whatever [`all`](Self::all) holds.
+    pub fn switchable(&self) -> &[Account] {
+        &self.switchable
+    }
+
+    /// Whether another account may be added. The same two blocks: an account
+    /// added now would share the one profile, or land beside a migration that
+    /// has not run.
+    pub fn can_add(&self) -> bool {
+        self.blocked_reason.is_none()
+    }
+
+    /// Why switching and adding are unavailable, in the words the user can act
+    /// on, or `None` when they are available.
+    pub fn blocked_reason(&self) -> Option<&str> {
+        self.blocked_reason.as_deref()
+    }
+
+    /// Whether the migration deleted a Windows Hello enrolment that has to be
+    /// set up again. Carried through here because the panel that shows it
+    /// reads this state and not the migration's own return value.
+    pub fn hello_needs_reenrolment(&self) -> bool {
+        self.hello_needs_reenrolment
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +769,518 @@ mod tests {
                 next_active_after_removal(&list, removed).map(|x| &x.id),
                 Some(removed)
             );
+        }
+    }
+
+    // --------------------------------------------------------------- 10
+
+    mod accounts_state {
+        use super::*;
+        use crate::bw_path::MultiAccountAvailability;
+        use crate::migration::MigrationState;
+
+        fn a() -> Account {
+            account(A)
+        }
+
+        fn b() -> Account {
+            account(B)
+        }
+
+        fn c() -> Account {
+            account(&"a".repeat(32))
+        }
+
+        fn completed(of: &Account) -> MigrationState {
+            MigrationState::Completed {
+                account: of.clone(),
+                hello_needs_reenrolment: false,
+            }
+        }
+
+        fn trap() -> MultiAccountAvailability {
+            MultiAccountAvailability::BlockedByPortableProfile {
+                relative_data_dir: PathBuf::from(r"C:\a\bin\bitwarden-cli"),
+            }
+        }
+
+        fn state(
+            availability: MultiAccountAvailability,
+            migration: MigrationState,
+            accounts: Vec<Account>,
+            active: &AccountId,
+        ) -> AccountsState {
+            AccountsState::new(availability, migration, accounts, active.clone())
+                .expect("these accounts are not empty")
+        }
+
+        fn switch_ids(state: &AccountsState) -> Vec<AccountId> {
+            state.switchable().iter().map(|x| x.id.clone()).collect()
+        }
+
+        #[test]
+        fn a_blocked_availability_offers_no_switch_targets_and_no_add() {
+            let s = state(trap(), completed(&a()), vec![a(), b()], &a().id);
+            assert!(
+                s.switchable().is_empty(),
+                "a switch was offered while the CLI ignores our env var: {:?}",
+                switch_ids(&s)
+            );
+            assert!(!s.can_add(), "an account was addable into one shared profile");
+            let why = s.blocked_reason().expect("the refusal must say why");
+            assert!(
+                why.contains(r"C:\a\bin\bitwarden-cli"),
+                "the message must name the directory the user can remove, got: {why}"
+            );
+            assert_eq!(
+                s.all().len(),
+                2,
+                "the list is still shown -- it is SWITCHING that is refused"
+            );
+            assert_eq!(s.active().id, a().id);
+        }
+
+        #[test]
+        fn an_unknown_cli_path_refuses_a_switch_exactly_as_the_portable_profile_does() {
+            // The variant the plan's own tests never name. An implementation
+            // that matched on `BlockedByPortableProfile` alone would pass every
+            // one of them and switch freely on the machine where the trap
+            // cannot be CHECKED for -- which is the state this variant exists
+            // to report, and the one where a wrong answer is unfalsifiable.
+            let s = state(
+                MultiAccountAvailability::BlockedByUnknownCliPath,
+                completed(&a()),
+                vec![a(), b()],
+                &a().id,
+            );
+            assert!(
+                s.switchable().is_empty(),
+                "a switch was offered without knowing where the CLI reads its profile from"
+            );
+            assert!(!s.can_add());
+            assert!(s.blocked_reason().is_some());
+            assert_eq!(s.all().len(), 2);
+        }
+
+        #[test]
+        fn a_blocked_migration_offers_no_switch_targets_even_when_the_cli_is_fine() {
+            // The second, independent reason. A half-migrated or unmigrated
+            // profile means the account directories do not hold what the list
+            // says they do.
+            let s = state(
+                MultiAccountAvailability::Available,
+                MigrationState::Blocked {
+                    reason: "the copy could not be verified".into(),
+                },
+                vec![a(), b()],
+                &a().id,
+            );
+            assert!(s.switchable().is_empty());
+            assert!(!s.can_add());
+            assert!(
+                s.blocked_reason()
+                    .is_some_and(|why| why.contains("could not be verified")),
+                "the migration's own reason must reach the user, got {:?}",
+                s.blocked_reason()
+            );
+        }
+
+        #[test]
+        fn an_available_migrated_state_offers_every_account_except_the_active_one() {
+            // The positive control for both tests above, and the rule in its
+            // own right: "switch to the account you are already on" is a no-op
+            // that would still tear the backend down and demand a master
+            // password.
+            let s = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![a(), b(), c()],
+                &b().id,
+            );
+            assert_eq!(
+                switch_ids(&s),
+                vec![a().id, c().id],
+                "in configured order, and without the active account"
+            );
+            assert!(s.can_add());
+            assert_eq!(s.blocked_reason(), None);
+            assert_eq!(s.active().id, b().id);
+            assert_eq!(s.all().len(), 3);
+        }
+
+        #[test]
+        fn a_later_launch_with_nothing_to_migrate_still_offers_a_switch() {
+            // `NothingToMigrate` is what `migrate` returns on EVERY launch
+            // after the first: `resume_action` answers `DoNothing` as soon as
+            // `accounts_already_configured` is true. Reading "migration has not
+            // completed" as "the state is not `Completed`" would therefore
+            // refuse every switch from the second launch onward -- a feature
+            // that works exactly once, on the launch that migrated, and is
+            // inert forever after. No end state distinguishes that from a
+            // correctly blocked app.
+            let s = state(
+                MultiAccountAvailability::Available,
+                MigrationState::NothingToMigrate,
+                vec![a(), b()],
+                &a().id,
+            );
+            assert_eq!(switch_ids(&s), vec![b().id]);
+            assert!(s.can_add());
+            assert_eq!(s.blocked_reason(), None);
+        }
+
+        #[test]
+        fn the_hello_notice_survives_into_the_state_the_login_window_reads() {
+            // WIRING for Task 7's panel line: a `hello_needs_reenrolment` that
+            // the migration computes and nothing carries forward is a notice
+            // the user never sees, and quick unlock silently stops working.
+            let loud = state(
+                MultiAccountAvailability::Available,
+                MigrationState::Completed {
+                    account: a(),
+                    hello_needs_reenrolment: true,
+                },
+                vec![a()],
+                &a().id,
+            );
+            assert!(loud.hello_needs_reenrolment());
+            let quiet = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![a()],
+                &a().id,
+            );
+            assert!(
+                !quiet.hello_needs_reenrolment(),
+                "a state that always says yes would put the notice in front of every user"
+            );
+            // And it is not a synonym for either block: a blocked state with
+            // the flag set still reports it, and an unblocked one without it
+            // still does not.
+            let blocked_and_loud = state(
+                trap(),
+                MigrationState::Completed {
+                    account: a(),
+                    hello_needs_reenrolment: true,
+                },
+                vec![a()],
+                &a().id,
+            );
+            assert!(blocked_and_loud.hello_needs_reenrolment());
+            let unmigrated = state(
+                MultiAccountAvailability::Available,
+                MigrationState::NothingToMigrate,
+                vec![a()],
+                &a().id,
+            );
+            assert!(!unmigrated.hello_needs_reenrolment());
+        }
+
+        #[test]
+        fn an_active_id_naming_no_stored_account_falls_back_to_the_first() {
+            // Reachable: `settings.json` is a user-editable file, and a removal
+            // that crashed between rewriting the list and rewriting
+            // `active_account` leaves exactly this. The fallback must be a
+            // REAL account -- an active account that is not in the list would
+            // point the CLI at a directory nothing created, and would then also
+            // appear in its own switch targets.
+            let ghost = id(&"9".repeat(32));
+            let s = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![b(), a()],
+                &ghost,
+            );
+            assert_eq!(s.active().id, b().id, "the first configured account");
+            assert_eq!(
+                switch_ids(&s),
+                vec![a().id],
+                "the fallback active account must not also be offered as a target"
+            );
+            assert!(
+                !switch_ids(&s).contains(&ghost),
+                "an id that names no account was offered as somewhere to switch to"
+            );
+            assert!(s.can_add());
+        }
+
+        #[test]
+        fn an_empty_account_list_is_not_an_accounts_state_at_all() {
+            // The pre-migration app has no `Account`, and that is a startup
+            // condition rather than an `AccountsState` holding nothing. If this
+            // constructed, `active()` would have to invent an account or panic
+            // -- and an invented one points the CLI at an empty directory,
+            // which presents as "signed out" with the real vault untouched a
+            // few directories away.
+            for availability in [
+                MultiAccountAvailability::Available,
+                MultiAccountAvailability::BlockedByUnknownCliPath,
+                trap(),
+            ] {
+                for migration in [
+                    MigrationState::NothingToMigrate,
+                    completed(&a()),
+                    MigrationState::Blocked {
+                        reason: "nope".into(),
+                    },
+                ] {
+                    assert!(
+                        AccountsState::new(
+                            availability.clone(),
+                            migration.clone(),
+                            vec![],
+                            a().id
+                        )
+                        .is_none(),
+                        "{availability:?} + {migration:?} built a state with no accounts"
+                    );
+                    // The positive control on the same call: one account and
+                    // the same two inputs does build.
+                    assert!(
+                        AccountsState::new(
+                            availability.clone(),
+                            migration.clone(),
+                            vec![a()],
+                            a().id
+                        )
+                        .is_some(),
+                        "{availability:?} + {migration:?} refused a perfectly good single account"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn a_single_account_has_nowhere_to_switch_to_but_may_still_be_added_to() {
+            let s = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![a()],
+                &a().id,
+            );
+            assert!(s.switchable().is_empty());
+            assert!(
+                s.can_add(),
+                "the only way a second account ever arrives is barred"
+            );
+            assert_eq!(s.blocked_reason(), None);
+            assert_eq!(s.all().len(), 1);
+        }
+
+        #[test]
+        fn a_duplicated_id_is_offered_once_rather_than_as_two_doors_onto_one_directory() {
+            // A hand-edited `settings.json` again. Two entries with one id are
+            // two menu items that switch to the same data directory.
+            let s = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![a(), b(), b(), a()],
+                &a().id,
+            );
+            assert_eq!(switch_ids(&s), vec![b().id]);
+            assert_eq!(s.all().len(), 4, "what is stored is still reported as stored");
+        }
+
+        #[test]
+        fn every_combination_of_the_two_blocks_obeys_one_rule() {
+            // The whole decision table, so no single combination can be
+            // special-cased into working while another silently is not. Three
+            // availabilities x three migration states x four account lists,
+            // each with an active account that is in the list and one that is
+            // not.
+            let unblocked_migrations = [MigrationState::NothingToMigrate, completed(&a())];
+            let availabilities = [
+                (MultiAccountAvailability::Available, true),
+                (MultiAccountAvailability::BlockedByUnknownCliPath, false),
+                (trap(), false),
+            ];
+            let migrations = [
+                (MigrationState::NothingToMigrate, true),
+                (completed(&a()), true),
+                (
+                    MigrationState::Blocked {
+                        reason: "the copy could not be verified".into(),
+                    },
+                    false,
+                ),
+            ];
+            let lists = [
+                vec![a()],
+                vec![a(), b()],
+                vec![a(), b(), c()],
+                vec![b(), c()], // the active id names none of these
+            ];
+
+            let mut ever_offered = 0usize;
+            for (availability, cli_ok) in &availabilities {
+                for (migration, migration_ok) in &migrations {
+                    for list in &lists {
+                        let s = state(
+                            availability.clone(),
+                            migration.clone(),
+                            list.clone(),
+                            &a().id,
+                        );
+                        let allowed = *cli_ok && *migration_ok;
+                        let label = format!("{availability:?} / {migration:?} / {list:?}");
+
+                        assert_eq!(s.can_add(), allowed, "can_add disagrees for {label}");
+                        assert_eq!(
+                            s.blocked_reason().is_none(),
+                            allowed,
+                            "blocked_reason disagrees for {label}"
+                        );
+                        assert_eq!(s.all(), &list[..], "all() rewrote the stored list for {label}");
+
+                        // The active account is always one of the stored ones,
+                        // and is never a switch target.
+                        assert!(
+                            list.iter().any(|x| x.id == s.active().id),
+                            "the active account is not in the list for {label}"
+                        );
+                        assert!(
+                            !switch_ids(&s).contains(&s.active().id),
+                            "the active account was offered as a target for {label}"
+                        );
+
+                        let expected: Vec<AccountId> = if allowed {
+                            list.iter()
+                                .map(|x| x.id.clone())
+                                .filter(|x| x != &s.active().id)
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                        assert_eq!(switch_ids(&s), expected, "switchable disagrees for {label}");
+                        ever_offered += s.switchable().len();
+                    }
+                }
+            }
+            // The positive control over the whole table: "refused" is not the
+            // answer everywhere, which is what a `switchable()` that returned
+            // an empty slice unconditionally would look like.
+            assert!(
+                ever_offered > 0,
+                "no combination in the whole table offered a single switch target"
+            );
+            // And the unblocked corner really does depend on the account list
+            // rather than on the state alone.
+            for migration in unblocked_migrations {
+                let one = state(
+                    MultiAccountAvailability::Available,
+                    migration.clone(),
+                    vec![a()],
+                    &a().id,
+                );
+                let two = state(
+                    MultiAccountAvailability::Available,
+                    migration,
+                    vec![a(), b()],
+                    &a().id,
+                );
+                assert!(one.switchable().is_empty());
+                assert_eq!(switch_ids(&two), vec![b().id]);
+            }
+        }
+
+        #[test]
+        fn an_unavailable_cli_always_explains_itself() {
+            // `AccountsState` decides on `explanation()` being `Some`, so
+            // "blocked" and "has something to say" have to be the same set. If
+            // a variant ever explained nothing, the door would silently swing
+            // open for it -- which is exactly how `BlockedByUnknownCliPath`
+            // would have got through.
+            for availability in [
+                MultiAccountAvailability::BlockedByUnknownCliPath,
+                trap(),
+            ] {
+                assert!(!availability.is_available(), "{availability:?}");
+                assert!(
+                    availability.explanation().is_some(),
+                    "{availability:?} blocks multi-account but says nothing about it"
+                );
+            }
+            assert!(MultiAccountAvailability::Available.is_available());
+            assert_eq!(MultiAccountAvailability::Available.explanation(), None);
+        }
+
+        /// The files that must ask [`AccountsState`] rather than answer for
+        /// themselves. `main.rs` is deliberately not among them: it is where
+        /// the two inputs are produced (Task 11), so it is the one place that
+        /// legitimately names both.
+        ///
+        /// Read off disk rather than with `include_str!` so this list can name
+        /// files in subdirectories, and so a file that stops existing is a
+        /// failure rather than a compile error nobody reads.
+        const MUST_NOT_DECIDE_FOR_THEMSELVES: [&str; 6] = [
+            "tray.rs",
+            "login_ui.rs",
+            "picker_ui.rs",
+            "prefs_ui.rs",
+            "vault_window/mod.rs",
+            "vault_window/sidebar.rs",
+        ];
+
+        #[test]
+        fn no_window_answers_may_i_switch_for_itself() {
+            // A gate nothing asks is the same as no gate. There is no
+            // production caller yet -- Task 11 wires the first one -- so what
+            // can be pinned today is the other half: that the two facts are
+            // combined HERE and are not reachable anywhere a second, weaker
+            // combination could grow. A window that asked
+            // `multi_account_availability()` and not the migration would offer
+            // a switch into a directory that was never populated; one that
+            // asked the migration and not the CLI would offer a switch that
+            // shares a profile. Both are silent.
+            //
+            // NEEDLES SPLIT ACROSS `concat!` ARGUMENTS, DELIBERATELY: written
+            // whole, each would match its own declaration in this file, and
+            // the positive control below would pass against an empty scan.
+            // Single-line for the same reason every other guard here is: this
+            // module is LF and the files it reads are not necessarily.
+            let banned = [
+                concat!("MultiAccount", "Availability"),
+                concat!("multi_account_", "availability"),
+                concat!("Migration", "State"),
+            ];
+            // `CARGO_MANIFEST_DIR`, not `file!()`: the latter is relative to
+            // the package root and would depend on the test binary's working
+            // directory.
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+            let mut scanned = 0usize;
+            for name in MUST_NOT_DECIDE_FOR_THEMSELVES {
+                let path = dir.join(name);
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                scanned += 1;
+                for needle in banned {
+                    assert!(
+                        !source.contains(needle),
+                        "{name} names `{needle}` itself. Whether this process may switch \
+                         accounts is `AccountsState`'s answer and nothing else's: a window \
+                         that combines those two facts a second time will disagree with this \
+                         one, and the disagreement is silent -- a switch that shares a profile, \
+                         or one into a directory the migration never populated."
+                    );
+                }
+            }
+            assert_eq!(
+                scanned,
+                MUST_NOT_DECIDE_FOR_THEMSELVES.len(),
+                "the scan did not read every file it names"
+            );
+            // Positive controls, on the same needles and the same reader: they
+            // ARE spelled that way, and they DO appear in the file that is
+            // allowed to name them.
+            let mine = std::fs::read_to_string(dir.join("accounts.rs"))
+                .expect("cannot read this module's own source");
+            for needle in banned {
+                assert!(
+                    mine.contains(needle),
+                    "the needle `{needle}` is not spelled that way in accounts.rs, so the scan \
+                     above proves nothing"
+                );
+            }
         }
     }
 }
