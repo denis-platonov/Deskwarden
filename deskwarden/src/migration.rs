@@ -2228,6 +2228,196 @@ mod tests {
         }
     }
 
+    /// Plants `accounts\<id>\data.json` under `cfg` and hands back the id.
+    fn plant_account_dir(cfg: &Path, hex: &str) -> AccountId {
+        let id = id(hex);
+        let dir = accounts::data_dir_for(cfg, &id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PROFILE_FILE), b"{\"profile\":1}").unwrap();
+        id
+    }
+
+    /// **The Critical, and the whole reason the bool became a `Vec`.**
+    ///
+    /// `main`'s `add_account` mints B, runs `bw login` into `accounts\B\`,
+    /// switches to it, and then fails `persist_accounts` — the code's own log
+    /// there says "it will not be there on the next launch". The disk is then
+    /// list `[A]`, `accounts\A\data.json` **and** `accounts\B\data.json`, no
+    /// marker, and no migration source involved anywhere. A kill in the same
+    /// window, and a `discard_prepared_account` that cannot delete, land on the
+    /// identical state.
+    ///
+    /// Fails without the fix: put the bool back — that is, make the `None` arm
+    /// of [`resume_action`] read
+    /// `if !observed.claimed_account_ids.is_empty() { DoNothing } else { ...
+    /// }`, short-circuiting before the set difference. Both halves then answer
+    /// `DoNothing`/`NothingToMigrate` and B is unreachable from the app
+    /// forever, which is the defect this closes.
+    #[test]
+    fn an_account_directory_unclaimed_beside_a_claimed_one_is_adopted() {
+        const B: &str = "fedcba9876543210fedcba9876543210";
+
+        // The pure decision first, so a failure says which half broke.
+        assert_eq!(
+            resume_action(&Observed {
+                claimed_account_ids: vec![id(A)],
+                account_dirs_with_profile: vec![id(A), id(B)],
+                ..observed(None, false, false, false)
+            }),
+            ResumeAction::AdoptUnclaimedAccount(id(B)),
+            "the account list names A and B also holds a whole vault; answering anything but \
+             `adopt B` leaves B with nothing pointing at it and no way back into the app"
+        );
+        // Positive control for that: once the list names BOTH, there is
+        // nothing unclaimed and the same shape must NOT adopt anything.
+        assert_eq!(
+            resume_action(&Observed {
+                claimed_account_ids: vec![id(A), id(B)],
+                account_dirs_with_profile: vec![id(A), id(B)],
+                ..observed(None, false, false, false)
+            }),
+            ResumeAction::DoNothing,
+            "control: a directory the list already names is adopted a second time"
+        );
+
+        // And the whole composition against a real disk.
+        let cfg = scratch_dir("adopt-beside-claimed").join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let a = plant_account_dir(&cfg, A);
+        let b = plant_account_dir(&cfg, B);
+        let state = migrate(
+            &cfg,
+            None, // no migration source: this state has nothing to do with one
+            &available(),
+            &[a.clone()],
+            |_| locked_as("second@example.com"),
+            || false,
+        );
+        let MigrationState::Completed { ref account, .. } = state else {
+            panic!(
+                "the launch abandoned the second vault at {}: {state:?}",
+                accounts::data_dir_for(&cfg, &b).display()
+            )
+        };
+        assert_eq!(
+            account.id, b,
+            "the launch adopted the wrong directory; {} is what nothing names",
+            accounts::data_dir_for(&cfg, &b).display()
+        );
+        assert_eq!(account.email, "second@example.com");
+
+        // The state `main` actually runs on: A survives in the list and B is
+        // appended to it rather than replacing it.
+        let stored = [Account {
+            id: a.clone(),
+            email: "first@example.com".to_string(),
+            server_url: None,
+        }];
+        let startup = accounts::resolve_startup(&stored, Some(&a), &state);
+        let accounts::StartupAccounts::Ready {
+            active, accounts, ..
+        } = startup
+        else {
+            panic!("{startup:?}")
+        };
+        assert_eq!(active.id, b);
+        assert_eq!(
+            accounts.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            vec![a, b],
+            "the recovery dropped the account that was already there"
+        );
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// **A copy the CLI REFUSED is not adopted while the original is right
+    /// there.**
+    ///
+    /// `rollback` is three ignored deletions and the marker goes regardless, so
+    /// a `remove_dir_all(accounts/<id>)` defeated by an AV lock — or by a
+    /// lingering `bw` handle on the very `data.json` verification just ran
+    /// against, which is what the `let _ =` exists to tolerate — leaves no
+    /// marker, an empty account list, `accounts/<id>/data.json`, and the source
+    /// present. That is byte-for-byte the state `AdoptUnclaimedAccount` was
+    /// written for, and adopting makes `settings.json` non-empty forever, so
+    /// the intact source is never migrated.
+    ///
+    /// The `finish`-remnant half is the same disk with a copy the CLI *does*
+    /// recognise, and it must still adopt — it is legitimately reachable
+    /// (`finish`'s source deletion is a `log::warn!` and the marker is removed
+    /// regardless).
+    ///
+    /// Fails without the fix: delete the `verification_passed` gate in
+    /// `migrate`'s `AdoptUnclaimedAccount` arm. The first half then reports
+    /// `Completed` with `email: ""` for a profile the CLI called
+    /// `Unauthenticated`, and the source is stranded.
+    #[test]
+    fn an_unclaimed_directory_the_cli_refuses_is_not_adopted_while_the_source_survives() {
+        let (cfg, source) = planted_profile("adopt-gate");
+        let orphan = plant_account_dir(&cfg, A);
+        let orphan_dir = accounts::data_dir_for(&cfg, &orphan);
+
+        // The defeated rollback: the CLI recognises the source and refuses the
+        // copy beside it.
+        let refused_copy = {
+            let orphan_dir = orphan_dir.clone();
+            move |dir: Option<&Path>| {
+                if dir == Some(orphan_dir.as_path()) {
+                    unauthenticated()
+                } else {
+                    locked_as("me@example.com")
+                }
+            }
+        };
+        let state = migrate(&cfg, Some(&source), &available(), &[], refused_copy, || {
+            false
+        });
+        let MigrationState::Blocked { reason } = &state else {
+            panic!(
+                "a copy the CLI reported as Unauthenticated was adopted, and the intact profile \
+                 at {} will now never be migrated: {state:?}",
+                source.display()
+            )
+        };
+        for named in [orphan_dir.display().to_string(), source.display().to_string()] {
+            assert!(
+                reason.contains(&named),
+                "the refusal does not name {named}, so the user is told nothing they can act \
+                 on: {reason}"
+            );
+        }
+        assert!(
+            source.join(PROFILE_FILE).is_file(),
+            "the refusal removed the original profile it exists to protect"
+        );
+        assert!(
+            orphan_dir.join(PROFILE_FILE).is_file(),
+            "the refusal deleted the directory it refused; nothing on this path may delete"
+        );
+
+        // Positive control, same disk: a `finish` remnant — a copy the CLI
+        // recognises as the source's own account — is still adopted. Without
+        // this the gate could be `never adopt when a source is present`, which
+        // would reintroduce the orphan the adoption exists to recover.
+        let verified_copy = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[],
+            |_| locked_as("me@example.com"),
+            || false,
+        );
+        let MigrationState::Completed { account, .. } = verified_copy else {
+            panic!(
+                "control: a verified unclaimed copy beside a source that `finish` could not \
+                 delete was NOT adopted, so a legitimate recovery is now refused: \
+                 {verified_copy:?}"
+            )
+        };
+        assert_eq!(account.id, orphan);
+        assert_eq!(account.email, "me@example.com");
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
     /// The scan behind that field: an account directory counts only when it
     /// holds a profile, and the staging names can never be mistaken for one.
     ///

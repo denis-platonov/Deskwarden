@@ -8430,6 +8430,56 @@ mod tests {
         );
     }
 
+    /// The app's worst survivable startup does not happen in silence.
+    ///
+    /// `StartupAccounts::Unmigrated` is no switcher, no accounts submenu and a
+    /// signed-out CLI, and it repeats identically every launch. One way in is
+    /// `migration`'s refusal over two account directories that each hold a real
+    /// vault the account list does not name — the refusal names both, and
+    /// naming them only in `deskwarden.log` leaves a user who never opens it
+    /// with two vaults stuck and no idea why. This file pops a modal for the
+    /// Hello re-enrolment *nicety*; it said nothing here.
+    ///
+    /// Fails without the fix: delete the `message_box` from that arm.
+    #[test]
+    fn the_account_less_startup_says_so_on_screen_and_says_why() {
+        let source = production_half_of_this_file();
+        let arm = source
+            .split_once(concat!("StartupAccounts::", "Unmigrated { reason } =>"))
+            .expect("startup must still have an account-less arm")
+            .1;
+        // Bounded by the arm's own end — the tuple it evaluates to — and not
+        // by a byte count. A fixed window is the shape that already overran
+        // into a neighbouring arm in this file and passed on its text.
+        let arm = arm
+            .split_once("(None, None)")
+            .expect("the account-less arm must still evaluate to no account and no state")
+            .0;
+        assert!(
+            arm.contains(concat!("message", "_box(")),
+            "the account-less startup shows the user nothing: the app has no switcher, no \
+             accounts submenu and a signed-out CLI, and the only trace is a log line"
+        );
+        assert!(
+            arm.contains("{reason}"),
+            "a notice is shown but the refusal's own reason is not in it — which is the half \
+             that names the directories holding the user's vaults"
+        );
+        // Positive controls: the region really is that arm, and it is an arm
+        // rather than the rest of the file.
+        assert!(
+            arm.contains(concat!("log::", "warn!")),
+            "control: the sliced region is not the account-less arm"
+        );
+        assert!(
+            arm.len() < source.len() / 4,
+            "control: the slice is {} of {} bytes, so it is not one arm and these assertions \
+             could be about anything",
+            arm.len(),
+            source.len()
+        );
+    }
+
     /// The debt Task 7 left and named: it made `run_login_flow_for` take an
     /// account and `run_login_flow` pass `None`, because startup had none to
     /// give. It has one now.
