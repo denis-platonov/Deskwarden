@@ -2239,6 +2239,93 @@ mod draw_resize_handles_tests {
 mod tests {
     use super::*;
 
+    /// **`bw logout` has to run in the doomed account's OWN directory.**
+    ///
+    /// `remove_account` settles the app onto the SURVIVOR before it logs
+    /// anything out, so a logout aimed at "whatever this process is pointed
+    /// at" would sign out the account the user is keeping and leave the one
+    /// they are deleting signed in on the server. Neither end state is visible
+    /// from the outside -- both leave a deleted directory behind and both
+    /// report success -- so the only thing that can be checked is what the
+    /// command was aimed at, which is why `logout_command_in` is built and
+    /// read rather than run.
+    ///
+    /// Never run, either: `.output()` here would sign the developer out of
+    /// their real vault.
+    #[test]
+    fn a_logout_is_aimed_at_the_directory_it_was_asked_for() {
+        use std::ffi::OsStr;
+        use std::path::PathBuf;
+
+        // First-wins and idempotent, so this is safe beside `bw_path`'s own
+        // tests in the same process.
+        crate::bw_path::remember_verified_bw_exe(PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let dir = PathBuf::from(r"C:\cfg\accounts\0123456789abcdef0123456789abcdef");
+
+        let cmd = logout_command_in(Some(&dir)).expect("a verified exe was just recorded");
+
+        let appdata: Vec<Option<PathBuf>> = cmd
+            .get_envs()
+            .filter(|(key, _)| *key == OsStr::new(crate::bw_path::BW_DATA_DIR_ENV))
+            .map(|(_, value)| value.map(PathBuf::from))
+            .collect();
+        assert_eq!(
+            appdata,
+            vec![Some(dir)],
+            "the logout was aimed at some other profile than the one asked for, which for a \
+             removal is the account the user is KEEPING"
+        );
+        assert_eq!(
+            cmd.get_args().collect::<Vec<&OsStr>>(),
+            vec![OsStr::new("logout")],
+            "a `bw logout` that is not `bw logout`"
+        );
+
+        // Positive control on the same reader: the directory really is
+        // carried per call, not baked in, so the assertion above is about the
+        // argument rather than about a variable that is always set.
+        let default = logout_command_in(None).expect("a verified exe was just recorded");
+        assert!(
+            default
+                .get_envs()
+                .all(|(key, _)| key != OsStr::new(crate::bw_path::BW_DATA_DIR_ENV)),
+            "a logout for the CLI's default profile named a directory anyway"
+        );
+    }
+
+    /// The active-profile wrapper is one line over the directory form, so the
+    /// two cannot drift into two different ideas of what a successful logout
+    /// is. Compile-time and source-level, because the only way to tell them
+    /// apart at runtime is to run `bw`.
+    #[test]
+    fn the_active_profile_logout_is_a_wrapper_over_the_directory_one() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub fn bw_", "logout() -> Result<(), String> {"))
+            .expect("the active-profile logout must still exist")
+            .1;
+        let body = body
+            .split_once('}')
+            .expect("its body must still be closed")
+            .0;
+        assert!(
+            body.contains(concat!("bw_logout", "_in(")),
+            "`bw_logout` has its own idea of what a logout is: {body:?}"
+        );
+        assert!(
+            body.contains(concat!("active_data", "_dir()")),
+            "`bw_logout` no longer acts on the ACTIVE profile, which is the whole of what it \
+             means: {body:?}"
+        );
+        // Positive control: the region really is a body and not the whole file.
+        assert!(
+            body.len() < source.len() / 4,
+            "control: the split isolated a body rather than keeping the rest of the file"
+        );
+    }
+
     #[test]
     fn parses_unlocked_status() {
         assert_eq!(

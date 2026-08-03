@@ -994,14 +994,17 @@ fn main() {
                                     active,
                                     &mut store,
                                     &mut resettle,
-                                    // **`bw_logout_in`, never `bw_logout`.**
-                                    // The active-profile form acts on whatever
-                                    // this process is pointed at, and by the
-                                    // time the logout runs the app has already
-                                    // settled onto the SURVIVOR -- so it would
-                                    // sign out the account the user is keeping
-                                    // and leave the doomed one logged in on the
-                                    // server.
+                                    // **The directory form, never the
+                                    // active-profile one.** That one acts on
+                                    // whatever this process is pointed at, and
+                                    // by the time the logout runs the app has
+                                    // already settled onto the SURVIVOR -- so
+                                    // it would sign out the account the user is
+                                    // keeping and leave the doomed one signed
+                                    // in on the server. The name is spelled
+                                    // once, here, because
+                                    // `the_removal_logs_out_in_the_doomed_
+                                    // accounts_own_directory` counts it.
                                     login_ui::bw_logout_in,
                                 ) {
                                     log::warn!("could not remove {label}: {reason}");
@@ -5337,9 +5340,16 @@ mod tests {
         /// Every outcome the switch can have is reported. A `RolledBack` the
         /// user never sees is a click that appears to do nothing; a `StoodDown`
         /// that is not logged is an app with no autofill and no record of why.
+        ///
+        /// **Each arm is cut at the next arm**, not at a fixed number of
+        /// bytes. Task 15 watched the fixed window this used to use survive the
+        /// mutation that deletes the `RolledBack` message box outright: the
+        /// window overran into `StoodDown`, whose own `message_box` satisfied
+        /// the assertion.
         #[test]
         fn every_outcome_of_the_switch_is_reported_somewhere() {
             let block = switch_block();
+            let variant = concat!("SwitchOutcome", "::");
             for (arm, must_contain, why) in [
                 (
                     concat!("SwitchOutcome::", "Declined =>"),
@@ -5361,14 +5371,445 @@ mod tests {
                 let at = block
                     .find(arm)
                     .unwrap_or_else(|| panic!("no {arm:?} arm in the switch block: {block:?}"));
-                let rest = &block[at..];
-                let arm_body = &rest[..rest.len().min(700)];
+                let rest = &block[at + arm.len()..];
+                let arm_body = match rest.find(variant) {
+                    Some(next) => &rest[..next],
+                    None => rest,
+                };
+                assert!(
+                    !arm_body.is_empty(),
+                    "control: the {arm:?} arm was cut down to nothing"
+                );
                 assert!(
                     arm_body.contains(must_contain),
-                    "the {arm:?} arm does not {must_contain:?}: {why}"
+                    "the {arm:?} arm does not {must_contain:?}: {why}. The arm reads: \
+                     {arm_body:?}"
                 );
             }
         }
+    }
+
+    /// **The tray's account wiring**, and the first production caller
+    /// `add_account` and `remove_account` have ever had.
+    ///
+    /// Both shipped complete, correct and `#[allow(dead_code)]` in Tasks 12
+    /// and 13; Task 14 gave `switch_to_account` a caller and left these two
+    /// where they were. Everything below is a source guard for the same reason
+    /// Task 14's is: this wiring lives in `main`'s loop, which owns a real
+    /// tray icon, a real message pump and a real `bw serve`, and no test in
+    /// this crate can enter it.
+    ///
+    /// The needles are `concat!`-split and single-line, for this file's usual
+    /// two reasons: a whole literal matches its own declaration, and a needle
+    /// carrying a newline passes on LF and fails on CRLF -- and this file is
+    /// entirely CRLF.
+    mod the_accounts_the_tray_offers {
+        use super::production_half_of_this_file;
+
+        /// Where the main loop decides a click belongs to the submenu.
+        fn account_click() -> String {
+            concat!("if tray.accounts().owns", "(&event.id) {").to_string()
+        }
+
+        /// That `if`'s body, depth-counted to its closing brace.
+        fn tray_block() -> &'static str {
+            let production = production_half_of_this_file();
+            let needle = account_click();
+            let at = production.find(&needle).unwrap_or_else(|| {
+                panic!(
+                    "{needle:?} is not in the production code -- the tray's account submenu is \
+                     built and then never acted on, which is the whole feature inert"
+                )
+            });
+            let after_open = &production[at..];
+            let open = after_open
+                .find('{')
+                .expect("the account click has no block to slice");
+            let after_open = &after_open[open + 1..];
+
+            let mut depth = 1usize;
+            for (offset, ch) in after_open.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = &after_open[..offset];
+                            assert!(
+                                body.len() > 500,
+                                "the sliced tray block is {} bytes, which is not the wiring: \
+                                 every assertion over it would pass against nothing",
+                                body.len()
+                            );
+                            return body;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the account click's block is never closed");
+        }
+
+        /// **The hole four tasks recorded and none could close.** A submenu
+        /// that offers "Add account..." and "Remove ..." and then calls
+        /// neither is exactly the shape this feature has shipped twice: a
+        /// complete, correct, entirely inert piece of work behind a green
+        /// suite.
+        #[test]
+        fn the_tray_calls_all_three_account_operations() {
+            let block = tray_block();
+            for (call, why) in [
+                (
+                    concat!("switch_to", "_account("),
+                    "clicking an account row switches to nothing",
+                ),
+                (
+                    concat!("add", "_account("),
+                    "\"Add account...\" is a menu item that does nothing; `add_account` still \
+                     has no production caller",
+                ),
+                (
+                    concat!("remove", "_account("),
+                    "\"Remove ...\" is a menu item that does nothing; `remove_account` still \
+                     has no production caller",
+                ),
+            ] {
+                assert!(
+                    block.contains(call),
+                    "the tray's account block never calls {call:?}: {why}"
+                );
+            }
+        }
+
+        /// **One resettle, and it is the one sequence.** `switch_to_account`,
+        /// `add_account` and `remove_account` all take the teardown-and-
+        /// repopulate as an injected closure because its real body needs a live
+        /// tray icon, and every test of all three passes a stub. Nothing but
+        /// this says the production closure runs `resettle_session` rather than
+        /// a second, untested implementation written inline.
+        ///
+        /// Exactly once: three copies would be three chances to get the hardest
+        /// code in this codebase subtly different, and the two that were not
+        /// looked at would be the ones that drifted.
+        #[test]
+        fn the_tray_settles_every_account_action_through_the_one_sequence() {
+            let block = tray_block();
+            let sequence = concat!("resettle_", "session(");
+            assert_eq!(
+                block.matches(sequence).count(),
+                1,
+                "expected exactly one {sequence:?} in the tray's account block -- a second is a \
+                 second teardown path with none of this codebase's tests, and none is a switch \
+                 that tears down by some other means entirely: {block:?}"
+            );
+            // Positive control on the same slice, so the count above cannot be
+            // satisfied by a block this helper failed to find.
+            assert!(
+                block.contains(concat!("switch_to", "_account(")),
+                "the sliced block does not call the switch at all: {block:?}"
+            );
+        }
+
+        /// **`bw_logout_in`, never `bw_logout`.** By the time the logout runs,
+        /// `remove_account` has already settled the app onto the SURVIVOR, so
+        /// the active-profile form would sign out the account the user is
+        /// keeping and leave the one being deleted signed in on the server.
+        /// Neither outcome is visible afterwards: both leave a deleted
+        /// directory and both report success.
+        ///
+        /// Counted rather than matched against `bw_logout()`, so the guard
+        /// cannot be fooled by a spelling with different whitespace -- and so
+        /// it carries no paren the production code might not.
+        #[test]
+        fn the_removal_logs_out_in_the_doomed_accounts_own_directory() {
+            let block = tray_block();
+            let active_form = concat!("bw_", "logout");
+            let directory_form = concat!("bw_logout", "_in");
+            assert_eq!(
+                block.matches(directory_form).count(),
+                1,
+                "the removal does not name {directory_form:?} once: {block:?}"
+            );
+            assert_eq!(
+                block.matches(active_form).count(),
+                block.matches(directory_form).count(),
+                "the tray reaches a logout that is not the directory form -- which acts on \
+                 whatever profile this process is pointed at, and by then that is the SURVIVOR: \
+                 {block:?}"
+            );
+            // Positive control for the counter: it really can find two.
+            assert_eq!(
+                format!("{active_form} {active_form}")
+                    .matches(active_form)
+                    .count(),
+                2
+            );
+        }
+
+        /// **`switchable()`, not `all()`.** The submenu was built from
+        /// `switchable()` too, so this is the second gate rather than the
+        /// first: a submenu built before a state change and clicked after it
+        /// must not be able to smuggle a target past the refusal.
+        #[test]
+        fn the_tray_resolves_its_target_through_switchable_and_not_the_raw_list() {
+            let block = tray_block();
+            let gate = concat!("state.switch", "able().iter().find(");
+            assert!(
+                block.contains(gate),
+                "the tray does not resolve its target through {gate:?}: {block:?}"
+            );
+            assert!(
+                !block.contains(concat!("state.all()", ".iter()")),
+                "the tray picks its target out of the raw account list, which still holds the \
+                 active account, still holds duplicate ids, and is NOT emptied when switching \
+                 is refused: {block:?}"
+            );
+            // Positive control: `all()` really is spelled that way here, so the
+            // negative above is about where it is used and not about a name
+            // that no longer exists.
+            assert!(
+                block.contains(concat!("state.", "all()")),
+                "the block never mentions `all()` at all, so the assertion above would pass \
+                 against a block that had stopped persisting anything: {block:?}"
+            );
+        }
+
+        /// **A switch that does not stick is worse than one that fails.** The
+        /// app resumes the previous account on the next launch, which is
+        /// indistinguishable from the `relativeDataDir` trap and sends whoever
+        /// debugs it down entirely the wrong path.
+        ///
+        /// `add_account` and `remove_account` persist inside themselves, in the
+        /// order Tasks 12 and 13 argued for; the switch is the one this block
+        /// owns, so there is exactly one persist here.
+        #[test]
+        fn a_successful_tray_switch_persists_the_new_active_account() {
+            let block = tray_block();
+            let persist = concat!("Settings::persist", "_accounts(");
+            let landed = concat!("== SwitchOutcome::", "Switched {");
+
+            assert_eq!(
+                block.matches(persist).count(),
+                1,
+                "expected exactly one persist in the tray's account block: {block:?}"
+            );
+            let after = block
+                .split_once(landed)
+                .unwrap_or_else(|| panic!("no {landed:?} guard in the tray block: {block:?}"))
+                .1;
+            assert!(
+                after.contains(persist),
+                "a successful tray switch does not persist the new active account, so the app \
+                 resumes the previous one on the next launch: {block:?}"
+            );
+            let before = block.split_once(landed).unwrap().0;
+            assert!(
+                !before.contains(persist),
+                "something is persisted before the switch is known to have landed: {block:?}"
+            );
+        }
+
+        /// Every outcome is reported. A `RolledBack` the user never sees is a
+        /// click that appears to do nothing; a `StoodDown` that is not logged
+        /// is an app with no autofill and no record of why.
+        ///
+        /// `Declined` is `log::info!` and nothing louder, and it can only mean
+        /// one thing here: the submenu gates "Add account..." on `can_add()`,
+        /// so the refused-gate `Declined` is unreachable and the only one left
+        /// is the sign-in the user closed.
+        ///
+        /// **Each arm is cut at the next arm, not at a fixed number of
+        /// bytes.** A window that overran into the following arm would let the
+        /// `RolledBack` assertion be satisfied by `StoodDown`'s message box --
+        /// which is exactly what happened when this was written with a 900-byte
+        /// window, and it survived the mutation that deletes the `RolledBack`
+        /// message box entirely.
+        #[test]
+        fn every_outcome_of_a_tray_account_action_is_reported() {
+            let block = tray_block();
+            let variant = concat!("SwitchOutcome", "::");
+            for (arm, must_contain, why) in [
+                (
+                    concat!("SwitchOutcome::", "Declined => {"),
+                    concat!("log::", "info!"),
+                    "a cancellation is not an error and must not be raised as one, but it is \
+                     still the record of an action that did not happen",
+                ),
+                (
+                    concat!("SwitchOutcome::", "RolledBack { reason } => {"),
+                    concat!("message", "_box("),
+                    "a failed switch or add the user is not told about is a click that did \
+                     nothing",
+                ),
+                (
+                    concat!("SwitchOutcome::", "StoodDown { reason } => {"),
+                    concat!("log::", "error!"),
+                    "autofill has been stood down and nothing records why",
+                ),
+            ] {
+                let at = block
+                    .find(arm)
+                    .unwrap_or_else(|| panic!("no {arm:?} arm in the tray block: {block:?}"));
+                let rest = &block[at + arm.len()..];
+                let arm_body = match rest.find(variant) {
+                    Some(next) => &rest[..next],
+                    None => rest,
+                };
+                assert!(
+                    !arm_body.is_empty(),
+                    "control: the {arm:?} arm was cut down to nothing, so the assertion below \
+                     would be about an empty string"
+                );
+                assert!(
+                    arm_body.contains(must_contain),
+                    "the {arm:?} arm does not {must_contain:?}: {why}. The arm reads: \
+                     {arm_body:?}"
+                );
+            }
+        }
+
+        /// **The submenu is rebuilt after the action, not inside its success
+        /// arm.** `MenuId`s are minted with their items, so the map goes stale
+        /// the moment the account list moves -- and it moves on a rolled-back
+        /// switch too, because `switch_to_account` may have re-pointed and
+        /// restored the store on the way. A rebuild only on success is a
+        /// submenu whose ids outlive the state they name.
+        #[test]
+        fn the_submenu_is_rebuilt_outside_the_action_that_changed_it() {
+            let production = production_half_of_this_file();
+            let rebuild = concat!("rebuild_accounts", "_menu(");
+            assert_eq!(
+                production.matches(rebuild).count(),
+                2,
+                "expected exactly two rebuilds in production: one at startup, before the user \
+                 can open the menu, and one after an account action"
+            );
+            assert!(
+                !tray_block().contains(rebuild),
+                "the rebuild is INSIDE the action's own block, so it is reachable only on the \
+                 paths that reach it -- and a click on an account the state no longer holds \
+                 reaches none of them"
+            );
+            // Positive control for that negative: the block really is a region
+            // of this file, and the rebuild really is spelled that way.
+            assert!(
+                tray_block().contains(concat!("switch_to", "_account(")),
+                "control: the sliced block is the account wiring"
+            );
+            assert!(
+                production.contains(rebuild),
+                "control: the rebuild is still called at all"
+            );
+        }
+
+        /// The plan's own gate test, widened to the three files that could
+        /// bypass it. `settings.accounts` is the raw list off disk: it has not
+        /// been through the `relativeDataDir` refusal, the migration refusal,
+        /// the active-account exclusion or the duplicate-id dedupe, and a UI
+        /// reading it directly bypasses all four.
+        #[test]
+        fn nothing_offers_an_account_without_going_through_accounts_state() {
+            let raw = concat!("settings.accounts", ".iter()");
+            for (name, source) in [
+                ("tray.rs", include_str!("tray.rs")),
+                ("main.rs", include_str!("main.rs")),
+                ("vault_window/mod.rs", include_str!("vault_window/mod.rs")),
+            ] {
+                assert!(
+                    !source.contains(raw),
+                    "{name} iterates the raw account list instead of asking AccountsState"
+                );
+                assert!(
+                    source.len() > 1000,
+                    "control: {name} was really read, so the assertion above is about its \
+                     contents and not about an empty string"
+                );
+            }
+            assert!(
+                format!("x{raw}y").contains(raw),
+                "control: the needle is findable in text that contains it"
+            );
+        }
+
+        /// `tray.rs` is on the ban list `no_window_answers_may_i_switch_for_
+        /// itself` enforces for `vault_window/mod.rs`, and for the same
+        /// reason: a second reading of the CLI's availability or the
+        /// migration's outcome is a second answer, and the two would first
+        /// disagree exactly where the trap is.
+        #[test]
+        fn the_tray_does_not_answer_may_i_switch_for_itself() {
+            let source = include_str!("tray.rs");
+            for banned in [
+                concat!("MultiAccount", "Availability"),
+                concat!("multi_account", "_availability"),
+                concat!("Migration", "State"),
+            ] {
+                assert!(
+                    !source.contains(banned),
+                    "tray.rs names {banned:?}: the submenu is deciding for itself whether a \
+                     switch is allowed, instead of asking AccountsState"
+                );
+            }
+            // Positive control: it does ask the door, so the negatives above
+            // are about a second answer rather than about no answer at all.
+            assert!(
+                source.contains(concat!("Accounts", "State")),
+                "tray.rs does not consult AccountsState at all"
+            );
+        }
+    }
+
+    /// The confirmation shown before an account's profile is deleted. The
+    /// dialog itself is a `MessageBoxW` no test can drive, so the text is a
+    /// pure function and this is what is actually asserted.
+    #[test]
+    fn the_removal_confirmation_names_the_account_and_says_what_is_deleted() {
+        let warning = account_removal_warning("someone@example.com");
+        assert!(
+            warning.contains("someone@example.com"),
+            "the confirmation does not say which account would go: {warning:?}"
+        );
+        assert!(
+            warning.contains("DELETES"),
+            "the confirmation reads as a tidy-up rather than as a deletion: {warning:?}"
+        );
+        assert!(
+            warning.contains("cannot be undone"),
+            "the confirmation does not say it is final: {warning:?}"
+        );
+        assert!(
+            warning.contains("not touched"),
+            "the confirmation does not say the server-side vault survives, which is the one \
+             thing a user needs to know before answering: {warning:?}"
+        );
+        // Positive control: a different account gets a different warning, so
+        // none of the above is passing against a constant string.
+        assert!(!account_removal_warning("other@example.com").contains("someone@example.com"));
+    }
+
+    /// This is the second most destructive thing this app does, and a stray
+    /// Return should not be what does it. Source-level: `MessageBoxW` cannot
+    /// be driven from a test.
+    #[test]
+    fn the_removal_confirmation_defaults_to_no() {
+        let production = production_half_of_this_file();
+        let body = production
+            .split_once(concat!("fn confirm_account", "_removal(label: &str) -> bool {"))
+            .expect("the confirmation must still exist")
+            .1;
+        let body = body.split_once("\r\n}").expect("its body must be closed").0;
+        assert!(
+            body.contains(concat!("MB_DEF", "BUTTON2")),
+            "the removal prompt defaults to Yes: {body:?}"
+        );
+        assert!(
+            body.contains(concat!("MB_", "YESNO")),
+            "the removal prompt is not a question at all: {body:?}"
+        );
+        assert!(
+            body.len() < production.len() / 10,
+            "control: the split isolated a body rather than keeping the rest of the file"
+        );
     }
 
     /// The spec's own warning, made mechanical: "if a task finds itself

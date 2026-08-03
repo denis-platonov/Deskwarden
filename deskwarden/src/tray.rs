@@ -548,6 +548,407 @@ fn set_tooltip(tray: &AppTray, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::Account;
+
+    // Two ids, spelled out rather than generated, so the assertions below name
+    // a specific account and not "whichever one came back".
+    const A: &str = "0123456789abcdef0123456789abcdef";
+    const B: &str = "fedcba9876543210fedcba9876543210";
+    const C: &str = "00112233445566778899aabbccddeeff";
+
+    fn id(raw: &str) -> AccountId {
+        AccountId::parse(raw).expect("a 32-char hex id")
+    }
+
+    fn account(raw: &str, email: &str) -> Account {
+        Account {
+            id: id(raw),
+            email: email.to_string(),
+            server_url: None,
+        }
+    }
+
+    /// Built through `AccountsState`'s own test constructor, which takes the
+    /// one `Option<String>` `new` distils the CLI's availability and the
+    /// migration's outcome into and computes `switchable` through the same
+    /// `switch_targets`. A hand-built state here would be a second idea of
+    /// what the tray is allowed to offer, which is the entire thing the one
+    /// door exists to prevent.
+    fn state(accounts: Vec<Account>, active: &str, blocked: Option<&str>) -> AccountsState {
+        AccountsState::from_blocked_reason(accounts, id(active), blocked.map(str::to_string))
+            .expect("a non-empty account list")
+    }
+
+    fn one_account() -> AccountsState {
+        state(vec![account(A, "solo@example.com")], A, None)
+    }
+
+    fn two_accounts() -> AccountsState {
+        state(
+            vec![account(A, "one@example.com"), account(B, "two@example.com")],
+            A,
+            None,
+        )
+    }
+
+    fn blocked_two_accounts() -> AccountsState {
+        state(
+            vec![account(A, "one@example.com"), account(B, "two@example.com")],
+            A,
+            Some("this bw.exe stores its data beside itself (relativeDataDir)"),
+        )
+    }
+
+    /// The plan's own test. A submenu whose ids map to the wrong account
+    /// switches the user to somewhere they did not ask for, and "Add
+    /// account..." mistaken for an account switches them to nothing at all.
+    #[test]
+    fn a_menu_id_maps_back_to_the_account_it_was_built_for() {
+        let menu = AccountsMenu::from_entries(
+            vec![
+                (MenuId::new("m1"), id(A)),
+                (MenuId::new("m2"), id(B)),
+            ],
+            Some(MenuId::new("add")),
+            Some(MenuId::new("remove")),
+        );
+
+        assert_eq!(menu.account_for_menu_id(&MenuId::new("m2")), Some(&id(B)));
+        assert_eq!(menu.account_for_menu_id(&MenuId::new("m1")), Some(&id(A)));
+        assert_eq!(
+            menu.account_for_menu_id(&MenuId::new("add")),
+            None,
+            "\"Add account...\" was mistaken for an account to switch to"
+        );
+        assert_eq!(
+            menu.account_for_menu_id(&MenuId::new("remove")),
+            None,
+            "the removal item was mistaken for an account to switch to"
+        );
+        assert_eq!(menu.account_for_menu_id(&MenuId::new("nope")), None);
+
+        assert!(menu.is_add(&MenuId::new("add")));
+        assert!(!menu.is_add(&MenuId::new("remove")));
+        assert!(menu.is_remove(&MenuId::new("remove")));
+        assert!(!menu.is_remove(&MenuId::new("m1")));
+        assert!(menu.owns(&MenuId::new("m1")) && menu.owns(&MenuId::new("add")));
+        assert!(
+            !menu.owns(&MenuId::new("nope")),
+            "the submenu claimed a click that belongs to another menu item"
+        );
+    }
+
+    /// An item that was never built has no id, so a menu that is not offering
+    /// an add cannot be talked into one by a stale or forged `MenuId`.
+    #[test]
+    fn a_menu_with_no_add_item_answers_no_to_every_id() {
+        let absent = AccountsMenu::from_entries(vec![(MenuId::new("m1"), id(A))], None, None);
+        assert!(!absent.is_add(&MenuId::new("add")));
+        assert!(!absent.is_remove(&MenuId::new("remove")));
+        // Positive control on the same two predicates, so the negatives above
+        // are about the absent item and not about a predicate that never says
+        // yes to anything.
+        let present = AccountsMenu::from_entries(
+            vec![(MenuId::new("m1"), id(A))],
+            Some(MenuId::new("add")),
+            Some(MenuId::new("remove")),
+        );
+        assert!(present.is_add(&MenuId::new("add")));
+        assert!(present.is_remove(&MenuId::new("remove")));
+    }
+
+    /// **The `relativeDataDir` refusal and the migration refusal.** A tray that
+    /// offered a switch under either would point the CLI at a directory it
+    /// ignores -- every account sharing one profile -- and the user would watch
+    /// the switch "work" and change nothing.
+    #[test]
+    fn a_blocked_state_offers_no_switch_and_no_add() {
+        let blocked = accounts_menu_plan(Some(&blocked_two_accounts()));
+        assert!(
+            blocked.switch_to.is_empty(),
+            "the tray offered a switch the CLI would ignore"
+        );
+        assert!(
+            !blocked.add,
+            "the tray offered to add an account that would share the one profile"
+        );
+        assert_eq!(
+            blocked.remove, None,
+            "the tray offered to delete a profile it cannot reach"
+        );
+
+        // Positive control on the same helper and the same two accounts: it is
+        // the block that empties the menu, not a plan that draws nothing.
+        let available = accounts_menu_plan(Some(&two_accounts()));
+        assert_eq!(
+            available.switch_to.len(),
+            1,
+            "only the non-active account is a switch target"
+        );
+        assert_eq!(available.switch_to[0].0, id(B));
+        assert!(available.add);
+        assert!(available.remove.is_some());
+    }
+
+    /// The blocked reason outranks "you have one account": a blocked state can
+    /// hold several accounts, and telling the user they have one would be
+    /// false as well as unactionable. The reason names the directory they can
+    /// go and act on.
+    #[test]
+    fn a_blocked_state_says_why_rather_than_claiming_there_is_one_account() {
+        let plan = accounts_menu_plan(Some(&blocked_two_accounts()));
+        let notice = plan.notice.expect("a blocked submenu must say something");
+        assert!(
+            notice.contains("relativeDataDir"),
+            "the submenu does not name what is wrong: {notice:?}"
+        );
+        assert_ne!(
+            notice, "No other accounts yet",
+            "a blocked state with two accounts was reported as a single-account one, which is \
+             both false and unactionable"
+        );
+    }
+
+    /// The literal is read here and the constant is named only in the failure
+    /// message: a test that re-derived its expectation from `NO_OTHER_ACCOUNTS`
+    /// would pass against `NO_OTHER_ACCOUNTS = ""`, which is the exact defect
+    /// it exists to catch -- an empty submenu that reads as broken.
+    #[test]
+    fn a_lone_account_is_told_so_rather_than_shown_an_empty_submenu() {
+        let plan = accounts_menu_plan(Some(&one_account()));
+        assert!(plan.switch_to.is_empty(), "there is nowhere to switch to");
+        assert_eq!(
+            plan.notice.as_deref(),
+            Some("No other accounts yet"),
+            "an empty submenu reads as a broken menu; NO_OTHER_ACCOUNTS is what fills it"
+        );
+        assert!(
+            plan.add,
+            "the one thing a single-account user can do here is add a second"
+        );
+    }
+
+    /// **The menu must not offer an action that can only fail.**
+    /// `remove_account` refuses the last account outright -- there is no
+    /// profile to point the CLI at afterwards -- so the item is not built.
+    #[test]
+    fn the_last_account_is_not_offered_for_removal() {
+        assert_eq!(
+            accounts_menu_plan(Some(&one_account())).remove,
+            None,
+            "the tray offered a removal `remove_account` refuses outright"
+        );
+        // Positive control: the same field, non-`None` the moment there is a
+        // survivor to settle onto, and naming the account that would go.
+        let removable = accounts_menu_plan(Some(&two_accounts()))
+            .remove
+            .expect("with two accounts there is a survivor to land on");
+        assert!(
+            removable.contains("one@example.com"),
+            "the removal item does not say which account it would delete: {removable:?}"
+        );
+    }
+
+    /// An account with no email yet -- minted by `resolve_startup` on a first
+    /// install, or by `prepare_new_account` before its sign-in lands -- is a
+    /// blank strip of menu the user is invited to click.
+    #[test]
+    fn an_account_with_no_address_is_still_named_in_the_menu() {
+        let plan = accounts_menu_plan(Some(&state(
+            vec![account(A, "one@example.com"), account(B, "")],
+            A,
+            None,
+        )));
+        assert_eq!(plan.switch_to.len(), 1);
+        assert_eq!(
+            plan.switch_to[0].1, B,
+            "an account with no address is offered as an empty row"
+        );
+    }
+
+    /// `StartupAccounts::Unmigrated`: there is no `Account` in existence, so
+    /// `main` has no `AccountsState` to hand over. The submenu still says
+    /// something -- a control that vanishes is one the user concludes they
+    /// imagined -- and offers nothing that would act on an account list that
+    /// is not there.
+    #[test]
+    fn with_no_accounts_state_the_menu_explains_itself_and_offers_nothing() {
+        let plan = accounts_menu_plan(None);
+        assert!(plan.switch_to.is_empty());
+        assert!(!plan.add);
+        assert_eq!(plan.remove, None);
+        assert_eq!(plan.active, None);
+        let notice = plan.notice.expect("an empty submenu reads as a broken one");
+        assert!(
+            notice.contains("not set up"),
+            "the submenu says nothing a user could act on: {notice:?}"
+        );
+    }
+
+    /// **The construction, not just the decision.** Every test above drives a
+    /// plan, and all of them would go on passing against a
+    /// `build_accounts_submenu` that appended nothing -- which is precisely
+    /// the "decision correct, renderer inert" shape this feature has shipped
+    /// before. A bare `Submenu` needs no tray icon, so the real items are
+    /// built and read back.
+    #[test]
+    fn the_built_submenu_carries_the_plans_rows_and_the_ids_they_were_built_for() {
+        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let plan = accounts_menu_plan(Some(&two_accounts()));
+        let menu = build_accounts_submenu(&submenu, &plan);
+
+        let labels: Vec<String> = submenu
+            .items()
+            .iter()
+            .map(|item| {
+                item.as_menuitem()
+                    .map(MenuItem::text)
+                    .unwrap_or_else(|| "<separator>".to_string())
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|l| l.contains("one@example.com")),
+            "the submenu never says which account you are on: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == "two@example.com"),
+            "the switch target the plan chose was never built into a menu item: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l == ADD_ACCOUNT),
+            "\"Add account...\" was planned and never built: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("Remove ")),
+            "the removal was planned and never built: {labels:?}"
+        );
+
+        // ...and the ids the caller will get back name those same items.
+        let switch_row = submenu
+            .items()
+            .into_iter()
+            .find(|item| item.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com"))
+            .expect("the switch row was just asserted to be there");
+        assert_eq!(
+            menu.account_for_menu_id(switch_row.id()),
+            Some(&id(B)),
+            "clicking the row labelled `two@example.com` would not switch to that account"
+        );
+        let add_row = submenu
+            .items()
+            .into_iter()
+            .find(|item| item.as_menuitem().map(MenuItem::text).as_deref() == Some(ADD_ACCOUNT))
+            .expect("the add row was just asserted to be there");
+        assert!(menu.is_add(add_row.id()));
+        assert_eq!(
+            menu.account_for_menu_id(add_row.id()),
+            None,
+            "the add row would be read back as an account to switch to"
+        );
+    }
+
+    /// The account you are on is shown, and shown as unclickable: "switch to
+    /// where you already are" still tears the backend down and demands a
+    /// master password.
+    #[test]
+    fn the_header_and_the_notice_are_disabled_and_the_switch_rows_are_not() {
+        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&two_accounts())));
+        let enabled = |text: &str| {
+            submenu
+                .items()
+                .into_iter()
+                .find_map(|item| {
+                    let item = item.as_menuitem()?;
+                    (item.text() == text).then(|| item.is_enabled())
+                })
+                .unwrap_or_else(|| panic!("no item labelled {text:?}"))
+        };
+        assert!(
+            !enabled("Signed in: one@example.com"),
+            "the account you are already on is offered as a switch target"
+        );
+        assert!(
+            enabled("two@example.com"),
+            "positive control: the switch row really is clickable"
+        );
+
+        let lone = Submenu::new(ACCOUNTS_SUBMENU, true);
+        build_accounts_submenu(&lone, &accounts_menu_plan(Some(&one_account())));
+        let notice = lone
+            .items()
+            .into_iter()
+            .find_map(|item| {
+                let item = item.as_menuitem()?;
+                (item.text() == "No other accounts yet").then(|| item.is_enabled())
+            })
+            .expect("the lone-account notice was not built");
+        assert!(!notice, "the explanatory notice invites a click it cannot serve");
+    }
+
+    /// **A rebuild replaces, it does not append.** `MenuId`s are minted with
+    /// their items, so a submenu that grew on every account change would leave
+    /// the previous rebuild's rows in place -- rows whose ids still map, and
+    /// which would switch the user to an account that may since have been
+    /// deleted.
+    #[test]
+    fn rebuilding_the_submenu_replaces_the_previous_rows_and_their_ids() {
+        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let first = build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&two_accounts())));
+        let before = submenu.items().len();
+        assert!(before > 2, "control: the first build really put rows in");
+        let stale = first
+            .account_for_menu_id(
+                submenu
+                    .items()
+                    .iter()
+                    .find(|i| i.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com"))
+                    .expect("the first build's switch row")
+                    .id(),
+            )
+            .cloned()
+            .expect("the first build mapped that row to an account");
+        assert_eq!(stale, id(B));
+
+        // The user removed B and the app rebuilt.
+        let second = build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&one_account())));
+        assert!(
+            !submenu
+                .items()
+                .iter()
+                .any(|i| i.as_menuitem().map(MenuItem::text).as_deref() == Some("two@example.com")),
+            "the removed account is still a clickable row in the submenu"
+        );
+        assert!(
+            submenu.items().len() < before,
+            "the submenu grew instead of being replaced: {} rows, was {before}",
+            submenu.items().len()
+        );
+        assert_eq!(
+            second.account_for_menu_id(&MenuId::new("whatever")),
+            None,
+            "control: the fresh map does not answer for ids it never minted"
+        );
+    }
+
+    /// A third account is a third row: the loop is a loop, not a hard-coded
+    /// pair. Pinned because every other test here uses one or two accounts,
+    /// and a `switch_to` built from `switchable().first()` would pass all of
+    /// them.
+    #[test]
+    fn every_switchable_account_gets_a_row() {
+        let plan = accounts_menu_plan(Some(&state(
+            vec![
+                account(A, "one@example.com"),
+                account(B, "two@example.com"),
+                account(C, "three@example.com"),
+            ],
+            A,
+            None,
+        )));
+        let labels: Vec<&str> = plan.switch_to.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(labels, vec!["two@example.com", "three@example.com"]);
+    }
 
     /// Review 18's Minor. Every path that lets the user click "Sync" again
     /// has to leave it *saying* "Sync" -- there is no state in which enabled
