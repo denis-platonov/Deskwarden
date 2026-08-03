@@ -6,6 +6,7 @@ use crate::theme;
 use crate::vault_bridge::{ItemKind, VaultError, VaultItem};
 use crate::vault_cache::{AppMatchWrite, PopulateOutcome, VaultCache, VaultEra, VaultUnavailable};
 use crate::window_list::{self, WindowInfo};
+use crate::window_watch;
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -775,8 +776,61 @@ enum BackendReadiness {
 /// the window exactly like Cancel -- nothing saved, nothing logged. Gating
 /// the button's own enabled state on this function makes that click
 /// unreachable in the first place, rather than reachable-but-silently-inert.
-fn can_save_app_match(selected_pid: Option<u32>, backend_ready: &BackendReadiness) -> bool {
-    selected_pid.is_some() && *backend_ready == BackendReadiness::Ready
+///
+/// Takes the selected window's **process name**, not its pid, because of the
+/// third condition: a match whose process is a window host
+/// ([`window_watch::is_host_process`]) is wrong by construction and must never
+/// reach the vault. `ApplicationFrameHost.exe` owns the top-level window of
+/// every Microsoft Store app, so an entry naming it does not mean "this app",
+/// it means "every Store app" -- the reported bug, where a match saved for
+/// KeepSolid popped the overlay on Speedtest. There is no trigger mode, no
+/// narrowing and no later fix that makes such an entry correct, so the only
+/// honest thing this window can do is decline to write it and say why (see
+/// [`host_process_refusal`]).
+fn can_save_app_match(selected_process: Option<&str>, backend_ready: &BackendReadiness) -> bool {
+    let Some(process) = selected_process else {
+        return false;
+    };
+    host_process_refusal(process).is_none() && *backend_ready == BackendReadiness::Ready
+}
+
+/// Why a match against `process` must not be saved, or `None` when it may be.
+///
+/// `Option<String>` rather than a `bool` so the reason and the refusal cannot
+/// drift apart: the same call that disables Save produces the sentence shown
+/// beside it, so "refused" can never be rendered without an explanation. The
+/// silent no-op is the failure mode this window has already been patched for
+/// twice (see [`can_save_app_match`]'s own doc).
+fn host_process_refusal(process: &str) -> Option<String> {
+    if !window_watch::is_host_process(process) {
+        return None;
+    }
+    Some(format!(
+        "{process} isn\u{2019}t an app -- it\u{2019}s the Windows process that owns the window for \
+         every Microsoft Store app. Matching it would fill this item into every Store app you \
+         open, so Deskwarden won\u{2019}t save it. Bring the app you want to the front, then open \
+         \u{201c}Add app\u{2026}\u{201d} again so its own window can be listed."
+    ))
+}
+
+/// Shown when the item this picker is targeting **already** carries a match
+/// against a window host -- one saved before the foreground watcher learned to
+/// look through `ApplicationFrameHost.exe`.
+///
+/// This is the chosen surface for the bad data already in the user's vault.
+/// `MatchEngine::rebuild` has stopped acting on such an entry, so the wrong
+/// pop-ups have stopped, but nothing had told the user *why* their match went
+/// quiet -- and this window is the one place where saying so is also the place
+/// they fix it, since Saving here overwrites the field. **Nothing is rewritten
+/// on their behalf:** the custom field stays exactly as they saved it until
+/// they choose a real app and click Save.
+fn existing_host_match_notice(item_name: &str, process: &str) -> String {
+    format!(
+        "\u{201c}{item_name}\u{201d} is currently matched to {process}, which Deskwarden is \
+         ignoring: that process owns the window for every Microsoft Store app, so the match fired \
+         on all of them rather than on the one you meant. Nothing in your vault has been changed. \
+         Pick the app below and Save to replace it."
+    )
 }
 
 /// The gate the button actually uses: [`can_save_app_match`] plus "this
@@ -792,11 +846,11 @@ fn can_save_app_match(selected_pid: Option<u32>, backend_ready: &BackendReadines
 /// it is testable at all: everything else in that closure is unreachable
 /// outside a real event loop.
 fn can_save_app_match_now(
-    selected_pid: Option<u32>,
+    selected_process: Option<&str>,
     backend_ready: &BackendReadiness,
     already_saved: bool,
 ) -> bool {
-    !already_saved && can_save_app_match(selected_pid, backend_ready)
+    !already_saved && can_save_app_match(selected_process, backend_ready)
 }
 
 /// What the user is told, inline and on screen, when the save reached the
@@ -954,6 +1008,14 @@ pub fn run_picker(
     let mut selected_pid: Option<u32> = default_window.map(|w| w.pid);
     let mut trigger = TriggerMode::Prompt;
     let mut styled = false;
+
+    // Read once, before the loop: the match this item already carries, if it
+    // names a window host. See `existing_host_match_notice` for why this is
+    // surfaced here and why nothing is rewritten. `None` for the overwhelming
+    // majority of items, including every item with a perfectly good match.
+    let existing_host_match: Option<String> = crate::vault_bridge::extract_app_match(&target_item)
+        .map(|m| m.process)
+        .filter(|process| window_watch::is_host_process(process));
 
     // Icon textures are loaded lazily, one GDI round-trip and one GPU upload
     // per distinct exe the *visible* rows actually need, not eagerly for
@@ -1186,6 +1248,38 @@ pub fn run_picker(
                     }
                     BackendReadiness::Ready => {}
                 }
+                // The selection is carried as a pid, but every gate below is
+                // about the process NAME (see `can_save_app_match`), so it is
+                // resolved once, here, through the same list the save itself
+                // reads -- a pid with no row left in it is not a selection
+                // this window can act on either.
+                let selected_process = selected_pid
+                    .and_then(|pid| windows.iter().find(|w| w.pid == pid))
+                    .map(|w| w.exe_name.as_str());
+
+                // The refusal, said out loud. `can_save_app_match` disables
+                // Save for a host process; without this the button would
+                // simply be grey for no stated reason, which is the "silent
+                // no-op" shape reviews 10 and 11 both removed from this
+                // window.
+                if let Some(refusal) = selected_process.and_then(host_process_refusal) {
+                    ui.label(RichText::new(refusal).size(11.0).color(theme::ERROR));
+                    ui.add_space(6.0);
+                }
+
+                // The item's PRE-EXISTING bad match, if it has one. Shown
+                // until something else is saved over it -- it is not about
+                // this window's own attempt, so it is not cleared by a
+                // selection or an error like `save_error` is.
+                if let Some(process) = &existing_host_match {
+                    ui.label(
+                        RichText::new(existing_host_match_notice(&target_item.name, process))
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
+                    );
+                    ui.add_space(6.0);
+                }
+
                 if let Some(error) = &save_error {
                     ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
                     ui.add_space(6.0);
@@ -1205,7 +1299,7 @@ pub fn run_picker(
                     // backend is confirmed to actually be answering --
                     // never both true is what let either bug happen before.
                     let can_save =
-                        can_save_app_match_now(selected_pid, &backend_ready, already_saved);
+                        can_save_app_match_now(selected_process, &backend_ready, already_saved);
                     let save_clicked = ui
                         .add_enabled_ui(can_save, |ui| theme::primary_button(ui, "Save", None))
                         .inner
@@ -1755,20 +1849,96 @@ mod tests {
         // Review 10's Important 2/3: a process being selected is not enough
         // on its own -- firing into a port that isn't confirmed bound yet is
         // exactly the bug being closed here.
-        assert!(!can_save_app_match(Some(1234), &BackendReadiness::Preparing));
+        assert!(!can_save_app_match(Some("notepad.exe"), &BackendReadiness::Preparing));
     }
 
     #[test]
     fn save_is_disabled_when_the_backend_never_became_reachable() {
         assert!(!can_save_app_match(
-            Some(1234),
+            Some("notepad.exe"),
             &BackendReadiness::Unavailable("connection refused".to_string())
         ));
     }
 
     #[test]
     fn save_is_enabled_only_once_something_is_selected_and_the_backend_is_ready() {
-        assert!(can_save_app_match(Some(1234), &BackendReadiness::Ready));
+        assert!(can_save_app_match(Some("notepad.exe"), &BackendReadiness::Ready));
+    }
+
+    const HOST: &str = "ApplicationFrameHost.exe";
+
+    /// A match against the frame host is wrong by construction -- it names
+    /// the process that owns the window for EVERY Microsoft Store app -- so
+    /// this window must not be able to write one, no matter how ready the
+    /// backend is.
+    #[test]
+    fn save_is_disabled_for_a_window_host_even_with_everything_else_ready() {
+        // Deleting the `host_process_refusal(process).is_none() &&` from
+        // `can_save_app_match` gives
+        //     "picking the Store-app frame host would save a match that fires on every Store app"
+        assert!(
+            !can_save_app_match(Some(HOST), &BackendReadiness::Ready),
+            "picking the Store-app frame host would save a match that fires on every Store app"
+        );
+        // Positive control on the same call with the same readiness: only the
+        // process name differs, so this cannot pass against a build where
+        // Save is simply never enabled.
+        assert!(can_save_app_match(Some("KeepSolid.exe"), &BackendReadiness::Ready));
+    }
+
+    #[test]
+    fn the_host_refusal_survives_the_outer_gate_too() {
+        assert!(!can_save_app_match_now(Some(HOST), &BackendReadiness::Ready, false));
+        assert!(can_save_app_match_now(
+            Some("KeepSolid.exe"),
+            &BackendReadiness::Ready,
+            false
+        ));
+    }
+
+    /// "Say clearly in the UI why, rather than silently doing nothing" -- the
+    /// disabled button and the sentence beside it come from the same call, so
+    /// they cannot drift apart.
+    #[test]
+    fn the_refusal_names_the_process_and_says_why_without_blaming_the_user() {
+        let refusal = host_process_refusal(HOST).expect("the frame host must be refused");
+        assert!(refusal.contains(HOST), "the user needs to know WHICH process: {refusal}");
+        assert!(
+            refusal.contains("Store"),
+            "the reason is that this process fronts every Microsoft Store app: {refusal}"
+        );
+        assert!(
+            refusal.contains("Add app"),
+            "and it must say what to do instead: {refusal}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_process_is_not_refused() {
+        // The positive control for the test above: a `host_process_refusal`
+        // that refused everything would satisfy it while making the picker
+        // unable to save anything at all.
+        assert_eq!(host_process_refusal("KeepSolid.exe"), None);
+        assert_eq!(host_process_refusal("Speedtest.exe"), None);
+    }
+
+    /// The chosen surface for a bad match ALREADY in the user's vault. It is
+    /// detected and ignored at match time (`MatchEngine::rebuild`), reported
+    /// here, and never rewritten on their behalf -- so the notice has to say
+    /// all three of those things.
+    #[test]
+    fn the_existing_match_notice_names_the_item_and_promises_no_rewrite() {
+        let notice = existing_host_match_notice("KeepSolid", HOST);
+        assert!(notice.contains("KeepSolid"), "which item: {notice}");
+        assert!(notice.contains(HOST), "which process: {notice}");
+        assert!(
+            notice.contains("ignoring"),
+            "the user's real question is why their match went quiet: {notice}"
+        );
+        assert!(
+            notice.contains("Nothing in your vault has been changed"),
+            "this app does not rewrite the user's vault, and must not imply it did: {notice}"
+        );
     }
 
     #[test]
@@ -1793,11 +1963,11 @@ mod tests {
     #[test]
     fn save_is_disabled_once_a_save_has_already_succeeded() {
         assert!(
-            !can_save_app_match_now(Some(1234), &BackendReadiness::Ready, true),
+            !can_save_app_match_now(Some("notepad.exe"), &BackendReadiness::Ready, true),
             "the save already landed on the server; clicking Save again repeats the PUT"
         );
         assert!(
-            can_save_app_match_now(Some(1234), &BackendReadiness::Ready, false),
+            can_save_app_match_now(Some("notepad.exe"), &BackendReadiness::Ready, false),
             "and it must not disable Save for a window that has saved nothing yet"
         );
         assert!(
