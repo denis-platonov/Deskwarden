@@ -457,6 +457,158 @@ impl ServerChoice {
 /// plus the body's bottom margin.
 pub const FOOTER_RESERVE: f32 = 62.0;
 
+// --- The login card on the empty app --------------------------------------
+//
+// The user asked for the sign-in window to "pre-load the big screen with the
+// position and size etc as it will be after log-in but empty kinda of and
+// then login on top blocking it". This window is therefore no longer a 470x588
+// card that is the whole window: it opens at the VAULT window's saved
+// geometry, paints that window's empty chrome, and floats the unchanged card
+// in the middle of it.
+//
+// It is still its own `run_native`. Merging the two eframe apps is not an
+// option and was not attempted: eframe cannot nest event loops, and
+// `vault_window::run` needs a live backend and a populated cache that by
+// definition do not exist before sign-in.
+
+/// What the placeholder titlebar says. **The vault window's own wordmark**,
+/// taken from its own constant: the bar the user is looking at while they sign
+/// in is the bar that is still there afterwards, and a different word in it
+/// would be the same jump this change removes, just smaller.
+///
+/// The OS-level window title stays "Log in to Deskwarden" -- that is what the
+/// taskbar and `round_window_corners` see, and it is what tells the two
+/// windows apart to everything outside this process.
+const VAULT_WINDOW_TITLE: &str = crate::vault_window::WINDOW_TITLE;
+
+/// The login card's width -- unchanged. The card's composition is the design's
+/// 3h and was not asked to change; only where it sits did.
+const LOGIN_CARD_WIDTH: f32 = 470.0;
+
+/// The card's height before the first frame has measured its content.
+///
+/// The window used to BE the card, at 470x588 with a 40px `ChromeMetrics::LOGIN`
+/// bar above the body; 588 - 40 is what that composition measured. Any wrong
+/// value here would settle within one frame (see `login_card_height`), but
+/// the frame it is wrong on is the first one the user sees.
+const LOGIN_CARD_INITIAL_HEIGHT: f32 = 548.0;
+
+/// The card's own padding: 3h's body margins, kept exactly.
+const CARD_MARGIN_X: f32 = 26.0;
+const CARD_MARGIN_TOP: f32 = 24.0;
+/// Deeper than the top: the footer row's dropdown otherwise sits too close to
+/// the card's edge. Note this is ALREADY counted inside [`FOOTER_RESERVE`],
+/// which is why `login_card_height` does not add it twice.
+const CARD_MARGIN_BOTTOM: f32 = 30.0;
+
+/// What is painted over the empty panes so the card reads as blocking them.
+///
+/// Over the body only, NOT over the titlebar. The bar carries the live
+/// ✕ and — controls, and dimming a control the user is still expected to be
+/// able to find and hit says the opposite of what a scrim is for. The panes
+/// underneath are the part that is inert.
+const SCRIM: Color32 = Color32::from_black_alpha(56);
+
+/// The vault window's layout, as empty regions: the titlebar, and the three
+/// panes at the widths `vault_window` really uses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VaultSkeleton {
+    pub bar: egui::Rect,
+    /// Everything under the bar -- the three panes' union, and what [`SCRIM`]
+    /// covers.
+    pub body: egui::Rect,
+    pub sidebar: egui::Rect,
+    pub list: egui::Rect,
+    pub detail: egui::Rect,
+}
+
+/// Divides `full` the way `vault_window::run` divides its window.
+///
+/// The widths come from `vault_window`'s own constants and the bar height from
+/// [`ChromeMetrics::VAULT`], because the whole point of this shape is that it
+/// is the app the user is about to be looking at. Numbers copied over here
+/// would be numbers that drift, and a placeholder whose panes are the wrong
+/// widths is worse than no placeholder: the window would visibly re-flow at
+/// the moment of sign-in, which is the jump this exists to remove.
+pub fn vault_skeleton(full: egui::Rect) -> VaultSkeleton {
+    let bar = egui::Rect::from_min_max(
+        full.min,
+        Pos2::new(full.max.x, full.min.y + ChromeMetrics::VAULT.bar_height),
+    );
+    let body = egui::Rect::from_min_max(Pos2::new(full.min.x, bar.max.y), full.max);
+    // Clamped to the body, so a window narrower than sidebar+list (which
+    // `MIN_VAULT_WINDOW_SIZE` forbids, but nothing here should depend on
+    // that) yields panes inside the window rather than off the right edge.
+    let sidebar_right = (body.min.x + crate::vault_window::SIDEBAR_WIDTH).min(body.max.x);
+    let list_right = (sidebar_right + crate::vault_window::LIST_WIDTH).min(body.max.x);
+    VaultSkeleton {
+        bar,
+        body,
+        sidebar: egui::Rect::from_min_max(body.min, Pos2::new(sidebar_right, body.max.y)),
+        list: egui::Rect::from_min_max(
+            Pos2::new(sidebar_right, body.min.y),
+            Pos2::new(list_right, body.max.y),
+        ),
+        detail: egui::Rect::from_min_max(Pos2::new(list_right, body.min.y), body.max),
+    }
+}
+
+/// Paints the empty app: the three panes in their real fills, the hairlines
+/// `egui::Panel` would draw between them, and the scrim over the lot.
+///
+/// The fills are `vault_window`'s own -- [`theme::CARD`] for the sidebar,
+/// [`theme::CANVAS`] for the item list and the detail pane -- so this reads as
+/// the app with nothing in it yet rather than as a blank rectangle. Nothing is
+/// drawn INSIDE the panes: there is no vault to list, and inventing
+/// placeholder rows would be inventing content the user is about to find out
+/// they do or do not have.
+pub fn paint_vault_skeleton(painter: &egui::Painter, skeleton: &VaultSkeleton) {
+    painter.rect_filled(skeleton.sidebar, CornerRadius::ZERO, theme::CARD);
+    painter.rect_filled(skeleton.list, CornerRadius::ZERO, theme::CANVAS);
+    painter.rect_filled(skeleton.detail, CornerRadius::ZERO, theme::CANVAS);
+    for pane in [skeleton.sidebar, skeleton.list] {
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                Pos2::new(pane.max.x - 1.0, pane.min.y),
+                Pos2::new(pane.max.x, pane.max.y),
+            ),
+            CornerRadius::ZERO,
+            theme::HAIRLINE,
+        );
+    }
+    painter.rect_filled(skeleton.body, CornerRadius::ZERO, SCRIM);
+}
+
+/// Where the card sits: centred in the empty app's BODY, not in the whole
+/// window -- the titlebar is chrome, and a card centred against it sits
+/// visibly high in the region it is blocking.
+pub fn login_card_rect(skeleton: &VaultSkeleton, card_height: f32) -> egui::Rect {
+    egui::Rect::from_center_size(
+        skeleton.body.center(),
+        Vec2::new(LOGIN_CARD_WIDTH, card_height),
+    )
+}
+
+/// The card's content area: the card less 3h's own margins.
+pub fn login_card_content_rect(card: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        Pos2::new(card.min.x + CARD_MARGIN_X, card.min.y + CARD_MARGIN_TOP),
+        Pos2::new(card.max.x - CARD_MARGIN_X, card.max.y - CARD_MARGIN_BOTTOM),
+    )
+}
+
+/// The height the card wants, given where `draw_login_window`'s flowing
+/// content ended and where its content area began.
+///
+/// The window used to send itself a `ViewportCommand::InnerSize` from exactly
+/// this measurement (`flow_bottom + FOOTER_RESERVE`); it now sizes the card
+/// instead and leaves the window alone. [`CARD_MARGIN_BOTTOM`] is not added:
+/// [`FOOTER_RESERVE`] is the footer row PLUS that margin, which is why the
+/// two numbers do not both appear here.
+pub fn login_card_height(flow_bottom: f32, content_top: f32) -> f32 {
+    (CARD_MARGIN_TOP + (flow_bottom - content_top) + FOOTER_RESERVE).ceil()
+}
+
 /// Gap between a field's label and the field itself.
 const LABEL_GAP: f32 = 7.0;
 /// Gap between one label+field group and the next (and before the action
@@ -1794,8 +1946,10 @@ pub fn run_login_flow_for(
 
     // Remeasured every frame and applied when it changes: the content
     // stack differs per state (self-hosted URL field, Hello panel, wrapped
-    // error text), so any fixed height either clips or leaves a gap.
-    let mut window_height = 0.0f32;
+    // error text), so any fixed height either clips or leaves a gap. It sizes
+    // the CARD now, not the window -- the window is the vault window's size
+    // and does not move.
+    let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
 
     // Outcome of an in-flight `bw login`/`bw unlock` (see `spawn_auth`),
     // polled non-blockingly each frame. `auth_in_progress` gates every
@@ -1804,12 +1958,42 @@ pub fn run_login_flow_for(
     let (auth_tx, auth_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let mut auth_in_progress = false;
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            // Starting size only; grown/shrunk to fit below.
-            .with_inner_size([470.0, 588.0])
-            // The design's window is a fixed composition; there is nothing
-            // in it that grows, so resizing only breaks the layout.
+    // **The vault window's placement, read the way the vault window reads
+    // it.** Same `Settings::vault_window`, same `monitor_work_areas`, same
+    // `clamp_window_geometry` -- by calling `vault_window::initial_placement`
+    // rather than by reimplementing it, so the two cannot answer differently
+    // and leave the window jumping at the exact moment this change exists to
+    // stop it jumping. `None` on disk falls back to that window's own
+    // `WINDOW_SIZE`, which is the same fallback it takes.
+    //
+    // Read here, on the main thread, before the window exists; every failure
+    // inside `Settings::load` already falls back to defaults, so this cannot
+    // be a reason the login window does not open.
+    let placement = crate::vault_window::initial_placement(
+        crate::settings::default_path()
+            .as_deref()
+            .and_then(|path| crate::settings::Settings::load(path).vault_window),
+        &monitor_work_areas(),
+    );
+    let mut viewport = egui::ViewportBuilder::default()
+            .with_inner_size([placement.width as f32, placement.height as f32])
+            // **Still fixed-size, deliberately, even though the window is now
+            // the vault window's shape.**
+            //
+            // Three reasons, and they compound. `with_decorations(false)`
+            // makes this flag inert on its own (see `draw_resize_handles`):
+            // the vault window is resizable because it PAINTS eight grab
+            // zones, and this window paints none. Painting them would then
+            // need somewhere to put the result -- and the only geometry on
+            // disk is the vault window's, which this window is borrowing and
+            // must not write back, or an aborted sign-in would silently
+            // re-home the vault. And nothing in the card grows: it is a fixed
+            // composition floating on a placeholder, so a resize would stretch
+            // the empty panes behind it and nothing else.
+            //
+            // A window the user can drag the edges of and whose size is then
+            // thrown away is worse than one that plainly cannot be resized,
+            // so ▢ stays the ghosted affordance it has always been here.
             .with_resizable(false)
             .with_maximize_button(false)
             // The titlebar is the design's own (white, mark, ghost
@@ -1818,9 +2002,11 @@ pub fn run_login_flow_for(
             .with_decorations(false)
             // The taskbar icon (there is no native titlebar to show one);
             // eframe windows don't inherit the exe's icon resource.
-            .with_icon(theme::window_icon()),
-        ..Default::default()
-    };
+            .with_icon(theme::window_icon());
+    if let Some((x, y)) = placement.position {
+        viewport = viewport.with_position([x as f32, y as f32]);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
 
     let mut styled = false;
 
@@ -1839,7 +2025,19 @@ pub fn run_login_flow_for(
             return;
         }
 
-        match draw_window_chrome(ui, "Log in to Deskwarden") {
+        // **The vault window's own titlebar, not this window's.** Same
+        // metrics (`ChromeMetrics::VAULT`) and the same wordmark, because the
+        // point is that the bar the user is looking at now is the bar that
+        // will still be there afterwards. `maximizable: false` for the reason
+        // the viewport is not resizable, above.
+        let full = ui.max_rect();
+        match draw_window_chrome_with_extra(
+            ui,
+            VAULT_WINDOW_TITLE,
+            ChromeMetrics::VAULT,
+            false,
+            |_ui| {},
+        ) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             ChromeAction::Minimize => ui
                 .ctx()
@@ -1847,16 +2045,28 @@ pub fn run_login_flow_for(
             ChromeAction::None => {}
         }
 
-        egui::Frame::new()
-            // Deeper at the bottom: the footer row's dropdown otherwise
-            // sits too close to the window edge (3h pads the body 30px).
-            .inner_margin(Margin {
-                left: 26,
-                right: 26,
-                top: 24,
-                bottom: 30,
-            })
-            .show(ui, |ui| {
+        // The empty app behind the card, at the real pane widths, dimmed.
+        let skeleton = vault_skeleton(full);
+        paint_vault_skeleton(ui.painter(), &skeleton);
+
+        // The card: the unchanged 3h composition, floated in the middle of
+        // the body on its own surface so it reads as sitting ON the blocked
+        // app rather than as part of it.
+        let card = login_card_rect(&skeleton, card_height);
+        ui.painter().rect(
+            card,
+            CornerRadius::same(12),
+            theme::WINDOW_BG,
+            Stroke::new(1.0, theme::BORDER),
+            egui::StrokeKind::Inside,
+        );
+        let content = login_card_content_rect(card);
+
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(content)
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
                 ui.set_min_width(ui.available_width());
 
                 // Non-blocking: the worker reports here and the window keeps
@@ -1889,15 +2099,19 @@ pub fn run_login_flow_for(
                 );
 
                 // Content height + the footer row and the bottom margin the
-                // footer is pinned above. Rounded up to whole pixels so a
-                // sub-pixel wobble can't ping-pong the window size.
-                let wanted = (flow_bottom + FOOTER_RESERVE).ceil();
-                if (wanted - window_height).abs() > 0.5 {
-                    window_height = wanted;
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                            470.0, wanted,
-                        )));
+                // footer is pinned above. This used to resize the WINDOW from
+                // exactly this measurement; it now sizes the card and leaves
+                // the window at the vault window's geometry. Rounded up to
+                // whole pixels (inside `login_card_height`) so a sub-pixel
+                // wobble can't ping-pong the card's size frame after frame.
+                let wanted = login_card_height(flow_bottom, content.min.y);
+                if (wanted - card_height).abs() > 0.5 {
+                    card_height = wanted;
+                    // The card is painted before its content is measured, so
+                    // the new height first appears on the next frame -- which
+                    // will not happen on its own in a window nobody is
+                    // touching.
+                    ui.ctx().request_repaint();
                 }
 
                 match action {
@@ -2076,7 +2290,8 @@ pub fn run_login_flow_for(
                     },
                     None => {}
                 }
-            });
+            },
+        );
     });
 
     // `None` means the user closed the window with the X button rather than
@@ -3220,6 +3435,348 @@ mod first_run_notice_tests {
             says_why_it_is_asking(&texts),
             "the notice is nested inside the Hello panel, so it disappeared \
              with it; got: {texts:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod empty_app_behind_the_card_tests {
+    //! **The login window is now the app it is about to become, with nothing
+    //! in it.**
+    //!
+    //! The user's words: "pre-load the big screen with the position and size
+    //! etc as it will be after log-in but empty kinda of and then login on top
+    //! blocking it". What can go wrong is geometry -- panes at the wrong
+    //! widths, a card centred against the wrong rect, a card that does not fit
+    //! the smallest window the vault is allowed to be -- so most of this is
+    //! measured. The two halves no harness can reach (the viewport builder and
+    //! the frame closure both need a live eframe event loop) are source
+    //! guards, in the house shape.
+
+    use super::*;
+    use egui::Rect;
+
+    /// A window the size design 2b draws.
+    fn full(width: f32, height: f32) -> Rect {
+        Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(width, height))
+    }
+
+    /// **The panes are the vault window's, not numbers written out again.**
+    /// A placeholder whose sidebar is the wrong width is worse than none: the
+    /// window would visibly re-flow at the instant of sign-in, which is the
+    /// jump this whole change exists to remove.
+    #[test]
+    fn the_placeholder_panes_are_the_vault_windows_own_widths() {
+        // The positive control for the two assertions below: these are
+        // different numbers, so a sidebar/list swap is detectable at all.
+        assert_ne!(
+            crate::vault_window::SIDEBAR_WIDTH,
+            crate::vault_window::LIST_WIDTH,
+            "the two pane widths are equal, so nothing below could tell a swap from a match"
+        );
+
+        let skeleton = vault_skeleton(full(1240.0, 740.0));
+        assert_eq!(
+            skeleton.sidebar.width(),
+            crate::vault_window::SIDEBAR_WIDTH,
+            "the placeholder sidebar is {}px against the vault window's {}px",
+            skeleton.sidebar.width(),
+            crate::vault_window::SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            skeleton.list.width(),
+            crate::vault_window::LIST_WIDTH,
+            "the placeholder item list is {}px against the vault window's {}px",
+            skeleton.list.width(),
+            crate::vault_window::LIST_WIDTH
+        );
+        assert_eq!(
+            skeleton.bar.height(),
+            ChromeMetrics::VAULT.bar_height,
+            "the placeholder titlebar is not the vault window's own bar height"
+        );
+    }
+
+    /// The three panes tile the body with no seam and no overlap, and the body
+    /// starts under the bar. A gap here paints the window background through
+    /// the middle of the app.
+    #[test]
+    fn the_three_panes_tile_the_body_under_the_titlebar() {
+        let window = full(1240.0, 740.0);
+        let skeleton = vault_skeleton(window);
+
+        assert_eq!(skeleton.bar.min, window.min, "the titlebar is not at the window's top");
+        assert_eq!(
+            skeleton.body.min.y, skeleton.bar.max.y,
+            "the body does not begin where the titlebar ends"
+        );
+        assert_eq!(skeleton.body.max, window.max, "the body does not reach the window's edges");
+
+        assert_eq!(skeleton.sidebar.min, skeleton.body.min);
+        assert_eq!(skeleton.sidebar.max.x, skeleton.list.min.x, "a seam between sidebar and list");
+        assert_eq!(skeleton.list.max.x, skeleton.detail.min.x, "a seam between list and detail");
+        assert_eq!(skeleton.detail.max, skeleton.body.max, "the detail pane does not fill the rest");
+        for (pane, named) in [
+            (skeleton.sidebar, "sidebar"),
+            (skeleton.list, "list"),
+            (skeleton.detail, "detail"),
+        ] {
+            assert_eq!(
+                (pane.min.y, pane.max.y),
+                (skeleton.body.min.y, skeleton.body.max.y),
+                "the {named} pane does not run the full height of the body"
+            );
+        }
+    }
+
+    /// **The card is centred in the BODY**, not in the whole window. Centred
+    /// against the window it sits half a titlebar high in the region it is
+    /// blocking, which is visible and is the kind of thing that gets
+    /// "simplified" back.
+    #[test]
+    fn the_card_is_centred_in_the_body_and_keeps_its_own_width() {
+        let window = full(1240.0, 740.0);
+        let skeleton = vault_skeleton(window);
+        let card = login_card_rect(&skeleton, LOGIN_CARD_INITIAL_HEIGHT);
+
+        assert_eq!(card.center(), skeleton.body.center());
+        // The positive control: the body's centre and the window's really are
+        // different points here, so the assertion above is a choice between
+        // two answers rather than one restated.
+        assert_ne!(
+            skeleton.body.center(),
+            window.center(),
+            "the body and the window share a centre, so centring on either is the same test"
+        );
+        assert_eq!(
+            card.width(),
+            LOGIN_CARD_WIDTH,
+            "the card is no longer the width the 3h composition is drawn at"
+        );
+    }
+
+    /// **The card fits the smallest window the vault is allowed to open at.**
+    /// The login window borrows the vault window's geometry, and
+    /// `settings::MIN_VAULT_WINDOW_SIZE` is the floor that geometry is clamped
+    /// to -- so this is a real reachable state, not a hypothetical one.
+    #[test]
+    fn the_card_fits_inside_the_smallest_vault_window() {
+        let (min_w, min_h) = crate::settings::MIN_VAULT_WINDOW_SIZE;
+        let skeleton = vault_skeleton(full(min_w as f32, min_h as f32));
+        let card = login_card_rect(&skeleton, LOGIN_CARD_INITIAL_HEIGHT);
+        assert!(
+            skeleton.body.contains_rect(card),
+            "at the smallest window the vault may open at ({min_w}x{min_h}) the {}x{} card \
+             overhangs the {}x{} body it is supposed to float in",
+            card.width(),
+            card.height(),
+            skeleton.body.width(),
+            skeleton.body.height()
+        );
+    }
+
+    /// **The measured height round-trips.** `login_card_height` answers with a
+    /// card size; `login_card_content_rect` carves the content area back out
+    /// of it. The content area has to come out tall enough for the run that
+    /// was measured PLUS the footer row pinned under it -- otherwise the card
+    /// clips its own footer, which is the failure the old
+    /// `ViewportCommand::InnerSize` version could not have (it sized the
+    /// window, and the window had no margins of its own).
+    #[test]
+    fn a_card_sized_from_a_measured_run_has_room_for_that_run_and_its_footer() {
+        for flow in [180.0f32, 462.0, 700.0] {
+            let content_top = 137.0f32;
+            let height = login_card_height(content_top + flow, content_top);
+            let card =
+                Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(LOGIN_CARD_WIDTH, height));
+            let content = login_card_content_rect(card);
+            let needed = flow + FOOTER_RESERVE - CARD_MARGIN_BOTTOM;
+            assert!(
+                content.height() >= needed - 0.01,
+                "a run of {flow}px produced a {height}px card whose content area is only {}px, \
+                 which is less than the {needed}px that run plus its pinned footer needs",
+                content.height()
+            );
+            // The other side of it: not wildly oversized either, or the card
+            // grows a band of dead space under the footer on every state.
+            assert!(
+                content.height() <= needed + 1.0,
+                "a run of {flow}px produced a content area of {}px against the {needed}px it \
+                 needs -- the card is padded with dead space",
+                content.height()
+            );
+        }
+    }
+
+    /// The default the first frame paints at, before anything has been
+    /// measured, is the height the window's own composition used to be: this
+    /// window WAS 470x588 with a 40px `ChromeMetrics::LOGIN` bar over the same
+    /// body. Anything else and the first frame the user ever sees is a card of
+    /// the wrong size that then resettles.
+    #[test]
+    fn the_cards_starting_height_is_the_composition_it_replaced() {
+        assert_eq!(
+            LOGIN_CARD_INITIAL_HEIGHT,
+            588.0 - ChromeMetrics::LOGIN.bar_height,
+            "the card's starting height is no longer the body of the 470x588 window this \
+             composition used to be, so the first frame resettles in front of the user"
+        );
+    }
+
+    /// What `paint_vault_skeleton` actually puts on screen: the vault window's
+    /// own fills, and a scrim over the whole body.
+    ///
+    /// The fills are read back off the painter rather than argued about --
+    /// "the sidebar is CARD and the panes are CANVAS" is the entire difference
+    /// between this reading as the app with nothing in it and reading as a
+    /// blank rectangle.
+    #[test]
+    fn the_empty_app_is_painted_in_the_vault_windows_own_fills_under_a_scrim() {
+        let ctx = egui::Context::default();
+        let window = full(1240.0, 740.0);
+        let skeleton = vault_skeleton(window);
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                ..Default::default()
+            },
+            |ui| paint_vault_skeleton(ui.painter(), &skeleton),
+        );
+
+        let mut rects: Vec<(Rect, Color32)> = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
+            match shape {
+                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+
+        let painted = |rect: Rect, fill: Color32| {
+            rects
+                .iter()
+                .any(|(r, f)| *f == fill && (r.width() - rect.width()).abs() < 0.01
+                    && (r.height() - rect.height()).abs() < 0.01
+                    && (r.min.x - rect.min.x).abs() < 0.01
+                    && (r.min.y - rect.min.y).abs() < 0.01)
+        };
+
+        assert!(
+            painted(skeleton.sidebar, theme::CARD),
+            "the placeholder sidebar is not painted in the vault window's own CARD fill; \
+             painted: {rects:?}"
+        );
+        assert!(
+            painted(skeleton.list, theme::CANVAS),
+            "the placeholder item list is not painted in the vault window's own CANVAS fill"
+        );
+        assert!(
+            painted(skeleton.detail, theme::CANVAS),
+            "the placeholder detail pane is not painted in the vault window's own CANVAS fill"
+        );
+        assert!(
+            painted(skeleton.body, SCRIM),
+            "nothing dims the empty app, so the card does not read as blocking it"
+        );
+        // ...and the scrim stops at the titlebar, which carries the live
+        // window controls the user still has to be able to find. `>=` rather
+        // than `intersects`, which counts two rects sharing one edge -- and
+        // the bar's bottom edge IS the body's top one.
+        for (rect, fill) in &rects {
+            if *fill == SCRIM {
+                assert!(
+                    rect.min.y >= skeleton.bar.max.y - 0.01,
+                    "a scrim rect reaches up to {} , above the titlebar's bottom at {} -- it \
+                     is dimming the ✕ and — the user is still expected to be able to hit",
+                    rect.min.y,
+                    skeleton.bar.max.y
+                );
+            }
+        }
+    }
+
+    /// The halves no harness can reach: the viewport is built before any frame
+    /// exists, and the frame closure runs only inside a live eframe event
+    /// loop. Both are pinned at the source, with `concat!`-split single-line
+    /// needles -- a needle written as one literal matches its own declaration,
+    /// and one carrying a newline passes on LF and fails on CRLF.
+    #[test]
+    fn the_window_opens_at_the_vault_windows_placement_and_paints_its_empty_panes() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub fn run_login_flow", "_for("))
+            .expect("`run_login_flow_for` is gone")
+            .1
+            .split_once(concat!("pub fn run_login", "_flow("))
+            .expect("`run_login_flow` no longer follows it, so this slice is unbounded")
+            .0;
+
+        for (needle, what) in [
+            (
+                concat!("vault_window::initial_", "placement("),
+                "the login window no longer derives its placement from the vault window's own, \
+                 so the two can disagree and the window jumps at sign-in after all",
+            ),
+            (
+                concat!("Settings::load(path)", ".vault_window"),
+                "the login window reads no saved vault geometry, so it opens wherever the OS \
+                 puts it",
+            ),
+            (
+                concat!("with_inner_size([placement", ".width as f32"),
+                "the window is not sized from the placement it just computed",
+            ),
+            (
+                concat!("viewport.with_", "position([x as f32"),
+                "the window is not positioned from the placement it just computed, so it opens \
+                 at the right size in the wrong place",
+            ),
+            (
+                concat!("paint_vault_", "skeleton(ui.painter()"),
+                "nothing paints the empty app behind the card",
+            ),
+            (
+                concat!("login_card_", "rect(&skeleton, card_height)"),
+                "the card is not placed against the empty app's own body",
+            ),
+            // The trailing comma is what makes this the CALL rather than the
+            // prose above it: the comment explaining why the window stays
+            // fixed-size names the same constant, and a bare needle counts
+            // two.
+            (
+                concat!("ChromeMetrics::VAULT", ","),
+                "the placeholder titlebar is not drawn at the vault window's metrics",
+            ),
+        ] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "expected exactly one {needle:?} in `run_login_flow_for`: {what}"
+            );
+        }
+
+        // ...and the two things it must NOT do any more. The old window resized
+        // ITSELF from the measured content; doing that now would drag the
+        // borrowed vault geometry around under the user.
+        let resizes = concat!("ViewportCommand::", "InnerSize");
+        assert!(
+            !body.contains(resizes),
+            "the login window still resizes itself from its measured content, so it no longer \
+             stays at the geometry the vault window will restore to"
+        );
+        // Positive control for that absence: the needle is one this crate
+        // really does spell this way, so its absence here means something.
+        assert!(
+            source.contains(concat!("ViewportCommand::", "Close")),
+            "no ViewportCommand at all is spelled this way any more -- the needle has drifted \
+             and the assertion above proves nothing"
         );
     }
 }

@@ -40,15 +40,22 @@ use std::time::{Duration, Instant};
 /// lock itself is the same place it otherwise tells you when it will.
 const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
 
-const WINDOW_TITLE: &str = "Deskwarden";
+/// Visible to the crate for `WINDOW_SIZE`'s reason just below: the login
+/// window paints this window's titlebar, wordmark and all.
+pub(crate) const WINDOW_TITLE: &str = "Deskwarden";
 /// The size this window opens at the very first time, before it has ever been
 /// closed and had its geometry recorded. Design 2b's own 1240x740.
 ///
 /// Every later launch uses `Settings::vault_window` instead, run through
 /// `settings::clamp_window_geometry` -- see `initial_placement`.
-const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
-const SIDEBAR_WIDTH: f32 = 212.0;
-const LIST_WIDTH: f32 = 390.0;
+/// Visible to the crate because the LOGIN window opens at this window's
+/// geometry and paints this window's empty panes behind its card, so the
+/// user's sign-in does not end in a small card vanishing and a large window
+/// appearing somewhere else (see `login_ui::vault_skeleton`). Copies of these
+/// three numbers over there would be three numbers that drift.
+pub(crate) const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
+pub(crate) const SIDEBAR_WIDTH: f32 = 212.0;
+pub(crate) const LIST_WIDTH: f32 = 390.0;
 
 /// TOTP is re-fetched from `bw serve` on this interval while an item with a
 /// code is selected -- cheap enough to poll (one local HTTP call) and far
@@ -102,7 +109,11 @@ const MIN_CONFIRM_DWELL: Duration = Duration::from_millis(300);
 /// clamp, so the window opens at [`WINDOW_SIZE`] and the OS places it. Every
 /// other case is [`settings::clamp_window_geometry`]'s, which is where all
 /// the actual rules live.
-fn initial_placement(
+///
+/// Visible to the crate so the LOGIN window opens at the same placement this
+/// one will restore to, by calling this rather than by reimplementing it --
+/// see `login_ui::run_login_flow_for`.
+pub(crate) fn initial_placement(
     saved: Option<crate::settings::WindowGeometry>,
     work_areas: &[crate::settings::WorkArea],
 ) -> crate::settings::WindowPlacement {
@@ -633,6 +644,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
+            // The OS window exists by this first painted frame (the same
+            // hook `round_window_corners` uses), and this is where it is
+            // brought to the front. See `foreground`: a refusal from Windows
+            // flashes the taskbar button rather than being ignored.
+            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
