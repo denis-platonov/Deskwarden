@@ -18,7 +18,7 @@ use std::ffi::OsStr;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, PoisonError, RwLock};
 
 /// Tells `CreateProcess` not to allocate a console for the child. `bw.exe` is
 /// a console-subsystem program; spawned plainly from this GUI-subsystem app
@@ -59,16 +59,75 @@ pub fn verified_bw_exe() -> Option<&'static Path> {
     VERIFIED_BW_EXE.get().map(PathBuf::as_path)
 }
 
-/// Builds a `Command` for the single verified `bw.exe`.
+/// The environment variable the Bitwarden CLI reads its profile directory
+/// from.
 ///
-/// Every spawn of the CLI in this crate goes through here, so there is exactly
-/// one place where "which binary gets the master password?" is answered, and
-/// that answer is the one startup checked the signature of.
-pub fn bw_command() -> Result<Command, String> {
+/// Named once, here, because the string is the entire interface between
+/// deskwarden and the CLI's notion of "which account is this?" — a typo in a
+/// second spelling of it would not fail to compile, would not fail to spawn,
+/// and would simply leave every account answering from one shared profile.
+pub const BW_DATA_DIR_ENV: &str = "BITWARDENCLI_APPDATA_DIR";
+
+/// The profile directory every `bw` spawn in this process currently points at,
+/// or `None` for "whatever the CLI picks by itself".
+///
+/// A process-global, deliberately, and deliberately **not** a real environment
+/// variable: `std::env::set_var` is process-wide and unsynchronised, and this
+/// value is read from background threads (the backend starter, the sync
+/// thread, the status poller) while the UI thread switches accounts. An
+/// `RwLock` makes the read side cheap and the hand-off explicit; setting the
+/// real variable would additionally leak the active account's directory into
+/// every *other* child this app spawns (PowerShell, the updater's installer).
+///
+/// An `RwLock`, not a `OnceLock` like [`VERIFIED_BW_EXE`] beside it, because
+/// the two invariants are opposites: the *binary* is verified once and may
+/// never be replaced, while the *directory* is exactly the thing an account
+/// switch replaces.
+static ACTIVE_DATA_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// Points every subsequent `bw` spawn at `dir`.
+///
+/// `None` means "the CLI's own default directory", which is what the app runs
+/// with before the migration to per-account directories has happened.
+pub fn set_active_data_dir(dir: Option<PathBuf>) {
+    *ACTIVE_DATA_DIR
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = dir;
+}
+
+/// The directory [`bw_command`] will point the CLI at.
+///
+/// Returns an owned `PathBuf` rather than a borrow: the value can be replaced
+/// by an account switch at any moment, so handing out a reference into the
+/// lock would either hold it across a spawn or dangle.
+pub fn active_data_dir() -> Option<PathBuf> {
+    ACTIVE_DATA_DIR
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+/// Builds a `Command` for the single verified `bw.exe`, pointed at a chosen
+/// profile directory.
+///
+/// `dir == None` sets **no** `BITWARDENCLI_APPDATA_DIR` at all — not an empty
+/// one, which the CLI would treat as a real (and nonsensical) directory rather
+/// than as "use your default". Migration reads the pre-existing profile
+/// through exactly this form, so the difference is the difference between
+/// migrating the user's vault and migrating nothing.
+///
+/// Takes the directory as an argument rather than always reading
+/// [`active_data_dir`] so migration can talk to the source profile and the
+/// copy in turn without ever disturbing the global that background threads are
+/// reading.
+pub fn bw_command_in(dir: Option<&Path>) -> Result<Command, String> {
     match verified_bw_exe() {
         Some(path) => {
             let mut cmd = Command::new(path);
             cmd.creation_flags(CREATE_NO_WINDOW);
+            if let Some(dir) = dir {
+                cmd.env(BW_DATA_DIR_ENV, dir);
+            }
             Ok(cmd)
         }
         None => Err(
@@ -78,6 +137,20 @@ pub fn bw_command() -> Result<Command, String> {
                 .to_string(),
         ),
     }
+}
+
+/// Builds a `Command` for the single verified `bw.exe`, pointed at the active
+/// account's profile directory.
+///
+/// Every spawn of the CLI in this crate goes through here, so there is exactly
+/// one place where "which binary gets the master password?" is answered — that
+/// answer being the one startup checked the signature of — and exactly one
+/// place where "which account is this?" is answered. `bw serve`, `bw sync`,
+/// `bw status`, `bw logout`, `bw config server` and the one call that hands
+/// over the master password all follow the active account with no signature
+/// widened at any of them.
+pub fn bw_command() -> Result<Command, String> {
+    bw_command_in(active_data_dir().as_deref())
 }
 
 /// Resolves `bw.exe`, preferring the location deskwarden's own installer
@@ -218,6 +291,33 @@ pub fn relative_data_dir(bw_exe: &Path) -> Option<PathBuf> {
     bw_exe.parent().map(|dir| dir.join("bitwarden-cli"))
 }
 
+/// The CLI's own fallback profile location on Windows —
+/// `path.join(process.env.APPDATA, "Bitwarden CLI")` — which is where the
+/// pre-existing single-account profile lives, and so what migration copies
+/// *from*.
+///
+/// The pure half, taking `%APPDATA%` as an argument, so the join can be
+/// asserted against a literal without depending on the machine running the
+/// test.
+///
+/// **A candidate, never a fact.** If the directory does not exist, or holds no
+/// `data.json`, there is simply nothing to migrate — the ordinary first-install
+/// case, to be handled as such rather than as an error. Nothing may be deleted
+/// on the strength of this path alone.
+///
+/// `None` when `%APPDATA%` is unset: with no `%APPDATA%` the CLI's own
+/// `path.join` would throw, so there is no default profile directory to name,
+/// and inventing one (the working directory, say) would point migration at a
+/// directory that has nothing to do with the CLI.
+pub fn cli_default_data_dir_from(appdata: Option<&OsStr>) -> Option<PathBuf> {
+    appdata.map(|a| Path::new(a).join("Bitwarden CLI"))
+}
+
+/// [`cli_default_data_dir_from`] against this process's real `%APPDATA%`.
+pub fn cli_default_data_dir() -> Option<PathBuf> {
+    cli_default_data_dir_from(std::env::var_os("APPDATA").as_deref())
+}
+
 /// Whether deskwarden may offer more than one account at all.
 ///
 /// Not a `bool`, because the two ways of saying "no" need different
@@ -330,6 +430,263 @@ mod tests {
     fn touch(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, b"").unwrap();
+    }
+
+    /// Serialises every test that touches [`ACTIVE_DATA_DIR`].
+    ///
+    /// The active directory is process-global and `cargo test` runs this
+    /// module's tests concurrently in one process, so without this two tests
+    /// setting different directories would read each other's value. Poisoning
+    /// is recovered from rather than propagated: a panic in one test must fail
+    /// that test, not cascade into every other test in the file.
+    static ACTIVE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_active_dir() -> std::sync::MutexGuard<'static, ()> {
+        ACTIVE_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Guarantees a verified `bw.exe` is recorded, so the `bw_command*` tests
+    /// exercise the `Some` arm rather than silently passing through the "no
+    /// verified CLI" error.
+    ///
+    /// `remember_verified_bw_exe` is first-wins and idempotent, so calling it
+    /// here is safe however the test order falls out; the path it installs is
+    /// the same one the two tests below it already use.
+    fn ensure_verified_exe() {
+        remember_verified_bw_exe(PathBuf::from(r"C:\deskwarden-test\first\bw.exe"));
+        assert!(
+            verified_bw_exe().is_some(),
+            "a verified bw.exe was just recorded and did not stick"
+        );
+    }
+
+    /// The `BITWARDENCLI_APPDATA_DIR` entries a built command carries.
+    ///
+    /// A `Vec`, not an `Option`, so "set twice" is distinguishable from "set
+    /// once" — `Command::env` overwrites, but a future `env_clear`/`envs`
+    /// rewrite could easily leave two.
+    fn appdata_env_entries(cmd: &Command) -> Vec<Option<PathBuf>> {
+        cmd.get_envs()
+            .filter(|(key, _)| *key == OsStr::new(BW_DATA_DIR_ENV))
+            .map(|(_, value)| value.map(PathBuf::from))
+            .collect()
+    }
+
+    #[test]
+    fn a_command_built_for_a_directory_carries_the_appdata_env_var() {
+        ensure_verified_exe();
+        let dir = PathBuf::from(r"C:\cfg\accounts\0123456789abcdef0123456789abcdef");
+
+        let cmd = bw_command_in(Some(&dir)).expect("a verified exe was just recorded");
+
+        assert_eq!(
+            appdata_env_entries(&cmd),
+            vec![Some(dir)],
+            "the CLI reads exactly one profile-directory variable, and it must be the \
+             directory asked for"
+        );
+    }
+
+    #[test]
+    fn a_command_built_for_the_cli_default_sets_no_appdata_env_var_at_all() {
+        // NOT "sets it to empty", and not `env_remove` either: an absent
+        // variable is the only form the CLI reads as "use your own default".
+        // Migration reads the SOURCE profile through this exact form, so
+        // getting it wrong means migrating from the wrong directory -- or from
+        // nothing.
+        ensure_verified_exe();
+
+        let cmd = bw_command_in(None).expect("a verified exe was just recorded");
+
+        assert_eq!(
+            appdata_env_entries(&cmd),
+            Vec::new(),
+            "a command for the CLI's default directory named the profile variable anyway"
+        );
+    }
+
+    #[test]
+    fn bw_command_follows_the_active_data_dir_in_both_directions() {
+        // THE mutation this file exists to catch: a `bw_command` that ignores
+        // the global makes the entire multiple-accounts feature inert, with
+        // every other test in this crate still green -- a switch would simply
+        // never reach the CLI, and the previous account would keep answering.
+        let _guard = lock_active_dir();
+        ensure_verified_exe();
+        let dir = PathBuf::from(r"C:\cfg\accounts\fedcba9876543210fedcba9876543210");
+
+        set_active_data_dir(Some(dir.clone()));
+        assert_eq!(active_data_dir(), Some(dir.clone()));
+        assert_eq!(
+            appdata_env_entries(&bw_command().expect("a verified exe was just recorded")),
+            vec![Some(dir)],
+            "bw_command ignored the active data directory"
+        );
+
+        // The positive control, on the same function: without it a
+        // `bw_command` that hard-coded that one directory would pass above.
+        set_active_data_dir(None);
+        assert_eq!(active_data_dir(), None);
+        assert_eq!(
+            appdata_env_entries(&bw_command().expect("a verified exe was just recorded")),
+            Vec::new(),
+            "bw_command kept pointing at a directory after the active one was cleared"
+        );
+    }
+
+    #[test]
+    fn the_backend_spawn_command_follows_the_active_data_dir_too() {
+        // WIRING, behaviourally rather than by reading the source.
+        // `bw_serve_command` is the one bw-spawning call site that hands its
+        // `Command` back unspawned, so it is the one that can be inspected --
+        // and it is also the most consequential, since `bw serve` is what the
+        // whole vault is read through. If it ever stopped going through
+        // `bw_command`, a switched account would keep serving the previous
+        // account's vault.
+        let _guard = lock_active_dir();
+        ensure_verified_exe();
+        let dir = PathBuf::from(r"C:\cfg\accounts\aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        set_active_data_dir(Some(dir.clone()));
+        let cmd = crate::bw_serve::bw_serve_command("not-a-real-token")
+            .expect("a verified exe was just recorded");
+        assert_eq!(
+            appdata_env_entries(&cmd),
+            vec![Some(dir)],
+            "`bw serve` would be spawned against a different account than the active one"
+        );
+
+        set_active_data_dir(None);
+        let cmd = crate::bw_serve::bw_serve_command("not-a-real-token")
+            .expect("a verified exe was just recorded");
+        assert_eq!(appdata_env_entries(&cmd), Vec::new());
+    }
+
+    #[test]
+    fn the_cli_default_profile_directory_is_bitwarden_cli_under_appdata() {
+        assert_eq!(
+            cli_default_data_dir_from(Some(OsStr::new(r"C:\Users\me\AppData\Roaming"))),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\Bitwarden CLI")),
+        );
+        // The space is load-bearing and the case is load-bearing: this is a
+        // literal directory name the CLI creates, and migration reading
+        // `BitwardenCLI` or `bitwarden-cli` instead would find nothing to
+        // migrate and report a first install.
+        assert_ne!(
+            cli_default_data_dir_from(Some(OsStr::new(r"C:\Users\me\AppData\Roaming"))),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\bitwarden-cli")),
+        );
+        assert_eq!(
+            cli_default_data_dir_from(None),
+            None,
+            "with no %APPDATA% there is no default profile directory to name, and inventing \
+             one would point migration somewhere unrelated to the CLI"
+        );
+    }
+
+    #[test]
+    fn the_live_cli_default_reads_the_real_appdata_variable() {
+        // WIRING for the impure half: `cli_default_data_dir()` answering from
+        // anything other than `%APPDATA%` would leave the pure test above
+        // green while migration read the wrong directory.
+        assert_eq!(
+            cli_default_data_dir(),
+            cli_default_data_dir_from(std::env::var_os("APPDATA").as_deref()),
+        );
+        // And on a machine that has %APPDATA% -- every Windows one -- it is a
+        // real answer rather than None, so the equality above is not two Nones.
+        if std::env::var_os("APPDATA").is_some() {
+            let dir = cli_default_data_dir().expect("%APPDATA% is set, so this cannot be None");
+            assert!(dir.ends_with("Bitwarden CLI"), "got {}", dir.display());
+        }
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension() == Some(OsStr::new("rs")) {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Lines that build a `Command` for something called `bw` directly.
+    ///
+    /// A free function so the guard below can be pointed at a *planted*
+    /// violation as well as at the real tree — a source guard whose matcher is
+    /// only ever run against code that passes is a guard nobody has seen work.
+    fn direct_bw_spawns(label: &str, text: &str) -> Vec<String> {
+        let needle = concat!("Command", "::new(");
+        text.lines()
+            .filter(|line| line.contains(needle) && line.contains("bw"))
+            .map(|line| format!("{label}: {}", line.trim()))
+            .collect()
+    }
+
+    #[test]
+    fn every_bw_spawn_in_the_crate_goes_through_bw_path() {
+        // WIRING. A new call site building its own command for `bw` silently
+        // uses whatever profile directory the CLI picks by default, so a
+        // switched account would keep answering from the previous one with no
+        // error anywhere.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+
+        // The walk itself, pinned: a recursion that returned nothing (or that
+        // never descended into `vault_window/` and `injector/`) would make
+        // every assertion below vacuously true.
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for expected in ["bw_path.rs", "bw_serve.rs", "login_ui.rs", "main.rs", "mod.rs"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "the source walk never reached {expected}; it found {names:?}"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            // The definition itself, and the only place allowed to name the
+            // binary.
+            if file.file_name() == Some(OsStr::new("bw_path.rs")) {
+                continue;
+            }
+            let text = std::fs::read_to_string(file).unwrap();
+            offenders.extend(direct_bw_spawns(&file.display().to_string(), &text));
+        }
+        assert!(
+            offenders.is_empty(),
+            "bw spawned outside bw_path, bypassing the active account's profile directory:\n{}",
+            offenders.join("\n")
+        );
+
+        // Positive control, through the same matcher: it can see the violation
+        // it exists to catch...
+        let planted = format!(
+            "        let mut cmd = {}\"bw.exe\");",
+            concat!("Command", "::new(")
+        );
+        assert_eq!(
+            direct_bw_spawns("planted.rs", &planted).len(),
+            1,
+            "the guard cannot see a direct bw spawn, so its silence above means nothing"
+        );
+        // ...and does not simply flag every spawn, which would make it
+        // unmaintainable rather than useful. This crate really does spawn
+        // `cmd`, `tasklist` and the updater's installer.
+        assert!(direct_bw_spawns(
+            "planted.rs",
+            &format!("let c = {}\"tasklist\");", concat!("Command", "::new("))
+        )
+        .is_empty());
     }
 
     #[test]
