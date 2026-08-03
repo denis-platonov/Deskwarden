@@ -9,6 +9,7 @@
 //! twice, and leave bin-only modules unreachable from examples and
 //! integration tests.
 
+pub mod accounts;
 pub mod app;
 pub mod app_match;
 pub mod backend_policy;
