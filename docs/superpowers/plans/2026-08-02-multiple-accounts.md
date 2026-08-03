@@ -128,9 +128,16 @@ Additional constraints for this plan:
 
 # Task 1 — Detect the `relativeDataDir` trap
 
-*(Unchanged from the first draft. **Already dispatched to an implementer** — do not
-renumber and do not change its interface. Later tasks compose around
-`MultiAccountAvailability` rather than extending it.)*
+> **DONE — shipped as `39f8ef1`, 888 lib (880 + 8) + 34 bin pass.** The interface
+> below is transcribed from what actually landed, not from the draft that was
+> dispatched. One deliberate improvement the implementer made, recorded here so
+> later tasks use it and no reader re-derives it: the impure half is
+> `multi_account_availability_from_exe(Option<&Path>)`, taking the executable
+> rather than reading `verified_bw_exe()` itself. The draft's live-probe test
+> rebuilt that expression at the call site, which would have left the production
+> `.exists()` unexercised — the decision tested and the wiring that reaches it
+> not, this repo's most repeated defect. Later tasks call
+> `multi_account_availability()`; nothing consumes it until Task 10.
 
 Earliest, because every later task is meaningless if it is not handled: a
 `bitwarden-cli` directory beside `bw.exe` makes `BITWARDENCLI_APPDATA_DIR` ignored and
@@ -166,6 +173,10 @@ pub enum MultiAccountAvailability {
 
 pub fn multi_account_from(relative: Option<PathBuf>, relative_exists: bool)
     -> MultiAccountAvailability;
+
+/// The impure half, taking the exe so a test can drive it against a really
+/// planted directory instead of rebuilding the expression at the call site.
+pub fn multi_account_availability_from_exe(bw_exe: Option<&Path>) -> MultiAccountAvailability;
 
 pub fn multi_account_availability() -> MultiAccountAvailability;
 
