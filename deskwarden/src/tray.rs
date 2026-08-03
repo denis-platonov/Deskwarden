@@ -1,5 +1,6 @@
+use crate::accounts::{account_label, AccountId, AccountsState};
 use semver::Version;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 /// Ordinal of the icon resource `build.rs` embeds into the executable. Must
@@ -12,6 +13,182 @@ const APP_ICON_RESOURCE_ID: u16 = 1;
 /// tray reverts to conceptually -- the update states below replace it while
 /// they apply.
 const IDLE_TOOLTIP: &str = "Deskwarden";
+
+/// Label of the submenu every account action lives under.
+const ACCOUNTS_SUBMENU: &str = "Accounts";
+
+/// Label of the item that mints and signs in to another account.
+const ADD_ACCOUNT: &str = "Add account...";
+
+/// Shown, disabled, when there is exactly one account and nothing is refused.
+/// An empty submenu reads as a broken menu; this reads as "you have one".
+const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
+
+/// Shown, disabled, when this process has no `AccountsState` at all --
+/// `StartupAccounts::Unmigrated`, where there is no `Account` in existence and
+/// the app is running against the CLI's own default profile. Not a blocked
+/// state and not a one-account state: there is nothing here to switch *from*.
+const ACCOUNTS_NOT_SET_UP: &str =
+    "Accounts are not set up on this machine yet - restart Deskwarden";
+
+/// What the "Accounts" submenu should contain, decided from
+/// [`AccountsState`](crate::accounts::AccountsState) alone.
+///
+/// **Every field is an answer this type asked the one door for.** Nothing here
+/// re-derives "may I switch" from the CLI's availability or the migration's
+/// outcome -- `tray.rs` is on the ban list
+/// `no_window_answers_may_i_switch_for_itself` enforces, and it is on it for
+/// the same reason `vault_window/mod.rs` is: a second reading of those two
+/// facts is a second answer, and the two would disagree exactly where the trap
+/// is.
+///
+/// Separated from the `muda` construction below because that construction
+/// needs a real Windows menu and a live message loop. This is the half every
+/// test drives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountsMenuPlan {
+    /// The account this process is on, as a disabled header. Always present
+    /// when there is an `AccountsState` at all: a menu of switch targets with
+    /// no indication of where you currently are is a menu you cannot read.
+    pub active: Option<String>,
+    /// One row per account the user may switch **to**, in
+    /// [`AccountsState::switchable`](crate::accounts::AccountsState::switchable)
+    /// order. Never [`all`](crate::accounts::AccountsState::all), which still
+    /// reports the active account, still reports duplicate ids, and is not
+    /// emptied when switching is refused.
+    pub switch_to: Vec<(AccountId, String)>,
+    /// A disabled row explaining why there is nothing to switch to, when there
+    /// is nothing to switch to. `None` whenever [`Self::switch_to`] is
+    /// non-empty.
+    pub notice: Option<String>,
+    /// Whether "Add account..." is offered at all.
+    ///
+    /// **Gated on
+    /// [`can_add`](crate::accounts::AccountsState::can_add), which is what
+    /// keeps `SwitchOutcome::Declined` unambiguous.** `add_account` answers
+    /// `Declined` both for "the user closed the sign-in window" and for "the
+    /// gate refused", and a tray that reported "cancelled" for a
+    /// `relativeDataDir` block would be telling the user something that never
+    /// happened. An item that is not there cannot be clicked, so the only
+    /// `Declined` this wiring can ever see is the cancelled sign-in.
+    pub add: bool,
+    /// The label of the account "Remove..." would delete, when a removal could
+    /// possibly succeed -- `None` otherwise, because a menu item that can only
+    /// fail is worse than one that is not there.
+    ///
+    /// Two refusals, both `remove_account`'s own and both asked of the same
+    /// door: **the last account cannot be removed** (there is nowhere coherent
+    /// for the app to land), and a **blocked** state cannot remove anything
+    /// (the app cannot reach the survivor it would have to settle onto). Both
+    /// collapse to "there is at least one switchable account", because that is
+    /// exactly the survivor `next_active_after_removal` picks.
+    pub remove: Option<String>,
+}
+
+/// The label the "Remove..." item carries for `active`.
+pub fn remove_account_label(active: &str) -> String {
+    format!("Remove {active}...")
+}
+
+/// Decides the submenu's contents. See [`AccountsMenuPlan`].
+///
+/// `None` is `StartupAccounts::Unmigrated`: `main` builds no `AccountsState`
+/// there because there is no `Account` to build one around, and
+/// `vault_window::run` already takes the same `Option`. The submenu is not
+/// hidden in that case -- a menu item that vanishes is a menu item the user
+/// concludes they imagined -- it says so and offers nothing.
+pub fn accounts_menu_plan(state: Option<&AccountsState>) -> AccountsMenuPlan {
+    let Some(state) = state else {
+        return AccountsMenuPlan {
+            active: None,
+            switch_to: Vec::new(),
+            notice: Some(ACCOUNTS_NOT_SET_UP.to_string()),
+            add: false,
+            remove: None,
+        };
+    };
+
+    let active = account_label(state.active()).to_string();
+    let switch_to: Vec<(AccountId, String)> = state
+        .switchable()
+        .iter()
+        .map(|a| (a.id.clone(), account_label(a).to_string()))
+        .collect();
+
+    let notice = if !switch_to.is_empty() {
+        None
+    } else {
+        // The blocked reason outranks "no other accounts yet", and it has to:
+        // a blocked state may well hold several accounts, and telling the user
+        // they have one would be false as well as unactionable.
+        Some(
+            state
+                .blocked_reason()
+                .map(str::to_string)
+                .unwrap_or_else(|| NO_OTHER_ACCOUNTS.to_string()),
+        )
+    };
+
+    AccountsMenuPlan {
+        remove: (!switch_to.is_empty()).then(|| remove_account_label(&active)),
+        active: Some(active),
+        switch_to,
+        notice,
+        add: state.can_add(),
+    }
+}
+
+/// The built submenu's answer to "which account was clicked?".
+///
+/// A `MenuId` → `AccountId` map rather than a match on labels: two accounts
+/// can carry the same email (the same address on two servers), and a label
+/// match would then switch to whichever came first.
+#[derive(Debug, Clone, Default)]
+pub struct AccountsMenu {
+    entries: Vec<(MenuId, AccountId)>,
+    /// `None` when the item was not built, which is how a refused add becomes
+    /// unclickable rather than merely refused after the fact.
+    add_id: Option<MenuId>,
+    remove_id: Option<MenuId>,
+}
+
+impl AccountsMenu {
+    pub fn from_entries(
+        entries: Vec<(MenuId, AccountId)>,
+        add_id: Option<MenuId>,
+        remove_id: Option<MenuId>,
+    ) -> Self {
+        Self {
+            entries,
+            add_id,
+            remove_id,
+        }
+    }
+
+    /// The account `id` switches to, or `None` -- including for
+    /// "Add account..." and "Remove ...", which must never be mistaken for
+    /// accounts.
+    pub fn account_for_menu_id(&self, id: &MenuId) -> Option<&AccountId> {
+        self.entries
+            .iter()
+            .find(|(menu_id, _)| menu_id == id)
+            .map(|(_, account)| account)
+    }
+
+    pub fn is_add(&self, id: &MenuId) -> bool {
+        self.add_id.as_ref() == Some(id)
+    }
+
+    pub fn is_remove(&self, id: &MenuId) -> bool {
+        self.remove_id.as_ref() == Some(id)
+    }
+
+    /// Whether `id` belongs to this submenu at all, so the main loop can skip
+    /// the whole account block for the clicks that are not one.
+    pub fn owns(&self, id: &MenuId) -> bool {
+        self.account_for_menu_id(id).is_some() || self.is_add(id) || self.is_remove(id)
+    }
+}
 
 pub struct AppTray {
     /// Kept (not just dropped-on-the-floor) because the tooltip is this app's
@@ -44,6 +221,14 @@ pub struct AppTray {
     /// Same reasoning as `update_item`, for `set_sync_in_progress`/
     /// `set_sync_idle`/`set_sync_failed`.
     sync_item: MenuItem,
+    /// The "Accounts" submenu, kept for the same reason `update_item` is: its
+    /// contents change whenever an account is added, removed or switched to,
+    /// and rebuilding it needs the handle.
+    accounts_submenu: Submenu,
+    /// What the submenu's ids currently mean. Replaced wholesale by
+    /// [`AppTray::rebuild_accounts_menu`] -- the ids are minted with the items,
+    /// so a stale map is a click that switches to the wrong account.
+    accounts: AccountsMenu,
 }
 
 pub fn build_tray() -> AppTray {
@@ -60,10 +245,16 @@ pub fn build_tray() -> AppTray {
     // uses rather than rebuilding the menu.
     let update_item = MenuItem::new("Update available", false, None);
     let preferences = MenuItem::new("Preferences...", true, None);
+    // Empty here and filled by `rebuild_accounts_menu`, which `main` calls
+    // once the account list exists and again after every change to it. Built
+    // empty rather than not at all so there is exactly one place that decides
+    // what is in it.
+    let accounts_submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
     menu.append(&open_vault).unwrap();
     menu.append(&add_app).unwrap();
     menu.append(&sync_item).unwrap();
     menu.append(&update_item).unwrap();
+    menu.append(&accounts_submenu).unwrap();
     menu.append(&preferences).unwrap();
     menu.append(&quit).unwrap();
 
@@ -91,7 +282,82 @@ pub fn build_tray() -> AppTray {
         update_id: update_item.id().clone(),
         update_item,
         sync_item,
+        accounts_submenu,
+        accounts: AccountsMenu::default(),
     }
+}
+
+impl AppTray {
+    /// What the "Accounts" submenu currently means.
+    pub fn accounts(&self) -> &AccountsMenu {
+        &self.accounts
+    }
+
+    /// Rebuilds the submenu from [`accounts_menu_plan`], and replaces the id
+    /// map with the ids of the items it just built.
+    ///
+    /// Rebuilt rather than mutated in place: the number of rows changes with
+    /// every add and every removal, and an item's `MenuId` is minted when the
+    /// item is. The two therefore have to move together, which is why this
+    /// function owns both halves and `self.accounts` is private.
+    ///
+    /// **This is the untestable half**, and deliberately the thinnest one:
+    /// every decision above it is `accounts_menu_plan`'s, and every lookup
+    /// after it is [`AccountsMenu`]'s. What is left here is `muda` calls on a
+    /// menu owned by a real tray icon, which no test in this crate can build
+    /// (see `build_tray`).
+    pub fn rebuild_accounts_menu(&mut self, state: Option<&AccountsState>) {
+        let plan = accounts_menu_plan(state);
+        self.accounts = build_accounts_submenu(&self.accounts_submenu, &plan);
+    }
+}
+
+/// Fills `submenu` with `plan` and hands back the id map for it.
+///
+/// Split out of [`AppTray::rebuild_accounts_menu`] for the reason the
+/// `sync_item_to_*` helpers below are split out of the `set_sync_*` functions:
+/// an `AppTray` owns a real `TrayIcon` and cannot be built in a test, but a
+/// bare `Submenu` can -- so the mapping between a plan and the items it
+/// produces is driven directly.
+fn build_accounts_submenu(submenu: &Submenu, plan: &AccountsMenuPlan) -> AccountsMenu {
+    // Emptied first, and from the front: `remove_at` is the only removal that
+    // does not need a handle on the item being removed, and these handles were
+    // dropped as soon as the previous rebuild finished with their ids.
+    while submenu.remove_at(0).is_some() {}
+
+    if let Some(active) = &plan.active {
+        // Disabled: this is the account you are on, and "switch to where you
+        // already are" still tears the backend down and demands a master
+        // password.
+        let header = MenuItem::new(format!("Signed in: {active}"), false, None);
+        let _ = submenu.append(&header);
+        let _ = submenu.append(&PredefinedMenuItem::separator());
+    }
+
+    let mut entries = Vec::new();
+    for (id, label) in &plan.switch_to {
+        let item = MenuItem::new(label, true, None);
+        entries.push((item.id().clone(), id.clone()));
+        let _ = submenu.append(&item);
+    }
+    if let Some(notice) = &plan.notice {
+        let _ = submenu.append(&MenuItem::new(notice, false, None));
+    }
+
+    let add_id = plan.add.then(|| {
+        let item = MenuItem::new(ADD_ACCOUNT, true, None);
+        let id = item.id().clone();
+        let _ = submenu.append(&item);
+        id
+    });
+    let remove_id = plan.remove.as_ref().map(|label| {
+        let item = MenuItem::new(label, true, None);
+        let id = item.id().clone();
+        let _ = submenu.append(&item);
+        id
+    });
+
+    AccountsMenu::from_entries(entries, add_id, remove_id)
 }
 
 /// Loads the icon `build.rs` embedded into this executable.

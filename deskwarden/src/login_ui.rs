@@ -169,9 +169,32 @@ pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
 /// Runs `bw logout`, for 3h's "Log out" footer action. Already being logged
 /// out counts as success -- the goal state is "no account", however we got
 /// there.
+///
+/// **Acts on whatever profile this process is currently pointed at**, which is
+/// what "Log out" means and is the *wrong* thing for a removal: the account
+/// being removed is not necessarily the active one. That caller wants
+/// [`bw_logout_in`], and `main.rs`'s `the_removal_logs_the_doomed_account_out`
+/// bans this form from reaching it.
 pub fn bw_logout() -> Result<(), String> {
-    let output = bw_command()?
-        .arg("logout")
+    bw_logout_in(crate::bw_path::active_data_dir().as_deref())
+}
+
+/// [`bw_logout`] against a **named** profile directory rather than the active
+/// account's.
+///
+/// The same shape, and for the same reason, as
+/// [`check_bw_status_details_in`]: `account_removal` has to log out the
+/// account it is about to delete, which is not the account this process is on.
+/// The alternative -- temporarily pointing `bw_path::set_active_data_dir` at
+/// the doomed directory and calling [`bw_logout`] -- is a process-global that
+/// background threads spawn `bw` against, so the window in which it names
+/// another account's profile is a window in which a sync can land in the wrong
+/// vault.
+///
+/// `None` keeps `bw_command_in`'s meaning: no override, so the child inherits
+/// whatever `BITWARDENCLI_APPDATA_DIR` the environment already had.
+pub fn bw_logout_in(data_dir: Option<&Path>) -> Result<(), String> {
+    let output = logout_command_in(data_dir)?
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -185,6 +208,20 @@ pub fn bw_logout() -> Result<(), String> {
     } else {
         Err(stderr)
     }
+}
+
+/// The `bw logout` invocation, built but not run.
+///
+/// Separated from [`bw_logout_in`] purely so a test can read back the
+/// environment and the arguments it carries: `.output()` needs a real `bw.exe`
+/// and would sign the user out of a real vault, and there is no other way to
+/// see *which directory* a logout was aimed at -- a `bw_logout_in` that
+/// dropped its argument would leave the same "already logged out" success
+/// behind as one that used it, having signed the wrong account out.
+fn logout_command_in(data_dir: Option<&Path>) -> Result<std::process::Command, String> {
+    let mut cmd = crate::bw_path::bw_command_in(data_dir)?;
+    cmd.arg("logout");
+    Ok(cmd)
 }
 
 /// Points the Bitwarden CLI at a self-hosted server.

@@ -579,7 +579,15 @@ fn main() {
     // undelivered in the queue forever and `tray::next_menu_event()` /
     // `hotkey::fill_hotkey_pressed()` would never see anything.
     let fill_hotkey = hotkey::register_fill_hotkey();
-    let tray = tray::build_tray();
+    // `mut`: the "Accounts" submenu is rebuilt in place after every add,
+    // removal and switch, and rebuilding mints new `MenuId`s that the tray has
+    // to remember.
+    let mut tray = tray::build_tray();
+    // Filled once here, so the submenu is correct before the user can open it,
+    // and again after every account change below. `accounts_state` is `None`
+    // for `StartupAccounts::Unmigrated` -- see `tray::accounts_menu_plan`,
+    // which says so in the menu rather than leaving it empty.
+    tray.rebuild_accounts_menu(accounts_state.as_ref());
 
     let current_version =
         Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
@@ -818,6 +826,245 @@ fn main() {
                         log::warn!("could not save settings: {e}");
                     }
                 }
+                last_dispatched_hwnd = None;
+            }
+
+            // ---------------------------------------------------------------
+            // The "Accounts" submenu: switch, add, remove.
+            //
+            // Read out of the tray FIRST, and by value. `account_for_menu_id`
+            // borrows the tray, the resettle below needs `&tray`, and the
+            // rebuild afterwards needs `&mut tray` -- so nothing here may hold
+            // a borrow across the work.
+            // ---------------------------------------------------------------
+            let switch_target = tray.accounts().account_for_menu_id(&event.id).cloned();
+            let add_clicked = tray.accounts().is_add(&event.id);
+            let remove_clicked = tray.accounts().is_remove(&event.id);
+            if tray.accounts().owns(&event.id) {
+                // **ONE resettle closure for all three actions**, handed to
+                // each by `&mut`. Three copies of this would be three chances
+                // to get the hardest sequence in this codebase subtly
+                // different; `the_tray_settles_every_account_action_through_
+                // the_one_sequence` pins that what is in here is the sequence
+                // and not a fourth teardown path written inline.
+                let mut resettle = |config_dir: &std::path::Path,
+                                    to: &Account,
+                                    store: &session_store::SessionStore|
+                 -> ResettleReport {
+                    // Built for the account being settled ONTO. A context for
+                    // the account being left would put the master-password
+                    // prompt up for the wrong account and seal the Windows
+                    // Hello blob under the wrong id.
+                    let login = login_context(config_dir, Some(to), hello_needs_reenrolment);
+                    let mut declined = false;
+                    let outcome = resettle_session(
+                        &cache,
+                        &mut engine,
+                        &mut bw_serve_child,
+                        &job,
+                        &schedule,
+                        &tray,
+                        &backend_op_rx,
+                        &mut backend_task_in_progress,
+                        &mut cached_status_details,
+                        &mut session_token,
+                        || {
+                            let token = authenticate_for_switch(store, login);
+                            declined = token.is_none();
+                            token
+                        },
+                    );
+                    // The three-way answer `ResettleOutcome`'s two variants
+                    // cannot give: only whoever built the `authenticate`
+                    // closure can tell "the user closed the prompt" from
+                    // "nothing came up to serve it".
+                    match outcome {
+                        ResettleOutcome::BackendStarted => ResettleReport::Settled,
+                        ResettleOutcome::BackendNotStarted if declined => ResettleReport::Declined,
+                        ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
+                    }
+                };
+
+                // Whatever the click turned out to be, reported through one
+                // match below: a switch and an add both land in a
+                // `SwitchOutcome`, and reporting each in its own arm is how
+                // one of them quietly stops raising the failure the other one
+                // does.
+                let reported: Option<(String, SwitchOutcome)> =
+                    if let Some(target) = switch_target.as_ref() {
+                    // **`switchable()`, not `all()`.** `all()` still reports
+                    // the active account and still reports duplicate ids, and
+                    // it is not emptied when switching is refused. The menu was
+                    // built from `switchable()` too; re-asking here costs
+                    // nothing and means a stale submenu -- one built before a
+                    // state change and clicked after it -- cannot smuggle a
+                    // target past the gate.
+                    let picked = accounts_state
+                        .as_ref()
+                        .and_then(|state| state.switchable().iter().find(|a| &a.id == target))
+                        .cloned();
+                    match (picked, accounts_state.as_mut(), active_account.as_mut()) {
+                        (Some(to), Some(state), Some(active)) => {
+                            let from = active.clone();
+                            let outcome = switch_to_account(
+                                &config_dir,
+                                &from,
+                                &to,
+                                active,
+                                &mut store,
+                                &mut resettle,
+                            );
+                            if outcome == SwitchOutcome::Switched {
+                                state.adopt(to.clone());
+                                // **After the switch has landed, never
+                                // before.** A list written first and a switch
+                                // that then failed would leave settings.json
+                                // naming an account this process is not on,
+                                // and the next launch would resume the wrong
+                                // one -- indistinguishable from the
+                                // `relativeDataDir` trap.
+                                if let Err(e) = settings::Settings::persist_accounts(
+                                    &settings_path,
+                                    state.all(),
+                                    Some(&to.id),
+                                ) {
+                                    log::warn!(
+                                        "could not persist the active account after a switch: {e}"
+                                    );
+                                }
+                            }
+                            Some((format!("switch to {}", account_label(&to)), outcome))
+                        }
+                        _ => {
+                            log::warn!(
+                                "the account the tray offered is no longer one this app can \
+                                 switch to; the submenu is being rebuilt"
+                            );
+                            None
+                        }
+                    }
+                } else if add_clicked {
+                    match (accounts_state.as_mut(), active_account.as_mut()) {
+                        (Some(state), Some(active)) => {
+                            let outcome = add_account(
+                                &config_dir,
+                                &settings_path,
+                                state,
+                                active,
+                                &mut store,
+                                // The sign-in window, run against whatever
+                                // profile `add_account` has pointed the CLI at
+                                // -- which is the NEW account's directory, and
+                                // is the whole reason this is injected rather
+                                // than called in there.
+                                |prepared| {
+                                    let login = login_context(
+                                        &config_dir,
+                                        Some(prepared),
+                                        hello_needs_reenrolment,
+                                    );
+                                    login_ui::run_login_flow_for(
+                                        login.account,
+                                        login.hello_needs_reenrolment,
+                                    )
+                                },
+                                // Asked of a NAMED directory. The active-profile
+                                // form would report the account being left.
+                                login_ui::check_bw_status_details_in,
+                                &mut resettle,
+                            );
+                            Some(("add an account".to_string(), outcome))
+                        }
+                        _ => {
+                            log::warn!("cannot add an account: this app has none to add one to");
+                            None
+                        }
+                    }
+                } else if remove_clicked {
+                    match (accounts_state.as_mut(), active_account.as_mut()) {
+                        (Some(state), Some(active)) => {
+                            let doomed = state.active().id.clone();
+                            let label = account_label(state.active()).to_string();
+                            if confirm_account_removal(&label) {
+                                if let Err(reason) = remove_account(
+                                    &config_dir,
+                                    &settings_path,
+                                    state,
+                                    &doomed,
+                                    active,
+                                    &mut store,
+                                    &mut resettle,
+                                    // **`bw_logout_in`, never `bw_logout`.**
+                                    // The active-profile form acts on whatever
+                                    // this process is pointed at, and by the
+                                    // time the logout runs the app has already
+                                    // settled onto the SURVIVOR -- so it would
+                                    // sign out the account the user is keeping
+                                    // and leave the doomed one logged in on the
+                                    // server.
+                                    login_ui::bw_logout_in,
+                                ) {
+                                    log::warn!("could not remove {label}: {reason}");
+                                    message_box("Deskwarden", &reason, MB_ICONERROR | MB_OK);
+                                }
+                            }
+                            None
+                        }
+                        _ => {
+                            log::warn!("cannot remove an account: this app has none");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((what, outcome)) = reported {
+                    match outcome {
+                        // Nothing to say: the app is where the user wanted it.
+                        SwitchOutcome::Switched => log::info!("{what}: done"),
+                        // Not an error and not raised as one. The submenu gates
+                        // "Add account..." on `can_add()`, so this is the
+                        // cancelled sign-in and never the refused gate -- the
+                        // two are the same variant, and a message box saying
+                        // "cancelled" for a `relativeDataDir` block would be
+                        // naming something that never happened.
+                        SwitchOutcome::Declined => {
+                            log::info!("the request to {what} was cancelled; nothing changed")
+                        }
+                        SwitchOutcome::RolledBack { reason } => {
+                            log::warn!("could not {what}: {reason}");
+                            message_box(
+                                "Deskwarden",
+                                &format!(
+                                    "Could not {what}.\n\n{reason}\n\nYou are still signed in \
+                                     to the account you were on.",
+                                ),
+                                MB_ICONERROR | MB_OK,
+                            );
+                        }
+                        SwitchOutcome::StoodDown { reason } => {
+                            log::error!("could not {what}, and could not go back: {reason}");
+                            message_box(
+                                "Deskwarden",
+                                &format!(
+                                    "Could not {what}.\n\n{reason}\n\nAutofill is stood down. \
+                                     Use the tray's \"Sync\" to bring it back.",
+                                ),
+                                MB_ICONERROR | MB_OK,
+                            );
+                        }
+                    }
+                }
+            }
+            // **Unconditional, and outside the borrow above.** Every one of the
+            // three actions can change what the submenu should say -- and so
+            // can one that failed, since a rolled-back switch still leaves the
+            // list it was built from intact but the ids it minted stale. A
+            // submenu rebuilt only on success is one whose ids outlive the
+            // state they name.
+            if add_clicked || remove_clicked || switch_target.is_some() {
+                tray.rebuild_accounts_menu(accounts_state.as_ref());
                 last_dispatched_hwnd = None;
             }
 
@@ -1324,6 +1571,38 @@ fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
             style | MB_SETFOREGROUND | MB_SYSTEMMODAL,
         )
     }
+}
+
+/// The text of the confirmation shown before an account's profile is deleted.
+///
+/// A pure function, so what the user is actually told can be asserted: the
+/// dialog itself is a `MessageBoxW` no test can drive, and a confirmation whose
+/// wording drifted into "Remove this account?" would be asking about something
+/// far less final than what happens next.
+fn account_removal_warning(label: &str) -> String {
+    format!(
+        "Remove {label} from Deskwarden?\n\nThis signs that account out and DELETES its local \
+         Bitwarden profile from this computer, including its saved session and its Windows \
+         Hello quick unlock. Your vault on the server is not touched, and you can sign in to \
+         this account again afterwards.\n\nThis cannot be undone."
+    )
+}
+
+/// Asks before deleting an account's profile. `true` only on an explicit Yes.
+///
+/// Defaulted to No (`MB_DEFBUTTON2`), the same way the unrecognized-CLI prompt
+/// is and for the same reason: this is the second most destructive thing this
+/// app does, and a stray Return should not be what does it.
+fn confirm_account_removal(label: &str) -> bool {
+    let answer = message_box(
+        "Deskwarden: remove account",
+        &account_removal_warning(label),
+        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
+    );
+    if answer != IDYES {
+        log::info!("the removal of {label} was cancelled; nothing has been deleted");
+    }
+    answer == IDYES
 }
 
 /// Logs `message`, shows it to the user, and exits.
@@ -2563,9 +2842,8 @@ enum SwitchOutcome {
 /// way left to remove it. Written last, a crash leaves the directory orphaned
 /// but intact, which is the survivable shape.
 #[allow(clippy::too_many_arguments)]
-// The live caller is the switcher in Task 14; until then only this file's
-// tests build one.
-#[allow(dead_code)]
+// Live since Task 15: the tray's "Accounts" submenu offers "Remove <account>..."
+// whenever `AccountsState` says there is a survivor to settle onto.
 fn remove_account(
     config_dir: &Path,
     settings_path: &Path,
@@ -2722,9 +3000,8 @@ fn remove_account(
 /// protects — a body that *also* called the real ones directly would make the
 /// observations above a lie while every test stayed green.
 #[allow(clippy::too_many_arguments)]
-// The live caller is the switcher in Task 14; until then only this file's
-// tests build one.
-#[allow(dead_code)]
+// Live since Task 15: the tray's "Accounts" submenu offers "Add account..."
+// whenever `AccountsState::can_add` allows it.
 fn add_account(
     config_dir: &Path,
     settings_path: &Path,
