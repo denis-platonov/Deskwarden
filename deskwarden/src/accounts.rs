@@ -223,11 +223,11 @@ pub fn next_active_after_removal<'a>(
 /// files *inside* it and neither writer creates it:
 /// [`SessionStore::new`](crate::session_store::SessionStore::new) is explicit
 /// that "its parent directory must already exist — the account directory is
-/// created when the account is". For a migrated account the copy created it;
-/// for an account this app mints (a first install, where there was no profile
-/// to migrate) nothing has, and without this call the very first `store.save`
-/// fails with "the system cannot find the path specified" — logged, survivable,
-/// and invisible except as a master-password prompt on every launch forever.
+/// created when the account is". [`prepare_new_account`] creates the directory
+/// for an account added mid-session; an account [`resolve_startup`] mints has
+/// none, and without this call the very first `store.save` fails with "the
+/// system cannot find the path specified" — logged, survivable, and invisible
+/// except as a master-password prompt on every launch forever.
 ///
 /// Idempotent, so startup can call it unconditionally rather than deciding
 /// which of the two cases it is in.
@@ -306,8 +306,8 @@ pub fn discard_prepared_account(config_dir: &Path, id: &AccountId) {
 /// The `starts_with` check is belt and braces over [`AccountId::parse`], which
 /// already makes `..` and an absolute path unrepresentable. It is here because
 /// of what being wrong costs: a path that escaped the accounts root would take
-/// `settings.json`, the log, and *every other account's* migrated profile with
-/// it. Refusing returns `Err` and deletes nothing.
+/// `settings.json`, the log, and *every other account's* profile with it.
+/// Refusing returns `Err` and deletes nothing.
 ///
 /// A directory that is already gone is `Ok`: "there is no such directory" is
 /// the goal state, however we got there.

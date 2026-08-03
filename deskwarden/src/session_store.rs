@@ -23,7 +23,7 @@ pub struct SessionStore {
 impl SessionStore {
     /// `path` is one account's `session.bin`; see the type's own doc. Its
     /// parent directory must already exist — the account directory is created
-    /// when the account is (`accounts`/`migration`), not lazily here, so that
+    /// when the account is (`accounts::ensure_account_dir`), not lazily here, so that
     /// a token can never be the thing that brings an account directory into
     /// being.
     pub fn new(path: PathBuf) -> Self {

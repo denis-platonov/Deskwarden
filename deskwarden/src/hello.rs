@@ -144,9 +144,8 @@ pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
 /// The old justification recorded here was that "a stale credential from an
 /// abandoned enrollment has no blob to pair with and is worthless", so
 /// replacing it was free. Both halves of that are now false. A stale *blob* is
-/// dealt with by deleting the blob — [`unenroll_for`], [`open_blob`]'s
-/// delete-on-failure, and `migration`'s removal of the pre-migration
-/// `hello.bin`, which no account's suffix can open anyway. A stale *credential*
+/// dealt with by deleting the blob — [`unenroll_for`] and [`open_blob`]'s
+/// delete-on-failure. A stale *credential*
 /// is not worthless: it is the one credential every other account depends on,
 /// and rotating it is the single most destructive thing this module could do.
 ///
@@ -442,11 +441,11 @@ mod tests {
     }
 
     #[test]
-    fn no_account_reproduces_the_pre_migration_derivation() {
+    fn no_account_reproduces_the_single_account_derivation() {
         // The pre-accounts key was SHA-256(KDF_LABEL ‖ signature) -- an empty
-        // suffix. If any account reproduced it, a `hello.bin` that a FAILED
-        // migration left behind in the config directory could be opened under
-        // that account's identity. `hello_kdf_suffix_for` returning an empty
+        // suffix. If any account reproduced it, a `hello.bin` left in the
+        // config directory by a version before this feature could be opened
+        // under that account's identity. `hello_kdf_suffix_for` returning an empty
         // suffix for any id -- the obvious "the first account keeps working"
         // shortcut -- fails this.
         let mut old = Sha256::new();
@@ -458,7 +457,7 @@ mod tests {
             assert_ne!(
                 key_for(&id(raw)).as_slice(),
                 &old,
-                "account {raw} derives the pre-migration key"
+                "account {raw} derives the single-account key"
             );
         }
 
@@ -495,8 +494,8 @@ mod tests {
         let paths: HashSet<PathBuf> = ids.iter().map(|i| blob_path_for(cfg, i)).collect();
         assert_eq!(paths.len(), ids.len(), "two accounts share a hello.bin");
 
-        // ...and none of them is the pre-accounts location, which a failed
-        // migration can still have a file at.
+        // ...and none of them is the pre-accounts location, which a machine
+        // upgraded from an earlier version can still have a file at.
         for i in &ids {
             assert_ne!(blob_path_for(cfg, i), cfg.join("hello.bin"));
         }
@@ -647,10 +646,9 @@ mod tests {
         // it. What it would do is the point -- the replacing option rotates
         // the ONE credential every account's key comes from, so enrolling
         // account B would silently destroy account A's enrolment and A would
-        // find out at the moment it next tried to unlock. Migration makes that
-        // worse rather than better: it is what leaves stale blobs around, and
-        // the answer to a stale blob is to DELETE IT, never to rotate the
-        // credential.
+        // find out at the moment it next tried to unlock. A stale blob is
+        // not a reason to reach for it either: the answer to a stale blob is
+        // to DELETE IT, never to rotate the credential.
         //
         // Both needles are `concat!`-split so neither matches its own
         // declaration here, and single-line so neither depends on whether this

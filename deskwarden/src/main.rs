@@ -590,7 +590,7 @@ fn main() {
     let mut tray = tray::build_tray();
     // Filled once here, so the submenu is correct before the user can open it,
     // and again after every account change below. `accounts_state` is `None`
-    // for `StartupAccounts::Unmigrated` -- see `tray::accounts_menu_plan`,
+    // for `StartupAccounts::NoAccountList` -- see `tray::accounts_menu_plan`,
     // which says so in the menu rather than leaving it empty.
     tray.rebuild_accounts_menu(accounts_state.as_ref());
 
@@ -2351,8 +2351,8 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // account -- the active one included, and duplicate ids included --
         // and it is not emptied when switching is refused. Re-checking here
         // rather than trusting the id the window sent back costs nothing and
-        // means the CLI-availability and migration refusals are enforced on
-        // this side of the window too.
+        // means the CLI-availability refusal is enforced on this side of the
+        // window too.
         let picked = accounts
             .as_ref()
             .and_then(|state| state.switchable().iter().find(|a| a.id == target))
@@ -2818,9 +2818,9 @@ enum SwitchOutcome {
 /// account's profile out, deletes it, and only then writes the shorter list.
 ///
 /// This deletes a real encrypted vault profile from the user's disk, which is
-/// the most destructive thing this app does short of the migration. So the
-/// order is the whole of it, and each step is chosen for what a crash
-/// *immediately after it* leaves behind.
+/// the most destructive thing this app does. So the order is the whole of it,
+/// and each step is chosen for what a crash *immediately after it* leaves
+/// behind.
 ///
 /// **1. The account being removed must not be the one the app is on.** If it
 /// is, the app settles onto `accounts::next_active_after_removal` first,
@@ -2841,8 +2841,8 @@ enum SwitchOutcome {
 /// **2. The gate is `AccountsState`'s, not the machine's.** The account the app
 /// has to reach — the survivor, or the target itself when it is not active —
 /// has to be one `AccountsState::switchable` offers. That is one question
-/// rather than a second reading of the CLI's availability and the migration's
-/// outcome, and it is the *right* question: where multiple accounts are
+/// rather than a second reading of the CLI's availability, and it is the
+/// *right* question: where multiple accounts are
 /// unavailable, every account shares one profile, so `bw logout` in the doomed
 /// account's directory would log out **the active account** and the deletion
 /// would take a directory the CLI never used.
@@ -2995,19 +2995,17 @@ fn remove_account(
 /// it with the **same** switch every other account change goes through — or
 /// leaves the app exactly where it started, with nothing left behind.
 ///
-/// **The gate is asked, not answered.** `state.can_add()` combines the two
-/// independent reasons multi-account may be unavailable (see
-/// [`accounts::AccountsState`]), and an account added under either is a profile
-/// this app cannot reliably reach again: one the CLI ignores
-/// `BITWARDENCLI_APPDATA_DIR` for, so every account shares one profile, or one
-/// beside a migration that never populated the account directories.
+/// **The gate is asked, not answered.** `state.can_add()` is the one answer to
+/// whether multi-account is available at all (see [`accounts::AccountsState`]),
+/// and an account added while it says no is a profile this app cannot reliably
+/// reach again: the CLI ignores `BITWARDENCLI_APPDATA_DIR` there, so every
+/// account it offers is served the one portable profile.
 ///
 /// **The sign-in runs in the new account's own directory, and the way it gets
 /// there is an argument, not a global.** `bw login` signs in to whatever
 /// profile `BITWARDENCLI_APPDATA_DIR` names and *replaces* whatever was there,
 /// so a sign-in aimed at the active account's directory would not add an
-/// account — it would sign the existing one out and overwrite it, and after
-/// the migration that existing one is the user's only vault. No end state
+/// account — it would sign the existing one out and overwrite it. No end state
 /// distinguishes the two, which is why
 /// `the_sign_in_runs_with_the_cli_pointed_at_the_new_accounts_directory`
 /// records what the sign-in could *see* rather than what it left behind.
@@ -3029,14 +3027,34 @@ fn remove_account(
 /// active account. The state to avoid is an entry naming a directory with no
 /// profile in it, which presents as an account that is permanently signed out.
 ///
-/// **The list is written after the switch lands, not before.** The plan has it
-/// the other way round, and the difference is what a failure costs. Written
-/// first, a rolled-back add needs a *second* write to undo, and if that one
-/// fails the entry outlives the directory it names — the permanently
-/// signed-out account above, and until account removal exists the user cannot
-/// even delete it. Written last, a failed persist costs them the account on the
-/// next launch with its directory orphaned but intact, which is the same
-/// survivable shape startup's own `needs_persist` failure already has.
+/// **The account is written to `settings.json` before the switch, and the
+/// active id after it.** Two writes, and the split is what makes a stranded
+/// profile unrepresentable rather than merely unlikely.
+///
+/// The window to close is the one between "`bw login` has written
+/// `accounts/<id>/data.json`" and "something on disk names that directory".
+/// This function used to close it *after* the switch, so a failed
+/// `persist_accounts` left a signed-in profile no launch could ever reach —
+/// the state a whole scan-and-adopt path in the deleted `migration` module
+/// existed to recover from, and the one it was found to be still reachable
+/// through. Written before the switch instead, a failed write has nothing to
+/// undo: the switch has not happened, so the response is
+/// [`accounts::discard_prepared_account`] and a rollback, exactly as for a
+/// closed sign-in window. It costs the user the sign-in they just did — the
+/// directory is a local cache and a session token, and the vault itself is on
+/// Bitwarden's servers — and it leaves nothing behind.
+///
+/// The active id stays on the account being *left* until the switch actually
+/// lands, so the only thing a failed second write costs is that the next
+/// launch resumes the old account with the new one listed beside it. Writing
+/// the new id up front would instead point the next launch at a directory this
+/// function may be about to delete.
+///
+/// Every remaining failure therefore leaves an entry whose directory is gone,
+/// never a directory nothing names — and an entry whose directory is gone is
+/// self-healing: `ensure_account_dir` recreates it and the login window signs
+/// in to it, or the user removes it. That asymmetry is the whole reason this
+/// ordering was chosen over keeping a path that scans for orphans.
 ///
 /// `sign_in` and `account_details` are injected for the reason every other
 /// window and `bw` spawn in this file is: neither can run in a test. That
@@ -3077,6 +3095,10 @@ fn add_account(
         }
     };
     let prepared_dir = accounts::data_dir_for(config_dir, &prepared.id);
+    // Everything from here to the persist below has to end in either a write
+    // that names `prepared_dir` or a delete of it. There is no third answer,
+    // and that is the invariant `a_failed_persist_strands_no_signed_in_profile`
+    // drives.
 
     // **No temporary mutation of `bw_path::set_active_data_dir`.** This used
     // to point the process-global at `prepared_dir`, run `sign_in` -- a
@@ -3127,23 +3149,57 @@ fn add_account(
         );
     }
 
+    // The claim, before the switch. `state.all()` plus the new account rather
+    // than `state.adopt` first: adopting makes it ACTIVE, and it is not active
+    // until the switch below says so.
+    let mut claimed = state.all().to_vec();
+    claimed.push(added.clone());
+    if let Err(e) = settings::Settings::persist_accounts(settings_path, &claimed, Some(&from.id)) {
+        // The signed-in profile in `prepared_dir` is now a directory nothing
+        // will ever name, so it goes. That costs the sign-in that just
+        // happened and nothing else -- the vault is on Bitwarden's servers.
+        let reason = format!(
+            "the new account signed in but could not be written to {}: {e}",
+            settings_path.display()
+        );
+        log::error!("{reason}; discarding it rather than leaving a profile nothing names");
+        accounts::discard_prepared_account(config_dir, &added.id);
+        return SwitchOutcome::RolledBack { reason };
+    }
+
     match switch_to_account(config_dir, &from, &added, active_account, store, resettle) {
         SwitchOutcome::Switched => {
             state.adopt(added.clone());
             if let Err(e) =
                 settings::Settings::persist_accounts(settings_path, state.all(), Some(&added.id))
             {
+                // The account itself is already recorded, so this costs only
+                // which one the next launch resumes.
                 log::error!(
-                    "the new account is live but could not be written to {}: {e}; it will not \
-                     be there on the next launch",
-                    settings_path.display()
+                    "the new account is live but {} could not be updated: {e}; the next launch \
+                     will resume {} instead, with the new account listed beside it",
+                    settings_path.display(),
+                    account_label(&from)
                 );
             }
             SwitchOutcome::Switched
         }
         other => {
             log::warn!("the new account did not settle ({other:?}); discarding it");
-            accounts::discard_prepared_account(config_dir, &added.id);
+            // The entry first, then the directory: the reverse order would
+            // leave a moment in which the list names a directory that is gone,
+            // and a crash inside it is the permanently signed-out account
+            // above. If this write fails the directory is kept, because the
+            // account it holds is real and listed -- the user can switch to it
+            // or remove it.
+            match settings::Settings::persist_accounts(settings_path, state.all(), Some(&from.id)) {
+                Ok(()) => accounts::discard_prepared_account(config_dir, &added.id),
+                Err(e) => log::error!(
+                    "the new account did not settle and could not be removed from {}: {e}; it \
+                     is signed in and will be offered on the next launch",
+                    settings_path.display()
+                ),
+            }
             other
         }
     }
@@ -3205,9 +3261,10 @@ fn switch_to_account(
     store: &mut session_store::SessionStore,
     mut resettle: impl FnMut(&Path, &Account, &session_store::SessionStore) -> ResettleReport,
 ) -> SwitchOutcome {
-    // Whatever it was, not `data_dir_for(from)`: before the migration in Task
-    // 11 has run the app is on the CLI's own default directory, and a rollback
-    // has to put it back there rather than invent an account directory.
+    // Whatever it was, not `data_dir_for(from)`: an app that resolved
+    // `StartupAccounts::NoAccountList` is on the CLI's own default directory,
+    // and a rollback has to put it back there rather than invent an account
+    // directory.
     let previous_dir = bw_path::active_data_dir();
     log::info!("switching accounts: {} -> {}", from.email, to.email);
 
@@ -4209,8 +4266,8 @@ fn recover_from_failed_vault_wait(
 /// them growing two more parameters it does nothing with.
 ///
 /// `account` is `None` in exactly one state --
-/// `accounts::StartupAccounts::Unmigrated`, where this app has no `Account` at
-/// all -- and the window then offers no Windows Hello quick unlock. It never
+/// `accounts::StartupAccounts::NoAccountList`, where this app has no `Account`
+/// at all -- and the window then offers no Windows Hello quick unlock. It never
 /// falls back to an account-less enrolment: the only key derivation available
 /// without an account id is the empty KDF suffix
 /// (`accounts::hello_kdf_suffix_for`'s doc), and one account sealed under that
@@ -5838,9 +5895,9 @@ mod tests {
 
         /// The plan's own gate test, widened to the three files that could
         /// bypass it. `settings.accounts` is the raw list off disk: it has not
-        /// been through the `relativeDataDir` refusal, the migration refusal,
-        /// the active-account exclusion or the duplicate-id dedupe, and a UI
-        /// reading it directly bypasses all four.
+        /// been through the `relativeDataDir` refusal, the active-account
+        /// exclusion or the duplicate-id dedupe, and a UI reading it directly
+        /// bypasses all three.
         #[test]
         fn nothing_offers_an_account_without_going_through_accounts_state() {
             let raw = concat!("settings.accounts", ".iter()");
@@ -5867,16 +5924,14 @@ mod tests {
 
         /// `tray.rs` is on the ban list `no_window_answers_may_i_switch_for_
         /// itself` enforces for `vault_window/mod.rs`, and for the same
-        /// reason: a second reading of the CLI's availability or the
-        /// migration's outcome is a second answer, and the two would first
-        /// disagree exactly where the trap is.
+        /// reason: a second reading of the CLI's availability is a second
+        /// answer, and the two would first disagree exactly where the trap is.
         #[test]
         fn the_tray_does_not_answer_may_i_switch_for_itself() {
             let source = include_str!("tray.rs");
             for banned in [
                 concat!("MultiAccount", "Availability"),
                 concat!("multi_account", "_availability"),
-                concat!("Migration", "State"),
             ] {
                 assert!(
                     !source.contains(banned),
@@ -6713,8 +6768,8 @@ mod tests {
 
     /// WIRING, and the one that decides whether "Add account" ADDS an account
     /// or LOGS THE EXISTING ONE OUT. `bw login` signs in to whatever profile
-    /// `BITWARDENCLI_APPDATA_DIR` names and replaces what was there -- and
-    /// after the migration that profile is the user's only vault.
+    /// `BITWARDENCLI_APPDATA_DIR` names and replaces what was there -- which,
+    /// aimed at the wrong directory, is the account the user is already on.
     ///
     /// **Two halves, and review 13 moved the boundary between them.** The
     /// sign-in must reach the NEW account's directory, and the process-global
@@ -6896,9 +6951,10 @@ mod tests {
         );
     }
 
-    /// The `relativeDataDir` trap and an unfinished migration both reach here,
-    /// and adding an account under either would write a profile the app cannot
-    /// reliably reach again.
+    /// The `relativeDataDir` trap reaches here, and adding an account under it
+    /// would write a profile the app cannot reliably reach again -- the CLI
+    /// ignores `BITWARDENCLI_APPDATA_DIR` there, so both accounts are served
+    /// the one portable profile.
     #[test]
     fn add_is_refused_while_accounts_state_says_it_cannot_be_done() {
         let _guard = lock_active_dir();
@@ -7040,7 +7096,21 @@ mod tests {
             !accounts::hello_blob_path_for(cfg.path(), &minted).exists(),
             "a Windows Hello blob sealing a master password outlived the account it belongs to"
         );
-        assert!(!settings_path.exists(), "a failed add was written to disk");
+        // The file EXISTS now, and that is the point of the ordering: the
+        // account was claimed before the switch was attempted, so what has to
+        // be checked is that the claim was withdrawn rather than that it was
+        // never made. Reading the file back rather than trusting `state`,
+        // because `state` is memory and this is what the next launch sees.
+        let written = std::fs::read_to_string(&settings_path)
+            .expect("the add claimed the account before switching, so the file must be there");
+        assert!(
+            !written.contains(minted.as_str()),
+            "the failed add is still named in settings.json, so the next launch offers an              account whose directory was deleted: {written}"
+        );
+        assert!(
+            written.contains(ACCOUNT_A),
+            "control: the rollback wrote a file that no longer names the existing account either"
+        );
         // Positive controls: the existing account kept everything it had, so
         // the four negatives above are about the new account rather than about
         // a rollback that wiped the accounts root.
@@ -7051,6 +7121,92 @@ mod tests {
         assert!(
             accounts::hello_blob_path_for(cfg.path(), &a.id).exists(),
             "the failed add took the existing account's quick unlock with it"
+        );
+    }
+
+    /// The invariant the deleted `migration` module's scan-and-adopt path
+    /// existed to recover from, closed by ordering instead.
+    ///
+    /// `bw login` writes `accounts/<id>/data.json`. If the account list is
+    /// written only after the switch, a failed write leaves that directory
+    /// signed in and named by nothing — no launch can ever reach it, and the
+    /// only way back was a scan of the accounts root against the stored ids.
+    /// Claiming the account *before* the switch means a failed write has
+    /// nothing to undo: the directory goes, and the cost is the sign-in that
+    /// just happened.
+    ///
+    /// The failure is real rather than injected: `Settings::save` refuses to
+    /// write over a file it could not parse, so an unreadable `settings.json`
+    /// makes every `persist_accounts` in this function fail — which is also
+    /// the one way this can happen in production.
+    ///
+    /// Fails if the persist moves back after the switch, and fails if the
+    /// discard is dropped.
+    #[test]
+    fn a_failed_persist_strands_no_signed_in_profile() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::with_accounts("add-persist-fails", &[ACCOUNT_A]);
+        let a = account(ACCOUNT_A, "a@example.com");
+        let settings_path = cfg.path().join("settings.json");
+        // Not valid settings, so `Settings::save` refuses every write.
+        std::fs::write(&settings_path, b"{ this is not settings").unwrap();
+        let mut state = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone()],
+            &a,
+        );
+        let mut active = a.clone();
+        let mut store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        let minted = std::cell::RefCell::new(None);
+        let outcome = add_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &mut active,
+            &mut store,
+            |prepared| {
+                *minted.borrow_mut() = Some(prepared.id.clone());
+                // What `bw login` leaves: a real, signed-in CLI profile in the
+                // new account's directory. Without this the assertions below
+                // would be about an empty directory and would say nothing
+                // about stranding a vault.
+                std::fs::write(
+                    accounts::data_dir_for(cfg.path(), &prepared.id).join("data.json"),
+                    b"{\"profile\":\"signed in\"}",
+                )
+                .unwrap();
+                Some("session-token".to_string())
+            },
+            |_| signed_in_as("new@example.com"),
+            |_, _, _| ResettleReport::Settled,
+        );
+
+        let minted = minted
+            .into_inner()
+            .expect("control: the sign-in never ran, so nothing was signed in to strand");
+        assert!(
+            matches!(outcome, SwitchOutcome::RolledBack { .. }),
+            "a write that failed was reported as a completed add: {outcome:?}"
+        );
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "a signed-in profile was left in a directory that nothing on disk names -- no \
+             launch can reach it and there is no longer a scan that would find it"
+        );
+        // The app is where it started, and the account the user was already on
+        // kept everything: the positive controls that stop the assertion above
+        // being satisfied by a rollback that wiped the accounts root.
+        assert_eq!(state.all().len(), 1);
+        assert_eq!(state.active().id, a.id);
+        assert_eq!(active.id, a.id);
+        assert!(accounts::session_path_for(cfg.path(), &a.id).exists());
+        assert!(
+            !accounts::data_dir_for(cfg.path(), &minted).exists(),
+            "control: the minted directory is the one that is gone"
         );
     }
 
@@ -7114,9 +7270,9 @@ mod tests {
             (concat!("run_login_flow", "_for("), login_ui_source.as_str()),
             (concat!("run_login", "_flow("), production),
             // No trailing paren on this one: `check_bw_status_details_in` is
-            // spelled without one where startup hands it to `migrate` as a
-            // function item, and handing it on is as much a direct call as
-            // making one. The needle covers the active-profile form
+            // spelled without one where it is handed on as a function item,
+            // and handing it on is as much a direct call as making one. The
+            // needle covers the active-profile form
             // (`check_bw_status_details`) too, which is worse still -- it would
             // label the new account with whatever profile this process is on.
             (concat!("check_bw_status_", "details"), production),
@@ -7457,8 +7613,8 @@ mod tests {
 
     /// `remove_dir_all` on a mis-built path -- an empty id, a `..` that slipped
     /// past `parse`, one `parent()` too many -- takes `settings.json`, the log,
-    /// and the account list naming the survivors with it. And it would take the
-    /// OTHER accounts' migrated profiles too.
+    /// and the account list naming the survivors with it. And it would take
+    /// the OTHER accounts' profiles too.
     #[test]
     fn a_removal_never_deletes_above_the_accounts_directory() {
         let _guard = lock_active_dir();
@@ -8246,7 +8402,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Task 11 -- startup: migrate, resolve, resume.
+    // Task 11 -- startup: resolve, point, resume.
     //
     // `fn main()` never returns and opens real windows, so none of it is
     // reachable from a test. Everything it DECIDES lives in

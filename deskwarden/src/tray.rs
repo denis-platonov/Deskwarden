@@ -25,9 +25,10 @@ const ADD_ACCOUNT: &str = "Add account...";
 const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
 
 /// Shown, disabled, when this process has no `AccountsState` at all --
-/// `StartupAccounts::Unmigrated`, where there is no `Account` in existence and
-/// the app is running against the CLI's own default profile. Not a blocked
-/// state and not a one-account state: there is nothing here to switch *from*.
+/// `StartupAccounts::NoAccountList`, where `settings.json` could not be read,
+/// there is no `Account` in existence, and the app is running against the
+/// CLI's own default profile. Not a blocked state and not a one-account state:
+/// there is nothing here to switch *from*.
 const ACCOUNTS_NOT_SET_UP: &str =
     "Accounts are not set up on this machine yet - restart Deskwarden";
 
@@ -35,11 +36,10 @@ const ACCOUNTS_NOT_SET_UP: &str =
 /// [`AccountsState`](crate::accounts::AccountsState) alone.
 ///
 /// **Every field is an answer this type asked the one door for.** Nothing here
-/// re-derives "may I switch" from the CLI's availability or the migration's
-/// outcome -- `tray.rs` is on the ban list
-/// `no_window_answers_may_i_switch_for_itself` enforces, and it is on it for
-/// the same reason `vault_window/mod.rs` is: a second reading of those two
-/// facts is a second answer, and the two would disagree exactly where the trap
+/// re-derives "may I switch" from the CLI's availability -- `tray.rs` is on the
+/// ban list `no_window_answers_may_i_switch_for_itself` enforces, and it is on
+/// it for the same reason `vault_window/mod.rs` is: a second reading of that
+/// fact is a second answer, and the two would disagree exactly where the trap
 /// is.
 ///
 /// Separated from the `muda` construction below because that construction
@@ -92,7 +92,7 @@ pub fn remove_account_label(active: &str) -> String {
 
 /// Decides the submenu's contents. See [`AccountsMenuPlan`].
 ///
-/// `None` is `StartupAccounts::Unmigrated`: `main` builds no `AccountsState`
+/// `None` is `StartupAccounts::NoAccountList`: `main` builds no `AccountsState`
 /// there because there is no `Account` to build one around, and
 /// `vault_window::run` already takes the same `Option`. The submenu is not
 /// hidden in that case -- a menu item that vanishes is a menu item the user
@@ -569,8 +569,8 @@ mod tests {
     }
 
     /// Built through `AccountsState`'s own test constructor, which takes the
-    /// one `Option<String>` `new` distils the CLI's availability and the
-    /// migration's outcome into and computes `switchable` through the same
+    /// one `Option<String>` `new` distils the CLI's availability into and
+    /// computes `switchable` through the same
     /// `switch_targets`. A hand-built state here would be a second idea of
     /// what the tray is allowed to offer, which is the entire thing the one
     /// door exists to prevent.
@@ -657,10 +657,10 @@ mod tests {
         assert!(present.is_remove(&MenuId::new("remove")));
     }
 
-    /// **The `relativeDataDir` refusal and the migration refusal.** A tray that
-    /// offered a switch under either would point the CLI at a directory it
-    /// ignores -- every account sharing one profile -- and the user would watch
-    /// the switch "work" and change nothing.
+    /// **The `relativeDataDir` refusal.** A tray that offered a switch under it
+    /// would point the CLI at a directory it ignores -- every account sharing
+    /// one profile -- and the user would watch the switch "work" and change
+    /// nothing.
     #[test]
     fn a_blocked_state_offers_no_switch_and_no_add() {
         let blocked = accounts_menu_plan(Some(&blocked_two_accounts()));
@@ -766,7 +766,7 @@ mod tests {
         );
     }
 
-    /// `StartupAccounts::Unmigrated`: there is no `Account` in existence, so
+    /// `StartupAccounts::NoAccountList`: there is no `Account` in existence, so
     /// `main` has no `AccountsState` to hand over. The submenu still says
     /// something -- a control that vanishes is one the user concludes they
     /// imagined -- and offers nothing that would act on an account list that

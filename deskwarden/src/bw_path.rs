@@ -87,8 +87,9 @@ static ACTIVE_DATA_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Points every subsequent `bw` spawn at `dir`.
 ///
-/// `None` means "the CLI's own default directory", which is what the app runs
-/// with before the migration to per-account directories has happened.
+/// `None` means "the CLI's own default directory", which the app runs with in
+/// exactly one state: `accounts::StartupAccounts::NoAccountList`, where it has
+/// no account of its own to point at.
 pub fn set_active_data_dir(dir: Option<PathBuf>) {
     *ACTIVE_DATA_DIR
         .write()
@@ -112,13 +113,11 @@ pub fn active_data_dir() -> Option<PathBuf> {
 ///
 /// `dir == None` sets **no** `BITWARDENCLI_APPDATA_DIR` at all — not an empty
 /// one, which the CLI would treat as a real (and nonsensical) directory rather
-/// than as "use your default". Migration reads the pre-existing profile
-/// through exactly this form, so the difference is the difference between
-/// migrating the user's vault and migrating nothing.
+/// than as "use your default".
 ///
 /// Takes the directory as an argument rather than always reading
-/// [`active_data_dir`] so migration can talk to the source profile and the
-/// copy in turn without ever disturbing the global that background threads are
+/// [`active_data_dir`] so `add_account` can sign in to a *new* account's
+/// directory without ever disturbing the global that background threads are
 /// reading.
 pub fn bw_command_in(dir: Option<&Path>) -> Result<Command, String> {
     match verified_bw_exe() {
@@ -289,33 +288,6 @@ fn resolve_bw_exe_with(exe_dir: Option<&Path>, path_var: &OsStr) -> Option<PathB
 /// `bin\`, so the two are genuinely different directories here.
 pub fn relative_data_dir(bw_exe: &Path) -> Option<PathBuf> {
     bw_exe.parent().map(|dir| dir.join("bitwarden-cli"))
-}
-
-/// The CLI's own fallback profile location on Windows —
-/// `path.join(process.env.APPDATA, "Bitwarden CLI")` — which is where the
-/// pre-existing single-account profile lives, and so what migration copies
-/// *from*.
-///
-/// The pure half, taking `%APPDATA%` as an argument, so the join can be
-/// asserted against a literal without depending on the machine running the
-/// test.
-///
-/// **A candidate, never a fact.** If the directory does not exist, or holds no
-/// `data.json`, there is simply nothing to migrate — the ordinary first-install
-/// case, to be handled as such rather than as an error. Nothing may be deleted
-/// on the strength of this path alone.
-///
-/// `None` when `%APPDATA%` is unset: with no `%APPDATA%` the CLI's own
-/// `path.join` would throw, so there is no default profile directory to name,
-/// and inventing one (the working directory, say) would point migration at a
-/// directory that has nothing to do with the CLI.
-pub fn cli_default_data_dir_from(appdata: Option<&OsStr>) -> Option<PathBuf> {
-    appdata.map(|a| Path::new(a).join("Bitwarden CLI"))
-}
-
-/// [`cli_default_data_dir_from`] against this process's real `%APPDATA%`.
-pub fn cli_default_data_dir() -> Option<PathBuf> {
-    cli_default_data_dir_from(std::env::var_os("APPDATA").as_deref())
 }
 
 /// Whether deskwarden may offer more than one account at all.
@@ -493,9 +465,9 @@ mod tests {
     fn a_command_built_for_the_cli_default_sets_no_appdata_env_var_at_all() {
         // NOT "sets it to empty", and not `env_remove` either: an absent
         // variable is the only form the CLI reads as "use your own default".
-        // Migration reads the SOURCE profile through this exact form, so
-        // getting it wrong means migrating from the wrong directory -- or from
-        // nothing.
+        // It is what an account-less app spawns `bw` with, and setting an
+        // empty string instead would point the CLI at a directory that is not
+        // a directory.
         ensure_verified_exe();
 
         let cmd = bw_command_in(None).expect("a verified exe was just recorded");
@@ -562,45 +534,6 @@ mod tests {
         let cmd = crate::bw_serve::bw_serve_command("not-a-real-token")
             .expect("a verified exe was just recorded");
         assert_eq!(appdata_env_entries(&cmd), Vec::new());
-    }
-
-    #[test]
-    fn the_cli_default_profile_directory_is_bitwarden_cli_under_appdata() {
-        assert_eq!(
-            cli_default_data_dir_from(Some(OsStr::new(r"C:\Users\me\AppData\Roaming"))),
-            Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\Bitwarden CLI")),
-        );
-        // The space is load-bearing and the case is load-bearing: this is a
-        // literal directory name the CLI creates, and migration reading
-        // `BitwardenCLI` or `bitwarden-cli` instead would find nothing to
-        // migrate and report a first install.
-        assert_ne!(
-            cli_default_data_dir_from(Some(OsStr::new(r"C:\Users\me\AppData\Roaming"))),
-            Some(PathBuf::from(r"C:\Users\me\AppData\Roaming\bitwarden-cli")),
-        );
-        assert_eq!(
-            cli_default_data_dir_from(None),
-            None,
-            "with no %APPDATA% there is no default profile directory to name, and inventing \
-             one would point migration somewhere unrelated to the CLI"
-        );
-    }
-
-    #[test]
-    fn the_live_cli_default_reads_the_real_appdata_variable() {
-        // WIRING for the impure half: `cli_default_data_dir()` answering from
-        // anything other than `%APPDATA%` would leave the pure test above
-        // green while migration read the wrong directory.
-        assert_eq!(
-            cli_default_data_dir(),
-            cli_default_data_dir_from(std::env::var_os("APPDATA").as_deref()),
-        );
-        // And on a machine that has %APPDATA% -- every Windows one -- it is a
-        // real answer rather than None, so the equality above is not two Nones.
-        if std::env::var_os("APPDATA").is_some() {
-            let dir = cli_default_data_dir().expect("%APPDATA% is set, so this cannot be None");
-            assert!(dir.ends_with("Bitwarden CLI"), "got {}", dir.display());
-        }
     }
 
     /// Every `.rs` file under `dir`, recursively.

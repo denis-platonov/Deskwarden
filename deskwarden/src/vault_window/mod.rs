@@ -265,8 +265,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // What the titlebar's account switcher offers, and the one door to it (see
     // `account_switcher`). By value rather than by reference because the
     // update closure below is `'static`; `None` in exactly one state --
-    // `StartupAccounts::Unmigrated`, where this app has no `Account` at all --
-    // and the titlebar then carries no switcher.
+    // `StartupAccounts::NoAccountList`, where this app has no `Account` at all
+    // -- and the titlebar then carries no switcher.
     accounts: Option<crate::accounts::AccountsState>,
 ) -> VaultWindowResult {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
@@ -4002,15 +4002,13 @@ const SWITCHER_MENU_WIDTH: f32 = 300.0;
 ///
 /// **A blocked state paints the reason rather than an empty menu**, and that is
 /// the only thing this window does with `blocked_reason`. Silently offering no
-/// rows would read as "you have one account"; the refusals this gate exists for
-/// (a `bitwarden-cli` directory beside `bw.exe`, a migration that did not land)
-/// are both things the user can go and act on, and neither is visible anywhere
-/// else in this window.
+/// rows would read as "you have one account"; the refusal this gate exists for
+/// (a `bitwarden-cli` directory beside `bw.exe`) is something the user can go
+/// and act on, and it is not visible anywhere else in this window.
 ///
-/// `None` accounts — `StartupAccounts::Unmigrated`, where this app has no
+/// `None` accounts — `StartupAccounts::NoAccountList`, where this app has no
 /// `Account` at all — draws no control whatsoever. There is nothing to say
-/// about accounts in an app that is running as the single-account app it was
-/// before this feature existed.
+/// about accounts in an app whose account list could not be read.
 fn account_switcher(
     ui: &mut egui::Ui,
     accounts: Option<&crate::accounts::AccountsState>,
@@ -9657,10 +9655,9 @@ mod account_switcher_tests {
     }
 
     /// **A refusal is said out loud.** Painting nothing is indistinguishable
-    /// from "you have one account", and both refusals this gate exists for --
-    /// a `bitwarden-cli` directory beside `bw.exe`, a migration that did not
-    /// land -- are things the user can go and act on. Nothing else in this
-    /// window mentions either.
+    /// from "you have one account", and the refusal this gate exists for -- a
+    /// `bitwarden-cli` directory beside `bw.exe` -- is something the user can
+    /// go and act on. Nothing else in this window mentions it.
     #[test]
     fn a_blocked_state_paints_the_reason_instead_of_a_switcher() {
         let mut switcher = Switcher::new();
@@ -9766,9 +9763,9 @@ mod account_switcher_tests {
         );
     }
 
-    /// `StartupAccounts::Unmigrated`: this app has no `Account` at all and is
-    /// running as the single-account app it was before this feature existed.
-    /// There is nothing to say about accounts, so there is no control.
+    /// `StartupAccounts::NoAccountList`: this app has no `Account` at all,
+    /// because `settings.json` could not be read. There is nothing to say
+    /// about accounts, so there is no control.
     #[test]
     fn an_app_with_no_account_list_draws_no_switcher_at_all() {
         let mut switcher = Switcher::new();

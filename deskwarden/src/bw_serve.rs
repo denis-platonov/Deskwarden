@@ -66,7 +66,7 @@ pub const BACKEND_OP_TIMEOUT: Duration = Duration::from_secs(90);
 /// is still holding the port, our freshly spawned `bw serve` will fail to bind
 /// and `VaultBridge` would end up talking to an unknown process holding an
 /// unknown session.
-pub fn port_in_use(port: u16) -> bool {
+fn port_in_use(port: u16) -> bool {
     let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     TcpStream::connect_timeout(&addr.into(), Duration::from_millis(300)).is_ok()
 }

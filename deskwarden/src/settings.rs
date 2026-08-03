@@ -354,11 +354,12 @@ pub struct Settings {
     /// **Owned by the account code, not by the preferences window** -- see
     /// [`Self::persist_accounts`], the third read-modify-write over this file.
     ///
-    /// Empty is not "no accounts exist"; it is *"the migration has not run
-    /// yet"*, which is the startup condition `migration` keys
-    /// `accounts_already_configured` off. An older `settings.json` written
-    /// before this field existed therefore parses as empty and is treated as a
-    /// pre-migration profile, which is exactly right.
+    /// Empty means *"no accounts yet"*, which is the startup condition
+    /// [`accounts::resolve_startup`](crate::accounts::resolve_startup) mints
+    /// one for. An older `settings.json` written before this field existed
+    /// therefore parses as empty and is treated as a machine with no accounts
+    /// set up, which is exactly right: it gets one account directory and one
+    /// sign-in.
     ///
     /// **No secrets, and no data directory.** An account carries its opaque
     /// id, the email to show in the menu, and the server URL. The CLI profile
@@ -388,15 +389,21 @@ pub struct Settings {
     /// [`Self::default`], and for the preference fields that is right — a
     /// corrupt file is not a reason to refuse to start. For
     /// [`Self::accounts`] it is not, and the reason is the meaning that field
-    /// carries: an empty list is *"the migration has not run yet"*. So a
-    /// single unparseable account id — a hand edit, a truncated write — would
-    /// otherwise present as a machine that has never migrated, and startup
-    /// would mint a fresh account and [`Self::persist_accounts`] would write
-    /// it over the list it could not read. The vault would still be in
-    /// `accounts/<old-id>/`, and nothing on disk would still say so.
+    /// carries: an empty list is *"no accounts yet — mint one and sign in"*.
+    /// So a single unparseable account id — a hand edit, a truncated write —
+    /// would otherwise present as a first run. Startup would mint a fresh
+    /// account, point the CLI at an empty directory and ask for a master
+    /// password, while the user's account sat in `accounts/<old-id>/`; and
+    /// [`Self::save`] would refuse the write, so the minted id would not even
+    /// be recorded and the next launch would mint another one.
     ///
-    /// So the distinction is kept and acted on twice: startup refuses to
-    /// migrate while it is set, and [`Self::save`] refuses to write at all.
+    /// So the distinction is kept and acted on twice:
+    /// [`accounts::resolve_startup`](crate::accounts::resolve_startup) is
+    /// handed it and answers
+    /// [`StartupAccounts::NoAccountList`](crate::accounts::StartupAccounts::NoAccountList)
+    /// instead of minting, and [`Self::save`] refuses to write at all. The
+    /// second is what makes the first recoverable: the file the user has to
+    /// fix is still there to be fixed.
     #[serde(skip)]
     pub accounts_unreadable: bool,
 }
@@ -549,18 +556,19 @@ impl Settings {
     ///
     /// Free-standing rather than a method for the same reason
     /// [`Self::persist_vault_window_geometry`] is: the callers (adding an
-    /// account, removing one, switching the active one, finishing a
-    /// migration) hold the account list and nothing else, so the only
-    /// `Settings` they could save is one they invented.
+    /// account, removing one, switching the active one, resolving startup)
+    /// hold the account list and nothing else, so the only `Settings` they
+    /// could save is one they invented.
     ///
     /// The blast radius of getting this wrong is worse than the geometry's,
     /// which is why it is its own writer rather than a widening of the
     /// preferences one. `main.rs` loads `Settings` once at startup; if a
     /// preferences save wrote that stale copy's empty list back over a list
     /// this function had persisted mid-session, the account would vanish --
-    /// *and* the next launch would read the empty list as "migration has
-    /// never run" and try to migrate a source profile that is no longer
-    /// there. `persisting_preferences_from_a_stale_copy_keeps_the_account_list`
+    /// *and* the next launch would read the empty list as "no accounts yet",
+    /// mint a second one and ask for a master password while the first
+    /// account's profile sat there unreferenced.
+    /// `persisting_preferences_from_a_stale_copy_keeps_the_account_list`
     /// pins that direction, and
     /// `persisting_accounts_keeps_every_preference_and_the_geometry` the other
     /// two.
@@ -653,7 +661,7 @@ mod tests {
         // is not a reason to refuse to start. What is no longer defaulted away
         // is the knowledge that a file was there and could not be read; see
         // `accounts_unreadable` and
-        // `one_unparseable_account_id_is_not_read_as_a_machine_that_never_migrated`.
+        // `one_unparseable_account_id_is_not_read_as_a_first_run`.
         assert_eq!(
             Settings::load(&path),
             Settings {
@@ -1064,7 +1072,7 @@ mod tests {
         let loaded = Settings::load(&path);
         assert!(
             loaded.accounts.is_empty(),
-            "an absent list is 'migration has not run yet', not a parse failure"
+            "an absent list is 'no accounts yet', not a parse failure"
         );
         assert_eq!(loaded.active_account, None);
         assert!(!loaded.keep_backend_running, "the fields it does carry still land");
@@ -1073,13 +1081,14 @@ mod tests {
     }
 
     #[test]
-    fn one_unparseable_account_id_is_not_read_as_a_machine_that_never_migrated() {
+    fn one_unparseable_account_id_is_not_read_as_a_first_run() {
         // Task 5 pinned "the whole file is discarded" as current behaviour and
-        // left narrowing it to whoever wired migration up. This is that, and
-        // the reason it could not stay: an empty account list MEANS "migration
-        // has not run", so a corrupt id would send startup to mint a fresh
-        // account and persist it over the list -- while the vault stayed in
-        // `accounts/<old-id>/` with nothing on disk still naming it.
+        // left narrowing it to whoever wired the account list up. This is
+        // that, and the reason it could not stay: an empty account list MEANS
+        // "no accounts yet", so a corrupt id would send startup to mint a
+        // fresh account and ask for a master password -- while the user's own
+        // account stayed in `accounts/<old-id>/` with nothing on disk still
+        // naming it.
         let path = temp_path("bad-account-id");
         std::fs::write(
             &path,
@@ -1090,8 +1099,8 @@ mod tests {
         let loaded = Settings::load(&path);
         assert!(
             loaded.accounts_unreadable,
-            "an unreadable account list reads as a first install, which is what re-runs the \
-             migration and overwrites it"
+            "an unreadable account list reads as a first run, which is what mints a second \
+             account beside the one already on disk"
         );
         assert!(loaded.accounts.is_empty(), "control: it still parsed as nothing");
 
@@ -1134,8 +1143,8 @@ mod tests {
     fn an_absent_or_empty_settings_file_is_still_a_first_launch_rather_than_trouble() {
         // The other side of the distinction above, and the one that must NOT
         // move: no file at all is a first launch, and so is the zero-byte file
-        // a crashed write leaves. Reporting either as unreadable would refuse
-        // to migrate on the machine the migration exists for.
+        // a crashed write leaves. Reporting either as unreadable would leave
+        // a brand-new install permanently account-less.
         let path = temp_path("absent");
         let _ = std::fs::remove_file(&path);
         assert!(!Settings::load(&path).accounts_unreadable, "no file at all");
@@ -1307,9 +1316,9 @@ mod tests {
         // written by `persist_accounts`; the user then opens Preferences and
         // changes the auto-lock. A whole-struct save writes main's stale
         // (empty) list back and the added account VANISHES on next launch --
-        // and with an empty list, the NEXT startup thinks migration never ran
-        // and tries to migrate a source directory that no longer exists. Same
-        // trap the geometry fell into, with a far worse blast radius.
+        // and with an empty list, the NEXT startup reads "no accounts yet",
+        // mints another one and asks for a master password. Same trap the
+        // geometry fell into, with a far worse blast radius.
         let path = temp_path("prefs-preserve-accounts");
         let at_startup = Settings::load(&path);
         assert!(at_startup.accounts.is_empty());
@@ -1345,12 +1354,12 @@ mod tests {
         // unparseable and the list still reads as empty -- that has not
         // changed, and it is what keeps a traversal out of `data_dir_for`.
         //
-        // What Task 11 added is the second half: an empty list is the
-        // migration trigger, so the read now also REPORTS that it failed, and
-        // startup refuses to migrate (and `save` refuses to write) while it
-        // says so. Task 5 flagged narrowing this as the decision belonging to
-        // whoever wired migration up; this is it, and it was narrowed by
-        // keeping the distinction rather than by accepting the bad entry.
+        // What Task 11 added is the second half: an empty list is what mints
+        // an account, so the read now also REPORTS that it failed, and startup
+        // mints nothing (and `save` refuses to write) while it says so. Task 5
+        // flagged narrowing this as the decision belonging to whoever wired
+        // the account list up; this is it, and it was narrowed by keeping the
+        // distinction rather than by accepting the bad entry.
         let path = temp_path("accounts-bad-id");
         std::fs::write(
             &path,
