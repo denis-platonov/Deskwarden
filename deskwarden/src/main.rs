@@ -2315,6 +2315,197 @@ enum SwitchOutcome {
     StoodDown { reason: String },
 }
 
+/// How an account is named in a message a user reads.
+///
+/// An account minted by `accounts::resolve_startup` on a first install, or by
+/// `accounts::prepare_new_account`, carries an empty email until a sign-in
+/// fills it in, and `"" could not be removed` names nothing at all.
+fn account_label(account: &Account) -> &str {
+    if account.email.is_empty() {
+        account.id.as_str()
+    } else {
+        &account.email
+    }
+}
+
+/// Removes a Bitwarden account: settles the app somewhere coherent, logs that
+/// account's profile out, deletes it, and only then writes the shorter list.
+///
+/// This deletes a real encrypted vault profile from the user's disk, which is
+/// the most destructive thing this app does short of the migration. So the
+/// order is the whole of it, and each step is chosen for what a crash
+/// *immediately after it* leaves behind.
+///
+/// **1. The account being removed must not be the one the app is on.** If it
+/// is, the app settles onto `accounts::next_active_after_removal` first,
+/// through [`switch_to_account`] — the same switch every other account change
+/// goes through, so there is no second teardown path here either. Deleting
+/// first would run `remove_dir_all` over the profile `bw serve` is at that
+/// moment serving, and leave the app pointed at a directory that no longer
+/// exists. A switch that does not land is a removal that does not happen:
+/// nothing is deleted and the account is still there to try again.
+///
+/// **The last account cannot be removed at all.** There is no coherent place
+/// for the app to land: no profile to point the CLI at, no `session.bin` to
+/// load and no account for the login window to enrol Windows Hello against, so
+/// every window this app opens would be operating on a directory that is not
+/// there. "Log out" already exists and is what emptying the app means; this
+/// refuses, with a message that says so.
+///
+/// **2. The gate is `AccountsState`'s, not the machine's.** The account the app
+/// has to reach — the survivor, or the target itself when it is not active —
+/// has to be one `AccountsState::switchable` offers. That is one question
+/// rather than a second reading of the CLI's availability and the migration's
+/// outcome, and it is the *right* question: where multiple accounts are
+/// unavailable, every account shares one profile, so `bw logout` in the doomed
+/// account's directory would log out **the active account** and the deletion
+/// would take a directory the CLI never used.
+///
+/// **3. `bw logout` runs in that account's OWN directory**, via the injected
+/// closure, which takes the directory as an argument. Never a temporary
+/// mutation of `bw_path::set_active_data_dir`: background threads spawn `bw`
+/// against that global, so a window in which it names another account's profile
+/// is a window in which a sync can land in the wrong vault.
+///
+/// A `bw logout` that fails does not stop the removal. The user asked for this
+/// profile to be gone, and a CLI that cannot be run is not a reason to leave an
+/// encrypted vault and a sealed master password on disk; it is logged and the
+/// deletion goes ahead.
+///
+/// **4. The Hello blob goes first, then the whole directory.**
+/// `accounts::delete_account_dir` takes `session.bin` and `hello.bin` with the
+/// profile — the reasoning `login_ui`'s log-out handler already applies: a
+/// sealed credential for an account the CLI no longer knows is a liability, not
+/// a feature. `hello::unenroll_for` runs first anyway, because a directory that
+/// *cannot* be deleted (a `bw` still holding `data.json` open) would otherwise
+/// leave that sealed master password behind for an account this app has
+/// forgotten. It touches only this account's file and rotates no Windows Hello
+/// credential: one credential seals every account, separated by
+/// `accounts::hello_kdf_suffix_for`, and replacing it would lock every *other*
+/// account's quick unlock out.
+///
+/// **5. The list is written LAST**, for the reason Task 12 established: written
+/// first, a removal that then fails leaves `settings.json` disagreeing with the
+/// disk — an account the app has forgotten whose vault is still there, and no
+/// way left to remove it. Written last, a crash leaves the directory orphaned
+/// but intact, which is the survivable shape.
+#[allow(clippy::too_many_arguments)]
+// The live caller is the switcher in Task 14; until then only this file's
+// tests build one.
+#[allow(dead_code)]
+fn remove_account(
+    config_dir: &Path,
+    settings_path: &Path,
+    state: &mut accounts::AccountsState,
+    target: &accounts::AccountId,
+    active_account: &mut Account,
+    store: &mut session_store::SessionStore,
+    resettle: impl FnMut(&Path, &Account, &session_store::SessionStore) -> ResettleReport,
+    mut logout: impl FnMut(Option<&Path>) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(doomed) = accounts::account_for(state.all(), target).cloned() else {
+        return Err(
+            "that account is not one of this app's accounts, so there is nothing to remove"
+                .to_string(),
+        );
+    };
+
+    let survivor = if state.active().id == doomed.id {
+        Some(
+            accounts::next_active_after_removal(state.all(), target)
+                .ok_or_else(|| {
+                    format!(
+                        "{} is the only account: removing it would leave this app with no \
+                         profile to point the Bitwarden CLI at. Log out instead.",
+                        account_label(&doomed)
+                    )
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
+
+    // Asked of the state, once, for both cases: the account the app has to be
+    // able to REACH is the survivor when the doomed one is active, and the
+    // doomed one itself otherwise.
+    let must_reach = survivor.as_ref().map_or(target, |s| &s.id);
+    if !state.switchable().iter().any(|a| &a.id == must_reach) {
+        return Err(format!(
+            "{} cannot be removed right now: {}",
+            account_label(&doomed),
+            state.blocked_reason().unwrap_or(
+                "this app cannot reach that account, and it will not delete a profile it \
+                 cannot reach"
+            )
+        ));
+    }
+
+    if let Some(survivor) = &survivor {
+        let from = state.active().clone();
+        match switch_to_account(config_dir, &from, survivor, active_account, store, resettle) {
+            SwitchOutcome::Switched => state.adopt(survivor.clone()),
+            other => {
+                return Err(format!(
+                    "{} was not removed: the app could not settle onto {} first ({other:?}), \
+                     and nothing has been deleted",
+                    account_label(&doomed),
+                    account_label(survivor)
+                ))
+            }
+        }
+    }
+
+    let dir = accounts::data_dir_for(config_dir, &doomed.id);
+    if let Err(e) = logout(Some(&dir)) {
+        log::warn!(
+            "`bw logout` for {} failed: {e}; its profile is being deleted anyway",
+            account_label(&doomed)
+        );
+    }
+
+    deskwarden::hello::unenroll_for(config_dir, &doomed.id);
+
+    match accounts::delete_account_dir(config_dir, &doomed.id) {
+        Ok(()) => log::info!(
+            "removed {}: {} is gone",
+            account_label(&doomed),
+            dir.display()
+        ),
+        Err(reason) => log::error!(
+            "{reason}; {} is being removed from the account list anyway, so that directory is \
+             orphaned and can be deleted by hand",
+            account_label(&doomed)
+        ),
+    }
+
+    if !state.forget(&doomed.id) {
+        // Unreachable: this function has already established that the account
+        // is in the list and is not the active one, which are `forget`'s only
+        // two refusals. Logged rather than ignored, because the state it would
+        // mean -- a live entry naming a deleted profile -- is one the user
+        // meets as an account that will not sign in.
+        log::error!(
+            "the account list still holds {} after its profile was deleted",
+            account_label(&doomed)
+        );
+    }
+
+    let active_id = state.active().id.clone();
+    if let Err(e) =
+        settings::Settings::persist_accounts(settings_path, state.all(), Some(&active_id))
+    {
+        log::error!(
+            "{} was removed but the shorter account list could not be written to {}: {e}; it \
+             will be back in the list on the next launch, naming a directory that is gone",
+            account_label(&doomed),
+            settings_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 /// Adds a Bitwarden account: mints one, signs in to it, and then settles onto
 /// it with the **same** switch every other account change goes through — or
 /// leaves the app exactly where it started, with nothing left behind.
@@ -5584,6 +5775,537 @@ mod tests {
                  a second, direct call is invisible to every one of them"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 13 -- removing an account.
+    // ---------------------------------------------------------------------
+
+    /// Everything an account keeps on disk beside its CLI profile. Planted for
+    /// both accounts in every removal test, so "the doomed account's secrets
+    /// went" is always paired with "the other account's did not".
+    fn plant_secrets(cfg: &Path, id: &deskwarden::accounts::AccountId) {
+        std::fs::create_dir_all(accounts::data_dir_for(cfg, id).join("bw")).unwrap();
+        std::fs::write(accounts::session_path_for(cfg, id), b"a-wrapped-token").unwrap();
+        std::fs::write(accounts::hello_blob_path_for(cfg, id), b"sealed").unwrap();
+    }
+
+    /// The two accounts, the state they are in, and the app pointed at `a`.
+    fn an_app_on_a_with_b_beside_it(
+        cfg: &ScratchConfig,
+        availability: deskwarden::bw_path::MultiAccountAvailability,
+    ) -> (
+        Account,
+        Account,
+        accounts::AccountsState,
+        Account,
+        session_store::SessionStore,
+    ) {
+        let a = account(ACCOUNT_A, "a@example.com");
+        let b = account(ACCOUNT_B, "b@example.com");
+        for id in [&a.id, &b.id] {
+            plant_secrets(cfg.path(), id);
+        }
+        let state = accounts_state(availability, vec![a.clone(), b.clone()], &a);
+        let store =
+            session_store::SessionStore::new(accounts::session_path_for(cfg.path(), &a.id));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        let active = a.clone();
+        (a, b, state, active, store)
+    }
+
+    /// WIRING, and the whole of it. `bw logout` with the wrong profile
+    /// directory -- or with none, which is the ACTIVE one -- logs the wrong
+    /// account out, and the account being removed stays signed in on the
+    /// server forever.
+    ///
+    /// The closure also observes the order from the inside, which is the only
+    /// place it is visible: at logout time the profile must still be there
+    /// (logging out after deleting it is a `bw logout` against nothing) and
+    /// `settings.json` must not have been written yet (a list written first
+    /// disagrees with the disk the moment anything below fails).
+    #[test]
+    fn removing_an_account_logs_out_in_that_accounts_own_directory() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-logout");
+        let (a, b, mut state, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+        );
+        let settings_path = cfg.path().join("settings.json");
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled to remove an account it was not on"),
+            |dir| {
+                seen.borrow_mut().push(dir.map(Path::to_path_buf));
+                assert!(
+                    accounts::data_dir_for(cfg.path(), &b.id).is_dir(),
+                    "the profile was deleted before it was logged out, so `bw logout` ran \
+                     against a directory that was not there"
+                );
+                assert!(
+                    !settings_path.exists(),
+                    "the account list was written before the profile was deleted: a removal \
+                     that fails from here leaves settings.json disagreeing with the disk"
+                );
+                Ok(())
+            },
+        )
+        .expect("the removal must succeed");
+
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), 1, "`bw logout` ran {} times", seen.len());
+        assert_eq!(
+            seen[0],
+            Some(accounts::data_dir_for(cfg.path(), &b.id)),
+            "`bw logout` ran in {:?} rather than in the removed account's own directory",
+            seen[0]
+        );
+        assert!(
+            seen[0].is_some(),
+            "`bw logout` ran with no profile directory at all, which is the ACTIVE account's: \
+             removing one account would sign the user out of the other"
+        );
+        assert_ne!(
+            seen[0],
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "`bw logout` ran in the account the app is ON"
+        );
+    }
+
+    /// The account's whole profile goes -- its `session.bin` and its
+    /// `hello.bin` with it, because a sealed master password for an account the
+    /// CLI no longer knows is a liability -- and nothing else does.
+    #[test]
+    fn removing_an_account_deletes_its_secrets_and_only_its_own() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-secrets");
+        let (a, b, mut state, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+        );
+        let settings_path = cfg.path().join("settings.json");
+        assert!(
+            accounts::hello_blob_path_for(cfg.path(), &b.id).exists(),
+            "control: the doomed account really had a sealed master password to lose"
+        );
+
+        remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled to remove an account it was not on"),
+            |_| Ok(()),
+        )
+        .expect("the removal must succeed");
+
+        assert!(!accounts::session_path_for(cfg.path(), &b.id).exists());
+        assert!(
+            !accounts::hello_blob_path_for(cfg.path(), &b.id).exists(),
+            "a Windows Hello blob sealing a master password outlived the account it belongs to"
+        );
+        assert!(!accounts::data_dir_for(cfg.path(), &b.id).exists());
+        // The positive controls, without which every assertion above passes
+        // against a build that deleted the whole accounts root.
+        assert!(
+            accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "the WRONG account's token went"
+        );
+        assert!(
+            accounts::hello_blob_path_for(cfg.path(), &a.id).exists(),
+            "the WRONG account's quick unlock went"
+        );
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string()],
+            "exactly the other account's directory is left"
+        );
+
+        // The app did not move, and the shorter list is on disk.
+        assert_eq!(state.all().len(), 1);
+        assert_eq!(state.active().id, a.id);
+        assert_eq!(active.id, a.id);
+        assert!(
+            state.switchable().is_empty(),
+            "the switcher still offers a door onto a directory that has been deleted"
+        );
+        let stored = settings::Settings::load(&settings_path);
+        assert_eq!(
+            stored.accounts.iter().map(|x| x.id.clone()).collect::<Vec<_>>(),
+            vec![a.id.clone()],
+            "the removed account is still in settings.json, so it is back on the next launch"
+        );
+        assert_eq!(stored.active_account, Some(a.id));
+    }
+
+    /// Removing the account the app is ON. It has to land somewhere coherent
+    /// first, and `bw serve` must not be serving the profile that is about to
+    /// be deleted -- so the switch runs BEFORE anything is removed, and a
+    /// switch that does not land is a removal that does not happen.
+    ///
+    /// And the last account cannot be removed at all: there would be no profile
+    /// to point the CLI at, no `session.bin` to load and no account for the
+    /// login window to enrol Windows Hello against.
+    #[test]
+    fn removing_the_active_account_switches_away_first_and_never_removes_the_last_one() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-active");
+        let (a, b, mut state, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+        );
+        let settings_path = cfg.path().join("settings.json");
+
+        let settled_onto = std::cell::RefCell::new(Vec::new());
+        remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &a.id,
+            &mut active,
+            &mut store,
+            |_, to, store| {
+                settled_onto.borrow_mut().push(to.id.clone());
+                assert!(
+                    accounts::data_dir_for(cfg.path(), &a.id).is_dir(),
+                    "the app was settled onto the survivor only AFTER the account it was on \
+                     had been deleted"
+                );
+                assert_eq!(
+                    store.path(),
+                    accounts::session_path_for(cfg.path(), &to.id),
+                    "the switch authenticated into the wrong account's token file"
+                );
+                ResettleReport::Settled
+            },
+            |_| Ok(()),
+        )
+        .expect("the removal must succeed");
+
+        assert_eq!(
+            settled_onto.into_inner(),
+            vec![b.id.clone()],
+            "the app did not settle onto the survivor exactly once"
+        );
+        assert_eq!(
+            state.active().id, b.id,
+            "the app was left pointing at a removed account"
+        );
+        assert_eq!(active.id, b.id);
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &b.id)),
+            "the CLI was left pointed at the directory the removal deleted"
+        );
+        assert!(!accounts::data_dir_for(cfg.path(), &a.id).exists());
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_B.to_string()],
+            "positive control: the survivor's profile is still there"
+        );
+        assert_eq!(
+            settings::Settings::load(&settings_path).active_account,
+            Some(b.id.clone()),
+            "settings.json still names the removed account as the active one"
+        );
+
+        // The last account, on the same state and the same call.
+        let e = remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled to remove the only account it has"),
+            |_| panic!("the only account was logged out"),
+        )
+        .expect_err("the last account was removed");
+        assert!(
+            e.contains("only account"),
+            "the refusal must say why, got: {e}"
+        );
+        assert_eq!(state.all().len(), 1);
+        assert_eq!(state.active().id, b.id);
+        assert!(
+            accounts::session_path_for(cfg.path(), &b.id).exists(),
+            "the refused removal took the last account's token anyway"
+        );
+        assert!(
+            accounts::hello_blob_path_for(cfg.path(), &b.id).exists(),
+            "the refused removal took the last account's quick unlock anyway"
+        );
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_B.to_string()]
+        );
+    }
+
+    /// A switch that does not land leaves the account exactly where it was.
+    /// `bw serve` is still on the doomed profile at that point -- deleting it
+    /// anyway would take the vault the running app is serving.
+    #[test]
+    fn a_removal_whose_switch_does_not_land_deletes_nothing() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-nosettle");
+        let (a, _b, mut state, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+        );
+        let settings_path = cfg.path().join("settings.json");
+
+        let e = remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &a.id,
+            &mut active,
+            &mut store,
+            |_, _, _| ResettleReport::NotStarted,
+            |_| panic!("a profile was logged out for a removal that could not go ahead"),
+        )
+        .expect_err("an account was removed without the app settling anywhere");
+        assert!(
+            e.contains("nothing has been deleted"),
+            "the failure must say the account is still there, got: {e}"
+        );
+
+        assert_eq!(state.all().len(), 2);
+        assert_eq!(state.active().id, a.id);
+        assert_eq!(active.id, a.id);
+        assert!(accounts::session_path_for(cfg.path(), &a.id).exists());
+        assert!(accounts::hello_blob_path_for(cfg.path(), &a.id).exists());
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string(), ACCOUNT_B.to_string()],
+            "a removal that could not go ahead deleted a profile anyway"
+        );
+        assert!(
+            !settings_path.exists(),
+            "a removal that did not happen was written to disk"
+        );
+    }
+
+    /// `remove_dir_all` on a mis-built path -- an empty id, a `..` that slipped
+    /// past `parse`, one `parent()` too many -- takes `settings.json`, the log,
+    /// and the account list naming the survivors with it. And it would take the
+    /// OTHER accounts' migrated profiles too.
+    #[test]
+    fn a_removal_never_deletes_above_the_accounts_directory() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-scope");
+        let (a, b, mut state, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+        );
+        let settings_path = cfg.path().join("settings.json");
+        let log = cfg.path().join("deskwarden.log");
+        std::fs::write(&log, b"a line").unwrap();
+
+        remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut state,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled to remove an account it was not on"),
+            |_| Ok(()),
+        )
+        .expect("the removal must succeed");
+
+        assert!(
+            !accounts::data_dir_for(cfg.path(), &b.id).exists(),
+            "positive control: the removal really did delete the account it was given"
+        );
+        assert!(log.is_file(), "the log went with the account");
+        assert!(cfg.path().is_dir(), "the config directory was deleted");
+        assert!(
+            accounts::accounts_root(cfg.path()).is_dir(),
+            "the accounts root was deleted"
+        );
+        assert!(
+            accounts::data_dir_for(cfg.path(), &a.id).is_dir(),
+            "the OTHER account's profile went with it"
+        );
+        assert!(accounts::data_dir_for(cfg.path(), &b.id)
+            .starts_with(accounts::accounts_root(cfg.path())));
+    }
+
+    /// The gate, and it is `AccountsState`'s. Where multiple accounts are
+    /// unavailable every account shares ONE profile, so `bw logout` in the
+    /// doomed account's directory would log out the account the app is on and
+    /// the deletion would take a directory the CLI never used.
+    #[test]
+    fn a_removal_is_refused_while_accounts_state_says_the_account_cannot_be_reached() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("remove-blocked");
+        let (_a, b, mut blocked, mut active, mut store) = an_app_on_a_with_b_beside_it(
+            &cfg,
+            deskwarden::bw_path::MultiAccountAvailability::BlockedByUnknownCliPath,
+        );
+        let settings_path = cfg.path().join("settings.json");
+        assert!(blocked.switchable().is_empty(), "control: nothing is reachable");
+
+        let e = remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut blocked,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled for an account it may not remove"),
+            |_| panic!("a profile was logged out for an account that may not be removed"),
+        )
+        .expect_err("an account was removed while the app could not reach it");
+        assert!(
+            blocked
+                .blocked_reason()
+                .is_some_and(|why| e.contains(why)),
+            "the refusal must carry the reason the user can act on, got: {e}"
+        );
+        assert_eq!(blocked.all().len(), 2);
+        assert_eq!(
+            dir_entries(&accounts::accounts_root(cfg.path())),
+            vec![ACCOUNT_A.to_string(), ACCOUNT_B.to_string()],
+            "a profile was deleted for an account that may not be removed"
+        );
+        assert!(!settings_path.exists());
+
+        // The positive control, on the same fixture and the same call: an
+        // unblocked state really does get through, so the refusal above is the
+        // gate rather than a `remove_account` that refuses everything.
+        let mut open = accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            blocked.all().to_vec(),
+            &account(ACCOUNT_A, "a@example.com"),
+        );
+        remove_account(
+            cfg.path(),
+            &settings_path,
+            &mut open,
+            &b.id,
+            &mut active,
+            &mut store,
+            |_, _, _| panic!("the app was resettled to remove an account it was not on"),
+            |_| Ok(()),
+        )
+        .expect("the unblocked removal must succeed");
+        assert_eq!(open.all().len(), 1);
+        assert!(!accounts::data_dir_for(cfg.path(), &b.id).exists());
+    }
+
+    /// `remove_account`'s own body, for the source guard below.
+    ///
+    /// Both ends are named and both are controlled: it starts at the function
+    /// and stops at the first line of the next item's doc comment, rather than
+    /// at a closing brace -- a `"\n}"` needle passes on LF and fails on CRLF,
+    /// and this file is CRLF throughout.
+    fn the_removal_body() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("fn remove_", "account("))
+            .expect("`remove_account` must still exist")
+            .1;
+        let body = after
+            .split_once(concat!(
+                "/// Adds a Bitwarden account: mints one,",
+                " signs in to it, and then settles onto"
+            ))
+            .expect("`add_account`'s doc comment must still follow `remove_account`")
+            .0;
+        assert!(
+            body.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            body.contains(concat!("delete_account", "_dir(")),
+            "control: the region really is the removal's own body"
+        );
+        assert!(
+            !body.contains(concat!("discard_prepared", "_account(")),
+            "control: the region really stops before `add_account`'s body"
+        );
+        body
+    }
+
+    /// What a removal may not do itself, and the one thing it must.
+    ///
+    /// Every needle here is invisible to the behavioural tests above. The
+    /// `bw logout` is injected so those tests can see WHICH PROFILE it runs
+    /// against; a direct `bw_logout()` beside it would log the active account
+    /// out with the suite still green. A raw `remove_dir_all` would work in
+    /// every test here and skip the one check that stands between a mis-built
+    /// path and the user's other vaults. Deleting the secrets by name would
+    /// leave the CLI profile itself behind. Rebuilding `AccountsState` or
+    /// re-asking the machine would be a second reading of the two facts that
+    /// type exists to be the single answer to.
+    ///
+    /// `hello::enroll_for(` is banned rather than incidental: ONE Windows Hello
+    /// credential seals every account, separated by the KDF suffix, so a
+    /// removal that re-created it would lock every OTHER account's quick unlock
+    /// out. It does not match the `hello::unenroll_for(` the body does call.
+    #[test]
+    fn a_removal_deletes_through_the_one_guarded_path_and_logs_out_through_the_injected_one() {
+        let body = the_removal_body();
+        let production = production_half_of_this_file();
+        let source_of = |name: &str| {
+            std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(name),
+            )
+            .unwrap_or_else(|e| panic!("cannot read {name}: {e}"))
+        };
+        let login_ui_source = source_of("login_ui.rs");
+        let accounts_source = source_of("accounts.rs");
+        let bw_path_source = source_of("bw_path.rs");
+
+        for (banned, control) in [
+            (concat!("bw_", "logout("), login_ui_source.as_str()),
+            (concat!("remove_dir", "_all("), accounts_source.as_str()),
+            (concat!("remove_", "file("), production),
+            (concat!("AccountsState", "::new("), production),
+            (
+                concat!("multi_account_", "availability("),
+                bw_path_source.as_str(),
+            ),
+            (concat!("hello::", "enroll_for("), login_ui_source.as_str()),
+            (concat!("fatal_startup", "_error("), production),
+        ] {
+            assert!(
+                control.contains(banned),
+                "control: `{banned}` is really spelled that way, so the ban below is not vacuous"
+            );
+            assert!(
+                !body.contains(banned),
+                "`{banned}` is reachable from `remove_account`, and no test above can see it"
+            );
+        }
+
+        // And the one thing that has no behavioural witness: the sealed master
+        // password is dropped BEFORE the directory, so a profile that cannot be
+        // deleted -- a `bw` still holding `data.json` open -- does not leave one
+        // behind for an account this app has forgotten.
+        let required = concat!("unenroll", "_for(");
+        assert!(
+            source_of("hello.rs").contains(required),
+            "control: `{required}` is really spelled that way"
+        );
+        assert!(
+            body.contains(required),
+            "`{required}` is gone from `remove_account`: the whole directory usually takes the \
+             blob with it, and on the one occasion it does not, a master password stays sealed \
+             on disk for an account nothing names"
+        );
     }
 
     /// A `bw serve` that answers one item carrying an app match, plus the

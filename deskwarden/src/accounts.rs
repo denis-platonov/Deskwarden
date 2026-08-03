@@ -260,24 +260,47 @@ pub fn prepare_new_account(config_dir: &Path) -> Result<Account, String> {
 /// wrong and there is no second recovery to offer, so a failure is logged and
 /// the caller gets on with restoring the account the user was already using.
 pub fn discard_prepared_account(config_dir: &Path, id: &AccountId) {
+    match delete_account_dir(config_dir, id) {
+        Ok(()) => log::info!(
+            "discarded the prepared account directory {}",
+            data_dir_for(config_dir, id).display()
+        ),
+        Err(reason) => log::warn!("{reason}"),
+    }
+}
+
+/// Deletes an account's whole directory — its CLI profile, its `session.bin`
+/// and its `hello.bin` — and is the **only** place in this module that runs
+/// `remove_dir_all` on a path built from an account id.
+///
+/// One implementation with two callers rather than one each:
+/// [`discard_prepared_account`] undoing an abandoned sign-in, and the account
+/// removal in `main`, which is the same deletion asked for on purpose. A second
+/// copy would be a second guard, and the guard is the whole point of the
+/// function.
+///
+/// The `starts_with` check is belt and braces over [`AccountId::parse`], which
+/// already makes `..` and an absolute path unrepresentable. It is here because
+/// of what being wrong costs: a path that escaped the accounts root would take
+/// `settings.json`, the log, and *every other account's* migrated profile with
+/// it. Refusing returns `Err` and deletes nothing.
+///
+/// A directory that is already gone is `Ok`: "there is no such directory" is
+/// the goal state, however we got there.
+pub fn delete_account_dir(config_dir: &Path, id: &AccountId) -> Result<(), String> {
     let dir = data_dir_for(config_dir, id);
-    // Belt and braces over `AccountId::parse`, because this is a
-    // `remove_dir_all` on a path built from an id. If one ever escaped the
-    // accounts root, this call would take `settings.json`, the log, and every
-    // other account's migrated profile with it.
-    if !dir.starts_with(accounts_root(config_dir)) {
-        log::error!(
+    let root = accounts_root(config_dir);
+    if !dir.starts_with(&root) {
+        return Err(format!(
             "refusing to delete {}: it is not under {}",
             dir.display(),
-            accounts_root(config_dir).display()
-        );
-        return;
+            root.display()
+        ));
     }
     match std::fs::remove_dir_all(&dir) {
-        Ok(()) => log::info!("discarded the prepared account directory {}", dir.display()),
-        // Nothing to undo is the goal state, however we got there.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::warn!("could not discard {}: {e}", dir.display()),
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not delete {}: {e}", dir.display())),
     }
 }
 
@@ -560,6 +583,43 @@ impl AccountsState {
         self.active = account;
         self.switchable =
             switch_targets(&self.accounts, &self.active, self.blocked_reason.is_some());
+    }
+
+    /// Drops `removed` from the list, and answers whether it did.
+    ///
+    /// The counterpart of [`adopt`](Self::adopt), and a mutation for the same
+    /// reason: [`new`](Self::new)'s two inputs are not re-derivable at the point
+    /// of a removal, and neither is *changed* by one.
+    ///
+    /// **It refuses to remove the account this process is on**, which is the
+    /// one rule this type needs to keep the two invariants it is built around.
+    /// The active account is always in the list, so refusing the active one is
+    /// also what keeps the list from ever becoming empty — and an empty
+    /// `AccountsState` is exactly the state [`new`](Self::new) returns `None`
+    /// rather than represent, because [`active`](Self::active) hands out an
+    /// `&Account` and there would be none to hand out. The caller that is
+    /// removing the *active* account settles onto the survivor first (see
+    /// [`next_active_after_removal`]) and [`adopt`](Self::adopt)s it, which
+    /// makes the account it is deleting inactive before it gets here.
+    ///
+    /// `false` for an id this state does not hold, so a double removal is a
+    /// no-op rather than a silent success that persists a list nobody changed.
+    pub fn forget(&mut self, removed: &AccountId) -> bool {
+        if &self.active.id == removed {
+            log::error!(
+                "refusing to forget the active account: the app would be left with no account \
+                 to point the CLI at"
+            );
+            return false;
+        }
+        let before = self.accounts.len();
+        self.accounts.retain(|a| &a.id != removed);
+        if self.accounts.len() == before {
+            return false;
+        }
+        self.switchable =
+            switch_targets(&self.accounts, &self.active, self.blocked_reason.is_some());
+        true
     }
 }
 
@@ -1915,6 +1975,42 @@ mod tests {
             discard_prepared_account(cfg.path(), &doomed.id);
             assert!(!data_dir_for(cfg.path(), &doomed.id).exists());
         }
+
+        #[test]
+        fn a_deletion_that_fails_says_so_rather_than_reporting_the_account_gone() {
+            // `discard_prepared_account` can only log; the account removal in
+            // `main` has a user in front of it and a `settings.json` write
+            // behind it, so it needs to be able to tell "the profile is gone"
+            // from "the profile is still sitting there".
+            let cfg = Scratch::new("delete-fails");
+            let obstructed = AccountId::generate();
+            std::fs::create_dir_all(accounts_root(cfg.path())).unwrap();
+            // A file where the account's directory should be: an undeletable
+            // directory (a `bw` still holding data.json open) has the same
+            // shape and cannot be arranged deterministically in a test.
+            std::fs::write(data_dir_for(cfg.path(), &obstructed), b"not a directory").unwrap();
+
+            let e = delete_account_dir(cfg.path(), &obstructed)
+                .expect_err("a deletion that did not happen was reported as done");
+            assert!(
+                e.contains(obstructed.as_str()),
+                "the failure must name the path that survived, got: {e}"
+            );
+            assert!(
+                data_dir_for(cfg.path(), &obstructed).is_file(),
+                "control: the obstruction is still there, so the call really did fail on it"
+            );
+
+            // The positive controls on the same function: a real account
+            // directory IS deleted and reported as such, and a second call for
+            // one already gone is success rather than a failure the caller
+            // would have to explain to the user.
+            let real = prepare_new_account(cfg.path()).expect("prepared");
+            std::fs::write(hello_blob_path_for(cfg.path(), &real.id), b"sealed").unwrap();
+            assert_eq!(delete_account_dir(cfg.path(), &real.id), Ok(()));
+            assert!(!data_dir_for(cfg.path(), &real.id).exists());
+            assert_eq!(delete_account_dir(cfg.path(), &real.id), Ok(()));
+        }
     }
 
     mod adopting_an_account {
@@ -2020,6 +2116,98 @@ mod tests {
             let mut open = state(MultiAccountAvailability::Available, vec![a.clone()], &a.id);
             open.adopt(b.clone());
             assert_eq!(switch_ids(&open), vec![a.id]);
+        }
+    }
+
+    // ---------------------------------------------------------------- 13
+
+    mod forgetting_an_account {
+        use super::*;
+        use crate::bw_path::MultiAccountAvailability;
+        use crate::migration::MigrationState;
+
+        fn state(list: Vec<Account>, active: &AccountId) -> AccountsState {
+            AccountsState::new(
+                MultiAccountAvailability::Available,
+                MigrationState::NothingToMigrate,
+                list,
+                active.clone(),
+            )
+            .expect("these accounts are not empty")
+        }
+
+        fn ids(accounts: &[Account]) -> Vec<AccountId> {
+            accounts.iter().map(|x| x.id.clone()).collect()
+        }
+
+        #[test]
+        fn a_forgotten_account_leaves_the_list_and_the_switch_targets_together() {
+            // Two answers, and a removal that updated only one of them would
+            // leave the switcher offering a door onto a directory that has
+            // been deleted -- which points the CLI at nothing and reads as a
+            // brand-new sign-in.
+            let (a, b, c) = (account(A), account(B), account(&"a".repeat(32)));
+            let mut s = state(vec![a.clone(), b.clone(), c.clone()], &a.id);
+            assert_eq!(
+                ids(s.switchable()),
+                vec![b.id.clone(), c.id.clone()],
+                "control: both of the others were offered before the removal"
+            );
+
+            assert!(s.forget(&b.id), "the removal reported that it did nothing");
+
+            assert_eq!(ids(s.all()), vec![a.id.clone(), c.id.clone()]);
+            assert_eq!(
+                ids(s.switchable()),
+                vec![c.id.clone()],
+                "a removed account is still offered as a switch target"
+            );
+            assert_eq!(s.active().id, a.id, "the removal moved the active account");
+        }
+
+        #[test]
+        fn a_state_refuses_to_forget_the_account_it_is_on() {
+            // The invariant the type is built around: `active()` hands out an
+            // `&Account`, so there has to BE one. Removing the active account
+            // is done by settling onto the survivor first and adopting it --
+            // by which point the account being deleted is not the active one.
+            let (a, b) = (account(A), account(B));
+            let mut s = state(vec![a.clone(), b.clone()], &a.id);
+
+            assert!(!s.forget(&a.id), "the active account was forgotten");
+            assert_eq!(ids(s.all()), vec![a.id.clone(), b.id.clone()]);
+            assert_eq!(s.active().id, a.id);
+
+            // Positive control on the same state and the same call: the OTHER
+            // account really can be forgotten, so the refusal above is the
+            // active-account rule rather than a `forget` that never removes
+            // anything.
+            assert!(s.forget(&b.id));
+            assert_eq!(ids(s.all()), vec![a.id.clone()]);
+
+            // And the last account is still the active one, so the list can
+            // never be emptied by this call however many times it is made.
+            assert!(!s.forget(&a.id));
+            assert_eq!(ids(s.all()), vec![a.id]);
+        }
+
+        #[test]
+        fn forgetting_an_account_this_state_never_held_changes_nothing_and_says_so() {
+            // The second click on "Remove", or a removal retried after a
+            // `settings.json` write failed. `true` here would persist a list
+            // nobody changed.
+            let (a, b) = (account(A), account(B));
+            let mut s = state(vec![a.clone(), b.clone()], &a.id);
+            let before = s.clone();
+
+            assert!(!s.forget(&id(&"9".repeat(32))));
+            assert_eq!(s, before);
+
+            // Positive control: an id this state DOES hold is removed by the
+            // same call, so the no-op above is about the id rather than about
+            // a `forget` that is inert.
+            assert!(s.forget(&b.id));
+            assert_ne!(s, before);
         }
     }
 }
