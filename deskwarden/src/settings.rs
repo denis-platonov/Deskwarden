@@ -349,6 +349,36 @@ pub struct Settings {
     /// re-reads the file when it opens -- but it is why
     /// [`Self::persist_preferences`] exists and why [`Self::save`] is private.
     pub vault_window: Option<WindowGeometry>,
+    /// Every configured account, in the order the account menu lists them.
+    ///
+    /// **Owned by the account code, not by the preferences window** -- see
+    /// [`Self::persist_accounts`], the third read-modify-write over this file.
+    ///
+    /// Empty is not "no accounts exist"; it is *"the migration has not run
+    /// yet"*, which is the startup condition `migration` keys
+    /// `accounts_already_configured` off. An older `settings.json` written
+    /// before this field existed therefore parses as empty and is treated as a
+    /// pre-migration profile, which is exactly right.
+    ///
+    /// **No secrets, and no data directory.** An account carries its opaque
+    /// id, the email to show in the menu, and the server URL. The CLI profile
+    /// directory is *derived* from the id by `accounts::data_dir_for` on every
+    /// use, deliberately never stored: a persisted path would be a second
+    /// source of truth that can disagree with the first, and a hand-editable
+    /// one at that, on a directory this app creates and later
+    /// `remove_dir_all`s. The session token and the Hello blob live in that
+    /// directory as files, never in here.
+    pub accounts: Vec<crate::accounts::Account>,
+    /// Which of [`Self::accounts`] the app is currently using, or `None`
+    /// before there is one.
+    ///
+    /// Not an index: an index into a list that another writer can reorder or
+    /// shorten silently points at a *different* account, and every path this
+    /// value reaches (`BITWARDENCLI_APPDATA_DIR`, the session file, the Hello
+    /// label) is one where naming the wrong account is a real failure. An id
+    /// that is no longer in the list is resolvable to "none", where a stale
+    /// index is not.
+    pub active_account: Option<crate::accounts::AccountId>,
 }
 
 impl Default for Settings {
@@ -358,6 +388,8 @@ impl Default for Settings {
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             vault_window: None,
+            accounts: Vec::new(),
+            active_account: None,
         }
     }
 }
@@ -372,15 +404,16 @@ impl Settings {
 
     /// Writes this whole struct out, field for field.
     ///
-    /// Private, and that is the point: this file has two writers with
+    /// Private, and that is the point: this file has three writers with
     /// *disjoint* fields -- the vault window owns [`Self::vault_window`], the
-    /// preferences window owns everything else -- and neither holds a
-    /// `Settings` that is fresh in the other's fields. Every write therefore
-    /// goes through [`Self::persist_vault_window_geometry`] or
-    /// [`Self::persist_preferences`], each of which re-reads the file and
-    /// overwrites only what it owns. A whole-struct save reachable from
-    /// outside this module is exactly how the geometry came to be reverted by
-    /// an unrelated preferences edit.
+    /// account code owns [`Self::accounts`] and [`Self::active_account`], the
+    /// preferences window owns everything else -- and none of them holds a
+    /// `Settings` that is fresh in the others' fields. Every write therefore
+    /// goes through [`Self::persist_vault_window_geometry`],
+    /// [`Self::persist_accounts`] or [`Self::persist_preferences`], each of
+    /// which re-reads the file and overwrites only what it owns. A
+    /// whole-struct save reachable from outside this module is exactly how the
+    /// geometry came to be reverted by an unrelated preferences edit.
     fn save(&self, path: &Path) -> std::io::Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?)
     }
@@ -430,19 +463,66 @@ impl Settings {
     ///
     /// The destructuring is deliberate rather than a list of field accesses:
     /// a field added to [`Settings`] becomes a compile error here, forcing
-    /// whoever adds it to say which of the two writers owns it, instead of
-    /// silently joining the set this one drops.
+    /// whoever adds it to say which of the writers owns it, instead of
+    /// silently joining the set this one drops. [`Settings::accounts`] and
+    /// [`Settings::active_account`] are bound as `_` because that is the
+    /// answer this function had to give: they belong to
+    /// [`Self::persist_accounts`], and writing them from here -- from the
+    /// `Settings` `main.rs` loaded at startup -- would delete every account
+    /// added since.
     pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
         let Settings {
             keep_backend_running,
             auto_lock_enabled,
             auto_lock_minutes,
             vault_window: _,
+            accounts: _,
+            active_account: _,
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
+        on_disk.save(path)
+    }
+
+    /// Writes the account list and the active account back, without
+    /// disturbing anything else in the file -- the third read-modify-write
+    /// over these disjoint fields, alongside
+    /// [`Self::persist_vault_window_geometry`] and
+    /// [`Self::persist_preferences`].
+    ///
+    /// Free-standing rather than a method for the same reason
+    /// [`Self::persist_vault_window_geometry`] is: the callers (adding an
+    /// account, removing one, switching the active one, finishing a
+    /// migration) hold the account list and nothing else, so the only
+    /// `Settings` they could save is one they invented.
+    ///
+    /// The blast radius of getting this wrong is worse than the geometry's,
+    /// which is why it is its own writer rather than a widening of the
+    /// preferences one. `main.rs` loads `Settings` once at startup; if a
+    /// preferences save wrote that stale copy's empty list back over a list
+    /// this function had persisted mid-session, the account would vanish --
+    /// *and* the next launch would read the empty list as "migration has
+    /// never run" and try to migrate a source profile that is no longer
+    /// there. `persisting_preferences_from_a_stale_copy_keeps_the_account_list`
+    /// pins that direction, and
+    /// `persisting_accounts_keeps_every_preference_and_the_geometry` the other
+    /// two.
+    ///
+    /// `active` is taken by reference and cloned rather than by value so that
+    /// clearing it (`None`) is expressible and is a real write: an account
+    /// list with no active account is the state a removal of the last account
+    /// leaves behind, and it has to survive a restart as itself rather than
+    /// as "whatever was active before".
+    pub fn persist_accounts(
+        path: &Path,
+        accounts: &[crate::accounts::Account],
+        active: Option<&crate::accounts::AccountId>,
+    ) -> std::io::Result<()> {
+        let mut on_disk = Self::load(path);
+        on_disk.accounts = accounts.to_vec();
+        on_disk.active_account = active.cloned();
         on_disk.save(path)
     }
 
@@ -480,6 +560,11 @@ mod tests {
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: None,
+            // Listed rather than `..Settings::default()` so this test keeps
+            // failing to compile when a field is added -- the same forcing
+            // function `persist_preferences`'s destructuring provides.
+            accounts: Vec::new(),
+            active_account: None,
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
@@ -616,6 +701,8 @@ mod tests {
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             vault_window: None,
+            accounts: Vec::new(),
+            active_account: None,
         };
         written.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -657,6 +744,8 @@ mod tests {
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
+            accounts: Vec::new(),
+            active_account: None,
         };
         written.save(&path).unwrap();
         assert_eq!(Settings::load(&path), written);
@@ -811,6 +900,329 @@ mod tests {
         // rather than produce a meaningful timeout.
         let s = Settings { auto_lock_minutes: u64::MAX, ..Settings::default() };
         assert_eq!(s.auto_lock(), AutoLock::After(Duration::from_secs(u64::MAX)));
+    }
+
+    // ---- the account list ------------------------------------------------
+    //
+    // Every id below is written out as a literal 32-character string in the
+    // assertions as well as in the construction, so that what is checked
+    // against the file is a constant rather than a value the writer produced.
+
+    use crate::accounts::{Account, AccountId};
+
+    /// A valid id made of one repeated hex digit, so the literal it must equal
+    /// is readable at the assertion site.
+    fn id_of(c: char) -> AccountId {
+        AccountId::parse(&std::iter::repeat(c).take(32).collect::<String>())
+            .expect("32 repeated lowercase hex characters is a valid id")
+    }
+
+    fn account(id: &AccountId) -> Account {
+        Account {
+            id: id.clone(),
+            email: "someone@example.com".to_string(),
+            server_url: None,
+        }
+    }
+
+    /// Does this settings text name a data *directory* anywhere?
+    ///
+    /// A free function rather than a chain of `assert!(!text.contains(..))`
+    /// so the negative assertion can be given a positive control that drives
+    /// this exact code -- otherwise "the file mentions no directory" and "the
+    /// needles were misspelt" are the same passing test.
+    fn mentions_a_data_directory(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        // Single-line needles: a needle containing a newline passes on an LF
+        // checkout and fails on a CRLF one, and this repo has both.
+        ["data_dir", "datadir", "directory", "appdata", "c:\\", "c:\\\\"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+
+    /// Does this settings text carry anything that could be a secret?
+    /// Same construction, same reason.
+    fn mentions_a_secret(text: &str) -> bool {
+        let lower = text.to_lowercase();
+        ["password", "session", "token", "secret", "master key"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    }
+
+    #[test]
+    fn the_two_file_content_guards_can_actually_see_what_they_look_for() {
+        // The positive control for the two assertions in
+        // `the_account_list_round_trips_through_settings_json`. Each planted
+        // sample is a shape a careless future `Account` field would really
+        // produce, and each drives the same function the real check does.
+        for planted in [
+            r#"{"accounts":[{"data_dir":"C:\\Users\\me\\AppData\\Roaming\\Deskwarden"}]}"#,
+            r#"{"accounts":[{"dataDir":"whatever"}]}"#,
+            r#"{"accounts":[{"directory":"whatever"}]}"#,
+            r#"{"accounts":[{"path":"c:\\somewhere"}]}"#,
+        ] {
+            assert!(
+                mentions_a_data_directory(planted),
+                "the data-directory guard cannot see a directory it was shown: {planted}"
+            );
+        }
+        for planted in [
+            r#"{"accounts":[{"password":"hunter2"}]}"#,
+            r#"{"accounts":[{"session":"abc"}]}"#,
+            r#"{"accounts":[{"api_token":"abc"}]}"#,
+        ] {
+            assert!(
+                mentions_a_secret(planted),
+                "the secrets guard cannot see a secret it was shown: {planted}"
+            );
+        }
+        // And neither fires on a settings file of the shape this task writes,
+        // so a guard that answered `true` unconditionally would not pass here.
+        let benign = r#"{"keep_backend_running":true,"accounts":[{"id":"0123456789abcdef0123456789abcdef","email":"me@example.com","server_url":null}],"active_account":null}"#;
+        assert!(!mentions_a_data_directory(benign));
+        assert!(!mentions_a_secret(benign));
+    }
+
+    #[test]
+    fn a_file_written_before_accounts_existed_still_parses() {
+        // `#[serde(default)]` on the struct, restated for the two fields this
+        // task adds after users already have a settings.json on disk. An
+        // absent list must not be a parse failure, because a parse failure
+        // here silently discards every preference in the file.
+        let path = temp_path("pre-accounts");
+        std::fs::write(&path, r#"{"keep_backend_running": false, "auto_lock_minutes": 3}"#)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            loaded.accounts.is_empty(),
+            "an absent list is 'migration has not run yet', not a parse failure"
+        );
+        assert_eq!(loaded.active_account, None);
+        assert!(!loaded.keep_backend_running, "the fields it does carry still land");
+        assert_eq!(loaded.auto_lock_minutes, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_account_list_round_trips_through_settings_json() {
+        let path = temp_path("accounts-round-trip");
+        let a = AccountId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let written = Settings {
+            accounts: vec![
+                Account {
+                    id: a.clone(),
+                    email: "work@example.com".into(),
+                    server_url: Some("https://vault.example.com".into()),
+                },
+                Account {
+                    id: id_of('a'),
+                    email: "me@example.com".into(),
+                    server_url: None,
+                },
+            ],
+            active_account: Some(a.clone()),
+            ..Settings::default()
+        };
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("work@example.com"), "not in the file at all: {text}");
+        assert!(
+            !mentions_a_data_directory(&text),
+            "the DATA DIRECTORY is derived, never stored -- storing it makes a second source \
+             of truth that can disagree with the first: {text}"
+        );
+        assert!(!mentions_a_secret(&text), "NO SECRETS: {text}");
+        assert_eq!(Settings::load(&path), written);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_accounts_really_writes_the_list_into_the_file() {
+        // Read back as raw JSON rather than through `Settings::load`: a
+        // round-trip runs the writer's own serde impl in reverse, so it
+        // cannot tell "the writer carried the field" from "the writer and the
+        // reader agree about dropping it". These assertions are against string
+        // literals, and fail if `persist_accounts` drops `accounts`, drops
+        // `active_account`, writes an index instead of an id, or reorders.
+        let path = temp_path("accounts-writer-carries");
+        let a = AccountId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let accounts = vec![
+            Account {
+                id: a.clone(),
+                email: "work@example.com".into(),
+                server_url: Some("https://vault.example.com".into()),
+            },
+            Account {
+                id: id_of('a'),
+                email: "me@example.com".into(),
+                server_url: None,
+            },
+        ];
+        Settings::persist_accounts(&path, &accounts, Some(&a)).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let list = json
+            .get("accounts")
+            .unwrap_or_else(|| panic!("`accounts` is not in the written file at all: {text}"))
+            .as_array()
+            .unwrap_or_else(|| panic!("`accounts` is not a list: {text}"));
+        assert_eq!(list.len(), 2, "the writer did not carry both accounts: {text}");
+        assert_eq!(list[0]["id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(list[0]["email"], "work@example.com");
+        assert_eq!(list[0]["server_url"], "https://vault.example.com");
+        assert_eq!(list[1]["id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(list[1]["email"], "me@example.com");
+        assert_eq!(
+            list[1]["server_url"],
+            serde_json::Value::Null,
+            "bitwarden.com is an absent server URL, not an empty string: {text}"
+        );
+        assert_eq!(
+            json["active_account"], "0123456789abcdef0123456789abcdef",
+            "the active account is stored as the id itself, never as a position in the list: {text}"
+        );
+        assert!(!mentions_a_data_directory(&text), "{text}");
+        assert!(!mentions_a_secret(&text), "{text}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_accounts_can_clear_the_active_account() {
+        // `None` has to be a write, not a no-op: removing the last account,
+        // or logging out of the active one, leaves a list with nothing
+        // active, and that state has to survive a restart as itself. An
+        // implementation that only ever assigns `Some` passes every other
+        // test here.
+        let path = temp_path("accounts-clear-active");
+        let a = id_of('b');
+        Settings::persist_accounts(&path, &[account(&a)], Some(&a)).unwrap();
+        assert_eq!(
+            Settings::load(&path).active_account,
+            Some(a.clone()),
+            "positive control: the active account was set in the first place"
+        );
+
+        Settings::persist_accounts(&path, &[account(&a)], None).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            json["active_account"],
+            serde_json::Value::Null,
+            "clearing the active account did not reach the file: {text}"
+        );
+        assert_eq!(
+            json["accounts"].as_array().map(Vec::len),
+            Some(1),
+            "and the list itself is still there: {text}"
+        );
+        assert_eq!(Settings::load(&path).active_account, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisting_accounts_keeps_every_preference_and_the_geometry() {
+        // All three writers over the same file, in one order; the two other
+        // pairings are pinned by `persisting_preferences_from_a_stale_copy_
+        // keeps_the_account_list` and by the pre-existing geometry tests.
+        let path = temp_path("accounts-preserve");
+        Settings { keep_backend_running: false, auto_lock_minutes: 7, ..Settings::default() }
+            .save(&path)
+            .unwrap();
+        Settings::persist_vault_window_geometry(
+            &path,
+            WindowGeometry { x: 1, y: 2, width: 1000, height: 700 },
+        )
+        .unwrap();
+        let a = id_of('b');
+        Settings::persist_accounts(&path, &[account(&a)], Some(&a)).unwrap();
+
+        let loaded = Settings::load(&path);
+        assert!(!loaded.keep_backend_running, "persist_accounts clobbered a preference");
+        assert_eq!(loaded.auto_lock_minutes, 7);
+        assert_eq!(
+            loaded.vault_window.map(|g| g.x),
+            Some(1),
+            "persist_accounts clobbered the geometry"
+        );
+        assert_eq!(loaded.active_account, Some(a));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisting_preferences_from_a_stale_copy_keeps_the_account_list() {
+        // The regression, in the order the app performs it: `main` loads
+        // `Settings` once at startup; an account is added mid-session and
+        // written by `persist_accounts`; the user then opens Preferences and
+        // changes the auto-lock. A whole-struct save writes main's stale
+        // (empty) list back and the added account VANISHES on next launch --
+        // and with an empty list, the NEXT startup thinks migration never ran
+        // and tries to migrate a source directory that no longer exists. Same
+        // trap the geometry fell into, with a far worse blast radius.
+        let path = temp_path("prefs-preserve-accounts");
+        let at_startup = Settings::load(&path);
+        assert!(at_startup.accounts.is_empty());
+        let a = id_of('c');
+        Settings::persist_accounts(&path, &[account(&a)], Some(&a)).unwrap();
+
+        Settings { auto_lock_minutes: 10, ..at_startup }.persist_preferences(&path).unwrap();
+
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.accounts.len(), 1, "a preferences save deleted the account list");
+        assert_eq!(loaded.active_account, Some(a));
+        assert_eq!(loaded.auto_lock_minutes, 10, "and the preference itself must still land");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persisting_accounts_wins_over_a_stale_list_in_the_file() {
+        // The other direction, so the read-modify-write cannot be "fixed"
+        // into merely ignoring the accounts it was handed.
+        let path = temp_path("accounts-win");
+        let (a, b) = (id_of('d'), id_of('e'));
+        Settings::persist_accounts(&path, &[account(&a)], Some(&a)).unwrap();
+        Settings::persist_accounts(&path, &[account(&a), account(&b)], Some(&b)).unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.accounts.len(), 2);
+        assert_eq!(loaded.active_account, Some(b));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_id_that_is_not_an_id_falls_the_whole_file_back_to_defaults() {
+        // Documenting what `Settings::load`'s existing "any parse failure is
+        // defaults" rule now means for a hand-edited account list, because it
+        // is no longer only a preference that is lost: an id that
+        // `AccountId::parse` rejects makes the whole file unparseable, the
+        // list reads as empty, and an empty list is the migration trigger.
+        // Narrowing that (dropping just the bad entry) is a change to `load`
+        // and a decision for whoever wires migration up, not for this task --
+        // but it must not be discovered by surprise.
+        let path = temp_path("accounts-bad-id");
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running": false, "accounts": [{"id": "../evil", "email": "x@example.com", "server_url": null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Settings::load(&path),
+            Settings::default(),
+            "a rejected id is not quietly turned into a usable account"
+        );
+
+        // Positive control: the identical file with a well-formed id parses,
+        // so the assertion above is about the id and not about the shape of
+        // the JSON around it.
+        std::fs::write(
+            &path,
+            r#"{"keep_backend_running": false, "accounts": [{"id": "0123456789abcdef0123456789abcdef", "email": "x@example.com", "server_url": null}]}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.accounts.len(), 1);
+        assert!(!loaded.keep_backend_running);
+        let _ = std::fs::remove_file(&path);
     }
 }
 
