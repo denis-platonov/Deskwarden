@@ -146,6 +146,12 @@ fn search_field(ui: &mut egui::Ui, filter: &mut String, hint: &str) {
 /// scroll-geometry estimate, not the rows' actual layout.
 const LIST_ROW_HEIGHT: f32 = 48.0;
 
+/// Named rather than inlined at the `run_ui_native` calls, because
+/// `foreground::raise_window` finds each window BY its title -- one
+/// declaration apiece means the two cannot drift apart.
+const PICK_ITEM_TITLE: &str = "Choose a vault item";
+const ADD_APP_TITLE: &str = "Add app to Deskwarden";
+
 /// The white, hairline-bordered card that scrollable lists live in, showing
 /// only the rows within the visible scroll range rather than laying out
 /// and painting `row_count` rows on every repaint.
@@ -586,7 +592,7 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
         ..Default::default()
     };
 
-    let _ = eframe::run_ui_native("Choose a vault item", options, move |ui, _frame| {
+    let _ = eframe::run_ui_native(PICK_ITEM_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
@@ -595,6 +601,11 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             // starts on the next one, once the fonts are actually live.
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
+            // The OS window exists by this first painted frame, and this is
+            // where it is brought to the front. See `foreground`: a refusal
+            // from Windows flashes the taskbar button rather than being
+            // ignored.
+            crate::foreground::raise_window(PICK_ITEM_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
@@ -1144,7 +1155,7 @@ pub fn run_picker(
         ..Default::default()
     };
 
-    let _ = eframe::run_ui_native("Add app to Deskwarden", options, move |ui, _frame| {
+    let _ = eframe::run_ui_native(ADD_APP_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
@@ -1152,6 +1163,11 @@ pub fn run_picker(
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
             theme::apply(ui.ctx());
+            // The OS window exists by this first painted frame, and this is
+            // where it is brought to the front. See `foreground`: a refusal
+            // from Windows flashes the taskbar button rather than being
+            // ignored.
+            crate::foreground::raise_window(ADD_APP_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;

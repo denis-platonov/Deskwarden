@@ -823,6 +823,11 @@ pub fn run(settings: Settings) -> Settings {
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
+            // The OS window exists by this first painted frame (the same
+            // hook `round_window_corners` uses), and this is where it is
+            // brought to the front. See `foreground`: a refusal from Windows
+            // flashes the taskbar button rather than being ignored.
+            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;

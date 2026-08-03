@@ -155,6 +155,17 @@ pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
 fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     let name = HSTRING::from(CREDENTIAL_NAME);
 
+    // Both calls below can put the OS's Hello prompt on screen, and
+    // `KeyCredentialManager` has no way to be told which window to parent it
+    // to -- there is no interop interface for it, unlike
+    // `IUserConsentVerifierInterop::RequestVerificationForWindowAsync`. So the
+    // only lever is to be the foreground process when the prompt is created,
+    // which is what the user reported missing: "Windows PIN screen launches in
+    // background". See `foreground`, including what happens when Windows
+    // refuses. `Target::Any`, because this is reached from the login window
+    // AND from the vault window's re-auth prompt.
+    let _ = crate::foreground::raise_this_process();
+
     let result = if create {
         let created = KeyCredentialManager::RequestCreateAsync(
             &name,
@@ -187,6 +198,12 @@ fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u
     let credential = result
         .Credential()
         .map_err(|e| format!("Windows Hello returned no credential: {e}"))?;
+
+    // Again, immediately before the call that shows the prompt. The
+    // create/open above may itself have shown one, in which case the broker
+    // took the foreground from us and the raise at the top of this function is
+    // stale by the time we get here.
+    let _ = crate::foreground::raise_this_process();
 
     let challenge = CryptographicBuffer::CreateFromByteArray(CHALLENGE)
         .map_err(|e| format!("could not build the Hello challenge buffer: {e}"))?;
@@ -714,5 +731,44 @@ mod tests {
         // needles, so a zero here is an absence and not a broken mechanism.
         assert_eq!(count(concat!("hello_derived_key(true, ", "&[])")), 0);
         assert_eq!(count(concat!("hello_derived_key(false, ", "&[])")), 0);
+    }
+
+    #[test]
+    fn this_process_is_pulled_forward_before_every_call_that_shows_the_hello_prompt() {
+        // WIRING, and a source guard for the same reason as the two above:
+        // `hello_derived_key` cannot run without Hello hardware and a live
+        // user at the machine. What it holds is the answer to "Windows PIN
+        // screen launches in background" -- `KeyCredentialManager` has no
+        // interop interface to parent its prompt to a window, so being the
+        // foreground process at the moment of the call is the only lever
+        // there is, and deleting either call leaves the whole suite green.
+        //
+        // `concat!`-split so the needle cannot match its own declaration
+        // here, and on one line so it does not depend on LF vs CRLF.
+        let source = include_str!("hello.rs");
+        let raise = concat!("foreground::raise_this", "_process()");
+        let signing = concat!(".RequestSign", "Async(&challenge)");
+
+        assert_eq!(
+            source.matches(raise).count(),
+            2,
+            "both prompting calls must be preceded by a raise: the create/open pair at the top of              `hello_derived_key`, and the signing call. One raise is not enough -- the create              prompt hands the foreground to the Hello broker, so the first raise is stale by the              time signing runs"
+        );
+
+        let sign_at = source.find(signing).expect("the signing call must still be here");
+        let raise_before_signing = source[..sign_at].matches(raise).count();
+        assert_eq!(
+            raise_before_signing, 2,
+            "the raise must come BEFORE the signing call -- after it this thread is already              blocked in `op.get()` with the prompt on screen behind whatever the user was using"
+        );
+
+        // Positive controls on the counting AND on the position arithmetic:
+        // the counter can find a needle that is really there and can tell one
+        // occurrence from two, and `find` locates the signing call rather than
+        // returning 0 (which would make the slice empty and the count above
+        // trivially wrong in the other direction).
+        assert_eq!(format!("{raise} {raise}").matches(raise).count(), 2);
+        assert_eq!("nothing here".matches(raise).count(), 0);
+        assert!(sign_at > 0, "the signing call was found at the very start of the file");
     }
 }

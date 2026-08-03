@@ -18,6 +18,7 @@ pub mod bw_serve;
 pub mod dispatch;
 pub mod favicon;
 pub mod fill_stats;
+pub mod foreground;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;

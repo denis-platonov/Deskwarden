@@ -14,6 +14,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 
+/// Named rather than inlined at the `run_ui_native` call, because
+/// `foreground::raise_window` finds this window BY this title -- one
+/// declaration means the two cannot drift apart.
+const WINDOW_TITLE: &str = "Deskwarden";
+
 /// Shows a "Deskwarden" window with a spinner and `message` until `rx`
 /// yields a value, then closes and returns `Some(value)`.
 ///
@@ -59,7 +64,7 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
 
     let mut styled = false;
 
-    let _ = eframe::run_ui_native("Deskwarden", options, move |ui, _frame| {
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
@@ -68,6 +73,11 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             // starts on the next one, once the fonts are actually live.
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
+            // The OS window exists by this first painted frame (the same
+            // hook `round_window_corners` uses), and this is where it is
+            // brought to the front. See `foreground`: a refusal from Windows
+            // flashes the taskbar button rather than being ignored.
+            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
