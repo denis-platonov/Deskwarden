@@ -7861,9 +7861,18 @@ mod window_era_placement_tests {
         //  * the WHOLE file holds exactly the two spawn uses the slice found,
         //    so a third spawn added after the marker cannot hide from
         //    `both_spawns_are_checked_against_that_one_era`;
-        //  * the slice still covers most of the file, so if the marker ever
-        //    moves to the top (a `#[cfg(test)] use` at the head, say) the
-        //    guards fail loudly instead of passing over an empty string.
+        //  * the slice still reaches the LAST item defined above the first
+        //    marker, so if that marker ever moves up (a `#[cfg(test)] use` at
+        //    the head, say) the guards fail loudly instead of passing over a
+        //    fraction of the file.
+        //
+        // That second check used to be "the slice is more than half the file",
+        // and it was measuring the wrong thing: this file's test modules grow
+        // every task, so the ratio decays on its own and says nothing about
+        // where the marker is. Task 14 took it under 50% by adding tests
+        // ONLY -- production got 80 lines and the tests got 900 -- which is
+        // the healthy direction and would have been reported as the marker
+        // moving to the top of the file.
         let source = include_str!("mod.rs");
         assert_eq!(
             source.matches(SPAWN_USE).count(),
@@ -7875,13 +7884,21 @@ mod window_era_placement_tests {
             source.matches(SPAWN_USE).count(),
             production().matches(SPAWN_USE).count()
         );
-        let covered = production().len() as f64 / source.len() as f64;
+        // The last thing defined above the first test marker. Named rather
+        // than measured, so this cannot drift with how much test code the
+        // file carries.
+        const LAST_PRODUCTION_ITEM: &str = concat!("fn webbrowser", "_open(url: &str)");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "{LAST_PRODUCTION_ITEM:?} is no longer in this file exactly once -- pick the new \
+             last production item above the first {TESTS_BEGIN:?} and name it here"
+        );
         assert!(
-            covered > 0.5,
-            "the production slice is only {:.0}% of the file: the first {TESTS_BEGIN:?} has \
-             moved up, so every guard in this module is now inspecting a fraction of the \
-             production code and passing for the wrong reason",
-            covered * 100.0
+            production().contains(LAST_PRODUCTION_ITEM),
+            "the production slice stops before {LAST_PRODUCTION_ITEM:?}, so the first \
+             {TESTS_BEGIN:?} has moved up and every guard in this module is now inspecting a \
+             fraction of the production code and passing for the wrong reason"
         );
     }
 }
@@ -8875,5 +8892,944 @@ mod auto_lock_never_wiring_tests {
             .find(LOCKS)
             .expect("the timed arm no longer locks once its timeout has elapsed");
         assert!(locks > 0, "the lock must be inside the elapsed check, not before it");
+    }
+}
+
+/// **The titlebar's account switcher**, driven through real frames.
+///
+/// The gear beside it could only ever be source-guarded (see
+/// `settings_gear_placement_tests`) because it *is* a click in a closure `run`
+/// owns. The switcher is not: its whole decision -- which accounts are
+/// offered, what a blocked state says, and what a click reports -- lives in
+/// `account_switcher`, which is an ordinary function a headless
+/// `egui::Context` can press. So these are click tests, and only the two
+/// things that genuinely cannot be reached (that `run`'s strip calls it, and
+/// where in that strip) are guarded by source below.
+///
+/// Modelled on `detail.rs`'s `Pane`, including its two hard-won details: a
+/// press *and* a release is what egui counts as a click, and **a popup only
+/// paints on the frame after the click that opened it**, so the frame that
+/// finds a menu row and the frame that opened the menu can never be the same
+/// one.
+#[cfg(test)]
+mod account_switcher_tests {
+    use super::*;
+    use crate::accounts::{Account, AccountId, AccountsState};
+
+    const A: &str = "0123456789abcdef0123456789abcdef";
+    const B: &str = "fedcba9876543210fedcba9876543210";
+    /// A third id, for the account with no email.
+    const C: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn account(id: &str, email: &str) -> Account {
+        Account {
+            id: AccountId::parse(id).expect("a 32-char lowercase hex id"),
+            email: email.to_string(),
+            server_url: None,
+        }
+    }
+
+    fn a() -> Account {
+        account(A, "ana@example.com")
+    }
+
+    fn b() -> Account {
+        account(B, "bruno@example.com")
+    }
+
+    /// An account as `resolve_startup` mints one on a first install: no email
+    /// at all until a sign-in fills it in.
+    fn blank() -> Account {
+        account(C, "")
+    }
+
+    /// A sentence with the same shape as the real `relativeDataDir` refusal --
+    /// long, and naming a directory.
+    const BLOCKED_REASON: &str =
+        "a bitwarden-cli directory sits beside bw.exe (C:\\tools\\bin\\bitwarden-cli), so the \
+         CLI ignores the profile Deskwarden points it at";
+
+    /// Built through `AccountsState::from_blocked_reason`, which is the only
+    /// constructor this file may use: `no_window_answers_may_i_switch_for_
+    /// itself` bans it from naming `AccountsState::new`'s two inputs at all,
+    /// tests included. `the_test_constructor_agrees_with_the_real_one` (in
+    /// `accounts.rs`, which may name them) pins the two together.
+    fn available_state() -> AccountsState {
+        AccountsState::from_blocked_reason(vec![a(), b()], a().id, None)
+            .expect("these accounts are not empty")
+    }
+
+    fn blocked_state() -> AccountsState {
+        AccountsState::from_blocked_reason(
+            vec![a(), b()],
+            a().id,
+            Some(BLOCKED_REASON.to_string()),
+        )
+        .expect("these accounts are not empty")
+    }
+
+    fn lone_state() -> AccountsState {
+        AccountsState::from_blocked_reason(vec![a()], a().id, None)
+            .expect("this account is not empty")
+    }
+
+    /// The switcher with an account that has never signed in.
+    fn blank_email_state() -> AccountsState {
+        AccountsState::from_blocked_reason(vec![a(), blank()], a().id, None)
+            .expect("these accounts are not empty")
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// The pane these frames are laid out at. An absolute number, never
+    /// re-derived from anything under test.
+    const PANE: f32 = 420.0;
+
+    struct Frame {
+        picked: Option<AccountId>,
+        texts: Vec<(String, egui::Rect)>,
+        /// The characters really laid out, which `Galley::text()` is blind to
+        /// -- see `detail.rs`'s `Frame::rendered`. A menu row elided down to
+        /// one "..." still reports the whole email it was handed.
+        rendered: Vec<(String, String)>,
+        chevrons: Vec<egui::Rect>,
+    }
+
+    impl Frame {
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn painted(&self, label: &str) -> bool {
+            self.texts.iter().any(|(t, _)| t == label)
+        }
+
+        /// What was actually DRAWN for the run laid out from `label`.
+        fn glyphs(&self, label: &str) -> String {
+            let found: Vec<&String> = self
+                .rendered
+                .iter()
+                .filter(|(source, _)| source == label)
+                .map(|(_, drawn)| drawn)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one run laid out from {label:?}, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0].clone()
+        }
+
+        fn rect_of(&self, label: &str) -> egui::Rect {
+            let found: Vec<egui::Rect> = self
+                .texts
+                .iter()
+                .filter(|(t, _)| t == label)
+                .map(|(_, r)| *r)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?}, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
+        fn chevron(&self) -> egui::Rect {
+            assert_eq!(
+                self.chevrons.len(),
+                1,
+                "expected exactly one switcher chevron, found {}; painted: {:?}",
+                self.chevrons.len(),
+                self.strings()
+            );
+            self.chevrons[0]
+        }
+    }
+
+    /// The harness. Draws the real `account_switcher` and nothing else, so
+    /// every string and every stroke a frame reports is the switcher's.
+    struct Switcher {
+        ctx: egui::Context,
+    }
+
+    impl Switcher {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            // The same two throwaway frames every harness in this crate runs:
+            // a font set registered during a frame is only usable from the
+            // start of the next one.
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Self { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::splat(PANE),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn frame(&mut self, accounts: Option<&AccountsState>, events: Vec<egui::Event>) -> Frame {
+            let mut picked = None;
+            let output = self.ctx.run_ui(Self::input(events), |ui| {
+                picked = account_switcher(ui, accounts);
+            });
+            frame_from(picked, &output)
+        }
+
+        fn idle(&mut self, accounts: Option<&AccountsState>) -> Frame {
+            self.frame(accounts, Vec::new())
+        }
+
+        fn click(&mut self, accounts: Option<&AccountsState>, pos: egui::Pos2) -> Frame {
+            self.frame(accounts, click_at(pos))
+        }
+
+        /// Click the chevron, then let the popup paint. Returns the frame the
+        /// open menu is on -- the click's own frame never has it.
+        fn open(&mut self, accounts: Option<&AccountsState>) -> Frame {
+            let chevron = self.idle(accounts).chevron();
+            let _ = self.click(accounts, chevron.center());
+            self.idle(accounts)
+        }
+    }
+
+    fn frame_from(picked: Option<AccountId>, output: &egui::FullOutput) -> Frame {
+        // ONE tree, not one call per clipped shape: a probe run per clipped
+        // shape could never see a chevron whose two arms landed in different
+        // ones.
+        let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+        let mut texts = Vec::new();
+        let mut rendered = Vec::new();
+        collect_switcher_text(&all, &mut texts, &mut rendered);
+        Frame {
+            picked,
+            texts,
+            rendered,
+            chevrons: theme::icon_probe::chevrons(&all),
+        }
+    }
+
+    fn collect_switcher_text(
+        shape: &egui::Shape,
+        texts: &mut Vec<(String, egui::Rect)>,
+        rendered: &mut Vec<(String, String)>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) => {
+                texts.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+                rendered.push((
+                    text.galley.text().to_string(),
+                    text.galley
+                        .rows
+                        .iter()
+                        .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                        .collect(),
+                ));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_switcher_text(shape, texts, rendered);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **The pick has to REACH the caller.** A switcher that paints its rows
+    /// correctly and answers `None` is the "decision correct, renderer inert"
+    /// shape this codebase keeps producing -- five mutations to this feature's
+    /// wiring have each left the whole suite green.
+    #[test]
+    fn the_switcher_lists_only_the_switchable_accounts_and_reports_the_pick() {
+        let mut switcher = Switcher::new();
+        let state = available_state();
+        let open = switcher.open(Some(&state));
+
+        assert!(
+            open.painted(&b().email),
+            "the open menu offers no row for the other account; it painted: {:?}",
+            open.strings()
+        );
+        let row = open.rect_of(&b().email);
+
+        let picked = switcher.click(Some(&state), row.center());
+        assert_eq!(
+            picked.picked,
+            Some(b().id),
+            "the click on {:?} reported {:?}",
+            b().email,
+            picked.picked
+        );
+    }
+
+    /// The other half of the same claim: the row the user is ALREADY on is not
+    /// a switch target. `all()` still holds it (and still holds duplicate ids);
+    /// `switchable()` is what this menu is built from.
+    #[test]
+    fn the_account_already_active_is_named_but_is_not_something_to_click() {
+        let mut switcher = Switcher::new();
+        let state = available_state();
+        let open = switcher.open(Some(&state));
+
+        assert!(
+            open.painted(&a().email),
+            "the menu never says which account this window is showing: {:?}",
+            open.strings()
+        );
+        // Positive control on the same frame: the row that IS clickable is
+        // there, so "clicking a does nothing" below is not a menu that drew
+        // nothing at all.
+        assert!(open.painted(&b().email), "control: {:?}", open.strings());
+
+        let clicked = switcher.click(Some(&state), open.rect_of(&a().email).center());
+        assert_eq!(
+            clicked.picked, None,
+            "clicking the account this window is already on reported a switch to it, which \
+             would tear the backend down and put up a master-password prompt to arrive \
+             exactly where the user already was"
+        );
+    }
+
+    /// **A refusal is said out loud.** Painting nothing is indistinguishable
+    /// from "you have one account", and both refusals this gate exists for --
+    /// a `bitwarden-cli` directory beside `bw.exe`, a migration that did not
+    /// land -- are things the user can go and act on. Nothing else in this
+    /// window mentions either.
+    #[test]
+    fn a_blocked_state_paints_the_reason_instead_of_a_switcher() {
+        let mut switcher = Switcher::new();
+        let state = blocked_state();
+        let open = switcher.open(Some(&state));
+
+        assert!(
+            !open.painted(&b().email),
+            "a switch to {:?} was offered while it cannot work: the CLI would ignore the \
+             profile and both accounts would share one. Painted: {:?}",
+            b().email,
+            open.strings()
+        );
+        assert!(
+            open.painted(BLOCKED_REASON),
+            "the user is not told why the switcher is empty; painted: {:?}",
+            open.strings()
+        );
+        // `Galley::text()` is blind to truncation: the reason names a
+        // directory, and a menu that elided it down to "a bitwarden-cli..."
+        // would pass the assertion above while telling the user nothing.
+        let drawn = open.glyphs(BLOCKED_REASON);
+        assert!(
+            drawn.contains("bitwarden-cli"),
+            "the reason was laid out but drawn as {drawn:?}"
+        );
+        assert!(
+            !drawn.contains('\u{2026}'),
+            "the reason was elided rather than wrapped; drawn as {drawn:?}"
+        );
+    }
+
+    /// The positive control for the test above. "The switcher offers no
+    /// blocked account" passes trivially against a switcher that draws
+    /// nothing at all, so the same helper has to be watched offering one.
+    #[test]
+    fn the_same_switcher_offers_the_account_once_nothing_is_blocking_it() {
+        let mut switcher = Switcher::new();
+        let open = switcher.open(Some(&available_state()));
+        assert!(
+            open.painted(&b().email),
+            "the harness offers nothing even unblocked, so the blocked assertions say \
+             nothing: {:?}",
+            open.strings()
+        );
+        assert!(
+            !open.painted(BLOCKED_REASON),
+            "an unblocked state paints a refusal: {:?}",
+            open.strings()
+        );
+    }
+
+    /// **A blank row is not a row.** An account minted by `resolve_startup` on
+    /// a first install, or by `prepare_new_account`, carries an empty email
+    /// until a sign-in fills it in -- so without `accounts::account_label` the
+    /// switcher offers a strip of menu with nothing written on it, and the
+    /// user has no way to tell what they would be switching to.
+    #[test]
+    fn an_account_with_no_email_is_offered_by_its_id_rather_than_as_a_blank_row() {
+        let mut switcher = Switcher::new();
+        let state = blank_email_state();
+        let open = switcher.open(Some(&state));
+
+        assert!(
+            open.painted(C),
+            "the account with no email is not named by its id; painted: {:?}",
+            open.strings()
+        );
+        assert!(
+            !open.painted(""),
+            "the switcher painted an empty string, which is the blank row this exists to \
+             stop: {:?}",
+            open.strings()
+        );
+        // And it is really clickable, not just readable.
+        let picked = switcher.click(Some(&state), open.rect_of(C).center());
+        assert_eq!(picked.picked, Some(blank().id));
+    }
+
+    /// One account and nothing blocking is the overwhelmingly common state.
+    /// An empty menu there is indistinguishable from a menu that failed to
+    /// build, and from the blocked state above -- which is a refusal the user
+    /// could act on and this is not.
+    #[test]
+    fn a_single_account_gets_a_menu_that_says_so_rather_than_an_empty_one() {
+        let mut switcher = Switcher::new();
+        let open = switcher.open(Some(&lone_state()));
+        // The literal, not `NO_OTHER_ACCOUNTS`: a test that reads the constant
+        // it is checking passes against any value that constant is given,
+        // including an empty string -- which is precisely the failure this
+        // test exists to catch. The constant is named only in the message.
+        assert!(
+            open.painted("No other accounts yet"),
+            "the lone-account menu says nothing at all (`NO_OTHER_ACCOUNTS` is {:?}); it \
+             painted: {:?}",
+            NO_OTHER_ACCOUNTS,
+            open.strings()
+        );
+        assert!(
+            !open.painted(BLOCKED_REASON),
+            "having one account is reported as a refusal: {:?}",
+            open.strings()
+        );
+    }
+
+    /// `StartupAccounts::Unmigrated`: this app has no `Account` at all and is
+    /// running as the single-account app it was before this feature existed.
+    /// There is nothing to say about accounts, so there is no control.
+    #[test]
+    fn an_app_with_no_account_list_draws_no_switcher_at_all() {
+        let mut switcher = Switcher::new();
+        assert!(
+            switcher.idle(None).chevrons.is_empty(),
+            "a switcher was drawn for an app that has no accounts"
+        );
+        // The positive control: the same harness, the same frame, one
+        // difference.
+        assert_eq!(
+            switcher.idle(Some(&available_state())).chevrons.len(),
+            1,
+            "the harness draws no chevron even WITH accounts, so the assertion above is \
+             about the harness rather than about the switcher"
+        );
+    }
+}
+
+/// **Where the switcher sits in the titlebar, and whether its clicks survive
+/// the drag zone.**
+///
+/// `draw_window_chrome_with_extra` narrows the window's drag zone to stop
+/// where the extra controls start, and registers that zone AFTER them -- so a
+/// control whose rect the zone still covers is a control whose clicks the drag
+/// swallows, which presents as a button that does nothing. This runs the real
+/// chrome function with the real switcher inside it and presses it.
+///
+/// The three controls are drawn here in the order
+/// `the_switcher_is_added_between_the_gear_and_the_avatar` pins `run`'s own
+/// strip to. That guard and this measurement are two halves: no harness in
+/// this crate can call `run` (it is the eframe application itself), so the
+/// ordering is pinned by source and its CONSEQUENCE is measured here rather
+/// than argued.
+#[cfg(test)]
+mod titlebar_switcher_placement_tests {
+    use super::*;
+    use crate::accounts::{Account, AccountId, AccountsState};
+    use crate::login_ui::ChromeMetrics;
+
+    const A: &str = "0123456789abcdef0123456789abcdef";
+    const B: &str = "fedcba9876543210fedcba9876543210";
+    /// Design 2b's own window size, which is what the titlebar's controls pack
+    /// against the right-hand end of.
+    const WINDOW_W: f32 = 1240.0;
+    const WINDOW_H: f32 = 740.0;
+    /// The email the switcher's one row is drawn from, and the string every
+    /// "did the menu open?" assertion below looks for.
+    const OTHER: &str = "bruno@example.com";
+
+    fn account(id: &str, email: &str) -> Account {
+        Account {
+            id: AccountId::parse(id).expect("a 32-char lowercase hex id"),
+            email: email.to_string(),
+            server_url: None,
+        }
+    }
+
+    fn state() -> AccountsState {
+        let active = account(A, "ana@example.com");
+        AccountsState::from_blocked_reason(
+            vec![active.clone(), account(B, OTHER)],
+            active.id,
+            None,
+        )
+        .expect("these accounts are not empty")
+    }
+
+    struct Strip {
+        ctx: egui::Context,
+    }
+
+    /// One frame of the real titlebar chrome: what the gear allocated, where
+    /// the chevron landed, where the avatar's initials landed, what strings
+    /// were painted, and what the frame asked the window to do.
+    struct Bar {
+        gear: egui::Rect,
+        chevron: egui::Rect,
+        initials: egui::Rect,
+        texts: Vec<String>,
+        started_drag: bool,
+    }
+
+    impl Bar {
+        /// Whether the switcher's menu is on this frame.
+        fn menu_is_open(&self) -> bool {
+            self.texts.iter().any(|t| t == OTHER)
+        }
+    }
+
+    impl Strip {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Self { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(WINDOW_W, WINDOW_H),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Bar {
+            let state = state();
+            let mut gear = egui::Rect::NOTHING;
+            let output = self.ctx.run_ui(Self::input(events), |ui| {
+                let _ = draw_window_chrome_with_extra(
+                    ui,
+                    WINDOW_TITLE,
+                    ChromeMetrics::VAULT,
+                    true,
+                    |ui| {
+                        // The gear FIRST, the switcher between, the avatar
+                        // last: right-to-left packing means earlier is further
+                        // right.
+                        gear = theme::gear_button(ui).rect;
+                        let _ = account_switcher(ui, Some(&state));
+                        draw_circle_avatar(ui, "AN");
+                    },
+                );
+            });
+
+            let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+            let chevrons = theme::icon_probe::chevrons(&all);
+            assert_eq!(
+                chevrons.len(),
+                1,
+                "expected exactly one chevron in the titlebar, found {}",
+                chevrons.len()
+            );
+            let mut texts = Vec::new();
+            let mut initials = None;
+            collect_titlebar_text(&all, &mut texts, &mut initials);
+            let started_drag = output.viewport_output.values().any(|viewport| {
+                viewport
+                    .commands
+                    .iter()
+                    .any(|c| matches!(c, egui::ViewportCommand::StartDrag))
+            });
+            Bar {
+                gear,
+                chevron: chevrons[0],
+                initials: initials.expect("the titlebar painted no avatar initials"),
+                texts,
+                started_drag,
+            }
+        }
+
+        fn idle(&mut self) -> Bar {
+            self.frame(Vec::new())
+        }
+
+        fn click(&mut self, pos: egui::Pos2) -> Bar {
+            self.frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ])
+        }
+
+        /// A press held down, then one frame of dragging -- which is what
+        /// actually starts a window drag. A press and release inside one frame
+        /// never reports `drag_started`.
+        fn drag_from(&mut self, pos: egui::Pos2) -> Bar {
+            let _ = self.frame(vec![egui::Event::PointerMoved(pos)]);
+            let _ = self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }]);
+            self.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(12.0, 4.0))])
+        }
+    }
+
+    fn collect_titlebar_text(
+        shape: &egui::Shape,
+        texts: &mut Vec<String>,
+        initials: &mut Option<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let source = text.galley.text().to_string();
+                if source == "AN" {
+                    *initials = Some(egui::Rect::from_min_size(text.pos, text.galley.size()));
+                }
+                texts.push(source);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_titlebar_text(shape, texts, initials);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **Measured rects, not source order.** The user asked for the gear to
+    /// the right of the avatar; the switcher goes between them, which is where
+    /// a disclosure chevron belongs -- against the thing it discloses.
+    #[test]
+    fn the_switcher_paints_between_the_avatar_and_the_gear() {
+        let bar = Strip::new().idle();
+        assert!(
+            bar.initials.center().x < bar.chevron.center().x,
+            "the switcher paints to the LEFT of the avatar (avatar at {:?}, chevron at \
+             {:?}) -- the right-to-left strip inverts the order it is written in, which is \
+             exactly how this lands on the wrong side",
+            bar.initials.center(),
+            bar.chevron.center()
+        );
+        assert!(
+            bar.chevron.center().x < bar.gear.center().x,
+            "the switcher paints to the RIGHT of the gear (chevron at {:?}, gear at {:?})",
+            bar.chevron.center(),
+            bar.gear.center()
+        );
+        // The controls really are packed against the window controls rather
+        // than floating in the middle of a 1240px bar, which is what makes
+        // "between" a statement about the group the user sees.
+        assert!(
+            bar.chevron.center().x > WINDOW_W - 300.0,
+            "the titlebar controls are not against the right-hand end of the bar at all; \
+             the chevron is at {:?}",
+            bar.chevron.center()
+        );
+    }
+
+    /// **The drag zone stops where the switcher starts.**
+    /// `draw_window_chrome_with_extra` registers the drag interaction AFTER
+    /// the extra controls and over everything left of them, so a zone that
+    /// still covered this control would take its clicks -- and the switcher
+    /// would be a chevron that does nothing, with no error anywhere.
+    #[test]
+    fn the_drag_zone_does_not_swallow_the_switchers_clicks() {
+        let mut strip = Strip::new();
+        let chevron = strip.idle().chevron;
+
+        let clicked = strip.click(chevron.center());
+        assert!(
+            !clicked.menu_is_open(),
+            "control: a popup paints on the frame AFTER the click that opened it, so this \
+             one must not have it yet"
+        );
+        assert!(
+            strip.idle().menu_is_open(),
+            "clicking the chevron opened no menu, so the click never reached it -- the drag \
+             zone took it"
+        );
+    }
+
+    /// The positive control for the test above, and the other half of the same
+    /// property: a press on the titlebar BESIDE the switcher still drags the
+    /// window. Without this, a drag zone shrunk to nothing would pass the test
+    /// above while making the window unmovable.
+    #[test]
+    fn the_titlebar_left_of_the_switcher_still_drags_the_window() {
+        let mut strip = Strip::new();
+        let chevron = strip.idle().chevron;
+        let beside = egui::pos2(chevron.left() - 60.0, chevron.center().y);
+
+        let dragged = strip.drag_from(beside);
+        assert!(
+            dragged.started_drag,
+            "a press at {beside:?} -- on the titlebar, 60px left of the switcher -- started \
+             no window drag, so the drag zone has been shrunk to nothing"
+        );
+        // And the same press does NOT open the switcher's menu, which is what
+        // makes the two zones distinct rather than overlapping.
+        assert!(
+            !strip.idle().menu_is_open(),
+            "a press in the drag zone opened the account menu"
+        );
+    }
+}
+
+/// The two halves of the switcher no harness can reach: that `run`'s titlebar
+/// strip calls it at all, and where in that strip. Source guards for
+/// `settings_gear_placement_tests`' reason -- the strip is a closure inside
+/// `run`, which is the eframe application, and rebuilding it in a test would
+/// assert the replica rather than the code.
+///
+/// The needles are `concat!`-split and single-line: a needle written as one
+/// literal can match its own declaration, and a needle containing a newline
+/// passes on LF and fails on CRLF (this repo has files in both states).
+#[cfg(test)]
+mod switcher_wiring_tests {
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    fn switcher_needle() -> String {
+        concat!("account_switcher(ui, ", "accounts.as_ref())").to_string()
+    }
+
+    fn gear_needle() -> String {
+        concat!("theme::gear_", "button(ui).clicked()").to_string()
+    }
+
+    fn avatar_needle() -> String {
+        concat!("draw_circle_", "avatar(ui,").to_string()
+    }
+
+    /// The strip packs right-to-left, so the widget added EARLIER ends up
+    /// further right: the gear first, then the switcher, then the avatar puts
+    /// the chevron between the other two.
+    /// `the_switcher_paints_between_the_avatar_and_the_gear` measures the
+    /// consequence; this is what ties that measurement to `run`.
+    #[test]
+    fn the_switcher_is_added_between_the_gear_and_the_avatar() {
+        let production = production();
+        let (gear, switcher, avatar) = (gear_needle(), switcher_needle(), avatar_needle());
+
+        // Positive controls. Without these, a rename of any of the three would
+        // leave the `find`s returning `None` and the ordering below comparing
+        // nothing at all.
+        let gear_at = production
+            .find(&gear)
+            .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
+        let switcher_at = production.find(&switcher).unwrap_or_else(|| {
+            panic!(
+                "no {switcher:?} in production code -- the titlebar switcher is gone, so every \
+                 click test over it is testing a function nothing calls"
+            )
+        });
+        let avatar_at = production
+            .find(&avatar)
+            .unwrap_or_else(|| panic!("no {avatar:?} in production code -- the avatar is gone"));
+        assert_eq!(
+            production.matches(&switcher).count(),
+            1,
+            "expected exactly one titlebar switcher; more than one and this ordering says \
+             nothing"
+        );
+
+        assert!(
+            gear_at < switcher_at,
+            "the switcher is added BEFORE the gear, so the right-to-left strip paints it to \
+             the RIGHT of the gear rather than between the gear and the avatar"
+        );
+        assert!(
+            switcher_at < avatar_at,
+            "the switcher is added AFTER the avatar, so the right-to-left strip paints it to \
+             the LEFT of the avatar -- on the far side of the account it names"
+        );
+    }
+
+    /// The click has to do both halves. Recording the pick without closing
+    /// leaves it sitting in a cell nobody reads until the user closes the
+    /// window by hand; closing without recording it loses the request and
+    /// reads as a window that shut for no reason.
+    #[test]
+    fn the_pick_is_recorded_and_then_closes_the_window() {
+        let body = switcher_click_body();
+        let records = concat!("*switch_to_for_", "closure.borrow_mut() = Some(picked);");
+        let closes = concat!("ViewportCommand::", "Close");
+
+        assert!(
+            body.contains(records),
+            "the switcher's click does not record which account was picked; `main` has \
+             nothing to act on: {body:?}"
+        );
+        assert!(
+            body.contains(closes),
+            "the switcher's click does not close the window, so `main` -- which cannot tear \
+             one backend down and start another while this window owns the event loop -- can \
+             never run the switch: {body:?}"
+        );
+    }
+
+    /// **A switch is not a lock, not an expired session, and not
+    /// Preferences.** The first two run the full recovery, which
+    /// re-authenticates against the account this process is ALREADY on: folded
+    /// into either, asking to switch would prompt for the master password of
+    /// the account being left and then leave the user on it. That is why
+    /// `switch_to` is its own field, and this is what stops a later tidy-up
+    /// from collapsing the four.
+    #[test]
+    fn picking_an_account_is_neither_a_lock_nor_an_expired_session_nor_preferences() {
+        let body = switcher_click_body();
+        for (needle, consequence) in [
+            (
+                concat!("*locked_for_", "closure.borrow_mut()"),
+                "sets the LOCK flag, so the switch runs the lock recovery for the account \
+                 being left",
+            ),
+            (
+                concat!("needs_reauth_for_", "closure"),
+                "flags an expired session, so the switch runs the re-authentication path",
+            ),
+            (
+                concat!("open_preferences_for_", "closure"),
+                "asks for the Preferences window instead of a switch",
+            ),
+        ] {
+            assert!(
+                !body.contains(needle),
+                "the switcher's click also {consequence}: {body:?}"
+            );
+        }
+        // Positive control: the body really is the switcher's click and not an
+        // empty slice, which every assertion above would pass against.
+        assert!(
+            body.contains(concat!("switch_to_for_", "closure")),
+            "the sliced body is not the switcher's click at all: {body:?}"
+        );
+    }
+
+    /// The last hop, and the one with nothing else watching it: the cell the
+    /// click writes into has to be read back out into `VaultWindowResult`
+    /// after the window closes. `run` is the eframe application, so no test
+    /// can watch a real window hand its result back -- and a `switch_to` left
+    /// hard-`None` there would make every click test above pass against a
+    /// switcher whose answer never leaves the window.
+    #[test]
+    fn the_recorded_pick_is_read_back_out_into_the_result() {
+        let production = production();
+        let read_back = concat!("let switch_to = switch_to.borrow_mut()", ".take();");
+        let result = concat!("VaultWindowResult { locked, needs_reauth,", " open_preferences,");
+
+        assert!(
+            production.contains(read_back),
+            "the cell the switcher writes into is never read back, so the pick dies with the \
+             window"
+        );
+        let at = production
+            .find(result)
+            .expect("no `VaultWindowResult` construction in production code");
+        let rest = &production[at..];
+        let construction = &rest[..rest.len().min(200)];
+        assert!(
+            construction.contains(concat!("switch", "_to }")),
+            "the result is built without the switcher's answer: {construction:?}"
+        );
+        // Positive control: the construction really was isolated, rather than
+        // being the whole rest of the file.
+        assert!(
+            construction.len() < production.len(),
+            "control: the slice isolated a region"
+        );
+    }
+
+    /// The body of the switcher's `if let Some(picked) = ...` block, depth-
+    /// counted to its closing brace.
+    fn switcher_click_body() -> &'static str {
+        let production = production();
+        let switcher = switcher_needle();
+        let at = production.find(&switcher).unwrap_or_else(|| {
+            panic!("no {switcher:?} in production code -- the titlebar switcher is gone")
+        });
+        let after_open = &production[at..];
+        let open = after_open
+            .find('{')
+            .expect("the switcher's click has no block to slice");
+        let after_open = &after_open[open + 1..];
+
+        let mut depth = 1usize;
+        for (offset, ch) in after_open.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let body = &after_open[..offset];
+                        assert!(
+                            !body.trim().is_empty(),
+                            "the switcher's click block is empty, so every assertion over it \
+                             would pass against nothing"
+                        );
+                        return body;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the switcher's click block is never closed");
     }
 }

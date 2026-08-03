@@ -4857,6 +4857,243 @@ mod tests {
         production
     }
 
+    /// **The switcher's production wiring**, which is where every previous
+    /// task in this feature stopped.
+    ///
+    /// `switch_to_account`, `add_account` and `remove_account` were each
+    /// shipped complete, correct and `#[allow(dead_code)]`; four tasks in a row
+    /// recorded that nothing proved the injected `resettle` closure would call
+    /// `resettle_session`, because there was no production closure to look at.
+    /// Task 14 wrote the first one, and it is in `open_vault_window` -- a
+    /// function no test in this crate can call, since it opens a real eframe
+    /// window. So it is sliced and read.
+    ///
+    /// The needles are `concat!`-split and single-line, for this file's usual
+    /// two reasons: a whole literal matches its own declaration, and a needle
+    /// carrying a newline passes on LF and fails on CRLF.
+    mod the_switch_the_vault_window_asks_for {
+        use super::production_half_of_this_file;
+
+        /// Where `open_vault_window` reads the switcher's answer.
+        fn switch_request() -> String {
+            concat!("if let Some(target) = result.switch", "_to.clone()").to_string()
+        }
+
+        fn lock_recovery() -> String {
+            concat!("if result.locked ", "|| result.needs_reauth {").to_string()
+        }
+
+        /// The body of the `if let` above, depth-counted to its closing brace.
+        fn switch_block() -> &'static str {
+            let production = production_half_of_this_file();
+            let request = switch_request();
+            let at = production.find(&request).unwrap_or_else(|| {
+                panic!(
+                    "{request:?} is not in the production code -- `open_vault_window` never \
+                     reads the switcher's result, so the whole control is inert"
+                )
+            });
+            let after_open = &production[at..];
+            let open = after_open
+                .find('{')
+                .expect("the switch request has no block to slice");
+            let after_open = &after_open[open + 1..];
+
+            let mut depth = 1usize;
+            for (offset, ch) in after_open.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = &after_open[..offset];
+                            assert!(
+                                body.len() > 200,
+                                "the sliced switch block is {} bytes, which is not a switch: \
+                                 every assertion over it would pass against nothing",
+                                body.len()
+                            );
+                            return body;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the switch request's block is never closed");
+        }
+
+        /// The plan's own wiring pin. A `switch_to` that `open_vault_window`
+        /// never reads means the switcher is 100% inert -- the exact shape of
+        /// the Trash/Archive feature that shipped dead behind an early return
+        /// with a green suite.
+        ///
+        /// **Before the lock recovery, and it reopens rather than returning.**
+        /// That recovery re-authenticates against the account this process is
+        /// already on, so a switch that fell into it would put up the master
+        /// password prompt for the account the user asked to LEAVE and then
+        /// leave them on it.
+        #[test]
+        fn open_vault_window_acts_on_a_switch_and_reopens_rather_than_running_the_lock_recovery()
+        {
+            let source = production_half_of_this_file();
+            let (request, lock) = (switch_request(), lock_recovery());
+
+            let switch_at = source.find(&request).unwrap_or_else(|| {
+                panic!("{request:?} is not in the production code -- the switcher is inert")
+            });
+            let lock_at = source.find(&lock).unwrap_or_else(|| {
+                panic!("{lock:?} is not in the production code -- this guard needs it to say \
+                        which side of the recovery the switch is on")
+            });
+            assert_ne!(
+                switch_at, lock_at,
+                "positive control: the two needles are two distinct positions"
+            );
+            assert!(
+                switch_at < lock_at,
+                "the switch is handled AFTER the lock/re-auth branch, so it would be \
+                 swallowed by a recovery for the wrong account"
+            );
+
+            assert!(
+                switch_block().contains("continue;"),
+                "the switch does not reopen the window, so asking to switch closes the vault \
+                 window for good and the user is left staring at the tray"
+            );
+        }
+
+        /// **The hole four tasks recorded and none could close.**
+        /// `switch_to_account`'s `resettle` is injected because its real body
+        /// needs a live Windows tray icon, and every test of the switch passes
+        /// a stub. Until this task there was no production closure at all, so
+        /// nothing anywhere said that the real one runs the one
+        /// teardown-and-repopulate sequence rather than a second, untested
+        /// one written inline.
+        #[test]
+        fn the_production_switch_resettles_through_the_one_sequence() {
+            let block = switch_block();
+            let sequence = concat!("resettle_", "session(");
+            assert!(
+                block.contains(sequence),
+                "the closure `open_vault_window` hands to `switch_to_account` does not call \
+                 {sequence:?}. The switch would then tear down and repopulate by some other \
+                 means -- a second implementation of the hardest code in this codebase, with \
+                 none of its tests: {block:?}"
+            );
+            // Positive control on the same slice, so the assertion above
+            // cannot be satisfied by a block this helper failed to find.
+            assert!(
+                block.contains(concat!("switch_to", "_account(")),
+                "the sliced block does not call the switch at all: {block:?}"
+            );
+        }
+
+        /// **The gate is `AccountsState`'s.** `all()` still reports the active
+        /// account and still reports duplicate ids, and it is not emptied when
+        /// switching is refused -- so a target resolved from it could be the
+        /// account the user is already on, or one the CLI would ignore the
+        /// profile of.
+        #[test]
+        fn the_target_is_resolved_through_switchable_and_not_the_raw_list() {
+            let block = switch_block();
+            let gate = concat!("state.switch", "able().iter().find(");
+            assert!(
+                block.contains(gate),
+                "the switch does not resolve its target through {gate:?}: {block:?}"
+            );
+            assert!(
+                !block.contains(concat!("state.all()", ".iter()")),
+                "the switch picks its target out of the raw account list, which still holds \
+                 the active account, still holds duplicate ids, and is NOT emptied when \
+                 switching is refused: {block:?}"
+            );
+            // Positive control: `all()` really is spelled that way here, so
+            // the negative above is about where it is used and not about a
+            // name that no longer exists.
+            assert!(
+                block.contains(concat!("state.", "all()")),
+                "the block never mentions `all()` at all, so the assertion above would pass \
+                 against a block that had stopped persisting anything: {block:?}"
+            );
+        }
+
+        /// **A switch that does not stick is worse than one that fails.** The
+        /// app would resume the PREVIOUS account on the next launch, which is
+        /// indistinguishable from the `relativeDataDir` trap and sends whoever
+        /// debugs it down entirely the wrong path.
+        ///
+        /// Persisted only on `Switched`, and only after it: written first, a
+        /// switch that then failed would leave `settings.json` naming an
+        /// account this process is not on.
+        #[test]
+        fn a_successful_switch_persists_the_new_active_account() {
+            let block = switch_block();
+            let persist = concat!("Settings::persist", "_accounts(");
+            let switched = concat!("SwitchOutcome::", "Switched => {");
+
+            assert_eq!(
+                block.matches(persist).count(),
+                1,
+                "expected exactly one persist in the switch block: {block:?}"
+            );
+            let landed = block
+                .split_once(switched)
+                .unwrap_or_else(|| {
+                    panic!("no {switched:?} arm in the switch block: {block:?}")
+                })
+                .1;
+            assert!(
+                landed.contains(persist),
+                "a successful switch does not persist the new active account, so the app \
+                 resumes the previous one on the next launch: {block:?}"
+            );
+            // ...and the arms that did NOT land do not persist. The `Declined`
+            // arm is the one that matters: the user is still on the account
+            // they started on, and writing the target there would strand them.
+            let before_landing = block.split_once(switched).unwrap().0;
+            assert!(
+                !before_landing.contains(persist),
+                "something is persisted before the switch is known to have landed: {block:?}"
+            );
+        }
+
+        /// Every outcome the switch can have is reported. A `RolledBack` the
+        /// user never sees is a click that appears to do nothing; a `StoodDown`
+        /// that is not logged is an app with no autofill and no record of why.
+        #[test]
+        fn every_outcome_of_the_switch_is_reported_somewhere() {
+            let block = switch_block();
+            for (arm, must_contain, why) in [
+                (
+                    concat!("SwitchOutcome::", "Declined =>"),
+                    concat!("log::", "info!"),
+                    "a decline is not an error and must not be raised as one, but it is \
+                     still the record of a switch that did not happen",
+                ),
+                (
+                    concat!("SwitchOutcome::", "RolledBack { reason } =>"),
+                    concat!("message", "_box("),
+                    "a failed switch the user is not told about is a click that did nothing",
+                ),
+                (
+                    concat!("SwitchOutcome::", "StoodDown { reason } =>"),
+                    concat!("log::", "error!"),
+                    "autofill has been stood down and nothing records why",
+                ),
+            ] {
+                let at = block
+                    .find(arm)
+                    .unwrap_or_else(|| panic!("no {arm:?} arm in the switch block: {block:?}"));
+                let rest = &block[at..];
+                let arm_body = &rest[..rest.len().min(700)];
+                assert!(
+                    arm_body.contains(must_contain),
+                    "the {arm:?} arm does not {must_contain:?}: {why}"
+                );
+            }
+        }
+    }
+
     /// The spec's own warning, made mechanical: "if a task finds itself
     /// writing a second teardown-and-repopulate path, it has gone wrong".
     /// A second call site is a second implementation of the hardest code in

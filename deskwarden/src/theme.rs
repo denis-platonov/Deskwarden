@@ -1530,6 +1530,24 @@ pub fn gear_button(ui: &mut Ui) -> Response {
     response.on_hover_text("Preferences")
 }
 
+/// Half the switcher chevron's width. Deliberately smaller than the gear's
+/// 9px tip radius: this is a subordinate mark beside the avatar, not a control
+/// competing with it.
+///
+/// At file scope rather than inside [`account_switcher_button`] so
+/// [`icon_probe::chevrons`] can find the mark by the same two numbers that
+/// draw it -- the vault titlebar strokes ✕ and — as line segments too, and a
+/// probe that spelled these out again would go on finding the close glyph
+/// after this shape was retuned out from under it.
+const SWITCHER_CHEVRON_ARM: f32 = 4.0;
+/// How far the switcher chevron's point drops below its two arms' ends.
+const SWITCHER_CHEVRON_DROP: f32 = 2.6;
+/// The chevron's stroke width, at file scope for the same reason as the two
+/// above: `Shape::visual_bounding_rect` expands a line segment by half the
+/// stroke at each end, so a probe matching on the raw arm and drop finds
+/// nothing at all.
+const SWITCHER_CHEVRON_STROKE: f32 = 1.3;
+
 /// The vault titlebar's account switcher: a downward chevron, 28px square,
 /// sized and coloured exactly like [`gear_button`] beside it.
 ///
@@ -1547,13 +1565,6 @@ pub fn gear_button(ui: &mut Ui) -> Response {
 /// label, for [`close_glyph`]'s reason: it has no word on it.
 pub fn account_switcher_button(ui: &mut Ui) -> Response {
     const SIZE: f32 = 28.0;
-    /// Half the chevron's width. Deliberately smaller than the gear's 9px
-    /// tip radius: this is a subordinate mark beside the avatar, not a
-    /// control competing with it.
-    const ARM: f32 = 4.0;
-    /// How far the point drops below the two arms' ends.
-    const DROP: f32 = 2.6;
-
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1561,19 +1572,28 @@ pub fn account_switcher_button(ui: &mut Ui) -> Response {
     // `gear_button`'s two-state treatment, and for its reason: a navigation
     // control with no "on" state never takes BLUE, and never takes ERROR.
     let color = if response.hovered() { INK } else { TEXT_SECONDARY };
-    let stroke = Stroke::new(1.3, color);
+    let stroke = Stroke::new(SWITCHER_CHEVRON_STROKE, color);
     // Centred on the chevron's own bounding box rather than on `rect`, so
     // the mark reads as vertically centred: a "V" hangs low if its widest
     // edge is put on the centre line.
-    let c = rect.center() - Vec2::new(0.0, DROP / 2.0);
+    let c = rect.center() - Vec2::new(0.0, SWITCHER_CHEVRON_DROP / 2.0);
     let painter = ui.painter();
-    // Two segments rather than one three-point path, so `icon_probe::
-    // line_segments` can find them the way it finds the eye's strike.
+    // Two segments rather than one three-point path, so `icon_probe::chevrons`
+    // can find them the way `line_segments` finds the eye's strike.
     painter.line_segment(
-        [c + Vec2::new(-ARM, 0.0), c + Vec2::new(0.0, DROP)],
+        [
+            c + Vec2::new(-SWITCHER_CHEVRON_ARM, 0.0),
+            c + Vec2::new(0.0, SWITCHER_CHEVRON_DROP),
+        ],
         stroke,
     );
-    painter.line_segment([c + Vec2::new(0.0, DROP), c + Vec2::new(ARM, 0.0)], stroke);
+    painter.line_segment(
+        [
+            c + Vec2::new(0.0, SWITCHER_CHEVRON_DROP),
+            c + Vec2::new(SWITCHER_CHEVRON_ARM, 0.0),
+        ],
+        stroke,
+    );
     response.on_hover_text("Switch account")
 }
 
@@ -1742,6 +1762,44 @@ pub mod icon_probe {
             matches!(s, egui::Shape::LineSegment { .. })
         });
         out
+    }
+
+    /// Every account-switcher chevron in a frame, each as the union of its
+    /// two strokes.
+    ///
+    /// In this module, and matched on [`SWITCHER_CHEVRON_ARM`] and
+    /// [`SWITCHER_CHEVRON_DROP`] rather than on numbers written out again,
+    /// for the reason this module exists at all: the vault titlebar this
+    /// chevron lives in also strokes ✕ (two 9x9 arms) and — (one 9x0 bar) as
+    /// line segments, so a test over there that used
+    /// [`line_segments`] directly would find three marks and could not say
+    /// which was the switcher -- and one that spelled out 4.0 x 2.6 itself
+    /// would go on finding the close glyph after this shape was retuned.
+    ///
+    /// The pairing is positional: `account_switcher_button` emits its two
+    /// segments back to back, so consecutive matching pairs are one chevron
+    /// each. An odd count means half a chevron was found, which is a probe
+    /// that has stopped matching rather than a shape worth reporting -- so it
+    /// panics rather than silently dropping it.
+    pub fn chevrons(shape: &egui::Shape) -> Vec<Rect> {
+        let arms: Vec<Rect> = line_segments(shape)
+            .into_iter()
+            .filter(|r| {
+                // `visual_bounding_rect` expands a segment by half the stroke
+                // at each end, so the arm's box is one whole stroke wider and
+                // taller than the arm.
+                (r.width() - (SWITCHER_CHEVRON_ARM + SWITCHER_CHEVRON_STROKE)).abs() < 0.01
+                    && (r.height() - (SWITCHER_CHEVRON_DROP + SWITCHER_CHEVRON_STROKE)).abs()
+                        < 0.01
+            })
+            .collect();
+        assert!(
+            arms.len() % 2 == 0,
+            "found {} chevron arms, which is not a whole number of chevrons -- this probe \
+             has stopped matching what `account_switcher_button` draws",
+            arms.len()
+        );
+        arms.chunks(2).map(|pair| pair[0].union(pair[1])).collect()
     }
 
     /// The kebab's individual dots, each with the colour it was filled in --
