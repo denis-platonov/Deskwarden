@@ -23,8 +23,10 @@
 //! Declares no modules of its own: every module lives in `lib.rs` (see the
 //! note there). This file is only `fn main()` and the startup sequence.
 
+use deskwarden::accounts::{self, Account};
 use deskwarden::app::{fill_from_vault, handle_match, match_entries, pump_windows_messages};
 use deskwarden::backend_policy;
+use deskwarden::bw_path;
 // `BACKEND_OP_TIMEOUT`: the upper bound on how long a legitimate backend
 // start or sync may take before something is treated as having gone wrong.
 // Used both by this file's own backend-op bookkeeping
@@ -53,6 +55,7 @@ use deskwarden::{
     session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
+use std::path::Path;
 use std::process::Child;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -2094,6 +2097,162 @@ fn resettle_session_with(
     ResettleOutcome::BackendStarted
 }
 
+/// What one run of the resettle told the switch.
+///
+/// [`ResettleOutcome`] has two variants and this has three, because a
+/// master-password prompt the user closed and a backend that would not start
+/// both arrive at `BackendNotStarted`, and only whoever built the
+/// `authenticate` closure can tell them apart. The switch has to: one is a
+/// failure to report and the other is the user changing their mind, and a
+/// switch that told the user "the backend did not start" because they pressed
+/// Cancel would be reporting something that never happened.
+///
+/// The alternative was to authenticate before calling the sequence, where the
+/// switch could see the answer directly. That is exactly the ordering Task 8's
+/// `the_resettle_authenticates_after_the_teardown_and_settles_after_the_start`
+/// exists to forbid: the master-password prompt for the *new* account would go
+/// up with the *previous* account's items still live in the cache and its
+/// matches still armed behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Constructed by the caller that owns the `authenticate` closure, which is the
+// tray wiring in Task 11; until then only this file's tests build one.
+#[allow(dead_code)]
+enum ResettleReport {
+    /// [`ResettleOutcome::BackendStarted`]: the account is live.
+    Settled,
+    /// `BackendNotStarted` because `authenticate` answered `None` -- the user
+    /// closed the master-password prompt.
+    Declined,
+    /// `BackendNotStarted` with a session in hand: nothing came up to serve it.
+    NotStarted,
+}
+
+/// Where an account switch left the app.
+#[derive(Debug, Clone, PartialEq, Eq)]
+// Returned to the tray wiring in Task 11; see `ResettleReport` above.
+#[allow(dead_code)]
+enum SwitchOutcome {
+    /// The target account is live: its backend is up, its cache is populated
+    /// from its own vault and its matches are armed from those items.
+    Switched,
+    /// The user closed the target account's master-password prompt, and the
+    /// previous account is back. Not an error, and not to be reported as one.
+    Declined,
+    /// The switch failed and the previous account is back.
+    RolledBack { reason: String },
+    /// The switch failed and so did the rollback: [`stand_down_after_unlock`]'s
+    /// state, which this app already ships and recovers from via the tray's
+    /// "Sync".
+    StoodDown { reason: String },
+}
+
+/// Switches the app from one account to another, or leaves it exactly where it
+/// started.
+///
+/// The dominant risk the spec names is a switch that HALF lands -- the CLI
+/// pointed at the new account's profile beside the old account's cache. That
+/// state is not reachable from here, and the reason is that this function does
+/// not perform a switch. It re-points the two values that answer "which
+/// account is this process?" and then runs *the* existing
+/// teardown-and-repopulate sequence, which is [`resettle_session`]. Every
+/// thing that could half-land -- the cache, the match engine, `bw serve`, the
+/// session token -- lives inside that sequence and is not a parameter here, so
+/// this body has nothing to touch out of order and no second teardown path to
+/// get wrong.
+///
+/// `resettle` is injected for exactly the reason `settle_vault_after_unlock`'s
+/// `probe` is: `resettle_session`'s own body needs a real `tray::AppTray`, and
+/// `tray::build_tray` makes a real Windows tray icon against a live message
+/// loop. The live caller passes a closure that calls it;
+/// `a_switch_reimplements_none_of_the_sequence_it_is_supposed_to_reuse` pins
+/// that this body has not done the work itself instead.
+///
+/// **Order.** The data directory and the token store are re-pointed BEFORE the
+/// sequence runs, because the sequence is what authenticates,
+/// `login_ui::run_login_flow_for` spawns `bw`, and that spawn has to land in
+/// the target account's profile -- and the token it produces has to be saved
+/// into the target account's `session.bin`, not written over the account the
+/// user is leaving. Re-pointing afterwards, or never, makes the whole feature
+/// inert while every end-state assertion stays green, which is why the failed
+/// -switch test records what each run of the sequence could SEE rather than
+/// only what was left behind.
+///
+/// **Rollback.** A rollback has nothing to undo. Between the re-point and the
+/// sequence this function changes nothing else: `active_account` is assigned
+/// only once the target has settled, and the outgoing account's token file is
+/// discarded only then too -- throwing it away up front would cost the user a
+/// master-password prompt for an account they never asked to leave, on top of
+/// the switch that just failed. So the rollback is the re-point in reverse
+/// plus the same sequence again, run for the account whose session was never
+/// invalidated.
+///
+/// **It may not kill the app.** `fatal_startup_error`, and startup's
+/// `start_backend` wrapper that calls it, are banned from this body and the
+/// ban is pinned by `no_switch_path_can_reach_the_fatal_startup_error`: the
+/// *other* account's backend refusing to start is not a reason to take a
+/// running app down. So is `run_login_flow`, the wrapper that exits when the
+/// user declines -- a switch authenticates through `run_login_flow_for`, which
+/// can answer `None`, and that `None` is this function's `Declined`.
+// Called by the tray wiring in Task 11; see `ResettleReport` above.
+#[allow(dead_code)]
+fn switch_to_account(
+    config_dir: &Path,
+    from: &Account,
+    to: &Account,
+    active_account: &mut Account,
+    store: &mut session_store::SessionStore,
+    mut resettle: impl FnMut(&Path, &Account, &session_store::SessionStore) -> ResettleReport,
+) -> SwitchOutcome {
+    // Whatever it was, not `data_dir_for(from)`: before the migration in Task
+    // 11 has run the app is on the CLI's own default directory, and a rollback
+    // has to put it back there rather than invent an account directory.
+    let previous_dir = bw_path::active_data_dir();
+    log::info!("switching accounts: {} -> {}", from.email, to.email);
+
+    bw_path::set_active_data_dir(Some(accounts::data_dir_for(config_dir, &to.id)));
+    *store = session_store::SessionStore::new(accounts::session_path_for(config_dir, &to.id));
+
+    let report = resettle(config_dir, to, store);
+    let failure = match report {
+        ResettleReport::Settled => {
+            *active_account = to.clone();
+            // Only NOW. Until the switch has landed, the outgoing account is
+            // still this app's account rather than an idle one.
+            let outgoing = accounts::session_path_for(config_dir, &from.id);
+            if let Err(e) = std::fs::remove_file(&outgoing) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "could not discard {}'s session token at {}: {e}",
+                        from.email,
+                        outgoing.display()
+                    );
+                }
+            }
+            log::info!("switched to {}", to.email);
+            return SwitchOutcome::Switched;
+        }
+        ResettleReport::Declined => {
+            format!("the master password prompt for {} was closed", to.email)
+        }
+        ResettleReport::NotStarted => {
+            format!("the Bitwarden backend for {} did not start", to.email)
+        }
+    };
+
+    log::warn!("{failure}; returning to {}", from.email);
+    bw_path::set_active_data_dir(previous_dir);
+    *store = session_store::SessionStore::new(accounts::session_path_for(config_dir, &from.id));
+    match resettle(config_dir, from, store) {
+        // A decline is the user changing their mind, and the previous account
+        // is back: there is nothing to report but the fact that nothing moved.
+        ResettleReport::Settled if report == ResettleReport::Declined => SwitchOutcome::Declined,
+        ResettleReport::Settled => SwitchOutcome::RolledBack { reason: failure },
+        ResettleReport::Declined | ResettleReport::NotStarted => SwitchOutcome::StoodDown {
+            reason: format!("{failure}, and {} could not be restored either", from.email),
+        },
+    }
+}
+
 /// Borrows the job object out of its `Arc` wrapper for a synchronous call.
 ///
 /// The `Arc` only exists so a clone can be handed off to a background
@@ -4039,6 +4198,542 @@ mod tests {
                 wiring.contains(needle),
                 "`resettle_session` no longer reaches `{needle}`: the sequence's tests all \
                  inject stubs, so nothing else would notice"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 9 -- the account switch.
+    // ---------------------------------------------------------------------
+
+    /// `bw_path::set_active_data_dir` writes a process-global, and these tests
+    /// both set it and read it back. Same guard the `bw_path` tests use for
+    /// the same static; a separate one because that one is `mod tests`-private
+    /// to the library and this is the binary's own test process.
+    static ACTIVE_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_active_dir() -> std::sync::MutexGuard<'static, ()> {
+        ACTIVE_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    const ACCOUNT_A: &str = "0123456789abcdef0123456789abcdef";
+    const ACCOUNT_B: &str = "fedcba9876543210fedcba9876543210";
+
+    fn account(id: &str, email: &str) -> Account {
+        Account {
+            id: deskwarden::accounts::AccountId::parse(id)
+                .unwrap_or_else(|| panic!("{id:?} should be a valid account id")),
+            email: email.to_string(),
+            server_url: None,
+        }
+    }
+
+    /// A config directory with both accounts' directories already made, and a
+    /// session token file already sitting in each -- the state a switch is
+    /// actually run from.
+    ///
+    /// **Every path any switch test touches is under one of these.** Nothing
+    /// here may reach the real `%APPDATA%` profile or the user's real config
+    /// directory: these tests delete a `session.bin` by design.
+    struct ScratchConfig(std::path::PathBuf);
+
+    impl ScratchConfig {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "deskwarden-switch-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            for id in [ACCOUNT_A, ACCOUNT_B] {
+                let account_dir =
+                    accounts::data_dir_for(&dir, &deskwarden::accounts::AccountId::parse(id).unwrap());
+                std::fs::create_dir_all(&account_dir).unwrap();
+                std::fs::write(account_dir.join("session.bin"), b"a-wrapped-token").unwrap();
+            }
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What the real sequence leaves behind when it settles, with the backend
+    /// and the master-password prompt taken out: the cache cleared (which is
+    /// what bumps the era), then repopulated and the engine rearmed from the
+    /// account's *own* items, through the same `repopulate_and_refresh_after_unlock`
+    /// production calls.
+    fn settled_on(cache: &VaultCache, engine: &mut MatchEngine, items: &[(&str, &str)]) {
+        cache.clear();
+        let epoch = cache.epoch();
+        repopulate_and_refresh_after_unlock(cache, engine, probe_items(items), epoch);
+    }
+
+    /// What the real sequence leaves behind when it does NOT settle: the
+    /// teardown has already happened -- `resettle_session_with` clears the
+    /// cache before it authenticates, and both failing arms end in
+    /// `stand_down_after_unlock` -- and only then is the failure reported.
+    ///
+    /// Modelling that is the point. A stub that returned the failure without
+    /// tearing anything down would make every "the previous account still
+    /// works" assertion below pass on an app that had never been disturbed.
+    fn torn_down(cache: &VaultCache, engine: &mut MatchEngine) {
+        cache.clear();
+        stand_down_after_unlock(engine, "a test's backend did not come up");
+    }
+
+    /// The spec's own test, with the worst failure mode it protects against: a
+    /// match left armed from account A, under account B's session, raises an
+    /// autofill prompt whose fill can only ever end in an error -- or, if the
+    /// two vaults happen to share an item id, in a credential from the wrong
+    /// vault.
+    #[test]
+    fn a_switch_rebuilds_the_engine_so_the_previous_accounts_matches_are_gone() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("rebuild");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store = session_store::SessionStore::new(accounts::session_path_for(
+            cfg.path(),
+            &a.id,
+        ));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+        assert!(
+            engine.lookup("notepad.exe").is_some() && cache.is_populated(),
+            "precondition: the app really is live on A, so the assertions below are about \
+             A being torn down rather than never having been there"
+        );
+
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, account, _store| {
+                assert_eq!(account.id, b.id, "only the switch itself should have run");
+                settled_on(&cache, &mut engine, &[("b-item", "code.exe")]);
+                ResettleReport::Settled
+            },
+        );
+
+        assert_eq!(outcome, SwitchOutcome::Switched);
+        assert_eq!(active.id, b.id, "the app is still reporting itself as A");
+        assert!(
+            engine.lookup("notepad.exe").is_none(),
+            "account A's match is STILL ARMED under account B's session"
+        );
+        // The positive control, so this cannot pass on an engine that is
+        // simply empty -- which is what a switch that stood autofill down and
+        // never rearmed it would leave, and which every negative assertion
+        // above would happily accept.
+        assert!(
+            engine.lookup("code.exe").is_some(),
+            "account B's own match is not armed, so the switch disarmed autofill instead of \
+             moving it"
+        );
+        let items = cache.items();
+        assert!(
+            items.iter().all(|i| i.id != "a-item"),
+            "account A's items are still in the cache under account B's session"
+        );
+        assert!(
+            items.iter().any(|i| i.id == "b-item"),
+            "control: account B's own items are there, so the cache was refilled rather than \
+             just emptied"
+        );
+        assert!(
+            !accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "A's session token outlived the switch"
+        );
+        assert!(
+            accounts::session_path_for(cfg.path(), &b.id).exists(),
+            "control: the switch deleted a token file, and it deleted the right one"
+        );
+    }
+
+    /// The era machinery is what makes a switch safe against a fetch that was
+    /// already in the air, and this is the assertion that a switch is actually
+    /// ROUTED THROUGH it rather than bypassing it.
+    #[test]
+    fn a_populate_from_the_previous_account_in_flight_across_a_switch_is_discarded() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("era");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut active = a.clone();
+        let mut store = session_store::SessionStore::new(accounts::session_path_for(
+            cfg.path(),
+            &a.id,
+        ));
+
+        // Account A's sync, mid-flight: its epoch was captured before its
+        // fetch, and its items are in hand but not yet written.
+        let a_epoch = cache.epoch();
+        let a_items = probe_items(&[("a-item", "notepad.exe")]);
+
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, _account, _store| {
+                cache.clear();
+                ResettleReport::Settled
+            },
+        );
+        assert_eq!(outcome, SwitchOutcome::Switched);
+
+        assert_eq!(
+            cache.populate_with(a_items, a_epoch).unwrap(),
+            PopulateOutcome::DiscardedStale,
+            "account A's items were written into account B's cache"
+        );
+        assert!(cache.items().is_empty());
+
+        // The positive control: an epoch captured AFTER the switch is not
+        // discarded, so the assertion above cannot pass merely because
+        // `populate_with` refuses everything from here on.
+        let b_epoch = cache.epoch();
+        assert_eq!(
+            cache
+                .populate_with(probe_items(&[("b-item", "code.exe")]), b_epoch)
+                .unwrap(),
+            PopulateOutcome::Populated,
+            "nothing can repopulate the cache after a switch, so the switch broke the vault \
+             rather than moving it"
+        );
+    }
+
+    /// "A half-switched app -- new data directory, old cache -- is the one
+    /// outcome that must not be reachable."
+    ///
+    /// The `seen` vector is the assertion this test exists for. Everything
+    /// else here is end state, and a switch that re-pointed the CLI *after*
+    /// the sequence ran -- or never -- leaves exactly the same end state while
+    /// making the entire feature inert: `bw` would keep answering from the
+    /// previous account's profile, so the "new" account's vault would simply
+    /// be the old one. Recording what each run of the sequence could SEE is
+    /// the only thing that can tell those apart.
+    #[test]
+    fn a_failed_switch_returns_to_the_previous_account_with_everything_working() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("rollback");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store = session_store::SessionStore::new(accounts::session_path_for(
+            cfg.path(),
+            &a.id,
+        ));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+
+        let mut seen: Vec<(Option<std::path::PathBuf>, std::path::PathBuf)> = Vec::new();
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, account, store| {
+                // AT THE MOMENT the sequence runs -- which is the moment
+                // `run_login_flow_for` spawns `bw` and the moment the token it
+                // produces is saved.
+                seen.push((bw_path::active_data_dir(), store.path().to_path_buf()));
+                if account.id == b.id {
+                    torn_down(&cache, &mut engine);
+                    ResettleReport::NotStarted
+                } else {
+                    settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+                    ResettleReport::Settled
+                }
+            },
+        );
+
+        assert!(
+            matches!(outcome, SwitchOutcome::RolledBack { .. }),
+            "expected a rollback, got {outcome:?}"
+        );
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "the CLI was left on B's directory beside A's cache"
+        );
+        assert_eq!(
+            store.path(),
+            accounts::session_path_for(cfg.path(), &a.id),
+            "the token store was left on B's file, so A's next token would be written there"
+        );
+        assert_eq!(active.id, a.id, "the app thinks it switched");
+        assert!(cache.is_populated(), "A's vault is gone after a failed switch");
+        assert!(
+            engine.lookup("notepad.exe").is_some(),
+            "A's autofill is dead after a failed switch"
+        );
+        assert!(
+            accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "A's token was discarded, so the rollback cost a second password prompt for an \
+             account the user never asked to leave"
+        );
+        assert!(
+            accounts::session_path_for(cfg.path(), &b.id).exists(),
+            "the switch that failed deleted the token of the account it failed to reach"
+        );
+
+        // THE pin: the directory and the token store really were swapped
+        // BEFORE the sequence ran, and swapped back before the rollback ran.
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    Some(accounts::data_dir_for(cfg.path(), &b.id)),
+                    accounts::session_path_for(cfg.path(), &b.id)
+                ),
+                (
+                    Some(accounts::data_dir_for(cfg.path(), &a.id)),
+                    accounts::session_path_for(cfg.path(), &a.id)
+                ),
+            ],
+            "the sequence did not run against the account it was switching to"
+        );
+    }
+
+    /// A declined master password is the user changing their mind, not a
+    /// failure, and it must leave them on the account they were already using.
+    ///
+    /// It is also the outcome Task 7's `run_login_flow_for` exists to make
+    /// possible: `run_login_flow` exits the process instead of answering, so a
+    /// switch built on it would kill a running app because the user pressed
+    /// Escape. Nothing in this test could observe that -- the process would be
+    /// gone -- which is why the ban below is a source guard.
+    #[test]
+    fn a_declined_master_password_leaves_the_app_on_the_account_it_started_on() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("declined");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store = session_store::SessionStore::new(accounts::session_path_for(
+            cfg.path(),
+            &a.id,
+        ));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, account, _store| {
+                if account.id == b.id {
+                    torn_down(&cache, &mut engine);
+                    ResettleReport::Declined
+                } else {
+                    settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+                    ResettleReport::Settled
+                }
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            SwitchOutcome::Declined,
+            "a cancelled prompt was reported to the user as a failure"
+        );
+        assert_eq!(active.id, a.id);
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &a.id))
+        );
+        assert!(engine.lookup("notepad.exe").is_some());
+        assert!(cache.is_populated());
+        assert!(accounts::session_path_for(cfg.path(), &a.id).exists());
+    }
+
+    /// The rollback can fail too -- A's own `bw serve` may not come back up --
+    /// and the answer is the state this app already ships and already tells
+    /// the user how to recover from, not a claim that the switch landed.
+    #[test]
+    fn a_switch_whose_rollback_also_fails_stands_down_rather_than_claiming_it_landed() {
+        let _guard = lock_active_dir();
+        let cfg = ScratchConfig::new("stooddown");
+        let (a, b) = (
+            account(ACCOUNT_A, "a@example.com"),
+            account(ACCOUNT_B, "b@example.com"),
+        );
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let mut active = a.clone();
+        let mut store = session_store::SessionStore::new(accounts::session_path_for(
+            cfg.path(),
+            &a.id,
+        ));
+        bw_path::set_active_data_dir(Some(accounts::data_dir_for(cfg.path(), &a.id)));
+        settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
+
+        let outcome = switch_to_account(
+            cfg.path(),
+            &a,
+            &b,
+            &mut active,
+            &mut store,
+            |_cfg, _account, _store| {
+                torn_down(&cache, &mut engine);
+                ResettleReport::NotStarted
+            },
+        );
+
+        match &outcome {
+            SwitchOutcome::StoodDown { reason } => {
+                assert!(
+                    reason.contains("b@example.com") && reason.contains("a@example.com"),
+                    "the message names neither the account that failed nor the one that could \
+                     not be restored: {reason}"
+                );
+            }
+            other => panic!("expected a stand-down, got {other:?}"),
+        }
+        assert_eq!(
+            active.id, a.id,
+            "the app adopted an account whose backend never came up"
+        );
+        assert_eq!(
+            bw_path::active_data_dir(),
+            Some(accounts::data_dir_for(cfg.path(), &a.id)),
+            "a stood-down app is left pointing at the account it could not reach, so the tray's \
+             Sync -- the recovery it tells the user about -- would recover the wrong one"
+        );
+        assert!(
+            accounts::session_path_for(cfg.path(), &a.id).exists(),
+            "the app stood down AND threw away the token it needs to come back"
+        );
+    }
+
+    /// `switch_to_account`'s own body, for the two source guards below.
+    ///
+    /// Cut at `fn job_ref(`, the function defined immediately after it, rather
+    /// than at a closing brace: a `"\n}"` needle passes on LF and fails on
+    /// CRLF, and this repository has both.
+    fn the_switch_body() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("fn switch_to", "_account("))
+            .expect("`switch_to_account` must still exist")
+            .1;
+        let body = after
+            .split_once(concat!("fn job_", "ref("))
+            .expect("`job_ref` must still be the function defined after the switch")
+            .0;
+        assert!(
+            body.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            body.contains(concat!("SwitchOutcome::Stood", "Down")),
+            "control: the region really is the switch's own body"
+        );
+        body
+    }
+
+    /// The spec's explicit warning. `start_backend` -- startup's wrapper
+    /// around `try_start_backend` -- calls `fatal_startup_error`, and killing
+    /// a running app because the OTHER account's backend would not start is
+    /// not acceptable. The `start_backend(` needle also matches
+    /// `try_start_backend(`, deliberately and correctly: a switch reaches
+    /// either one only through `resettle_session`, which is what all the
+    /// tests above drive.
+    ///
+    /// `run_login_flow(` is banned for the same reason and does NOT match
+    /// `run_login_flow_for(`: the wrapper exits when the user declines, and
+    /// the cancellable form is the one a switch has to call.
+    #[test]
+    fn no_switch_path_can_reach_the_fatal_startup_error() {
+        let body = the_switch_body();
+        let production = production_half_of_this_file();
+        for banned in [
+            concat!("fatal_startup", "_error("),
+            concat!("start_", "backend("),
+            concat!("run_login", "_flow("),
+        ] {
+            assert!(
+                production.contains(banned),
+                "control: `{banned}` is really spelled that way in this file, so the ban below \
+                 is not vacuous"
+            );
+            assert!(
+                !body.contains(banned),
+                "`{banned}` is reachable from a switch: a failed switch would kill a running app"
+            );
+        }
+    }
+
+    /// The spec's dominant risk, made mechanical: "if an implementation finds
+    /// itself writing a second teardown-and-repopulate path, that is the
+    /// signal it has gone wrong."
+    ///
+    /// `switch_to_account` is that implementation's most likely author, and
+    /// the tempting version of it is easy to write and impossible to see in a
+    /// green suite: clear the cache here, start a backend there, rebuild the
+    /// engine at the end. It would pass every behavioural test above, because
+    /// those tests only ever assert on the state the sequence leaves. This
+    /// guard is what says the state came from THE sequence.
+    #[test]
+    fn a_switch_reimplements_none_of_the_sequence_it_is_supposed_to_reuse() {
+        let body = the_switch_body();
+        let production = production_half_of_this_file();
+        for banned in [
+            concat!("cache.", "clear("),
+            concat!("stop_bw_", "serve("),
+            concat!("engine.", "rebuild("),
+            concat!("stand_down_after", "_unlock("),
+            concat!("settle_vault_after", "_unlock("),
+            concat!("repopulate_and_refresh_after", "_unlock("),
+        ] {
+            assert!(
+                production.contains(banned),
+                "control: `{banned}` is really spelled that way in this file, so the ban below \
+                 is not vacuous"
+            );
+            assert!(
+                !body.contains(banned),
+                "the switch does `{banned}` itself: that is a second teardown-and-repopulate \
+                 path, and it does not have the tests the first one has"
             );
         }
     }

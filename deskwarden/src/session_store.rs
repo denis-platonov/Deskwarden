@@ -30,6 +30,18 @@ impl SessionStore {
         Self { path }
     }
 
+    /// The `session.bin` this store reads and writes.
+    ///
+    /// Exists so an account switch's re-point is observable *at the moment the
+    /// switch's sequence runs*, rather than only at the end. A switch that
+    /// authenticated the new account while the store still addressed the old
+    /// one would write the new session token over the account the user is
+    /// leaving — a mutation no end-state assertion catches, because by then the
+    /// store has been re-pointed anyway.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn save(&self, token: &str) -> std::io::Result<()> {
         let protected =
             protect(token.as_bytes()).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
