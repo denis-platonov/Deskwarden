@@ -22,7 +22,7 @@
 
 use crate::app_match::AppMatch;
 use crate::vault_bridge::{
-    with_app_match, with_favorite, with_folder, without_deleted_date, Folder, NewItem, VaultBridge,
+    with_favorite, without_deleted_date, Folder, NewItem, VaultBridge,
     VaultError, VaultItem,
 };
 use std::sync::Mutex;
@@ -904,22 +904,28 @@ impl VaultCache {
         Ok(created)
     }
 
-    pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
-        self.bridge.update_item(item)?;
+    /// **Returns the item as the SERVER answered, not `Ok(())`**, for the
+    /// reason [`Self::set_favorite`] does and one more: the vault window keeps
+    /// its own `Vec` and used to reinstate `updated` -- the value it SENT --
+    /// after a save. That value carries a `revisionDate` the write has already
+    /// superseded, so the next write of that item is refused with a 400. See
+    /// `vault_bridge`'s `REVISION_DATE_KEY`.
+    pub fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
+        let saved = self.bridge.update_item(item)?;
         let mut snapshot = self.lock();
         if snapshot.populated {
             // By index rather than `iter_mut().find()`: the write has to be
             // recorded on the same snapshot, and an outstanding `&mut` into
             // its items would still be alive inside an `if let`.
             if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
-                snapshot.items[at] = item.clone();
+                snapshot.items[at] = saved.clone();
                 // Recorded only when the snapshot actually changed, so the
                 // log can never name an id the snapshot cannot supply at
                 // replay time -- see `replay_writes`.
                 snapshot.note_item_write(&item.id, false);
             }
         }
-        Ok(())
+        Ok(saved)
     }
 
     /// Attaches an app match to `item` via [`VaultBridge::set_app_match`] and
@@ -981,7 +987,11 @@ impl VaultCache {
         item: &VaultItem,
         m: &AppMatch,
     ) -> Result<AppMatchWrite, VaultError> {
-        self.bridge.set_app_match(item, m)?;
+        // The SERVER's copy, not `with_app_match(item, m)`. The two agree on
+        // every field the app cares about, and differ on the one that decides
+        // whether the NEXT write of this item is accepted at all -- see
+        // `vault_bridge`'s `REVISION_DATE_KEY`.
+        let saved = self.bridge.set_app_match(item, m)?;
         let mut snapshot = self.lock();
         if !snapshot.populated {
             drop(snapshot);
@@ -1000,7 +1010,7 @@ impl VaultCache {
         // diagnostic, so it lives in these two log lines, not in the type.
         match snapshot.items.iter().position(|i| i.id == item.id) {
             Some(at) => {
-                snapshot.items[at] = with_app_match(item, m);
+                snapshot.items[at] = saved;
                 snapshot.note_item_write(&item.id, false);
                 Ok(AppMatchWrite::WroteThrough)
             }
@@ -1062,14 +1072,15 @@ impl VaultCache {
         &self,
         item: &VaultItem,
         folder_id: Option<&str>,
-    ) -> Result<(), VaultError> {
+    ) -> Result<VaultItem, VaultError> {
         // Bridge call BEFORE `self.lock()`, like every other write here: no
         // lock may be held across HTTP.
-        self.bridge.move_item_to_folder(item, folder_id)?;
-        // Built from the caller's item rather than reconstructed from the
-        // snapshot's copy, so the snapshot holds exactly what was sent -- the
-        // same rule `set_app_match` follows with `with_app_match`.
-        let moved = with_folder(item, folder_id);
+        //
+        // The SERVER's copy, not `with_folder(item, folder_id)`: the locally
+        // rebuilt value carries the `revisionDate` this very write has just
+        // superseded, and the next write of the item would be refused for it
+        // -- see `vault_bridge`'s `REVISION_DATE_KEY`.
+        let moved = self.bridge.move_item_to_folder(item, folder_id)?;
         let mut snapshot = self.lock();
         if !snapshot.populated {
             drop(snapshot);
@@ -1079,11 +1090,11 @@ impl VaultCache {
                 item.id,
                 folder_id
             );
-            return Ok(());
+            return Ok(moved);
         }
         match snapshot.items.iter().position(|i| i.id == item.id) {
             Some(at) => {
-                snapshot.items[at] = moved;
+                snapshot.items[at] = moved.clone();
                 // Recorded only when the snapshot actually changed, so the
                 // replay log can never name an id the snapshot cannot supply
                 // -- see `replay_writes`. This is what stops a populate that
@@ -1103,7 +1114,7 @@ impl VaultCache {
                 );
             }
         }
-        Ok(())
+        Ok(moved)
     }
 
     /// Marks `item` as a favourite, or clears the mark, and writes the change
@@ -1132,8 +1143,14 @@ impl VaultCache {
     /// with a named front door, and it is the front door that is worth
     /// having.
     pub fn set_favorite(&self, item: &VaultItem, favorite: bool) -> Result<VaultItem, VaultError> {
-        let updated = with_favorite(item, favorite);
-        self.bridge.update_item(&updated)?;
+        // The SERVER's answer, not the locally built `with_favorite(..)`
+        // value that was sent. They agree on `favorite`; they differ on
+        // `revisionDate`, which the write has just bumped and which the NEXT
+        // write of this item must carry or be refused with a 400. Toggling a
+        // star is the operation a user repeats on ONE item, so it is the one
+        // that met that refusal first -- see `vault_bridge`'s
+        // `REVISION_DATE_KEY`.
+        let updated = self.bridge.update_item(&with_favorite(item, favorite))?;
         let mut snapshot = self.lock();
         if !snapshot.populated {
             drop(snapshot);
@@ -1521,6 +1538,14 @@ impl VaultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// See `vault_bridge::echoing_item_put`: what the server reports back as
+    /// the item's new `revisionDate`, chosen to differ from every fixture's so
+    /// "kept what we sent" and "took what the server answered" cannot look
+    /// alike.
+    const NEXT_REVISION: &str = "2026-08-03T02:33:03.427Z";
+
+    use crate::vault_bridge::{echoing_item_put, with_app_match};
     use crate::app_match::TriggerMode;
     use crate::vault_bridge::{CardData, IdentityData};
 
@@ -1864,6 +1889,147 @@ mod tests {
         assert_eq!(cache.folders()[0].name, "Renamed");
     }
 
+    /// The vault the stale-token tests run against: one item, carrying the
+    /// `revisionDate` a real `/list/object/items` element carries.
+    fn items_body_with_a_revision_date() -> &'static str {
+        r#"{"success":true,"data":{"data":[
+            {"id":"1","name":"Alpha","fields":[],"type":1,"favorite":false,
+             "revisionDate":"2026-08-03T02:31:59.604Z"}
+        ]}}"#
+    }
+
+    const FETCHED_REVISION: &str = "2026-08-03T02:31:59.604Z";
+    const AFTER_FIRST_WRITE: &str = "2026-08-03T02:32:06.832Z";
+    const AFTER_SECOND_WRITE: &str = "2026-08-03T02:33:03.427Z";
+
+    fn cache_with_one_dated_item(server: &mut mockito::Server) -> VaultCache {
+        server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body_with_a_revision_date())
+            .create();
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        cache
+    }
+
+    /// THE USER-REPORTED DEFECT. Favouriting is the one operation a user
+    /// repeats on a single item -- star, look elsewhere, star again -- so it
+    /// is where the stale optimistic-concurrency token surfaced first.
+    ///
+    /// `revisionDate` rides `VaultItem::other`, so it is on the wire of every
+    /// full-state PUT, and Bitwarden reads it as "the version you think you
+    /// are editing". The write bumps it. An app that keeps the value it SENT
+    /// is holding a superseded token from that instant, and the live backend
+    /// answers its next write of that item with
+    /// `400 The client copy of this cipher is out of date. Resync the client
+    /// and try again.` -- measured against the user's `bw serve` 2026.7.0.
+    ///
+    /// The two mocks are keyed on the token so this cannot pass by accident:
+    /// the second write must carry what the FIRST write's response reported,
+    /// not what the populate did.
+    #[test]
+    fn a_second_favourite_toggle_carries_the_revision_date_the_first_write_returned() {
+        let mut server = mockito::Server::new();
+        let cache = cache_with_one_dated_item(&mut server);
+        let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "revisionDate": FETCHED_REVISION,
+            })))
+            .expect(1)
+            .create();
+        let second = echoing_item_put(&mut server, "/object/item/1", AFTER_SECOND_WRITE)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "revisionDate": AFTER_FIRST_WRITE,
+            })))
+            .expect(1)
+            .create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        assert_eq!(
+            item.other.get("revisionDate").and_then(|v| v.as_str()),
+            Some(FETCHED_REVISION),
+            "the premise: the populated item carries the token the fetch reported"
+        );
+
+        let starred = cache.set_favorite(&item, true).expect("the first toggle");
+        // POSITIVE CONTROL: the first write really happened, and really was
+        // the one keyed on the fetched token. Without this, the assertion
+        // below could pass on a path that made no request at all.
+        first.assert();
+        assert!(starred.favorite, "the first toggle did not report the item as favourited");
+        assert_eq!(
+            starred.other.get("revisionDate").and_then(|v| v.as_str()),
+            Some(AFTER_FIRST_WRITE),
+            "set_favorite handed back the value it SENT, not the server's answer -- so the \
+             caller now holds a superseded token"
+        );
+
+        let unstarred = cache.set_favorite(&starred, false).expect(
+            "the second toggle was refused -- the body it sent carried a superseded revisionDate",
+        );
+        second.assert();
+        assert!(!unstarred.favorite);
+        assert_eq!(
+            cache
+                .items()
+                .into_iter()
+                .find(|i| i.id == "1")
+                .unwrap()
+                .other
+                .get("revisionDate")
+                .and_then(|v| v.as_str()),
+            Some(AFTER_SECOND_WRITE),
+            "the snapshot kept a stale token, so the THIRD write of this item would be refused"
+        );
+    }
+
+    /// The same defect on the edit path, which is the other repeated write.
+    /// Separate rather than folded into the test above because the two reach
+    /// different `VaultCache` methods, and this repository's most-repeated
+    /// finding is a decision that is right while one of the wires into it is
+    /// not.
+    #[test]
+    fn a_second_edit_of_one_item_carries_the_revision_date_the_first_save_returned() {
+        let mut server = mockito::Server::new();
+        let cache = cache_with_one_dated_item(&mut server);
+        let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "revisionDate": FETCHED_REVISION,
+            })))
+            .expect(1)
+            .create();
+        let second = echoing_item_put(&mut server, "/object/item/1", AFTER_SECOND_WRITE)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "revisionDate": AFTER_FIRST_WRITE,
+            })))
+            .expect(1)
+            .create();
+
+        let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
+        let mut renamed = item.clone();
+        renamed.name = "Alpha renamed".to_string();
+        let saved = cache.update_item(&renamed).expect("the first save");
+        first.assert();
+        // POSITIVE CONTROL: the answer this adopts is still the edit that was
+        // made, not a fixture that happens to carry the right token.
+        assert_eq!(saved.name, "Alpha renamed", "the first save lost the edit");
+
+        let mut again = saved.clone();
+        again.name = "Alpha renamed twice".to_string();
+        cache
+            .update_item(&again)
+            .expect("the second save was refused -- it sent a superseded revisionDate");
+        second.assert();
+    }
+
     fn an_app_match() -> AppMatch {
         AppMatch { process: "notepad.exe".to_string(), trigger: TriggerMode::Prompt }
     }
@@ -1883,7 +2049,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(folders_body())
             .create();
-        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
 
         let cache = cache_for(server.url());
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
@@ -1962,7 +2128,7 @@ mod tests {
     fn moving_an_item_into_a_folder_updates_the_cached_item() {
         let mut server = mockito::Server::new();
         let cache = populated_cache_with_a_filed_item(&mut server);
-        let _u = server.mock("PUT", "/object/item/2").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION).create();
 
         let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
         assert_eq!(item.folder_id, None, "the premise: item 2 starts unfiled");
@@ -1986,8 +2152,7 @@ mod tests {
         // null, so this also pins that the cache routes through
         // `VaultBridge::move_item_to_folder` and not through `update_item` --
         // the latter omits the key and would get a 501 here.
-        let _u = server
-            .mock("PUT", "/object/item/1")
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "Alpha",
@@ -1996,7 +2161,6 @@ mod tests {
                 "favorite": false,
                 "folderId": null,
             })))
-            .with_status(200)
             .create();
 
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
@@ -2043,8 +2207,7 @@ mod tests {
         let cache = populated_cache_with_a_filed_item(&mut server);
         // The mock matches only a body that STATES `favorite: true`, so this
         // also pins the wire shape and not merely the in-memory result.
-        let _u = server
-            .mock("PUT", "/object/item/2")
+        let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "2",
                 "name": "Beta",
@@ -2052,7 +2215,6 @@ mod tests {
                 "fields": [],
                 "favorite": true,
             })))
-            .with_status(200)
             .create();
 
         let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
@@ -2091,8 +2253,7 @@ mod tests {
             .create();
         let cache = cache_for(server.url());
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
-        let _u = server
-            .mock("PUT", "/object/item/1")
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "Alpha",
@@ -2100,7 +2261,6 @@ mod tests {
                 "fields": [],
                 "favorite": false,
             })))
-            .with_status(200)
             .create();
 
         let item = cache.items().into_iter().find(|i| i.id == "1").unwrap();
@@ -2154,7 +2314,7 @@ mod tests {
         // un-stars the item on the next sync.
         let mut server = mockito::Server::new();
         let cache = populated_cache_with_a_filed_item(&mut server);
-        let _u = server.mock("PUT", "/object/item/2").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION).create();
 
         let mark = cache.epoch();
         let fetched = cache.bridge().list_items().unwrap();
@@ -2199,7 +2359,7 @@ mod tests {
         // window between a populate's mark and its lock, and nothing else.
         let mut server = mockito::Server::new();
         let cache = populated_cache_with_a_filed_item(&mut server);
-        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
 
         let mark = cache.epoch();
         let fetched = cache.bridge().list_items().unwrap();
@@ -2260,7 +2420,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(folders_body())
             .create();
-        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
 
         let cache = cache_for(server.url());
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
@@ -2360,10 +2520,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(folders_body())
             .create();
-        server
-            .mock("PUT", "/object/item/1")
-            .with_status(200)
-            .create();
+        echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
         server
             .mock("DELETE", "/object/item/1")
             .with_status(200)
@@ -2997,7 +3154,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(folders_body())
             .create();
-        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
 
         let cache = cache_for(server.url());
         let item = VaultItem {
@@ -3042,7 +3199,7 @@ mod tests {
     #[test]
     fn set_app_match_reports_an_unpopulated_cache_as_server_only_too() {
         let mut server = mockito::Server::new();
-        let _u = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
         let cache = cache_for(server.url());
         let item = VaultItem {
             id: "1".to_string(),

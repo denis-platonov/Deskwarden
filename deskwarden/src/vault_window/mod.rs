@@ -1543,16 +1543,16 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     // the item back where it was.
                     item_list::RowCommand::MoveToFolder(folder_id) => {
                         match cache.move_item_to_folder(&item, Some(folder_id.as_str())) {
-                            Ok(()) => {
+                            Ok(moved) => {
                                 if let Some(pos) = items.iter().position(|i| i.id == item.id) {
-                                    // The same value the cache wrote into its
-                                    // own snapshot, built the same way, so
-                                    // this window's copy cannot say something
-                                    // different from the cache's.
-                                    items[pos] = crate::vault_bridge::with_folder(
-                                        &item,
-                                        Some(folder_id.as_str()),
-                                    );
+                                    // The value the cache wrote into its own
+                                    // snapshot -- which is the SERVER's copy,
+                                    // not a local rebuild of it. A rebuild
+                                    // would carry the `revisionDate` this
+                                    // write just superseded and the next
+                                    // write of the row would be refused; see
+                                    // `vault_bridge`'s `REVISION_DATE_KEY`.
+                                    items[pos] = moved;
                                 }
                             }
                             Err(e) => {
@@ -2041,11 +2041,18 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 // changes and the failure is reported.
                                 DetailAction::ToggleFavorite(to) => {
                                     match cache.set_favorite(item, to) {
-                                        Ok(updated) => {
+                                        // Named for the arm it belongs to so
+                                        // the source pin in
+                                        // `write_arms_adopt_the_backends_copy_tests`
+                                        // can tell the three write arms
+                                        // apart. This one already adopted the
+                                        // cache's answer; the other two did
+                                        // not, and that was the defect.
+                                        Ok(starred) => {
                                             if let Some(pos) =
-                                                items.iter().position(|i| i.id == updated.id)
+                                                items.iter().position(|i| i.id == starred.id)
                                             {
-                                                items[pos] = updated;
+                                                items[pos] = starred;
                                             }
                                         }
                                         Err(e) => {
@@ -2112,9 +2119,15 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
                                     match cache.update_item(&updated) {
-                                        Ok(()) => {
+                                        // The SERVER's copy, not `updated`:
+                                        // see the move arm above and
+                                        // `vault_bridge`'s
+                                        // `REVISION_DATE_KEY`. Reinstating
+                                        // `updated` here is what made a
+                                        // second save of one item fail.
+                                        Ok(saved) => {
                                             if let Some(pos) = items.iter().position(|i| i.id == item.id) {
-                                                items[pos] = updated;
+                                                items[pos] = saved;
                                             }
                                             mode = DetailMode::Read;
                                         }
@@ -2479,11 +2492,17 @@ fn move_item_into_folder(
         return None;
     };
     let before = items[at].clone();
-    // The same value the cache writes into its own snapshot, built the same
-    // way, so this window's copy cannot say something different from it.
+    // Optimistic, and locally rebuilt ON PURPOSE: this paints the row in its
+    // new folder for the duration of the call. It is REPLACED by the server's
+    // copy on success below -- keeping this value would leave the row holding
+    // a `revisionDate` the write has superseded, and the next write of it
+    // would be refused (see `vault_bridge`'s `REVISION_DATE_KEY`).
     items[at] = crate::vault_bridge::with_folder(&before, Some(folder_id));
     match cache.move_item_to_folder(&before, Some(folder_id)) {
-        Ok(()) => None,
+        Ok(moved) => {
+            items[at] = moved;
+            None
+        }
         Err(e) => {
             items[at] = before;
             log::warn!("failed to move item {item_id} into folder {folder_id}: {e:?}");
@@ -4535,6 +4554,97 @@ mod synced_ago_text_tests {
 /// touches these lines; what the guards exist for is the edit that touches
 /// neither and still re-creates the state per frame.
 #[cfg(test)]
+/// The two write arms that live INSIDE the per-frame closure, where no test
+/// can call them, pinned as source text.
+///
+/// `move_item_into_folder` is a free function and is tested for real
+/// (`a_move_the_backend_accepts_files_the_item_and_says_nothing` asserts the
+/// row adopts the backend's copy). These two are not reachable that way, and
+/// they are the same decision: on success, the window's local `Vec` must take
+/// the item the CACHE handed back -- which is the backend's copy -- rather
+/// than the value the window built and sent. Keeping the sent value leaves the
+/// row holding a `revisionDate` the write has already superseded, and the next
+/// write of that row is refused with a 400 (see `vault_bridge`'s
+/// `REVISION_DATE_KEY`). That is the user-reported favourite defect.
+#[cfg(test)]
+mod write_arms_adopt_the_backends_copy_tests {
+    // EVERY NEEDLE IS SPLIT ACROSS TWO LITERALS, AND THAT IS LOAD-BEARING --
+    // see `reveal_state_placement_tests` for the full reasoning: `include_str!`
+    // pulls this module in too, so an unsplit needle always matches its own
+    // definition and the test can never fail. The occurrence counts below are
+    // what enforce the splitting.
+    const MOVE_ARM: &str = concat!("items[pos] = ", "moved;");
+    const SAVE_ARM: &str = concat!("items[pos] = ", "saved;");
+    const FAVOURITE_ARM: &str = concat!("items[pos] = ", "starred;");
+    /// What the move arm used to do: rebuild the row locally from the item it
+    /// sent. Present nowhere in this file once the arm is right.
+    const MOVE_ARM_REBUILD: &str = concat!("items[pos] = crate::vault_bridge::", "with_folder(");
+    /// What the save arm used to do: reinstate the value it PUT.
+    const SAVE_ARM_REINSTATE: &str = concat!("items[pos] = ", "updated;");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    #[test]
+    fn the_row_menus_move_arm_takes_the_item_the_cache_returned() {
+        assert_eq!(
+            source().matches(MOVE_ARM).count(),
+            1,
+            "the row menu's move arm does not adopt the cache's returned item exactly once \
+             (needle {MOVE_ARM:?})"
+        );
+        assert_eq!(
+            source().matches(MOVE_ARM_REBUILD).count(),
+            0,
+            "a move arm is rebuilding the row locally again ({MOVE_ARM_REBUILD:?}); that copy \
+             carries a superseded revisionDate and the row's next write is refused"
+        );
+    }
+
+    #[test]
+    fn the_edit_panes_save_arm_takes_the_item_the_cache_returned() {
+        assert_eq!(
+            source().matches(SAVE_ARM).count(),
+            1,
+            "the edit pane's save arm does not adopt the cache's returned item exactly once \
+             (needle {SAVE_ARM:?})"
+        );
+        assert_eq!(
+            source().matches(SAVE_ARM_REINSTATE).count(),
+            0,
+            "the save arm is reinstating the value it sent again ({SAVE_ARM_REINSTATE:?}); a \
+             second save of one item is then refused with a 400"
+        );
+    }
+
+    /// POSITIVE CONTROL for the two `count() == 0` assertions above. A needle
+    /// that never matched anything would make them pass forever, including
+    /// against a spelling change that left the defect live. This proves the
+    /// search itself finds this file's real text.
+    /// The arm the user's report is about. It has adopted the cache's answer
+    /// all along -- what had not was `VaultCache::set_favorite` itself, which
+    /// handed back the value it sent. Pinned here so the two halves of that
+    /// fix cannot drift apart.
+    #[test]
+    fn the_favourite_arm_takes_the_item_the_cache_returned() {
+        assert_eq!(
+            source().matches(FAVOURITE_ARM).count(),
+            1,
+            "the star's arm does not adopt the cache's returned item exactly once (needle              {FAVOURITE_ARM:?})"
+        );
+    }
+
+    #[test]
+    fn the_needles_are_searched_against_this_files_real_source() {
+        assert!(
+            source().contains(concat!("fn move_item_into_", "folder(")),
+            "include_str! is not reading this module's own source"
+        );
+    }
+}
+
+#[cfg(test)]
 mod reveal_state_placement_tests {
     // EVERY NEEDLE IS SPLIT ACROSS TWO LITERALS, AND THAT IS LOAD-BEARING.
     // `include_str!("mod.rs")` pulls in this test module too, so a needle
@@ -4835,12 +4945,16 @@ mod folder_drop_tests {
     #[test]
     fn a_move_the_backend_accepts_files_the_item_and_says_nothing() {
         let mut server = mockito::Server::new();
-        let put = server
-            .mock("PUT", "/object/item/i1")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"success":true,"data":{}}"#)
-            .create();
+        // Answers the way the backend does -- with the item, carrying the
+        // `revisionDate` this write minted. `move_item_into_folder` must adopt
+        // THAT, not the optimistic local rebuild it painted first; see
+        // `vault_bridge`'s `REVISION_DATE_KEY`.
+        let put = crate::vault_bridge::echoing_item_put(
+            &mut server,
+            "/object/item/i1",
+            "2026-08-03T02:33:03.427Z",
+        )
+        .create();
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         let (ctx, reauth) = ctx_and_reauth();
         let mut items = vec![item("i1", None)];
@@ -4850,6 +4964,16 @@ mod folder_drop_tests {
         put.assert();
         assert_eq!(message, None, "a successful move should have nothing to say");
         assert_eq!(items[0].folder_id.as_deref(), Some("f2"));
+        // THE ROW MUST HOLD THE SERVER'S COPY, not the optimistic rebuild
+        // that was painted first. They agree on the folder -- which is why
+        // the assertion above passes either way -- and differ on
+        // `revisionDate`, the token the item's NEXT write has to carry or be
+        // refused with a 400. See `vault_bridge`'s `REVISION_DATE_KEY`.
+        assert_eq!(
+            items[0].other.get("revisionDate").and_then(|v| v.as_str()),
+            Some("2026-08-03T02:33:03.427Z"),
+            "the moved row kept this window's own copy, not the backend's answer"
+        );
     }
 
     #[test]

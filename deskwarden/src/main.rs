@@ -3731,6 +3731,33 @@ mod tests {
     /// Review 18's third finding, and the composed case that matters: a sync
     /// in flight, a WRITE landing while it is in flight, the sync's outcome
     /// applying afterwards. The write must survive.
+    /// `bw serve` answers a PUT with the item as it now holds it, carrying a
+    /// bumped `revisionDate` -- and the app must adopt that copy, because the
+    /// value it SENT holds a token the write has already superseded (see
+    /// `vault_bridge`'s `REVISION_DATE_KEY`). A mock that answers an empty
+    /// 200 models no backend at all, which is how that defect stayed
+    /// invisible. The lib's own `vault_bridge::echoing_item_put` is
+    /// `#[cfg(test)]`, so it is not reachable from this binary's tests; this
+    /// is the same shape, locally.
+    fn echoing_item_put(server: &mut mockito::Server, path: &str) -> mockito::Mock {
+        server
+            .mock("PUT", path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(|req| {
+                let sent = req.body().expect("a PUT this app makes always carries a body");
+                let mut item: serde_json::Value =
+                    serde_json::from_slice(sent).expect("this app's write bodies are JSON");
+                if let Some(map) = item.as_object_mut() {
+                    map.insert(
+                        "revisionDate".to_string(),
+                        serde_json::json!("2026-08-03T02:33:03.427Z"),
+                    );
+                }
+                serde_json::json!({ "success": true, "data": item }).to_string().into_bytes()
+            })
+    }
+
     #[test]
     fn an_app_match_saved_while_a_sync_was_in_flight_survives_that_sync() {
         const ONE_ITEM_NO_MATCH: &str =
@@ -3748,10 +3775,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"data":[]}}"#)
             .create();
-        server
-            .mock("PUT", "/object/item/1")
-            .with_status(200)
-            .create();
+        echoing_item_put(&mut server, "/object/item/1").create();
 
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         // The tray Sync worker: its `list_items` returns the vault as it was
@@ -3830,10 +3854,7 @@ mod tests {
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"data":[]}}"#)
             .create();
-        server
-            .mock("PUT", "/object/item/1")
-            .with_status(200)
-            .create();
+        echoing_item_put(&mut server, "/object/item/1").create();
 
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         // Startup, so the cache is populated exactly as it is when the tray

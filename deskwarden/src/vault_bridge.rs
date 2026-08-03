@@ -521,6 +521,7 @@ pub fn password_history(item: &VaultItem) -> Vec<PasswordHistoryEntry> {
 /// ago") without that blast radius.
 const DELETED_DATE_KEY: &str = "deletedDate";
 
+
 /// When `bw serve` says this item was trashed, or `None` for a live item.
 ///
 /// Verified against the live backend (`.superpowers/sdd/item-shapes-capture.md`):
@@ -622,6 +623,63 @@ fn folder_move_body(
              could not be stated explicitly"
         ))),
     }
+}
+
+#[cfg(test)]
+/// The key Bitwarden uses as an item's **optimistic-concurrency token**, and
+/// the reason every write on this type answers with the server's copy.
+///
+/// It rides [`VaultItem::other`] like [`DELETED_DATE_KEY`], so it is echoed
+/// back verbatim on every full-state PUT this app makes. That is not inert.
+/// Measured against the user's live `bw serve` 2026.7.0 on a throwaway item:
+///
+/// | PUT | body's `revisionDate` | result |
+/// |---|---|---|
+/// | 1st after a fetch | what the fetch reported | 200, server answers with a NEWER one |
+/// | 2nd from the same fetched value | the fetch's, now stale | **400** |
+///
+/// The 400's message is `The client copy of this cipher is out of date.
+/// Resync the client and try again.` -- so a caller that keeps the value it
+/// SENT (rather than the one it got back) is holding a token the server has
+/// already superseded, and its next write of that item is refused.
+///
+/// This is why [`VaultBridge::update_item`] and
+/// [`VaultBridge::move_item_to_folder`] return `VaultItem` rather than `()`.
+/// Stripping the key instead was tried and rejected: `bw serve` answers 200
+/// and reports the new state, but a `GET` immediately afterwards still shows
+/// the OLD one -- the write is accepted and then not visible, which is worse
+/// than a refusal because nothing surfaces it.
+const REVISION_DATE_KEY: &str = "revisionDate";
+
+/// A `mockito` PUT mock that answers the way `bw serve` really does: with the
+/// item the request carried, wrapped in the success envelope, and with
+/// `REVISION_DATE_KEY` advanced to `new_revision`.
+///
+/// **Every write mock in this crate used to answer `.with_status(200)` and an
+/// EMPTY body.** That is not this backend, and the gap is exactly where the
+/// stale-revision defect lived: a suite whose PUTs answer nothing can never
+/// notice that the app is throwing the answer away, nor that the token it
+/// keeps instead is one the server has already superseded. Reach for this
+/// rather than a bare `with_status(200)` for any write that succeeds.
+#[cfg(test)]
+pub fn echoing_item_put(
+    server: &mut mockito::Server,
+    path: &str,
+    new_revision: &'static str,
+) -> mockito::Mock {
+    server
+        .mock("PUT", path)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body_from_request(move |req| {
+            let sent = req.body().expect("a PUT this app makes always carries a body");
+            let mut item: serde_json::Value =
+                serde_json::from_slice(sent).expect("this app's write bodies are JSON");
+            if let Some(map) = item.as_object_mut() {
+                map.insert(REVISION_DATE_KEY.to_string(), serde_json::json!(new_revision));
+            }
+            serde_json::json!({ "success": true, "data": item }).to_string().into_bytes()
+        })
 }
 
 pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
@@ -1263,7 +1321,9 @@ impl VaultBridge {
         Ok(body.data.data)
     }
 
-    pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<(), VaultError> {
+    /// Answers with the server's copy, for `REVISION_DATE_KEY`'s reason:
+    /// this is [`Self::update_item`] with the body built for it.
+    pub fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         self.update_item(&with_app_match(item, m))
     }
 
@@ -1320,13 +1380,25 @@ impl VaultBridge {
     /// Writes `item` back as its own new state -- the same PUT `set_app_match`
     /// already used, generalized so the vault window's edit flow doesn't need
     /// its own copy of it.
-    pub fn update_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+    ///
+    /// **Returns the item the SERVER answered with, not `Ok(())`, and every
+    /// caller must store that rather than the value it sent.** See
+    /// `REVISION_DATE_KEY`: the body carries `revisionDate` out of
+    /// [`VaultItem::other`], Bitwarden reads it as an optimistic-concurrency
+    /// token, and the write bumps it. A caller that keeps its own pre-write
+    /// copy is holding a stale token from the moment this returns, and its
+    /// NEXT write of the same item is rejected with 400 "The client copy of
+    /// this cipher is out of date."
+    pub fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, item.id);
-        self.write_agent
+        let body: Envelope<VaultItem> = self
+            .write_agent
             .put(&url)
             .send_json(item)
-            .map_err(map_http_err)?;
-        Ok(())
+            .map_err(map_http_err)?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
     }
 
     /// Files `item` under `folder_id`, or un-files it when that is `None`.
@@ -1342,17 +1414,24 @@ impl VaultBridge {
     ///
     /// Callers should reach this through [`crate::vault_cache::VaultCache`],
     /// not here, so the snapshot moves with the server.
+    ///
+    /// Answers with the server's copy for the reason [`Self::update_item`]
+    /// does -- this is the same PUT, so it invalidates the caller's
+    /// `revisionDate` in exactly the same way. See `REVISION_DATE_KEY`.
     pub fn move_item_to_folder(
         &self,
         item: &VaultItem,
         folder_id: Option<&str>,
-    ) -> Result<(), VaultError> {
+    ) -> Result<VaultItem, VaultError> {
         let url = format!("{}/object/item/{}", self.base_url, item.id);
-        self.write_agent
+        let body: Envelope<VaultItem> = self
+            .write_agent
             .put(&url)
             .send_json(folder_move_body(item, folder_id)?)
-            .map_err(map_http_err)?;
-        Ok(())
+            .map_err(map_http_err)?
+            .into_json()
+            .map_err(|e| VaultError::Parse(e.to_string()))?;
+        Ok(body.data)
     }
 
     pub fn delete_item(&self, id: &str) -> Result<(), VaultError> {
@@ -1594,6 +1673,11 @@ impl VaultBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `revisionDate` `echoing_item_put` reports back, distinct from any
+    /// value a fixture starts with so "the app kept what it sent" and "the app
+    /// took what the server answered" cannot look alike.
+    const NEXT_REVISION: &str = "2026-08-03T02:33:03.427Z";
     use crate::app_match::TriggerMode;
 
     /// A minimal item with no type, for tests that only care about one field.
@@ -3130,7 +3214,7 @@ mod tests {
     #[test]
     fn update_item_puts_the_full_item_state() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("PUT", "/object/item/1").with_status(200).create();
+        let _m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
         let bridge = VaultBridge::new(server.url());
         let item: VaultItem = serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
         assert!(bridge.update_item(&item).is_ok());
@@ -3154,8 +3238,7 @@ mod tests {
         // a body that differs in any key makes mockito answer 501, which
         // `unwrap` turns into a failure, and `assert` then reports the miss.
         let mut server = mockito::Server::new();
-        let m = server
-            .mock("PUT", "/object/item/1")
+        let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
@@ -3163,7 +3246,6 @@ mod tests {
                 "favorite": false,
                 "folderId": "f1",
             })))
-            .with_status(200)
             .expect(1)
             .create();
 
@@ -3184,8 +3266,7 @@ mod tests {
         // asserts the same property structurally, with a message that says
         // which of the two failed.
         let mut server = mockito::Server::new();
-        let m = server
-            .mock("PUT", "/object/item/1")
+        let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
@@ -3193,7 +3274,6 @@ mod tests {
                 "favorite": false,
                 "folderId": null,
             })))
-            .with_status(200)
             .expect(1)
             .create();
 
@@ -3297,15 +3377,13 @@ mod tests {
         // if anyone does that, and so does
         // `a_real_shaped_item_round_trips_with_every_observed_key`.
         let mut server = mockito::Server::new();
-        let m = server
-            .mock("PUT", "/object/item/1")
+        let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
             .match_body(mockito::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
                 "fields": [],
                 "favorite": false,
             })))
-            .with_status(200)
             .expect(1)
             .create();
 
