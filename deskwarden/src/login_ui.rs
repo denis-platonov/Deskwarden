@@ -2754,8 +2754,19 @@ mod login_entry_point_tests {
     /// been there all along. `bw_*` catches `bw_command`, `bw_logout`,
     /// `bw_status_stdout` and anything spelled like them; the three
     /// remaining prefixes cover the entry points in this file that spawn `bw`
-    /// under some other name. A form that matches none of these is not a `bw`
-    /// spawn, and a form that does has to earn its place in `ALLOWED`.
+    /// under some other name. A form that does match has to earn its place in
+    /// `ALLOWED`.
+    ///
+    /// What it must **not** be read as is "a form that matches none of these
+    /// is not a `bw` spawn", which this doc used to say and which is untrue of
+    /// this file's own [`logout_command_in`] — a `bw` spawn matching no prefix
+    /// here. Nor is it a closed set: `use ... as sign_out;`, a bare
+    /// `logout_command()`, a `status_command()`, the helper taken as a
+    /// function value and called through the binding, and `bw_logout ()` with
+    /// a space all pass straight through. No rule over source text can catch a
+    /// rename, so this is a tripwire against reintroducing a *known* spelling,
+    /// not a proof of absence; a newly named spawn helper still has to be
+    /// reviewed on its own merits.
     fn profile_sensitive_calls(code: &str) -> Vec<String> {
         let bytes = code.as_bytes();
         let mut out = Vec::new();

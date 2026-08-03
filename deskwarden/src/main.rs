@@ -8485,6 +8485,29 @@ mod tests {
             "a notice is shown but the refusal's own reason is not in it — which is the half \
              that names the directories holding the user's vaults. It reads: {notice:?}"
         );
+        // And it must not go back to promising more than it can see. One
+        // `Blocked` that reaches this arm is a resumed migration whose
+        // re-verification failed after an earlier run had already verified and
+        // deleted the user's original -- so the unqualified "Nothing has been
+        // deleted." this used to print was printed on the one launch it was
+        // least true of. What holds in every `Blocked` here is the narrower
+        // claim, and `migration::rollback` supplies the rest through `reason`.
+        assert!(
+            !notice.contains("Nothing has been deleted"),
+            "the notice makes an absolute claim about deletion that the arm cannot check: \
+             {notice:?}"
+        );
+        // Two short needles rather than the whole sentence: the literal is
+        // line-wrapped with `\` continuations in the source this reads, so a
+        // needle spanning the wrap can never match however right the message
+        // is.
+        for phrase in ["No Bitwarden profile of yours has been", "deleted on this launch"] {
+            assert!(
+                notice.contains(phrase),
+                "the notice no longer reassures the user about their vault ({phrase:?} is not in \
+                 it): {notice:?}"
+            );
+        }
         // Positive controls: the region really is that arm, and it is an arm
         // rather than the rest of the file.
         assert!(

@@ -857,8 +857,8 @@ pub fn migrate_with_probe(
                 // extra conjunct skipped the check for every multi-account
                 // user, adopted the refused copy, and stranded the intact
                 // source forever. See
-                // `an_unclaimed_directory_the_cli_refuses_is_not_adopted_
-                // beside_a_source_while_another_account_is_claimed`.
+                // `a_refused_copy_beside_a_source_is_not_adopted_even_with_an_
+                // account_claimed`.
                 let dir = accounts::data_dir_for(config_dir, &id);
                 if observed.source_has_data_json {
                     let source = effective_source
@@ -2144,6 +2144,225 @@ mod tests {
         }
     }
 
+    /// **The Critical: the resume that deleted the user's only copy.**
+    ///
+    /// Same disk as the test below — marker at [`Stage::Promoted`], `<id>`
+    /// present, source already deleted by an earlier run — except that the
+    /// re-verification does not pass this time. That needs nothing exotic:
+    /// `login_ui::bw_status_stdout_in` maps a `bw.exe` that is found but will
+    /// not run, an empty or garbled stdout, a non-zero exit and a momentarily
+    /// locked `data.json` all onto `Unauthenticated`, which
+    /// [`verification_passed`] rejects. [`finish`] then rolled back, and
+    /// rollback `remove_dir_all`d `accounts/<id>` with no source left to fall
+    /// back on.
+    ///
+    /// Fails without the fix: in [`rollback`], drop the `source_is_whole`
+    /// branch and delete `final_dir` unconditionally — the state the code was
+    /// in before this commit. The first assertion then reports an empty
+    /// accounts root.
+    ///
+    /// The control below is why the fix cannot be "rollback never deletes":
+    /// with the source whole, the failed copy is still removed and the
+    /// original is still the one that survives.
+    #[test]
+    fn a_resumed_verification_that_fails_with_no_source_left_keeps_the_only_copy() {
+        let (cfg, source) = planted_profile("resume-verify-fails-no-source");
+        let a = AccountId::generate();
+        let final_dir = accounts::data_dir_for(&cfg, &a);
+        copy_dir_all(&source, &final_dir).unwrap();
+        write_marker(
+            &cfg,
+            &Marker {
+                id: a.clone(),
+                source: source.clone(),
+                source_email: Some("me@example.com".into()),
+                stage: Stage::Promoted,
+            },
+        )
+        .unwrap();
+        // `finish` got this far on the previous launch: verified, then deleted
+        // the source, then failed to remove the marker (which only warns).
+        std::fs::remove_dir_all(&source).unwrap();
+
+        let state = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[],
+            |_| unauthenticated(),
+            || false,
+        );
+
+        assert!(
+            final_dir.join(PROFILE_FILE).is_file(),
+            "the only copy of the vault was deleted; the accounts root now holds {:?} and the \
+             source at {} is gone too",
+            dir_entries(accounts::accounts_root(&cfg)),
+            source.display()
+        );
+        let MigrationState::Blocked { reason } = &state else {
+            panic!("a failed verification must not report success: {state:?}")
+        };
+        assert!(
+            reason.contains(&final_dir.display().to_string())
+                && reason.contains("KEPT")
+                && !reason.contains("left exactly as it was"),
+            "the reason claims the original survived, and there is no original: {reason}"
+        );
+        // The marker is cleared, and that is the recovery: the next launch
+        // sees an unclaimed directory with no source beside it, which is the
+        // ungated half of `AdoptUnclaimedAccount`.
+        assert!(!marker_path(&cfg, &a).exists(), "the marker was left behind");
+        let next = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[],
+            |_| unauthenticated(),
+            || false,
+        );
+        let MigrationState::Completed { account, .. } = &next else {
+            panic!("the kept copy is never offered back to the user: {next:?}")
+        };
+        assert_eq!(account.id, a);
+
+        // Positive control, the same failure with the source still whole: the
+        // copy IS deleted and the original is what survives. Without this the
+        // fix could be "rollback stopped deleting", which would leave a failed
+        // first migration's rejected copy sitting in the accounts root.
+        let (cfg2, source2) = planted_profile("resume-verify-fails-with-source");
+        let b = AccountId::generate();
+        let final2 = accounts::data_dir_for(&cfg2, &b);
+        copy_dir_all(&source2, &final2).unwrap();
+        write_marker(
+            &cfg2,
+            &Marker {
+                id: b.clone(),
+                source: source2.clone(),
+                source_email: Some("me@example.com".into()),
+                stage: Stage::Promoted,
+            },
+        )
+        .unwrap();
+        let control = migrate(
+            &cfg2,
+            Some(&source2),
+            &available(),
+            &[],
+            |_| unauthenticated(),
+            || false,
+        );
+        let MigrationState::Blocked { reason } = &control else {
+            panic!("control: {control:?}")
+        };
+        assert!(
+            !final2.exists(),
+            "control: the rejected copy at {} outlived the rollback",
+            final2.display()
+        );
+        assert!(
+            source2.join(PROFILE_FILE).is_file(),
+            "control: the rollback removed the original it exists to protect"
+        );
+        assert!(
+            reason.contains("left exactly as it was"),
+            "control: the reason does not say the original survived: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+        let _ = std::fs::remove_dir_all(cfg2.parent().unwrap());
+    }
+
+    /// The other last-copy deletion on the resume path: `<id>.incoming` is
+    /// ours and normally worthless, but "worthless" assumes something else
+    /// holds the vault.
+    ///
+    /// Fails without the fix: delete the `!observed.source_has_data_json &&
+    /// !observed.account_dirs_with_profile.contains(&marker.id)` guard in
+    /// `migrate_with_probe`'s `DiscardPartialCopyAndRetry` arm. The staging
+    /// copy — every byte the user has left — is then removed and the first
+    /// assertion fails.
+    #[test]
+    fn a_staging_copy_is_not_discarded_when_it_is_the_only_copy_left() {
+        let (cfg, source) = planted_profile("discard-last-copy");
+        let a = AccountId::generate();
+        let incoming = incoming_path(&cfg, &a);
+        copy_dir_all(&source, &incoming).unwrap();
+        write_marker(
+            &cfg,
+            &Marker {
+                id: a.clone(),
+                source: source.clone(),
+                source_email: Some("me@example.com".into()),
+                stage: Stage::Copying,
+            },
+        )
+        .unwrap();
+        // The source went away under an interrupted migration: the user tidied
+        // `%APPDATA%` after the app misbehaved, or a `finish` deleted it and
+        // the reassess that follows found this staging directory.
+        std::fs::remove_dir_all(&source).unwrap();
+
+        let state = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[],
+            |_| locked_as("me@example.com"),
+            || false,
+        );
+
+        assert!(
+            incoming.join(PROFILE_FILE).is_file(),
+            "the last remaining bytes of the vault were discarded as scratch; the accounts root \
+             now holds {:?}",
+            dir_entries(accounts::accounts_root(&cfg))
+        );
+        let MigrationState::Blocked { reason } = &state else {
+            panic!("{state:?}")
+        };
+        assert!(
+            reason.contains(&incoming.display().to_string())
+                && reason.contains("may be incomplete"),
+            "the user is not told where the copy is or that it may be partial: {reason}"
+        );
+
+        // Positive control: with the source still there the staging copy is
+        // scratch again and goes, or the guard would strand every interrupted
+        // migration.
+        let (cfg2, source2) = planted_profile("discard-with-source");
+        let b = AccountId::generate();
+        let incoming2 = incoming_path(&cfg2, &b);
+        copy_dir_all(&source2, &incoming2).unwrap();
+        write_marker(
+            &cfg2,
+            &Marker {
+                id: b.clone(),
+                source: source2.clone(),
+                source_email: Some("me@example.com".into()),
+                stage: Stage::Copying,
+            },
+        )
+        .unwrap();
+        let control = migrate(
+            &cfg2,
+            Some(&source2),
+            &available(),
+            &[],
+            |_| locked_as("me@example.com"),
+            || false,
+        );
+        assert!(
+            !incoming2.exists(),
+            "control: an interrupted staging copy was not cleaned up beside an intact source"
+        );
+        assert!(
+            matches!(control, MigrationState::Completed { .. }),
+            "control: the retry after the discard did not migrate: {control:?}"
+        );
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+        let _ = std::fs::remove_dir_all(cfg2.parent().unwrap());
+    }
+
     #[test]
     fn a_promoted_marker_whose_source_is_already_gone_finishes_instead_of_restarting() {
         // The state a crash between "delete source" and "delete marker"
@@ -2576,6 +2795,199 @@ mod tests {
         assert_eq!(account.id, orphan);
         assert_eq!(account.email, "me@example.com");
         let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// The same defeated rollback, on a machine that already has an account.
+    ///
+    /// The hazard the gate exists for is "an unclaimed directory the CLI
+    /// refuses, sitting beside an intact source". Whether some *other* account
+    /// is already claimed is no part of that, and `add_account`'s
+    /// `discard_prepared_account` — defeated by the same lock its `let _ =`
+    /// tolerates — is the most plausible way to produce it: list `[A]`,
+    /// `accounts\B` holding a copy the CLI will not answer for, and the
+    /// inherited profile still whole and unmigrated.
+    ///
+    /// Fails without the fix: put the conjunct back — make the gate
+    /// `observed.claimed_account_ids.is_empty() && observed.source_has_data_json`.
+    /// The check is skipped for every user who has an account, B is adopted,
+    /// `settings.json` becomes `[A, B]`, and the intact source is never
+    /// migrated.
+    #[test]
+    fn a_refused_copy_beside_a_source_is_not_adopted_even_with_an_account_claimed() {
+        const B: &str = "fedcba9876543210fedcba9876543210";
+        let (cfg, source) = planted_profile("adopt-gate-claimed");
+        let claimed = plant_account_dir(&cfg, A);
+        let orphan = plant_account_dir(&cfg, B);
+        let orphan_dir = accounts::data_dir_for(&cfg, &orphan);
+
+        let refused_copy = {
+            let orphan_dir = orphan_dir.clone();
+            move |dir: Option<&Path>| {
+                if dir == Some(orphan_dir.as_path()) {
+                    unauthenticated()
+                } else {
+                    locked_as("me@example.com")
+                }
+            }
+        };
+        let state = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[claimed.clone()],
+            refused_copy,
+            || false,
+        );
+
+        let MigrationState::Blocked { reason } = &state else {
+            panic!(
+                "a copy the CLI reported as Unauthenticated was adopted because another account \
+                 was already claimed, and the intact profile at {} will now never be migrated: \
+                 {state:?}",
+                source.display()
+            )
+        };
+        assert!(
+            reason.contains(&orphan_dir.display().to_string()),
+            "the refusal does not name the directory it refused: {reason}"
+        );
+        assert!(
+            source.join(PROFILE_FILE).is_file()
+                && orphan_dir.join(PROFILE_FILE).is_file()
+                && accounts::data_dir_for(&cfg, &claimed)
+                    .join(PROFILE_FILE)
+                    .is_file(),
+            "nothing on this path may delete, and something was deleted: {:?}",
+            dir_entries(accounts::accounts_root(&cfg))
+        );
+
+        // Positive control, same disk: a copy the CLI DOES recognise is still
+        // adopted beside a claimed account, so the gate has not become "never
+        // adopt when a source is present".
+        let verified = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            &[claimed],
+            |_| locked_as("me@example.com"),
+            || false,
+        );
+        let MigrationState::Completed { account, .. } = &verified else {
+            panic!("control: a verified unclaimed copy was not adopted: {verified:?}")
+        };
+        assert_eq!(account.id, orphan);
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// Rule 5's second half — "named in the refusal" — for the two refusals
+    /// that are decided *before* the set difference is computed.
+    ///
+    /// The port is transient and would be forgiven. The `relativeDataDir` trap
+    /// is not: a `bitwarden-cli` directory beside `bw.exe` persists, so
+    /// without this an orphaned vault stays unreferenced *and* unmentioned on
+    /// every launch, forever, which is exactly the loss rule 5 names.
+    ///
+    /// Fails without the fix, in two separate places: drop `unclaimed_note`
+    /// from either early arm of [`resume_action`] (the first two assertions),
+    /// or restore `availability.explanation().unwrap_or(reason)` in
+    /// `migrate_with_probe`'s `Refuse` arm, which discards whatever the pure
+    /// decision said (the last one).
+    #[test]
+    fn the_refusals_taken_before_the_set_difference_still_name_the_unclaimed() {
+        const B: &str = "fedcba9876543210fedcba9876543210";
+        let with_an_orphan = Observed {
+            account_dirs_with_profile: vec![id(A), id(B)],
+            claimed_account_ids: vec![id(A)],
+            ..observed(None, false, false, true)
+        };
+        for refusal in [
+            Observed {
+                multi_account_available: false,
+                ..with_an_orphan.clone()
+            },
+            Observed {
+                backend_port_in_use: true,
+                ..with_an_orphan.clone()
+            },
+        ] {
+            let ResumeAction::Refuse { reason } = resume_action(&refusal) else {
+                panic!("this observation must refuse: {refusal:?}")
+            };
+            assert!(
+                reason.contains(&format!("accounts\\{B}")),
+                "the refusal never mentions the unclaimed vault at accounts\\{B}: {reason}"
+            );
+            assert!(
+                !reason.contains(&format!("accounts\\{A}")),
+                "the refusal names a directory the account list DOES name: {reason}"
+            );
+        }
+
+        // Positive control: with both directories claimed there is nothing to
+        // append, and the refusal is exactly its own constant -- so the note
+        // cannot degenerate into "always say something".
+        let nothing_unclaimed = Observed {
+            multi_account_available: false,
+            claimed_account_ids: vec![id(A), id(B)],
+            ..with_an_orphan.clone()
+        };
+        assert_eq!(
+            resume_action(&nothing_unclaimed),
+            ResumeAction::Refuse {
+                reason: REFUSE_UNAVAILABLE.to_string()
+            }
+        );
+
+        // And through `migrate`, where `main`'s substitution happens: the
+        // availability explanation replaces the reason, and the list has to
+        // survive it.
+        let (cfg, source) = planted_profile("refuse-names-unclaimed");
+        let orphan = plant_account_dir(&cfg, B);
+        let trap = MultiAccountAvailability::BlockedByPortableProfile {
+            relative_data_dir: PathBuf::from(r"C:\Program Files\Bitwarden CLI\bitwarden-cli"),
+        };
+        let state = migrate(&cfg, Some(&source), &trap, &[], |_| unauthenticated(), || {
+            false
+        });
+        let MigrationState::Blocked { reason } = &state else {
+            panic!("{state:?}")
+        };
+        assert!(
+            reason.contains("bitwarden-cli"),
+            "the explanation that names the directory to remove was lost: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("accounts\\{orphan}")),
+            "the unclaimed vault is unreferenced AND unmentioned, which is the loss rule 5 \
+             names: {reason}"
+        );
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// The ambiguous-unclaimed refusal reaches a tray notice and a log, and
+    /// `blocked_reason.is_some()` disables switching, adding *and* removing —
+    /// so a working multi-account user is locked out until they move
+    /// directories by hand. The text has to say so; the `Unmigrated` modal
+    /// already tells its user where to look.
+    ///
+    /// Fails without the fix: delete the "To get past this, move all but one
+    /// ..." sentence from [`refuse_ambiguous_unclaimed`].
+    #[test]
+    fn the_ambiguous_refusal_says_how_to_get_out_of_it() {
+        const B: &str = "fedcba9876543210fedcba9876543210";
+        let reason = refuse_ambiguous_unclaimed(&[id(A), id(B)]);
+        for named in [format!("accounts\\{A}"), format!("accounts\\{B}")] {
+            assert!(reason.contains(&named), "{reason}");
+        }
+        assert!(
+            reason.contains("move all but one") && reason.contains("start Deskwarden again"),
+            "the user is told they are stuck and not how to get unstuck: {reason}"
+        );
+        assert!(
+            reason.contains("do not delete"),
+            "the only instruction the app gives about vault directories must not read as \
+             permission to delete one: {reason}"
+        );
     }
 
     /// The scan behind that field: an account directory counts only when it
