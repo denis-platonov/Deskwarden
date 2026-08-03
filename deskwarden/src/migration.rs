@@ -379,6 +379,23 @@ pub fn migration_source() -> Option<PathBuf> {
 /// free-space query, and a precheck would be the wrong mechanism anyway: a copy
 /// that runs out of space returns `Err`, which is a rollback, and rollback at
 /// that point deletes only our own staging directory.
+/// The reparse-point decision, split from the walk so it can be asserted in
+/// both directions without depending on the machine running the test having
+/// the privilege to create a link.
+///
+/// On Windows `FileType::is_symlink` is true for a symbolic link *and* for a
+/// junction (a mount-point reparse point), which is the form an unprivileged
+/// user can actually create — so both are refused by the one check.
+fn refuse_reparse_point(path: &Path, is_link: bool) -> std::io::Result<()> {
+    if is_link {
+        return Err(std::io::Error::other(format!(
+            "{} is a link, not a real file or directory; refusing to copy through it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<u64> {
     std::fs::create_dir_all(dst)?;
     let mut bytes = 0u64;
@@ -386,12 +403,7 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<u64> {
         let entry = entry?;
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(format!(
-                "{} is a link, not a real file or directory; refusing to copy through it",
-                path.display()
-            )));
-        }
+        refuse_reparse_point(&path, meta.file_type().is_symlink())?;
         if meta.is_dir() {
             bytes += copy_dir_all(&path, &dst.join(entry.file_name()))?;
         } else {
@@ -1291,16 +1303,62 @@ mod tests {
 
         let outside = root.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        if std::os::windows::fs::symlink_dir(&outside, src.join("link")).is_err() {
-            let _ = std::fs::remove_dir_all(&root);
-            return; // no privilege to create one on this machine
-        }
+        let link = src.join("link");
+        assert!(
+            plant_reparse_point(&link, &outside),
+            "neither a symlink nor a junction could be created at {}, so this machine cannot \
+             exercise the guard at all",
+            link.display()
+        );
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the planted reparse point is not seen as a link, so the guard below would be \
+             untested even though something was planted"
+        );
 
         let err = copy_dir_all(&src, &root.join("dst"))
             .expect_err("a link in the source must fail the copy");
         assert!(err.to_string().contains("refusing to copy through it"), "{err}");
+        // ...and the destination never received whatever it pointed at.
+        assert!(!root.join("dst").join("link").exists());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Creates a directory reparse point at `link` pointing at `target`.
+    ///
+    /// A symbolic link first, and a **junction** as the fallback: creating a
+    /// symlink needs `SeCreateSymbolicLinkPrivilege` (or Developer Mode) and
+    /// routinely fails on an ordinary account, while `mklink /J` needs no
+    /// privilege at all. Without the fallback this test silently skipped on
+    /// this machine — verified by mutation: deleting the guard in
+    /// `copy_dir_all` left the whole suite green.
+    fn plant_reparse_point(link: &Path, target: &Path) -> bool {
+        if std::os::windows::fs::symlink_dir(target, link).is_ok() {
+            return true;
+        }
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()))
+            .join("System32")
+            .join("cmd.exe");
+        std::process::Command::new(shell)
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    #[test]
+    fn the_reparse_decision_answers_both_ways_and_says_which_path_it_refused() {
+        // The pure half, so the direction of the check is pinned even on a
+        // machine where nothing can be planted: a guard that cannot tell a
+        // link from a plain file is one character from a guard that refuses
+        // every copy.
+        let path = Path::new(r"C:\cfg\accounts\aaaa.incoming\link");
+        assert!(refuse_reparse_point(path, false).is_ok());
+        let err = refuse_reparse_point(path, true).expect_err("a link must be refused");
+        assert!(err.to_string().contains(r"C:\cfg\accounts\aaaa.incoming\link"), "{err}");
+        assert!(err.to_string().contains("refusing to copy through it"), "{err}");
     }
 
     // ---------------------------------------------------------------- 4.4
@@ -1903,6 +1961,34 @@ mod tests {
         assert_eq!(std::fs::read(cfg.join("hello.bin")).unwrap(), b"sealed");
         assert_eq!(std::fs::read(cfg.join("session.bin")).unwrap(), b"dpapi-wrapped");
         let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    #[test]
+    fn the_marker_is_flushed_to_the_platter_and_not_merely_written() {
+        // Unavoidably a source guard: a buffered write and a synced one are
+        // indistinguishable from outside the process, and the difference is
+        // whether a marker survives the power loss it exists for. The
+        // ordering test above proves `MarkerFlushed` precedes the copy; only
+        // this proves the event means what it says.
+        //
+        // Needles are `concat!`-split so none can match its own declaration
+        // here, and single-line so a CRLF checkout cannot turn them into false
+        // passes. Each is a *required* needle, so the assertion is itself the
+        // proof that it matches live code.
+        let source = include_str!("migration.rs");
+        for required in [
+            concat!("file.", "sync_all()?;"),
+            concat!("probe(Probe::", "MarkerFlushed);"),
+        ] {
+            assert!(
+                source.contains(required),
+                "`{required}` is gone: the marker is no longer made durable before the copy \
+                 it labels"
+            );
+        }
+        // Positive control on `contains` over this same text, so the two
+        // assertions above are discriminating rather than trivially true.
+        assert!(!source.contains(concat!("file.", "sync_none()")));
     }
 
     // ---------------------------------------------------------------- 4.7
