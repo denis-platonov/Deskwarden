@@ -2,7 +2,7 @@
 //! `accounts/<id>/`.
 //!
 //! **The one part of this app that can destroy a vault profile.** Everything
-//! here is arranged around four rules, and each of them is a test:
+//! here is arranged around five rules, and each of them is a test:
 //!
 //! 1. **Copy, verify, repoint, delete. Never a move, never a rename of the
 //!    source.** An interrupted `fs::rename` — or one that half-completes across
