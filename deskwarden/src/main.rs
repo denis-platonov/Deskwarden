@@ -8504,6 +8504,48 @@ mod tests {
         assert_eq!(all.len(), n, "two of the five needles found the same position");
     }
 
+    /// The wire `fn main()` makes untestable: `resolve_startup` computes
+    /// `first_run` and startup has to turn it into the id every login window
+    /// is gated on.
+    ///
+    /// The mutation is a one-line revert -- `let first_run_account = None` --
+    /// and it is invisible in every end state: the app starts, signs in and
+    /// works, `login_context`'s own decision stays correct, `login_ui`'s notice
+    /// tests stay green, and the one login window every new user meets asks
+    /// for a master password on a machine they were already signed in on with
+    /// nothing to say why. Found by exactly that mutation, which the value
+    /// test below did not catch.
+    #[test]
+    fn the_minted_accounts_id_is_what_the_first_run_notice_is_gated_on() {
+        let block = the_startup_account_block();
+        let at = |what: &str, needle: &str| {
+            block
+                .find(needle)
+                .unwrap_or_else(|| panic!("startup no longer {what} (`{needle}` is not there)"))
+        };
+        let derived = at(
+            "derives the first-run account from what the resolution answered",
+            concat!("first_run.", "then("),
+        );
+        let passed = at(
+            "hands that id to the login context",
+            concat!("first_run_account", ".as_ref()"),
+        );
+        assert!(
+            derived < passed,
+            "the login context is built before the minted account is known, so it cannot be \
+             carrying it"
+        );
+        // Positive controls on the same region and the same reader: it really
+        // is the region that builds login contexts, and the two needles found
+        // two different places rather than one twice.
+        assert!(
+            block.contains(concat!("login", "_context(")),
+            "control: the sliced region does not build a login context at all"
+        );
+        assert_ne!(derived, passed, "control: one needle found both positions");
+    }
+
     /// The first-run notice is offered to **exactly one** account: the one
     /// this launch minted.
     ///

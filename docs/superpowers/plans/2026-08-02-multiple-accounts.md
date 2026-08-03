@@ -3,14 +3,21 @@
 **Spec:** `docs/superpowers/specs/2026-08-01-multiple-accounts-design.md` (approved, `3bb7615`).
 **Baseline:** `1a0bea9` on `main`, tree clean, **880 lib + 34 bin pass, zero warnings**.
 
+**Revision, 2026-08-03. Task 4 (migration) is REMOVED and the feature shipped without
+it.** See Task 4 below for the record. In one line: `%APPDATA%\Bitwarden CLI` is a local
+cache plus a session token — the vault lives on Bitwarden's servers — so losing it costs
+a sign-in and no data, and every risk `migration.rs` was arranged around was a risk to a
+regenerable cache. A first run under the per-account layout now mints an account, points
+the CLI at it and lets the login window prompt once. The pre-existing profile is left
+exactly where it is: never read, never copied, never deleted.
+
 **Revision, 2026-08-02.** A first draft of this plan proposed leaving the pre-existing
 account in the CLI's own default profile directory (`AccountLocation::CliDefault`), so
 nothing had to be relocated. **That was put to the user with both costs stated and
 overruled: all accounts are symmetric under `accounts/<id>/`, and the pre-existing
 profile is migrated.** The user explicitly accepted that Windows Hello quick unlock has
-to be re-enrolled as a consequence. Migration is Task 4, and it is now the riskiest
-step in the feature — ahead of the switch — because it is the only one that can destroy
-data rather than merely fail.
+to be re-enrolled as a consequence. Migration was Task 4 — superseded by the 2026-08-03
+revision above, which keeps the symmetry and drops the copying.
 
 The plan's other departure from the spec stands unchanged and was not challenged: **the
 data directory is derived, never persisted** in `settings.json`.
@@ -63,31 +70,37 @@ still verified once and never replaced).
 is reached with `BITWARDENCLI_APPDATA_DIR` pointing at it. There is **no
 `AccountLocation` enum** and no "the first one is special" variant — this project has
 already had to delete one variant with no members this week, and the overruled draft
-would have created another. The pre-migration state is not an account variant; it is
-the absence of an account list, represented by `StartupAccounts::Unmigrated`, which is
-a *startup* condition that ends the moment migration succeeds.
+would have created another. A machine with no accounts set up is not an account variant;
+it is the absence of an account list, which is a *startup* condition that ends the moment
+the user signs in once.
 
-**Migration copies, verifies, repoints, and only then deletes.** Task 4. Never a move,
-never a rename of the source. At every intermediate state the original profile is
-intact, so every failure rolls back to "the app as it works today".
+**~~Migration copies, verifies, repoints, and only then deletes.~~ (Removed 2026-08-03.)**
+There is no migration. `accounts::resolve_startup` answers from `settings.accounts`
+alone: accounts present → resume the active one; none → mint one and let the login
+window prompt. Its one account-less answer is `StartupAccounts::NoAccountList`, whose
+only producer is a `settings.json` that exists and cannot be parsed — where an empty
+list cannot be believed.
 
 **Windows Hello.** One key credential (`deskwarden-quick-unlock`), shared, with
 accounts separated by the KDF label's account suffix. `RequestCreateAsync(ReplaceExisting)`
 is banned outright — it rotates the shared credential and destroys every other
-account's enrolment. Migration invalidates the existing `hello.bin` by construction
-(the suffix is now non-empty for every account, including the first), so migration
-deletes it and **tells the user their quick unlock needs re-enrolling** rather than
-letting them discover it when Hello stops working.
+account's enrolment. The per-account suffix is non-empty for every account including
+the first, so a `hello.bin` written by a version before this feature cannot be opened by
+any account — it is simply never read again, and the first-run login window
+**tells the user their quick unlock has to be set up again**
+(`login_ui::FIRST_RUN_NOTICE`) rather than letting them discover it when Hello stops
+working.
 
 **Availability is one object, not a scattered check.** `accounts::AccountsState` is
-constructed from `(availability, migration_state, records, active)` and reports no
-switch targets when either the `relativeDataDir` trap or an unfinished migration is in
-play. Every consumer — tray, vault-window switcher, add-account flow — asks it. One
-door.
+constructed from `(availability, records, active)` and reports no switch targets when
+the `relativeDataDir` trap is in play. Every consumer — tray, vault-window switcher,
+add-account flow — asks it. One door. *(It took a `migration_state` too until
+2026-08-03; the door survives the second reason going away, because the first still has
+to reach every window through one value.)*
 
 ## Tech stack
 
-Rust 2021, Windows-only. `serde`/`serde_json` (settings, migration marker),
+Rust 2021, Windows-only. `serde`/`serde_json` (settings),
 `directories` (config dir), `getrandom` (account ids — already a dependency via
 `hello.rs`), `aes-gcm`/`sha2` (hello), `windows` crate (DPAPI, Hello), `eframe`/`egui`
 (windows), `tray-icon`, `mockito` (HTTP tests). No new dependencies.
@@ -119,8 +132,12 @@ Additional constraints for this plan:
   needles with a positive control.** A needle written as one literal in a file the test
   `include_str!`s matches its own declaration and can never fail. A needle containing
   `\n` passes on an LF working tree and fails on a CRLF one; this repo has both.
-- **Task 4 may not delete anything the app did not itself create, until after
-  verification has passed.** That is an invariant, not a preference.
+- **~~Task 4 may not delete anything the app did not itself create, until after
+  verification has passed.~~** Superseded 2026-08-03, and replaced by something
+  stronger: **the app does not delete a Bitwarden profile it did not itself create at
+  all.** The only `remove_dir_all` on a profile directory is
+  `accounts::delete_account_dir`, reached from an account removal the user asked for and
+  from `discard_prepared_account` undoing an add this app started.
 - Line endings: leave files as you found them. Do not reflow or `cargo fmt` untouched
   regions.
 
@@ -676,7 +693,11 @@ fn bw_command_follows_the_active_data_dir() {
 Every test that touches the process-global takes `ACTIVE_DIR_LOCK` (a `static
 Mutex<()>` in the test module) first, so a parallel runner cannot interleave them.
 
-### Step 3.3 — the migration source
+### Step 3.3 — ~~the migration source~~ REMOVED 2026-08-03
+
+> Superseded with Task 4. `bw_path::cli_default_data_dir{,_from}` are deleted: the app
+> no longer has code that can name the CLI's own default profile directory, which is
+> what "leave the pre-existing profile alone" means in practice.
 
 ```rust
 #[test]
@@ -735,566 +756,52 @@ directly (3.4, which carries its own positive control so the guard cannot be dea
 
 ---
 
-# Task 4 — Migrate the pre-existing profile into `accounts/<id>/`
+# Task 4 — ~~Migrate the pre-existing profile into `accounts/<id>/`~~ REMOVED 2026-08-03
 
-**The riskiest task in this plan.** Every other task can fail; this one can destroy an
-encrypted vault profile. Placed after the path derivation it depends on (Task 2) and the
-CLI plumbing it verifies through (Task 3), and before anything that switches (Task 9 on).
+**This task shipped and was then deleted, in full.** `deskwarden/src/migration.rs` and
+every reference to it are gone; what stood here — the four rules, the marker and its
+layout, the resume state machine, `copy_dir_all`, `verification_passed`, `rollback` and
+the mutation log below them — described code that no longer exists, so it is not kept as
+a description of the app. The record of *why* is kept, because the reasoning applies to
+anything that might propose it again.
 
-**Files:** create `deskwarden/src/migration.rs`; modify `deskwarden/src/lib.rs`.
+**The premise was wrong.** Everything here was arranged around "this is the one part of
+the app that can destroy a vault profile". `%APPDATA%\Bitwarden CLI` is a local cache
+plus a session token; the vault itself lives on Bitwarden's servers, and writes reach
+them synchronously (verified live: a forced `POST /sync`, which pulls server state over
+local, left an edited item intact). Losing that directory costs a sign-in. It costs no
+data. Every one of the four Criticals three reviews found in this module — all of them
+in the copy/verify/delete/resume machinery, the last a path that deleted the last copy
+of a profile — was a risk to a regenerable cache, priced as a risk to a vault.
 
-## The four rules, and why each one is there
+**The cost/benefit, plainly.** 1,273 production lines and more than half the feature's
+test suite, in service of a 57-line switch, to save the user one sign-in. Removed, the
+first launch under the per-account layout finds an empty account list, mints
+`accounts/<id>/`, points `BITWARDENCLI_APPDATA_DIR` and the `SessionStore` at it, and
+the ordinary login window asks once. `login_ui::FIRST_RUN_NOTICE` says why, and says the
+Windows Hello enrolment has to be redone, so neither arrives unexplained.
 
-1. **Copy, verify, repoint, delete. Never a move, never a rename of the source.** A
-   `fs::rename` that half-completes across a device boundary, or an interrupted move,
-   leaves an encrypted profile in two incomplete halves and neither is usable. A copy
-   leaves the original whole no matter when it is interrupted, so the worst outcome of
-   any crash is wasted disk. The *only* rename in this task is the promotion of our own
-   staging directory to its final name, within one directory on one volume, where
-   `rename` is atomic and neither side is the user's data.
-2. **Idempotent and resumable, with a marker whose lifecycle is defined.** The app can
-   be killed at any instruction — Windows update, power loss, the user quitting. The
-   half-migrated state must be *detectable*, never inferred from a heuristic. The state
-   machine below is a total function over what the next startup can observe.
-3. **Verified before the original is removed.** "Verified" means: `bw status`, run via
-   `bw_command_in(Some(new_dir))`, parses to `Locked` or `Unlocked` **and** reports the
-   same `userEmail` the source reported before the copy began. A file count would pass
-   for a copy with a truncated `data.json`; the CLI refusing to recognise the account is
-   exactly the failure that must be caught while the old copy still exists.
-4. **Rollback on any failure**, leaving the user on the original directory with a
-   working app. Because nothing is deleted before rule 3 passes, rollback is always
-   "delete what we created, clear the marker" — it can never need to *restore* anything.
+**The pre-existing profile is left alone.** Not read, not copied, not deleted, not
+offered for import. `bw_path::cli_default_data_dir` — the only function that could name
+that directory — was removed with the module, so the app no longer has code that can
+find it.
 
-## Layout and the marker
+**What was kept.** Everything the migration was *not*: per-account `session.bin` and
+`hello.bin`, the non-empty `hello_kdf_suffix_for`, the ban on
+`RequestCreateAsync(ReplaceExisting)`, the `relativeDataDir` detection and the one door
+that reports it, and the switch/add/remove wiring pins.
 
-```
-<config_dir>\accounts\<id>.migrating.json     the marker
-<config_dir>\accounts\<id>.incoming\          the staging copy
-<config_dir>\accounts\<id>\                   the finished account
-```
-
-`<id>.migrating.json` and `<id>.incoming` cannot collide with an account directory:
-`AccountId::parse` accepts only 32 hex characters, so no account id contains `.`.
-Asserted in Step 4.2.
-
-**Interfaces**
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    /// The marker is on disk and a copy into `<id>.incoming` may be part done.
-    /// Nothing outside `<id>.incoming` has been touched.
-    Copying,
-    /// `<id>.incoming` was renamed to `<id>`. The source is still whole and
-    /// still authoritative; verification has not passed yet.
-    Promoted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Marker {
-    pub id: AccountId,
-    /// The directory being copied FROM, recorded rather than re-derived: a
-    /// resume must delete exactly what this run was reading, even if
-    /// `%APPDATA%` has changed underneath us.
-    pub source: PathBuf,
-    /// What `bw status` reported for `source` before the copy started -- the
-    /// value verification compares against, so a RESUMED verification asks the
-    /// same question the original one would have.
-    pub source_email: Option<String>,
-    pub stage: Stage,
-}
-
-/// Everything the next startup can see, gathered once so the decision is pure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Observed {
-    pub marker: Option<Marker>,
-    pub incoming_exists: bool,
-    pub final_exists: bool,
-    pub source_has_data_json: bool,
-    pub accounts_already_configured: bool,
-    pub multi_account_available: bool,
-    pub backend_port_in_use: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResumeAction {
-    /// Migration already happened, or there is nothing to migrate.
-    DoNothing,
-    /// No marker, no account list, a source profile is present: begin.
-    StartFresh,
-    /// A marker at `Copying`: the staging copy is untrustworthy. Delete it and
-    /// the marker, then begin again from a clean slate. The source is untouched.
-    DiscardPartialCopyAndRetry,
-    /// A marker at `Promoted`: `<id>` exists. Re-run verification and, on
-    /// success, finish (delete source, delete marker).
-    VerifyAndFinish,
-    /// A marker that describes nothing on disk. Clear it and reassess.
-    ClearStaleMarkerAndReassess,
-    /// Refuse to migrate on this launch and run as a single-account app.
-    Refuse { reason: String },
-}
-
-pub fn resume_action(observed: &Observed) -> ResumeAction;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MigrationState {
-    /// A first install: no profile to migrate.
-    NothingToMigrate,
-    /// Done, on this launch or an earlier one.
-    Completed { account: Account, hello_needs_reenrolment: bool },
-    /// Not done, and the pre-existing profile is intact and untouched. The app
-    /// runs exactly as it does today, against the CLI's default directory.
-    Blocked { reason: String },
-}
-
-/// The whole effectful migration, with its two impure dependencies injected so
-/// the tests drive the real composition without a CLI.
-pub fn migrate(
-    config_dir: &Path,
-    availability: &MultiAccountAvailability,
-    accounts_already_configured: bool,
-    /// `bw status` against a chosen directory.
-    /// Live caller: `|dir| login_ui::check_bw_status_details_in(dir)`.
-    status: impl Fn(Option<&Path>) -> login_ui::BwStatusDetails,
-    /// Live caller: `|| bw_serve::port_in_use(bw_serve::BW_SERVE_PORT)`.
-    port_in_use: impl Fn() -> bool,
-) -> MigrationState;
-```
-
-`login_ui::check_bw_status_details_in(dir: Option<&Path>)` is a small addition (Task 7):
-`check_bw_status_details()` becomes `check_bw_status_details_in(active_data_dir())`,
-mirroring `bw_command`/`bw_command_in`.
-
-## The state machine
-
-`resume_action` is a total function over `Observed`. Every row below is a test.
-
-| marker | `.incoming` | `<id>` | source `data.json` | action |
-|---|---|---|---|---|
-| — | — | — | no | `DoNothing` (nothing to migrate) |
-| — | — | — | yes, accounts configured | `DoNothing` (already migrated) |
-| — | — | — | yes, no accounts | `StartFresh` |
-| `Copying` | yes | — | any | `DiscardPartialCopyAndRetry` |
-| `Copying` | — | — | any | `ClearStaleMarkerAndReassess` |
-| `Copying` | yes | yes | any | `DiscardPartialCopyAndRetry` |
-| `Promoted` | — | yes | any | `VerifyAndFinish` |
-| `Promoted` | — | — | any | `ClearStaleMarkerAndReassess` |
-| `Promoted` | yes | yes | any | `DiscardPartialCopyAndRetry` — an `.incoming` that outlived promotion is a directory we cannot account for |
-| any | any | any | *and* multi-account blocked | `Refuse` |
-| any | any | any | *and* backend port in use | `Refuse` |
-
-Two rows need their reasons stated in the source:
-
-- **`Promoted` with a missing source is still `VerifyAndFinish`**, and it is idempotent:
-  verification runs against `<id>`, the source deletion is a no-op, the marker is
-  removed. That is the state a crash between "delete source" and "delete marker"
-  produces, and it must not be read as an error.
-- **`Refuse` outranks everything**, including a marker at `Promoted`. If the
-  `relativeDataDir` trap is present the CLI ignores our env var, so a verification run
-  against `<id>` would really be reading the *portable* profile and could pass while
-  proving nothing — and the source would then be deleted on the strength of it.
-  Refusing leaves the marker and the directories exactly as they are, to be resumed on
-  a launch where the trap is gone.
-
-### Step 4.1 — the state machine, exhaustively
-
-```rust
-fn observed(marker: Option<Stage>, incoming: bool, fin: bool, src: bool) -> Observed {
-    Observed {
-        marker: marker.map(|stage| Marker {
-            id: id("0123456789abcdef0123456789abcdef"),
-            source: PathBuf::from(r"C:\Users\me\AppData\Roaming\Bitwarden CLI"),
-            source_email: Some("me@example.com".into()),
-            stage,
-        }),
-        incoming_exists: incoming,
-        final_exists: fin,
-        source_has_data_json: src,
-        accounts_already_configured: false,
-        multi_account_available: true,
-        backend_port_in_use: false,
-    }
-}
-
-#[test]
-fn the_resume_table_is_exactly_this() {
-    // Absolute expectations for every reachable observation, so this passes for
-    // exactly one implementation. A `_ => DoNothing` catch-all is the mutation
-    // this is written to reject: it silently converts every half-migrated state
-    // into "pretend it is fine", which is precisely the outcome that must not be
-    // reachable.
-    use ResumeAction::*;
-    assert_eq!(resume_action(&observed(None, false, false, false)), DoNothing);
-    assert_eq!(resume_action(&observed(None, false, false, true)), StartFresh);
-    assert_eq!(
-        resume_action(&Observed { accounts_already_configured: true,
-                                  ..observed(None, false, false, true) }),
-        DoNothing, "an account list already exists; migration happened on an earlier launch");
-    assert_eq!(resume_action(&observed(Some(Stage::Copying), true, false, true)),
-               DiscardPartialCopyAndRetry);
-    assert_eq!(resume_action(&observed(Some(Stage::Copying), true, true, true)),
-               DiscardPartialCopyAndRetry);
-    assert_eq!(resume_action(&observed(Some(Stage::Copying), false, false, true)),
-               ClearStaleMarkerAndReassess);
-    assert_eq!(resume_action(&observed(Some(Stage::Promoted), false, true, true)),
-               VerifyAndFinish);
-    assert_eq!(resume_action(&observed(Some(Stage::Promoted), false, true, false)),
-               VerifyAndFinish,
-               "a crash between deleting the source and deleting the marker must FINISH, \
-                not restart -- restarting would find no source and give up on a migration \
-                that had already succeeded");
-    assert_eq!(resume_action(&observed(Some(Stage::Promoted), false, false, true)),
-               ClearStaleMarkerAndReassess);
-    assert_eq!(resume_action(&observed(Some(Stage::Promoted), true, true, true)),
-               DiscardPartialCopyAndRetry);
-}
-
-#[test]
-fn a_blocked_availability_refuses_even_a_promoted_migration() {
-    // With `relativeDataDir` present the CLI IGNORES our env var, so a
-    // verification run against the new directory would really be reading the
-    // portable profile: it could pass while proving nothing, and the source
-    // would then be deleted on the strength of it.
-    let o = Observed { multi_account_available: false,
-                       ..observed(Some(Stage::Promoted), false, true, true) };
-    assert!(matches!(resume_action(&o), ResumeAction::Refuse { .. }));
-    // Positive control: the same observation migrates when the trap is absent.
-    assert_eq!(resume_action(&observed(Some(Stage::Promoted), false, true, true)),
-               ResumeAction::VerifyAndFinish);
-}
-
-#[test]
-fn a_backend_still_holding_the_port_refuses_rather_than_copying_a_live_profile() {
-    // An orphaned `bw serve` from an unclean exit is reading and writing the
-    // source profile right now. Copying it would capture a torn `data.json`,
-    // and verification might well pass on it.
-    let o = Observed { backend_port_in_use: true, ..observed(None, false, false, true) };
-    assert!(matches!(resume_action(&o), ResumeAction::Refuse { .. }));
-    assert_eq!(resume_action(&observed(None, false, false, true)), ResumeAction::StartFresh);
-}
-```
-
-### Step 4.2 — the staging names cannot collide with an account
-
-```rust
-#[test]
-fn the_marker_and_staging_names_can_never_be_an_account_directory() {
-    let cfg = Path::new(r"C:\cfg");
-    let a = id("0123456789abcdef0123456789abcdef");
-    let (marker, incoming, finished) =
-        (marker_path(cfg, &a), incoming_path(cfg, &a), accounts::data_dir_for(cfg, &a));
-    assert_ne!(marker, finished);
-    assert_ne!(incoming, finished);
-    // The property that makes it so: an id is 32 hex characters, so it can
-    // never contain a `.`, so `<id>.incoming` can never BE an `<id>`.
-    assert!(AccountId::parse("0123456789abcdef0123456789abc.in").is_none());
-    for name in [&marker, &incoming] {
-        let leaf = name.file_name().unwrap().to_string_lossy();
-        assert!(leaf.contains('.'), "{leaf} could be parsed as an account id");
-        assert!(AccountId::parse(&leaf).is_none());
-    }
-}
-```
-
-### Step 4.3 — the copy never moves, and refuses reparse points
-
-```rust
-#[test]
-fn the_copy_leaves_the_source_completely_intact() {
-    // THE single most important assertion in this task. `fs::rename` on the
-    // source -- the "obvious" implementation, and one line shorter -- passes
-    // every other test here and destroys the user's profile the first time it
-    // is interrupted.
-    let root = scratch_dir("copy-intact");
-    let src = root.join("src");
-    std::fs::create_dir_all(src.join("nested")).unwrap();
-    std::fs::write(src.join("data.json"), b"{\"profile\":1}").unwrap();
-    std::fs::write(src.join("nested").join("blob.bin"), b"\x00\x01\x02").unwrap();
-
-    let dst = root.join("dst");
-    copy_dir_all(&src, &dst).unwrap();
-
-    assert_eq!(std::fs::read(src.join("data.json")).unwrap(), b"{\"profile\":1}");
-    assert_eq!(std::fs::read(src.join("nested").join("blob.bin")).unwrap(), b"\x00\x01\x02");
-    assert_eq!(std::fs::read(dst.join("data.json")).unwrap(), b"{\"profile\":1}");
-    assert_eq!(std::fs::read(dst.join("nested").join("blob.bin")).unwrap(), b"\x00\x01\x02");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn a_reparse_point_in_the_source_fails_the_copy_rather_than_being_followed() {
-    // A junction or symlink inside a CLI profile is not something that happens
-    // by itself. Copying THROUGH it would silently pull in whatever it points
-    // at -- possibly the account directory we are copying into. Refusing is a
-    // rollback, and rollback deletes nothing of the user's.
-    let root = scratch_dir("copy-reparse");
-    let src = root.join("src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(src.join("data.json"), b"{}").unwrap();
-    let Ok(()) = make_directory_symlink(&src.join("link"), &root) else {
-        return;   // no privilege to create one on this machine; nothing to assert
-    };
-    assert!(copy_dir_all(&src, &root.join("dst")).is_err());
-    let _ = std::fs::remove_dir_all(&root);
-}
-```
-
-```rust
-/// Recursive copy. `fs::copy` per file, `create_dir_all` per directory, and
-/// **never** a rename or a move of anything under `src`: the source is the
-/// user's only copy of an encrypted vault profile until verification passes.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    std::fs::create_dir_all(dst)?;
-    let mut bytes = 0u64;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let meta = std::fs::symlink_metadata(entry.path())?;
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::other(format!(
-                "{} is a link, not a real file or directory; refusing to copy through it",
-                entry.path().display()
-            )));
-        }
-        if meta.is_dir() {
-            bytes += copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
-        } else {
-            bytes += std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
-        }
-    }
-    Ok(bytes)
-}
-```
-
-There is **no free-space precheck**. `std` exposes no portable free-space query, and a
-precheck would be the wrong mechanism anyway: a copy that runs out of space returns an
-`Err`, which is a rollback, and rollback at that point deletes only our own staging
-directory. Said here so a reader does not add one believing it was forgotten.
-
-### Step 4.4 — verification is the CLI answering, not a file count
-
-```rust
-#[test]
-fn verification_requires_the_cli_to_recognise_the_same_account_in_the_new_directory() {
-    // The concrete meaning of "verified". A file count, a byte total, or
-    // "data.json exists" all pass for a truncated copy; `bw` refusing to
-    // recognise the account is the failure that has to be caught while the
-    // original still exists.
-    let src = Some("me@example.com".to_string());
-    assert!(verification_passed(&details(BwStatus::Locked, Some("me@example.com")), &src));
-    assert!(verification_passed(&details(BwStatus::Unlocked, Some("me@example.com")), &src));
-
-    // Every failure the copy can produce:
-    assert!(!verification_passed(&details(BwStatus::Unauthenticated, None), &src),
-        "an empty profile reports Unauthenticated -- the copy landed nothing");
-    assert!(!verification_passed(&details(BwStatus::Locked, Some("someone@else")), &src),
-        "a DIFFERENT account answered -- the env var was ignored and this is another profile");
-    assert!(!verification_passed(&details(BwStatus::Locked, None), &src),
-        "the CLI could not say whose profile this is");
-}
-
-#[test]
-fn a_source_that_reports_no_email_cannot_be_verified_and_is_not_migrated() {
-    // If we could not establish whose profile the source is, there is no
-    // question to ask of the copy -- so there is no check that could ever
-    // justify deleting the original.
-    assert!(!verification_passed(&details(BwStatus::Locked, Some("me@example.com")), &None));
-}
-```
-
-### Step 4.5 — the whole migration, end to end, with `status` injected
-
-```rust
-#[test]
-fn a_successful_migration_copies_verifies_repoints_and_only_then_deletes() {
-    let (cfg, source) = planted_profile("migrate-ok");        // source holds data.json
-    let state = migrate(&cfg, &available(), false,
-        |_dir| locked_as("me@example.com"), || false);
-
-    let MigrationState::Completed { account, .. } = state else { panic!("{state:?}") };
-    assert!(accounts::data_dir_for(&cfg, &account.id).join("data.json").exists(),
-        "the profile did not land");
-    assert_eq!(account.email, "me@example.com");
-    assert!(!source.exists(), "the source was not removed after a verified copy");
-    assert!(!marker_path(&cfg, &account.id).exists(), "the marker outlived the migration");
-    assert!(!incoming_path(&cfg, &account.id).exists(), "the staging directory was left behind");
-}
-
-#[test]
-fn a_migration_whose_copy_fails_verification_deletes_nothing_of_the_users() {
-    // The whole point of rule 3. `bw` cannot open the copy; the original is the
-    // user's only working profile and must still be there.
-    let (cfg, source) = planted_profile("migrate-unverified");
-    let state = migrate(&cfg, &available(), false,
-        |dir| match dir {
-            None => locked_as("me@example.com"),              // the source
-            Some(_) => unauthenticated(),                     // the copy is unusable
-        },
-        || false);
-
-    assert!(matches!(state, MigrationState::Blocked { .. }), "{state:?}");
-    assert!(source.join("data.json").exists(), "THE USER'S PROFILE WAS DELETED");
-    // And nothing half-made is left to be mistaken for an account.
-    assert!(dir_entries(accounts::accounts_root(&cfg)).is_empty(),
-        "left behind: {:?}", dir_entries(accounts::accounts_root(&cfg)));
-}
-
-#[test]
-fn a_migration_is_idempotent_across_a_kill_at_every_stage() {
-    // Drives the resume path for real: reproduce on disk exactly what each
-    // stage leaves behind, then run `migrate` again and require it to converge
-    // on the same end state.
-    for stage in [Stage::Copying, Stage::Promoted] {
-        let (cfg, source) = planted_profile(&format!("migrate-resume-{stage:?}"));
-        let a = AccountId::generate();
-        write_marker(&cfg, &Marker { id: a.clone(), source: source.clone(),
-            source_email: Some("me@example.com".into()), stage });
-        match stage {
-            Stage::Copying => {
-                copy_dir_all(&source, &incoming_path(&cfg, &a)).unwrap();
-                truncate(&incoming_path(&cfg, &a).join("data.json"));   // a torn copy
-            }
-            Stage::Promoted => {
-                copy_dir_all(&source, &accounts::data_dir_for(&cfg, &a)).unwrap();
-            }
-        }
-
-        let state = migrate(&cfg, &available(), false, |_| locked_as("me@example.com"), || false);
-
-        let MigrationState::Completed { account, .. } = state else { panic!("{stage:?}: {state:?}") };
-        assert!(accounts::data_dir_for(&cfg, &account.id).join("data.json").exists());
-        assert!(!source.exists(), "{stage:?}: the source survived a completed migration");
-        assert!(!marker_path(&cfg, &account.id).exists());
-        assert!(!incoming_path(&cfg, &account.id).exists());
-        // A resumed `Promoted` keeps the id the marker named -- restarting with
-        // a fresh id would strand the already-promoted directory forever.
-        if stage == Stage::Promoted {
-            assert_eq!(account.id, a, "a resumed promotion invented a new account id");
-        }
-    }
-}
-
-#[test]
-fn running_migrate_twice_in_a_row_changes_nothing_the_second_time() {
-    let (cfg, _) = planted_profile("migrate-twice");
-    let MigrationState::Completed { account, .. } =
-        migrate(&cfg, &available(), false, |_| locked_as("me@example.com"), || false)
-    else { panic!() };
-    // Second launch: the account list now exists.
-    let second = migrate(&cfg, &available(), true, |_| locked_as("me@example.com"), || false);
-    assert!(matches!(second, MigrationState::NothingToMigrate | MigrationState::Completed { .. }));
-    assert!(accounts::data_dir_for(&cfg, &account.id).join("data.json").exists());
-}
-```
-
-### Step 4.6 — the ordering, which is the safety property
-
-```rust
-#[test]
-fn the_marker_is_durable_before_copying_and_the_source_dies_after_verification() {
-    // Two orderings, and they are the whole of rules 2 and 3:
-    //  * a crash after the first byte and before the marker lands leaves an
-    //    UNLABELLED partial copy that the resume table cannot see --
-    //    `ClearStaleMarkerAndReassess` never runs for it and `<id>.incoming`
-    //    sits there forever;
-    //  * deleting the source before verification is the data-loss bug this
-    //    entire task exists to prevent, and it leaves NO trace in the end state
-    //    of a successful run, so only an ordering assertion can catch it.
-    let order = std::cell::RefCell::new(Vec::new());
-    migrate_with_probe(.., |event| order.borrow_mut().push(event));
-    let order = order.into_inner();
-    let at = |e| order.iter().position(|x| *x == e).unwrap_or_else(|| panic!("no {e:?}: {order:?}"));
-    assert!(at(Probe::MarkerFlushed) < at(Probe::CopyStarted),
-        "copying began before the marker was durable: {order:?}");
-    assert!(at(Probe::Verified) < at(Probe::SourceDeleted),
-        "the source was deleted before verification passed: {order:?}");
-    assert!(at(Probe::SourceDeleted) < at(Probe::MarkerRemoved),
-        "the marker went first, so a crash here would restart a finished migration");
-}
-```
-
-`migrate_with_probe` is `migrate`'s body with a `#[cfg(test)]` event sink; the public
-`migrate` calls it with a no-op sink. That is the only way to assert an *ordering* that
-leaves no trace in the end state — and the ordering is the safety property. Write the
-marker with `File::create` + `write_all` + `sync_all`; `Probe::MarkerFlushed` is emitted
-after the `sync_all`, not after the `write_all`.
-
-### Step 4.7 — the session token, the Hello blob, and the notice
-
-Migration moves `<config_dir>\session.bin` into `accounts/<id>/session.bin` (copy, then
-delete — same rule) and **deletes** `<config_dir>\hello.bin` without copying it. The
-blob cannot be carried over: the KDF suffix is non-empty for every account now (Step
-2.3), so it can never be opened again by anyone. Leaving it would be a file holding a
-sealed master password that nothing can ever use and nothing will ever clean up.
-
-`hello_needs_reenrolment` is `true` **only if that file existed**. A user who never
-enrolled is told nothing.
-
-```rust
-#[test]
-fn migration_reports_that_hello_needs_reenrolling_only_when_it_was_enrolled() {
-    let (cfg, _) = planted_profile("migrate-hello");
-    std::fs::write(cfg.join("hello.bin"), b"sealed").unwrap();
-    let MigrationState::Completed { account, hello_needs_reenrolment } =
-        migrate(&cfg, &available(), false, |_| locked_as("me@example.com"), || false)
-    else { panic!() };
-    assert!(hello_needs_reenrolment, "the user is not told their quick unlock stopped working");
-    assert!(!cfg.join("hello.bin").exists(),
-        "a sealed master password that NOTHING can open was left on disk");
-    assert!(!accounts::hello_blob_path_for(&cfg, &account.id).exists(),
-        "the unopenable blob was copied into the account instead of being deleted");
-
-    // Positive control: a user who never enrolled is told nothing.
-    let (cfg2, _) = planted_profile("migrate-no-hello");
-    let MigrationState::Completed { hello_needs_reenrolment, .. } =
-        migrate(&cfg2, &available(), false, |_| locked_as("me@example.com"), || false)
-    else { panic!() };
-    assert!(!hello_needs_reenrolment);
-}
-
-#[test]
-fn the_session_token_moves_with_the_account_so_the_first_launch_needs_no_password() {
-    // `bw` is still unlocked under this token; not carrying it over would demand
-    // a master password on the very launch that migrated, which reads to the
-    // user as the migration having lost something.
-    let (cfg, _) = planted_profile("migrate-session");
-    std::fs::write(cfg.join("session.bin"), b"dpapi-wrapped").unwrap();
-    let MigrationState::Completed { account, .. } =
-        migrate(&cfg, &available(), false, |_| locked_as("me@example.com"), || false)
-    else { panic!() };
-    assert_eq!(std::fs::read(accounts::session_path_for(&cfg, &account.id)).unwrap(),
-               b"dpapi-wrapped");
-    assert!(!cfg.join("session.bin").exists(), "the token was left in the shared directory too");
-}
-```
-
-**Where the Hello re-enrolment notice is surfaced** — three places, because a tray app
-has no window and one channel is not enough for something the user has to act on:
-
-1. **A modal `message_box` immediately after a successful migration**, before the tray
-   appears (Task 11 wires it). This is the one moment we know the user is at the
-   machine, because they just launched the app. It names quick unlock explicitly and
-   says it has to be set up again.
-2. **A line in the login window's Hello panel.** `hello_needs_reenrolment` is carried
-   into `AccountsState` (Task 10) and read by `login_ui` (Task 7): instead of the panel
-   simply being absent — which is exactly the silent failure to avoid, and is
-   indistinguishable from Hello never having been set up — it shows *"Quick unlock needs
-   setting up again after your account was moved."* beside the enrol checkbox. The login
-   window is the very next thing the user sees on any launch where the session also has
-   to be re-entered.
-3. **`log::warn!`**, for whoever reads the log afterwards.
-
-**What would make these tests fail:** `fs::rename` on the source (4.3's first test — the
-mutation that destroys data, and the first assertion in the task); copying through a
-junction (4.3's second); verification reduced to "the file exists" or to a byte count
-(4.4); the source deleted before verification (4.5's second test *and* 4.6's ordering
-assertion, which catches it even on a run where verification would have passed anyway);
-a `_ => DoNothing` catch-all in `resume_action` (4.1); a resumed promotion inventing a
-fresh id and stranding the promoted directory (4.5's third); `hello.bin` copied instead
-of deleted, or the notice raised unconditionally (4.7); the marker written after copying
-starts (4.6).
-
----
+**The one protection that had to be replaced rather than dropped.**
+`ResumeAction::AdoptUnclaimedAccount` scanned the accounts root for a directory holding a
+profile that `settings.json` did not name, and its last live producer had nothing to do
+with migration: `add_account` signed in (writing `accounts/B/data.json`), the switch
+landed, and `persist_accounts` failed — leaving B signed in and unreferenced forever.
+That is closed by ordering instead of by a scan: the account is written to
+`settings.json` **before** the switch is attempted, so a failed write has nothing to undo
+and the response is `discard_prepared_account`. Every remaining failure leaves an entry
+whose directory is gone — which `ensure_account_dir` and one sign-in repair — and never a
+directory nothing names. Pinned by
+`a_failed_persist_strands_no_signed_in_profile`.
 
 # Task 5 — Persist the account list
 
@@ -1691,7 +1198,13 @@ fn only_one_login_entry_point_can_exit_the_process() {
 }
 ```
 
-### Step 7.2 — per-account Hello, and the re-enrolment line
+### Step 7.2 — per-account Hello, and the first-run line
+
+> Amended 2026-08-03. Per-account Hello is unchanged. The line is no longer
+> `HELLO_REENROLMENT_NOTICE` carried out of a migration; it is
+> `login_ui::FIRST_RUN_NOTICE`, gated on the account `resolve_startup` minted on this
+> launch, and it says both why the app is asking for a master password and that quick
+> unlock has to be set up again.
 
 Replace the five `hello::` call sites with their `_for` equivalents. The
 `LoginAction::LogOut` arm's `hello::unenroll()` becomes `hello::unenroll_for(config_dir,
@@ -2032,6 +1545,11 @@ the era bypassed (9.3); no rollback (9.4); the outgoing token deleted early (9.4
 
 # Task 10 — `AccountsState`: the one door for "may I switch?"
 
+> Amended 2026-08-03. `new` takes `(availability, records, active)`: the
+> `MigrationState` input and the `hello_needs_reenrolment` field went with Task 4. The
+> `relativeDataDir` half — and the rule that every window asks this and nothing else —
+> is unchanged.
+
 **Files:** modify `deskwarden/src/accounts.rs`.
 
 **Interfaces**
@@ -2125,7 +1643,13 @@ transit.
 
 ---
 
-# Task 11 — Startup: migrate, resolve, resume
+# Task 11 — Startup: resolve, point, resume
+
+> Amended 2026-08-03. Step 1 (migrate) is gone. `resolve_startup(stored, stored_active,
+> unreadable_reason)` answers from `settings.accounts` alone and mints one account when
+> there are none; `StartupAccounts::Unmigrated` is now `NoAccountList { reason }`, whose
+> only producer is a `settings.json` that exists and cannot be parsed. Every code block
+> below that names `MigrationState` describes deleted code.
 
 **Files:** modify `deskwarden/src/main.rs`; modify `deskwarden/src/accounts.rs`.
 
@@ -2651,18 +2175,13 @@ was watched to fail on**, with the verbatim failure message. A test that has not
 watched to fail has not been shown to test anything, and that is how this repository has
 shipped a feature 100% inert behind an early return with a green suite.
 
-For **Task 4 specifically**, the mutation log is not optional and must include, at
-minimum:
+~~For **Task 4 specifically**, the mutation log is not optional~~ — Task 4 is removed
+(see above) and its mutation table with it, since every test it named is deleted. The
+mutations watched for what replaced it are recorded in `.superpowers/sdd/progress.md`
+under the 2026-08-03 entry: a startup that mints nothing, a startup that mints twice, an
+unreadable account list that mints anyway, a `first_run` that is always on, a
+`first_run_account` that never leaves startup, a notice offered to every account, the
+add-account persist moved back after the switch, and the discard dropped from its
+failure path.
 
-| mutation | test that must catch it |
-|---|---|
-| `fs::rename(src, dst)` substituted for `copy_dir_all` | `the_copy_leaves_the_source_completely_intact` |
-| the source deletion moved above the verification | `a_migration_whose_copy_fails_verification_deletes_nothing_of_the_users`, and `the_marker_is_durable_before_copying_and_the_source_dies_after_verification` |
-| `resume_action` given a `_ => DoNothing` arm | `the_resume_table_is_exactly_this` |
-| verification reduced to `data.json` existing | `verification_requires_the_cli_to_recognise_the_same_account_in_the_new_directory` |
-| the marker write moved after the copy begins | `the_marker_is_durable_before_copying_and_the_source_dies_after_verification` |
-| a resumed `Promoted` generating a fresh `AccountId` | `a_migration_is_idempotent_across_a_kill_at_every_stage` |
-| `hello.bin` copied into the account instead of deleted | `migration_reports_that_hello_needs_reenrolling_only_when_it_was_enrolled` |
 
-Each of those is a one-line change that a green suite would otherwise accept, and the
-first two lose a user's vault profile.
