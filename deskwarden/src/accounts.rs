@@ -6,12 +6,13 @@
 //! `BITWARDENCLI_APPDATA_DIR` at that directory.
 //!
 //! **All accounts are symmetric.** There is no "the first one is special"
-//! variant and no `AccountLocation` enum: the pre-existing profile is migrated
-//! into this layout like any other. The pre-migration state is the *absence*
-//! of an account list — a startup condition that ends the moment migration
-//! succeeds — not a kind of account. So [`data_dir_for`] returns a plain
-//! `PathBuf`; there is no account whose directory is "wherever the CLI would
-//! have put it".
+//! variant and no `AccountLocation` enum: the first account is minted and
+//! signed in to exactly like the second. Deskwarden never adopts the profile
+//! the Bitwarden CLI may already hold under `%APPDATA%\Bitwarden CLI`; that
+//! directory is left where it is, and a first run is simply an account list
+//! with nothing in it yet. So [`data_dir_for`] returns a plain `PathBuf`;
+//! there is no account whose directory is "wherever the CLI would have put
+//! it".
 //!
 //! **The id is opaque and generated, never derived.** [`AccountId::generate`]
 //! takes no arguments, so an id cannot be a function of the email — the
@@ -70,7 +71,7 @@ impl AccountId {
     }
 
     /// Parses an id that came from somewhere untrusted — `settings.json`, a
-    /// migration marker, a directory listing.
+    /// directory listing.
     ///
     /// Accepts exactly 32 lowercase hex characters and nothing else. That is
     /// deliberately far narrower than "a valid filename": this string is
@@ -165,10 +166,11 @@ pub fn hello_blob_path_for(config_dir: &Path, id: &AccountId) -> PathBuf {
 ///
 /// Never empty, for every account including the first. An empty suffix would
 /// reproduce the derivation used before this feature existed, which would mean
-/// a `hello.bin` left over from before the migration could still be opened —
-/// under whichever account happened to have the empty suffix. Quick unlock is
-/// therefore re-enrolled per account after migration, which is why the
-/// migration deletes the pre-migration blob and tells the user so.
+/// a `hello.bin` left over from that version — one still sitting in
+/// `<config_dir>` — could be opened under whichever account happened to have
+/// the empty suffix. Quick unlock is therefore enrolled per account, which is
+/// why the first-run login window says the earlier enrolment no longer applies
+/// (see [`login_ui::FIRST_RUN_NOTICE`](crate::login_ui::FIRST_RUN_NOTICE)).
 pub fn hello_kdf_suffix_for(id: &AccountId) -> Vec<u8> {
     let mut suffix = b" account ".to_vec();
     suffix.extend_from_slice(id.as_str().as_bytes());
@@ -328,12 +330,10 @@ pub fn delete_account_dir(config_dir: &Path, id: &AccountId) -> Result<(), Strin
 
 // -------------------------------------------------- what startup resolves to
 
-/// What this launch is pointed at, once the migration has had its turn.
+/// What this launch is pointed at.
 ///
-/// Exactly two shapes, because `main` has exactly two: an app pointed at an
-/// account directory, and *today's* app pointed at whatever profile the CLI
-/// would use by itself. The second is a fallback to existing behaviour, not a
-/// second implementation of anything.
+/// Exactly two shapes, because `main` has exactly two: an app pointed at one
+/// account's directory, and an app with no account of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupAccounts {
     /// The normal case: at least one account, one of them active.
@@ -341,153 +341,97 @@ pub enum StartupAccounts {
         active: Account,
         accounts: Vec<Account>,
         /// Whether the resolution changed something `settings.json` has to be
-        /// told about — a migrated or freshly minted account, or an active id
-        /// that named nobody.
+        /// told about — a freshly minted account, or an active id that named
+        /// nobody.
         needs_persist: bool,
+        /// Whether `active` was **minted by this resolution** rather than
+        /// resumed from the stored list.
+        ///
+        /// Which is the same thing as "nobody has ever signed in to this
+        /// account", because minting only creates a directory. The login
+        /// window uses it to say why it is asking
+        /// ([`login_ui::FIRST_RUN_NOTICE`](crate::login_ui::FIRST_RUN_NOTICE)):
+        /// on the first launch under the per-account layout the user is asked
+        /// for a master password with nothing on screen to explain it, which
+        /// reads as a bug rather than as setup.
+        first_run: bool,
     },
-    /// Migration did not produce an account list. The app sets no
-    /// `BITWARDENCLI_APPDATA_DIR` at all and reads `<config_dir>\session.bin`,
-    /// and `reason` is what [`AccountsState::blocked_reason`] reports wherever
-    /// a switch would have been.
+    /// `settings.json` is there and could not be read, so the app runs with no
+    /// account of its own: no `BITWARDENCLI_APPDATA_DIR` is set and
+    /// `<config_dir>\session.bin` is the token store.
     ///
-    /// **What that leaves depends on whether a migration ever ran, and only
-    /// one of the two is "today's app".** On a machine that never migrated,
-    /// the CLI's own directory still holds the vault and this really is the
-    /// pre-multi-account behaviour. On one that migrated and is now blocked
-    /// — a `bitwarden-cli` directory that appeared beside `bw.exe` since, or
-    /// an unreadable `settings.json` — that directory and
-    /// `<config_dir>\session.bin` were both deleted by the migration, so what
-    /// the user meets is a **signed-out** app asking for a master password.
-    /// Nothing is lost either way (the vault is in `accounts/<id>/` and this
-    /// state deletes nothing), but the second case is a sign-in, not a
-    /// continuation, and saying otherwise sends whoever reads it looking for
-    /// a directory that is not there.
+    /// **The only state in which the app has no [`Account`] at all**, and the
+    /// reason it exists is that a failed parse yields an *empty* account list
+    /// — indistinguishable, to [`resolve_startup`], from a machine with no
+    /// accounts yet. Minting on that would point the CLI at an empty
+    /// directory while the user's own account sat in `accounts/<old-id>/`, and
+    /// [`Settings::save`](crate::settings::Settings::save) refuses to write
+    /// over an unreadable file, so the fresh id would not even be recorded:
+    /// the next launch would mint another one, and the one after that another.
     ///
-    /// **This is the only state in which the app has no [`Account`] at all**,
-    /// and it is a startup condition rather than an account variant — see this
-    /// module's header on why `AccountLocation` does not exist.
-    Unmigrated { reason: String },
+    /// Nothing is deleted here and nothing is written; `reason` is what
+    /// [`AccountsState::blocked_reason`] would have reported, and `main` puts
+    /// it on screen because this state repeats identically on every launch
+    /// until the file is fixed or removed.
+    NoAccountList { reason: String },
 }
 
-/// The ids a stored account list claims — what
-/// [`migration::resume_action`](crate::migration::resume_action) subtracts the
-/// directories on disk from.
+/// Which account this launch runs as, given what `settings.json` holds.
 ///
-/// Here rather than spelled out at the call site for the reason
-/// `nothing_offers_an_account_without_going_through_accounts_state` exists:
-/// `settings.accounts.iter()` in `main.rs` is banned, because in every *other*
-/// place it is the raw list bypassing [`AccountsState`]'s four refusals. This
-/// one read is legitimate and cannot go through `AccountsState` — it runs
-/// *before* the migration whose answer `AccountsState` is built from — so it
-/// lives beside [`resolve_startup`], the other function that is given the same
-/// raw list for the same reason.
-pub fn claimed_ids(stored: &[Account]) -> Vec<AccountId> {
-    stored.iter().map(|a| a.id.clone()).collect()
-}
-
-/// Which account this launch runs as, given what is stored and what the
-/// migration just did.
+/// Pure: every effect belongs to the caller, so this can be driven through
+/// every branch without a `%APPDATA%` anywhere near it.
 ///
-/// Pure, and deliberately given the migration's *answer* rather than the
-/// config directory: every effect belongs to the caller, so this can be driven
-/// through every branch without a `%APPDATA%` anywhere near it.
+/// There are three answers and the whole function is the difference between
+/// them:
 ///
-/// The one decision worth spelling out is which migration states may mint an
-/// account and which may not:
-///
-/// * [`Blocked`](crate::migration::MigrationState::Blocked) with nothing
-///   stored means the user's vault is somewhere this launch did not put an
-///   account on. Usually that is the pre-existing profile, still sitting where
-///   it always was and untouched. It is **not** always: a resumed migration
-///   whose re-verification failed after an earlier run had already verified
-///   and deleted the source is `Blocked` too, and there the only copy is the
-///   one `migration::rollback` kept at `accounts/<id>` — which the next launch
-///   adopts, the marker having been cleared. Either way the answer is the
-///   same, and it is the answer that matters here: inventing an account would
-///   point the CLI at an **empty** directory, and the app would present as
-///   signed out while the real vault sat a few directories away — the symptom
-///   a user reports as "the update deleted my vault".
-/// * [`Blocked`](crate::migration::MigrationState::Blocked) with accounts
-///   already stored is the opposite case and takes the opposite answer:
-///   migration ran on some earlier launch and a `bitwarden-cli` directory has
-///   appeared beside `bw.exe` since. The app is still `Ready` and its state,
-///   `session.bin` and Windows Hello label all name the stored active
-///   account; [`AccountsState`] is what refuses the *switch*.
-///
-///   **Under `BlockedByPortableProfile` the CLI does not read the directory
-///   this points at.** That is the whole of what the block means: a
-///   `bitwarden-cli` directory beside `bw.exe` makes `bw` ignore
-///   `BITWARDENCLI_APPDATA_DIR` and read the portable profile instead, so the
-///   vault the user sees is that one while every name the app shows is
-///   account X's. It is still the right answer — refusing to switch is what
-///   keeps one profile from being served under several identities, and
-///   nothing here deletes anything — but `Ready` here means "pointed at",
-///   not "reading from", and the two are the same only when the block is one
-///   of the other kinds.
-/// * [`NothingToMigrate`](crate::migration::MigrationState::NothingToMigrate)
-///   with nothing stored is a new machine, not a failure. It gets one account
-///   directory to sign in to.
+/// * **Accounts stored.** Resume the active one — or, if the stored active id
+///   names none of them (a hand-edited `settings.json`, or a removal that
+///   crashed between two writes), the first configured account, rewriting the
+///   active id. Never no active account: that would leave the app with no
+///   directory to point the CLI at.
+/// * **No accounts stored, and the list was readable.** A first run: mint one
+///   account, mark it `first_run`, and let the login window ask for a master
+///   password. Deskwarden does not import the profile the Bitwarden CLI may
+///   already have under `%APPDATA%` — it is left exactly where it is,
+///   untouched — because the vault lives on Bitwarden's servers and that
+///   directory is a local cache plus a session token. Re-signing in
+///   reconstructs it; copying it does not gain the user anything a sign-in
+///   does not.
+/// * **No accounts stored because the list could not be read.**
+///   [`StartupAccounts::NoAccountList`], which mints nothing. See that
+///   variant.
 pub fn resolve_startup(
     stored: &[Account],
     stored_active: Option<&AccountId>,
-    migration: &crate::migration::MigrationState,
+    unreadable_reason: Option<&str>,
 ) -> StartupAccounts {
-    use crate::migration::MigrationState;
-
     let mut accounts = stored.to_vec();
     let mut needs_persist = false;
-    // The account this resolution is *introducing*, which is the one that then
-    // becomes active. `None` when nothing new arrived, in which case the
-    // stored active account is resumed and nothing is rewritten.
-    let mut introduced: Option<AccountId> = None;
-
-    if let MigrationState::Completed { account, .. } = migration {
-        // Only when it is not already there. `Completed` is reported by the
-        // launch that migrated, and a resumed `VerifyAndFinish` can report it
-        // again after the list was already written; appending twice would put
-        // two entries on one directory, and re-activating would silently drag
-        // the user off whichever account they had switched to.
-        if account_for(&accounts, &account.id).is_none() {
-            introduced = Some(account.id.clone());
-            accounts.push(account.clone());
-            needs_persist = true;
-        }
-    }
+    let mut first_run = false;
 
     if accounts.is_empty() {
-        match migration {
-            MigrationState::Blocked { reason } => {
-                return StartupAccounts::Unmigrated {
-                    reason: reason.clone(),
-                };
-            }
-            // `Completed` cannot reach here — it pushed above — but it is
-            // spelled out rather than caught by a wildcard so that a later
-            // variant has to be thought about instead of silently minting an
-            // account.
-            MigrationState::NothingToMigrate | MigrationState::Completed { .. } => {
-                let fresh = Account {
-                    id: AccountId::generate(),
-                    // Not known yet: nobody has signed in. Filled in by
-                    // whoever completes a sign-in against this directory.
-                    email: String::new(),
-                    server_url: None,
-                };
-                introduced = Some(fresh.id.clone());
-                accounts.push(fresh);
-                needs_persist = true;
-            }
+        if let Some(reason) = unreadable_reason {
+            return StartupAccounts::NoAccountList {
+                reason: reason.to_string(),
+            };
         }
+        accounts.push(Account {
+            id: AccountId::generate(),
+            // Not known yet: nobody has signed in. Filled in by whoever
+            // completes a sign-in against this directory.
+            email: String::new(),
+            server_url: None,
+        });
+        needs_persist = true;
+        first_run = true;
     }
 
-    let active = introduced
-        .as_ref()
-        .or(stored_active)
-        .and_then(|id| account_for(&accounts, id))
-        // A stored active id naming no stored account is a hand-edited
-        // `settings.json`, or a removal that crashed between the two writes.
-        // Falling through to "no active account" would leave the app with no
-        // directory to point the CLI at at all.
+    // The minted account when there is one, else the stored active id, else
+    // the first configured account.
+    let active = first_run
+        .then(|| accounts.first())
+        .flatten()
+        .or_else(|| stored_active.and_then(|id| account_for(&accounts, id)))
         .or_else(|| accounts.first())
         .expect("the account list is non-empty by construction above")
         .clone();
@@ -499,6 +443,7 @@ pub fn resolve_startup(
         active,
         accounts,
         needs_persist,
+        first_run,
     }
 }
 
@@ -506,22 +451,20 @@ pub fn resolve_startup(
 
 /// The one door for "may I offer another account, and which one am I on?".
 ///
-/// Two *independent* reasons a switch may be unavailable, and every UI entry
-/// point needs the same answer to both:
+/// One reason a switch may be unavailable, and every UI entry point needs the
+/// same answer to it:
+/// [`MultiAccountAvailability`](crate::bw_path::MultiAccountAvailability) — a
+/// `bitwarden-cli` directory beside `bw.exe` makes the CLI ignore
+/// `BITWARDENCLI_APPDATA_DIR`, so every account would silently share one
+/// profile; and "we do not know where the CLI is" is the same refusal, because
+/// the trap cannot be ruled out.
 ///
-/// * [`MultiAccountAvailability`](crate::bw_path::MultiAccountAvailability) —
-///   a `bitwarden-cli` directory beside `bw.exe` makes the CLI ignore
-///   `BITWARDENCLI_APPDATA_DIR`, so every account would silently share one
-///   profile; and "we do not know where the CLI is" is the same refusal,
-///   because the trap cannot be ruled out.
-/// * [`MigrationState`](crate::migration::MigrationState) — a migration that
-///   was refused or could not be verified means the account directories do not
-///   hold what the account list says they do.
-///
-/// They are combined here and nowhere else. A window that asked one of them
-/// and not the other would offer a switch that shares a profile, or one into a
-/// directory that was never populated — neither of which reports an error, so
-/// neither is visible in an end state.
+/// It is asked here and nowhere else. A window that answered it for itself
+/// would offer a switch that shares a profile — which reports no error, so it
+/// is not visible in an end state. There *were* two reasons, the second being
+/// a profile migration that had been refused; that feature is gone and the
+/// door is not, because the remaining refusal still has to reach every window
+/// through one value.
 ///
 /// [`switchable`](Self::switchable) is a *field*, computed once in
 /// [`new`](Self::new), rather than a filter a caller could be tempted to
@@ -532,18 +475,18 @@ pub struct AccountsState {
     active: Account,
     switchable: Vec<Account>,
     blocked_reason: Option<String>,
-    hello_needs_reenrolment: bool,
 }
 
 impl AccountsState {
     /// `None` when `accounts` is empty, which is the *only* way this can fail.
     ///
-    /// An account list with no accounts is not a state this app has: before
-    /// migration produces one there is no `Account` at all, and that is a
-    /// startup condition (`StartupAccounts::Unmigrated`, Task 11) rather than
-    /// an `AccountsState` with nothing in it. Making that unrepresentable is
-    /// what lets [`active`](Self::active) return `&Account` instead of an
-    /// `Option` every caller would have to unwrap somewhere.
+    /// An account list with no accounts is not a state this app has:
+    /// [`resolve_startup`] either resumes a stored account or mints one, and
+    /// its one account-less answer
+    /// ([`StartupAccounts::NoAccountList`]) builds no `AccountsState` at all.
+    /// Making that unrepresentable is what lets [`active`](Self::active)
+    /// return `&Account` instead of an `Option` every caller would have to
+    /// unwrap somewhere.
     ///
     /// `active` naming an id that is not in `accounts` falls back to the first
     /// configured account rather than being refused. `settings.json` is a
@@ -552,70 +495,41 @@ impl AccountsState {
     /// with no directory to point the CLI at.
     pub fn new(
         availability: crate::bw_path::MultiAccountAvailability,
-        migration: crate::migration::MigrationState,
         accounts: Vec<Account>,
         active: AccountId,
     ) -> Option<Self> {
-        use crate::migration::MigrationState;
-
         let active = account_for(&accounts, &active)
             .or_else(|| accounts.first())?
             .clone();
 
-        // The CLI's refusal outranks the migration's: with the trap present a
-        // migration is refused *because of* it, and the availability
-        // explanation is the one that names the directory the user can go and
-        // remove.
-        let blocked_reason = match (availability.explanation(), &migration) {
-            (Some(why), _) => Some(why),
-            (None, MigrationState::Blocked { reason }) => Some(reason.clone()),
-            // `NothingToMigrate` is not "not yet migrated": it is what every
-            // launch after the first one reports, because an existing account
-            // list is itself the reason there is nothing to do. Treating it as
-            // pending would refuse every switch from the second launch onward.
-            (None, MigrationState::Completed { .. } | MigrationState::NothingToMigrate) => None,
-        };
-
+        let blocked_reason = availability.explanation();
         let switchable = switch_targets(&accounts, &active, blocked_reason.is_some());
-
-        let hello_needs_reenrolment = matches!(
-            migration,
-            MigrationState::Completed {
-                hello_needs_reenrolment: true,
-                ..
-            }
-        );
 
         Some(Self {
             accounts,
             active,
             switchable,
             blocked_reason,
-            hello_needs_reenrolment,
         })
     }
 
     /// The same state, built from the one thing [`new`](Self::new) distils its
-    /// two inputs down to — for the tests of a window that is **banned from
-    /// naming those inputs**.
+    /// input down to — for the tests of a window that is **banned from naming
+    /// that input**.
     ///
     /// `no_window_answers_may_i_switch_for_itself` forbids
-    /// `vault_window/mod.rs` from containing the strings
-    /// `MultiAccountAvailability` or `MigrationState` anywhere at all, tests
-    /// included, and that ban is the point of this type. But the account
-    /// switcher in that window still has to be handed a blocked state and an
-    /// available one by its own tests, and a hand-built struct literal there
-    /// would be a second `AccountsState` with its own idea of what
-    /// `switchable` means.
+    /// `vault_window/mod.rs` from containing the string
+    /// `MultiAccountAvailability` anywhere at all, tests included, and that ban
+    /// is the point of this type. But the account switcher in that window still
+    /// has to be handed a blocked state and an available one by its own tests,
+    /// and a hand-built struct literal there would be a second `AccountsState`
+    /// with its own idea of what `switchable` means.
     ///
     /// So this takes exactly the `Option<String>` that
-    /// [`new`](Self::new)'s `match` produces and computes everything else the
-    /// same way it does — including `switchable`, through the one
-    /// [`switch_targets`], rather than filtering the list a second time.
+    /// [`new`](Self::new) derives and computes everything else the same way it
+    /// does — including `switchable`, through the one [`switch_targets`],
+    /// rather than filtering the list a second time.
     /// `the_test_constructor_agrees_with_the_real_one` pins the two together.
-    ///
-    /// `hello_needs_reenrolment` is `false`: it is a fact about the migration
-    /// and no switcher reads it.
     #[cfg(test)]
     pub fn from_blocked_reason(
         accounts: Vec<Account>,
@@ -631,7 +545,6 @@ impl AccountsState {
             active,
             switchable,
             blocked_reason,
-            hello_needs_reenrolment: false,
         })
     }
 
@@ -646,15 +559,14 @@ impl AccountsState {
         &self.accounts
     }
 
-    /// The accounts a user may switch **to** right now. Empty when multi-account
-    /// is blocked or the migration is, whatever [`all`](Self::all) holds.
+    /// The accounts a user may switch **to** right now. Empty when
+    /// multi-account is blocked, whatever [`all`](Self::all) holds.
     pub fn switchable(&self) -> &[Account] {
         &self.switchable
     }
 
-    /// Whether another account may be added. The same two blocks: an account
-    /// added now would share the one profile, or land beside a migration that
-    /// has not run.
+    /// Whether another account may be added. The same block: an account added
+    /// now would share the one profile.
     pub fn can_add(&self) -> bool {
         self.blocked_reason.is_none()
     }
@@ -665,24 +577,17 @@ impl AccountsState {
         self.blocked_reason.as_deref()
     }
 
-    /// Whether the migration deleted a Windows Hello enrolment that has to be
-    /// set up again. Carried through here because the panel that shows it
-    /// reads this state and not the migration's own return value.
-    pub fn hello_needs_reenrolment(&self) -> bool {
-        self.hello_needs_reenrolment
-    }
-
     /// Records the account this process has just moved onto, appending it to
     /// the list if it is not there yet.
     ///
     /// This is how an *added* account reaches the state every window reads.
-    /// It is a mutation rather than a rebuild because [`new`](Self::new)'s two
-    /// inputs — the CLI's availability and the migration's outcome — are not
-    /// re-derivable here, and re-deriving them would be a second reading of
-    /// the two facts this type exists to be the single answer to. Neither is
-    /// changed by adding an account: whether switching is blocked was settled
-    /// at startup, so it is *carried*, and a blocked state that adopts one
-    /// still offers no switch targets.
+    /// It is a mutation rather than a rebuild because [`new`](Self::new)'s
+    /// input — the CLI's availability — is not re-derivable here, and
+    /// re-deriving it would be a second reading of the fact this type exists
+    /// to be the single answer to. It is not changed by adding an account:
+    /// whether switching is blocked was settled at startup, so it is
+    /// *carried*, and a blocked state that adopts one still offers no switch
+    /// targets.
     pub fn adopt(&mut self, account: Account) {
         if account_for(&self.accounts, &account.id).is_none() {
             self.accounts.push(account.clone());
@@ -825,8 +730,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_anything_that_could_escape_the_accounts_directory() {
-        // This id becomes a directory name, and the migration (and account
-        // removal) will `remove_dir_all` a path built from it. A traversal, a
+        // This id becomes a directory name, and account removal will
+        // `remove_dir_all` a path built from it. A traversal, a
         // separator, a drive-absolute path or a reserved device name reaching
         // `data_dir_for` would put -- or DELETE -- something somewhere else
         // entirely.
@@ -1010,10 +915,10 @@ mod tests {
 
     #[test]
     fn no_secret_of_any_account_lands_in_the_shared_config_directory() {
-        // The pre-migration app kept `session.bin` and `hello.bin` directly in
-        // `config_dir`. After migration nothing does -- if one account's blob
-        // resolved back to the shared directory it would be found (and
-        // deleted, and overwritten) by every other account.
+        // The single-account app kept `session.bin` and `hello.bin` directly
+        // in `config_dir`. Nothing does now -- if one account's blob resolved
+        // back to the shared directory it would be found (and deleted, and
+        // overwritten) by every other account.
         let cfg = Path::new(r"C:\cfg");
         for raw in [A, B, &"0".repeat(32), &"f".repeat(32)] {
             let a = id(raw);
@@ -1109,9 +1014,8 @@ mod tests {
         let b = id(B);
         assert_ne!(hello_kdf_suffix_for(&a), hello_kdf_suffix_for(&b));
         // Absolute, not incidental: an empty suffix would reproduce the
-        // pre-migration derivation, so a stale hello.bin left behind by a
-        // failed migration would silently open under the migrated account's
-        // identity.
+        // single-account derivation, so a stale hello.bin still sitting in
+        // `config_dir` would silently open under this account's identity.
         assert!(!hello_kdf_suffix_for(&a).is_empty());
         assert!(!hello_kdf_suffix_for(&b).is_empty());
         assert!(!hello_kdf_suffix_for(&AccountId::generate()).is_empty());
@@ -1196,7 +1100,6 @@ mod tests {
     mod accounts_state {
         use super::*;
         use crate::bw_path::MultiAccountAvailability;
-        use crate::migration::MigrationState;
 
         fn a() -> Account {
             account(A)
@@ -1210,13 +1113,6 @@ mod tests {
             account(&"a".repeat(32))
         }
 
-        fn completed(of: &Account) -> MigrationState {
-            MigrationState::Completed {
-                account: of.clone(),
-                hello_needs_reenrolment: false,
-            }
-        }
-
         fn trap() -> MultiAccountAvailability {
             MultiAccountAvailability::BlockedByPortableProfile {
                 relative_data_dir: PathBuf::from(r"C:\a\bin\bitwarden-cli"),
@@ -1225,11 +1121,10 @@ mod tests {
 
         fn state(
             availability: MultiAccountAvailability,
-            migration: MigrationState,
             accounts: Vec<Account>,
             active: &AccountId,
         ) -> AccountsState {
-            AccountsState::new(availability, migration, accounts, active.clone())
+            AccountsState::new(availability, accounts, active.clone())
                 .expect("these accounts are not empty")
         }
 
@@ -1249,18 +1144,13 @@ mod tests {
         /// assertion in that file pass for the wrong reason.
         #[test]
         fn the_test_constructor_agrees_with_the_real_one() {
-            let real_open = state(
-                MultiAccountAvailability::Available,
-                completed(&a()),
-                vec![a(), b()],
-                &a().id,
-            );
+            let real_open = state(MultiAccountAvailability::Available, vec![a(), b()], &a().id);
             let open = AccountsState::from_blocked_reason(vec![a(), b()], a().id, None)
                 .expect("these accounts are not empty");
             assert_eq!(open, real_open);
             assert_eq!(switch_ids(&open), vec![b().id], "control: it offers b");
 
-            let real_blocked = state(trap(), completed(&a()), vec![a(), b()], &a().id);
+            let real_blocked = state(trap(), vec![a(), b()], &a().id);
             let blocked = AccountsState::from_blocked_reason(
                 vec![a(), b()],
                 a().id,
@@ -1280,7 +1170,7 @@ mod tests {
 
         #[test]
         fn a_blocked_availability_offers_no_switch_targets_and_no_add() {
-            let s = state(trap(), completed(&a()), vec![a(), b()], &a().id);
+            let s = state(trap(), vec![a(), b()], &a().id);
             assert!(
                 s.switchable().is_empty(),
                 "a switch was offered while the CLI ignores our env var: {:?}",
@@ -1309,7 +1199,6 @@ mod tests {
             // to report, and the one where a wrong answer is unfalsifiable.
             let s = state(
                 MultiAccountAvailability::BlockedByUnknownCliPath,
-                completed(&a()),
                 vec![a(), b()],
                 &a().id,
             );
@@ -1323,40 +1212,12 @@ mod tests {
         }
 
         #[test]
-        fn a_blocked_migration_offers_no_switch_targets_even_when_the_cli_is_fine() {
-            // The second, independent reason. A half-migrated or unmigrated
-            // profile means the account directories do not hold what the list
-            // says they do.
-            let s = state(
-                MultiAccountAvailability::Available,
-                MigrationState::Blocked {
-                    reason: "the copy could not be verified".into(),
-                },
-                vec![a(), b()],
-                &a().id,
-            );
-            assert!(s.switchable().is_empty());
-            assert!(!s.can_add());
-            assert!(
-                s.blocked_reason()
-                    .is_some_and(|why| why.contains("could not be verified")),
-                "the migration's own reason must reach the user, got {:?}",
-                s.blocked_reason()
-            );
-        }
-
-        #[test]
-        fn an_available_migrated_state_offers_every_account_except_the_active_one() {
+        fn an_available_state_offers_every_account_except_the_active_one() {
             // The positive control for both tests above, and the rule in its
             // own right: "switch to the account you are already on" is a no-op
             // that would still tear the backend down and demand a master
             // password.
-            let s = state(
-                MultiAccountAvailability::Available,
-                completed(&a()),
-                vec![a(), b(), c()],
-                &b().id,
-            );
+            let s = state(MultiAccountAvailability::Available, vec![a(), b(), c()], &b().id);
             assert_eq!(
                 switch_ids(&s),
                 vec![a().id, c().id],
@@ -1369,74 +1230,6 @@ mod tests {
         }
 
         #[test]
-        fn a_later_launch_with_nothing_to_migrate_still_offers_a_switch() {
-            // `NothingToMigrate` is what `migrate` returns on EVERY launch
-            // after the first: `resume_action` answers `DoNothing` as soon as
-            // `accounts_already_configured` is true. Reading "migration has not
-            // completed" as "the state is not `Completed`" would therefore
-            // refuse every switch from the second launch onward -- a feature
-            // that works exactly once, on the launch that migrated, and is
-            // inert forever after. No end state distinguishes that from a
-            // correctly blocked app.
-            let s = state(
-                MultiAccountAvailability::Available,
-                MigrationState::NothingToMigrate,
-                vec![a(), b()],
-                &a().id,
-            );
-            assert_eq!(switch_ids(&s), vec![b().id]);
-            assert!(s.can_add());
-            assert_eq!(s.blocked_reason(), None);
-        }
-
-        #[test]
-        fn the_hello_notice_survives_into_the_state_the_login_window_reads() {
-            // WIRING for Task 7's panel line: a `hello_needs_reenrolment` that
-            // the migration computes and nothing carries forward is a notice
-            // the user never sees, and quick unlock silently stops working.
-            let loud = state(
-                MultiAccountAvailability::Available,
-                MigrationState::Completed {
-                    account: a(),
-                    hello_needs_reenrolment: true,
-                },
-                vec![a()],
-                &a().id,
-            );
-            assert!(loud.hello_needs_reenrolment());
-            let quiet = state(
-                MultiAccountAvailability::Available,
-                completed(&a()),
-                vec![a()],
-                &a().id,
-            );
-            assert!(
-                !quiet.hello_needs_reenrolment(),
-                "a state that always says yes would put the notice in front of every user"
-            );
-            // And it is not a synonym for either block: a blocked state with
-            // the flag set still reports it, and an unblocked one without it
-            // still does not.
-            let blocked_and_loud = state(
-                trap(),
-                MigrationState::Completed {
-                    account: a(),
-                    hello_needs_reenrolment: true,
-                },
-                vec![a()],
-                &a().id,
-            );
-            assert!(blocked_and_loud.hello_needs_reenrolment());
-            let unmigrated = state(
-                MultiAccountAvailability::Available,
-                MigrationState::NothingToMigrate,
-                vec![a()],
-                &a().id,
-            );
-            assert!(!unmigrated.hello_needs_reenrolment());
-        }
-
-        #[test]
         fn an_active_id_naming_no_stored_account_falls_back_to_the_first() {
             // Reachable: `settings.json` is a user-editable file, and a removal
             // that crashed between rewriting the list and rewriting
@@ -1445,12 +1238,7 @@ mod tests {
             // point the CLI at a directory nothing created, and would then also
             // appear in its own switch targets.
             let ghost = id(&"9".repeat(32));
-            let s = state(
-                MultiAccountAvailability::Available,
-                completed(&a()),
-                vec![b(), a()],
-                &ghost,
-            );
+            let s = state(MultiAccountAvailability::Available, vec![b(), a()], &ghost);
             assert_eq!(s.active().id, b().id, "the first configured account");
             assert_eq!(
                 switch_ids(&s),
@@ -1466,58 +1254,33 @@ mod tests {
 
         #[test]
         fn an_empty_account_list_is_not_an_accounts_state_at_all() {
-            // The pre-migration app has no `Account`, and that is a startup
-            // condition rather than an `AccountsState` holding nothing. If this
-            // constructed, `active()` would have to invent an account or panic
-            // -- and an invented one points the CLI at an empty directory,
-            // which presents as "signed out" with the real vault untouched a
-            // few directories away.
+            // `StartupAccounts::NoAccountList` is a startup condition rather
+            // than an `AccountsState` holding nothing. If this constructed,
+            // `active()` would have to invent an account or panic -- and an
+            // invented one points the CLI at an empty directory, which presents
+            // as "signed out" with the real vault untouched a few directories
+            // away.
             for availability in [
                 MultiAccountAvailability::Available,
                 MultiAccountAvailability::BlockedByUnknownCliPath,
                 trap(),
             ] {
-                for migration in [
-                    MigrationState::NothingToMigrate,
-                    completed(&a()),
-                    MigrationState::Blocked {
-                        reason: "nope".into(),
-                    },
-                ] {
-                    assert!(
-                        AccountsState::new(
-                            availability.clone(),
-                            migration.clone(),
-                            vec![],
-                            a().id
-                        )
-                        .is_none(),
-                        "{availability:?} + {migration:?} built a state with no accounts"
-                    );
-                    // The positive control on the same call: one account and
-                    // the same two inputs does build.
-                    assert!(
-                        AccountsState::new(
-                            availability.clone(),
-                            migration.clone(),
-                            vec![a()],
-                            a().id
-                        )
-                        .is_some(),
-                        "{availability:?} + {migration:?} refused a perfectly good single account"
-                    );
-                }
+                assert!(
+                    AccountsState::new(availability.clone(), vec![], a().id).is_none(),
+                    "{availability:?} built a state with no accounts"
+                );
+                // The positive control on the same call: one account and the
+                // same availability does build.
+                assert!(
+                    AccountsState::new(availability.clone(), vec![a()], a().id).is_some(),
+                    "{availability:?} refused a perfectly good single account"
+                );
             }
         }
 
         #[test]
         fn a_single_account_has_nowhere_to_switch_to_but_may_still_be_added_to() {
-            let s = state(
-                MultiAccountAvailability::Available,
-                completed(&a()),
-                vec![a()],
-                &a().id,
-            );
+            let s = state(MultiAccountAvailability::Available, vec![a()], &a().id);
             assert!(s.switchable().is_empty());
             assert!(
                 s.can_add(),
@@ -1533,7 +1296,6 @@ mod tests {
             // two menu items that switch to the same data directory.
             let s = state(
                 MultiAccountAvailability::Available,
-                completed(&a()),
                 vec![a(), b(), b(), a()],
                 &a().id,
             );
@@ -1542,27 +1304,15 @@ mod tests {
         }
 
         #[test]
-        fn every_combination_of_the_two_blocks_obeys_one_rule() {
+        fn every_combination_of_the_block_and_the_list_obeys_one_rule() {
             // The whole decision table, so no single combination can be
             // special-cased into working while another silently is not. Three
-            // availabilities x three migration states x four account lists,
-            // each with an active account that is in the list and one that is
-            // not.
-            let unblocked_migrations = [MigrationState::NothingToMigrate, completed(&a())];
+            // availabilities x four account lists, each with an active account
+            // that is in the list and one that is not.
             let availabilities = [
                 (MultiAccountAvailability::Available, true),
                 (MultiAccountAvailability::BlockedByUnknownCliPath, false),
                 (trap(), false),
-            ];
-            let migrations = [
-                (MigrationState::NothingToMigrate, true),
-                (completed(&a()), true),
-                (
-                    MigrationState::Blocked {
-                        reason: "the copy could not be verified".into(),
-                    },
-                    false,
-                ),
             ];
             let lists = [
                 vec![a()],
@@ -1572,48 +1322,41 @@ mod tests {
             ];
 
             let mut ever_offered = 0usize;
-            for (availability, cli_ok) in &availabilities {
-                for (migration, migration_ok) in &migrations {
-                    for list in &lists {
-                        let s = state(
-                            availability.clone(),
-                            migration.clone(),
-                            list.clone(),
-                            &a().id,
-                        );
-                        let allowed = *cli_ok && *migration_ok;
-                        let label = format!("{availability:?} / {migration:?} / {list:?}");
+            for (availability, allowed) in &availabilities {
+                for list in &lists {
+                    let s = state(availability.clone(), list.clone(), &a().id);
+                    let allowed = *allowed;
+                    let label = format!("{availability:?} / {list:?}");
 
-                        assert_eq!(s.can_add(), allowed, "can_add disagrees for {label}");
-                        assert_eq!(
-                            s.blocked_reason().is_none(),
-                            allowed,
-                            "blocked_reason disagrees for {label}"
-                        );
-                        assert_eq!(s.all(), &list[..], "all() rewrote the stored list for {label}");
+                    assert_eq!(s.can_add(), allowed, "can_add disagrees for {label}");
+                    assert_eq!(
+                        s.blocked_reason().is_none(),
+                        allowed,
+                        "blocked_reason disagrees for {label}"
+                    );
+                    assert_eq!(s.all(), &list[..], "all() rewrote the stored list for {label}");
 
-                        // The active account is always one of the stored ones,
-                        // and is never a switch target.
-                        assert!(
-                            list.iter().any(|x| x.id == s.active().id),
-                            "the active account is not in the list for {label}"
-                        );
-                        assert!(
-                            !switch_ids(&s).contains(&s.active().id),
-                            "the active account was offered as a target for {label}"
-                        );
+                    // The active account is always one of the stored ones,
+                    // and is never a switch target.
+                    assert!(
+                        list.iter().any(|x| x.id == s.active().id),
+                        "the active account is not in the list for {label}"
+                    );
+                    assert!(
+                        !switch_ids(&s).contains(&s.active().id),
+                        "the active account was offered as a target for {label}"
+                    );
 
-                        let expected: Vec<AccountId> = if allowed {
-                            list.iter()
-                                .map(|x| x.id.clone())
-                                .filter(|x| x != &s.active().id)
-                                .collect()
-                        } else {
-                            vec![]
-                        };
-                        assert_eq!(switch_ids(&s), expected, "switchable disagrees for {label}");
-                        ever_offered += s.switchable().len();
-                    }
+                    let expected: Vec<AccountId> = if allowed {
+                        list.iter()
+                            .map(|x| x.id.clone())
+                            .filter(|x| x != &s.active().id)
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(switch_ids(&s), expected, "switchable disagrees for {label}");
+                    ever_offered += s.switchable().len();
                 }
             }
             // The positive control over the whole table: "refused" is not the
@@ -1624,23 +1367,11 @@ mod tests {
                 "no combination in the whole table offered a single switch target"
             );
             // And the unblocked corner really does depend on the account list
-            // rather than on the state alone.
-            for migration in unblocked_migrations {
-                let one = state(
-                    MultiAccountAvailability::Available,
-                    migration.clone(),
-                    vec![a()],
-                    &a().id,
-                );
-                let two = state(
-                    MultiAccountAvailability::Available,
-                    migration,
-                    vec![a(), b()],
-                    &a().id,
-                );
-                assert!(one.switchable().is_empty());
-                assert_eq!(switch_ids(&two), vec![b().id]);
-            }
+            // rather than on the availability alone.
+            let one = state(MultiAccountAvailability::Available, vec![a()], &a().id);
+            let two = state(MultiAccountAvailability::Available, vec![a(), b()], &a().id);
+            assert!(one.switchable().is_empty());
+            assert_eq!(switch_ids(&two), vec![b().id]);
         }
 
         #[test]
@@ -1666,8 +1397,8 @@ mod tests {
 
         /// The files that must ask [`AccountsState`] rather than answer for
         /// themselves. `main.rs` is deliberately not among them: it is where
-        /// the two inputs are produced (Task 11), so it is the one place that
-        /// legitimately names both.
+        /// the availability is produced, so it is the one place that
+        /// legitimately names it.
         ///
         /// Read off disk rather than with `include_str!` so this list can name
         /// files in subdirectories, and so a file that stops existing is a
@@ -1683,15 +1414,13 @@ mod tests {
 
         #[test]
         fn no_window_answers_may_i_switch_for_itself() {
-            // A gate nothing asks is the same as no gate. There is no
-            // production caller yet -- Task 11 wires the first one -- so what
-            // can be pinned today is the other half: that the two facts are
-            // combined HERE and are not reachable anywhere a second, weaker
-            // combination could grow. A window that asked
-            // `multi_account_availability()` and not the migration would offer
-            // a switch into a directory that was never populated; one that
-            // asked the migration and not the CLI would offer a switch that
-            // shares a profile. Both are silent.
+            // A gate nothing asks is the same as no gate. A window that asked
+            // `multi_account_availability()` for itself would answer it at a
+            // different moment from startup -- a `bitwarden-cli` directory that
+            // appeared since, or a `bw.exe` that has not been verified in this
+            // process -- and would then offer a switch that silently shares one
+            // profile between two identities. Nothing reports an error when
+            // that happens, so it is not visible in an end state.
             //
             // NEEDLES SPLIT ACROSS `concat!` ARGUMENTS, DELIBERATELY: written
             // whole, each would match its own declaration in this file, and
@@ -1701,7 +1430,6 @@ mod tests {
             let banned = [
                 concat!("MultiAccount", "Availability"),
                 concat!("multi_account_", "availability"),
-                concat!("Migration", "State"),
             ];
             // `CARGO_MANIFEST_DIR`, not `file!()`: the latter is relative to
             // the package root and would depend on the test binary's working
@@ -1718,9 +1446,9 @@ mod tests {
                         !source.contains(needle),
                         "{name} names `{needle}` itself. Whether this process may switch \
                          accounts is `AccountsState`'s answer and nothing else's: a window \
-                         that combines those two facts a second time will disagree with this \
-                         one, and the disagreement is silent -- a switch that shares a profile, \
-                         or one into a directory the migration never populated."
+                         that reads that fact a second time will disagree with this one, and \
+                         the disagreement is silent -- a switch that shares one profile \
+                         between two identities."
                     );
                 }
             }
@@ -1749,60 +1477,35 @@ mod tests {
 
     mod startup_resolution {
         use super::*;
-        use crate::migration::MigrationState;
 
-        fn completed(account: &Account) -> MigrationState {
-            MigrationState::Completed {
-                account: account.clone(),
-                hello_needs_reenrolment: false,
+        fn ready(r: StartupAccounts) -> (Account, Vec<Account>, bool, bool) {
+            match r {
+                StartupAccounts::Ready {
+                    active,
+                    accounts,
+                    needs_persist,
+                    first_run,
+                } => (active, accounts, needs_persist, first_run),
+                other => panic!("{other:?}"),
             }
-        }
-
-        #[test]
-        fn a_completed_migration_on_this_launch_becomes_the_active_account() {
-            let migrated = account(A);
-            let r = resolve_startup(
-                &[],
-                None,
-                &MigrationState::Completed {
-                    account: migrated.clone(),
-                    hello_needs_reenrolment: true,
-                },
-            );
-            let StartupAccounts::Ready {
-                active,
-                accounts,
-                needs_persist,
-            } = r
-            else {
-                panic!("{r:?}")
-            };
-            assert_eq!(active.id, migrated.id);
-            assert_eq!(accounts.len(), 1);
-            assert!(
-                needs_persist,
-                "the migrated account must be written before the next launch"
-            );
         }
 
         #[test]
         fn the_stored_active_account_is_resumed_on_a_later_launch() {
             let (a, b) = (account(A), account(B));
-            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&a));
-            let StartupAccounts::Ready {
-                active,
-                accounts,
-                needs_persist,
-            } = r
-            else {
-                panic!("{r:?}")
-            };
+            let (active, accounts, needs_persist, first_run) =
+                ready(resolve_startup(&[a.clone(), b.clone()], Some(&b.id), None));
             assert_eq!(
                 active.id, b.id,
                 "a restart must resume the account that was last active"
             );
             assert_eq!(accounts.len(), 2, "and must not drop the others");
             assert!(!needs_persist, "nothing changed, so nothing is rewritten");
+            assert!(
+                !first_run,
+                "a resumed account has been signed in to; saying otherwise puts the first-run \
+                 notice in front of the user on every launch forever"
+            );
         }
 
         #[test]
@@ -1812,128 +1515,84 @@ mod tests {
             // would leave the app with nothing to point the CLI at.
             let a = account(A);
             let ghost = AccountId::parse(&"9".repeat(32)).unwrap();
-            let r = resolve_startup(&[a.clone()], Some(&ghost), &completed(&a));
-            let StartupAccounts::Ready {
-                active,
-                needs_persist,
-                ..
-            } = r
-            else {
-                panic!("{r:?}")
-            };
+            let (active, _, needs_persist, first_run) =
+                ready(resolve_startup(&[a.clone()], Some(&ghost), None));
             assert_eq!(active.id, a.id);
             assert!(
                 needs_persist,
                 "the dangling active id must be corrected on disk"
             );
-        }
-
-        #[test]
-        fn a_blocked_migration_leaves_the_app_unmigrated_rather_than_inventing_an_account() {
-            // The failure path that keeps the app working. Inventing an
-            // `Account` here would point the CLI at an EMPTY directory and
-            // present as "signed out", while the real profile sat untouched a
-            // few directories away -- the exact symptom a user would report as
-            // "the update deleted my vault".
-            let r = resolve_startup(
-                &[],
-                None,
-                &MigrationState::Blocked {
-                    reason: "the copy could not be verified".into(),
-                },
+            assert!(
+                !first_run,
+                "the account was stored, so it is not this launch's doing"
             );
-            let StartupAccounts::Unmigrated { reason } = r else {
-                panic!("{r:?}")
-            };
-            assert!(reason.contains("could not be verified"));
         }
 
         #[test]
-        fn a_first_install_gets_one_fresh_account_rather_than_running_unmigrated() {
-            // `NothingToMigrate` is not a failure: there was no profile
-            // because this is a new machine. Give it an account directory and
-            // let the user sign in there.
-            let r = resolve_startup(&[], None, &MigrationState::NothingToMigrate);
-            let StartupAccounts::Ready {
-                active,
-                accounts,
-                needs_persist,
-            } = r
-            else {
-                panic!("{r:?}")
-            };
-            assert_eq!(accounts.len(), 1);
-            assert!(needs_persist);
+        fn a_first_run_mints_exactly_one_account_and_says_it_is_new() {
+            // No account list, and nothing to import: Deskwarden does not
+            // touch whatever the Bitwarden CLI may already hold under
+            // `%APPDATA%`. It mints one directory and the login window asks
+            // for a master password. `first_run` is what tells the window to
+            // say why.
+            let (active, accounts, needs_persist, first_run) =
+                ready(resolve_startup(&[], None, None));
+            assert_eq!(
+                accounts.len(),
+                1,
+                "a first run must mint exactly one account, got {accounts:?}"
+            );
+            assert!(needs_persist, "the minted account must reach settings.json");
             assert_eq!(
                 accounts[0].id, active.id,
                 "the minted account is the one that becomes active"
             );
+            assert!(
+                accounts[0].email.is_empty(),
+                "nobody has signed in yet, so there is no address to claim"
+            );
+            assert!(first_run, "the minted account has never been signed in to");
+            // And the id really is minted rather than a constant: two first
+            // runs are two different directories.
+            let (second, ..) = ready(resolve_startup(&[], None, None));
+            assert_ne!(second.id, active.id);
         }
 
         #[test]
-        fn a_block_that_appears_after_the_migration_still_resumes_the_migrated_account() {
-            // Not in the plan, and the inverse of the test above it. A
-            // `bitwarden-cli` directory appearing beside `bw.exe` AFTER the
-            // profile was migrated blocks the migration report on every later
-            // launch -- and reading that as `Unmigrated` would point the CLI
-            // at its own default profile while the vault sits in
-            // `accounts/<id>/`. That is the same "signed out on upgrade"
-            // symptom the empty-list case exists to avoid, arrived at from the
-            // opposite direction: refusing to migrate is safe, refusing to
-            // RESUME is not.
+        fn an_unreadable_account_list_mints_nothing_at_all() {
+            // `Settings::load` answers a failed parse with an EMPTY account
+            // list, which is indistinguishable here from a first run. Minting
+            // on it would point the CLI at an empty directory while the user's
+            // account sat in `accounts/<old-id>/` -- and `Settings::save`
+            // refuses to write over a file it could not read, so the fresh id
+            // would not even be recorded: the next launch would mint another,
+            // and the one after that another.
+            let r = resolve_startup(&[], None, Some("settings.json could not be read"));
+            let StartupAccounts::NoAccountList { reason } = r else {
+                panic!("an unreadable account list minted an account: {r:?}")
+            };
+            assert!(reason.contains("could not be read"), "{reason}");
+            // The control, on the same call with the same empty list: a
+            // READABLE empty list does mint. Without this the refusal above
+            // could be "never mint anything", which is the app never starting.
+            let (_, accounts, ..) = ready(resolve_startup(&[], None, None));
+            assert_eq!(accounts.len(), 1);
+        }
+
+        #[test]
+        fn a_stored_account_outranks_an_unreadable_list() {
+            // Unreachable through `Settings::load` -- a failed parse yields no
+            // accounts -- and spelled out anyway, because the alternative
+            // ordering (refuse whenever the flag is set) would throw away a
+            // perfectly good account list and take the app account-less.
             let a = account(A);
-            let r = resolve_startup(
+            let (active, _, _, first_run) = ready(resolve_startup(
                 &[a.clone()],
                 Some(&a.id),
-                &MigrationState::Blocked {
-                    reason: "a bitwarden-cli directory sits beside bw.exe".into(),
-                },
-            );
-            let StartupAccounts::Ready {
-                active,
-                needs_persist,
-                ..
-            } = r
-            else {
-                panic!("a migrated account was dropped when a later launch was blocked: {r:?}")
-            };
+                Some("settings.json could not be read"),
+            ));
             assert_eq!(active.id, a.id);
-            assert!(!needs_persist);
-        }
-
-        #[test]
-        fn a_completed_migration_reported_twice_neither_duplicates_nor_re_activates() {
-            // A crash between deleting the source and clearing the marker
-            // leaves `VerifyAndFinish`, so a LATER launch can report
-            // `Completed` for an account that is already stored -- and by then
-            // the user may have added and switched to a second one. Appending
-            // again would put two menu entries on one directory; re-activating
-            // would silently drag them back.
-            let (a, b) = (account(A), account(B));
-            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&a));
-            let StartupAccounts::Ready {
-                active,
-                accounts,
-                needs_persist,
-            } = r
-            else {
-                panic!("{r:?}")
-            };
-            assert_eq!(accounts.len(), 2, "the migrated account was added twice");
-            assert_eq!(active.id, b.id, "the user was dragged back off their pick");
-            assert!(!needs_persist);
-            // Positive control on the same call shape: an account the list
-            // does NOT hold really is added and really does become active.
-            let fresh = account(&"c".repeat(32));
-            let r = resolve_startup(&[a.clone(), b.clone()], Some(&b.id), &completed(&fresh));
-            let StartupAccounts::Ready {
-                active, accounts, ..
-            } = r
-            else {
-                panic!("{r:?}")
-            };
-            assert_eq!(accounts.len(), 3);
-            assert_eq!(active.id, fresh.id);
+            assert!(!first_run);
         }
 
         #[test]
@@ -2164,20 +1823,14 @@ mod tests {
     mod adopting_an_account {
         use super::*;
         use crate::bw_path::MultiAccountAvailability;
-        use crate::migration::MigrationState;
 
         fn state(
             availability: MultiAccountAvailability,
             list: Vec<Account>,
             active: &AccountId,
         ) -> AccountsState {
-            AccountsState::new(
-                availability,
-                MigrationState::NothingToMigrate,
-                list,
-                active.clone(),
-            )
-            .expect("these accounts are not empty")
+            AccountsState::new(availability, list, active.clone())
+                .expect("these accounts are not empty")
         }
 
         fn switch_ids(state: &AccountsState) -> Vec<AccountId> {
@@ -2272,16 +1925,10 @@ mod tests {
     mod forgetting_an_account {
         use super::*;
         use crate::bw_path::MultiAccountAvailability;
-        use crate::migration::MigrationState;
 
         fn state(list: Vec<Account>, active: &AccountId) -> AccountsState {
-            AccountsState::new(
-                MultiAccountAvailability::Available,
-                MigrationState::NothingToMigrate,
-                list,
-                active.clone(),
-            )
-            .expect("these accounts are not empty")
+            AccountsState::new(MultiAccountAvailability::Available, list, active.clone())
+                .expect("these accounts are not empty")
         }
 
         fn ids(accounts: &[Account]) -> Vec<AccountId> {

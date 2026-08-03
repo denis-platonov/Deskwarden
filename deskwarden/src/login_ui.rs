@@ -98,10 +98,10 @@ fn bw_status_stdout(session_token: Option<&str>) -> Option<String> {
 /// [`bw_status_stdout`] against a **named** profile directory rather than the
 /// active account's.
 ///
-/// `Some(dir)` is the only interesting case and the only one migration uses:
-/// asking the CLI "whose vault is in *this* directory?" is how a copy is
-/// verified before the original is deleted, and it has to be a different
-/// directory from the one this process is currently pointed at. `None` keeps
+/// `Some(dir)` is the only interesting case: asking the CLI "whose vault is
+/// in *this* directory?" is how `add_account` learns the address a sign-in
+/// just landed under, and it has to be a different directory from the one this
+/// process is currently pointed at. `None` keeps
 /// `bw_command_in`'s meaning -- no override, so the child inherits whatever
 /// `BITWARDENCLI_APPDATA_DIR` the environment already had.
 fn bw_status_stdout_in(data_dir: Option<&Path>, session_token: Option<&str>) -> Option<String> {
@@ -153,13 +153,12 @@ pub fn check_bw_status_details() -> BwStatusDetails {
 
 /// [`check_bw_status_details`] asked of a **named** profile directory.
 ///
-/// This is `migration::migrate`'s `status` parameter in production: the whole
-/// of "was the copy verified?" is this function answering, for the copy's own
-/// directory, with the email the source reported before anything was copied.
-/// A `status` that ignored its argument would answer for whatever profile this
-/// process happens to be pointed at -- which is how a verification passes
-/// while proving nothing, and the user's original profile is then deleted on
-/// the strength of it.
+/// Every caller that has an account in hand uses this form rather than
+/// [`check_bw_status_details`]: `add_account` asks it about the directory the
+/// new sign-in landed in, which is not the one this process is pointed at. A
+/// version that ignored its argument would answer for whatever profile the
+/// process happens to be on, and the new account would inherit the previous
+/// account's address.
 pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
     bw_status_stdout_in(data_dir, None)
         .map(|stdout| parse_bw_status_details(&stdout))
@@ -1086,23 +1085,35 @@ pub enum LoginAction {
 /// primitive). The Hello panel appears once quick unlock is enrolled
 /// (`hello.enrolled`); the mock's static "Bitwarden · EU" footer is a live
 /// server dropdown while signing in.
-/// What the window says when a migration has just cost this account its
-/// Windows Hello enrollment.
+/// What the window says the first time it asks for a master password against
+/// a freshly minted account.
 ///
-/// One of the three channels the migration announces that through; the other
-/// two are elsewhere. Worded as a consequence of something the user agreed to
-/// rather than as an error, because nothing has gone wrong -- but it is said
-/// out loud, because a quick unlock that quietly stops existing reads as a
-/// bug in the app.
-pub const HELLO_REENROLMENT_NOTICE: &str =
-    "Your vault moved into its own profile, so Windows Hello quick unlock has to be set up again.";
+/// **Why it exists at all.** Deskwarden keeps each account in its own CLI
+/// profile under `accounts/<id>/`, and it does not import whatever profile the
+/// Bitwarden CLI already had. So the first launch under this layout opens a
+/// login window on a machine the user was already signed in on. With nothing
+/// on screen to explain it that reads as a bug -- or as a phishing prompt --
+/// rather than as one-off setup.
+///
+/// **Both halves are load-bearing.** The second sentence is not a nicety: the
+/// Windows Hello key is derived per account
+/// ([`accounts::hello_kdf_suffix_for`](crate::accounts::hello_kdf_suffix_for)),
+/// so an enrolment made by an earlier version cannot be opened here. A quick
+/// unlock that silently stops existing is indistinguishable from Windows Hello
+/// never having been set up.
+///
+/// Worded as setup rather than as an error, because nothing has gone wrong --
+/// and nothing of the user's has been touched: the CLI's own profile
+/// directory is left exactly where it is.
+pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own profile -- sign \
+     in once to set this one up. Windows Hello quick unlock has to be set up again too.";
 
-/// Paints [`HELLO_REENROLMENT_NOTICE`]. One definition, two call sites (with
-/// the Hello panel, and standing alone when there is no panel), so the two
-/// cannot drift into saying different things.
-fn draw_reenrolment_notice(ui: &mut egui::Ui) {
+/// Paints [`FIRST_RUN_NOTICE`]. One definition, two call sites (with the Hello
+/// panel, and standing alone when there is no panel), so the two cannot drift
+/// into saying different things.
+fn draw_first_run_notice(ui: &mut egui::Ui) {
     ui.label(
-        RichText::new(HELLO_REENROLMENT_NOTICE)
+        RichText::new(FIRST_RUN_NOTICE)
             .size(11.0)
             .color(theme::TEXT_MUTED),
     );
@@ -1121,14 +1132,12 @@ pub fn draw_login_window(
     // answers. Disables every control that could start a second sign-in and
     // shows the spinner beside Continue.
     auth_in_progress: bool,
-    // This account's vault was just moved into its own profile, which left
-    // its Windows Hello enrollment behind (the sealed blob is derived from
-    // the account's identity, so it cannot be carried over). Draws
-    // [`HELLO_REENROLMENT_NOTICE`]. Not something the window infers: the
-    // fact travels from the migration, and without it the user's only
-    // signal is a quick unlock panel that offers "first use" again --
-    // indistinguishable from never having set it up.
-    hello_needs_reenrolment: bool,
+    // This account was minted by THIS launch and has never been signed in
+    // to. Draws [`FIRST_RUN_NOTICE`]. Not something the window infers: the
+    // fact travels from `accounts::resolve_startup`, and without it the user
+    // meets a master-password prompt on a machine they were already signed
+    // in on with nothing to say why.
+    first_run: bool,
 ) -> Option<LoginAction> {
     let mut action = None;
 
@@ -1238,10 +1247,12 @@ pub fn draw_login_window(
     let show_panel = hello.available && (needs_setup || status != BwStatus::Unauthenticated);
     // Deliberately NOT nested inside `show_panel`. If Hello has since been
     // turned off on this machine there is no panel to hang the line from,
-    // and the line is then the only thing that says the quick unlock the
-    // user had is gone. `needs_setup` because a re-enrolled account has
-    // nothing left to be told.
-    let show_reenrolment_notice = hello_needs_reenrolment && needs_setup;
+    // and the line is then the only thing that says why the app is asking
+    // for a master password at all. `needs_setup` because an account that
+    // has already enrolled on this layout has nothing left to be told --
+    // which is also what stops the notice reappearing after the first
+    // sign-in within one launch.
+    let show_first_run_notice = first_run && needs_setup;
     if show_panel {
         ui.add_space(10.0);
         ui.horizontal(|ui| {
@@ -1252,8 +1263,8 @@ pub fn draw_login_window(
         });
         ui.add_space(10.0);
 
-        if show_reenrolment_notice {
-            draw_reenrolment_notice(ui);
+        if show_first_run_notice {
+            draw_first_run_notice(ui);
         }
 
         let subtitle = if needs_setup {
@@ -1281,9 +1292,9 @@ pub fn draw_login_window(
                 action = Some(LoginAction::Submit);
             }
         }
-    } else if show_reenrolment_notice {
+    } else if show_first_run_notice {
         ui.add_space(10.0);
-        draw_reenrolment_notice(ui);
+        draw_first_run_notice(ui);
     }
 
     // Enter submits from anywhere in the form, same as clicking Continue --
@@ -1550,8 +1561,8 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
 /// `bw_path::active_data_dir()`.** Those two agree for every login window
 /// except the one that matters: `main`'s `add_account` opens this window for
 /// an account that has just been minted and is not the active one, and its
-/// `bw login` *replaces* whatever profile it lands in -- which, after the
-/// migration, is the user's only vault.
+/// `bw login` *replaces* whatever profile it lands in -- which would otherwise
+/// be the account the user is already signed into.
 ///
 /// The alternative is what `add_account` used to do: set the process-global
 /// to the new directory, run the window, set it back. `bw_serve.rs` reads that
@@ -1561,7 +1572,7 @@ fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32
 /// directory here is what lets the function beside it obey the same one.
 ///
 /// `None` is the one startup condition with no account at all
-/// (`accounts::StartupAccounts::Unmigrated`), and it keeps `bw_command_in`'s
+/// (`accounts::StartupAccounts::NoAccountList`), and it keeps `bw_command_in`'s
 /// meaning: no override, so the child resolves the profile the CLI would by
 /// itself. That is also what the global held in that state, so nothing about
 /// it changed.
@@ -1587,7 +1598,7 @@ fn spawn_auth(
     enroll_hello: Option<(PathBuf, AccountId)>,
     // The profile directory the `bw login`/`bw unlock` acts on, owned because
     // the worker outlives this frame. `None` only when this window belongs to
-    // no account at all (`StartupAccounts::Unmigrated`), where there is no
+    // no account at all (`StartupAccounts::NoAccountList`), where there is no
     // override to set and the CLI resolves its own.
     data_dir: Option<PathBuf>,
 ) {
@@ -1625,18 +1636,17 @@ fn spawn_auth(
 /// `account` is the account this window's Windows Hello enrollment belongs
 /// to, with the config directory it lives under. `None` is the one startup
 /// condition in which this app has no account at all --
-/// `accounts::StartupAccounts::Unmigrated`, a machine where the migration was
-/// refused -- and the window then simply offers no quick unlock, because there
+/// `accounts::StartupAccounts::NoAccountList`, a machine whose `settings.json`
+/// could not be read -- and the window then offers no quick unlock, because there
 /// is no account whose blob it could read or write. It never falls back to a
 /// shared, account-less enrollment: the only derivation available without an
 /// account is the empty KDF suffix, which would make one account's sealed
 /// master password openable by every other one.
 ///
-/// `hello_needs_reenrolment` draws [`HELLO_REENROLMENT_NOTICE`]; see
-/// [`draw_login_window`].
+/// `first_run` draws [`FIRST_RUN_NOTICE`]; see [`draw_login_window`].
 pub fn run_login_flow_for(
     account: Option<(&Path, &Account)>,
-    hello_needs_reenrolment: bool,
+    first_run: bool,
 ) -> Option<String> {
     // **Every `bw` this window runs is aimed at THIS account's directory**,
     // derived from the account it was already given rather than read off the
@@ -1775,7 +1785,7 @@ pub fn run_login_flow_for(
                     &mut form,
                     &mut flow_bottom,
                     auth_in_progress,
-                    hello_needs_reenrolment,
+                    first_run,
                 );
 
                 // Content height + the footer row and the bottom margin the
@@ -1983,13 +1993,13 @@ pub fn run_login_flow_for(
 /// the master-password prompt during a switch would kill an app that was
 /// running perfectly well with a vault already open.
 ///
-/// `account` and `hello_needs_reenrolment` are passed straight through to
+/// `account` and `first_run` are passed straight through to
 /// [`run_login_flow_for`]; this function decides what a closed window costs
 /// and nothing else. It takes them rather than hard-coding `None` because a
 /// hard-coded `None` is an app whose *startup* login window silently has no
 /// quick unlock -- which is the one login window every user meets.
-pub fn run_login_flow(account: Option<(&Path, &Account)>, hello_needs_reenrolment: bool) -> String {
-    match run_login_flow_for(account, hello_needs_reenrolment) {
+pub fn run_login_flow(account: Option<(&Path, &Account)>, first_run: bool) -> String {
+    match run_login_flow_for(account, first_run) {
         Some(session_token) => session_token,
         None => {
             // Exit cleanly with a logged reason rather than a raw panic
@@ -2665,7 +2675,7 @@ mod login_entry_point_tests {
         assert_eq!(
             profile_dir_for(None),
             None,
-            "an account-less window (StartupAccounts::Unmigrated) invented a directory rather \
+            "an account-less window (StartupAccounts::NoAccountList) invented a directory rather \
              than leaving the CLI to resolve its own"
         );
 
@@ -2936,13 +2946,14 @@ mod login_entry_point_tests {
 }
 
 #[cfg(test)]
-mod hello_notice_tests {
-    //! The line that says a migration cost this account its quick unlock.
+mod first_run_notice_tests {
+    //! The line that says why a machine the user is already signed in on is
+    //! asking for a master password.
     //!
     //! Driven through real frames with a headless `egui::Context`, the way the
     //! rest of this crate's windows are tested: what can go wrong here is not
     //! the wording, it is the window never painting it -- or painting it at
-    //! someone who never migrated.
+    //! every user on every launch.
 
     use super::*;
 
@@ -2979,9 +2990,8 @@ mod hello_notice_tests {
         }
     }
 
-    /// Every string the login window paints in one frame of a `Locked` vault
-    /// -- which is the state a just-migrated account comes back in.
-    fn painted(hello: HelloState, hello_needs_reenrolment: bool) -> Vec<String> {
+    /// Every string the login window paints in one frame of a `Locked` vault.
+    fn painted(hello: HelloState, first_run: bool) -> Vec<String> {
         let ctx = styled_context();
         let mut form = LoginForm::default();
         let mut flow_bottom = 0.0f32;
@@ -2995,7 +3005,7 @@ mod hello_notice_tests {
                 &mut form,
                 &mut flow_bottom,
                 false,
-                hello_needs_reenrolment,
+                first_run,
             );
         });
         let mut texts = Vec::new();
@@ -3005,7 +3015,20 @@ mod hello_notice_tests {
         texts
     }
 
-    fn says_set_up_again(texts: &[String]) -> bool {
+    /// Two independent needles, one per half of [`FIRST_RUN_NOTICE`], because
+    /// the two halves answer different questions and a notice that dropped
+    /// either would still pass a single-needle check. Neither spans the `\`
+    /// continuation the constant is wrapped with, and neither is re-derived
+    /// from the constant itself -- a test that asserted
+    /// `texts.contains(FIRST_RUN_NOTICE)` would pass for every wording,
+    /// including an empty one.
+    fn says_why_it_is_asking(texts: &[String]) -> bool {
+        texts
+            .iter()
+            .any(|t| t.to_lowercase().contains("its own profile"))
+    }
+
+    fn says_hello_must_be_set_up_again(texts: &[String]) -> bool {
         texts
             .iter()
             .any(|t| t.to_lowercase().contains("set up again"))
@@ -3028,11 +3051,16 @@ mod hello_notice_tests {
     };
 
     #[test]
-    fn a_migrated_account_is_told_its_quick_unlock_has_to_be_set_up_again() {
+    fn a_freshly_minted_account_is_told_why_it_is_being_asked_and_what_it_costs() {
         let texts = painted(NOT_ENROLLED, true);
         assert!(
-            says_set_up_again(&texts),
-            "the migration's re-enrolment line was never painted; got: {texts:?}"
+            says_why_it_is_asking(&texts),
+            "the first-run window asks for a master password without saying why; got: {texts:?}"
+        );
+        assert!(
+            says_hello_must_be_set_up_again(&texts),
+            "the first-run notice no longer says quick unlock has to be set up again, which is \
+             the half the user finds out about by its absence; got: {texts:?}"
         );
         assert!(
             shows_the_hello_panel(&texts),
@@ -3041,7 +3069,11 @@ mod hello_notice_tests {
     }
 
     #[test]
-    fn a_user_who_did_not_migrate_is_told_nothing() {
+    fn every_later_launch_is_told_nothing() {
+        // The gate. `resolve_startup` answers `first_run` only for the account
+        // it minted on this launch, so a second launch -- and a switch to any
+        // other account -- paints nothing. A notice that appeared every time
+        // would be a permanent "something is wrong" on a working app.
         let texts = painted(NOT_ENROLLED, false);
         assert!(
             shows_the_hello_panel(&texts),
@@ -3049,20 +3081,20 @@ mod hello_notice_tests {
              would pass for the wrong reason; got: {texts:?}"
         );
         assert!(
-            !says_set_up_again(&texts),
-            "the re-enrolment line is painted unconditionally; got: {texts:?}"
+            !says_why_it_is_asking(&texts) && !says_hello_must_be_set_up_again(&texts),
+            "the first-run notice is painted unconditionally; got: {texts:?}"
         );
     }
 
     #[test]
-    fn an_account_that_has_already_re_enrolled_is_not_told_again() {
+    fn an_account_that_has_already_enrolled_is_not_told_again() {
         let texts = painted(ENROLLED, true);
         assert!(
             !texts.is_empty(),
             "positive control: the window painted nothing at all"
         );
         assert!(
-            !says_set_up_again(&texts),
+            !says_hello_must_be_set_up_again(&texts),
             "an enrolled account is still being told to set Hello up again; \
              got: {texts:?}"
         );
@@ -3072,8 +3104,8 @@ mod hello_notice_tests {
     fn the_notice_survives_hello_being_switched_off_on_the_machine() {
         // The case the line exists for. With Hello unavailable there is no
         // panel, so a notice nested inside the panel would vanish with it --
-        // and the user's only signal that their quick unlock is gone would be
-        // the silence this whole task is about.
+        // and the user's only signal for why they are being asked to sign in
+        // again would be the silence this whole notice is about.
         let texts = painted(HelloState::unavailable(), true);
         assert!(
             !shows_the_hello_panel(&texts),
@@ -3081,7 +3113,7 @@ mod hello_notice_tests {
              got: {texts:?}"
         );
         assert!(
-            says_set_up_again(&texts),
+            says_why_it_is_asking(&texts),
             "the notice is nested inside the Hello panel, so it disappeared \
              with it; got: {texts:?}"
         );

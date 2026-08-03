@@ -51,7 +51,7 @@ use deskwarden::vault_cache::{
     VaultUnavailable,
 };
 use deskwarden::{
-    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, migration, picker_ui,
+    fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui,
     prefs_ui, session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
@@ -61,7 +61,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
+    GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_SYSTEMMODAL, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE,
 };
@@ -228,181 +228,122 @@ fn main() {
     // The order below is the whole of it, and every step of it is load-
     // bearing:
     //
-    //   1. migrate    -- the pre-existing profile moves into `accounts/<id>/`
-    //                    (once, ever). Resolving first would resolve against a
-    //                    profile that is about to move.
-    //   2. resolve    -- which account this process runs as, given what is
-    //                    stored and what step 1 just did. Pure; see
-    //                    `accounts::resolve_startup`.
-    //   3. point      -- `BITWARDENCLI_APPDATA_DIR` and the token store are
+    //   1. resolve    -- which account this process runs as, given what
+    //                    `settings.json` holds. Pure; see
+    //                    `accounts::resolve_startup`. With no accounts stored
+    //                    it MINTS one: there is nothing to import, because
+    //                    the vault lives on Bitwarden's servers and
+    //                    `%APPDATA%\Bitwarden CLI` is a local cache plus a
+    //                    session token. That directory is left exactly where
+    //                    it is -- never read, never copied, never deleted.
+    //   2. point      -- `BITWARDENCLI_APPDATA_DIR` and the token store are
     //                    aimed at that account, BEFORE anything reads a token
-    //                    or spawns `bw`. The first launch after a migration
-    //                    would otherwise validate a token against the wrong
-    //                    profile and silently re-authenticate, which reads as
-    //                    "the update lost my login".
+    //                    or spawns `bw`. Otherwise a token is validated
+    //                    against the wrong profile and silently
+    //                    re-authenticated, which reads as "the update lost my
+    //                    login".
     //
-    // Nothing here may kill the app. A migration that cannot run leaves the
-    // pre-existing profile exactly as it was and the app runs against it, as
-    // it does today -- so there is no `fatal_startup_error` anywhere in this
-    // block.
+    // Nothing here may kill the app: there is no `fatal_startup_error`
+    // anywhere in this block. The worst it can do is mint an account the user
+    // then signs in to.
     //
     // `remember_verified_bw_exe` above is a prerequisite, not an ordering
     // nicety: `multi_account_availability` looks beside the *verified*
     // `bw.exe` for the `bitwarden-cli` directory that makes the CLI ignore
     // `BITWARDENCLI_APPDATA_DIR`.
     let availability = bw_path::multi_account_availability();
-    let migration = if settings.accounts_unreadable {
-        // `settings.json` is there and could not be read (see
-        // `Settings::accounts_unreadable`). Its account list therefore parsed
-        // as empty, and an empty list is what `migrate` reads as "this has
-        // never run" -- so migrating now would copy, verify and DELETE a
-        // profile on the strength of a list we know we cannot see. Refuse, and
-        // say so where the user will find it.
-        let reason = format!(
+    // `settings.json` is there and could not be read (see
+    // `Settings::accounts_unreadable`), so its account list parsed as EMPTY --
+    // which is the same thing `resolve_startup` reads as "no accounts yet, mint
+    // one". Minting on a list we know we cannot see would point the CLI at an
+    // empty directory while the user's own account sat in `accounts/<id>/`,
+    // and `Settings::save` refuses to write over the file, so the minted id
+    // would not even be recorded: every launch would mint another one. So the
+    // fact is handed to the resolution rather than being swallowed here.
+    let unreadable_reason = settings.accounts_unreadable.then(|| {
+        format!(
             "{} could not be read, so Deskwarden cannot tell which accounts are already set up",
             settings_path.display()
-        );
-        log::error!("{reason}; not migrating anything on this launch");
-        migration::MigrationState::Blocked { reason }
-    } else {
-        // The account list's IDS, not `!is_empty()`. `migrate` adopts the set
-        // difference between "directories holding a vault" and "directories
-        // the list names", and a bool collapses that to "is anything
-        // claimed" -- under which `add_account`'s failed `persist_accounts`
-        // leaves a signed-in vault no launch can ever reach. See
-        // `migration`'s rule 5.
-        let claimed = accounts::claimed_ids(&settings.accounts);
-        migration::migrate(
-            &config_dir,
-            migration::migration_source().as_deref(),
-            &availability,
-            &claimed,
-            login_ui::check_bw_status_details_in,
-            || bw_serve::port_in_use(bw_serve::BW_SERVE_PORT),
         )
-    };
-    if let migration::MigrationState::Completed {
-        hello_needs_reenrolment: true,
-        ..
-    } = &migration
-    {
-        // The one moment we know the user is at the machine: they just
-        // launched the app. A tray app has no window, and a quick-unlock panel
-        // that is silently absent is indistinguishable from Windows Hello
-        // never having been set up in the first place.
-        message_box(
-            "Deskwarden",
-            "Your Bitwarden profile has been moved so Deskwarden can hold more than one \
-             account.\n\nWindows Hello quick unlock has to be set up again -- tick \"Use \
-             Windows Hello\" the next time you enter your master password.",
-            MB_ICONINFORMATION | MB_OK,
-        );
+    });
+    if let Some(reason) = &unreadable_reason {
+        log::error!("{reason}; running with no account of our own on this launch");
     }
-
     let startup = accounts::resolve_startup(
         &settings.accounts,
         settings.active_account.as_ref(),
-        &migration,
+        unreadable_reason.as_deref(),
     );
     // `accounts_state` is the one door for "may I switch accounts, and to
-    // what" (Task 10). It is built HERE and nowhere else, because this is the
-    // only place both of its inputs exist -- and every later reader asks it
-    // rather than recomputing either half. That includes the Hello notice
-    // below: `hello_needs_reenrolment` is a fact about the migration that has
-    // to survive into the window that shows it.
+    // what" (Task 10). It is built HERE and nowhere else, and every later
+    // reader asks it rather than recomputing the CLI availability for itself.
     // `mut`, both of them: an account switch re-points which account this
     // process is (`active_account`) and which account the switcher offers to
     // leave (`accounts_state`'s `active`). See `open_vault_window`.
-    let (mut active_account, mut accounts_state) = match &startup {
+    let (mut active_account, mut accounts_state, first_run_account) = match &startup {
         accounts::StartupAccounts::Ready {
             active,
             accounts,
             needs_persist,
+            first_run,
         } => {
             if *needs_persist {
                 if let Err(e) =
                     settings::Settings::persist_accounts(&settings_path, accounts, Some(&active.id))
                 {
-                    // Survivable, and only because of `migration`'s rule 5.
-                    // This launch is correctly pointed either way; the next
-                    // one sees an account directory holding a `data.json`
-                    // that nothing in `settings.json` names, and
-                    // `migration::resume_action` ADOPTS it
-                    // (`AdoptUnclaimedAccount`) rather than minting a fresh
-                    // id beside the user's whole vault. Before that existed
-                    // this comment was false for the launch that had just
-                    // migrated: the source and the marker were both gone by
-                    // then, so "re-resolves from whatever is on disk" had
-                    // nothing left to resolve from.
+                    // Survivable. This launch is correctly pointed either way;
+                    // the next one finds no account list, mints a second
+                    // directory and asks for a sign-in again. That costs the
+                    // user one sign-in and a few megabytes of stale cache --
+                    // the vault itself is on Bitwarden's servers and is not
+                    // involved.
                     log::warn!("could not persist the account list: {e}");
                 }
             }
-            let state = accounts::AccountsState::new(
-                availability,
-                migration,
-                accounts.clone(),
-                active.id.clone(),
-            );
-            (Some(active.clone()), state)
+            let state =
+                accounts::AccountsState::new(availability, accounts.clone(), active.id.clone());
+            // Only the account this launch MINTED gets the first-run notice.
+            // An id rather than a bool, because the same flag is handed to
+            // every login window this process opens -- including the ones a
+            // switch to some *other* account opens, which are not first runs
+            // and must say nothing.
+            let first_run_account = first_run.then(|| active.id.clone());
+            (Some(active.clone()), state, first_run_account)
         }
-        accounts::StartupAccounts::Unmigrated { reason } => {
-            // NOT "running as a single-account app against the CLI's default
-            // profile", which is what this said and is only true on a machine
-            // that never migrated. `Unmigrated` is also reachable AFTER a
-            // migration -- a `bitwarden-cli` directory that appeared beside
-            // `bw.exe` since, or an unreadable `settings.json` -- and by then
-            // `%APPDATA%\Bitwarden CLI` and `<config_dir>\session.bin` have
-            // both been deleted. There is still no override to set, which is
-            // the accurate half; what the user meets is a sign-in window, not
-            // yesterday's app.
+        accounts::StartupAccounts::NoAccountList { reason } => {
             log::warn!(
                 "{reason}; running with no account of our own: the CLI is left on whatever \
-                 profile it resolves by itself, which is a signed-out one if the migration \
-                 already ran"
+                 profile it resolves by itself"
             );
             // On SCREEN, and not only in the log. This is the app's worst
-            // survivable startup: no switcher, no accounts submenu, a
-            // signed-out CLI -- and it repeats identically every launch, so a
-            // user who never opens `deskwarden.log` has no way to learn that
-            // anything is wrong, let alone what. The refusal that reaches here
-            // with two unclaimed account directories is holding two real
-            // vaults hostage and names both of them in `reason`; the app pops
-            // a modal for the Hello re-enrolment nicety and said nothing here.
+            // survivable startup: no switcher, no accounts submenu, and it
+            // repeats identically every launch until `settings.json` is fixed
+            // or removed -- so a user who never opens `deskwarden.log` has no
+            // way to learn that anything is wrong, let alone what.
             //
-            // Only in this arm. The other refusals -- a `Blocked` beside an
-            // account list that still works -- leave a usable app and are
-            // reported by `blocked_reason` where the switch is offered; a
-            // modal on every launch for those would be nagging about
-            // something the user can already see.
+            // Only in this arm. The other refusal -- a `bitwarden-cli`
+            // directory beside `bw.exe` -- leaves a usable app and is reported
+            // by `blocked_reason` where the switch is offered; a modal on every
+            // launch for that would be nagging about something the user can
+            // already see.
             //
-            // NOT "Nothing has been deleted", which this said. One `Blocked`
-            // is reachable on a launch where the user's original profile is
-            // already gone: a resumed migration whose re-verification failed
-            // after an earlier run had verified and removed the source. The
-            // blanket claim was printed on precisely the launch it was least
-            // true of. `migration::rollback` says what is on disk and what was
-            // kept, in the same branch that decides it, so the modal states
-            // only what holds in every `Blocked` this arm can be reached from
-            // -- that no profile of the USER'S was removed on this launch; a
-            // failed first migration does delete the copy Deskwarden itself
-            // made -- and lets `reason` carry the rest.
+            // The claim about deletion is absolute here and can be: this
+            // launch resolved an account list and did nothing else. Deskwarden
+            // has no code that deletes a Bitwarden profile it did not itself
+            // create.
             message_box(
                 "Deskwarden",
                 &format!(
-                    "Deskwarden could not set up its accounts on this machine, so it is running \
-                     with no account of its own -- there is no account switcher and the \
-                     Bitwarden CLI is signed out.\n\nNo Bitwarden profile of yours has been \
-                     deleted on this launch. What is on disk is described below.\n\n{reason}\n\nThe \
-                     directories named above are under your Deskwarden configuration folder.",
+                    "Deskwarden could not read its account list, so it is running with no \
+                     account of its own -- there is no account switcher and the Bitwarden CLI \
+                     is signed out.\n\nNothing has been deleted. Fix or remove the file named \
+                     below and start Deskwarden again.\n\n{reason}",
                 ),
                 MB_ICONWARNING | MB_OK,
             );
-            (None, None)
+            (None, None, None)
         }
     };
-    let hello_needs_reenrolment = accounts_state
-        .as_ref()
-        .is_some_and(accounts::AccountsState::hello_needs_reenrolment);
     if let Some(why) = accounts_state
         .as_ref()
         .and_then(accounts::AccountsState::blocked_reason)
@@ -411,21 +352,17 @@ fn main() {
     }
 
     // The two arms are "no account of our own" and "the account-aware app".
-    // Not "today's app": on a machine that has already migrated, the
-    // `Unmigrated` arm leaves the CLI on a directory the migration deleted, so
-    // what it falls back to is a sign-out, not the pre-multi-account
-    // behaviour. This is a FALLBACK in the sense of "no override is set and
-    // nothing offers a switch", not a second implementation of anything:
-    // the switch, the resettle and the cache are untouched by it, and the
-    // `Unmigrated` arm reaches none of them because `AccountsState` is `None`
-    // there and so nothing offers a switch at all.
+    // The first is a FALLBACK in the sense of "no override is set and nothing
+    // offers a switch", not a second implementation of anything: the switch,
+    // the resettle and the cache are untouched by it, and the
+    // `NoAccountList` arm reaches none of them because `AccountsState` is
+    // `None` there and so nothing offers a switch at all.
     //
-    // The directory is created, not assumed. A migrated account's directory
-    // was made by the copy; an account this app minted on a first install has
-    // none, and `SessionStore` is explicit that it will not create its own
-    // parent -- so without this the very first `store.save` fails and the user
-    // retypes their master password on every launch, forever, with nothing
-    // else to see.
+    // The directory is created, not assumed. `resolve_startup` mints an
+    // account without touching the disk, and `SessionStore` is explicit that
+    // it will not create its own parent -- so without this the very first
+    // `store.save` fails and the user retypes their master password on every
+    // launch, forever, with nothing else to see.
     let (session_path, active_dir) = match &active_account {
         Some(a) => {
             if let Err(e) = accounts::ensure_account_dir(&config_dir, &a.id) {
@@ -459,7 +396,7 @@ fn main() {
     let login = login_context(
         config_dir.as_path(),
         active_account.as_ref(),
-        hello_needs_reenrolment,
+        first_run_account.as_ref(),
     );
 
     let fill_stats_path = config_dir.join("fill-stats.json");
@@ -862,7 +799,7 @@ fn main() {
                     &config_dir,
                     &mut active_account,
                     &mut accounts_state,
-                    hello_needs_reenrolment,
+                    first_run_account.as_ref(),
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -924,7 +861,7 @@ fn main() {
                     // the account being left would put the master-password
                     // prompt up for the wrong account and seal the Windows
                     // Hello blob under the wrong id.
-                    let login = login_context(config_dir, Some(to), hello_needs_reenrolment);
+                    let login = login_context(config_dir, Some(to), first_run_account.as_ref());
                     let mut declined = false;
                     let outcome = resettle_session(
                         &cache,
@@ -1030,12 +967,9 @@ fn main() {
                                     let login = login_context(
                                         &config_dir,
                                         Some(prepared),
-                                        hello_needs_reenrolment,
+                                        first_run_account.as_ref(),
                                     );
-                                    login_ui::run_login_flow_for(
-                                        login.account,
-                                        login.hello_needs_reenrolment,
-                                    )
+                                    login_ui::run_login_flow_for(login.account, login.first_run)
                                 },
                                 // Asked of a NAMED directory. The active-profile
                                 // form would report the account being left.
@@ -1422,7 +1356,7 @@ fn main() {
                     &config_dir,
                     &mut active_account,
                     &mut accounts_state,
-                    hello_needs_reenrolment,
+                    first_run_account.as_ref(),
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -2292,7 +2226,9 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // The one door for "may I switch, and to what" (Task 10), and `&mut`
     // because a switch that lands moves its `active`.
     accounts: &mut Option<accounts::AccountsState>,
-    hello_needs_reenrolment: bool,
+    // Passed through to every `login_context` this function builds; see that
+    // function.
+    first_run_account: Option<&accounts::AccountId>,
     settings: &mut settings::Settings,
     settings_path: &std::path::Path,
     tray: &tray::AppTray,
@@ -2444,7 +2380,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                         // for `from` here would put the master-password prompt
                         // up for the wrong account and seal the Hello blob
                         // under the wrong id.
-                        let login = login_context(config_dir, Some(to), hello_needs_reenrolment);
+                        let login = login_context(config_dir, Some(to), first_run_account);
                         let mut declined = false;
                         let outcome = resettle_session(
                             cache,
@@ -2595,7 +2531,7 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             // have changed since the caller's own context was built.
             || {
                 let login =
-                    login_context(config_dir, active_account.as_ref(), hello_needs_reenrolment);
+                    login_context(config_dir, active_account.as_ref(), first_run_account);
                 Some(reauthenticate(store, login))
             },
         );
@@ -4282,7 +4218,7 @@ fn recover_from_failed_vault_wait(
 #[derive(Clone, Copy)]
 struct LoginContext<'a> {
     account: Option<(&'a Path, &'a Account)>,
-    hello_needs_reenrolment: bool,
+    first_run: bool,
 }
 
 /// **The only place a [`LoginContext`] is built**, which is the property
@@ -4302,11 +4238,20 @@ struct LoginContext<'a> {
 fn login_context<'a>(
     config_dir: &'a Path,
     active_account: Option<&'a Account>,
-    hello_needs_reenrolment: bool,
+    // The account `accounts::resolve_startup` MINTED on this launch, if it
+    // minted one. An id rather than a bool because this same value reaches
+    // every login window the process opens, including the ones a switch to
+    // some other account opens -- and only the minted account has never been
+    // signed in to. The comparison is what gates
+    // `login_ui::FIRST_RUN_NOTICE`, and it is what makes
+    // `the_first_run_notice_is_offered_to_exactly_one_account` able to fail.
+    first_run_account: Option<&accounts::AccountId>,
 ) -> LoginContext<'a> {
     LoginContext {
         account: active_account.map(|account| (config_dir, account)),
-        hello_needs_reenrolment,
+        first_run: active_account
+            .zip(first_run_account)
+            .is_some_and(|(account, minted)| &account.id == minted),
     }
 }
 
@@ -4330,7 +4275,7 @@ fn authenticate_for_switch(
     store: &session_store::SessionStore,
     login: LoginContext<'_>,
 ) -> Option<String> {
-    let token = login_ui::run_login_flow_for(login.account, login.hello_needs_reenrolment)?;
+    let token = login_ui::run_login_flow_for(login.account, login.first_run)?;
     if let Err(e) = store.save(&token) {
         log::error!("failed to persist the session token for the account switched to: {e}");
     }
@@ -4338,7 +4283,7 @@ fn authenticate_for_switch(
 }
 
 fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) -> String {
-    let token = login_ui::run_login_flow(login.account, login.hello_needs_reenrolment);
+    let token = login_ui::run_login_flow(login.account, login.first_run);
     if let Err(e) = store.save(&token) {
         log::error!("failed to persist session token: {e}");
     }
@@ -6674,12 +6619,7 @@ mod tests {
         list: Vec<Account>,
         active: &Account,
     ) -> accounts::AccountsState {
-        accounts::AccountsState::new(
-            availability,
-            migration::MigrationState::NothingToMigrate,
-            list,
-            active.id.clone(),
-        )
+        accounts::AccountsState::new(availability, list, active.id.clone())
         .expect("a non-empty account list")
     }
 
@@ -8326,7 +8266,7 @@ mod tests {
     ///
     /// Cut at a named comment and a named statement rather than at braces for
     /// the CRLF reason above, and both ends are controlled: the region must be
-    /// shorter than what it was cut from, and must contain the migration call
+    /// shorter than what it was cut from, and must contain the resolution call
     /// it exists to talk about.
     fn the_startup_account_block() -> &'static str {
         let production = production_half_of_this_file();
@@ -8343,25 +8283,24 @@ mod tests {
             "control: the split isolated a region rather than keeping the rest of the file"
         );
         assert!(
-            block.contains(concat!("migration::", "migrate(")),
+            block.contains(concat!("accounts::resolve", "_startup(")),
             "control: the region really is the startup account block"
         );
         block
     }
 
-    /// The plan's own ordering test, and the ordering is the point three times
-    /// over. Migration must finish before the account is resolved, or the
-    /// account is resolved against a profile that is about to move. The CLI
-    /// and the token store must be pointed at that account before
-    /// `store.load()` and before `check_bw_status_with_session` spawns `bw`,
-    /// or the first launch after a migration validates a token against the
-    /// wrong profile and silently re-authenticates -- which the user reads as
-    /// "the update lost my login".
+    /// The plan's own ordering test. The account has to be resolved before
+    /// its directory can be created, the directory has to exist before a
+    /// `SessionStore` is built inside it, and the CLI and the store both have
+    /// to be pointed at that account before `store.load()` and before
+    /// `check_bw_status_with_session` spawns `bw` -- or a token is validated
+    /// against the wrong profile and silently re-authenticated, which the user
+    /// reads as "the update lost my login".
     ///
     /// Pure ordering, and invisible to any value-based test: every one of
     /// these mutations leaves an app that starts, signs in, and works.
     #[test]
-    fn startup_migrates_and_points_the_cli_before_it_loads_a_session() {
+    fn startup_points_the_cli_at_the_account_before_it_loads_a_session() {
         // The production half, not the whole file: a needle that also appears
         // in this module would otherwise let a deleted call site be satisfied
         // by its own test.
@@ -8371,7 +8310,6 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("startup no longer {what} (`{needle}` is not there)"))
         };
-        let migrate_at = at("migrates", concat!("migration::", "migrate("));
         let resolve_at = at("resolves an account", concat!("accounts::resolve", "_startup("));
         let ensure_at = at(
             "creates the account's directory",
@@ -8381,11 +8319,6 @@ mod tests {
         let build_store = at("builds a token store", concat!("SessionStore", "::new("));
         let load = at("reads a cached token", concat!("store", ".load()"));
 
-        assert!(
-            migrate_at < resolve_at,
-            "the account is resolved before migration runs, so it is resolved against a profile \
-             that is about to move"
-        );
         assert!(
             resolve_at < ensure_at,
             "the account's directory is created before there is an account to create it for"
@@ -8405,67 +8338,86 @@ mod tests {
             "a cached session token is read before there is a store pointed at the account"
         );
 
-        // Positive control: six distinct positions were found, so the
-        // assertions above are between six real call sites rather than
+        // Positive control: five distinct positions were found, so the
+        // assertions above are between five real call sites rather than
         // between repeated hits on one.
-        let mut all = vec![migrate_at, resolve_at, ensure_at, set_dir, build_store, load];
+        let mut all = vec![resolve_at, ensure_at, set_dir, build_store, load];
         let n = all.len();
         all.sort_unstable();
         all.dedup();
-        assert_eq!(all.len(), n, "two of the six needles found the same position");
+        assert_eq!(all.len(), n, "two of the five needles found the same position");
     }
 
-    /// The user accepted re-enrolling Windows Hello. They did not accept
-    /// finding out by having quick unlock silently stop working: a tray app
-    /// has no window, and an absent quick-unlock panel is indistinguishable
-    /// from Hello never having been set up.
+    /// The first-run notice is offered to **exactly one** account: the one
+    /// this launch minted.
+    ///
+    /// A value test on the one constructor, because the two mutations that
+    /// matter are both invisible in an end state. `first_run: true` for every
+    /// window puts a "sign in once to set this one up" line in front of a user
+    /// switching between two accounts they set up months ago. `first_run:
+    /// false` always deletes the notice while leaving the constant, the
+    /// painting code and every one of `login_ui`'s own tests green -- the user
+    /// meets an unexplained master-password prompt and the suite says nothing.
     #[test]
-    fn the_hello_notice_is_raised_where_the_migration_completes() {
-        let source = production_half_of_this_file();
-        let region = source
-            .split_once(concat!("MigrationState::", "Completed"))
-            .expect("startup must still recognise a completed migration")
-            .1;
-        let window = &region[..region.len().min(1200)];
+    fn the_first_run_notice_is_offered_to_exactly_one_account() {
+        let cfg = std::path::Path::new(r"C:\cfg");
+        let minted = Account {
+            id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
+            email: String::new(),
+            server_url: None,
+        };
+        let other = Account {
+            id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
+            email: "someone@example.com".to_string(),
+            server_url: None,
+        };
+
         assert!(
-            window.contains(concat!("message", "_box(")),
-            "no notice is shown on completion"
+            login_context(cfg, Some(&minted), Some(&minted.id)).first_run,
+            "the account this launch minted is not told why it is being asked to sign in"
         );
         assert!(
-            window.to_lowercase().contains("windows hello"),
-            "the notice does not name Hello"
+            !login_context(cfg, Some(&other), Some(&minted.id)).first_run,
+            "a switch to an account that already existed shows the first-run notice"
         );
-        // Positive control on the same window: it really is the notice's own
-        // text and not some unrelated dialog that happened to be nearby.
         assert!(
-            window.contains(concat!("has been ", "moved")),
-            "control: the region does not contain the migration notice at all"
+            !login_context(cfg, Some(&minted), None).first_run,
+            "a launch that minted nothing still shows the notice, so it shows on every launch \
+             forever"
         );
+        assert!(
+            !login_context(cfg, None, Some(&minted.id)).first_run,
+            "an account-less window claims to be a first run for an account it does not have"
+        );
+        // Positive control on the same calls: the account really is being
+        // carried, so the assertions above are not all reading a context that
+        // was never built.
+        assert!(login_context(cfg, Some(&minted), None).account.is_some());
     }
 
     /// The app's worst survivable startup does not happen in silence.
     ///
-    /// `StartupAccounts::Unmigrated` is no switcher, no accounts submenu and a
-    /// signed-out CLI, and it repeats identically every launch. One way in is
-    /// `migration`'s refusal over two account directories that each hold a real
-    /// vault the account list does not name — the refusal names both, and
-    /// naming them only in `deskwarden.log` leaves a user who never opens it
-    /// with two vaults stuck and no idea why. This file pops a modal for the
-    /// Hello re-enrolment *nicety*; it said nothing here.
+    /// `StartupAccounts::NoAccountList` is no switcher, no accounts submenu
+    /// and a signed-out CLI, and it repeats identically every launch until
+    /// `settings.json` is fixed or removed. The only way in is a settings file
+    /// that exists and cannot be parsed — which the user can act on, but only
+    /// if they are told which file and that it is the reason. Naming it in
+    /// `deskwarden.log` alone leaves a user who never opens it with a
+    /// permanently account-less app and no idea why.
     ///
     /// Fails without the fix: delete the `message_box` from that arm.
     #[test]
     fn the_account_less_startup_says_so_on_screen_and_says_why() {
         let source = production_half_of_this_file();
         let arm = source
-            .split_once(concat!("StartupAccounts::", "Unmigrated { reason } =>"))
+            .split_once(concat!("StartupAccounts::", "NoAccountList { reason } =>"))
             .expect("startup must still have an account-less arm")
             .1;
         // Bounded by the arm's own end — the tuple it evaluates to — and not
         // by a byte count. A fixed window is the shape that already overran
         // into a neighbouring arm in this file and passed on its text.
         let arm = arm
-            .split_once("(None, None)")
+            .split_once("(None, None, None)")
             .expect("the account-less arm must still evaluate to no account and no state")
             .0;
         // From the `message_box(` onwards, NOT the whole arm. The arm already
@@ -8482,30 +8434,22 @@ mod tests {
             .1;
         assert!(
             notice.contains("{reason}"),
-            "a notice is shown but the refusal's own reason is not in it — which is the half \
-             that names the directories holding the user's vaults. It reads: {notice:?}"
+            "a notice is shown but the reason is not in it — which is the half that names the \
+             file the user has to fix. It reads: {notice:?}"
         );
-        // And it must not go back to promising more than it can see. One
-        // `Blocked` that reaches this arm is a resumed migration whose
-        // re-verification failed after an earlier run had already verified and
-        // deleted the user's original -- so the unqualified "Nothing has been
-        // deleted." this used to print was printed on the one launch it was
-        // least true of. What holds in every `Blocked` here is the narrower
-        // claim, and `migration::rollback` supplies the rest through `reason`.
-        assert!(
-            !notice.contains("Nothing has been deleted"),
-            "the notice makes an absolute claim about deletion that the arm cannot check: \
-             {notice:?}"
-        );
-        // Two short needles rather than the whole sentence: the literal is
+        // Short needles, never one spanning the wrap: the literal is
         // line-wrapped with `\` continuations in the source this reads, so a
-        // needle spanning the wrap can never match however right the message
-        // is.
-        for phrase in ["No Bitwarden profile of yours has been", "deleted on this launch"] {
+        // needle that crossed a wrap could never match however right the
+        // message is.
+        for phrase in [
+            "could not read its account list",
+            "Nothing has been deleted",
+            "start Deskwarden again",
+        ] {
             assert!(
                 notice.contains(phrase),
-                "the notice no longer reassures the user about their vault ({phrase:?} is not in \
-                 it): {notice:?}"
+                "the notice no longer tells the user what happened or what to do about it \
+                 ({phrase:?} is not in it): {notice:?}"
             );
         }
         // Positive controls: the region really is that arm, and it is an arm
@@ -8559,8 +8503,10 @@ mod tests {
              Hello quick unlock at all -- got `{args}`"
         );
         assert!(
-            args.contains(concat!("hello_needs_re", "enrolment")),
-            "the re-enrolment notice never reaches the window that shows it -- got `{args}`"
+            args.contains(concat!("login.", "first_run")),
+            "the first-run notice never reaches the window that shows it, so the one login \
+             window every new user meets asks for a master password and says nothing about why \
+             -- got `{args}`"
         );
 
         // And nothing rebuilds the context beside the one construction, which
@@ -8576,28 +8522,22 @@ mod tests {
 
     /// Task 10 shipped `AccountsState` with no production caller, and nothing
     /// asserted that a real caller would ASK it rather than decide for itself.
-    /// This is the half of that debt Task 11 can close: the Hello notice the
-    /// login window shows is read back out of `AccountsState`, not out of a
-    /// second match on the migration's return value.
     ///
-    /// The mutation: `hello_needs_reenrolment` computed by re-matching
-    /// `MigrationState::Completed { hello_needs_reenrolment: true, .. }`. It
-    /// gives the same answer today and drifts silently the first time
-    /// `AccountsState` learns to say no -- for instance for an account the
-    /// migration did not produce.
+    /// The mutation: startup reading `availability.explanation()` a second
+    /// time for its own log line instead of `blocked_reason()`. It gives the
+    /// same answer today and drifts silently the first time `AccountsState`
+    /// learns to block for a reason the availability alone does not carry.
     #[test]
-    fn startup_asks_accounts_state_what_it_needs_rather_than_re_reading_the_migration() {
+    fn startup_asks_accounts_state_what_it_needs_rather_than_deciding_for_itself() {
         let block = the_startup_account_block();
         for needle in [
-            concat!("AccountsState::hello_needs_", "reenrolment"),
             concat!("AccountsState::blocked", "_reason"),
             concat!("accounts::AccountsState", "::new("),
         ] {
             assert!(
                 block.contains(needle),
-                "startup does not go through `{needle}`: whether this process may switch, and \
-                 whether it must say so about Windows Hello, is `AccountsState`'s answer and \
-                 nothing else's"
+                "startup does not go through `{needle}`: whether this process may switch is \
+                 `AccountsState`'s answer and nothing else's"
             );
         }
         // Positive control on the same region and the same reader: a needle
@@ -8608,19 +8548,18 @@ mod tests {
         );
     }
 
-    /// A failed migration must leave a WORKING app on the pre-existing
-    /// profile. `start_backend` is startup's wrapper that calls
-    /// `fatal_startup_error`, and neither belongs anywhere in this block: the
-    /// profile could not be copied is not a reason to refuse to run at all,
-    /// and the whole `Unmigrated` arm exists so that today's app is what the
-    /// user gets instead.
+    /// An account list that cannot be read must leave a RUNNING app.
+    /// `start_backend` is startup's wrapper that calls `fatal_startup_error`,
+    /// and neither belongs anywhere in this block: an unparseable
+    /// `settings.json` is not a reason to refuse to run at all, and the whole
+    /// `NoAccountList` arm exists so the user gets an app that can tell them
+    /// which file to fix.
     ///
-    /// The mutation: `MigrationState::Blocked` handled with a
-    /// `fatal_startup_error` rather than a `log::warn!` and the fallback.
-    /// Every value-based test stays green, because the app that would die
-    /// never reaches one.
+    /// The mutation: the account-less arm handled with a `fatal_startup_error`
+    /// rather than a `log::warn!`, a modal and the fallback. Every value-based
+    /// test stays green, because the app that would die never reaches one.
     #[test]
-    fn a_migration_that_cannot_run_does_not_take_the_app_down() {
+    fn an_unreadable_account_list_does_not_take_the_app_down() {
         let block = the_startup_account_block();
         let production = production_half_of_this_file();
         for banned in [
@@ -8634,75 +8573,61 @@ mod tests {
             );
             assert!(
                 !block.contains(banned),
-                "`{banned}` is reachable from the startup account block: a profile that could \
-                 not be migrated would stop the app from starting at all, on a machine whose \
-                 vault is sitting there intact"
+                "`{banned}` is reachable from the startup account block: a settings file \
+                 that could not be parsed would stop the app from starting at all, leaving the \
+                 user with nothing that could tell them which file to fix"
             );
         }
         // The fallback it must take instead.
         assert!(
-            block.contains(concat!("StartupAccounts::", "Unmigrated")),
-            "there is no fallback arm at all, so a refused migration has nowhere to go"
+            block.contains(concat!("StartupAccounts::", "NoAccountList")),
+            "there is no fallback arm at all, so an unreadable account list has nowhere to go"
         );
     }
 
-    /// Migration is a copy, a verification and then a DELETION of the user's
-    /// only profile, and every input that decides whether it may run has to
-    /// come from the machine.
+    /// Whether this machine can hold more than one account is a question about
+    /// the machine, and it has to be asked OF the machine.
     ///
-    /// Two mutations, both of which make the whole suite green and the trap
-    /// undetectable: a hard-coded `MultiAccountAvailability::Available` (the
-    /// `relativeDataDir` trap makes the CLI ignore `BITWARDENCLI_APPDATA_DIR`,
-    /// so verification would read the PORTABLE profile -- it could pass while
-    /// proving nothing, and the source would then be deleted on the strength
-    /// of it), and a `status` closure that ignores the directory it is handed
-    /// and answers for whatever profile this process is pointed at.
+    /// The mutation: a hard-coded `MultiAccountAvailability::Available`. A
+    /// `bitwarden-cli` directory beside `bw.exe` makes the CLI ignore
+    /// `BITWARDENCLI_APPDATA_DIR` entirely, so every account this app offers
+    /// would silently be served the one portable profile -- two identities,
+    /// one vault, and no error anywhere.
     #[test]
-    fn startup_asks_the_machine_the_questions_that_decide_whether_a_profile_is_deleted() {
+    fn startup_asks_the_machine_whether_more_than_one_account_is_possible() {
         let block = the_startup_account_block();
-        for required in [
-            concat!("bw_path::multi_account_", "availability()"),
-            concat!("migration::migration", "_source()"),
-            concat!("login_ui::check_bw_status_details", "_in"),
-            concat!("bw_serve::port", "_in_use("),
-        ] {
-            assert!(
-                block.contains(required),
-                "startup does not ask `{required}`: migration deletes the user's only profile, \
-                 and every input that decides whether it may is answered from the machine or \
-                 not at all"
-            );
-        }
+        let required = concat!("bw_path::multi_account_", "availability()");
+        assert!(
+            block.contains(required),
+            "startup does not ask `{required}`: whether the CLI reads the directory this app \
+             points it at is a fact about the machine, and it is answered from the machine or \
+             not at all"
+        );
         // `CARGO_MANIFEST_DIR`, not `file!()`: the latter is relative to the
         // package root and would depend on the test binary's working
-        // directory. Each banned needle is controlled against the module that
+        // directory. The banned needle is controlled against the module that
         // really declares it, so a misspelled ban cannot pass by matching
         // nothing anywhere.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for (hard_coded, declared_in) in [
-            (concat!("MultiAccountAvailability::", "Available"), "bw_path.rs"),
-            (concat!("MigrationState::", "NothingToMigrate"), "migration.rs"),
-        ] {
-            let elsewhere = std::fs::read_to_string(src.join(declared_in))
-                .unwrap_or_else(|e| panic!("cannot read {declared_in}: {e}"));
-            assert!(
-                elsewhere.contains(hard_coded),
-                "the needle `{hard_coded}` is not spelled that way in {declared_in}, so the ban \
-                 below proves nothing"
-            );
-            assert!(
-                !block.contains(hard_coded),
-                "startup writes `{hard_coded}` itself instead of asking. A hard-coded answer \
-                 here is a migration that runs -- and deletes -- on the machine where the \
-                 `relativeDataDir` trap makes the verification prove nothing"
-            );
-        }
+        let hard_coded = concat!("MultiAccountAvailability::", "Available");
+        let elsewhere = std::fs::read_to_string(src.join("bw_path.rs"))
+            .unwrap_or_else(|e| panic!("cannot read bw_path.rs: {e}"));
+        assert!(
+            elsewhere.contains(hard_coded),
+            "the needle `{hard_coded}` is not spelled that way in bw_path.rs, so the ban below \
+             proves nothing"
+        );
+        assert!(
+            !block.contains(hard_coded),
+            "startup writes `{hard_coded}` itself instead of asking, so the account switcher is \
+             offered on the machine where every account shares one profile"
+        );
         // Positive control on the same reader and the same region: a needle of
-        // exactly that shape that IS present, so the bans are not passing
+        // exactly that shape that IS present, so the ban is not passing
         // against a region that was cut down to nothing.
         assert!(
-            block.contains(concat!("MigrationState::", "Blocked")),
-            "control: the region really does name `MigrationState` variants"
+            block.contains(concat!("StartupAccounts::", "Ready")),
+            "control: the region really does name the variants it resolves to"
         );
     }
 }
