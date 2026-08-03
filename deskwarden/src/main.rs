@@ -3724,6 +3724,325 @@ mod tests {
         );
     }
 
+    /// The state a resettle is handed: a cache populated from one account and
+    /// an engine armed from it, plus the toolbar strings that account's
+    /// `bw status` produced. Returns the mock server too, because dropping it
+    /// unmounts the mocks the repopulate below will need.
+    fn an_app_signed_into_one_account() -> (
+        mockito::ServerGuard,
+        VaultCache,
+        MatchEngine,
+        Option<login_ui::BwStatusDetails>,
+    ) {
+        let server = sync_server();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let mut engine = MatchEngine::new();
+        let epoch = cache.epoch();
+        repopulate_and_refresh_after_unlock(
+            &cache,
+            &mut engine,
+            probe_items(&[("1", "prev.exe")]),
+            epoch,
+        );
+        let details = Some(login_ui::BwStatusDetails {
+            status: login_ui::BwStatus::Unlocked,
+            user_email: Some("prev@example.com".to_string()),
+            server_url: Some("https://prev.example.com".to_string()),
+        });
+        (server, cache, engine, details)
+    }
+
+    /// The ORDER inside the resettle is the whole safety property, and until
+    /// this test nothing pinned it. The four tests the plan names as this
+    /// refactor's safety net all drive the PIECES --
+    /// `repopulate_and_refresh_after_unlock`, `settle_vault_after_unlock`,
+    /// `restart_backend_after_unlock` -- and not one of them could tell
+    /// "clear the cache, then authenticate" from "authenticate, then clear
+    /// the cache". Inlined in `open_vault_window`, the sequence had nowhere
+    /// to be tested from; that is exactly what the extraction buys.
+    ///
+    /// The difference the assertion below is protecting is not academic. Run
+    /// the other way round, the user is retyping a master password -- for a
+    /// DIFFERENT account, once switching exists -- while the outgoing
+    /// account's items are still live in the cache behind the prompt, and
+    /// autofill is still armed from them. And the backend must be started
+    /// from the token the authentication just produced, not the one it
+    /// replaced, or `bw serve` comes up under a session that was already
+    /// gone.
+    ///
+    /// So each injected closure records the step it is and what it can see of
+    /// the app at the moment it runs, and the whole sequence is one
+    /// assertion.
+    #[test]
+    fn the_resettle_authenticates_after_the_teardown_and_settles_after_the_start() {
+        let (_server, cache, mut engine, mut cached_status_details) =
+            an_app_signed_into_one_account();
+        assert!(
+            cache.is_populated() && engine.lookup("prev.exe").is_some(),
+            "control: the app really is holding the previous account's vault and matches, so \
+             the assertions below are about them being torn down rather than never existing"
+        );
+
+        let mut bw_serve_child = None;
+        let mut session_token = "old-token".to_string();
+        let steps = std::cell::RefCell::new(Vec::new());
+
+        let outcome = resettle_session_with(
+            &cache,
+            &mut engine,
+            &mut bw_serve_child,
+            &mut cached_status_details,
+            &mut session_token,
+            || {
+                steps
+                    .borrow_mut()
+                    .push(format!("authenticate, cache populated: {}", cache.is_populated()));
+                Some("new-token".to_string())
+            },
+            |token| {
+                steps.borrow_mut().push(format!("start, token: {token}"));
+                std::process::Command::new("cmd")
+                    .args(["/C", "exit"])
+                    .spawn()
+                    .map_err(BackendStartError::Spawn)
+            },
+            |_message| {
+                steps.borrow_mut().push("probe".to_string());
+                VaultReadyOutcome::Ready(probe_items(&[("2", "next.exe")]))
+            },
+        );
+
+        assert_eq!(outcome, ResettleOutcome::BackendStarted);
+        assert_eq!(
+            steps.into_inner(),
+            vec![
+                "authenticate, cache populated: false".to_string(),
+                "start, token: new-token".to_string(),
+                "probe".to_string(),
+            ],
+            "the sequence is teardown -> authenticate -> start -> settle, and each step must \
+             see the previous one's work: nothing authenticates over a live cache, and nothing \
+             starts a backend from the session the authentication just replaced"
+        );
+        assert_eq!(session_token, "new-token");
+        assert!(
+            cached_status_details.is_none(),
+            "the toolbar's cached email and server belong to the account that just went away; \
+             left behind, the next open shows it under the new session"
+        );
+        assert!(bw_serve_child.is_some(), "the started backend must be tracked");
+        assert!(
+            engine.lookup("next.exe").is_some() && engine.lookup("prev.exe").is_none(),
+            "the engine is rebuilt from the probe's items, so the incoming account's matches \
+             are armed and the outgoing account's are gone"
+        );
+        assert!(cache.is_populated(), "and the cache is refilled from the same items");
+
+        kill_and_reap(&mut bw_serve_child);
+    }
+
+    /// The plan's Step 8.3. `authenticate` answering `None` is the one arm
+    /// the inlined block had no way to express -- `reauthenticate` exits the
+    /// process rather than return a failure -- and it is how a declined
+    /// account switch arrives: the user closed the master-password prompt.
+    ///
+    /// Nothing is started for a session nobody authenticated, and the app is
+    /// left in the state `stand_down_after_unlock` already ships and the tray
+    /// already names a recovery for. The outgoing token is deliberately still
+    /// here: it is what a switch rolls back with, and clearing it would cost
+    /// the user a second password prompt for an account they never asked to
+    /// leave.
+    #[test]
+    fn a_declined_authentication_starts_no_backend_and_leaves_the_cache_cleared() {
+        let (_server, cache, mut engine, mut cached_status_details) =
+            an_app_signed_into_one_account();
+        assert!(
+            cache.is_populated() && engine.lookup("prev.exe").is_some(),
+            "control: the previous account's vault and matches are really here to be torn down"
+        );
+
+        let mut bw_serve_child = None;
+        let mut session_token = "old-token".to_string();
+
+        let outcome = resettle_session_with(
+            &cache,
+            &mut engine,
+            &mut bw_serve_child,
+            &mut cached_status_details,
+            &mut session_token,
+            || None,
+            |_token| panic!("a declined authentication must not start a backend"),
+            |_message| panic!("a declined authentication must not open a readiness spinner"),
+        );
+
+        assert_eq!(outcome, ResettleOutcome::BackendNotStarted);
+        assert!(
+            engine.lookup("prev.exe").is_none(),
+            "the previous account's matches survived a declined authentication: a matched \
+             process would still raise the prompt, and the fill could only ever end in an error"
+        );
+        assert!(!cache.is_populated());
+        assert!(bw_serve_child.is_none());
+        assert!(
+            cached_status_details.is_none(),
+            "a declined authentication left the previous account's address in the toolbar"
+        );
+        assert_eq!(
+            session_token, "old-token",
+            "the outgoing token is what a rollback re-authenticates from; a decline must not \
+             spend it"
+        );
+    }
+
+    /// The other failing arm, and the pair to the test above: the session WAS
+    /// authenticated and the backend still would not come up. There is
+    /// nothing left to probe once no backend came up, so the ~30s readiness
+    /// deadline is not spent on a port nothing is listening on -- the probe
+    /// closure below fails the test if it runs, and
+    /// `the_resettle_authenticates_after_the_teardown_and_settles_after_the_start`
+    /// is the control that it does run when a backend did start.
+    #[test]
+    fn a_backend_that_will_not_start_is_never_probed_and_reports_it() {
+        let (_server, cache, mut engine, mut cached_status_details) =
+            an_app_signed_into_one_account();
+        let mut bw_serve_child = None;
+        let mut session_token = "old-token".to_string();
+
+        let outcome = resettle_session_with(
+            &cache,
+            &mut engine,
+            &mut bw_serve_child,
+            &mut cached_status_details,
+            &mut session_token,
+            || Some("new-token".to_string()),
+            |_token| Err(BackendStartError::PortHeld(Duration::from_secs(1))),
+            |_message| panic!("there is nothing to probe once no backend came up"),
+        );
+
+        assert_eq!(outcome, ResettleOutcome::BackendNotStarted);
+        assert!(bw_serve_child.is_none());
+        assert!(
+            engine.lookup("prev.exe").is_none(),
+            "nothing confirmed a backend under the new session, so the engine can only be \
+             holding the previous account's matches"
+        );
+        assert_eq!(
+            session_token, "new-token",
+            "the re-authentication itself succeeded, and a later tray Sync starts a backend \
+             from this token: throwing it away would make the named recovery fail"
+        );
+    }
+
+    /// The `main.rs` half that is production code. `mod tests` drives
+    /// `settle_vault_after_unlock` three times on purpose, so the plan's
+    /// "two occurrences in `main.rs`" cannot be read off the whole file.
+    fn production_half_of_this_file() -> &'static str {
+        let source = include_str!("main.rs");
+        let production = source
+            .split_once(concat!("mod te", "sts {"))
+            .expect("main.rs must still have its test module")
+            .0;
+        assert!(
+            production.len() < source.len(),
+            "control: the split really cut the test module off the end"
+        );
+        production
+    }
+
+    /// The spec's own warning, made mechanical: "if a task finds itself
+    /// writing a second teardown-and-repopulate path, it has gone wrong".
+    /// A second call site is a second implementation of the hardest code in
+    /// this codebase, and it would not have the three tests above.
+    ///
+    /// Triangulated rather than counted in one lump, so the guard can tell a
+    /// duplicated sequence from a settle that was quietly lifted back out
+    /// into the wiring where nothing can drive it: the definition is before
+    /// `resettle_session`, the wiring between the two functions has none, and
+    /// the sequence has exactly one.
+    #[test]
+    fn there_is_exactly_one_teardown_and_repopulate_path() {
+        let production = production_half_of_this_file();
+        let settle = concat!("settle_vault_after", "_unlock(");
+        assert_eq!(
+            format!("{settle} {settle}").matches(settle).count(),
+            2,
+            "control: the counter can find a needle in text that has two"
+        );
+        assert!(
+            include_str!("main.rs").matches(settle).count() > production.matches(settle).count(),
+            "control: the test module really does call it, so `production` is not the whole file"
+        );
+
+        let (definition, from_resettle) = production
+            .split_once(concat!("fn resettle", "_session("))
+            .expect("`resettle_session` must still exist");
+        let (wiring, sequence) = from_resettle
+            .split_once(concat!("fn resettle_session", "_with("))
+            .expect("`resettle_session_with` must still exist");
+
+        assert_eq!(
+            definition.matches(settle).count(),
+            1,
+            "control: the settle's own definition is where it always was"
+        );
+        assert_eq!(
+            wiring.matches(settle).count(),
+            0,
+            "the settle moved into `resettle_session`'s own body, which needs a real tray icon \
+             and so is reachable from no test"
+        );
+        assert_eq!(
+            sequence.matches(settle).count(),
+            1,
+            "expected exactly ONE call site, inside `resettle_session_with`"
+        );
+        assert_eq!(
+            production.matches(settle).count(),
+            2,
+            "the definition and one call site, and nothing else in production"
+        );
+    }
+
+    /// `resettle_session`'s own body is the half no test can reach: the
+    /// in-flight drain needs a real `tray::AppTray`, and `tray::build_tray`
+    /// makes a real Windows tray icon against a live message loop. So what
+    /// the sequence is actually GIVEN in production is pinned here instead --
+    /// every test above injects stubs, and all three would go on passing
+    /// against an app whose real wiring started nothing.
+    #[test]
+    fn the_resettle_wiring_passes_the_real_backend_the_real_spinner_and_the_drain() {
+        let production = production_half_of_this_file();
+        let from_resettle = production
+            .split_once(concat!("fn resettle", "_session("))
+            .expect("`resettle_session` must still exist")
+            .1;
+        let wiring = from_resettle
+            .split_once(concat!("fn resettle_session", "_with("))
+            .expect("`resettle_session_with` must still exist")
+            .0;
+        assert!(
+            wiring.len() < from_resettle.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            !wiring.contains(concat!("fn job_", "ref(")),
+            "control: the region really ends at `resettle_session_with`, since `job_ref` is \
+             defined after it"
+        );
+
+        for needle in [
+            concat!("try_start_", "backend("),
+            concat!("wait_for_vault_ready_", "with_spinner("),
+            concat!("apply_backend_", "op("),
+        ] {
+            assert!(
+                wiring.contains(needle),
+                "`resettle_session` no longer reaches `{needle}`: the sequence's tests all \
+                 inject stubs, so nothing else would notice"
+            );
+        }
+    }
+
     /// A `bw serve` that answers one item carrying an app match, plus the
     /// folders every populate also fetches.
     fn sync_server() -> mockito::ServerGuard {
