@@ -187,6 +187,19 @@ pub struct VaultWindowResult {
     /// perfectly healthy backend to do it. Distinct situations get distinct
     /// fields here.
     pub open_preferences: bool,
+    /// The account the user picked in the titlebar switcher. The window closed
+    /// only because `main` has to tear one backend down and bring another one
+    /// up, and that cannot happen while this window owns the event loop --
+    /// exactly the reason [`open_preferences`](Self::open_preferences) exists.
+    ///
+    /// **A fourth field, and distinct from all three above.** `locked` and
+    /// `needs_reauth` mean the session is gone; this session was never lost.
+    /// Folded into either, asking to switch would run the lock recovery, and
+    /// that recovery re-authenticates against **the account this process is
+    /// already on** -- so the user would be asked for the master password of
+    /// the account they were leaving, and would then be left on it. Folded into
+    /// `open_preferences` it would open the preferences window instead.
+    pub switch_to: Option<crate::accounts::AccountId>,
 }
 
 enum DetailMode {
@@ -249,6 +262,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // where the backend is essentially always already running) hardest even
     // though that mode never touches the memory-saving setting at all.
     backend_already_running: bool,
+    // What the titlebar's account switcher offers, and the one door to it (see
+    // `account_switcher`). By value rather than by reference because the
+    // update closure below is `'static`; `None` in exactly one state --
+    // `StartupAccounts::Unmigrated`, where this app has no `Account` at all --
+    // and the titlebar then carries no switcher.
+    accounts: Option<crate::accounts::AccountsState>,
 ) -> VaultWindowResult {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
     // to a real winit event loop, not run on a borrowed stack), but `injector`
@@ -275,6 +294,11 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // for why the three outcomes must not collapse into one.
     let open_preferences = Rc::new(RefCell::new(false));
     let open_preferences_for_closure = open_preferences.clone();
+    // See `VaultWindowResult::switch_to`. A fourth cell rather than a share of
+    // any of the three above, for the reason that field's doc gives.
+    let switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>> =
+        Rc::new(RefCell::new(None));
+    let switch_to_for_closure = switch_to.clone();
     let mut sync_status: Option<Result<(), String>> = None;
     // When the most recent successful sync completed, for the toolbar's
     // sync pill ("Synced N min ago" per design spec 4.8) -- set below
@@ -969,7 +993,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         match draw_window_chrome_with_extra(ui, WINDOW_TITLE, ChromeMetrics::VAULT, true, |ui| {
             // Right-to-left, so this reads left-to-right (nearest the title,
             // furthest from the window controls, first) as: Sync status
-            // pill, "Lock CTRL+L", avatar, settings gear. Added here in the
+            // pill, "Lock CTRL+L", avatar, account switcher, settings gear.
+            // Added here in the
             // opposite order (the gear closest to the window controls, sync
             // pill furthest) since `right_to_left` packs each new widget
             // just to the left of the previous one.
@@ -998,6 +1023,28 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 // has to leave this window entirely and be served by the
                 // caller once this loop has ended.
                 *open_preferences_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // **Between the gear and the avatar, and therefore added between
+            // them**, since this strip packs right-to-left: the mark that
+            // opens the account menu belongs against the account it names, and
+            // the conventional place for a disclosure chevron is the avatar's
+            // right-hand side. `the_switcher_sits_between_the_avatar_and_the_
+            // gear` measures the painted rects rather than trusting this
+            // ordering, which is inverted and is exactly the kind of thing
+            // reasoning gets backwards.
+            //
+            // Design 2b has no switcher (it has one account), so this is the
+            // user's direction the way the gear is. What it takes from 2b is
+            // its metrics: `theme::account_switcher_button` is 28px square,
+            // matching the gear, the avatar and the Lock pill either side.
+            if let Some(picked) = account_switcher(ui, accounts.as_ref()) {
+                // The gear's two-step dance, for the same reason and one more:
+                // `main` cannot tear this account's backend down and bring the
+                // other one up while this window owns the event loop, and the
+                // master-password prompt the switch may raise is itself
+                // another eframe window on this same thread.
+                *switch_to_for_closure.borrow_mut() = Some(picked);
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
             if let Some(email) = &account_email {
@@ -2354,7 +2401,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // race it, and `persist_preferences` is a read-modify-write of the two
     // preference fields only, so it cannot clobber the geometry either.
     let open_preferences = *open_preferences.borrow();
-    VaultWindowResult { locked, needs_reauth, open_preferences }
+    let switch_to = switch_to.borrow_mut().take();
+    VaultWindowResult { locked, needs_reauth, open_preferences, switch_to }
 }
 
 /// If `e` is `VaultError::Unauthorized`, flags the window to close and
@@ -3788,6 +3836,89 @@ fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) {
         egui::FontId::new(11.0, egui::FontFamily::Name(theme::BOLD.into())),
         egui::Color32::WHITE,
     );
+}
+
+/// What the switcher's menu says when there is nothing to switch to and
+/// nothing is stopping one. One account is the overwhelmingly common state, and
+/// an empty menu is indistinguishable from a menu that failed to build.
+const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
+
+/// How wide the switcher's menu is allowed to get.
+///
+/// A blocked state paints [`AccountsState::blocked_reason`] in here, and those
+/// sentences name a directory path — unwrapped, one of them is a menu wider
+/// than the window it hangs off.
+const SWITCHER_MENU_WIDTH: f32 = 300.0;
+
+/// The titlebar's account switcher: the chevron beside the avatar, and the
+/// menu it opens.
+///
+/// **It asks [`AccountsState`](crate::accounts::AccountsState) and derives
+/// nothing.** The rows it offers are exactly
+/// [`switchable`](crate::accounts::AccountsState::switchable) — never
+/// [`all`](crate::accounts::AccountsState::all), which still reports every
+/// configured account including the active one and including duplicate ids, so
+/// a menu built from it could offer a row that switches to where the user
+/// already is, and two rows for one directory. `switchable` is also already
+/// empty whenever switching is refused, which is why nothing here re-reads why.
+///
+/// **A blocked state paints the reason rather than an empty menu**, and that is
+/// the only thing this window does with `blocked_reason`. Silently offering no
+/// rows would read as "you have one account"; the refusals this gate exists for
+/// (a `bitwarden-cli` directory beside `bw.exe`, a migration that did not land)
+/// are both things the user can go and act on, and neither is visible anywhere
+/// else in this window.
+///
+/// `None` accounts — `StartupAccounts::Unmigrated`, where this app has no
+/// `Account` at all — draws no control whatsoever. There is nothing to say
+/// about accounts in an app that is running as the single-account app it was
+/// before this feature existed.
+fn account_switcher(
+    ui: &mut egui::Ui,
+    accounts: Option<&crate::accounts::AccountsState>,
+) -> Option<crate::accounts::AccountId> {
+    let state = accounts?;
+    let mut picked = None;
+    let chevron = theme::account_switcher_button(ui);
+    egui::Popup::menu(&chevron).show(|ui| {
+        ui.set_max_width(SWITCHER_MENU_WIDTH);
+        // The account this window is showing, first and not a button: the
+        // switcher's first job is to answer "whose vault am I looking at?",
+        // which the avatar's two initials can only hint at. `account_label`
+        // rather than the email directly -- an account minted on a first
+        // install has none until a sign-in fills it in, and a blank row here
+        // would be a strip of menu with nothing on it.
+        ui.label(
+            egui::RichText::new(crate::accounts::account_label(state.active()))
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+        if let Some(why) = state.blocked_reason() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(why).size(12.0).color(theme::TEXT_SECONDARY),
+                )
+                .wrap(),
+            );
+        } else if state.switchable().is_empty() {
+            ui.label(
+                egui::RichText::new(NO_OTHER_ACCOUNTS)
+                    .size(12.0)
+                    .color(theme::TEXT_SECONDARY),
+            );
+        } else {
+            for account in state.switchable() {
+                if ui
+                    .button(crate::accounts::account_label(account))
+                    .clicked()
+                {
+                    picked = Some(account.id.clone());
+                    ui.close();
+                }
+            }
+        }
+    });
+    picked
 }
 
 /// The toolbar sync pill's relative-time wording for a successful sync:

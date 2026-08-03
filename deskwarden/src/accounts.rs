@@ -180,6 +180,28 @@ pub fn account_for<'a>(accounts: &'a [Account], id: &AccountId) -> Option<&'a Ac
     accounts.iter().find(|a| &a.id == id)
 }
 
+/// How an account is named in anything a user reads — a message box, a log
+/// line, or a row in the vault window's account switcher.
+///
+/// An account minted by [`resolve_startup`] on a first install, or by
+/// [`prepare_new_account`], carries an **empty** email until a sign-in fills it
+/// in. `"" could not be removed` names nothing at all, and a switcher row
+/// showing it is a blank strip of menu the user is invited to click. The id is
+/// not friendly, but it is the directory name under `accounts\` and so is the
+/// one thing that always distinguishes this account from every other.
+///
+/// In this module rather than in `main.rs`, where it was written for
+/// `remove_account`'s messages, because the vault window needs the same answer
+/// and is in the library half of this crate: two spellings of "what do we call
+/// an account with no email" is one of them drifting.
+pub fn account_label(account: &Account) -> &str {
+    if account.email.is_empty() {
+        account.id.as_str()
+    } else {
+        &account.email
+    }
+}
+
 /// Which account becomes active when `removed` is deleted: the first survivor
 /// in configured order, or `None` when it was the last one.
 ///
@@ -525,6 +547,46 @@ impl AccountsState {
             switchable,
             blocked_reason,
             hello_needs_reenrolment,
+        })
+    }
+
+    /// The same state, built from the one thing [`new`](Self::new) distils its
+    /// two inputs down to — for the tests of a window that is **banned from
+    /// naming those inputs**.
+    ///
+    /// `no_window_answers_may_i_switch_for_itself` forbids
+    /// `vault_window/mod.rs` from containing the strings
+    /// `MultiAccountAvailability` or `MigrationState` anywhere at all, tests
+    /// included, and that ban is the point of this type. But the account
+    /// switcher in that window still has to be handed a blocked state and an
+    /// available one by its own tests, and a hand-built struct literal there
+    /// would be a second `AccountsState` with its own idea of what
+    /// `switchable` means.
+    ///
+    /// So this takes exactly the `Option<String>` that
+    /// [`new`](Self::new)'s `match` produces and computes everything else the
+    /// same way it does — including `switchable`, through the one
+    /// [`switch_targets`], rather than filtering the list a second time.
+    /// `the_test_constructor_agrees_with_the_real_one` pins the two together.
+    ///
+    /// `hello_needs_reenrolment` is `false`: it is a fact about the migration
+    /// and no switcher reads it.
+    #[cfg(test)]
+    pub fn from_blocked_reason(
+        accounts: Vec<Account>,
+        active: AccountId,
+        blocked_reason: Option<String>,
+    ) -> Option<Self> {
+        let active = account_for(&accounts, &active)
+            .or_else(|| accounts.first())?
+            .clone();
+        let switchable = switch_targets(&accounts, &active, blocked_reason.is_some());
+        Some(Self {
+            accounts,
+            active,
+            switchable,
+            blocked_reason,
+            hello_needs_reenrolment: false,
         })
     }
 
@@ -1128,6 +1190,47 @@ mod tests {
 
         fn switch_ids(state: &AccountsState) -> Vec<AccountId> {
             state.switchable().iter().map(|x| x.id.clone()).collect()
+        }
+
+        /// [`AccountsState::from_blocked_reason`] is what `vault_window`'s
+        /// switcher tests build their states with, because that file may not
+        /// name either of [`AccountsState::new`]'s inputs. A constructor only
+        /// tests use is a constructor that can quietly stop matching the one
+        /// production uses — and every switcher assertion over there would
+        /// keep passing against it.
+        ///
+        /// Both states, not just the blocked one: an available state that
+        /// offered no targets would make every "the switcher offers nothing"
+        /// assertion in that file pass for the wrong reason.
+        #[test]
+        fn the_test_constructor_agrees_with_the_real_one() {
+            let real_open = state(
+                MultiAccountAvailability::Available,
+                completed(&a()),
+                vec![a(), b()],
+                &a().id,
+            );
+            let open = AccountsState::from_blocked_reason(vec![a(), b()], a().id, None)
+                .expect("these accounts are not empty");
+            assert_eq!(open, real_open);
+            assert_eq!(switch_ids(&open), vec![b().id], "control: it offers b");
+
+            let real_blocked = state(trap(), completed(&a()), vec![a(), b()], &a().id);
+            let blocked = AccountsState::from_blocked_reason(
+                vec![a(), b()],
+                a().id,
+                trap().explanation(),
+            )
+            .expect("these accounts are not empty");
+            assert_eq!(blocked, real_blocked);
+            assert!(
+                blocked.switchable().is_empty(),
+                "control: the blocked one really does offer nothing"
+            );
+            assert_ne!(
+                open, blocked,
+                "control: the two states this constructor is asked for are different states"
+            );
         }
 
         #[test]

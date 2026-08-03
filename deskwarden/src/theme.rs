@@ -1530,6 +1530,53 @@ pub fn gear_button(ui: &mut Ui) -> Response {
     response.on_hover_text("Preferences")
 }
 
+/// The vault titlebar's account switcher: a downward chevron, 28px square,
+/// sized and coloured exactly like [`gear_button`] beside it.
+///
+/// **Two strokes, not U+25BE**, and measured before it was decided.
+/// `the_switcher_chevron_is_not_carried_by_this_apps_own_typeface` asks the
+/// resolved stack the same way
+/// `the_icon_codepoints_are_not_carried_by_this_apps_own_typeface` asks it
+/// about ★/☆/👁 -- and gets the *worse* answer. ▾ is not in their position
+/// (a real glyph out of a fallback face nobody chose); it is in ⋮'s and ✕'s:
+/// `has_glyph` says no, and ▾ ▼ ▸ ✓ all measure to one identical width that
+/// is the replacement box. Typed, this control would be a tofu square beside
+/// a 28px gear, a 28px avatar and a 28px Lock pill.
+///
+/// Named for what it opens rather than for its shape, and carrying a hover
+/// label, for [`close_glyph`]'s reason: it has no word on it.
+pub fn account_switcher_button(ui: &mut Ui) -> Response {
+    const SIZE: f32 = 28.0;
+    /// Half the chevron's width. Deliberately smaller than the gear's 9px
+    /// tip radius: this is a subordinate mark beside the avatar, not a
+    /// control competing with it.
+    const ARM: f32 = 4.0;
+    /// How far the point drops below the two arms' ends.
+    const DROP: f32 = 2.6;
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // `gear_button`'s two-state treatment, and for its reason: a navigation
+    // control with no "on" state never takes BLUE, and never takes ERROR.
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    let stroke = Stroke::new(1.3, color);
+    // Centred on the chevron's own bounding box rather than on `rect`, so
+    // the mark reads as vertically centred: a "V" hangs low if its widest
+    // edge is put on the centre line.
+    let c = rect.center() - Vec2::new(0.0, DROP / 2.0);
+    let painter = ui.painter();
+    // Two segments rather than one three-point path, so `icon_probe::
+    // line_segments` can find them the way it finds the eye's strike.
+    painter.line_segment(
+        [c + Vec2::new(-ARM, 0.0), c + Vec2::new(0.0, DROP)],
+        stroke,
+    );
+    painter.line_segment([c + Vec2::new(0.0, DROP), c + Vec2::new(ARM, 0.0)], stroke);
+    response.on_hover_text("Switch account")
+}
+
 /// The eye's almond outline: two parabolic lids meeting at the corners.
 fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
     let lid = |t: f32, sign: f32| {
@@ -2320,6 +2367,72 @@ mod tests {
         // The positive control for the three above: Archivo is proportional,
         // so equal advances are evidence of an icon face and not just of how
         // this stack measures everything.
+        assert_ne!(
+            width("A"),
+            width("W"),
+            "'A' and 'W' advance identically, so the equal-advance argument above is \
+             about the measurement, not about the face"
+        );
+    }
+
+    /// **The same measurement for the account switcher's chevron**, taken
+    /// before it was drawn rather than assumed from the star's answer -- and
+    /// it is not the star's answer.
+    ///
+    /// U+25BE BLACK DOWN-POINTING SMALL TRIANGLE is the codepoint a switcher
+    /// beside an avatar would reach for first. It is in the *worse* of the
+    /// two positions this app's icons can be in: not "resolves out of a
+    /// fallback face nobody chose" like ★ and 👁, but the U+22EE/U+2715
+    /// position -- nothing in the resolved stack carries it at all, so as
+    /// text it is a tofu box.
+    ///
+    /// The advances below are the second half of that. ▾, ▼, ▸ and ✓ are
+    /// four unrelated marks that all lay out to one identical width, and it
+    /// is not ★'s: that is the replacement box being measured four times,
+    /// not four glyphs. So `account_switcher_button` strokes its chevron,
+    /// and this is the evidence rather than an argument by analogy.
+    #[test]
+    fn the_switcher_chevron_is_not_carried_by_this_apps_own_typeface() {
+        let ctx = ctx_with_fonts();
+        let font = FontId::new(13.0, FontFamily::Proportional);
+        let width = |s: &str| {
+            ctx.fonts_mut(|f| f.layout_no_wrap(s.to_string(), font.clone(), INK))
+                .size()
+                .x
+        };
+
+        assert!(
+            !ctx.fonts_mut(|f| f.has_glyph(&font, '\u{25BE}')),
+            "U+25BE now resolves; the switcher's chevron is two drawn strokes because it \
+             did not"
+        );
+        // The positive control for that, the same one the kebab's assertion
+        // above carries: `has_glyph` is not simply answering "no" to
+        // everything, and the fonts really did load.
+        assert!(
+            ctx.fonts_mut(|f| f.has_glyph(&font, 'A')),
+            "the font set resolves no 'A' either, so the assertion above proves nothing"
+        );
+
+        let chevron = width("\u{25BE}");
+        for missing in ["\u{25BC}", "\u{25B8}", "\u{2713}"] {
+            assert_eq!(
+                chevron,
+                width(missing),
+                "▾ and {missing} no longer share one advance, so at least one of them is \
+                 now a real glyph rather than the replacement box"
+            );
+        }
+        assert_ne!(
+            chevron,
+            width("\u{2605}"),
+            "▾ now advances like ★, which DOES resolve -- out of egui's bundled icon \
+             fallback. Re-measure: this test's whole claim is that ▾ is in the worse \
+             position of the two"
+        );
+        // The positive control for the equal-advance argument, the same one
+        // the test above uses: this stack really does measure a proportional
+        // face proportionally, so four equal advances mean something.
         assert_ne!(
             width("A"),
             width("W"),

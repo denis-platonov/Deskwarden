@@ -23,7 +23,7 @@
 //! Declares no modules of its own: every module lives in `lib.rs` (see the
 //! note there). This file is only `fn main()` and the startup sequence.
 
-use deskwarden::accounts::{self, Account};
+use deskwarden::accounts::{self, account_label, Account};
 use deskwarden::app::{fill_from_vault, handle_match, match_entries, pump_windows_messages};
 use deskwarden::backend_policy;
 use deskwarden::bw_path;
@@ -303,7 +303,10 @@ fn main() {
     // rather than recomputing either half. That includes the Hello notice
     // below: `hello_needs_reenrolment` is a fact about the migration that has
     // to survive into the window that shows it.
-    let (active_account, accounts_state) = match &startup {
+    // `mut`, both of them: an account switch re-points which account this
+    // process is (`active_account`) and which account the switcher offers to
+    // leave (`accounts_state`'s `active`). See `open_vault_window`.
+    let (mut active_account, mut accounts_state) = match &startup {
         accounts::StartupAccounts::Ready {
             active,
             accounts,
@@ -371,17 +374,25 @@ fn main() {
         None => (config_dir.join("session.bin"), None),
     };
     bw_path::set_active_data_dir(active_dir);
-    let store = session_store::SessionStore::new(session_path);
+    // `mut` for the same reason: `switch_to_account` re-points this at the
+    // target account's own `session.bin` before it authenticates, so the token
+    // the switch produces cannot land in the file of the account being left.
+    let mut store = session_store::SessionStore::new(session_path);
 
-    // What every login window this process opens is scoped to. Built once,
-    // here, so no call site can quietly go back to passing `None` and losing
-    // quick unlock -- see `login_ui::run_login_flow_for`.
-    let login = LoginContext {
-        account: active_account
-            .as_ref()
-            .map(|a| (config_dir.as_path(), a)),
+    // What every login window this process opens is scoped to. Built through
+    // the one constructor, so no call site can quietly go back to passing
+    // `None` and losing quick unlock -- see `login_context`, and
+    // `login_ui::run_login_flow_for`.
+    //
+    // A local for the startup paths below rather than for the whole run: it
+    // borrows `active_account`, and an account switch inside the main loop
+    // takes `&mut` to it. Its last use is the `recover_from_failed_vault_wait`
+    // arms just below, and the borrow ends there.
+    let login = login_context(
+        config_dir.as_path(),
+        active_account.as_ref(),
         hello_needs_reenrolment,
-    };
+    );
 
     let fill_stats_path = config_dir.join("fill-stats.json");
     let fill_stats = fill_stats::FillStats::new(fill_stats_path);
@@ -767,12 +778,15 @@ fn main() {
                     &mut session_token,
                     &mut bw_serve_child,
                     &job,
-                    &store,
+                    &mut store,
                     &schedule,
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
-                    login,
+                    &config_dir,
+                    &mut active_account,
+                    &mut accounts_state,
+                    hello_needs_reenrolment,
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -1081,12 +1095,15 @@ fn main() {
                     &mut session_token,
                     &mut bw_serve_child,
                     &job,
-                    &store,
+                    &mut store,
                     &schedule,
                     &mut engine,
                     &icon_cache_dir,
                     &mut cached_status_details,
-                    login,
+                    &config_dir,
+                    &mut active_account,
+                    &mut accounts_state,
+                    hello_needs_reenrolment,
                     &mut settings,
                     &settings_path,
                     &tray,
@@ -1855,7 +1872,10 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     session_token: &mut String,
     bw_serve_child: &mut Option<Child>,
     job: &Arc<Option<job_object::KillOnCloseJob>>,
-    store: &session_store::SessionStore,
+    // `&mut` since Task 14: an account switch re-points this at the target
+    // account's `session.bin` (inside `switch_to_account`) before the login
+    // window it may raise produces a token to save.
+    store: &mut session_store::SessionStore,
     schedule: &[Duration],
     engine: &mut MatchEngine,
     icon_cache_dir: &std::path::Path,
@@ -1881,10 +1901,19 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // timeout edited in that window apply to the very next vault window
     // rather than only to the next app launch.
     // What the lock/re-auth prompt this window can raise is scoped to: the
-    // account this process is signed into. Threaded through rather than
-    // rebuilt here so there is exactly one place that decides which account a
-    // login window seals a master password for.
-    login: LoginContext<'_>,
+    // account this process is signed into. The pieces rather than a built
+    // `LoginContext`, because this function can now CHANGE which account that
+    // is (the titlebar switcher below) and a context built by the caller would
+    // still name the account the user just left -- so the master-password
+    // prompt after a switch-then-lock would be for the wrong account. Every
+    // context here goes through the one `login_context` constructor, which is
+    // what keeps "no window is opened without an account" a single decision.
+    config_dir: &std::path::Path,
+    active_account: &mut Option<Account>,
+    // The one door for "may I switch, and to what" (Task 10), and `&mut`
+    // because a switch that lands moves its `active`.
+    accounts: &mut Option<accounts::AccountsState>,
+    hello_needs_reenrolment: bool,
     settings: &mut settings::Settings,
     settings_path: &std::path::Path,
     tray: &tray::AppTray,
@@ -1944,6 +1973,10 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // window below governs the window this loop is about to reopen.
         settings.auto_lock(),
         backend_already_running,
+        // Cloned per pass, not once outside the loop: a switch below replaces
+        // the state, and the window reopened after it has to offer the account
+        // the user just left rather than the one they are now on.
+        accounts.clone(),
     );
 
     // Handled before the lock/re-auth branch and with its own `continue`,
@@ -1983,6 +2016,152 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             if let Err(e) = settings.persist_preferences(settings_path) {
                 log::warn!("could not save settings: {e}");
             }
+        }
+        continue;
+    }
+
+    // **Before the lock/re-auth branch, and with its own `continue`.** A
+    // switch is not a lost session: the recovery below re-authenticates
+    // against the account this process is ALREADY on, so a switch folded into
+    // it would prompt for the master password of the account the user asked to
+    // leave and then leave them on it. See `VaultWindowResult::switch_to`.
+    //
+    // Everything the switch itself does is `switch_to_account`'s -- the data
+    // directory, the token store, the teardown, the authentication, the
+    // restart, the rollback. This block is the caller's three jobs and no
+    // fourth: name the target through the one gate, report the outcome, and
+    // persist.
+    if let Some(target) = result.switch_to.clone() {
+        // **`switchable()`, not `all()`.** `all()` is every configured
+        // account -- the active one included, and duplicate ids included --
+        // and it is not emptied when switching is refused. Re-checking here
+        // rather than trusting the id the window sent back costs nothing and
+        // means the CLI-availability and migration refusals are enforced on
+        // this side of the window too.
+        let picked = accounts
+            .as_ref()
+            .and_then(|state| state.switchable().iter().find(|a| a.id == target))
+            .cloned();
+        match (picked, accounts.as_mut(), active_account.as_mut()) {
+            (Some(to), Some(state), Some(active)) => {
+                let from = active.clone();
+                let outcome = switch_to_account(
+                    config_dir,
+                    &from,
+                    &to,
+                    active,
+                    store,
+                    // **The injected resettle, and it calls the one
+                    // teardown-and-repopulate sequence.** Nothing else may
+                    // live in here: `a_switch_reimplements_none_of_the_
+                    // sequence_it_is_supposed_to_reuse` pins that
+                    // `switch_to_account` did not do the work itself, and
+                    // `the_production_switch_resettles_through_the_one_
+                    // sequence` pins that this closure -- the only thing that
+                    // gets to decide what "resettle" means in production --
+                    // did not either.
+                    |config_dir, to, store| {
+                        // Built for the account being switched TO. A context
+                        // for `from` here would put the master-password prompt
+                        // up for the wrong account and seal the Hello blob
+                        // under the wrong id.
+                        let login = login_context(config_dir, Some(to), hello_needs_reenrolment);
+                        let mut declined = false;
+                        let outcome = resettle_session(
+                            cache,
+                            engine,
+                            bw_serve_child,
+                            job,
+                            schedule,
+                            tray,
+                            backend_op_rx,
+                            backend_task_in_progress,
+                            cached_status_details,
+                            session_token,
+                            || {
+                                let token = authenticate_for_switch(store, login);
+                                declined = token.is_none();
+                                token
+                            },
+                        );
+                        // The three-way answer `ResettleOutcome`'s two
+                        // variants cannot give: only whoever built the
+                        // `authenticate` closure can tell "the user closed the
+                        // prompt" from "nothing came up to serve it", and a
+                        // switch that reported a backend failure because the
+                        // user pressed Cancel would be naming something that
+                        // never happened.
+                        match outcome {
+                            ResettleOutcome::BackendStarted => ResettleReport::Settled,
+                            ResettleOutcome::BackendNotStarted if declined => {
+                                ResettleReport::Declined
+                            }
+                            ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
+                        }
+                    },
+                );
+                match outcome {
+                    SwitchOutcome::Switched => {
+                        // `adopt`, which moves this state's `active` and
+                        // recomputes what it offers -- so the window reopened
+                        // below offers the account just left.
+                        state.adopt(to.clone());
+                        // **After the switch has landed, never before.** A
+                        // list written first and a switch that then failed
+                        // would leave `settings.json` naming an account this
+                        // process is not on, and the next launch would resume
+                        // the wrong one. Written here, a switch that does not
+                        // stick across a restart is impossible -- which
+                        // matters because "switching that appears to work and
+                        // then doesn't" is indistinguishable from the
+                        // `relativeDataDir` trap and sends whoever debugs it
+                        // down the wrong path entirely.
+                        if let Err(e) = settings::Settings::persist_accounts(
+                            settings_path,
+                            state.all(),
+                            Some(&to.id),
+                        ) {
+                            log::warn!("could not persist the active account after a switch: {e}");
+                        }
+                    }
+                    // Not an error and not reported as one: the user closed
+                    // the target account's master-password prompt and the
+                    // account they were on is back.
+                    SwitchOutcome::Declined => log::info!(
+                        "the switch to {} was declined; staying on {}",
+                        account_label(&to),
+                        account_label(&from)
+                    ),
+                    SwitchOutcome::RolledBack { reason } => {
+                        log::warn!("could not switch to {}: {reason}", account_label(&to));
+                        message_box(
+                            "Deskwarden",
+                            &format!(
+                                "Could not switch to {}.\n\n{reason}\n\nYou are still signed \
+                                 in to {}.",
+                                account_label(&to),
+                                account_label(&from)
+                            ),
+                            MB_ICONERROR | MB_OK,
+                        );
+                    }
+                    // `stand_down_after_unlock`'s state, which this app
+                    // already ships and already tells the user to recover from
+                    // with the tray's "Sync". Logged rather than raised: the
+                    // stand-down has already said its piece.
+                    SwitchOutcome::StoodDown { reason } => {
+                        log::error!("the switch to {} stood autofill down: {reason}", account_label(&to))
+                    }
+                }
+            }
+            // The window offered an account this side will not switch to. Not
+            // reachable through the switcher, which is built from the same
+            // `switchable()`; reachable if the two ever disagree, and silence
+            // there would be a click that does nothing forever.
+            _ => log::warn!(
+                "the vault window asked to switch to an account that is not one this app may \
+                 switch to right now"
+            ),
         }
         continue;
     }
@@ -2032,7 +2211,14 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
             backend_task_in_progress,
             cached_status_details,
             session_token,
-            || Some(reauthenticate(store, login)),
+            // Built HERE rather than handed in, so it names whichever account
+            // this process is on at this moment -- which the switch above may
+            // have changed since the caller's own context was built.
+            || {
+                let login =
+                    login_context(config_dir, active_account.as_ref(), hello_needs_reenrolment);
+                Some(reauthenticate(store, login))
+            },
         );
     }
 
@@ -2313,19 +2499,6 @@ enum SwitchOutcome {
     /// state, which this app already ships and recovers from via the tray's
     /// "Sync".
     StoodDown { reason: String },
-}
-
-/// How an account is named in a message a user reads.
-///
-/// An account minted by `accounts::resolve_startup` on a first install, or by
-/// `accounts::prepare_new_account`, carries an empty email until a sign-in
-/// fills it in, and `"" could not be removed` names nothing at all.
-fn account_label(account: &Account) -> &str {
-    if account.email.is_empty() {
-        account.id.as_str()
-    } else {
-        &account.email
-    }
 }
 
 /// Removes a Bitwarden account: settles the app somewhere coherent, logs that
@@ -3722,6 +3895,58 @@ fn recover_from_failed_vault_wait(
 struct LoginContext<'a> {
     account: Option<(&'a Path, &'a Account)>,
     hello_needs_reenrolment: bool,
+}
+
+/// **The only place a [`LoginContext`] is built**, which is the property
+/// `every_login_window_this_process_opens_is_scoped_to_an_account` pins by
+/// counting the struct literal.
+///
+/// It used to be a single `let login = ...` in `main`, and it could not stay
+/// one: that binding borrows the active account for as long as it lives, and
+/// an account switch takes `&mut` to the very same value. A context built at
+/// each point of use borrows only across the call, which is what lets the same
+/// function open a login window and then change which account this process is.
+///
+/// The function is the thing that keeps the guarantee the single binding was
+/// there for -- no call site can quietly go back to passing `None` for the
+/// account and losing Windows Hello quick unlock, because none of them says
+/// `None` at all.
+fn login_context<'a>(
+    config_dir: &'a Path,
+    active_account: Option<&'a Account>,
+    hello_needs_reenrolment: bool,
+) -> LoginContext<'a> {
+    LoginContext {
+        account: active_account.map(|account| (config_dir, account)),
+        hello_needs_reenrolment,
+    }
+}
+
+/// The cancellable half of [`reauthenticate`]: runs the login window for
+/// whichever account `login` names and saves the token into whichever
+/// `SessionStore` it is handed.
+///
+/// **Both of those are the switch's**, and that is the whole reason this
+/// exists rather than `reauthenticate` being reused. `reauthenticate` calls
+/// `login_ui::run_login_flow`, which *exits the process* when the user closes
+/// the window -- correct at startup, where there is nothing to fall back to,
+/// and catastrophic for a switch, where declining means "stay on the account I
+/// was already on". `run_login_flow_for` answers `None` instead, and that
+/// `None` becomes [`ResettleReport::Declined`].
+///
+/// The store is a parameter rather than read from anywhere because
+/// [`switch_to_account`] has already re-pointed it at the target account's
+/// `session.bin` before the sequence runs; saving into `main`'s original store
+/// would write the new account's token over the file of the account being left.
+fn authenticate_for_switch(
+    store: &session_store::SessionStore,
+    login: LoginContext<'_>,
+) -> Option<String> {
+    let token = login_ui::run_login_flow_for(login.account, login.hello_needs_reenrolment)?;
+    if let Err(e) = store.save(&token) {
+        log::error!("failed to persist the session token for the account switched to: {e}");
+    }
+    Some(token)
 }
 
 fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) -> String {
