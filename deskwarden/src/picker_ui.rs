@@ -801,15 +801,26 @@ fn can_save_app_match(selected_process: Option<&str>, backend_ready: &BackendRea
 /// beside it, so "refused" can never be rendered without an explanation. The
 /// silent no-op is the failure mode this window has already been patched for
 /// twice (see [`can_save_app_match`]'s own doc).
+///
+/// **The remedy it names was measured, not guessed.** A row can only still be
+/// carrying a host's name when the frame had no `Windows.UI.Core.CoreWindow`
+/// child to attribute it by (see `window_list::enum_proc`), and on the
+/// reporting machine that was true of both open Store windows because both
+/// were minimised -- a minimised UWP app is suspended, and its CoreWindow is
+/// gone with it. Restoring the app so it is actually on screen is what brings
+/// that child back, which is why this says "restore it" and not merely "try
+/// again".
 fn host_process_refusal(process: &str) -> Option<String> {
     if !window_watch::is_host_process(process) {
         return None;
     }
     Some(format!(
         "{process} isn\u{2019}t an app -- it\u{2019}s the Windows process that owns the window for \
-         every Microsoft Store app. Matching it would fill this item into every Store app you \
-         open, so Deskwarden won\u{2019}t save it. Bring the app you want to the front, then open \
-         \u{201c}Add app\u{2026}\u{201d} again so its own window can be listed."
+         every Microsoft Store app, so matching it would fill this item into all of them. \
+         Deskwarden won\u{2019}t save that. This row is showing the host because the app is \
+         minimised (Windows suspends it, and Deskwarden can no longer see which app it is): \
+         restore the app so it\u{2019}s on screen, then open \u{201c}Add app\u{2026}\u{201d} \
+         again and it will be listed under its own name."
     ))
 }
 
@@ -1910,6 +1921,14 @@ mod tests {
         assert!(
             refusal.contains("Add app"),
             "and it must say what to do instead: {refusal}"
+        );
+        // The remedy is specific because the cause is: a host row exists only
+        // when the frame had no CoreWindow child to attribute it by, which on
+        // the reporting machine was because the app was minimised. "Try
+        // again" without restoring the app would fail identically.
+        assert!(
+            refusal.contains("minimised") && refusal.contains("restore"),
+            "the only remedy that works is restoring the app so its own window exists: {refusal}"
         );
     }
 

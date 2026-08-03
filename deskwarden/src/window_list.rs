@@ -85,15 +85,24 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // every Store/UWP window in this list is owned by
     // `ApplicationFrameHost.exe`, so without this the picker offers the user
     // the host as "that app" -- which is precisely the entry that then
-    // matches every other Store app. A window whose hosted app cannot be
-    // identified is dropped rather than listed under the host's name: an
-    // unpickable row is better than a row that saves the wrong thing.
+    // matches every other Store app.
+    //
+    // **An unattributable host window is still LISTED, under the host's
+    // name.** That was measured, not assumed: on the reporting machine both
+    // live Store frames (titled "Speedtest" and "Settings", both pid 12472)
+    // had no `Windows.UI.Core.CoreWindow` child at all -- a minimised UWP app
+    // is suspended and its CoreWindow goes with it -- so dropping the row
+    // makes the app the user is looking at simply vanish from the picker with
+    // no explanation. The row stays, and `picker_ui::host_process_refusal`
+    // declines the save and says why and what to do instead. Silently
+    // removing the row would be the same "silent no-op" this window has twice
+    // been patched to stop doing.
     let hwnd_value = hwnd.0 as isize;
-    let window_watch::Attribution::Attributed { pid, exe_name } =
-        window_watch::resolve_window_attribution(hwnd_value, owner_pid, &owner_exe)
-    else {
-        return CONTINUE;
-    };
+    let (pid, exe_name) =
+        match window_watch::resolve_window_attribution(hwnd_value, owner_pid, &owner_exe) {
+            window_watch::Attribution::Attributed { pid, exe_name } => (pid, exe_name),
+            window_watch::Attribution::UnresolvedHost { host } => (owner_pid, host),
+        };
 
     // Resolved from the ATTRIBUTED pid, not the owner's: for a hosted app the
     // host's image path would load the wrong icon (and give the picker a path
@@ -114,40 +123,85 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     CONTINUE
 }
 
+/// Source guard for the one line of glue that cannot be reached from a test:
+/// that `enum_proc` names each row by ATTRIBUTION rather than by the process
+/// that owns the window.
+///
+/// `enum_proc` is an `extern "system"` callback driven by `EnumWindows`, and
+/// its only observable output (`list_windows`) depends entirely on what the
+/// machine happens to be showing -- and, since an unattributable host window
+/// is deliberately still listed under the host's name, a live assertion
+/// cannot tell the fixed build from the reverted one at all on a desktop
+/// whose Store apps are all suspended (which is what the reporting machine's
+/// were). So the revert is pinned by source position instead.
+///
+/// What it can and cannot see: it pins that the call is there, exactly once.
+/// It cannot see a call whose result is thrown away -- that is visible in any
+/// diff touching these lines. What it guards is the revert.
+#[cfg(test)]
+mod attribution_wiring_tests {
+    // SPLIT ACROSS TWO LITERALS, on ONE line: `include_str!` pulls this module
+    // in too, so a whole needle would match its own declaration, and a needle
+    // containing a newline would pass on an LF checkout and fail on a CRLF one
+    // (this repo has both).
+    const CALL: &str = concat!("resolve_window_attribution", "(");
+
+    fn source() -> &'static str {
+        include_str!("window_list.rs")
+    }
+
+    /// The same counting the real assertion uses, so the positive control
+    /// drives this code rather than a re-implementation of it.
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn the_counter_finds_a_call_that_is_really_there() {
+        let planted = concat!("match resolve_window_attribution", "(h, p, e) {");
+        assert_eq!(occurrences(planted, CALL), 1, "planted: {planted}");
+        assert_eq!(occurrences("nothing here", CALL), 0);
+    }
+
+    #[test]
+    fn every_picker_row_is_named_by_attribution_not_by_the_owning_process() {
+        assert_eq!(
+            occurrences(source(), CALL),
+            1,
+            "expected {CALL:?} exactly once in window_list.rs -- `enum_proc`'s attribution of the \
+             row it is about to push. Zero means the picker went back to naming each row after \
+             the process that owns the window, and every Microsoft Store app would again be \
+             offered as ApplicationFrameHost.exe: one saved match that fires on all of them"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The live half. `list_windows` walks the real desktop, so what it
-    /// returns depends on the machine -- which is why the assertion below is
-    /// paired with a control that does not.
+    /// Live, and deliberately weak: it asserts only that a host row, IF the
+    /// desktop produces one, is one the picker will refuse to save (see
+    /// `picker_ui::host_process_refusal`). It cannot distinguish the fix from
+    /// the revert -- `every_picker_row_is_named_by_attribution_not_by_the_
+    /// owning_process` above is what does that.
     ///
-    /// The bug this guards: the picker offering `ApplicationFrameHost.exe` as
-    /// "that app" for a Store window, which is the entry that then matches
-    /// every Store app. Reverting `enum_proc` to name the owning process
-    /// makes every open Store window a host row here.
+    /// It is here because it is the only thing that runs `list_windows`
+    /// against a real desktop at all, and a panic or a hang in the enumeration
+    /// (a bad `LPARAM` cast, an unterminated walk) has no other test.
     #[test]
-    fn no_listed_window_is_offered_under_a_window_hosts_name() {
-        let hosts: Vec<&str> = list_windows(0)
-            .iter()
-            .filter(|w| window_watch::is_host_process(&w.exe_name))
-            .map(|_| "host row")
-            .collect();
-        assert!(
-            hosts.is_empty(),
-            "the picker would offer a window host as an app: {hosts:?}"
-        );
+    fn enumerating_the_real_desktop_yields_rows_the_save_gate_can_answer_for() {
+        for w in list_windows(0) {
+            assert!(!w.exe_name.is_empty(), "a row with no process name: {}", w.title);
+            assert!(!w.exe_name.contains('\\'), "expected a file name: {}", w.exe_name);
+        }
     }
 
-    /// The control for the test above, which is vacuous on a machine with no
-    /// Store app open (and on a session with no windows at all).
-    ///
-    /// It drives the SAME predicate the filter uses, rather than re-asserting
-    /// a planted string: if `is_host_process` answered `false` for everything
-    /// -- the one mutation that would make the live test pass no matter what
-    /// `enum_proc` does -- this fails.
+    /// The predicate the picker's refusal turns on, exercised directly --
+    /// the one mutation that would make every host-related assertion in this
+    /// crate vacuous is `is_host_process` answering `false` for everything.
     #[test]
-    fn the_filter_that_test_uses_really_does_recognise_the_frame_host() {
+    fn the_frame_host_is_recognised_and_a_real_app_is_not() {
         assert!(window_watch::is_host_process("ApplicationFrameHost.exe"));
         assert!(!window_watch::is_host_process("Speedtest.exe"));
     }
