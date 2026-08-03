@@ -5503,4 +5503,325 @@ mod tests {
             .expect("tasklist must run");
         String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
     }
+
+    // ---------------------------------------------------------------------
+    // Task 11 -- startup: migrate, resolve, resume.
+    //
+    // `fn main()` never returns and opens real windows, so none of it is
+    // reachable from a test. Everything it DECIDES lives in
+    // `accounts::resolve_startup`, which is pure and is driven through every
+    // branch in `accounts.rs`. What is left here is the wiring -- the part
+    // that has twice in this feature's history been the whole bug -- and the
+    // only handle on it is its own source.
+    //
+    // Every needle below is `concat!`-split so none matches its own
+    // declaration, single-line so none turns on LF versus CRLF (this file is
+    // entirely CRLF), and paired with a positive control so a scan that read
+    // nothing cannot pass.
+    // ---------------------------------------------------------------------
+
+    /// The startup block, from the availability probe to the point where the
+    /// account-aware part is done and `fill_stats` resumes.
+    ///
+    /// Cut at a named comment and a named statement rather than at braces for
+    /// the CRLF reason above, and both ends are controlled: the region must be
+    /// shorter than what it was cut from, and must contain the migration call
+    /// it exists to talk about.
+    fn the_startup_account_block() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("// Which account is ", "this launch?"))
+            .expect("the startup account block must still be there and still say so")
+            .1;
+        let block = after
+            .split_once(concat!("let fill_stats_path", " ="))
+            .expect("`fill_stats_path` must still be the statement after the account block")
+            .0;
+        assert!(
+            block.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            block.contains(concat!("migration::", "migrate(")),
+            "control: the region really is the startup account block"
+        );
+        block
+    }
+
+    /// The plan's own ordering test, and the ordering is the point three times
+    /// over. Migration must finish before the account is resolved, or the
+    /// account is resolved against a profile that is about to move. The CLI
+    /// and the token store must be pointed at that account before
+    /// `store.load()` and before `check_bw_status_with_session` spawns `bw`,
+    /// or the first launch after a migration validates a token against the
+    /// wrong profile and silently re-authenticates -- which the user reads as
+    /// "the update lost my login".
+    ///
+    /// Pure ordering, and invisible to any value-based test: every one of
+    /// these mutations leaves an app that starts, signs in, and works.
+    #[test]
+    fn startup_migrates_and_points_the_cli_before_it_loads_a_session() {
+        // The production half, not the whole file: a needle that also appears
+        // in this module would otherwise let a deleted call site be satisfied
+        // by its own test.
+        let source = production_half_of_this_file();
+        let at = |what: &str, needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("startup no longer {what} (`{needle}` is not there)"))
+        };
+        let migrate_at = at("migrates", concat!("migration::", "migrate("));
+        let resolve_at = at("resolves an account", concat!("accounts::resolve", "_startup("));
+        let ensure_at = at(
+            "creates the account's directory",
+            concat!("accounts::ensure_account", "_dir("),
+        );
+        let set_dir = at("points the CLI", concat!("set_active_data", "_dir("));
+        let build_store = at("builds a token store", concat!("SessionStore", "::new("));
+        let load = at("reads a cached token", concat!("store", ".load()"));
+
+        assert!(
+            migrate_at < resolve_at,
+            "the account is resolved before migration runs, so it is resolved against a profile \
+             that is about to move"
+        );
+        assert!(
+            resolve_at < ensure_at,
+            "the account's directory is created before there is an account to create it for"
+        );
+        assert!(
+            ensure_at < build_store,
+            "the token store is built for a directory that may not exist yet, and `SessionStore` \
+             does not create its own parent: the first save fails and the master password is \
+             asked for on every launch, forever"
+        );
+        assert!(
+            set_dir < build_store,
+            "the CLI is pointed at the account AFTER the store is built"
+        );
+        assert!(
+            build_store < load,
+            "a cached session token is read before there is a store pointed at the account"
+        );
+
+        // Positive control: six distinct positions were found, so the
+        // assertions above are between six real call sites rather than
+        // between repeated hits on one.
+        let mut all = vec![migrate_at, resolve_at, ensure_at, set_dir, build_store, load];
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "two of the six needles found the same position");
+    }
+
+    /// The user accepted re-enrolling Windows Hello. They did not accept
+    /// finding out by having quick unlock silently stop working: a tray app
+    /// has no window, and an absent quick-unlock panel is indistinguishable
+    /// from Hello never having been set up.
+    #[test]
+    fn the_hello_notice_is_raised_where_the_migration_completes() {
+        let source = production_half_of_this_file();
+        let region = source
+            .split_once(concat!("MigrationState::", "Completed"))
+            .expect("startup must still recognise a completed migration")
+            .1;
+        let window = &region[..region.len().min(1200)];
+        assert!(
+            window.contains(concat!("message", "_box(")),
+            "no notice is shown on completion"
+        );
+        assert!(
+            window.to_lowercase().contains("windows hello"),
+            "the notice does not name Hello"
+        );
+        // Positive control on the same window: it really is the notice's own
+        // text and not some unrelated dialog that happened to be nearby.
+        assert!(
+            window.contains(concat!("has been ", "moved")),
+            "control: the region does not contain the migration notice at all"
+        );
+    }
+
+    /// The debt Task 7 left and named: it made `run_login_flow_for` take an
+    /// account and `run_login_flow` pass `None`, because startup had none to
+    /// give. It has one now.
+    ///
+    /// The mutation this exists for is a one-word revert -- `login.account`
+    /// back to `None` -- and it is invisible in every other way: the app
+    /// starts, signs in, and works. The only difference is that the quick
+    /// unlock panel is never offered in the one login window every user meets,
+    /// and there is no account-less fallback that could offer it, because the
+    /// only derivation available without an account id is the empty KDF suffix
+    /// (`accounts::hello_kdf_suffix_for`) -- one account sealed under which is
+    /// one account's master password every other account can open.
+    #[test]
+    fn every_login_window_this_process_opens_is_scoped_to_an_account() {
+        let production = production_half_of_this_file();
+        let call = concat!("run_login", "_flow(");
+        assert!(
+            production.contains(call),
+            "control: `{call}` is really spelled that way in this file"
+        );
+        assert_eq!(
+            production.matches(call).count(),
+            1,
+            "there is more than one fatal login call site; each is a chance to pass no account"
+        );
+        let args = production
+            .split_once(call)
+            .expect("the fatal login wrapper must still be called")
+            .1;
+        let args = &args[..args.len().min(120)];
+        assert!(
+            args.contains(concat!("login.", "account")),
+            "the startup login window is opened without an account, so it offers no Windows \
+             Hello quick unlock at all -- got `{args}`"
+        );
+        assert!(
+            args.contains(concat!("hello_needs_re", "enrolment")),
+            "the re-enrolment notice never reaches the window that shows it -- got `{args}`"
+        );
+
+        // And nothing rebuilds the context beside the one construction, which
+        // is what makes the assertions above cover every window rather than
+        // one call site.
+        assert_eq!(
+            production.matches(concat!("LoginContext", " {")).count(),
+            1,
+            "a second `LoginContext` is a second answer to which account a login window seals a \
+             master password for"
+        );
+    }
+
+    /// Task 10 shipped `AccountsState` with no production caller, and nothing
+    /// asserted that a real caller would ASK it rather than decide for itself.
+    /// This is the half of that debt Task 11 can close: the Hello notice the
+    /// login window shows is read back out of `AccountsState`, not out of a
+    /// second match on the migration's return value.
+    ///
+    /// The mutation: `hello_needs_reenrolment` computed by re-matching
+    /// `MigrationState::Completed { hello_needs_reenrolment: true, .. }`. It
+    /// gives the same answer today and drifts silently the first time
+    /// `AccountsState` learns to say no -- for instance for an account the
+    /// migration did not produce.
+    #[test]
+    fn startup_asks_accounts_state_what_it_needs_rather_than_re_reading_the_migration() {
+        let block = the_startup_account_block();
+        for needle in [
+            concat!("AccountsState::hello_needs_", "reenrolment"),
+            concat!("AccountsState::blocked", "_reason"),
+            concat!("accounts::AccountsState", "::new("),
+        ] {
+            assert!(
+                block.contains(needle),
+                "startup does not go through `{needle}`: whether this process may switch, and \
+                 whether it must say so about Windows Hello, is `AccountsState`'s answer and \
+                 nothing else's"
+            );
+        }
+        // Positive control on the same region and the same reader: a needle
+        // spelled the same way that is deliberately NOT there.
+        assert!(
+            !block.contains(concat!("AccountsState::switch", "able(")),
+            "control: this region is not simply matching every needle it is shown"
+        );
+    }
+
+    /// A failed migration must leave a WORKING app on the pre-existing
+    /// profile. `start_backend` is startup's wrapper that calls
+    /// `fatal_startup_error`, and neither belongs anywhere in this block: the
+    /// profile could not be copied is not a reason to refuse to run at all,
+    /// and the whole `Unmigrated` arm exists so that today's app is what the
+    /// user gets instead.
+    ///
+    /// The mutation: `MigrationState::Blocked` handled with a
+    /// `fatal_startup_error` rather than a `log::warn!` and the fallback.
+    /// Every value-based test stays green, because the app that would die
+    /// never reaches one.
+    #[test]
+    fn a_migration_that_cannot_run_does_not_take_the_app_down() {
+        let block = the_startup_account_block();
+        let production = production_half_of_this_file();
+        for banned in [
+            concat!("fatal_startup", "_error("),
+            concat!("std::process", "::exit("),
+        ] {
+            assert!(
+                production.contains(banned),
+                "control: `{banned}` is really spelled that way in this file, so the ban below \
+                 is not vacuous"
+            );
+            assert!(
+                !block.contains(banned),
+                "`{banned}` is reachable from the startup account block: a profile that could \
+                 not be migrated would stop the app from starting at all, on a machine whose \
+                 vault is sitting there intact"
+            );
+        }
+        // The fallback it must take instead.
+        assert!(
+            block.contains(concat!("StartupAccounts::", "Unmigrated")),
+            "there is no fallback arm at all, so a refused migration has nowhere to go"
+        );
+    }
+
+    /// Migration is a copy, a verification and then a DELETION of the user's
+    /// only profile, and every input that decides whether it may run has to
+    /// come from the machine.
+    ///
+    /// Two mutations, both of which make the whole suite green and the trap
+    /// undetectable: a hard-coded `MultiAccountAvailability::Available` (the
+    /// `relativeDataDir` trap makes the CLI ignore `BITWARDENCLI_APPDATA_DIR`,
+    /// so verification would read the PORTABLE profile -- it could pass while
+    /// proving nothing, and the source would then be deleted on the strength
+    /// of it), and a `status` closure that ignores the directory it is handed
+    /// and answers for whatever profile this process is pointed at.
+    #[test]
+    fn startup_asks_the_machine_the_questions_that_decide_whether_a_profile_is_deleted() {
+        let block = the_startup_account_block();
+        for required in [
+            concat!("bw_path::multi_account_", "availability()"),
+            concat!("migration::migration", "_source()"),
+            concat!("login_ui::check_bw_status_details", "_in"),
+            concat!("bw_serve::port", "_in_use("),
+        ] {
+            assert!(
+                block.contains(required),
+                "startup does not ask `{required}`: migration deletes the user's only profile, \
+                 and every input that decides whether it may is answered from the machine or \
+                 not at all"
+            );
+        }
+        // `CARGO_MANIFEST_DIR`, not `file!()`: the latter is relative to the
+        // package root and would depend on the test binary's working
+        // directory. Each banned needle is controlled against the module that
+        // really declares it, so a misspelled ban cannot pass by matching
+        // nothing anywhere.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (hard_coded, declared_in) in [
+            (concat!("MultiAccountAvailability::", "Available"), "bw_path.rs"),
+            (concat!("MigrationState::", "NothingToMigrate"), "migration.rs"),
+        ] {
+            let elsewhere = std::fs::read_to_string(src.join(declared_in))
+                .unwrap_or_else(|e| panic!("cannot read {declared_in}: {e}"));
+            assert!(
+                elsewhere.contains(hard_coded),
+                "the needle `{hard_coded}` is not spelled that way in {declared_in}, so the ban \
+                 below proves nothing"
+            );
+            assert!(
+                !block.contains(hard_coded),
+                "startup writes `{hard_coded}` itself instead of asking. A hard-coded answer \
+                 here is a migration that runs -- and deletes -- on the machine where the \
+                 `relativeDataDir` trap makes the verification prove nothing"
+            );
+        }
+        // Positive control on the same reader and the same region: a needle of
+        // exactly that shape that IS present, so the bans are not passing
+        // against a region that was cut down to nothing.
+        assert!(
+            block.contains(concat!("MigrationState::", "Blocked")),
+            "control: the region really does name `MigrationState` variants"
+        );
+    }
 }
