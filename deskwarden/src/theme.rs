@@ -1289,25 +1289,54 @@ pub const KEBAB_DOT_RADIUS: f32 = 1.7;
 /// The eye's pupil radius -- not [`KEBAB_DOT_RADIUS`], see there.
 const EYE_PUPIL_RADIUS: f32 = 2.4;
 
-/// Teeth around the settings gear. Eight is the fewest that still reads as a
-/// cog rather than a flower at 28px, and it keeps the outline's vertex count
-/// clear of every other drawn icon here (see [`GEAR_VERTICES`]).
-const GEAR_TEETH: usize = 8;
+/// Teeth around the settings gear. **Six, and it used to be eight.**
+///
+/// The user's note was that the gear looked outdated beside its neighbours,
+/// and what dated it was density: eight teeth on an 18px mark put a tooth
+/// every 45°, so at [`GEAR_STROKE`] the gaps between them are barely wider
+/// than the stroke itself and the outline reads as a serrated ring rather
+/// than as a cog. Its neighbours are all one or two marks -- five points
+/// ([`STAR_VERTICES`]), three dots, one almond and a pupil, two chevron
+/// strokes -- and six teeth is what puts the gear in their company.
+const GEAR_TEETH: usize = 6;
 
-/// Vertices in the gear's outline: four per tooth (rise, crown-out,
-/// crown-in, fall), so 32.
+/// Vertices in the gear's outline: **three** per tooth (crown-out, crown-in,
+/// valley), so 18.
+///
+/// It was four -- a flat root between every pair of teeth as well as a flat
+/// crown on each -- which is the other half of what made the old mark dense:
+/// two flats and two flanks per 45° sector is more corners than 18px can
+/// show. One valley point between neighbouring crowns draws the same cog with
+/// a third fewer corners.
 ///
 /// Deliberately distinct from [`STAR_VERTICES`] (10) and [`EYE_VERTICES`]
 /// (24) -- [`icon_probe`] tells these icons apart by vertex count alone, so
-/// two of them sharing one count would make each findable as the other.
-pub const GEAR_VERTICES: usize = GEAR_TEETH * 4;
+/// two of them sharing one count would make each findable as the other. That
+/// is a live constraint here rather than a note: six teeth at the old four
+/// points each would be 24, exactly the eye's, and
+/// `no_two_drawn_icons_share_a_vertex_count` is what refuses it.
+pub const GEAR_VERTICES: usize = GEAR_TEETH * 3;
 
 /// The gear's hub. Not [`KEBAB_DOT_RADIUS`] (1.7) and not
 /// [`EYE_PUPIL_RADIUS`] (2.4), for the same reason those two differ from
 /// each other: `icon_probe::kebab_dots` finds circles BY radius, and a hub
 /// that matched would be reported as a stray kebab dot in every frame the
 /// titlebar is painted in.
-const GEAR_HUB_RADIUS: f32 = 3.2;
+///
+/// Shrunk from 3.2 along with the tooth count. The hub is the gear's ONLY
+/// internal mark -- the counterpart of the eye's pupil -- and against a 6.6
+/// root radius a 3.2 ring sat nearly halfway out, making the mark read as
+/// three concentric bands.
+const GEAR_HUB_RADIUS: f32 = 2.8;
+
+/// The weight every drawn icon in this titlebar/header family is stroked at:
+/// the gear's outline and hub, the eye's almond, the switcher's chevron
+/// ([`SWITCHER_CHEVRON_STROKE`]).
+///
+/// At file scope because "the same styling as its neighbours" is the whole
+/// of what was asked for the gear, and a number written out separately in
+/// each of them is a number that drifts apart.
+pub const GEAR_STROKE: f32 = 1.3;
 
 /// The five-pointed star's outline, starting at the top point.
 ///
@@ -1453,20 +1482,24 @@ pub fn kebab_button(ui: &mut Ui, armed: bool) -> Response {
     response
 }
 
-/// The gear's outline: [`GEAR_TEETH`] square-ish teeth around a hub, walked
-/// once anticlockwise as a single closed path.
+/// The gear's outline: [`GEAR_TEETH`] flat-topped teeth separated by single
+/// valley points, walked once as a single closed path.
 ///
-/// Each tooth contributes four points -- the two roots either side of it at
-/// `root` radius and the two crown corners at `tip` -- so the path steps
-/// out, across, and back in for every tooth rather than being a star's
-/// alternating spikes. That is what makes it read as a cog: a gear's tooth
-/// has a flat top, a pentagram's point does not.
+/// Each tooth contributes three points -- its two crown corners at `tip`, and
+/// the one valley at `root` shared between it and the next tooth. The flat
+/// crown is what makes it read as a cog rather than as a star: a gear's tooth
+/// has a flat top, a pentagram's point does not. The single valley is what
+/// keeps it from reading as a serrated ring: with a flat root as well as a
+/// flat crown (which is what this drew before), every 60° of the mark carried
+/// four corners, and at 18px across that is more detail than the shape can
+/// show.
 fn gear_outline(center: Pos2, tip: f32, root: f32) -> Vec<Pos2> {
     // Half the angular width of one tooth's crown, as a fraction of the
-    // per-tooth sector. 0.30 leaves the gap between teeth slightly wider
-    // than the teeth themselves, which is what stops the outline reading as
-    // a plain scalloped circle at this size.
-    const CROWN_HALF: f32 = 0.30;
+    // per-tooth sector. The crown therefore spans `2 * CROWN_HALF` of the
+    // sector and the notch between two crowns the rest -- at 0.34 that is a
+    // 41° tooth and a 19° notch, so the flanks stay steep enough to read as
+    // teeth rather than as a scalloped circle.
+    const CROWN_HALF: f32 = 0.34;
     let sector = std::f32::consts::TAU / GEAR_TEETH as f32;
     let at = |angle: f32, radius: f32| {
         center + Vec2::new(radius * angle.cos(), radius * angle.sin())
@@ -1474,10 +1507,9 @@ fn gear_outline(center: Pos2, tip: f32, root: f32) -> Vec<Pos2> {
     let mut points = Vec::with_capacity(GEAR_VERTICES);
     for tooth in 0..GEAR_TEETH {
         let mid = tooth as f32 * sector;
-        points.push(at(mid - sector * 0.5 + sector * 0.10, root));
         points.push(at(mid - sector * CROWN_HALF, tip));
         points.push(at(mid + sector * CROWN_HALF, tip));
-        points.push(at(mid + sector * 0.5 - sector * 0.10, root));
+        points.push(at(mid + sector * 0.5, root));
     }
     debug_assert_eq!(points.len(), GEAR_VERTICES);
     points
@@ -1501,12 +1533,26 @@ fn gear_outline(center: Pos2, tip: f32, root: f32) -> Vec<Pos2> {
 /// (`toolbar_button_with_shortcut`'s `HEIGHT`, `draw_circle_avatar`'s
 /// `SIZE`), so its hit target is theirs rather than only as big as the mark.
 ///
+/// **Retuned to sit with the other drawn icons**, on the user's note that it
+/// looked outdated beside them. It is now two marks -- one closed outline and
+/// one hub ring -- at [`GEAR_STROKE`], which is what [`eye_toggle`] and
+/// [`account_switcher_button`] are; the eye is an almond and a pupil, the
+/// switcher two strokes, the kebab three dots. Six teeth rather than eight,
+/// three vertices per tooth rather than four, and a hub pulled in from 3.2 to
+/// [`GEAR_HUB_RADIUS`]: see those constants for what each was costing. The
+/// hit target and the two-state colouring are unchanged -- neither was the
+/// complaint.
+///
 /// Carries a hover label because, unlike Lock, it has no word on it --
 /// [`close_glyph`]'s "Dismiss" is the precedent for an unlabelled drawn
 /// control naming itself on hover.
 pub fn gear_button(ui: &mut Ui) -> Response {
     const SIZE: f32 = 28.0;
-    const TIP: f32 = 9.0;
+    // Shallower teeth than the 9.0/6.6 this drew before: the tooth is now
+    // 2.0 tall against a 6.6 root rather than 2.4, which is the last of the
+    // three things that made the old mark busy (the other two being the
+    // tooth count and the flat roots -- see `GEAR_TEETH` and `gear_outline`).
+    const TIP: f32 = 8.6;
     const ROOT: f32 = 6.6;
 
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
@@ -1521,12 +1567,13 @@ pub fn gear_button(ui: &mut Ui) -> Response {
     let center = rect.center();
     ui.painter().add(egui::Shape::closed_line(
         gear_outline(center, TIP, ROOT),
-        Stroke::new(1.3, color),
+        Stroke::new(GEAR_STROKE, color),
     ));
     // The hub, stroked rather than filled: a filled disc at this size closes
-    // the cog up into a blob, and the ring is what makes it a gear.
+    // the cog up into a blob, and the ring is what makes it a gear. It is
+    // this mark's only internal detail, exactly as the pupil is the eye's.
     ui.painter()
-        .circle_stroke(center, GEAR_HUB_RADIUS, Stroke::new(1.3, color));
+        .circle_stroke(center, GEAR_HUB_RADIUS, Stroke::new(GEAR_STROKE, color));
     response.on_hover_text("Preferences")
 }
 
@@ -1546,7 +1593,10 @@ const SWITCHER_CHEVRON_DROP: f32 = 2.6;
 /// above: `Shape::visual_bounding_rect` expands a line segment by half the
 /// stroke at each end, so a probe matching on the raw arm and drop finds
 /// nothing at all.
-const SWITCHER_CHEVRON_STROKE: f32 = 1.3;
+///
+/// [`GEAR_STROKE`] by definition rather than by coincidence: these two
+/// controls sit next to each other in the same 28px strip.
+const SWITCHER_CHEVRON_STROKE: f32 = GEAR_STROKE;
 
 /// The vault titlebar's account switcher: a downward chevron, 28px square,
 /// sized and coloured exactly like [`gear_button`] beside it.
@@ -1634,7 +1684,10 @@ pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
     let painter = ui.painter();
     painter.add(egui::Shape::closed_line(
         eye_outline(center, HALF_W, HALF_H),
-        Stroke::new(1.3, color),
+        // [`GEAR_STROKE`]: this is the weight the drawn-icon family shares,
+        // and the gear was retuned to sit with this eye rather than the
+        // other way round.
+        Stroke::new(GEAR_STROKE, color),
     ));
     painter.circle_filled(center, EYE_PUPIL_RADIUS, color);
     if revealed {
@@ -2705,5 +2758,307 @@ mod tests {
                 "a quadrant no longer touches the shield center"
             );
         }
+    }
+}
+
+/// **The drawn-icon family, measured against each other rather than each
+/// against itself.**
+///
+/// The user's note on the settings gear was comparative -- "looks outdated,
+/// use the same styling (more minimalistic)" -- so every assertion here is
+/// comparative too: the gear's stroke weight, its hit target and its mark
+/// count are checked against [`eye_toggle`], [`account_switcher_button`] and
+/// [`kebab_button`] beside it, not against numbers copied out of
+/// [`gear_button`]. A test that restated the gear's own constants would pass
+/// against any gear at all, including the one that prompted the note.
+#[cfg(test)]
+mod drawn_icon_family_tests {
+    use super::*;
+
+    /// One frame at a size big enough for a row of 28px controls, with this
+    /// app's real font set installed -- `apply` only takes effect at the
+    /// start of the *next* frame, which is why the styling frame is run and
+    /// discarded first (the same dance `tests::ctx_with_fonts` does).
+    fn frame(mut build: impl FnMut(&mut Ui)) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let output = ctx.run_ui(input(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| build(ui));
+        });
+        output.shapes.into_iter().map(|c| c.shape).collect()
+    }
+
+    /// Every shape in `shapes`, flattened out of the `Shape::Vec` nesting
+    /// egui builds, that paints inside `within`.
+    fn marks_in(shapes: &[egui::Shape], within: Rect) -> Vec<egui::Shape> {
+        fn walk(shape: &egui::Shape, within: Rect, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, within, out);
+                    }
+                }
+                egui::Shape::Noop => {}
+                other => {
+                    let rect = other.visual_bounding_rect();
+                    // `is_finite` rejects the sentinel `Rect::NOTHING` an
+                    // empty shape reports, which `contains_rect` would
+                    // otherwise answer "yes" to for every box on screen.
+                    if rect.is_finite() && within.expand(1.0).contains_rect(rect) {
+                        out.push(other.clone());
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for shape in shapes {
+            walk(shape, within, &mut out);
+        }
+        out
+    }
+
+    /// The stroke width of one painted mark, whichever of the three stroked
+    /// shape kinds it is. `None` for a glyph, and `None` for a purely FILLED
+    /// mark -- the eye's pupil is a `circle_filled`, which reports width 0
+    /// and is not a stroke weight this family shares or should be compared
+    /// against. A mark that quietly became a fill therefore disappears from
+    /// the weight comparison rather than passing it; what catches that is
+    /// `the_gear_carries_no_more_marks_than_the_eye_beside_it`, which counts
+    /// marks of every kind.
+    fn stroke_width(shape: &egui::Shape) -> Option<f32> {
+        let width = match shape {
+            egui::Shape::Path(p) => p.stroke.width,
+            egui::Shape::Circle(c) => c.stroke.width,
+            egui::Shape::LineSegment { stroke, .. } => stroke.width,
+            _ => return None,
+        };
+        (width > 0.0).then_some(width)
+    }
+
+    /// Lays out one control, alone, and returns its allocated rect together
+    /// with everything painted inside it.
+    fn control(mut draw: impl FnMut(&mut Ui) -> Response) -> (Rect, Vec<egui::Shape>) {
+        let rect = std::cell::Cell::new(Rect::NOTHING);
+        let shapes = frame(|ui| {
+            rect.set(draw(ui).rect);
+        });
+        let rect = rect.get();
+        let marks = marks_in(&shapes, rect);
+        (rect, marks)
+    }
+
+    /// **The constraint that decided the gear's vertex count**, and it is not
+    /// decorative: [`icon_probe`] identifies these three outlines by point
+    /// count ALONE, so two of them sharing a count makes each findable as the
+    /// other -- `icon_probe::gears` would report every eye in the frame as a
+    /// gear, and the titlebar's own gear-placement tests would then be
+    /// asserting about whichever mark happened to be found first.
+    ///
+    /// It is a live tripwire rather than a note. Six teeth at the four
+    /// vertices each the gear used to use is 24, which is exactly
+    /// [`EYE_VERTICES`]; the three-vertex tooth was chosen to clear it.
+    #[test]
+    fn no_two_drawn_icons_share_a_vertex_count() {
+        for (a, a_name, b, b_name) in [
+            (GEAR_VERTICES, "the gear", EYE_VERTICES, "the eye"),
+            (GEAR_VERTICES, "the gear", STAR_VERTICES, "the star"),
+            (EYE_VERTICES, "the eye", STAR_VERTICES, "the star"),
+        ] {
+            assert_ne!(
+                a, b,
+                "{a_name} and {b_name} both close over {a} points, and `icon_probe` tells \
+                 these outlines apart by point count alone -- so each is now findable as \
+                 the other and every probe over them is reporting the wrong mark"
+            );
+        }
+    }
+
+    /// **The gear is stroked at the weight its neighbours are.** Read off the
+    /// painted shapes rather than off [`GEAR_STROKE`]: the constant being
+    /// shared is only evidence that the source says so, and the eye, the
+    /// chevron and the gear each hand their stroke to a different egui shape
+    /// kind (`Path`, `LineSegment`, `Circle`), any of which could stop
+    /// honouring it.
+    #[test]
+    fn the_gear_is_stroked_at_the_weight_the_eye_and_the_switcher_are() {
+        let (_, gear) = control(gear_button);
+        let (_, eye) = control(|ui| eye_toggle(ui, false));
+        let (_, switcher) = control(account_switcher_button);
+
+        let widths = |marks: &[egui::Shape]| -> Vec<f32> {
+            marks.iter().filter_map(stroke_width).collect()
+        };
+        let gear_widths = widths(&gear);
+        let eye_widths = widths(&eye);
+        let switcher_widths = widths(&switcher);
+
+        // Positive controls: all three really did paint stroked marks. Without
+        // these, a control that painted nothing at all would satisfy every
+        // comparison below by having no widths to disagree about.
+        for (found, what) in [
+            (&gear_widths, "the gear"),
+            (&eye_widths, "the eye"),
+            (&switcher_widths, "the switcher"),
+        ] {
+            assert!(
+                !found.is_empty(),
+                "{what} painted no stroked mark at all, so the weight comparison below \
+                 compares nothing"
+            );
+        }
+
+        let reference = eye_widths[0];
+        for width in gear_widths.iter().chain(&switcher_widths).chain(&eye_widths) {
+            assert!(
+                (width - reference).abs() < 0.01,
+                "this family is stroked at {reference} but a mark here is stroked at \
+                 {width}: gear {gear_widths:?}, eye {eye_widths:?}, switcher \
+                 {switcher_widths:?}"
+            );
+        }
+    }
+
+    /// **The gear is as few marks as the eye is.** The eye is an almond and a
+    /// pupil; the gear is an outline and a hub. That parity is the whole of
+    /// "more minimalistic" that can be measured -- a spoke, a second ring or
+    /// an inner shadow added to the gear would put it ahead of every
+    /// neighbour again, which is the state the user complained about.
+    ///
+    /// Counted against the kebab too, which is the family's ceiling at three.
+    #[test]
+    fn the_gear_carries_no_more_marks_than_the_eye_beside_it() {
+        let (_, gear) = control(gear_button);
+        let (_, eye) = control(|ui| eye_toggle(ui, false));
+        let (_, kebab) = control(|ui| kebab_button(ui, false));
+
+        // Positive control: `marks_in` really does find marks, so the counts
+        // below are counts of something.
+        assert_eq!(
+            kebab.len(),
+            3,
+            "the kebab is three dots and `marks_in` found {} shapes in it -- this helper \
+             has stopped seeing what these controls paint, so the gear's count means \
+             nothing either",
+            kebab.len()
+        );
+        assert_eq!(
+            eye.len(),
+            2,
+            "the eye is an almond and a pupil and `marks_in` found {} shapes in it",
+            eye.len()
+        );
+        assert!(
+            gear.len() <= eye.len(),
+            "the gear paints {} marks against the eye's {} beside it, so it is again the \
+             busiest icon in a family of one- and two-mark shapes",
+            gear.len(),
+            eye.len()
+        );
+    }
+
+    /// **Fewer teeth, measured off the painted path** rather than read back
+    /// out of [`GEAR_TEETH`] -- a test that asserted the constant equals
+    /// itself would pass against the eight-tooth mark that prompted this.
+    ///
+    /// A tooth is a pair of crown corners out at the tip radius; the valleys
+    /// sit in at the root. Eight is what it was and is therefore the bound;
+    /// five is the floor below which the mark stops reading as a cog at all
+    /// (a five-crowned ring is a flower).
+    #[test]
+    fn the_gear_has_fewer_teeth_than_the_eight_it_had() {
+        let center = Pos2::new(50.0, 50.0);
+        let outline = gear_outline(center, 8.6, 6.6);
+        let far = outline
+            .iter()
+            .map(|p| (*p - center).length())
+            .fold(0.0f32, f32::max);
+        // Crown corners sit at the tip radius, valleys well inside it.
+        let crowns = outline
+            .iter()
+            .filter(|p| ((**p - center).length() - far).abs() < 0.01)
+            .count();
+        // Positive control: the outline really has both kinds of point. An
+        // outline that had collapsed onto one radius would otherwise report
+        // every point as a crown and still satisfy a bound.
+        assert!(
+            crowns < outline.len(),
+            "every one of the gear outline's {} points is at the tip radius, so it is a \
+             polygon and not a cog",
+            outline.len()
+        );
+        assert_eq!(
+            crowns % 2,
+            0,
+            "found {crowns} crown corners, which is not a whole number of flat-topped \
+             teeth -- this measurement has stopped matching what `gear_outline` draws"
+        );
+        let teeth = crowns / 2;
+        assert!(
+            (5..8).contains(&teeth),
+            "the gear has {teeth} teeth: eight is what the user called outdated and five \
+             is where a cog becomes a flower"
+        );
+    }
+
+    /// **28px, the same target the controls beside it have.** The mark got
+    /// smaller and lighter; the thing the user has to hit did not.
+    #[test]
+    fn the_gear_keeps_its_neighbours_hit_target() {
+        let (gear, _) = control(gear_button);
+        let (eye, _) = control(|ui| eye_toggle(ui, false));
+        let (switcher, _) = control(account_switcher_button);
+
+        assert!(
+            gear.width() > 0.0 && gear.height() > 0.0,
+            "the gear allocated nothing at all, so the comparisons below are between \
+             empty rects"
+        );
+        assert_eq!(
+            gear.size(),
+            eye.size(),
+            "the gear's hit target is {:?} against the eye's {:?}",
+            gear.size(),
+            eye.size()
+        );
+        assert_eq!(
+            gear.size(),
+            switcher.size(),
+            "the gear's hit target is {:?} against the switcher's {:?}",
+            gear.size(),
+            switcher.size()
+        );
+    }
+
+    /// **Still a stroked shape, not a codepoint.**
+    /// `the_icon_codepoints_are_not_carried_by_this_apps_own_typeface`
+    /// records why: the gear codepoint resolves here only out of egui's
+    /// bundled icon fallback, at a weight and baseline nobody in this app
+    /// chose. "Make it more minimalistic" is exactly the note that gets
+    /// answered by reaching for a glyph, so the absence is pinned.
+    #[test]
+    fn the_gear_paints_no_text() {
+        let (rect, gear) = control(gear_button);
+        assert!(
+            !gear.iter().any(|s| matches!(s, egui::Shape::Text(_))),
+            "the gear painted a text shape -- it is a typed glyph again"
+        );
+        // The positive control: a text shape drawn in this same harness IS
+        // found, so the absence above is the gear's and not the walker's.
+        let with_text = frame(|ui| {
+            ui.put(rect, egui::Label::new("\u{2699}"));
+        });
+        assert!(
+            marks_in(&with_text, rect)
+                .iter()
+                .any(|s| matches!(s, egui::Shape::Text(_))),
+            "a label painted into the gear's own rect produced no text shape either, so \
+             the assertion above proves nothing about the gear"
+        );
     }
 }
