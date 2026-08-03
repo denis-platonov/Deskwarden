@@ -1377,8 +1377,17 @@ impl VaultCache {
     /// An item that is somehow BOTH is not a state this backend has been
     /// observed to produce, and inventing handling for it would be modelling
     /// from memory.
-    pub fn unarchive_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+    ///
+    /// **Returns the item as it was stored, not `Ok(())`**, for
+    /// [`Self::set_favorite`]'s reason exactly: the vault window keeps its own
+    /// `Vec`, and pushing the caller's copy into it after this call is what
+    /// put a superseded revision token back in front of the next write. See
+    /// [`Self::current_revision_of`].
+    pub fn unarchive_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         self.bridge.unarchive_item(&item.id)?;
+        // Both bridge calls BEFORE `self.lock()`: no lock may be held across
+        // HTTP, and this one is HTTP too.
+        let unarchived = self.current_revision_of(item);
         let mut snapshot = self.lock();
         if !snapshot.populated {
             drop(snapshot);
@@ -1387,14 +1396,58 @@ impl VaultCache {
                  it through to; the vault has it live and any populate will bring it in",
                 item.id
             );
-            return Ok(());
+            return Ok(unarchived);
         }
         match snapshot.items.iter().position(|i| i.id == item.id) {
-            Some(at) => snapshot.items[at] = item.clone(),
-            None => snapshot.items.push(item.clone()),
+            Some(at) => snapshot.items[at] = unarchived.clone(),
+            None => snapshot.items.push(unarchived.clone()),
         }
         snapshot.note_item_write(&item.id, false);
-        Ok(())
+        Ok(unarchived)
+    }
+
+    /// `item` with the revision token the server currently reports for it, or
+    /// `item` unchanged when that read fails.
+    ///
+    /// **The third stale-token path.** `fba91ff` fixed the two writes that
+    /// answer with the server's copy ([`Self::update_item`],
+    /// [`Self::move_item_to_folder`], and [`Self::set_favorite`] through the
+    /// first) by adopting that copy. `POST /restore/item/{id}` -- the one
+    /// route behind both [`Self::restore_item`] and [`Self::unarchive_item`]
+    /// -- answers with a body this crate has never verified the shape of, so
+    /// those two stored the CALLER's copy instead, token and all. Its token is
+    /// the one the item had before the restore. If this backend bumps
+    /// `revisionDate` on a restore, the very next write of that item is
+    /// refused with the 400 in `vault_bridge`'s `REVISION_DATE_KEY` -- and the
+    /// user's report that started all of this was a favourite that "shows as
+    /// faved in folder but not in original client", which is that 400 exactly.
+    ///
+    /// **Whether this backend bumps the token on a restore is NOT verified.**
+    /// `bw serve` was not running when this was written, so the code fact (the
+    /// caller's token was kept) is what was established and the consequence is
+    /// inferred. That is why this reads the token rather than assuming either
+    /// answer: if the restore does not bump, the read returns the same string
+    /// and this is a no-op; if it does, the stale one never reaches the
+    /// snapshot. The cost is one `GET /object/item/{id}` per restore, on a
+    /// gesture a user makes by hand.
+    ///
+    /// **A failed read is not a failed restore.** The write already succeeded,
+    /// so this cannot turn it into an error; it falls back to the caller's
+    /// copy, which is precisely today's behaviour, and says so in the log.
+    fn current_revision_of(&self, item: &VaultItem) -> VaultItem {
+        match self.bridge.get_item(&item.id) {
+            Ok(server) => crate::vault_bridge::with_revision_date_from(item, &server),
+            Err(e) => {
+                log::warn!(
+                    "could not read vault item {} back after taking it out of the trash or the \
+                     archive, so this app is holding the revision token the item had BEFORE that \
+                     write ({e:?}); if the backend advanced it, the next edit of this item will \
+                     be refused until the next full refresh",
+                    item.id
+                );
+                item.clone()
+            }
+        }
     }
 
     /// Takes `item` out of the trash and puts it back in the live snapshot.
@@ -1426,9 +1479,13 @@ impl VaultCache {
     /// `a_restore_overrides_the_pending_delete_that_trashed_the_item` walks
     /// exactly that, deterministically.
     ///
-    /// Returns `Result<(), VaultError>` rather than an [`AppMatchWrite`]-style
-    /// outcome, on the same test that doc sets (the two misses must demand
-    /// identical caller behaviour):
+    /// **Returns the item as it was stored**, carrying the revision token the
+    /// server reports NOW rather than the one the trashed copy arrived with --
+    /// see [`Self::current_revision_of`], and hand it to whatever local list
+    /// the caller keeps.
+    ///
+    /// Returns no [`AppMatchWrite`]-style miss/hit outcome, on the same test
+    /// that doc sets (the two misses must demand identical caller behaviour):
     ///
     ///  * **Cache unpopulated.** Write-through skipped, and self-curing: any
     ///    populate fetches from a server that has the item live. Note that the
@@ -1440,11 +1497,12 @@ impl VaultCache {
     ///
     /// Nothing arms itself from an item's trashed-ness, so neither case leaves
     /// a consumer acting on a claim the vault does not support.
-    pub fn restore_item(&self, item: &VaultItem) -> Result<(), VaultError> {
+    pub fn restore_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
         // Bridge call BEFORE `self.lock()`, like every other write here: no
-        // lock may be held across HTTP.
+        // lock may be held across HTTP -- and `current_revision_of` is a
+        // second HTTP call, so it goes here too and not below the lock.
         self.bridge.restore_item(&item.id)?;
-        let restored = without_deleted_date(item);
+        let restored = self.current_revision_of(&without_deleted_date(item));
         let mut snapshot = self.lock();
         if !snapshot.populated {
             drop(snapshot);
@@ -1453,7 +1511,7 @@ impl VaultCache {
                  it through to; the vault has it live and any populate will bring it in",
                 item.id
             );
-            return Ok(());
+            return Ok(restored);
         }
         match snapshot.items.iter().position(|i| i.id == item.id) {
             // A restored item is by definition absent from the live snapshot,
@@ -1461,14 +1519,14 @@ impl VaultCache {
             // reachable when an older populate's fetch still carried the item
             // as live. Replacing rather than pushing there is what keeps the
             // snapshot from holding the same id twice.
-            Some(at) => snapshot.items[at] = restored,
-            None => snapshot.items.push(restored),
+            Some(at) => snapshot.items[at] = restored.clone(),
+            None => snapshot.items.push(restored.clone()),
         }
         // UNCONDITIONAL, unlike the `position`-guarded writes above: both arms
         // changed the snapshot, and this entry has a stale `deleted: true` to
         // overwrite. See the doc.
         snapshot.note_item_write(&item.id, false);
-        Ok(())
+        Ok(restored)
     }
 
     /// Deletes a trashed item for good, via
@@ -3580,6 +3638,228 @@ mod tests {
         assert!(!live.iter().any(|i| i.id == "t1"));
     }
 
+    // --- The third stale-token path ----------------------------------------
+    //
+    // `fba91ff` fixed `update_item`, `move_item_to_folder` and `set_favorite`
+    // by adopting the copy the server answered with. `POST /restore/item/{id}`
+    // answers with nothing this crate has verified, so restore and unarchive
+    // stored the CALLER's copy -- token and all -- and the token in it is the
+    // one the item had BEFORE the restore. See `current_revision_of`.
+
+    const TOKEN_BEFORE: &str = "2026-07-30T09:15:00.000Z";
+    const TOKEN_AFTER: &str = "2026-08-03T11:47:19.101Z";
+
+    /// The trash, with a revision token on the item -- which the real backend
+    /// puts on every item and `trash_body` above simply does not model.
+    fn trash_body_with_a_token() -> String {
+        format!(
+            r#"{{"success":true,"data":{{"data":[
+                {{"id":"t1","name":"Old thing","fields":[],"type":1,
+                 "deletedDate":"{TOKEN_BEFORE}","revisionDate":"{TOKEN_BEFORE}"}}
+            ]}}}}"#
+        )
+    }
+
+    fn mock_trash_with_a_token(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(trash_body_with_a_token())
+            .create()
+    }
+
+    /// `GET /object/item/t1` answering the way a backend mid-settle would:
+    /// the NEW token, on an otherwise **pre-restore** copy -- still trashed,
+    /// and under a name the caller's copy does not have. Deliberately hostile,
+    /// because `current_revision_of` must take one key off this and nothing
+    /// else.
+    fn mock_read_back_mid_settle(server: &mut mockito::Server) -> mockito::Mock {
+        server
+            .mock("GET", "/object/item/t1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":
+                    {{"id":"t1","name":"NOT the caller's name","fields":[],"type":1,
+                     "deletedDate":"{TOKEN_BEFORE}","revisionDate":"{TOKEN_AFTER}"}}
+                }}"#
+            ))
+            .create()
+    }
+
+    fn revision_of(item: &VaultItem) -> Option<&str> {
+        item.other.get("revisionDate").and_then(|v| v.as_str())
+    }
+
+    #[test]
+    fn a_restore_leaves_the_snapshot_holding_the_token_the_backend_reports() {
+        // THE REVIEWER'S PROBE, resolved. It passed against the old code:
+        // after `cache.restore_item` the snapshot still held the PRE-restore
+        // `revisionDate`, so the next write of that item was refused with the
+        // 400 in `vault_bridge`'s `REVISION_DATE_KEY` -- which is the user's
+        // report ("shows as faved in folder but not in original client")
+        // exactly, one door along from where `fba91ff` closed it.
+        //
+        // Reverting `current_revision_of` to `item.clone()` gives
+        //     the snapshot kept the pre-restore revision token
+        //     left: Some("2026-07-30T09:15:00.000Z")
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = mock_trash_with_a_token(&mut server);
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let _g = mock_read_back_mid_settle(&mut server);
+
+        let item = the_trashed_item(&cache);
+        assert_eq!(
+            revision_of(&item),
+            Some(TOKEN_BEFORE),
+            "the premise: the trashed copy the caller holds carries the old token"
+        );
+
+        let restored = cache.restore_item(&item).unwrap();
+
+        assert_eq!(
+            revision_of(&restored),
+            Some(TOKEN_AFTER),
+            "the caller was handed the pre-restore revision token"
+        );
+        let back = cache.items().into_iter().find(|i| i.id == "t1").expect("the restored item");
+        assert_eq!(
+            revision_of(&back),
+            Some(TOKEN_AFTER),
+            "the snapshot kept the pre-restore revision token"
+        );
+    }
+
+    #[test]
+    fn the_read_back_contributes_the_token_and_nothing_else() {
+        // The positive control for the test above, and the one that pins the
+        // decision rather than the outcome: `current_revision_of` could have
+        // been "swap in the server's copy", which satisfies the token
+        // assertion and reinstates `deletedDate` on a live item -- the exact
+        // key `without_deleted_date` exists to keep out, at a backend whose
+        // handling of it is unverified.
+        //
+        // Replacing `with_revision_date_from(item, &server)` with `server`
+        // gives
+        //     the read-back's whole copy was swapped in, not just its token
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = mock_trash_with_a_token(&mut server);
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let _g = mock_read_back_mid_settle(&mut server);
+
+        let restored = cache.restore_item(&the_trashed_item(&cache)).unwrap();
+
+        assert_eq!(
+            restored.name, "Old thing",
+            "the read-back's whole copy was swapped in, not just its token"
+        );
+        assert_eq!(
+            crate::vault_bridge::deleted_date(&restored),
+            None,
+            "a restored item was put back into the live snapshot still claiming a deletion date"
+        );
+    }
+
+    #[test]
+    fn after_a_restore_the_next_write_carries_the_new_token() {
+        // The consequence, on the wire. The PUT mock answers ONLY a body
+        // carrying the post-restore token; mockito returns 501 for anything
+        // else, so a `set_favorite` built from a stale copy comes back `Err`.
+        // This is `bw serve`'s optimistic-concurrency check, modelled.
+        //
+        // Reverting `current_revision_of` to `item.clone()` gives
+        //     favouriting a just-restored item was refused
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = mock_trash_with_a_token(&mut server);
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let _g = mock_read_back_mid_settle(&mut server);
+        let _p = server
+            .mock("PUT", "/object/item/t1")
+            .match_body(mockito::Matcher::Regex(format!("revisionDate\":\"{TOKEN_AFTER}")))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":
+                    {{"id":"t1","name":"Old thing","fields":[],"type":1,"favorite":true,
+                     "revisionDate":"{TOKEN_AFTER}"}}
+                }}"#
+            ))
+            .create();
+
+        let restored = cache.restore_item(&the_trashed_item(&cache)).unwrap();
+
+        assert!(
+            cache.set_favorite(&restored, true).is_ok(),
+            "favouriting a just-restored item was refused -- the write carried a token the \
+             backend had already superseded, which is the reported bug"
+        );
+    }
+
+    #[test]
+    fn the_pre_restore_token_is_not_what_goes_back_on_the_wire() {
+        // The other half of the test above: it proves a write is accepted when
+        // the mock demands the NEW token, and this proves one is refused when
+        // the mock demands the OLD one. Together they say the token on the
+        // wire really is the read-back's, rather than that this app now sends
+        // some token or none.
+        //
+        // Reverting `current_revision_of` to `item.clone()` makes this PASS
+        // the write and fail here with
+        //     the stale pre-restore token is still what this app sends
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = mock_trash_with_a_token(&mut server);
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let _g = mock_read_back_mid_settle(&mut server);
+        let _p = server
+            .mock("PUT", "/object/item/t1")
+            .match_body(mockito::Matcher::Regex(format!("revisionDate\":\"{TOKEN_BEFORE}")))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"id":"t1","name":"Old thing","fields":[]}}"#)
+            .create();
+
+        let restored = cache.restore_item(&the_trashed_item(&cache)).unwrap();
+
+        assert!(
+            cache.set_favorite(&restored, true).is_err(),
+            "the stale pre-restore token is still what this app sends"
+        );
+    }
+
+    #[test]
+    fn a_read_back_that_fails_still_leaves_the_restore_successful() {
+        // The write already landed on the server, so a failed read-back cannot
+        // turn it into an error -- that would tell the user their restore
+        // failed when the item is sitting live in their vault. It falls back
+        // to the caller's copy, which is precisely the behaviour this replaced,
+        // and says so in the log.
+        //
+        // Making `current_revision_of`'s `Err` arm return the error instead
+        // gives a panic on the `unwrap` below, with the 501 in it.
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        let _t = mock_trash_with_a_token(&mut server);
+        let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
+        let _g = server.mock("GET", "/object/item/t1").with_status(500).create();
+
+        let restored = cache.restore_item(&the_trashed_item(&cache)).unwrap();
+
+        assert_eq!(revision_of(&restored), Some(TOKEN_BEFORE));
+        assert_eq!(
+            crate::vault_bridge::deleted_date(&restored),
+            None,
+            "the fallback must still be the RESTORED shape, not the raw trashed one"
+        );
+        let back = cache.items().into_iter().find(|i| i.id == "t1").expect("the restored item");
+        assert_eq!(back.name, "Old thing", "a failed read-back must not cost the write-through");
+    }
+
     #[test]
     fn a_restore_overrides_the_pending_delete_that_trashed_the_item() {
         // THE ONE PLACE THIS FEATURE CAN BE WRONG, walked deterministically.
@@ -3859,6 +4139,70 @@ mod tests {
         assert!(
             !cache.items().iter().any(|i| i.id == "a1"),
             "a failed unarchive put the item into the live snapshot anyway"
+        );
+    }
+
+    #[test]
+    fn an_unarchive_leaves_the_snapshot_holding_the_token_the_backend_reports() {
+        // The same defect as the restore's, and the same fix: an unarchive
+        // goes down the very same `POST /restore/item/{id}` route (see
+        // `VaultBridge::unarchive_item`), so it too stored the caller's copy
+        // and the caller's token. Asserted separately rather than trusted to
+        // the restore's test, because they are two functions and only one of
+        // them was ever fixed by hand.
+        //
+        // Reverting `current_revision_of` to `item.clone()` gives
+        //     the snapshot kept the pre-unarchive revision token
+        //     left: Some("2026-07-30T09:15:00.000Z")
+        let mut server = mockito::Server::new();
+        let cache = populated_cache(&mut server);
+        server
+            .mock("GET", "/list/object/items")
+            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":{{"data":[
+                    {{"id":"a1","name":"Put aside","fields":[],"type":1,
+                     "revisionDate":"{TOKEN_BEFORE}"}}
+                ]}}}}"#
+            ))
+            .create();
+        let _u = server.mock("POST", "/restore/item/a1").with_status(200).create();
+        let _g = server
+            .mock("GET", "/object/item/a1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"success":true,"data":
+                    {{"id":"a1","name":"NOT the caller's name","fields":[],"type":1,
+                     "revisionDate":"{TOKEN_AFTER}"}}
+                }}"#
+            ))
+            .create();
+
+        let item = cache.list_archive().unwrap().into_iter().next().unwrap();
+        assert_eq!(revision_of(&item), Some(TOKEN_BEFORE), "the premise");
+
+        let unarchived = cache.unarchive_item(&item).unwrap();
+
+        assert_eq!(
+            revision_of(&unarchived),
+            Some(TOKEN_AFTER),
+            "the caller was handed the pre-unarchive revision token"
+        );
+        let back = cache.items().into_iter().find(|i| i.id == "a1").expect("the unarchived item");
+        assert_eq!(
+            revision_of(&back),
+            Some(TOKEN_AFTER),
+            "the snapshot kept the pre-unarchive revision token"
+        );
+        // POSITIVE CONTROL, the same one the restore's has: only the token is
+        // taken off the read-back. Swapping the whole copy in would pass every
+        // assertion above and rename the user's item.
+        assert_eq!(
+            back.name, "Put aside",
+            "the read-back's whole copy was swapped in, not just its token"
         );
     }
 

@@ -4,12 +4,11 @@ use std::collections::HashMap;
 
 pub struct MatchEngine {
     by_process: HashMap<String, (String, AppMatch)>,
-    unmatchable_hosts: Vec<(String, String)>,
 }
 
 impl MatchEngine {
     pub fn new() -> Self {
-        Self { by_process: HashMap::new(), unmatchable_hosts: Vec::new() }
+        Self { by_process: HashMap::new() }
     }
 
     /// Rebuilds the lookup table, **dropping every entry whose process is a
@@ -26,43 +25,43 @@ impl MatchEngine {
     ///
     /// **Dropped here, and nowhere else.** This app does not rewrite the
     /// user's vault behind their back, so the field stays exactly as they
-    /// saved it; what changes is that autofill stops acting on it. The
-    /// dropped entries are kept in [`Self::unmatchable_hosts`] so the "Add
-    /// app..." flow can tell the user which item is affected and let them
-    /// replace it themselves.
+    /// saved it; what changes is that autofill stops acting on it.
+    ///
+    /// **The user is told by `picker_ui::existing_host_match_notice`, not by
+    /// anything this type hands back.** A `Vec` of the dropped pairs and an
+    /// `unmatchable_hosts()` accessor lived here for exactly that purpose and
+    /// never acquired a caller -- complete, correct and unreachable, which a
+    /// `pub` function in a lib crate produces no warning for. `MatchEngine` is
+    /// owned by `main`'s event loop and the picker is a separate window with
+    /// no reference to it, so the report had nowhere to go. The picker derives
+    /// the same fact where it is actually usable: straight off the target
+    /// item's own `deskwarden:app-match` field, on the screen where Save
+    /// replaces it. Deleting the accessor therefore cost nothing but its own
+    /// tests. The `log::warn!` below is what remains, and it is a trace for
+    /// the developer, not a surface for the user.
+    ///
+    /// So a user whose match went quiet is told **when they next open "Add
+    /// app..." on that item**, and not at the moment it goes quiet. Closing
+    /// that gap needs a channel out of `main`'s loop -- a tray balloon, say --
+    /// which is a decision about `main.rs`, not about this file.
     pub fn rebuild(&mut self, entries: &[(String, AppMatch)]) {
         self.by_process = entries
             .iter()
             .filter(|(_, m)| !is_host_process(&m.process))
             .map(|(item_id, m)| (m.process.to_lowercase(), (item_id.clone(), m.clone())))
             .collect();
-        self.unmatchable_hosts = entries
-            .iter()
-            .filter(|(_, m)| is_host_process(&m.process))
-            .map(|(item_id, m)| (item_id.clone(), m.process.clone()))
-            .collect();
 
         // Logged here rather than at the four `rebuild` call sites in `main`,
         // because there are four of them and a warning that only three carry
         // is a warning that goes missing on the fourth path.
-        for (item_id, process) in &self.unmatchable_hosts {
+        for (item_id, m) in entries.iter().filter(|(_, m)| is_host_process(&m.process)) {
+            let process = &m.process;
             log::warn!(
                 "ignoring the app match on vault item {item_id}: {process} owns the top-level \
                  window for every Microsoft Store app, so this match would fire on all of them. \
                  The vault is unchanged -- re-add the app from \"Add app...\" to replace it"
             );
         }
-    }
-
-    /// The `(item_id, process)` pairs [`Self::rebuild`] refused to load
-    /// because their process is a window host, in the order they arrived.
-    ///
-    /// Empty in the ordinary case. Non-empty means the user has a stored
-    /// match that this app is deliberately ignoring, and they have not been
-    /// told anything about it yet -- so every caller of this is a place that
-    /// tells them.
-    pub fn unmatchable_hosts(&self) -> &[(String, String)] {
-        &self.unmatchable_hosts
     }
 
     /// Drops every match, so nothing can be looked up until a rebuild.
@@ -78,7 +77,6 @@ impl MatchEngine {
     /// look like.
     pub fn clear(&mut self) {
         self.by_process.clear();
-        self.unmatchable_hosts.clear();
     }
 
     pub fn lookup(&self, exe_name: &str) -> Option<(&str, &AppMatch)> {
@@ -187,56 +185,31 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_host_entry_is_reported_so_the_user_can_be_told_which_item_it_is() {
-        // Nothing is rewritten in the vault, so the ONLY way the user ever
-        // learns their match went quiet is this list. Returning an empty
-        // slice from `unmatchable_hosts` gives
-        //     left: []  right: [("keepsolid", "ApplicationFrameHost.exe")]
-        let mut engine = MatchEngine::new();
-        engine.rebuild(&[
-            entry("keepsolid", "ApplicationFrameHost.exe", TriggerMode::Prompt),
-            entry("ledgerline", "Ledgerline.exe", TriggerMode::Auto),
-        ]);
-
-        assert_eq!(
-            engine.unmatchable_hosts(),
-            [("keepsolid".to_string(), "ApplicationFrameHost.exe".to_string())]
-        );
-    }
-
-    #[test]
-    fn an_ordinary_vault_reports_nothing_unmatchable() {
-        // Paired with the test above: a `unmatchable_hosts` that reported
-        // every entry, or one that reported a fixed value, fails here.
-        let mut engine = MatchEngine::new();
-        engine.rebuild(&[entry("ledgerline", "Ledgerline.exe", TriggerMode::Auto)]);
-
-        assert!(engine.unmatchable_hosts().is_empty());
-    }
-
-    #[test]
-    fn a_rebuild_without_host_entries_clears_a_previous_report() {
-        // `unmatchable_hosts` is rebuilt, not appended to: once the user has
-        // replaced the bad match, the picker must stop telling them about it.
+    fn replacing_a_host_entry_with_a_real_one_makes_the_replacement_live() {
+        // What the deleted `unmatchable_hosts` report used to be asserted
+        // through, said in terms of the only thing `rebuild` actually changes:
+        // the lookup table. Deleting the `self.by_process = ...` assignment
+        // (so a rebuild keeps the previous table) gives
+        //     "the replacement must actually be live"
+        // and inverting the filter's sense gives
+        //     "the bad entry survived its own replacement"
         let mut engine = MatchEngine::new();
         engine.rebuild(&[entry("keepsolid", "ApplicationFrameHost.exe", TriggerMode::Prompt)]);
-        assert_eq!(engine.unmatchable_hosts().len(), 1, "precondition");
+        assert!(
+            engine.lookup("ApplicationFrameHost.exe").is_none(),
+            "precondition: the host entry was never loaded"
+        );
 
         engine.rebuild(&[entry("keepsolid", "KeepSolid.exe", TriggerMode::Prompt)]);
 
-        assert!(engine.unmatchable_hosts().is_empty());
         assert!(
             engine.lookup("KeepSolid.exe").is_some(),
-            "and the replacement must actually be live"
+            "the replacement must actually be live"
         );
-    }
-
-    #[test]
-    fn clear_drops_the_unmatchable_report_too() {
-        let mut engine = MatchEngine::new();
-        engine.rebuild(&[entry("keepsolid", "ApplicationFrameHost.exe", TriggerMode::Prompt)]);
-        engine.clear();
-        assert!(engine.unmatchable_hosts().is_empty());
+        assert!(
+            engine.lookup("ApplicationFrameHost.exe").is_none(),
+            "the bad entry survived its own replacement"
+        );
     }
 
     #[test]

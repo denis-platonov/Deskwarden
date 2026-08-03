@@ -1713,12 +1713,19 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     }
                     item_list::RowCommand::Unarchive => {
                         match cache.unarchive_item(&item) {
-                            Ok(()) => {
+                            // THE CACHE'S COPY, not `item`. The cache read the
+                            // item's current revision token back after the
+                            // write (`VaultCache::current_revision_of`);
+                            // pushing the caller's `item` here would put the
+                            // pre-unarchive token straight back into the list
+                            // the next edit of this item is built from, which
+                            // is `fba91ff`'s defect one door along.
+                            Ok(unarchived) => {
                                 // The item is live again, so the window's own
                                 // copy of the live list gains it -- exactly
                                 // what the cache just did to its snapshot.
                                 if !items.iter().any(|i| i.id == item.id) {
-                                    items.push(item.clone());
+                                    items.push(unarchived);
                                 }
                                 archive_list.invalidate();
                             }
@@ -1735,14 +1742,17 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     }
                     item_list::RowCommand::Restore => {
                         match cache.restore_item(&item) {
-                            Ok(()) => {
-                                // `without_deleted_date` is the cache's, and
-                                // it is load-bearing: an item put back into a
-                                // live list still carrying `deletedDate`
-                                // would PUT that key on its next ordinary
-                                // edit, at a backend whose handling of it is
-                                // unverified.
-                                let restored = crate::vault_bridge::without_deleted_date(&item);
+                            // THE CACHE'S COPY, for the reason the unarchive
+                            // arm above states. It has already had
+                            // `without_deleted_date` applied -- which is
+                            // load-bearing: an item put back into a live list
+                            // still carrying `deletedDate` would PUT that key
+                            // on its next ordinary edit, at a backend whose
+                            // handling of it is unverified -- and it carries
+                            // the revision token the server reports now. This
+                            // arm used to rebuild both of those locally and
+                            // got the second one wrong.
+                            Ok(restored) => {
                                 if !items.iter().any(|i| i.id == item.id) {
                                     items.push(restored);
                                 }
@@ -2102,8 +2112,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                                 items[pos] = starred;
                                             }
                                         }
+                                        // The band, not just the log: see
+                                        // `ItemWrite`. `to` is the direction
+                                        // that was ASKED for, so a refused
+                                        // favourite says "it still isn't one"
+                                        // and a refused un-favourite says the
+                                        // opposite -- both true of the item as
+                                        // it now stands.
                                         Err(e) => {
                                             log::warn!("could not change the favourite flag: {e:?}");
+                                            move_error = Some(item_write_failure_message(
+                                                if to { ItemWrite::Favorite } else { ItemWrite::Unfavorite },
+                                                &item.name,
+                                                &e,
+                                            ));
                                             flag_reauth_if_unauthorized(
                                                 ui.ctx(),
                                                 &needs_reauth_for_closure,
@@ -2178,8 +2200,25 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                             }
                                             mode = DetailMode::Read;
                                         }
+                                        // See `ItemWrite`. `generate_error`
+                                        // is dropped first because it
+                                        // OUTRANKS this band (see
+                                        // `inline_notice`) and the editor is
+                                        // still open, so the clear at the
+                                        // bottom of this closure cannot reach
+                                        // it: a generate that failed earlier
+                                        // in this same draft would otherwise
+                                        // hide the refused save behind a
+                                        // message about a box the user has
+                                        // since moved on from.
                                         Err(e) => {
                                             log::warn!("failed to save item {}: {e:?}", item.id);
+                                            generate_error = None;
+                                            move_error = Some(item_write_failure_message(
+                                                ItemWrite::Save,
+                                                &item.name,
+                                                &e,
+                                            ));
                                             flag_reauth_if_unauthorized(
                                                 ui.ctx(),
                                                 &needs_reauth_for_closure,
@@ -2244,8 +2283,20 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                                             items.push(created);
                                             mode = DetailMode::Read;
                                         }
+                                        // See `ItemWrite`, and the Save arm
+                                        // above for why `generate_error` goes
+                                        // first. The name comes from the
+                                        // DRAFT: there is no vault item to
+                                        // name yet, which is the whole of
+                                        // what a refused create means.
                                         Err(e) => {
                                             log::warn!("failed to create item: {e:?}");
+                                            generate_error = None;
+                                            move_error = Some(item_write_failure_message(
+                                                ItemWrite::Create,
+                                                new_item.name(),
+                                                &e,
+                                            ));
                                             flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                                         }
                                     }
@@ -2654,6 +2705,93 @@ fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError
         ListCommand::Delete => ("delete", "It's still in your vault."),
     };
     format!("Couldn't {verb} \"{name}\" -- {because}. {unchanged}")
+}
+
+/// The three writes in the detail pane that a refusal used to leave silent.
+///
+/// **This is the case the user actually reported.** "Tried to Fav one item --
+/// it shows as faved in folder but not in original client even after syncing":
+/// a `PUT` refused with the 400 in `vault_bridge`'s `REVISION_DATE_KEY`, and a
+/// star that looked flipped because the row was painted from the local copy.
+/// `fba91ff` removed the cause the implementer found -- a stale revision token
+/// this app kept -- but a 400 has other causes that are all still reachable
+/// (the official client edited the item, a concurrent write, a restore whose
+/// token this app had not read back), and every one of them reproduces that
+/// report exactly. The arms did `log::warn!` and nothing else, so the user was
+/// told nothing on any of them.
+///
+/// [`ListCommand`]'s own doc is the precedent and the argument is the same one
+/// `03c36ea` made for Generate: a write whose failure leaves **no** trace on
+/// screen has to make its own. A favourite is that shape -- the star comes
+/// from the local copy, so a refused toggle and an accepted one look
+/// identical -- and so is a Save, which leaves the form exactly as it was
+/// whether the write landed or not.
+///
+/// **These go to the same band ([`NoticeSource::Move`]) rather than to a
+/// fourth source**, for the reason [`ListCommand`] does not have one either:
+/// they want the same precedence and the same plain-clear dismissal, and a
+/// fourth `NoticeSource` would need a fourth precedence rule with nothing to
+/// derive it from.
+///
+/// **On [`VaultError::Unauthorized`] the band is not what the user sees**, and
+/// that is not a gap. `flag_reauth_if_unauthorized` closes the window on that
+/// one variant, so the sentence is set and the window goes; the re-auth the
+/// flag triggers is the trace, and it is a louder one. The 400 -- the variant
+/// the report was actually about -- leaves the window open and the band up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemWrite {
+    /// Two variants rather than one carrying a `bool`, so the wording cannot
+    /// be got backwards at the call site: "It's still not a favourite" after a
+    /// failed UN-favourite would be a false statement about the user's vault.
+    Favorite,
+    Unfavorite,
+    Save,
+    Create,
+}
+
+/// What a refused detail-pane write shows in the inline band.
+///
+/// Same three `because` clauses, worded the same way as
+/// [`list_command_failure_message`]'s and [`move_failure_message`]'s: one
+/// vocabulary for "the backend said no" across this window, not three. And
+/// like both of those, every sentence ends by naming the state the item or the
+/// form is actually in, because the question a user has after clicking and
+/// seeing nothing move is "did it half-work?" -- and the answer is always no.
+fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> String {
+    let because = match e {
+        VaultError::Unauthorized => "the vault backend no longer accepts this session",
+        VaultError::Http(_) => "the vault backend refused the write",
+        VaultError::Parse(_) => "the vault backend's answer couldn't be read",
+    };
+    // Exhaustive with no catch-all, for [`move_failure_message`]'s reason: a
+    // fifth write must be given its own wording rather than silently
+    // inheriting a neighbour's.
+    match write {
+        // The star in the detail pane is painted from this window's own copy
+        // of the item, which a refused write does not change -- so "it is not
+        // a favourite" is the whole of what the user cannot otherwise see.
+        ItemWrite::Favorite => {
+            format!("Couldn't add \"{name}\" to your favourites -- {because}. It still isn't one.")
+        }
+        ItemWrite::Unfavorite => {
+            format!(
+                "Couldn't remove \"{name}\" from your favourites -- {because}. It still is one."
+            )
+        }
+        // The editor stays open on failure (`mode` is left on `Edit`), so the
+        // user's typing is not lost and the sentence says so -- otherwise the
+        // safe reaction to "couldn't save" is to assume it is gone.
+        ItemWrite::Save => format!(
+            "Couldn't save your changes to \"{name}\" -- {because}. Nothing has been written, and \
+             your edits are still in the form."
+        ),
+        // `name` is the draft's name, not a vault item's: there is no vault
+        // item yet, which is exactly what this says.
+        ItemWrite::Create => format!(
+            "Couldn't create \"{name}\" -- {because}. Nothing has been added to your vault, and \
+             what you typed is still in the form."
+        ),
+    }
 }
 
 /// What a failed **Generate** does: the sentence the inline band shows, and
@@ -5217,6 +5355,132 @@ mod folder_drop_tests {
     }
 }
 
+/// What a refused favourite, save or create says.
+///
+/// The behaviour these pin is the whole of the fix for "a refused write is
+/// still silent on the two arms the bug was reported through": before it, all
+/// three arms were `log::warn!` plus a re-auth flag, so a 400 -- the official
+/// client edited the item, a concurrent write, a restore whose token this app
+/// had not read back -- left the star looking flipped and the form looking
+/// saved with nothing on screen to say otherwise. That is the user's report
+/// verbatim.
+#[cfg(test)]
+mod item_write_failure_tests {
+    use super::{item_write_failure_message, ItemWrite, VaultError};
+
+    /// Every variant against every error, spelled out rather than iterated:
+    /// neither enum has a catch-all, so a new one has to be brought here
+    /// deliberately.
+    fn all() -> Vec<String> {
+        let mut out = Vec::new();
+        for write in [
+            ItemWrite::Favorite,
+            ItemWrite::Unfavorite,
+            ItemWrite::Save,
+            ItemWrite::Create,
+        ] {
+            for e in [
+                VaultError::Unauthorized,
+                VaultError::Http("400 Bad Request".into()),
+                VaultError::Parse("expected value at line 1".into()),
+            ] {
+                out.push(item_write_failure_message(write, "Ledgerline", &e));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_refusal_names_the_item_and_says_what_failed() {
+        // A band that said only "the vault backend refused the write" is a
+        // band the user cannot act on: this window shows one at a time and
+        // they may have clicked several things. Dropping `{name}` from any arm
+        // fails here with that arm's own sentence quoted.
+        for message in all() {
+            assert!(message.contains("Ledgerline"), "which item? {message}");
+            assert!(message.starts_with("Couldn't "), "what failed? {message}");
+        }
+    }
+
+    #[test]
+    fn every_refusal_says_the_thing_the_user_cannot_see_is_unchanged() {
+        // The question a user has after clicking and seeing nothing move is
+        // "did it half-work?", and the answer is always no. The star and the
+        // form are both painted from local state a refused write does not
+        // touch, so nothing on screen answers it.
+        //
+        // Deleting the tail of any one arm fails here with that arm quoted.
+        for message in all() {
+            assert!(
+                message.contains("still")
+                    || message.contains("Nothing has been written")
+                    || message.contains("Nothing has been added"),
+                "does not say what state the item or the form is in: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_favourite_directions_are_not_worded_the_same_way() {
+        // THE ONE THING THAT CAN BE GOT BACKWARDS. "It still isn't one" after
+        // a failed UN-favourite is a false statement about the user's vault --
+        // it tells them the star is off when it is on -- and a single variant
+        // carrying a `bool` is exactly how that mistake gets made. Swapping
+        // the two arms' bodies fails here.
+        let e = VaultError::Http("400 Bad Request".into());
+        let on = item_write_failure_message(ItemWrite::Favorite, "Ledgerline", &e);
+        let off = item_write_failure_message(ItemWrite::Unfavorite, "Ledgerline", &e);
+
+        assert!(on.contains("add") && on.contains("still isn't one"), "{on}");
+        assert!(off.contains("remove") && off.contains("still is one"), "{off}");
+    }
+
+    #[test]
+    fn a_refused_save_or_create_promises_the_typing_survives() {
+        // Both editors are LEFT OPEN on failure (`mode` stays on
+        // `Edit`/`Create`), so this is true -- and saying it is what stops a
+        // user from assuming their work is gone and retyping it. Deleting
+        // either clause fails here.
+        let e = VaultError::Http("400 Bad Request".into());
+        assert!(
+            item_write_failure_message(ItemWrite::Save, "Ledgerline", &e)
+                .contains("still in the form"),
+            "a refused save must say the edits survived"
+        );
+        assert!(
+            item_write_failure_message(ItemWrite::Create, "Ledgerline", &e)
+                .contains("still in the form"),
+            "a refused create must say the entries survived"
+        );
+    }
+
+    #[test]
+    fn no_two_of_the_twelve_share_a_wording() {
+        // The same property `move_failure_message` and
+        // `list_command_failure_message` are held to, and for the same reason:
+        // a band that reads identically for four different clicks cannot tell
+        // the user which one it is about. Collapsing any two arms into one
+        // fails here with the duplicate count.
+        let messages = all();
+        let unique: std::collections::BTreeSet<&String> = messages.iter().collect();
+        assert_eq!(
+            unique.len(),
+            messages.len(),
+            "two refusals share one wording: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_backends_own_words_stay_in_the_log() {
+        // Same rule as every other band in this window: the payload is a
+        // developer's, not a user's.
+        for message in all() {
+            assert!(!message.contains("400 Bad Request"), "{message}");
+            assert!(!message.contains("expected value"), "{message}");
+        }
+    }
+}
+
 /// What a failed Generate says, and what it does about the session.
 ///
 /// The behaviour these pin is the whole of the fix for "Generate swallows
@@ -5847,6 +6111,177 @@ mod generate_failure_wiring_tests {
              thing that condition is for, and the clear must be INSIDE the block: moved \
              out below it, it runs every frame.\n{body}"
         );
+    }
+}
+
+/// Source-text guards on the three arms a refused write used to leave silent:
+/// `DetailAction::ToggleFavorite`, and `EditAction::Save` in each of the two
+/// draft editors.
+///
+/// Same reason as [`generate_failure_wiring_tests`], which is the precedent
+/// these follow line for line: the arms live inside `run`'s update closure,
+/// which needs a real event loop and is unreachable from this suite. The
+/// decision they carry lives in `item_write_failure_message`, where
+/// `item_write_failure_tests` drives it directly; what is left in the arms is
+/// plumbing, and this pins the plumbing.
+///
+/// **What they do not guarantee**, stated so the doc claims no coverage it
+/// lacks: they see spellings and counts, not behaviour. A `move_error` set
+/// here and never rendered would pass -- `BAND_FEED` in the module above is
+/// what pins that the band is fed at all. What they catch is the edit that
+/// puts a swallowed error back, which is the regression this whole finding is.
+#[cfg(test)]
+mod refused_write_wiring_tests {
+    // EVERY NEEDLE IS SPLIT WITH `concat!`, for the reason spelled out in
+    // `generate_failure_wiring_tests`: `include_str!("mod.rs")` pulls this
+    // module in too, so a needle written as one literal always matches itself.
+    // The count assertions ENFORCE the split -- re-joining one makes it appear
+    // an extra time and fails.
+    const FAV_ARM: &str = concat!("DetailAction::ToggleFavorite(to)", " => {");
+    const FAV_NEXT: &str = concat!("DetailAction::CopyPassword", "History(index) =>");
+    const SAVE_ARM: &str = concat!("EditAction::Save", " => {");
+    const SAVE_NEXT: &str = concat!("EditAction::Generate", "Password =>");
+    /// One needle for both halves of the fix: it is the assignment that puts a
+    /// sentence in the band AND the call that decides the sentence. An arm
+    /// that computed a message and dropped it, or set the band from a literal,
+    /// fails on this.
+    const REPORTS: &str = concat!("move_error = Some(item_write_failure", "_message(");
+    const FAVOURITE_ON: &str = concat!("ItemWrite::", "Favorite");
+    const FAVOURITE_OFF: &str = concat!("ItemWrite::", "Unfavorite");
+    const SAVE_KIND: &str = concat!("ItemWrite::", "Save");
+    const CREATE_KIND: &str = concat!("ItemWrite::", "Create");
+    /// The drop that stops a Generate failure earlier in the SAME draft from
+    /// outranking the refused save (`inline_notice` ranks Generate above
+    /// Move), which the `editor_is_closed` clear cannot do because a failed
+    /// save leaves the editor open.
+    const DROPS_THE_OUTRANKING_ONE: &str = concat!("generate_error = ", "None;");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// The text of each arm opened by `arm`, up to the next arm of the same
+    /// `match`. Slicing rather than searching the whole file is the point:
+    /// `move_error = Some(...)` is correct in a dozen other places in this
+    /// closure, and a file-wide count could not tell those from these.
+    fn bodies(arm: &str, next: &str) -> Vec<&'static str> {
+        let source = source();
+        source
+            .match_indices(arm)
+            .map(|(at, _)| {
+                let rest = &source[at..];
+                let end = rest.find(next).unwrap_or_else(|| {
+                    panic!(
+                        "no {next:?} after {arm:?} -- these guards slice the arm body between \
+                         the two and cannot without it"
+                    )
+                });
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn there_is_one_favourite_arm_and_two_save_arms() {
+        // What makes the counts below meaningful rather than arbitrary: a
+        // third draft form, or a second favourite door, fails here first and
+        // says it must be wired to report its failures too.
+        assert_eq!(source().matches(FAV_ARM).count(), 1, "expected {FAV_ARM:?} exactly once");
+        assert_eq!(
+            source().matches(SAVE_ARM).count(),
+            2,
+            "expected {SAVE_ARM:?} exactly twice -- the Edit draft's and the Create draft's"
+        );
+    }
+
+    #[test]
+    fn the_favourite_arm_reports_a_refusal_in_the_direction_it_was_asked() {
+        let body = bodies(FAV_ARM, FAV_NEXT).remove(0);
+        assert_eq!(
+            body.matches(REPORTS).count(),
+            1,
+            "the favourite arm does not call {REPORTS:?}. Without it the failure is log-only \
+             again -- the star is painted from this window's own copy of the item, which a \
+             refused write does not change, so a refused toggle and an accepted one look \
+             identical. That is the user's report.\n{body}"
+        );
+        // Both directions, because one variant serving both is exactly how
+        // "It still isn't one" ends up on a failed un-favourite.
+        assert_eq!(
+            body.matches(FAVOURITE_ON).count(),
+            1,
+            "the favourite arm does not name {FAVOURITE_ON:?}\n{body}"
+        );
+        assert_eq!(
+            body.matches(FAVOURITE_OFF).count(),
+            1,
+            "the favourite arm does not name {FAVOURITE_OFF:?}, so one direction of the \
+             toggle reports the other direction's sentence\n{body}"
+        );
+    }
+
+    #[test]
+    fn both_save_arms_report_a_refusal_under_their_own_kind() {
+        let bodies = bodies(SAVE_ARM, SAVE_NEXT);
+        assert_eq!(bodies.len(), 2, "counted above");
+        for body in &bodies {
+            assert_eq!(
+                body.matches(REPORTS).count(),
+                1,
+                "a Save arm does not call {REPORTS:?}. The editor is left exactly as it was \
+                 on failure, so nothing else on screen says the write did not land.\n{body}"
+            );
+            assert_eq!(
+                body.matches(DROPS_THE_OUTRANKING_ONE).count(),
+                1,
+                "a Save arm does not drop {DROPS_THE_OUTRANKING_ONE:?} first. A generate \
+                 failure earlier in this same draft outranks this band and the editor is \
+                 still open, so the `editor_is_closed` clear cannot reach it -- the refused \
+                 save is invisible behind a message about a box the user has moved on \
+                 from.\n{body}"
+            );
+        }
+        // EACH ARM UNDER ITS OWN KIND, identified by the write it makes and
+        // not by its position. "One of each between them" was the first
+        // version of this, and swapping the two kinds survived it -- which
+        // would tell a user editing an existing item that nothing was added to
+        // their vault, and a user creating one that their unsaved edits are
+        // safe in a form that is about to be discarded.
+        for body in &bodies {
+            let (makes, kind, other) = if body.contains(concat!("cache.update_", "item(")) {
+                (concat!("cache.update_", "item("), SAVE_KIND, CREATE_KIND)
+            } else {
+                (concat!("cache.create_", "item("), CREATE_KIND, SAVE_KIND)
+            };
+            assert!(
+                body.contains(kind),
+                "the arm that calls {makes:?} does not report under {kind:?}\n{body}"
+            );
+            assert!(
+                !body.contains(other),
+                "the arm that calls {makes:?} reports under {other:?}, which is the other \
+                 editor's sentence\n{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slices_are_the_arms_they_claim_to_be() {
+        // POSITIVE CONTROL for all three tests above: an arm body that failed
+        // to slice -- empty, or the wrong region -- would satisfy a `count()`
+        // assertion for free and satisfy `(1, 1)` by accident. Each body must
+        // contain the call that is the reason the arm exists at all.
+        assert!(
+            bodies(FAV_ARM, FAV_NEXT)[0].contains(concat!("cache.set_", "favorite(")),
+            "sliced something that is not the favourite arm"
+        );
+        for body in bodies(SAVE_ARM, SAVE_NEXT) {
+            assert!(
+                body.contains(concat!("cache.update_", "item("))
+                    || body.contains(concat!("cache.create_", "item(")),
+                "sliced something that is not a Save arm\n{body}"
+            );
+        }
     }
 }
 

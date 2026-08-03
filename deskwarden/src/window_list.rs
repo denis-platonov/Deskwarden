@@ -101,6 +101,13 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     let (pid, exe_name) =
         match window_watch::resolve_window_attribution(hwnd_value, owner_pid, &owner_exe) {
             window_watch::Attribution::Attributed { pid, exe_name } => (pid, exe_name),
+            // The HOST's pid, because there is no other one to give: the whole
+            // of `UnresolvedHost` is "no child process could be identified".
+            // So every unattributable row on a machine shares one pid -- both
+            // Store frames on the reporting machine were 12472 -- and `pid` is
+            // therefore NOT a key for these rows.
+            // `picker_ui::selected_window` keys the picker's selection by
+            // `hwnd` for exactly that reason.
             window_watch::Attribution::UnresolvedHost { host } => (owner_pid, host),
         };
 

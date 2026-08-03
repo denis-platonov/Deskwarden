@@ -625,7 +625,6 @@ fn folder_move_body(
     }
 }
 
-#[cfg(test)]
 /// The key Bitwarden uses as an item's **optimistic-concurrency token**, and
 /// the reason every write on this type answers with the server's copy.
 ///
@@ -649,7 +648,50 @@ fn folder_move_body(
 /// and reports the new state, but a `GET` immediately afterwards still shows
 /// the OLD one -- the write is accepted and then not visible, which is worse
 /// than a refusal because nothing surfaces it.
+///
+/// **No longer `#[cfg(test)]`.** It was, because the only thing that named it
+/// was the mock below -- production code never touched the key, it just let it
+/// ride `other`. [`with_revision_date_from`] is the first production reader,
+/// and it exists because one write cannot let the key ride: see its doc.
 const REVISION_DATE_KEY: &str = "revisionDate";
+
+/// A copy of `item` carrying `source`'s revision token instead of its own.
+///
+/// **For the two writes that cannot return the server's copy.**
+/// `POST /restore/item/{id}` -- which both un-trashes and un-archives -- has
+/// no body this crate has verified the shape of, so
+/// [`crate::vault_cache::VaultCache::restore_item`] and
+/// [`crate::vault_cache::VaultCache::unarchive_item`] cannot adopt an answer
+/// the way [`VaultBridge::update_item`] and [`VaultBridge::move_item_to_folder`]
+/// do. They read the item back with [`VaultBridge::get_item`] and adopt this
+/// one key off it instead.
+///
+/// **One key and not the whole item**, deliberately. A `GET` taken right after
+/// a restore may race the ~1.5s settle this backend was measured to have
+/// (see [`VaultBridge::archive_item`]), so its copy can still be the
+/// pre-restore one -- carrying `deletedDate`, which
+/// [`without_deleted_date`] exists to keep out of the live snapshot.
+/// Swapping the whole item in would reinstate exactly that. The revision
+/// token is the one field where the server's value is right *whatever* the
+/// settle is doing, because a token is only ever "the one the next write must
+/// quote".
+///
+/// An absent key on `source` REMOVES the key rather than leaving `item`'s in
+/// place: "the server reports no token" and "the server reports the token I
+/// already had" are different claims, and keeping a superseded token because
+/// the answer did not mention one is the defect this function exists for.
+pub fn with_revision_date_from(item: &VaultItem, source: &VaultItem) -> VaultItem {
+    let mut adopted = item.clone();
+    match source.other.get(REVISION_DATE_KEY) {
+        Some(revision) => {
+            adopted.other.insert(REVISION_DATE_KEY.to_string(), revision.clone());
+        }
+        None => {
+            adopted.other.remove(REVISION_DATE_KEY);
+        }
+    }
+    adopted
+}
 
 /// A `mockito` PUT mock that answers the way `bw serve` really does: with the
 /// item the request carried, wrapped in the success envelope, and with
@@ -868,7 +910,10 @@ impl NewItem {
         }
     }
 
-    fn name(&self) -> &str {
+    /// `pub` because a refused create has to name what it refused, and the
+    /// only name that exists at that point is this one -- there is no vault
+    /// item yet. See `vault_window`'s `ItemWrite::Create`.
+    pub fn name(&self) -> &str {
         match self {
             NewItem::Login { name, .. }
             | NewItem::SecureNote { name, .. }
@@ -3817,6 +3862,82 @@ mod tests {
             serde_json::to_value(&item).unwrap(),
             serde_json::to_value(without_deleted_date(&item)).unwrap()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Revision tokens
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_revision_date_from_takes_that_one_key_and_leaves_the_rest() {
+        // The whole of what `VaultCache::current_revision_of` is allowed to do
+        // with a read-back. A `GET` taken right after a restore may still be
+        // showing the pre-restore state -- trashed, and under whatever name
+        // and fields the server last committed -- so anything this took
+        // besides the token would put that state back into the live snapshot.
+        //
+        // Returning `source.clone()` gives
+        //     the source's OTHER keys came across too
+        //     left: "the server's stale copy"  right: "Mine"
+        let mine: VaultItem = serde_json::from_str(
+            r#"{"id":"1","object":"item","type":1,"name":"Mine","favorite":true,"fields":[],
+                "reprompt":0,"key":"K","revisionDate":"2026-07-30T09:15:00.000Z"}"#,
+        )
+        .unwrap();
+        let source: VaultItem = serde_json::from_str(
+            r#"{"id":"1","object":"item","type":1,"name":"the server's stale copy",
+                "favorite":false,"fields":[],"deletedDate":"2026-07-30T09:15:00.000Z",
+                "revisionDate":"2026-08-03T11:47:19.101Z"}"#,
+        )
+        .unwrap();
+
+        let adopted = with_revision_date_from(&mine, &source);
+
+        assert_eq!(
+            adopted.other.get("revisionDate").and_then(|v| v.as_str()),
+            Some("2026-08-03T11:47:19.101Z"),
+            "the stale token survived the adoption"
+        );
+        assert_eq!(adopted.name, "Mine", "the source's OTHER keys came across too");
+        assert_eq!(deleted_date(&adopted), None, "the source's deletion date came across too");
+
+        // POSITIVE CONTROL: everything else really is byte-identical to
+        // `mine`, so this cannot pass against a function that quietly dropped
+        // a key the way an early `without_deleted_date` bug would have.
+        let mut expected = serde_json::to_value(&mine).unwrap();
+        expected.as_object_mut().unwrap().insert(
+            "revisionDate".to_string(),
+            serde_json::json!("2026-08-03T11:47:19.101Z"),
+        );
+        assert_eq!(expected, serde_json::to_value(&adopted).unwrap());
+    }
+
+    #[test]
+    fn a_source_with_no_token_removes_the_one_the_item_had() {
+        // "The server reports no token" and "the server reports the token I
+        // already had" are different claims, and keeping a superseded token
+        // because the answer did not mention one is the defect this function
+        // exists for. Leaving `item`'s key in place on the `None` arm is the
+        // mutation; it gives
+        //     an unmentioned token was kept rather than dropped
+        let mine: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"Mine","type":1,"fields":[],
+                "revisionDate":"2026-07-30T09:15:00.000Z"}"#,
+        )
+        .unwrap();
+        let tokenless: VaultItem =
+            serde_json::from_str(r#"{"id":"1","name":"Mine","type":1,"fields":[]}"#).unwrap();
+
+        let adopted = with_revision_date_from(&mine, &tokenless);
+
+        assert_eq!(
+            adopted.other.get("revisionDate"),
+            None,
+            "an unmentioned token was kept rather than dropped"
+        );
+        // POSITIVE CONTROL for the assertion above: a function that returned
+        // an empty item, or `tokenless`, would satisfy it for free.
+        assert_eq!(adopted.name, "Mine");
     }
 
     // -----------------------------------------------------------------------

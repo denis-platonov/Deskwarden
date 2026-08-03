@@ -787,6 +787,30 @@ enum BackendReadiness {
 /// narrowing and no later fix that makes such an entry correct, so the only
 /// honest thing this window can do is decline to write it and say why (see
 /// [`host_process_refusal`]).
+/// The row the user has selected, found by **window handle**.
+///
+/// Not by pid, which is what this window used to carry the selection as. Every
+/// `UnresolvedHost` row is listed under the host's pid (`window_list::enum_proc`
+/// hands `owner_pid` to rows it could not attribute), so on the reporting
+/// machine both Store frames -- titled "Speedtest" and "Settings" -- were pid
+/// 12472, and a `find(|w| w.pid == pid)` could not tell them apart: it
+/// answered with whichever came first while the highlight sat on the other.
+/// Harmless *today*, because both are refused and refused for the same reason,
+/// so the sentence beside the button is the same either way. It stops being
+/// harmless the moment those two rows can differ -- which is one attribution
+/// improvement away, since a frame whose CoreWindow becomes readable resolves
+/// to a real app while its neighbour does not.
+///
+/// An `HWND` is unique among live windows, which is precisely the property
+/// "the row the user clicked" needs and a pid does not have. The `default_pid`
+/// this window opens on is still a pid -- it comes from a foreground event,
+/// which has no row of its own -- so that one lookup stays by pid and its
+/// answer's `hwnd` becomes the selection.
+fn selected_window(windows: &[WindowInfo], selected: Option<isize>) -> Option<&WindowInfo> {
+    let hwnd = selected?;
+    windows.iter().find(|w| w.hwnd == hwnd)
+}
+
 fn can_save_app_match(selected_process: Option<&str>, backend_ready: &BackendReadiness) -> bool {
     let Some(process) = selected_process else {
         return false;
@@ -802,14 +826,28 @@ fn can_save_app_match(selected_process: Option<&str>, backend_ready: &BackendRea
 /// silent no-op is the failure mode this window has already been patched for
 /// twice (see [`can_save_app_match`]'s own doc).
 ///
-/// **The remedy it names was measured, not guessed.** A row can only still be
-/// carrying a host's name when the frame had no `Windows.UI.Core.CoreWindow`
-/// child to attribute it by (see `window_list::enum_proc`), and on the
-/// reporting machine that was true of both open Store windows because both
-/// were minimised -- a minimised UWP app is suspended, and its CoreWindow is
-/// gone with it. Restoring the app so it is actually on screen is what brings
-/// that child back, which is why this says "restore it" and not merely "try
-/// again".
+/// **The remedy it names was measured -- but it is not the only cause, and
+/// this no longer claims it is.** A row can still be carrying a host's name in
+/// exactly the two cases [`window_watch::attribute_window`] falls through to
+/// `UnresolvedHost`:
+///
+///  * The frame had **no** `Windows.UI.Core.CoreWindow` child at all. That is
+///    what the reporting machine had: both open Store windows were minimised,
+///    and a minimised UWP app is suspended with its CoreWindow gone. Restoring
+///    the app brings the child back, and the row then lists under the app's
+///    own name.
+///  * The child was there but **could not be opened or named** --
+///    `attribute_window`'s `child.exe_name` was `None`. A Store app running at
+///    higher integrity than Deskwarden does that, and restoring it changes
+///    nothing whatever.
+///
+/// The first wording stated the first cause as certain, which made "restore
+/// the app and open Add app... again" advice that can never work for anyone in
+/// the second -- stated as fact, so a user in that case is told to keep
+/// retrying something that cannot succeed. This window cannot tell the two
+/// apart from a process name, so it names the likely one as likely and says
+/// what the other looks like: a row that still shows the host after the app is
+/// on screen.
 fn host_process_refusal(process: &str) -> Option<String> {
     if !window_watch::is_host_process(process) {
         return None;
@@ -817,10 +855,12 @@ fn host_process_refusal(process: &str) -> Option<String> {
     Some(format!(
         "{process} isn\u{2019}t an app -- it\u{2019}s the Windows process that owns the window for \
          every Microsoft Store app, so matching it would fill this item into all of them. \
-         Deskwarden won\u{2019}t save that. This row is showing the host because the app is \
-         minimised (Windows suspends it, and Deskwarden can no longer see which app it is): \
-         restore the app so it\u{2019}s on screen, then open \u{201c}Add app\u{2026}\u{201d} \
-         again and it will be listed under its own name."
+         Deskwarden won\u{2019}t save that. This row is showing the host because Deskwarden \
+         couldn\u{2019}t see which app is inside it. Usually that\u{2019}s because the app is \
+         minimised (Windows suspends it): restore the app so it\u{2019}s on screen, then open \
+         \u{201c}Add app\u{2026}\u{201d} again and it should be listed under its own name. If it \
+         still shows as {process} with the app on screen, Windows is keeping that app out of \
+         Deskwarden\u{2019}s reach and this item can\u{2019}t be matched to it here."
     ))
 }
 
@@ -1016,7 +1056,10 @@ pub fn run_picker(
 
     let default_window = default_pid.and_then(|pid| windows.iter().find(|w| w.pid == pid));
     let mut filter = default_window.map(|w| w.exe_name.clone()).unwrap_or_default();
-    let mut selected_pid: Option<u32> = default_window.map(|w| w.pid);
+    // The WINDOW, not its pid -- see `selected_window`. `default_pid` is a
+    // foreground event's pid and has no row of its own, so it is resolved to a
+    // row once, here, and it is that row's handle the window carries.
+    let mut selected_hwnd: Option<isize> = default_window.map(|w| w.hwnd);
     let mut trigger = TriggerMode::Prompt;
     let mut styled = false;
 
@@ -1176,7 +1219,7 @@ pub fn run_picker(
                     filtered.len(),
                     |ui, row| {
                         let w = &windows[filtered[row]];
-                        let selected = selected_pid == Some(w.pid);
+                        let selected = selected_hwnd == Some(w.hwnd);
                         let secondary = format!("({} \u{b7} {})", w.exe_name, w.pid);
                         let texture = icon_cache
                             .entry(w.exe_path.clone())
@@ -1195,7 +1238,7 @@ pub fn run_picker(
                             })
                             .as_ref();
                         if list_row(ui, &w.title, &secondary, selected, texture) {
-                            selected_pid = Some(w.pid);
+                            selected_hwnd = Some(w.hwnd);
                             // Review 11's Minor: a previous attempt's failure
                             // message otherwise persisted even after the
                             // user picked a different process, reading like
@@ -1259,14 +1302,14 @@ pub fn run_picker(
                     }
                     BackendReadiness::Ready => {}
                 }
-                // The selection is carried as a pid, but every gate below is
-                // about the process NAME (see `can_save_app_match`), so it is
-                // resolved once, here, through the same list the save itself
-                // reads -- a pid with no row left in it is not a selection
-                // this window can act on either.
-                let selected_process = selected_pid
-                    .and_then(|pid| windows.iter().find(|w| w.pid == pid))
-                    .map(|w| w.exe_name.as_str());
+                // The selection is carried as a window handle, but every gate
+                // below is about the process NAME (see `can_save_app_match`),
+                // so it is resolved once, here, through the same list -- and
+                // through the same `selected_window` the save itself uses, so
+                // the row this answers for and the row that gets written can
+                // never be two different rows.
+                let selected_process =
+                    selected_window(&windows, selected_hwnd).map(|w| w.exe_name.as_str());
 
                 // The refusal, said out loud. `can_save_app_match` disables
                 // Save for a host process; without this the button would
@@ -1316,99 +1359,97 @@ pub fn run_picker(
                         .inner
                         .clicked();
                     if save_clicked {
-                        // `can_save` already guarantees both of these, but
-                        // matching defensively rather than `.unwrap()`ing
-                        // costs nothing and means a future change to the
-                        // gate can't turn this into a panic.
-                        if let Some(pid) = selected_pid {
-                            if let Some(w) = windows.iter().find(|w| w.pid == pid) {
-                                let m = AppMatch {
-                                    process: w.exe_name.clone(),
-                                    trigger,
-                                };
-                                match cache.set_app_match(&target_item, &m) {
-                                    Ok(written) => {
-                                        // Matched exhaustively rather than
-                                        // ignored: review 26's Minor 2 is
-                                        // that this used to be `Ok(())` for
-                                        // BOTH of these, and the second one
-                                        // means the match is saved in the
-                                        // vault but absent from the snapshot
-                                        // `main` immediately rebuilds the
-                                        // engine from -- so the match the
-                                        // user just spent two windows on
-                                        // does nothing until the next full
-                                        // sync. Save still SUCCEEDED (the
-                                        // server has it), so this window
-                                        // still closes with `Some(m)`:
-                                        // returning `None` would tell `main`
-                                        // the user cancelled, which is a
-                                        // different and false statement. See
-                                        // the ledger for the `main.rs` half
-                                        // this cannot reach from here.
-                                        // Set BEFORE the arms below, because
-                                        // the `ServerOnly` arm deliberately
-                                        // does not close the window: whatever
-                                        // closes it afterwards (Cancel, the
-                                        // title-bar X) must still hand this
-                                        // match back, since the save really
-                                        // did happen.
-                                        *result_for_closure.borrow_mut() = Some(SavedAppMatch {
-                                            app_match: m,
-                                            write: written,
-                                        });
-                                        match written {
-                                            AppMatchWrite::WroteThrough => {
-                                                already_saved = true;
-                                                done = true;
-                                            }
-                                            AppMatchWrite::ServerOnly => {
-                                                already_saved = true;
-                                                log::warn!(
-                                                    "saved the app match for vault item {} to the \
-                                                     server, but the cache's snapshot does not \
-                                                     hold that item, so a match engine rebuilt \
-                                                     from the cache alone would NOT have it",
-                                                    target_item.id
-                                                );
-                                                // Review 28's Important 2:
-                                                // this used to close exactly
-                                                // like a fully live save, so
-                                                // the ONE state where the
-                                                // user has to do something
-                                                // looked identical to the
-                                                // state where they do not.
-                                                // Staying open is what makes
-                                                // the notice visible at all;
-                                                // `can_save` above goes false
-                                                // the moment it is set, so
-                                                // Cancel (relabelled below)
-                                                // is the only way on.
-                                                save_error = None;
-                                                save_notice =
-                                                    Some(server_only_notice(&target_item.name));
-                                            }
+                        // `can_save` already guarantees this, but matching
+                        // defensively rather than `.unwrap()`ing costs nothing
+                        // and means a future change to the gate can't turn
+                        // this into a panic.
+                        if let Some(w) = selected_window(&windows, selected_hwnd) {
+                            let m = AppMatch {
+                                process: w.exe_name.clone(),
+                                trigger,
+                            };
+                            match cache.set_app_match(&target_item, &m) {
+                                Ok(written) => {
+                                    // Matched exhaustively rather than
+                                    // ignored: review 26's Minor 2 is
+                                    // that this used to be `Ok(())` for
+                                    // BOTH of these, and the second one
+                                    // means the match is saved in the
+                                    // vault but absent from the snapshot
+                                    // `main` immediately rebuilds the
+                                    // engine from -- so the match the
+                                    // user just spent two windows on
+                                    // does nothing until the next full
+                                    // sync. Save still SUCCEEDED (the
+                                    // server has it), so this window
+                                    // still closes with `Some(m)`:
+                                    // returning `None` would tell `main`
+                                    // the user cancelled, which is a
+                                    // different and false statement. See
+                                    // the ledger for the `main.rs` half
+                                    // this cannot reach from here.
+                                    // Set BEFORE the arms below, because
+                                    // the `ServerOnly` arm deliberately
+                                    // does not close the window: whatever
+                                    // closes it afterwards (Cancel, the
+                                    // title-bar X) must still hand this
+                                    // match back, since the save really
+                                    // did happen.
+                                    *result_for_closure.borrow_mut() = Some(SavedAppMatch {
+                                        app_match: m,
+                                        write: written,
+                                    });
+                                    match written {
+                                        AppMatchWrite::WroteThrough => {
+                                            already_saved = true;
+                                            done = true;
+                                        }
+                                        AppMatchWrite::ServerOnly => {
+                                            already_saved = true;
+                                            log::warn!(
+                                                "saved the app match for vault item {} to the \
+                                                 server, but the cache's snapshot does not \
+                                                 hold that item, so a match engine rebuilt \
+                                                 from the cache alone would NOT have it",
+                                                target_item.id
+                                            );
+                                            // Review 28's Important 2:
+                                            // this used to close exactly
+                                            // like a fully live save, so
+                                            // the ONE state where the
+                                            // user has to do something
+                                            // looked identical to the
+                                            // state where they do not.
+                                            // Staying open is what makes
+                                            // the notice visible at all;
+                                            // `can_save` above goes false
+                                            // the moment it is set, so
+                                            // Cancel (relabelled below)
+                                            // is the only way on.
+                                            save_error = None;
+                                            save_notice =
+                                                Some(server_only_notice(&target_item.name));
                                         }
                                     }
-                                    // Item 2 (review 10's Important 1): stay
-                                    // open with the item and process choice
-                                    // both still intact -- `selected_pid`,
-                                    // `filter`, and `trigger` are untouched
-                                    // above -- instead of discarding two
-                                    // windows of user effort the way an
-                                    // unconditional `done = true` used to.
-                                    // `save_error` renders inline above; the
-                                    // user retries by clicking Save again
-                                    // (still enabled, since the backend
-                                    // itself is fine -- this one write just
-                                    // failed) or gives up via Cancel.
-                                    Err(e) => {
-                                        log::error!(
-                                            "failed to save app match onto vault item {}: {e:?}",
-                                            target_item.id
-                                        );
-                                        save_error = Some(save_error_message(&e));
-                                    }
+                                }
+                                // Item 2 (review 10's Important 1): stay
+                                // open with the item and process choice
+                                // both still intact -- `selected_hwnd`,
+                                // `filter`, and `trigger` are untouched
+                                // above -- instead of discarding two
+                                // windows of user effort the way an
+                                // unconditional `done = true` used to.
+                                // `save_error` renders inline above; the
+                                // user retries by clicking Save again
+                                // (still enabled, since the backend
+                                // itself is fine -- this one write just
+                                // failed) or gives up via Cancel.
+                                Err(e) => {
+                                    log::error!(
+                                        "failed to save app match onto vault item {}: {e:?}",
+                                        target_item.id
+                                    );
+                                    save_error = Some(save_error_message(&e));
                                 }
                             }
                         }
@@ -1922,14 +1963,93 @@ mod tests {
             refusal.contains("Add app"),
             "and it must say what to do instead: {refusal}"
         );
-        // The remedy is specific because the cause is: a host row exists only
-        // when the frame had no CoreWindow child to attribute it by, which on
-        // the reporting machine was because the app was minimised. "Try
-        // again" without restoring the app would fail identically.
+        // The likely cause and its remedy: a host row exists only when
+        // `attribute_window` fell through, which on the reporting machine was
+        // because both Store apps were minimised. "Try again" without
+        // restoring the app would fail identically.
         assert!(
             refusal.contains("minimised") && refusal.contains("restore"),
-            "the only remedy that works is restoring the app so its own window exists: {refusal}"
+            "the remedy for the likely cause is restoring the app so its own window exists: \
+             {refusal}"
         );
+    }
+
+    #[test]
+    fn the_refusal_does_not_state_the_likely_cause_as_the_only_one() {
+        // `window_watch::attribute_window` yields `UnresolvedHost` in TWO
+        // cases: no `CoreWindow` child (the minimised app), and a child whose
+        // process could not be opened or named -- a Store app running at
+        // higher integrity than Deskwarden. The first wording asserted the
+        // first as fact, which made "restore the app and reopen Add app..."
+        // advice that can never work for anyone in the second, stated as
+        // certainty.
+        //
+        // Restoring the "because the app is minimised" phrasing fails here on
+        // the hedge; deleting the closing sentence fails on the second
+        // assertion.
+        let refusal = host_process_refusal(HOST).expect("the frame host must be refused");
+        assert!(
+            refusal.contains("Usually"),
+            "the likely cause is stated as the certain one, so a user it does not apply to is \
+             told to keep retrying something that cannot succeed: {refusal}"
+        );
+        assert!(
+            refusal.contains("still shows"),
+            "nothing tells a user in the other case how to recognise it -- a row that still \
+             names the host with the app on screen: {refusal}"
+        );
+    }
+
+    /// The picker keys its selection by window handle, which is the reason
+    /// `selected_window` exists at all rather than a `find` at each site.
+    #[test]
+    fn two_rows_that_share_a_pid_are_still_two_selections() {
+        // `window_list::enum_proc` gives every `UnresolvedHost` row the HOST's
+        // pid, because there is no other one to give. On the reporting machine
+        // both Store frames -- "Speedtest" and "Settings" -- were pid 12472,
+        // so a `find(|w| w.pid == pid)` answered with whichever came first
+        // while the highlight sat on the other.
+        //
+        // Keying on `w.pid == hwnd as u32`, or returning `windows.first()`,
+        // gives
+        //     the row the gate answers for is not the row the user clicked
+        //     left: "Speedtest"  right: "Settings"
+        let windows = vec![frame("Speedtest", 101), frame("Settings", 102)];
+
+        let picked = selected_window(&windows, Some(102)).expect("the second frame");
+
+        assert_eq!(
+            picked.title, "Settings",
+            "the row the gate answers for is not the row the user clicked"
+        );
+        // POSITIVE CONTROL: the other handle really does resolve to the other
+        // row, so this cannot pass against a function that always answers
+        // last.
+        assert_eq!(selected_window(&windows, Some(101)).unwrap().title, "Speedtest");
+    }
+
+    #[test]
+    fn nothing_selected_and_a_handle_with_no_row_are_both_no_selection() {
+        // The second is not hypothetical: the list is read once when the
+        // picker opens, but the window it names can be closed while the picker
+        // is up. `can_save_app_match` refuses a `None` process, so the button
+        // greys out rather than saving against a row that is gone.
+        let windows = vec![frame("Speedtest", 101)];
+        assert!(selected_window(&windows, None).is_none());
+        assert!(selected_window(&windows, Some(999)).is_none());
+        assert!(selected_window(&[], Some(101)).is_none());
+    }
+
+    /// Two unattributable Store frames as `window_list` builds them: distinct
+    /// handles, distinct titles, and **one** pid between them.
+    fn frame(title: &str, hwnd: isize) -> WindowInfo {
+        WindowInfo {
+            hwnd,
+            pid: 12472,
+            exe_path: "C:\\Windows\\System32\\ApplicationFrameHost.exe".into(),
+            exe_name: HOST.into(),
+            title: title.into(),
+        }
     }
 
     #[test]
