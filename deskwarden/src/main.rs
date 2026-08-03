@@ -316,8 +316,17 @@ fn main() {
                 if let Err(e) =
                     settings::Settings::persist_accounts(&settings_path, accounts, Some(&active.id))
                 {
-                    // Survivable: this launch is correctly pointed either way,
-                    // and the next one re-resolves from whatever is on disk.
+                    // Survivable, and only because of `migration`'s rule 5.
+                    // This launch is correctly pointed either way; the next
+                    // one sees an account directory holding a `data.json`
+                    // that nothing in `settings.json` names, and
+                    // `migration::resume_action` ADOPTS it
+                    // (`AdoptUnclaimedAccount`) rather than minting a fresh
+                    // id beside the user's whole vault. Before that existed
+                    // this comment was false for the launch that had just
+                    // migrated: the source and the marker were both gone by
+                    // then, so "re-resolves from whatever is on disk" had
+                    // nothing left to resolve from.
                     log::warn!("could not persist the account list: {e}");
                 }
             }
@@ -330,8 +339,19 @@ fn main() {
             (Some(active.clone()), state)
         }
         accounts::StartupAccounts::Unmigrated { reason } => {
+            // NOT "running as a single-account app against the CLI's default
+            // profile", which is what this said and is only true on a machine
+            // that never migrated. `Unmigrated` is also reachable AFTER a
+            // migration -- a `bitwarden-cli` directory that appeared beside
+            // `bw.exe` since, or an unreadable `settings.json` -- and by then
+            // `%APPDATA%\Bitwarden CLI` and `<config_dir>\session.bin` have
+            // both been deleted. There is still no override to set, which is
+            // the accurate half; what the user meets is a sign-in window, not
+            // yesterday's app.
             log::warn!(
-                "{reason}; running as a single-account app against the CLI's default profile"
+                "{reason}; running with no account of our own: the CLI is left on whatever \
+                 profile it resolves by itself, which is a signed-out one if the migration \
+                 already ran"
             );
             (None, None)
         }
@@ -346,8 +366,12 @@ fn main() {
         log::warn!("switching and adding accounts are unavailable on this machine: {why}");
     }
 
-    // The two arms are "today's app" and "the account-aware app". This is a
-    // FALLBACK to existing behaviour, not a second implementation of anything:
+    // The two arms are "no account of our own" and "the account-aware app".
+    // Not "today's app": on a machine that has already migrated, the
+    // `Unmigrated` arm leaves the CLI on a directory the migration deleted, so
+    // what it falls back to is a sign-out, not the pre-multi-account
+    // behaviour. This is a FALLBACK in the sense of "no override is set and
+    // nothing offers a switch", not a second implementation of anything:
     // the switch, the resettle and the cache are untouched by it, and the
     // `Unmigrated` arm reaches none of them because `AccountsState` is `None`
     // there and so nothing offers a switch at all.

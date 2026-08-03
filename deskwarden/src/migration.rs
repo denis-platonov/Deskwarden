@@ -26,6 +26,18 @@
 //! 4. **Rollback on any failure.** Because nothing of the user's is deleted
 //!    before rule 3 passes, rollback is always "delete what we created, clear
 //!    the marker" — it can never need to *restore* anything.
+//! 5. **No on-disk state leaves a real vault directory that nothing
+//!    references.** The marker covers the migration; it does not cover the
+//!    *account list*, which `main` writes only after [`migrate`] has returned.
+//!    So the window between "the marker is gone" and "`settings.json` names
+//!    the account" is a window in which the whole vault sits in
+//!    `accounts/<id>/` with nothing pointing at it, and one failed settings
+//!    write is enough to make that window permanent. [`Observed`] therefore
+//!    carries [`account_dirs_with_profile`](Observed::account_dirs_with_profile)
+//!    and [`resume_action`] answers
+//!    [`AdoptUnclaimedAccount`](ResumeAction::AdoptUnclaimedAccount) —
+//!    recovering the state however it arose rather than narrowing the window
+//!    that produces it.
 //!
 //! ## Which directory is the source
 //!
@@ -225,8 +237,48 @@ pub struct Observed {
     pub final_exists: bool,
     pub source_has_data_json: bool,
     pub accounts_already_configured: bool,
+    /// Every `<config_dir>\accounts\<id>\` that holds a [`PROFILE_FILE`],
+    /// sorted by id — the directories that contain a real, encrypted vault
+    /// profile whatever anything else on disk says.
+    ///
+    /// Without this the state machine has no way to see a vault directory that
+    /// nothing references, and "nothing references it" is a *reachable* state:
+    /// [`finish`] deletes the source and then the marker, and the account list
+    /// is not written until `main` gets the answer back. A power loss, a kill,
+    /// or one failed `settings.json` write in that window leaves the whole
+    /// vault in `accounts/<id>/` with no marker and no entry — and a
+    /// [`resume_action`] that could not see it answered [`DoNothing`], which
+    /// made the next startup mint a fresh id beside it and present as never
+    /// signed in. See `a_completed_migration_whose_account_list_was_never_
+    /// written_is_adopted_not_reminted`.
+    ///
+    /// [`DoNothing`]: ResumeAction::DoNothing
+    pub account_dirs_with_profile: Vec<AccountId>,
     pub multi_account_available: bool,
     pub backend_port_in_use: bool,
+}
+
+/// The ids in [`Observed::account_dirs_with_profile`], read off the disk.
+///
+/// `<id>.incoming` and `<id>.migrating.json` cannot appear here: an
+/// [`AccountId`] is 32 lowercase hex characters, so neither name parses.
+fn account_dirs_with_profile(config_dir: &Path) -> Vec<AccountId> {
+    let root = accounts::accounts_root(config_dir);
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new(); // no accounts directory yet: nothing is claimed
+    };
+    let mut found: Vec<AccountId> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let id = AccountId::parse(&entry.file_name().to_string_lossy())?;
+            accounts::data_dir_for(config_dir, &id)
+                .join(PROFILE_FILE)
+                .is_file()
+                .then_some(id)
+        })
+        .collect();
+    found.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    found
 }
 
 /// What to do about what was observed.
@@ -247,6 +299,17 @@ pub enum ResumeAction {
     VerifyAndFinish,
     /// A marker that describes nothing on disk. Clear it and reassess.
     ClearStaleMarkerAndReassess,
+    /// No marker, no account list, and `accounts/<id>/` holds a real profile:
+    /// **adopt that id** rather than minting a new one beside it.
+    ///
+    /// This is a migration that finished — copied, verified, source deleted,
+    /// marker deleted — and whose account list never reached `settings.json`.
+    /// Nothing here deletes or copies anything, so unlike every other action
+    /// that touches the user's data it needs no verification gate: `data.json`
+    /// being there is the whole of the evidence, and the alternative is
+    /// minting a fresh id whose empty directory presents as "never signed in"
+    /// while the real vault sits beside it under a name nothing uses.
+    AdoptUnclaimedAccount(AccountId),
     /// Refuse to migrate on this launch and run as a single-account app.
     Refuse { reason: String },
 }
@@ -263,6 +326,16 @@ const REFUSE_UNAVAILABLE: &str =
 const REFUSE_PORT: &str =
     "a Bitwarden backend is still listening on the local port, so it is reading and writing the \
      profile that would be copied; the copy could capture a torn data.json";
+
+/// The reason [`resume_action`] gives when there is no account list and *more
+/// than one* account directory holds a profile.
+///
+/// One of them can be adopted; two cannot, because nothing on disk says which
+/// is the account this app was on, and guessing would present one real vault
+/// and hide the other. Refusing deletes nothing and names both in the log.
+const REFUSE_AMBIGUOUS_UNCLAIMED: &str =
+    "more than one account directory holds a Bitwarden profile and Deskwarden's account list is \
+     empty, so which of them this app was signed in to cannot be established";
 
 /// The whole decision, as a total function over what was observed.
 ///
@@ -288,11 +361,26 @@ pub fn resume_action(observed: &Observed) -> ResumeAction {
     match observed.marker.as_ref().map(|m| m.stage) {
         // No migration in flight. An account list means it already happened on
         // an earlier launch; no source profile means there is nothing to move.
+        //
+        // With an account list, every directory is already spoken for and
+        // this is a launch after the migration. Without one, a directory
+        // holding a profile is a vault nothing references, and adopting it
+        // outranks `StartFresh`: the pair "unclaimed directory AND a source
+        // still present" is a `finish` whose source deletion failed and whose
+        // marker removal then succeeded, so migrating again would put a second
+        // copy of the same vault under a second id.
         None => {
-            if observed.accounts_already_configured || !observed.source_has_data_json {
+            if observed.accounts_already_configured {
                 ResumeAction::DoNothing
             } else {
-                ResumeAction::StartFresh
+                match observed.account_dirs_with_profile.as_slice() {
+                    [] if observed.source_has_data_json => ResumeAction::StartFresh,
+                    [] => ResumeAction::DoNothing,
+                    [only] => ResumeAction::AdoptUnclaimedAccount(only.clone()),
+                    _ => ResumeAction::Refuse {
+                        reason: REFUSE_AMBIGUOUS_UNCLAIMED.to_string(),
+                    },
+                }
             }
         }
 
@@ -471,6 +559,9 @@ pub enum Probe {
     Promoted,
     /// The CLI answered for the new directory with the source's own email.
     Verified,
+    /// An account directory nothing referenced was taken over rather than
+    /// left orphaned beside a freshly minted id.
+    Adopted,
     SessionMoved,
     HelloDeleted,
     SourceDeleted,
@@ -570,6 +661,7 @@ pub fn migrate_with_probe(
                 .is_some_and(|s| s.join(PROFILE_FILE).is_file()),
             marker,
             accounts_already_configured,
+            account_dirs_with_profile: account_dirs_with_profile(config_dir),
             multi_account_available: availability.is_available(),
             backend_port_in_use: port_in_use(),
         };
@@ -594,6 +686,34 @@ pub fn migrate_with_probe(
                     };
                 };
                 return start_fresh(config_dir, &source, &status, probe);
+            }
+
+            ResumeAction::AdoptUnclaimedAccount(id) => {
+                // Deletes nothing, copies nothing, renames nothing. `status`
+                // is asked only for the LABEL, and a CLI that cannot answer
+                // costs a blank address in the switcher -- never the adoption
+                // itself, because refusing to adopt is precisely how the
+                // directory stays orphaned.
+                let dir = accounts::data_dir_for(config_dir, &id);
+                log::warn!(
+                    "adopting {}: it holds a Bitwarden profile and nothing in settings.json \
+                     names it, which is what a migration that finished before its account list \
+                     was written leaves behind",
+                    dir.display()
+                );
+                let details = status(Some(&dir));
+                probe(Probe::Adopted);
+                return MigrationState::Completed {
+                    account: Account {
+                        id,
+                        email: details.user_email.unwrap_or_default(),
+                        server_url: details.server_url,
+                    },
+                    // The blob this launch could have re-enrolled was deleted
+                    // by the run that migrated; there is nothing to warn about
+                    // a second time.
+                    hello_needs_reenrolment: false,
+                };
             }
 
             ResumeAction::VerifyAndFinish => {
@@ -943,6 +1063,7 @@ mod tests {
             final_exists: fin,
             source_has_data_json: src,
             accounts_already_configured: false,
+            account_dirs_with_profile: Vec::new(),
             multi_account_available: true,
             backend_port_in_use: false,
         }
@@ -1825,6 +1946,203 @@ mod tests {
             vec![account.id.to_string()]
         );
         let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// **Rule 5, end to end.** The migration finishes — source deleted, marker
+    /// deleted — and `settings.json` is then never written: a power loss, a
+    /// kill, or a single failed write (disk full, an AV lock, a roaming
+    /// profile) between [`migrate`] returning and `Settings::persist_accounts`
+    /// landing. Nothing simulated but the omission itself.
+    ///
+    /// The next launch therefore sees `accounts/<id>/` holding the whole vault,
+    /// no marker, no account entry, and no `%APPDATA%\Bitwarden CLI` to
+    /// re-resolve from. It must land on **that** id.
+    ///
+    /// Fails without the fix: delete the `[only] =>
+    /// AdoptUnclaimedAccount(...)` arm in [`resume_action`] (or make
+    /// [`Observed::account_dirs_with_profile`] always empty) and the second
+    /// launch answers `NothingToMigrate`, `resolve_startup` mints a fresh id,
+    /// and `assert_eq!(second_id, first_id)` reports two different ids with
+    /// `data.json` still sitting under the first.
+    #[test]
+    fn a_completed_migration_whose_account_list_was_never_written_is_adopted_not_reminted() {
+        let (cfg, source) = planted_profile("migrate-orphan");
+        let MigrationState::Completed { account: first, .. } = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            false,
+            |_| locked_as("me@example.com"),
+            || false,
+        ) else {
+            panic!("the first launch must migrate")
+        };
+
+        // The state the crash leaves: everything `finish` did, and nothing
+        // `main` would have done afterwards.
+        assert!(
+            !source.exists(),
+            "control: the migration really did delete the source, so there is nothing left to \
+             re-resolve from"
+        );
+        assert!(
+            !marker_path(&cfg, &first.id).exists(),
+            "control: the marker really is gone, so no resume can see the migration"
+        );
+        assert!(
+            accounts::data_dir_for(&cfg, &first.id)
+                .join(PROFILE_FILE)
+                .is_file(),
+            "control: the vault really is in the account directory"
+        );
+
+        // The second launch, with the empty account list the failed write left.
+        let second = migrate(
+            &cfg,
+            Some(&source),
+            &available(),
+            false,
+            |_| locked_as("me@example.com"),
+            || false,
+        );
+        let MigrationState::Completed {
+            account: ref adopted,
+            hello_needs_reenrolment,
+        } = second
+        else {
+            panic!("the second launch abandoned the vault: {second:?}")
+        };
+        assert_eq!(
+            adopted.id, first.id,
+            "the second launch is on a different account from the one holding the vault; \
+             {} still exists and nothing names it",
+            accounts::data_dir_for(&cfg, &first.id).display()
+        );
+        assert_eq!(
+            adopted.email, "me@example.com",
+            "the adopted account is unlabelled, so the switcher shows a blank row"
+        );
+        assert!(
+            !hello_needs_reenrolment,
+            "the Hello notice was raised a second time for a blob the first launch deleted"
+        );
+
+        // And the state `main` actually runs on: `resolve_startup` must point
+        // at that directory rather than mint one beside it.
+        let startup = accounts::resolve_startup(&[], None, &second);
+        let accounts::StartupAccounts::Ready { active, .. } = startup else {
+            panic!("{startup:?}")
+        };
+        assert_eq!(active.id, first.id);
+        assert_eq!(
+            dir_entries(accounts::accounts_root(&cfg)),
+            vec![first.id.to_string()],
+            "a second account directory was minted beside the one holding the vault"
+        );
+        let _ = std::fs::remove_dir_all(cfg.parent().unwrap());
+    }
+
+    /// The same recovery asked of the pure decision, plus the two neighbours
+    /// that must NOT adopt.
+    ///
+    /// Fails without the fix: the first assertion is `DoNothing`.
+    #[test]
+    fn an_unclaimed_account_directory_is_adopted_only_with_no_account_list() {
+        use ResumeAction::*;
+        const B: &str = "fedcba9876543210fedcba9876543210";
+
+        let orphaned = Observed {
+            account_dirs_with_profile: vec![id(A)],
+            ..observed(None, false, false, false)
+        };
+        assert_eq!(
+            resume_action(&orphaned),
+            AdoptUnclaimedAccount(id(A)),
+            "the vault in accounts/<id> is left for a freshly minted id to sit beside"
+        );
+
+        // A source that survived a `finish` whose deletion failed does not
+        // make this a fresh migration: copying again would put a second copy
+        // of the same vault under a second id.
+        assert_eq!(
+            resume_action(&Observed {
+                account_dirs_with_profile: vec![id(A)],
+                ..observed(None, false, false, true)
+            }),
+            AdoptUnclaimedAccount(id(A))
+        );
+        // Positive control for that: with no such directory the same
+        // observation still starts a migration.
+        assert_eq!(
+            resume_action(&observed(None, false, false, true)),
+            StartFresh,
+            "control: a source with nothing adopted is still a first migration"
+        );
+
+        // An account list means every directory is already spoken for.
+        assert_eq!(
+            resume_action(&Observed {
+                accounts_already_configured: true,
+                account_dirs_with_profile: vec![id(A)],
+                ..observed(None, false, false, false)
+            }),
+            DoNothing
+        );
+        // A marker outranks it: that state has a defined resume of its own,
+        // and it is the one that still holds the source.
+        assert_eq!(
+            resume_action(&Observed {
+                account_dirs_with_profile: vec![id(A)],
+                ..observed(Some(Stage::Promoted), false, true, true)
+            }),
+            VerifyAndFinish
+        );
+
+        // Two unclaimed vaults cannot be told apart, so neither is guessed at.
+        let two = Observed {
+            account_dirs_with_profile: vec![id(A), id(B)],
+            ..observed(None, false, false, false)
+        };
+        let Refuse { reason } = resume_action(&two) else {
+            panic!("two unclaimed vaults were resolved to one: {:?}", resume_action(&two))
+        };
+        assert!(reason.contains("more than one"), "{reason}");
+    }
+
+    /// The scan behind that field: an account directory counts only when it
+    /// holds a profile, and the staging names can never be mistaken for one.
+    ///
+    /// Fails without the fix: the function does not exist. With it, drop the
+    /// `PROFILE_FILE` check and the empty directory is reported.
+    #[test]
+    fn only_an_account_directory_holding_a_profile_counts_as_unclaimed() {
+        let root = scratch_dir("unclaimed-scan");
+        let cfg = root.join("cfg");
+        let a = id(A);
+        assert!(
+            account_dirs_with_profile(&cfg).is_empty(),
+            "a config directory with no accounts root reported something"
+        );
+
+        // An empty directory is `prepare_new_account`'s, mid sign-in. There is
+        // no vault in it, so adopting it would make an entry naming a profile
+        // that is not there -- an account permanently signed out.
+        std::fs::create_dir_all(accounts::data_dir_for(&cfg, &a)).unwrap();
+        assert!(account_dirs_with_profile(&cfg).is_empty());
+
+        // Neither staging name parses as an id, so neither can be adopted.
+        std::fs::create_dir_all(incoming_path(&cfg, &a)).unwrap();
+        std::fs::write(incoming_path(&cfg, &a).join(PROFILE_FILE), b"{}").unwrap();
+        std::fs::write(marker_path(&cfg, &a), b"{}").unwrap();
+        assert!(
+            account_dirs_with_profile(&cfg).is_empty(),
+            "a staging directory was offered up as an account to adopt"
+        );
+
+        // Positive control: the real thing is found.
+        std::fs::write(accounts::data_dir_for(&cfg, &a).join(PROFILE_FILE), b"{}").unwrap();
+        assert_eq!(account_dirs_with_profile(&cfg), vec![a]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -345,11 +345,23 @@ pub enum StartupAccounts {
         /// that named nobody.
         needs_persist: bool,
     },
-    /// Migration did not produce an account list. The app runs as a
-    /// single-account app against the CLI's own default directory, exactly as
-    /// it does today, and `reason` is what
-    /// [`AccountsState::blocked_reason`] reports wherever a switch would have
-    /// been.
+    /// Migration did not produce an account list. The app sets no
+    /// `BITWARDENCLI_APPDATA_DIR` at all and reads `<config_dir>\session.bin`,
+    /// and `reason` is what [`AccountsState::blocked_reason`] reports wherever
+    /// a switch would have been.
+    ///
+    /// **What that leaves depends on whether a migration ever ran, and only
+    /// one of the two is "today's app".** On a machine that never migrated,
+    /// the CLI's own directory still holds the vault and this really is the
+    /// pre-multi-account behaviour. On one that migrated and is now blocked
+    /// — a `bitwarden-cli` directory that appeared beside `bw.exe` since, or
+    /// an unreadable `settings.json` — that directory and
+    /// `<config_dir>\session.bin` were both deleted by the migration, so what
+    /// the user meets is a **signed-out** app asking for a master password.
+    /// Nothing is lost either way (the vault is in `accounts/<id>/` and this
+    /// state deletes nothing), but the second case is a sign-in, not a
+    /// continuation, and saying otherwise sends whoever reads it looking for
+    /// a directory that is not there.
     ///
     /// **This is the only state in which the app has no [`Account`] at all**,
     /// and it is a startup condition rather than an account variant — see this
@@ -376,9 +388,20 @@ pub enum StartupAccounts {
 /// * [`Blocked`](crate::migration::MigrationState::Blocked) with accounts
 ///   already stored is the opposite case and takes the opposite answer:
 ///   migration ran on some earlier launch and a `bitwarden-cli` directory has
-///   appeared beside `bw.exe` since. The vault is in the account directory
-///   now, so the app is still `Ready` and points at it;
-///   [`AccountsState`] is what refuses the *switch*.
+///   appeared beside `bw.exe` since. The app is still `Ready` and its state,
+///   `session.bin` and Windows Hello label all name the stored active
+///   account; [`AccountsState`] is what refuses the *switch*.
+///
+///   **Under `BlockedByPortableProfile` the CLI does not read the directory
+///   this points at.** That is the whole of what the block means: a
+///   `bitwarden-cli` directory beside `bw.exe` makes `bw` ignore
+///   `BITWARDENCLI_APPDATA_DIR` and read the portable profile instead, so the
+///   vault the user sees is that one while every name the app shows is
+///   account X's. It is still the right answer — refusing to switch is what
+///   keeps one profile from being served under several identities, and
+///   nothing here deletes anything — but `Ready` here means "pointed at",
+///   not "reading from", and the two are the same only when the block is one
+///   of the other kinds.
 /// * [`NothingToMigrate`](crate::migration::MigrationState::NothingToMigrate)
 ///   with nothing stored is a new machine, not a failure. It gets one account
 ///   directory to sign in to.
