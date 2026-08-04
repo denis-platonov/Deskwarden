@@ -159,15 +159,22 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
 /// from this path at all -- per the spec, it arms `(item_id, hwnd)` and
 /// returns it so the main loop's separate `fill_hotkey_pressed` check can
 /// fill it later, once the user actually presses the fill hotkey.
+///
+/// **Takes the window as one `ForegroundEvent`**, not as a handle plus a name
+/// plus a title. Those three describe one window and are only correct
+/// together; handed over separately, the one call site -- inside `main`'s
+/// event loop, where no test reaches -- can pass a title that belongs to no
+/// window, and the overlay then names the wrong thing while every test here
+/// stays green.
 pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
     injector: &Injector<A, B>,
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     m: &AppMatch,
-    hwnd: isize,
-    exe_name: &str,
+    window: &crate::window_watch::ForegroundEvent,
 ) -> Option<(String, isize)> {
+    let hwnd = window.hwnd;
     match m.trigger {
         TriggerMode::Auto => {
             fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
@@ -201,14 +208,41 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
                     username: username.filter(|u| !u.is_empty()),
                 }
             });
-            if overlay_ui::show_prompt_overlay(exe_name, matched.as_ref(), overlay_position(hwnd))
-            {
+            // `window_label`, not `exe_name`: a match found through the title
+            // table belongs to a window whose `exe_name` is the frame host's,
+            // and "ApplicationFrameHost.exe wants your password" names nothing
+            // the user has ever heard of. The label is computed here rather
+            // than by the caller so the two strings cannot be assembled wrong
+            // at a call site no test can reach.
+            let label = window_label(&window.exe_name, &window.title);
+            if overlay_ui::show_prompt_overlay(label, matched.as_ref(), overlay_position(hwnd)) {
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
             }
             None
         }
         TriggerMode::Hotkey => Some((item_id.to_string(), hwnd)),
     }
+}
+
+/// What to call the app in a window a foreground event describes.
+///
+/// Normally its executable's file name, which is what every overlay and log
+/// line in this app has always said. The exception is the one window that has
+/// no executable to name: an unattributable host frame, whose `exe_name` is
+/// `ApplicationFrameHost.exe` -- a Windows implementation detail, and the very
+/// string the user was shown in the bug they reported. Such a window is
+/// matched by its title (see [`crate::match_engine::MatchEngine::lookup`]), so
+/// the title is also the only name it has.
+///
+/// A host frame with no title falls back to the host's name rather than to an
+/// empty string: no such window can be matched, so this is unreachable from
+/// the fill path, but "" beside "wants to fill" would be worse than an ugly
+/// name if any other caller ever arrives.
+pub fn window_label<'a>(exe_name: &'a str, title: &'a str) -> &'a str {
+    if crate::window_watch::is_host_process(exe_name) && !title.is_empty() {
+        return title;
+    }
+    exe_name
 }
 
 /// Finds a currently-open window whose exe name matches `process` -- for
@@ -336,5 +370,28 @@ mod tests {
         let found = find_window_for_process(&windows, "epicgameslauncher.exe").unwrap();
         assert_eq!(found.hwnd, 1);
         assert!(find_window_for_process(&windows, "steam.exe").is_none());
+    }
+
+    const HOST: &str = "ApplicationFrameHost.exe";
+
+    #[test]
+    fn an_ordinary_window_is_named_by_its_executable() {
+        // The positive control for the two below: a `window_label` that always
+        // answered with the title would fail here, and one that always
+        // answered with the exe name would fail the next test.
+        assert_eq!(window_label("Ledgerline.exe", "Ledgerline -- Invoices"), "Ledgerline.exe");
+    }
+
+    #[test]
+    fn an_unattributable_store_frame_is_named_by_its_title() {
+        // Deleting the `is_host_process` branch gives
+        //     left: "ApplicationFrameHost.exe"  right: "Speedtest"
+        // -- which is the exact string the user reported being shown.
+        assert_eq!(window_label(HOST, "Speedtest"), "Speedtest");
+    }
+
+    #[test]
+    fn an_untitled_host_frame_falls_back_to_the_host_name_rather_than_to_nothing() {
+        assert_eq!(window_label(HOST, ""), HOST);
     }
 }

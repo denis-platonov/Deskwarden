@@ -2199,15 +2199,13 @@ fn process_foreground_event(
     }
     *last_dispatched_hwnd = Some(event.hwnd);
 
-    if let Some((item_id, m)) = engine.lookup(&event.exe_name) {
+    if let Some((item_id, m)) = engine.lookup(event) {
         log::info!(
             "matched {} to vault item {item_id} (trigger {:?})",
-            event.exe_name,
+            deskwarden::app::window_label(&event.exe_name, &event.title),
             m.trigger
         );
-        if let Some(armed) =
-            handle_match(cache, injector, fill_stats, item_id, m, event.hwnd, &event.exe_name)
-        {
+        if let Some(armed) = handle_match(cache, injector, fill_stats, item_id, m, event) {
             *pending_hotkey_fill = Some(armed);
         }
     }
@@ -5221,6 +5219,23 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 mod tests {
     use super::*;
 
+    /// The foreground window these tests ask the match engine about.
+    ///
+    /// `MatchEngine::lookup` takes a whole `ForegroundEvent` rather than the
+    /// strings it reads, so that `main`'s one production call site -- inside
+    /// an event loop no test can drive -- has nothing to assemble and nothing
+    /// to get wrong. That applies here too: these tests are about which
+    /// matches a *rebuild* armed, so the window they ask about is an ordinary
+    /// titleless one, and the title rule has its own tests in `match_engine`.
+    fn foreground(exe_name: &str) -> deskwarden::window_watch::ForegroundEvent {
+        deskwarden::window_watch::ForegroundEvent {
+            hwnd: 0x1234,
+            pid: 4242,
+            exe_name: exe_name.to_string(),
+            title: String::new(),
+        }
+    }
+
     /// A real, short-lived child process, for exercising `backend_is_running`
     /// and `stop_backend_if_idle` against an actual `Child` without needing a
     /// real `bw serve` -- neither function cares what the process is, only
@@ -5458,7 +5473,7 @@ mod tests {
             "the populate genuinely failed; this test is about what happens *despite* that"
         );
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "a transient list_folders failure must not disarm autofill for the whole session -- \
              there is no periodic match-engine refresh left, so nothing would ever re-arm it"
         );
@@ -5499,7 +5514,7 @@ mod tests {
         );
 
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "the engine's arming must depend only on the fetch already known to have succeeded, \
              so no later backend failure can disarm autofill for the rest of the session"
         );
@@ -5531,7 +5546,7 @@ mod tests {
         repopulate_and_refresh_after_unlock(&cache, &mut engine, probe_items(&[]), epoch);
 
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "matches from the account this app was signed into before the unlock must not \
              survive an unlock whose own vault does not have them"
         );
@@ -5625,7 +5640,7 @@ mod tests {
         );
 
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "a dismissal followed by a successful retry must arm the engine exactly as a \
              first-probe success does -- otherwise one impatient click kills autofill for the \
              whole session with no recovery the user would ever think to try"
@@ -5671,7 +5686,7 @@ mod tests {
             "exactly one retry -- the scripted probe panics if a third is asked for"
         );
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "nothing confirmed the backend, so the engine can only be holding the PRE-lock \
              account's matches and a locked app must be inert (review 13's Minor 3)"
         );
@@ -5712,7 +5727,7 @@ mod tests {
              another one (startup's Failed arm does not retry either)"
         );
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "same stand-down as a dismissal: empty cache, empty engine, app alive and locked"
         );
     }
@@ -5755,7 +5770,7 @@ mod tests {
              starts one rather than talking to a process nothing owns"
         );
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "nothing confirmed the backend under the NEW session, so the engine can only hold \
              the pre-lock account's matches: same stand-down the readiness arms produce, not an \
              exit and not a silently armed engine"
@@ -5784,7 +5799,7 @@ mod tests {
         let mut child = started.expect("a successful start must hand its child back");
         let _ = child.wait();
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "a successful restart must not stand autofill down"
         );
     }
@@ -5843,7 +5858,7 @@ mod tests {
         let (_server, cache, mut engine, mut cached_status_details) =
             an_app_signed_into_one_account();
         assert!(
-            cache.is_populated() && engine.lookup("prev.exe").is_some(),
+            cache.is_populated() && engine.lookup(&foreground("prev.exe")).is_some(),
             "control: the app really is holding the previous account's vault and matches, so \
              the assertions below are about them being torn down rather than never existing"
         );
@@ -5897,7 +5912,7 @@ mod tests {
         );
         assert!(bw_serve_child.is_some(), "the started backend must be tracked");
         assert!(
-            engine.lookup("next.exe").is_some() && engine.lookup("prev.exe").is_none(),
+            engine.lookup(&foreground("next.exe")).is_some() && engine.lookup(&foreground("prev.exe")).is_none(),
             "the engine is rebuilt from the probe's items, so the incoming account's matches \
              are armed and the outgoing account's are gone"
         );
@@ -5922,7 +5937,7 @@ mod tests {
         let (_server, cache, mut engine, mut cached_status_details) =
             an_app_signed_into_one_account();
         assert!(
-            cache.is_populated() && engine.lookup("prev.exe").is_some(),
+            cache.is_populated() && engine.lookup(&foreground("prev.exe")).is_some(),
             "control: the previous account's vault and matches are really here to be torn down"
         );
 
@@ -5942,7 +5957,7 @@ mod tests {
 
         assert_eq!(outcome, ResettleOutcome::BackendNotStarted);
         assert!(
-            engine.lookup("prev.exe").is_none(),
+            engine.lookup(&foreground("prev.exe")).is_none(),
             "the previous account's matches survived a declined authentication: a matched \
              process would still raise the prompt, and the fill could only ever end in an error"
         );
@@ -5987,7 +6002,7 @@ mod tests {
         assert_eq!(outcome, ResettleOutcome::BackendNotStarted);
         assert!(bw_serve_child.is_none());
         assert!(
-            engine.lookup("prev.exe").is_none(),
+            engine.lookup(&foreground("prev.exe")).is_none(),
             "nothing confirmed a backend under the new session, so the engine can only be \
              holding the previous account's matches"
         );
@@ -7521,7 +7536,7 @@ mod tests {
 
         settled_on(&cache, &mut engine, &[("a-item", "notepad.exe")]);
         assert!(
-            engine.lookup("notepad.exe").is_some() && cache.is_populated(),
+            engine.lookup(&foreground("notepad.exe")).is_some() && cache.is_populated(),
             "precondition: the app really is live on A, so the assertions below are about \
              A being torn down rather than never having been there"
         );
@@ -7542,7 +7557,7 @@ mod tests {
         assert_eq!(outcome, SwitchOutcome::Switched);
         assert_eq!(active.id, b.id, "the app is still reporting itself as A");
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "account A's match is STILL ARMED under account B's session"
         );
         // The positive control, so this cannot pass on an engine that is
@@ -7550,7 +7565,7 @@ mod tests {
         // never rearmed it would leave, and which every negative assertion
         // above would happily accept.
         assert!(
-            engine.lookup("code.exe").is_some(),
+            engine.lookup(&foreground("code.exe")).is_some(),
             "account B's own match is not armed, so the switch disarmed autofill instead of \
              moving it"
         );
@@ -7700,7 +7715,7 @@ mod tests {
         assert_eq!(active.id, a.id, "the app thinks it switched");
         assert!(cache.is_populated(), "A's vault is gone after a failed switch");
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "A's autofill is dead after a failed switch"
         );
         assert!(
@@ -7785,7 +7800,7 @@ mod tests {
             bw_path::active_data_dir(),
             Some(accounts::data_dir_for(cfg.path(), &a.id))
         );
-        assert!(engine.lookup("notepad.exe").is_some());
+        assert!(engine.lookup(&foreground("notepad.exe")).is_some());
         assert!(cache.is_populated());
         assert!(accounts::session_path_for(cfg.path(), &a.id).exists());
     }
@@ -9338,7 +9353,7 @@ mod tests {
             SettledSync::Failed(e) => panic!("expected a refreshed sync, got Failed({e})"),
         }
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "a sync nothing interfered with must still refresh the match engine"
         );
     }
@@ -9382,11 +9397,11 @@ mod tests {
              not be applied to anything"
         );
         assert!(
-            engine.lookup("code.exe").is_some(),
+            engine.lookup(&foreground("code.exe")).is_some(),
             "the engine the recovery armed must survive the late arrival"
         );
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "the pre-clear vault's matches must not be armed by the late arrival"
         );
     }
@@ -9426,11 +9441,11 @@ mod tests {
              been refilled for the new one"
         );
         assert!(
-            engine.lookup("code.exe").is_some(),
+            engine.lookup(&foreground("code.exe")).is_some(),
             "the new account's matches must stay armed"
         );
         assert!(
-            engine.lookup("notepad.exe").is_none(),
+            engine.lookup(&foreground("notepad.exe")).is_none(),
             "the previous account's matches must not be armed after an account switch"
         );
     }
@@ -9502,7 +9517,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&match_entries(&cache.items()));
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "the save itself must arm the engine"
         );
 
@@ -9518,7 +9533,7 @@ mod tests {
             SettledSync::Failed(e) => panic!("expected a refreshed sync, got Failed({e})"),
         }
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "the app match the user saved while the sync was in flight was silently dropped by \
              the sync's own, older item list"
         );
@@ -9583,7 +9598,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&match_entries(&cache.items()));
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "the save itself must arm the engine"
         );
 
@@ -9599,7 +9614,7 @@ mod tests {
         }
 
         assert!(
-            engine.lookup("notepad.exe").is_some(),
+            engine.lookup(&foreground("notepad.exe")).is_some(),
             "the app match the user saved while the sync was FETCHING was reverted by the \
              sync's populate, so the engine was rebuilt without it"
         );

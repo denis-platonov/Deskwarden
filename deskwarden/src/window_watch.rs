@@ -6,14 +6,25 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnumChildWindows, GetClassNameW, GetForegroundWindow, GetMessageW,
-    GetWindowThreadProcessId, TranslateMessage, CHILDID_SELF, EVENT_SYSTEM_FOREGROUND, MSG,
-    OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, TranslateMessage, CHILDID_SELF,
+    EVENT_SYSTEM_FOREGROUND, MSG, OBJID_WINDOW, WINEVENT_OUTOFCONTEXT,
 };
 
 pub struct ForegroundEvent {
     pub hwnd: isize,
     pub pid: u32,
+    /// The application this window was attributed to -- or, when it could not
+    /// be attributed at all, the name of the host that owns it. A consumer
+    /// must therefore never treat this as "the app": route it through
+    /// [`crate::match_engine::MatchEngine::lookup`], which decides what an
+    /// unattributable window is allowed to match, or through
+    /// [`crate::app::window_label`], which decides what it is called on screen.
     pub exe_name: String,
+    /// The window's own title, as `GetWindowTextW` reports it.
+    ///
+    /// Empty is possible and means "this window has no title", not "not
+    /// looked up": plenty of real top-level windows have none.
+    pub title: String,
 }
 
 thread_local! {
@@ -210,19 +221,53 @@ pub fn attribute_window(owner_pid: u32, owner_exe: &str, children: &[ChildWindow
 /// build the event" step lived inside either of them, the fix could be
 /// reverted with every test still green. It lives here instead, and both of
 /// them are glue over it.
+///
+/// **An unattributable host frame now raises an event, under the host's name,
+/// as long as it has a title.** It used to raise none at all, and that was
+/// right while the host's name was the only thing such a window could be
+/// matched on -- a name that means "every Microsoft Store app". It has one
+/// other thing: the title on the frame, which a suspended Store app keeps when
+/// its `CoreWindow` (and with it any way of naming its executable) is gone.
+/// The event carries both, and
+/// [`crate::match_engine::MatchEngine::lookup`] is where the host's name stops
+/// being usable as an identity -- it routes a host-named window to the stored
+/// titles and to nothing else. A frame with no title has neither, and still
+/// raises nothing.
 pub fn foreground_event_from(
     hwnd: isize,
     owner_pid: u32,
     owner_exe: &str,
+    title: &str,
     children: &[ChildWindow],
 ) -> Option<ForegroundEvent> {
     match attribute_window(owner_pid, owner_exe, children) {
-        Attribution::Attributed { pid, exe_name } => Some(ForegroundEvent { hwnd, pid, exe_name }),
-        Attribution::UnresolvedHost { host } => {
+        Attribution::Attributed { pid, exe_name } => Some(ForegroundEvent {
+            hwnd,
+            pid,
+            exe_name,
+            title: title.to_string(),
+        }),
+        Attribution::UnresolvedHost { host } if title.is_empty() => {
             log::debug!(
-                "ignoring foreground window {hwnd}: hosted by {host}, no hosted app identified"
+                "ignoring foreground window {hwnd}: hosted by {host}, no hosted app identified \
+                 and no title to identify it by"
             );
             None
+        }
+        Attribution::UnresolvedHost { host } => {
+            log::debug!(
+                "foreground window {hwnd} is hosted by {host} with no hosted app identified; \
+                 it can only match on its title, {title:?}"
+            );
+            // The HOST's pid, because there is no other one: nothing behind
+            // this frame could be named. Callers that key on a pid must know
+            // that (`window_list::enum_proc` says the same of its rows).
+            Some(ForegroundEvent {
+                hwnd,
+                pid: owner_pid,
+                exe_name: host,
+                title: title.to_string(),
+            })
         }
     }
 }
@@ -236,16 +281,44 @@ pub fn foreground_event_from(
 /// [`attribute_window`]) and this runs on every foreground change. The
 /// non-host case still goes *through* the pure function, with no children,
 /// rather than being answered here.
+///
+/// The title, by contrast, is read on both paths: it is one cheap call, and
+/// making it conditional would mean the event's contents depended on which
+/// branch produced it.
 pub fn observe_foreground_event(
     hwnd: isize,
     owner_pid: u32,
     owner_exe: &str,
 ) -> Option<ForegroundEvent> {
+    let title = window_title(hwnd);
     if !is_host_process(owner_exe) {
-        return foreground_event_from(hwnd, owner_pid, owner_exe, &[]);
+        return foreground_event_from(hwnd, owner_pid, owner_exe, &title, &[]);
     }
     let children = child_windows_of(hwnd);
-    foreground_event_from(hwnd, owner_pid, owner_exe, &children)
+    foreground_event_from(hwnd, owner_pid, owner_exe, &title, &children)
+}
+
+/// The window's title, or an empty string if it has none (or it could not be
+/// read).
+///
+/// Pure observation, no decisions -- the same shape as [`child_windows_of`].
+/// `window_list::enum_proc` reads titles the same way, but *drops* untitled
+/// windows because an untitled row is nothing a user could click; here an
+/// untitled window is an ordinary case that simply cannot be matched by title.
+fn window_title(hwnd: isize) -> String {
+    let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buffer = vec![0u16; len as usize + 1];
+        let copied = GetWindowTextW(hwnd, &mut buffer);
+        if copied <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buffer[..copied as usize])
+    }
 }
 
 /// Attributes `hwnd` to a real application, for callers that want the
@@ -365,6 +438,7 @@ unsafe extern "system" fn win_event_proc(
                 hwnd: event.hwnd,
                 pid: event.pid,
                 exe_name: event.exe_name.clone(),
+                title: event.title.clone(),
             });
         }
     });
@@ -544,8 +618,14 @@ mod tests {
         // build the event from `owner_pid`/`owner_exe` gives
         //     left: ("ApplicationFrameHost.exe", 12472)
         //     right: ("Speedtest.exe", 45996)
-        let event = foreground_event_from(0x1234, 12472, HOST, &[core_window(45996, "Speedtest.exe")])
-            .expect("a frame with an identifiable hosted app must raise an event");
+        let event = foreground_event_from(
+            0x1234,
+            12472,
+            HOST,
+            "Speedtest",
+            &[core_window(45996, "Speedtest.exe")],
+        )
+        .expect("a frame with an identifiable hosted app must raise an event");
         assert_eq!(
             (event.exe_name.as_str(), event.pid, event.hwnd),
             ("Speedtest.exe", 45996, 0x1234)
@@ -553,15 +633,50 @@ mod tests {
     }
 
     #[test]
-    fn an_unattributable_host_frame_raises_no_event_at_all() {
-        assert!(
-            foreground_event_from(0x1234, 12472, HOST, &[]).is_none(),
-            "a window we cannot attribute must not be matched under the host's name"
+    fn every_event_carries_the_window_title_it_was_built_from() {
+        // The title is the whole of what a suspended Store app can be matched
+        // by, so an event that dropped it would make `MatchEngine`'s title
+        // table unreachable in production while every test of that table
+        // stayed green. Dropping the field from the `Attributed` arm gives
+        //     left: ""  right: "Untitled - Notepad"
+        let event = foreground_event_from(0x1234, 4242, "notepad.exe", "Untitled - Notepad", &[])
+            .expect("an ordinary window raises an event");
+        assert_eq!(event.title, "Untitled - Notepad");
+    }
+
+    /// **What used to be `an_unattributable_host_frame_raises_no_event_at_all`.**
+    /// It now raises one, because the title on the frame is a real identity
+    /// even when nothing behind it can be named -- see `foreground_event_from`.
+    /// The host's NAME is still not an identity, and that is enforced in
+    /// `MatchEngine::lookup`, which is the only thing that reads it.
+    #[test]
+    fn an_unattributable_host_frame_is_reported_under_the_host_name_with_its_title() {
+        // Reverting the `UnresolvedHost` arm to `None` gives
+        //     "a titled frame is the only chance a suspended Store app has"
+        let event = foreground_event_from(0x1234, 12472, HOST, "Speedtest", &[])
+            .expect("a titled frame is the only chance a suspended Store app has");
+        assert_eq!(
+            (event.exe_name.as_str(), event.pid, event.title.as_str()),
+            (HOST, 12472, "Speedtest")
         );
-        // Positive control on the same function: an ordinary window still
-        // raises an event, so this is not passing against a watcher that has
-        // gone entirely inert.
-        assert!(foreground_event_from(0x1234, 4242, "Speedtest.exe", &[]).is_some());
+    }
+
+    #[test]
+    fn an_unattributable_host_frame_with_no_title_raises_no_event_at_all() {
+        // Nothing can identify this window: not its process, not its title.
+        // Deleting the `if title.is_empty()` arm gives
+        //     "a window with no identity at all must raise no event"
+        assert!(
+            foreground_event_from(0x1234, 12472, HOST, "", &[]).is_none(),
+            "a window with no identity at all must raise no event"
+        );
+        // Positive control on the same function and the same host: the ONLY
+        // difference is the title, so this cannot pass against a watcher that
+        // has gone entirely inert.
+        assert!(foreground_event_from(0x1234, 12472, HOST, "Speedtest", &[]).is_some());
+        // ...and an ordinary untitled window is unaffected: it is identified
+        // by its process, and the title guard must not reach it.
+        assert!(foreground_event_from(0x1234, 4242, "Speedtest.exe", "", &[]).is_some());
     }
 }
 
@@ -589,6 +704,25 @@ mod watcher_wiring_tests {
     // both). `concat!` joins at compile time.
     const CALL: &str = concat!("observe_foreground_event", "(");
 
+    /// The other call this module has to pin, and for a sharper reason: every
+    /// test of the title rule injects the title as an argument, so
+    /// `foreground_event_from(hwnd, owner_pid, owner_exe, "", &children)` --
+    /// one deleted call -- compiles, leaves the whole suite green, and makes
+    /// the title table unreachable on a real desktop. That is the exact shape
+    /// this repo has been bitten by twice.
+    const TITLE_CALL: &str = concat!("window_title", "(");
+
+    /// And the other half of it. `TITLE_CALL` alone pins only that the title is
+    /// READ: the mutation that rewrites both `foreground_event_from` calls to
+    /// pass `""` leaves the `window_title` call sitting there, counted, with
+    /// its result dropped -- measured, not assumed, and it is exactly the "call
+    /// whose result is thrown away" the sibling guards in this crate disclaim.
+    /// This needle is the argument itself, at both call sites.
+    ///
+    /// Together they are tight: this one alone would accept a `let title =
+    /// String::new()`, and that one alone accepts the empty literal.
+    const TITLE_ARGUMENT: &str = concat!("&title", ", &");
+
     fn source() -> &'static str {
         include_str!("window_watch.rs")
     }
@@ -606,6 +740,40 @@ mod watcher_wiring_tests {
         let planted = concat!("let x = observe_foreground_event", "(1, 2, \"a\");");
         assert_eq!(occurrences(planted, CALL), 1, "planted: {planted}");
         assert_eq!(occurrences("nothing here", CALL), 0);
+
+        let planted_title = concat!("let t = window_title", "(hwnd);");
+        assert_eq!(occurrences(planted_title, TITLE_CALL), 1, "planted: {planted_title}");
+        assert_eq!(occurrences("nothing here", TITLE_CALL), 0);
+
+        let planted_arg = concat!("f(hwnd, owner_pid, owner_exe, &title", ", &[])");
+        assert_eq!(occurrences(planted_arg, TITLE_ARGUMENT), 1, "planted: {planted_arg}");
+        assert_eq!(occurrences(concat!("f(hwnd, owner_exe, \"\"", ", &[])"), TITLE_ARGUMENT), 0);
+    }
+
+    #[test]
+    fn the_observer_reads_the_windows_real_title_rather_than_passing_an_empty_one() {
+        assert_eq!(
+            occurrences(source(), TITLE_CALL),
+            2,
+            "expected {TITLE_CALL:?} exactly twice in window_watch.rs -- its own definition and \
+             the one call, in `observe_foreground_event`. One means every foreground event now \
+             carries an empty title, which silently disables the only way a suspended Microsoft \
+             Store app can be matched: `MatchEngine`'s title table is keyed on a title no live \
+             event would ever supply"
+        );
+    }
+
+    #[test]
+    fn the_title_it_read_is_the_title_it_hands_to_the_decision() {
+        assert_eq!(
+            occurrences(source(), TITLE_ARGUMENT),
+            2,
+            "expected {TITLE_ARGUMENT:?} exactly twice in window_watch.rs -- one for each of \
+             `observe_foreground_event`'s two calls to `foreground_event_from`, the host path \
+             and the ordinary one. Fewer means a call went back to passing a literal, so every \
+             foreground event on that path carries no title: a suspended Microsoft Store app \
+             then has no identity at all and can never be matched"
+        );
     }
 
     #[test]

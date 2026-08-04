@@ -63,6 +63,7 @@ mod tests {
             hwnd,
             pid,
             exe_name: "target.exe".to_string(),
+            title: "Target".to_string(),
         }
     }
 
