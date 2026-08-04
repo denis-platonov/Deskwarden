@@ -21,6 +21,7 @@
 //! it), and the read-mode file was already large enough on its own.
 
 use super::sidebar::OutOfVault;
+use crate::app_match::{AppMatch, TriggerMode};
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
@@ -397,6 +398,33 @@ pub enum DetailAction {
     /// non-zeroizing home inside this enum. [`Self::CopyValue`]'s door is for
     /// non-secrets and this must not use it.
     CopyPasswordHistory(usize),
+    /// The `MATCHED APP` card's trigger control was set to a **new** mode,
+    /// carrying the mode the match should end up in.
+    ///
+    /// Carrying the target rather than "the control was clicked", for exactly
+    /// [`Self::ToggleFavorite`]'s reason: the pane already read the match's
+    /// current trigger to decide which pill is filled, so it is the one that
+    /// knows what the other state is.
+    ///
+    /// It carries **only the trigger**, not a whole [`AppMatch`]: the rest of
+    /// the match (`process`, `title`, `hosted`, `path`) is the picker's
+    /// capture off a live window, and a card that handed a rebuilt copy back
+    /// would be a second producer of those four fields. The caller reads the
+    /// current match off the item and changes one field --
+    /// [`app_match_with_trigger`] is that change, so the pane and the caller
+    /// cannot disagree about what "only the trigger" means.
+    ///
+    /// Reported only when the mode actually differs; see
+    /// [`app_trigger_click`], which is where that gate lives so a click on
+    /// the already-selected pill cannot cost a vault write.
+    SetAppTrigger(TriggerMode),
+    /// The `MATCHED APP` card's Remove was clicked: the item should stop
+    /// being bound to any app at all.
+    ///
+    /// **No value, because there is nothing to choose.** The caller resolves
+    /// this through `vault_bridge::without_app_match`, which removes the
+    /// custom field rather than blanking it.
+    RemoveAppMatch,
 }
 
 /// Whether this kind can be filled into an application.
@@ -1152,6 +1180,32 @@ fn copy_row_tooltip(hint: Option<CopyShortcut>) -> String {
     }
 }
 
+/// Whether a row that would copy `value` has anything to copy.
+///
+/// **The click path's half of the rule [`copy_shortcut_action`] already
+/// states.** That function refuses a chord over an empty field rather than
+/// falling back, because "an empty string looks like a failed paste"; the
+/// click path had no such gate, so a Password or Username row -- both of
+/// which are drawn whether or not the item carries a value -- took the hover
+/// tint, the pointing hand and the "Click to copy" tooltip, reported a copy,
+/// and raised a "Password copied" toast with nothing on the clipboard.
+///
+/// **An empty row is made INERT, not merely quiet.** Suppressing only the
+/// toast was the smaller change and was rejected: the tint, the cursor and
+/// the tooltip are three separate promises made *before* the click, and a row
+/// that keeps all three and then does nothing is the case `copy_row`'s own
+/// doc already calls "worse than an inert one, because there is no way to
+/// tell from the outside that it did nothing". So an empty row senses hover
+/// only -- no tint, no hand, no tooltip, no action, no toast.
+///
+/// Pure and trivial on purpose: what is worth pinning is not the expression
+/// but that both paths agree, which
+/// `an_empty_field_is_refused_by_the_click_path_and_the_chord_path_alike`
+/// asserts against [`copy_shortcut_action`] directly.
+fn row_offers_copy(value: &str) -> bool {
+    !value.is_empty()
+}
+
 /// A row's keyboard-shortcut hint, on the control line.
 ///
 /// Bare 10px monospace in ghost grey, matching the design's other shortcut
@@ -1811,11 +1865,28 @@ pub fn draw_detail_read(
                 |_ui| {},
                 DetailAction::CopyValue(website.to_string()),
                 Some(CopyShortcut::Url),
+                // Not a constant `true`: this card is already gated on
+                // `!website.is_empty()` above, and stating the rule through
+                // the same predicate every other row uses means the two
+                // cannot drift if that gate ever changes.
+                row_offers_copy(website),
                 &mut action,
             );
             if opened {
                 action = DetailAction::OpenWebsite(website.to_string());
             }
+        });
+        ui.add_space(CARD_GAP);
+    }
+
+    // **Directly under AUTOFILL TARGETS, and NOT inside it** -- see
+    // `APP_CARD_HEADING`. Last of the body cards, above the metadata strip:
+    // the cards above are the item's own contents, and this one is about what
+    // Deskwarden does with them.
+    let app_match = crate::vault_bridge::extract_app_match(item);
+    if app_card_visible(app_match.is_some(), kind) {
+        card(ui, APP_CARD_HEADING, |ui| {
+            app_match_card(ui, app_match.as_ref(), &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -1859,6 +1930,313 @@ pub fn draw_detail_read(
     // on the clock by the time this reads it and shows it in the same frame.
     draw_copy_toast(ui, pane);
     action
+}
+
+// ---------------------------------------------------------------------------
+// The MATCHED APP card.
+//
+// `AppMatch::path` has been written into real vault items since the picker
+// learned to capture it and NOTHING has ever read it back; an app match could
+// only be created, never seen, corrected or undone -- not even to find out
+// which app an item is bound to. This card is that reader.
+//
+// Every decision it makes is one of the pure functions below, and
+// `app_match_card` does nothing but obey them, for this file's standing
+// reason: a decision reachable only through an `egui` closure is a decision
+// no test can call.
+// ---------------------------------------------------------------------------
+
+/// **Its own card, beside `AUTOFILL TARGETS` rather than inside it.**
+///
+/// An app match *is* an autofill target, and folding these rows into that card
+/// was the first thing considered and the first thing rejected: that card is
+/// drawn only `if !website.is_empty()`, so an item bound to an app and carrying
+/// no URI would have had its match hidden by a gate about a website -- which is
+/// the exact invisibility this card exists to end. Two cards also keep the
+/// heading honest about what the rows underneath are: a web address and a
+/// Windows executable are matched by two different engines against two
+/// different things.
+const APP_CARD_HEADING: &str = "MATCHED APP";
+
+/// What the card says when the item is bound to nothing.
+///
+/// **It names the door rather than offering one.** There IS a picker
+/// (`picker_ui::run_picker`), and this card deliberately does not duplicate or
+/// route to it: the picker is opened by the tray's "Add app..." on `main`'s
+/// own thread, and the vault window is a *blocking* call on that same thread
+/// -- so there is no way for this pane to raise it without restructuring
+/// `main.rs`. Saying nothing at all was the alternative, and it leaves a user
+/// looking at an empty card with no idea that the feature exists.
+const APP_MATCH_EMPTY_NOTICE: &str =
+    "No app is matched to this item yet. Use \"Add app...\" in the Deskwarden tray menu to \
+     pick a window, and it will show up here.";
+
+/// What the card says under the rows when the match was captured off a
+/// Microsoft Store / UWP frame.
+///
+/// **The word `hosted` never reaches the screen**, and neither does
+/// `ApplicationFrameHost.exe`: they are the mechanism, not the fact. What the
+/// user needs to know is that this one match is keyed on a window title rather
+/// than on an executable name, because that is what makes it behave
+/// differently -- it is the only match that keeps working while the app is
+/// suspended, and the only one a renamed window can break.
+const APP_HOSTED_NOTE: &str =
+    "Matched by its window title, because this is a Microsoft Store app.";
+
+/// Whether the pane draws a [`APP_CARD_HEADING`] card at all.
+///
+/// **Two reasons, and the first outranks the second.** An item that HAS a
+/// match always gets the card, whatever kind it is: a binding the pane refuses
+/// to draw is the defect being fixed, and an app match sitting on a secure
+/// note is exactly the case a user would most need to see in order to remove
+/// it. An item with no match gets the card only where a match would do
+/// something -- `kind_offers_fill`, the same predicate that gates the Fill
+/// button and the `AUTOFILL TARGETS` card, so a card, a note and a button
+/// cannot end up disagreeing about which kinds autofill.
+fn app_card_visible(has_match: bool, kind: ItemKind) -> bool {
+    has_match || kind_offers_fill(kind)
+}
+
+/// One row of the card: its label, the text in its value column, and whether
+/// that text is the match's own value (so the row copies) or a placeholder
+/// standing in for a value that was never recorded (so it does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppRow {
+    label: &'static str,
+    value: String,
+    /// `false` for a placeholder. It reaches [`copy_row`]'s `copyable`, so a
+    /// row saying "Not recorded" is inert -- no tint, no hand, no tooltip, no
+    /// toast -- for the same reason an empty Password row is (see
+    /// [`row_offers_copy`]).
+    real: bool,
+}
+
+/// The placeholder for a `path` this match never captured -- every match saved
+/// before the field existed, which is a shape still sitting in real vaults.
+const APP_PATH_UNRECORDED: &str = "Not recorded";
+
+/// The card's rows, in order, for a match that exists.
+///
+/// **The user asked for "name, path + keys", and this is that mapping made
+/// explicit.** `process` is the name, `path` is the path, `trigger` is the
+/// keys -- but the trigger is a control rather than a row of text, so it is
+/// not here; it is [`trigger_label`]'s three pills, drawn after these.
+///
+///  * **App** -- `process`, the executable's file name. This is the thing the
+///    match engine actually compares, so it is first.
+///  * **Window title** -- `title`, and ONLY when `hosted`. An unhosted title
+///    is inert by design (see [`AppMatch::hosted`]): every one saved during
+///    the one commit that recorded titles for every row is deliberately never
+///    matched on, and drawing it here would tell the user it does something.
+///  * **Program file** -- `path`, or [`APP_PATH_UNRECORDED`]. Shown as the
+///    match stores it, NOT through `AppMatch::launchable_path`: that function
+///    answers "is this safe to execute", this row answers "what did the picker
+///    record", and showing nothing for a path that fails the launch check
+///    would hide the very corruption a user needs to see in order to fix it.
+fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
+    let mut rows = vec![AppRow {
+        label: "App",
+        value: m.process.clone(),
+        real: row_offers_copy(&m.process),
+    }];
+    if m.hosted && !m.title.is_empty() {
+        rows.push(AppRow {
+            label: "Window title",
+            value: m.title.clone(),
+            real: true,
+        });
+    }
+    let recorded = row_offers_copy(&m.path);
+    rows.push(AppRow {
+        label: "Program file",
+        value: if recorded {
+            m.path.clone()
+        } else {
+            APP_PATH_UNRECORDED.to_string()
+        },
+        real: recorded,
+    });
+    rows
+}
+
+/// The card's footer lines, under the rows: what the selected trigger means,
+/// and -- for a Store app -- why this match is keyed on a title.
+fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
+    let mut notes = vec![trigger_caption(m.trigger)];
+    if m.hosted {
+        notes.push(APP_HOSTED_NOTE);
+    }
+    notes
+}
+
+/// The three trigger pills, in the order they are drawn.
+///
+/// The same three the picker offers, in the same order, so the control a user
+/// met when they created the match is the control they meet when they change
+/// it. (The picker's own `TRIGGER_CHOICES` is private to `picker_ui`, and this
+/// pass does not own that file; the wording below is held to it by
+/// `the_trigger_pills_say_what_the_picker_says`.)
+const TRIGGER_ORDER: [TriggerMode; 3] = [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
+
+/// A trigger mode's pill label. Exhaustive with no catch-all: a fourth
+/// [`TriggerMode`] must be a compile error here rather than silently
+/// inheriting a neighbour's name.
+fn trigger_label(mode: TriggerMode) -> &'static str {
+    match mode {
+        TriggerMode::Prompt => "Prompt",
+        TriggerMode::Hotkey => "Hotkey",
+        TriggerMode::Auto => "Auto",
+    }
+}
+
+/// The sentence under the pills, saying what the selected mode does.
+/// Exhaustive for [`trigger_label`]'s reason.
+fn trigger_caption(mode: TriggerMode) -> &'static str {
+    match mode {
+        TriggerMode::Prompt => "Show the overlay when this app is focused.",
+        TriggerMode::Hotkey => "Fill only when the fill hotkey is pressed.",
+        TriggerMode::Auto => "Fill immediately when this app is focused.",
+    }
+}
+
+/// What a click on the `clicked` pill should report, given the mode the match
+/// is already on.
+///
+/// **`None` for the pill that is already selected**, and that is the whole of
+/// this function. A segmented control's selected segment still reports clicks,
+/// and every one of them would otherwise be a PUT to the user's vault that
+/// changes nothing -- each of which supersedes the item's `revisionDate` and
+/// so is a chance for the write to fail for no reason at all.
+fn app_trigger_click(current: TriggerMode, clicked: TriggerMode) -> Option<DetailAction> {
+    (current != clicked).then_some(DetailAction::SetAppTrigger(clicked))
+}
+
+/// `m` with its trigger set to `to` and **every other field untouched**.
+///
+/// Public because the write lives in `vault_window::mod` -- the pane reports
+/// a [`DetailAction`] and never writes -- and both must agree that changing
+/// the trigger changes exactly one field. `process`, `title`, `hosted` and
+/// `path` are the picker's capture off a live window; a write arm that
+/// rebuilt them would be a second producer of four fields whose whole value
+/// is that they came off a real window once.
+pub fn app_match_with_trigger(m: &AppMatch, to: TriggerMode) -> AppMatch {
+    AppMatch { trigger: to, ..m.clone() }
+}
+
+/// The card's body: the rows, the trigger pills, the notes and Remove -- or,
+/// for an item bound to nothing, one sentence saying so.
+fn app_match_card(ui: &mut egui::Ui, app_match: Option<&AppMatch>, action: &mut DetailAction) {
+    let Some(m) = app_match else {
+        card_text(
+            ui,
+            RichText::new(APP_MATCH_EMPTY_NOTICE)
+                .size(ROW_LABEL_SIZE)
+                .color(theme::TEXT_FAINT),
+        );
+        return;
+    };
+    for (index, app_row) in app_match_rows(m).iter().enumerate() {
+        if index > 0 {
+            theme::row_rule(ui);
+        }
+        if app_row.real {
+            // A plain non-secret value, copied through `CopyValue` -- the
+            // door `DetailAction::CopyValue` reserves for values that are not
+            // `Zeroizing` in the model, which an exe name and a path are not.
+            credential_row(
+                ui,
+                app_row.label,
+                &app_row.value,
+                None,
+                action,
+                DetailAction::CopyValue(app_row.value.clone()),
+            );
+        } else {
+            row(
+                ui,
+                app_row.label,
+                |ui| {
+                    ui.label(
+                        RichText::new(&app_row.value)
+                            .size(ROW_VALUE_SIZE)
+                            .color(theme::TEXT_FAINT),
+                    );
+                },
+                |_ui| {},
+            );
+        }
+    }
+
+    theme::row_rule(ui);
+    // The trigger lives in the VALUE column, not the control group: it is
+    // this row's value -- what the match's `trigger` currently is -- and not
+    // an action performed on a value shown elsewhere.
+    row(
+        ui,
+        "Autofill",
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for mode in TRIGGER_ORDER {
+                let selected = mode == m.trigger;
+                let button = egui::Button::new(theme::semibold(trigger_label(mode), 12.0).color(
+                    if selected { egui::Color32::WHITE } else { theme::INK },
+                ))
+                .fill(if selected { theme::BLUE } else { theme::CARD })
+                .stroke(if selected {
+                    Stroke::NONE
+                } else {
+                    Stroke::new(1.0, theme::BORDER_STRONG)
+                })
+                .corner_radius(CornerRadius::same(7));
+                if ui.add(button).clicked() {
+                    if let Some(chosen) = app_trigger_click(m.trigger, mode) {
+                        *action = chosen;
+                    }
+                }
+            }
+        },
+        |_ui| {},
+    );
+
+    theme::row_rule(ui);
+    // The footer: the notes on the left where a value goes, Remove in the
+    // control group where every other row's control goes. An empty label
+    // keeps it on the same two columns as the rows above it.
+    row(
+        ui,
+        "",
+        |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for note in app_card_notes(m) {
+                    ui.label(
+                        RichText::new(note)
+                            .size(ROW_HINT_SIZE)
+                            .color(theme::TEXT_GHOST),
+                    );
+                }
+            });
+        },
+        |ui| {
+            // **One click, no arming.** `confirm_click`'s two-click gate is
+            // reserved for the item Delete, which trashes the whole item;
+            // this removes one custom field, the card says so immediately by
+            // flipping to `APP_MATCH_EMPTY_NOTICE`, and that notice names the
+            // way to put it back. Making this the third armed control on the
+            // pane would have cost `draw_detail_read` another parameter and
+            // `vault_window::mod` another piece of per-item pending state,
+            // for a click whose undo is four clicks in the tray.
+            //
+            // Hand-editing `process` and `path` is deliberately NOT offered
+            // here -- see the module's own note on the card.
+            if theme::row_button(ui, "Remove")
+                .on_hover_text("Stop autofilling this item into that app")
+                .clicked()
+            {
+                *action = DetailAction::RemoveAppMatch;
+            }
+        },
+    );
 }
 
 /// A pane for an item this build cannot show the contents of: it states the
@@ -1963,6 +2341,14 @@ fn copy_row(
     // row gets a tooltip; only some have a chord, and only some of those
     // paint it on the row; the chord is drawn to the right of them.
     hint: Option<CopyShortcut>,
+    // **Whether there is anything to copy at all** -- the caller's answer,
+    // because this function cannot work it out. The secret variants
+    // (`CopyPassword`, `CopyUsername`, `CopyTotp`, `CopyCardNumber`,
+    // `CopyCardCode`, `CopySshPrivateKey`) deliberately do NOT carry their
+    // value (see `DetailAction`'s docs), so `on_copy` says which field and
+    // never whether it is empty. Every caller derives this from the value it
+    // is about to paint, through `row_offers_copy`.
+    copyable: bool,
     action: &mut DetailAction,
 ) {
     // **The chord is added FIRST, which puts it at the far RIGHT.** The
@@ -1980,6 +2366,14 @@ fn copy_row(
         shortcut_hint(ui, hint);
         controls(ui);
     };
+    // **`Sense::hover()` when there is nothing to copy**, which is what
+    // withdraws the tint and the pointing hand -- `row_impl` gates both on
+    // the sense it was handed. See [`row_offers_copy`] for why the row is
+    // made inert rather than merely silent.
+    if !copyable {
+        row_impl(ui, label, value, controls, egui::Sense::hover());
+        return;
+    }
     let response = row_impl(ui, label, value, controls, egui::Sense::click());
     // **Asked for only while the tile itself is what the pointer is on.**
     // `Response::hovered` is egui's answer to "which one widget would a click
@@ -2133,6 +2527,7 @@ fn credential_row(
         |_ui| {},
         on_copy,
         hint,
+        row_offers_copy(value),
         action,
     );
 }
@@ -2205,6 +2600,11 @@ fn masked_row(
         // concern; it was never what the old Copy button honoured either.
         on_copy,
         hint,
+        // **`value`, never `shown`.** `shown` is the bullet run while the row
+        // is masked, which is never empty -- deriving the offer from it would
+        // make an empty Password row copyable again, and mask the bug behind
+        // the mask.
+        row_offers_copy(value),
         action,
     );
 }
@@ -2511,6 +2911,10 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
         |_ui| {},
         DetailAction::CopyTotp,
         Some(CopyShortcut::Totp),
+        // Stated rather than assumed true. `TotpRow::Code` is only reached
+        // from `TotpState::Code`, whose code has always been non-empty in
+        // practice -- but "in practice" is what the Password row had too.
+        row_offers_copy(code),
         action,
     );
 }
@@ -4330,6 +4734,549 @@ mod tests {
             "clicking the eye ALSO copied the password to the clipboard -- a secret the \
              user never asked for"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The MATCHED APP card.
+    // -----------------------------------------------------------------
+
+    /// The match the picker builds for an ordinary desktop app: an exe name,
+    /// a full image path, no title, not hosted.
+    fn a_desktop_match() -> AppMatch {
+        AppMatch {
+            process: "Ledgerline.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    /// The match the picker builds for a Microsoft Store row: the only shape
+    /// that records a title, and the only one whose title is ever matched on.
+    fn a_store_match() -> AppMatch {
+        AppMatch {
+            process: "Speedtest.exe".to_string(),
+            title: "Speedtest".to_string(),
+            hosted: true,
+            path: r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe".to_string(),
+            trigger: TriggerMode::Hotkey,
+        }
+    }
+
+    /// `item` carrying `m` in the `deskwarden:app-match` custom field --
+    /// through `vault_bridge::with_app_match`, the one producer of that
+    /// field, so these tests read back exactly what a real save writes.
+    fn bound_to(item: &VaultItem, m: &AppMatch) -> VaultItem {
+        crate::vault_bridge::with_app_match(item, m)
+    }
+
+    #[test]
+    fn the_card_is_offered_wherever_a_match_would_do_something_and_shown_wherever_one_exists() {
+        for kind in EVERY_KIND {
+            // A binding is NEVER hidden, whatever the item is: an app match
+            // on a secure note is precisely the one a user needs to find in
+            // order to remove it.
+            assert!(
+                app_card_visible(true, kind),
+                "a {kind:?} that IS bound to an app does not show that binding"
+            );
+            // With no match, the card follows the same predicate the Fill
+            // button and AUTOFILL TARGETS follow, so the three cannot
+            // disagree about which kinds autofill.
+            assert_eq!(
+                app_card_visible(false, kind),
+                kind_offers_fill(kind),
+                "an unbound {kind:?} offers the card on different terms from Fill"
+            );
+        }
+        // The control: the two answers really are different for some kind,
+        // so the assertions above are not both satisfied by a constant.
+        assert!(!app_card_visible(false, ItemKind::SecureNote));
+        assert!(app_card_visible(false, ItemKind::Login));
+    }
+
+    #[test]
+    fn the_cards_rows_name_the_app_and_the_program_file() {
+        let rows = app_match_rows(&a_desktop_match());
+        assert_eq!(
+            rows,
+            vec![
+                AppRow { label: "App", value: "Ledgerline.exe".to_string(), real: true },
+                AppRow {
+                    label: "Program file",
+                    value: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
+                    real: true,
+                },
+            ],
+            "the rows are not the user's \"name, path\""
+        );
+    }
+
+    /// Every match saved before `path` existed -- a shape still sitting in
+    /// real vaults. The row must say so, and must not offer to copy the words
+    /// "Not recorded" onto the clipboard.
+    #[test]
+    fn a_match_that_recorded_no_program_file_says_so_and_that_row_is_inert() {
+        let m = AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto);
+        let rows = app_match_rows(&m);
+        let path = rows
+            .iter()
+            .find(|r| r.label == "Program file")
+            .expect("the card dropped the Program file row entirely");
+        assert_eq!(path.value, "Not recorded");
+        assert!(!path.real, "the placeholder would be copied to the clipboard");
+        // Control: a match that DID record one is copyable, so `real` is not
+        // simply always false.
+        let recorded = app_match_rows(&a_desktop_match());
+        assert!(recorded.iter().find(|r| r.label == "Program file").unwrap().real);
+    }
+
+    /// **An unhosted title is inert by design** (see `AppMatch::hosted`):
+    /// every one saved during the commit that recorded titles for every row
+    /// is deliberately never matched on, so drawing it would tell the user it
+    /// does something. The four-key shape below is the literal JSON that
+    /// commit wrote.
+    #[test]
+    fn a_title_that_is_never_matched_on_is_never_drawn() {
+        let stored = AppMatch::from_field_value(
+            r#"{"process":"Ledgerline.exe","title":"Ledgerline - Invoices","path":"C:\\Apps\\Ledgerline.exe","trigger":"prompt"}"#,
+        )
+        .expect("a shipped field value must parse");
+        assert_eq!(stored.title, "Ledgerline - Invoices", "the premise: it HAS a title");
+        assert!(!stored.hosted);
+        assert!(
+            !app_match_rows(&stored).iter().any(|r| r.label == "Window title"),
+            "an inert title is drawn as if it matched something"
+        );
+        // Control: the row exists at all, for the match that really is keyed
+        // on its title.
+        assert!(app_match_rows(&a_store_match())
+            .iter()
+            .any(|r| r.label == "Window title" && r.value == "Speedtest"));
+    }
+
+    #[test]
+    fn a_store_apps_card_explains_why_it_is_matched_by_a_title() {
+        let notes = app_card_notes(&a_store_match());
+        assert!(
+            notes.iter().any(|n| n.contains("Microsoft Store")),
+            "a Store match does not say why it behaves differently: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("hosted") || n.contains("FrameHost")),
+            "the mechanism reached the screen: {notes:?}"
+        );
+        // The caption for the SELECTED mode is there too, and it is the
+        // selected one -- Hotkey, not the first in the list.
+        assert!(notes.contains(&trigger_caption(TriggerMode::Hotkey)), "{notes:?}");
+        assert!(!notes.contains(&trigger_caption(TriggerMode::Prompt)), "{notes:?}");
+        // Control: an ordinary app gets the caption and NOT the Store note.
+        let ordinary = app_card_notes(&a_desktop_match());
+        assert_eq!(ordinary, vec![trigger_caption(TriggerMode::Prompt)]);
+    }
+
+    #[test]
+    fn every_trigger_mode_is_a_pill_with_its_own_name_and_its_own_sentence() {
+        // A fourth `TriggerMode` left out of `TRIGGER_ORDER` fails here; one
+        // left out of `trigger_label`/`trigger_caption` fails to compile.
+        for mode in [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto] {
+            assert!(TRIGGER_ORDER.contains(&mode), "{mode:?} has no pill to click");
+        }
+        let labels: std::collections::BTreeSet<&str> =
+            TRIGGER_ORDER.iter().map(|m| trigger_label(*m)).collect();
+        let captions: std::collections::BTreeSet<&str> =
+            TRIGGER_ORDER.iter().map(|m| trigger_caption(*m)).collect();
+        assert_eq!(labels.len(), 3, "two pills share a name: {labels:?}");
+        assert_eq!(captions.len(), 3, "two modes share a sentence: {captions:?}");
+    }
+
+    #[test]
+    fn clicking_the_pill_that_is_already_selected_costs_no_vault_write() {
+        for mode in TRIGGER_ORDER {
+            assert_eq!(
+                app_trigger_click(mode, mode),
+                None,
+                "re-clicking {mode:?} would PUT the item for no change"
+            );
+            for other in TRIGGER_ORDER.iter().filter(|m| **m != mode) {
+                assert_eq!(
+                    app_trigger_click(mode, *other),
+                    Some(DetailAction::SetAppTrigger(*other)),
+                    "moving from {mode:?} to {other:?} reports the wrong thing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changing_the_trigger_changes_the_trigger_and_nothing_else() {
+        let before = a_store_match();
+        let after = app_match_with_trigger(&before, TriggerMode::Auto);
+        assert_eq!(after.trigger, TriggerMode::Auto);
+        // Each field named, not `..before`: the whole risk is that the write
+        // path rebuilds one of the four the picker captured off a live
+        // window.
+        assert_eq!(after.process, before.process);
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.hosted, before.hosted);
+        assert_eq!(after.path, before.path);
+        assert_ne!(after.trigger, before.trigger, "the premise: it really did change");
+    }
+
+    // --- the wiring: does the pane actually draw and report any of this ---
+
+    /// Deleting the `card(ui, APP_CARD_HEADING, ...)` call in
+    /// `draw_detail_read` fails this.
+    #[test]
+    fn the_pane_draws_the_matched_app_card_for_a_bound_item() {
+        let item = bound_to(&a_login(), &a_store_match());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        for needle in [
+            "MATCHED APP",
+            "App",
+            "Speedtest.exe",
+            "Window title",
+            "Speedtest",
+            "Program file",
+            r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe",
+            "Autofill",
+            "Prompt",
+            "Hotkey",
+            "Auto",
+            "Remove",
+            APP_HOSTED_NOTE,
+        ] {
+            assert!(
+                frame.painted(needle),
+                "the pane painted no {needle:?}; it painted: {:?}",
+                frame.strings()
+            );
+        }
+        // The path is read back with the GLYPHS that were laid out, not the
+        // source string: a value column too narrow to hold it would elide to
+        // "…" and still report the full path in `texts`.
+        assert!(
+            frame
+                .rendered_glyphs(r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe")
+                .contains("Speedtest.exe"),
+            "the program file was drawn but not legibly"
+        );
+        // The control: the same pane, on the same item with no match, paints
+        // none of the values -- so the assertions above are about this card
+        // and not about something else on the pane that happens to say
+        // "App".
+        let unbound = a_login();
+        let bare = pane.idle(&unbound, &TotpState::NoSecret);
+        assert!(!bare.painted("Speedtest.exe"), "{:?}", bare.strings());
+        assert!(!bare.painted("Window title"), "{:?}", bare.strings());
+    }
+
+    #[test]
+    fn the_pane_says_so_when_an_item_is_bound_to_nothing() {
+        let mut pane = Pane::new();
+        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+        assert!(frame.painted("MATCHED APP"), "{:?}", frame.strings());
+        assert!(
+            frame.strings().iter().any(|t| t.contains("Add app...")),
+            "the empty card does not name the way to create a match: {:?}",
+            frame.strings()
+        );
+        assert!(
+            !frame.painted("Remove"),
+            "an item bound to nothing offers to unbind it"
+        );
+        // Control: an item that IS bound does NOT show the empty notice.
+        let bound = pane.idle(&bound_to(&a_login(), &a_desktop_match()), &TotpState::NoSecret);
+        assert!(
+            !bound.strings().iter().any(|t| t.contains("Add app...")),
+            "a bound item is told it has no match: {:?}",
+            bound.strings()
+        );
+    }
+
+    /// A secure note is not filled into anything, so an unbound one gets no
+    /// card -- but a bound one still shows what it is bound to.
+    #[test]
+    fn a_kind_that_never_autofills_is_offered_no_card_until_it_has_one() {
+        let note = an_item(Some(2));
+        let mut pane = Pane::new();
+        let bare = pane.idle(&note, &TotpState::NoSecret);
+        assert!(
+            !bare.painted("MATCHED APP"),
+            "a secure note is offered an autofill binding: {:?}",
+            bare.strings()
+        );
+        let bound = pane.idle(&bound_to(&note, &a_desktop_match()), &TotpState::NoSecret);
+        assert!(
+            bound.painted("MATCHED APP") && bound.painted("Ledgerline.exe"),
+            "a secure note that IS bound cannot see or remove that binding: {:?}",
+            bound.strings()
+        );
+    }
+
+    /// Deleting `*action = chosen;` in the pill loop fails this.
+    #[test]
+    fn clicking_a_trigger_pill_reports_the_mode_it_names() {
+        // From Prompt, so both of the other two are a real change.
+        let item = bound_to(&a_login(), &a_desktop_match());
+        for mode in [TriggerMode::Hotkey, TriggerMode::Auto] {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            let pill = laid_out.rect_of(trigger_label(mode));
+            let clicked = pane.click(&item, &TotpState::NoSecret, pill.center());
+            assert_eq!(
+                clicked.action,
+                DetailAction::SetAppTrigger(mode),
+                "clicking the {mode:?} pill reported {:?}",
+                clicked.action
+            );
+        }
+        // The other half of `app_trigger_click`, at the pane: the pill that
+        // is already selected reports nothing at all.
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let pill = laid_out.rect_of(trigger_label(TriggerMode::Prompt));
+        let clicked = pane.click(&item, &TotpState::NoSecret, pill.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::None,
+            "re-clicking the selected pill reported {:?}, which is a vault write for no change",
+            clicked.action
+        );
+    }
+
+    /// Deleting `*action = DetailAction::RemoveAppMatch;` fails this.
+    #[test]
+    fn clicking_remove_reports_that_the_binding_should_go() {
+        let item = bound_to(&a_login(), &a_store_match());
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let remove = laid_out.rect_of("Remove");
+        let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::RemoveAppMatch,
+            "clicking Remove reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// The card's rows are the pane's ordinary copy rows, and the placeholder
+    /// is not -- Task 1's rule, reaching this card.
+    #[test]
+    fn the_program_file_row_copies_its_path_and_the_placeholder_copies_nothing() {
+        let bound = bound_to(&a_login(), &a_desktop_match());
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&bound, &TotpState::NoSecret);
+        let row = laid_out.rect_of("Program file");
+        let clicked = pane.click(&bound, &TotpState::NoSecret, row.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue(r"C:\Apps\Ledgerline\Ledgerline.exe".to_string()),
+            "the Program file row reported {:?}",
+            clicked.action
+        );
+
+        let unrecorded = bound_to(
+            &a_login(),
+            &AppMatch::for_process("Ledgerline.exe", TriggerMode::Prompt),
+        );
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&unrecorded, &TotpState::NoSecret);
+        assert!(laid_out.painted("Not recorded"), "{:?}", laid_out.strings());
+        let row = laid_out.rect_of("Program file");
+        let clicked = pane.click(&unrecorded, &TotpState::NoSecret, row.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::None,
+            "the \"Not recorded\" placeholder was copied to the clipboard"
+        );
+        let hovered = pane.hover(&unrecorded, &TotpState::NoSecret, row.center());
+        assert_ne!(
+            hovered.cursor,
+            egui::CursorIcon::PointingHand,
+            "the placeholder row still offers a click"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // An empty row promises nothing (see `row_offers_copy`).
+    // -----------------------------------------------------------------
+
+    /// A login whose username and password are both the empty string -- which
+    /// is a real vault item (an item saved with only a URI and a note), and
+    /// the one the toast used to lie about.
+    fn a_login_with_no_credentials() -> VaultItem {
+        let mut item = a_login();
+        if let Some(login) = item.login.as_mut() {
+            login.username = Some(String::new());
+            login.password = Some(String::new().into());
+        }
+        item
+    }
+
+    /// **The two paths, asked the same question.** The chord path has always
+    /// refused an empty field; this asserts the click path's predicate gives
+    /// the identical answer, against `copy_shortcut_action` itself rather
+    /// than against a second copy of its rule.
+    #[test]
+    fn an_empty_field_is_refused_by_the_click_path_and_the_chord_path_alike() {
+        for value in ["", " ", "hunter2"] {
+            let chord_takes_username =
+                copy_shortcut_action(CopyShortcut::Username, value, "x", &TotpState::NoSecret, "")
+                    .is_some();
+            let chord_takes_password =
+                copy_shortcut_action(CopyShortcut::Password, "x", value, &TotpState::NoSecret, "")
+                    .is_some();
+            assert_eq!(
+                row_offers_copy(value),
+                chord_takes_username,
+                "the click path and CTRL+U disagree about {value:?}"
+            );
+            assert_eq!(
+                row_offers_copy(value),
+                chord_takes_password,
+                "the click path and CTRL+B disagree about {value:?}"
+            );
+        }
+        // The control that keeps the loop above from passing against a
+        // `row_offers_copy` that is always false AND a `copy_shortcut_action`
+        // that is always `None`: the two agree, and they agree on YES for a
+        // value and NO for the empty string.
+        assert!(row_offers_copy("hunter2"));
+        assert!(!row_offers_copy(""));
+    }
+
+    /// The bug, at the pane: a click on an empty Password row reported a copy
+    /// and raised "Password copied" over an untouched clipboard.
+    #[test]
+    fn clicking_an_empty_credential_row_reports_nothing_and_raises_no_toast() {
+        for (label, toast) in [("Password", "Password copied"), ("Username", "Username copied")] {
+            let empty = a_login_with_no_credentials();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+
+            let clicked = pane.click(&empty, &TotpState::NoSecret, row.center());
+            assert_eq!(
+                clicked.action,
+                DetailAction::None,
+                "clicking the empty {label:?} row reported {:?}",
+                clicked.action
+            );
+            // The frame AFTER the click is where a toast raised by that click
+            // would be painted, exactly as the toast's own tests read it.
+            let after = pane.idle(&empty, &TotpState::NoSecret);
+            assert!(
+                !after.painted(toast),
+                "the empty {label:?} row confirmed a copy that never happened; the frame \
+                 painted: {:?}",
+                after.strings()
+            );
+
+            // POSITIVE CONTROL, same rect, same gesture, on an item that DOES
+            // carry the value: without it a pane that had stopped drawing the
+            // row at all -- or a click that missed -- would pass the above.
+            let filled = a_login();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let clicked = pane.click(&filled, &TotpState::NoSecret, row.center());
+            assert_ne!(
+                clicked.action,
+                DetailAction::None,
+                "the filled {label:?} row reported no copy either, so the assertion above \
+                 is about a click that hit nothing"
+            );
+            let after = pane.idle(&filled, &TotpState::NoSecret);
+            assert!(
+                after.painted(toast),
+                "the filled {label:?} row raised no {toast:?} either; painted: {:?}",
+                after.strings()
+            );
+        }
+    }
+
+    /// The other two promises: the hover tint and the pointing hand. Both are
+    /// made *before* the click, which is why suppressing the toast alone was
+    /// not enough.
+    #[test]
+    fn an_empty_credential_row_offers_no_hover_affordance() {
+        for label in ["Password", "Username"] {
+            let empty = a_login_with_no_credentials();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let hovered = pane.hover(&empty, &TotpState::NoSecret, row.center());
+            assert_ne!(
+                hovered.cursor,
+                egui::CursorIcon::PointingHand,
+                "the empty {label:?} row still shows the pointing hand"
+            );
+            assert!(
+                !hovered
+                    .rects
+                    .iter()
+                    .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(row.center())),
+                "the empty {label:?} row still takes the hover tint"
+            );
+
+            // POSITIVE CONTROL: the same read, on a row that really does copy.
+            let filled = a_login();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let hovered = pane.hover(&filled, &TotpState::NoSecret, row.center());
+            assert_eq!(
+                hovered.cursor,
+                egui::CursorIcon::PointingHand,
+                "the filled {label:?} row shows no hand either"
+            );
+            assert!(
+                hovered
+                    .rects
+                    .iter()
+                    .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(row.center())),
+                "the filled {label:?} row takes no tint either"
+            );
+        }
+    }
+
+    /// The third promise: the tooltip. Not covered by the two above -- egui
+    /// holds it back half a second, so only a settled hover can see it.
+    #[test]
+    fn an_empty_credential_row_offers_no_click_to_copy_tooltip() {
+        for (label, tooltip) in [
+            ("Password", "Click to copy · CTRL+B"),
+            ("Username", "Click to copy · CTRL+U"),
+        ] {
+            let empty = a_login_with_no_credentials();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let settled = pane.hover_settled(&empty, &TotpState::NoSecret, row.center());
+            assert!(
+                !settled.painted(tooltip),
+                "the empty {label:?} row still offers {tooltip:?}; painted: {:?}",
+                settled.strings()
+            );
+
+            // POSITIVE CONTROL: the tooltip really is reachable by this
+            // gesture, at this rect, on a row that copies.
+            let filled = a_login();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
+            let row = laid_out.rect_of(label);
+            let settled = pane.hover_settled(&filled, &TotpState::NoSecret, row.center());
+            assert!(
+                settled.painted(tooltip),
+                "the filled {label:?} row painted no {tooltip:?} either, so the assertion \
+                 above is about a gesture that shows nothing; painted: {:?}",
+                settled.strings()
+            );
+        }
     }
 
     /// The tile copies when the click lands anywhere else in it. Over the

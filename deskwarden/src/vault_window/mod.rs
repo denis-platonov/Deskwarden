@@ -2468,6 +2468,100 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                         }
                                     }
                                 }
+                                // **The MATCHED APP card's two writes.** Both
+                                // go through `cache.update_item`, which
+                                // returns the SERVER's copy, and both adopt
+                                // it -- see
+                                // `write_arms_adopt_the_backends_copy_tests`
+                                // and `vault_bridge`'s `REVISION_DATE_KEY`:
+                                // keeping the value that was sent carries a
+                                // superseded `revisionDate` and the item's
+                                // next write is refused with a 400.
+                                //
+                                // NOT `cache.set_app_match`, deliberately.
+                                // That method answers an `AppMatchWrite` --
+                                // the diagnosis `main`'s "Add app..." handler
+                                // needs before it rebuilds the match engine
+                                // from the snapshot moments later -- and does
+                                // not hand the written item back, so an arm
+                                // built on it could not adopt anything. Both
+                                // write through the same snapshot; this
+                                // window's edits are already case 2 of
+                                // `apply_sync_outcome`'s doc ("a WRITE -- an
+                                // \"Add app...\" save, or any vault-window
+                                // edit").
+                                DetailAction::SetAppTrigger(to) => {
+                                    match crate::vault_bridge::extract_app_match(item) {
+                                        Some(current) => {
+                                            // ONE field changes, and
+                                            // `app_match_with_trigger` is
+                                            // where that is decided -- this
+                                            // arm never rebuilds the four
+                                            // fields the picker captured off
+                                            // a live window.
+                                            let rebound = crate::vault_bridge::with_app_match(
+                                                item,
+                                                &detail::app_match_with_trigger(&current, to),
+                                            );
+                                            match cache.update_item(&rebound) {
+                                                Ok(triggered) => {
+                                                    if let Some(pos) =
+                                                        items.iter().position(|i| i.id == item.id)
+                                                    {
+                                                        items[pos] = triggered;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("could not change the autofill trigger: {e:?}");
+                                                    move_error = Some(item_write_failure_message(
+                                                        ItemWrite::AppTrigger,
+                                                        &item.name,
+                                                        &e,
+                                                    ));
+                                                    flag_reauth_if_unauthorized(
+                                                        ui.ctx(),
+                                                        &needs_reauth_for_closure,
+                                                        &e,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        // Only reachable if the field went
+                                        // away between the frame that painted
+                                        // the pills and this one. Nothing to
+                                        // change, and nothing to write.
+                                        None => log::warn!(
+                                            "a trigger change was reported for {}, which no \
+                                             longer carries an app match",
+                                            item.id
+                                        ),
+                                    }
+                                }
+                                DetailAction::RemoveAppMatch => {
+                                    let unbound = crate::vault_bridge::without_app_match(item);
+                                    match cache.update_item(&unbound) {
+                                        Ok(cleared) => {
+                                            if let Some(pos) =
+                                                items.iter().position(|i| i.id == item.id)
+                                            {
+                                                items[pos] = cleared;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!("could not remove the app match: {e:?}");
+                                            move_error = Some(item_write_failure_message(
+                                                ItemWrite::AppUnmatch,
+                                                &item.name,
+                                                &e,
+                                            ));
+                                            flag_reauth_if_unauthorized(
+                                                ui.ctx(),
+                                                &needs_reauth_for_closure,
+                                                &e,
+                                            );
+                                        }
+                                    }
+                                }
                                 DetailAction::None => {}
                             }
                         } else {
@@ -3130,6 +3224,13 @@ enum ItemWrite {
     Unfavorite,
     Save,
     Create,
+    /// The MATCHED APP card's trigger pills.
+    AppTrigger,
+    /// The MATCHED APP card's Remove. Two variants rather than one, for the
+    /// favourite pair's reason: what the user is told the item still is
+    /// differs, and getting it backwards is a false statement about their
+    /// vault.
+    AppUnmatch,
 }
 
 /// What a refused detail-pane write shows in the inline band.
@@ -3173,6 +3274,16 @@ fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> S
         ItemWrite::Create => format!(
             "Couldn't create \"{name}\" -- {because}. Nothing has been added to your vault, and \
              what you typed is still in the form."
+        ),
+        // The card repaints from this window's own copy of the item, which a
+        // refused write does not change -- so the pills snap back to where
+        // they were, and this says so rather than leaving the user to wonder
+        // whether the one they clicked took.
+        ItemWrite::AppTrigger => format!(
+            "Couldn't change when \"{name}\" fills -- {because}. It still fills the way it did."
+        ),
+        ItemWrite::AppUnmatch => format!(
+            "Couldn't unmatch \"{name}\" from its app -- {because}. It is still matched to it."
         ),
     }
 }
@@ -5496,6 +5607,15 @@ mod write_arms_adopt_the_backends_copy_tests {
     const MOVE_ARM_REBUILD: &str = concat!("items[pos] = crate::vault_bridge::", "with_folder(");
     /// What the save arm used to do: reinstate the value it PUT.
     const SAVE_ARM_REINSTATE: &str = concat!("items[pos] = ", "updated;");
+    /// The MATCHED APP card's two arms, and the two values each of them must
+    /// NOT reinstate -- `rebound`/`unbound` are what those arms SEND.
+    const TRIGGER_ARM: &str = concat!("items[pos] = ", "triggered;");
+    const UNMATCH_ARM: &str = concat!("items[pos] = ", "cleared;");
+    const TRIGGER_ARM_REINSTATE: &str = concat!("items[pos] = ", "rebound;");
+    const UNMATCH_ARM_REINSTATE: &str = concat!("items[pos] = ", "unbound;");
+    /// The calls that make each arm a write at all.
+    const UNMATCH_CALL: &str = concat!("crate::vault_bridge::without_app", "_match(item)");
+    const TRIGGER_CALL: &str = concat!("detail::app_match_with", "_trigger(&current, to)");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -5547,6 +5667,53 @@ mod write_arms_adopt_the_backends_copy_tests {
             source().matches(FAVOURITE_ARM).count(),
             1,
             "the star's arm does not adopt the cache's returned item exactly once (needle              {FAVOURITE_ARM:?})"
+        );
+    }
+
+    /// The MATCHED APP card's two write arms, which live in the same closure
+    /// as the three above and are unreachable from this suite for the same
+    /// reason. Both PUT the item, so both carry the identical `revisionDate`
+    /// hazard: a trigger change that reinstated its own copy would make the
+    /// user's NEXT edit of that item fail with a 400.
+    #[test]
+    fn the_app_match_arms_take_the_item_the_cache_returned() {
+        for (needle, what) in [
+            (TRIGGER_ARM, "the MATCHED APP card's trigger arm"),
+            (UNMATCH_ARM, "the MATCHED APP card's Remove arm"),
+        ] {
+            assert_eq!(
+                source().matches(needle).count(),
+                1,
+                "{what} does not adopt the cache's returned item exactly once (needle \
+                 {needle:?})"
+            );
+        }
+        // Neither arm may rebuild the row from what it SENT -- the same
+        // defect the move and save arms were fixed out of, one card further
+        // on.
+        for needle in [TRIGGER_ARM_REINSTATE, UNMATCH_ARM_REINSTATE] {
+            assert_eq!(
+                source().matches(needle).count(),
+                0,
+                "a MATCHED APP arm is reinstating the value it sent ({needle:?}); the item's \
+                 next write is then refused with a 400"
+            );
+        }
+        // **The write really is a write.** An arm that adopted a returned
+        // item without ever calling the cache would satisfy everything above.
+        assert_eq!(
+            source().matches(UNMATCH_CALL).count(),
+            1,
+            "the Remove arm does not clear the app-match field through \
+             `vault_bridge::without_app_match` exactly once (needle {UNMATCH_CALL:?}); \
+             without it, Remove reports and writes nothing"
+        );
+        assert_eq!(
+            source().matches(TRIGGER_CALL).count(),
+            1,
+            "the trigger arm does not go through `detail::app_match_with_trigger` exactly \
+             once (needle {TRIGGER_CALL:?}); rebuilding the match here would make this a \
+             second producer of the four fields the picker captured off a live window"
         );
     }
 
@@ -6029,6 +6196,8 @@ mod item_write_failure_tests {
             ItemWrite::Unfavorite,
             ItemWrite::Save,
             ItemWrite::Create,
+            ItemWrite::AppTrigger,
+            ItemWrite::AppUnmatch,
         ] {
             for e in [
                 VaultError::Unauthorized,

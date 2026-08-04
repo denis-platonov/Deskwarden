@@ -732,6 +732,36 @@ pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
         .and_then(|v| AppMatch::from_field_value(v).ok())
 }
 
+/// A copy of `item` with the `deskwarden:app-match` custom field **gone** --
+/// the inverse of [`with_app_match`], and the only way an app binding can be
+/// undone.
+///
+/// It exists because [`with_app_match`] cannot express "no match": its whole
+/// body is "rebuild that one field", and there is no [`AppMatch`] value that
+/// means unbound. The detail pane's `MATCHED APP` card offers Remove, and
+/// without this the only honest thing it could offer was nothing.
+///
+/// **The field is removed, not blanked.** A field left in place with an empty
+/// value would still be a `deskwarden:app-match` row in every other Bitwarden
+/// client, and [`extract_app_match`] would file it as a match that fails to
+/// parse -- which is indistinguishable from a corrupted one. Removing it puts
+/// the item back into exactly the shape it had before any match was saved.
+///
+/// Every other field is cloned wholesale, and so is everything unmodelled
+/// riding [`VaultItem::other`], for the reason [`with_app_match`] records: the
+/// PUT is state-replacing, so anything this function drops is dropped from the
+/// user's vault.
+///
+/// An item that carries no such field comes back unchanged -- so a Remove that
+/// races a Remove is a no-op rather than an error.
+pub fn without_app_match(item: &VaultItem) -> VaultItem {
+    let mut updated = item.clone();
+    updated
+        .fields
+        .retain(|f| f.name.as_deref() != Some(APP_MATCH_FIELD_NAME));
+    updated
+}
+
 #[derive(Debug)]
 pub enum VaultError {
     Http(String),
@@ -2285,6 +2315,83 @@ mod tests {
         let m_back = extract_app_match(&updated).unwrap();
         assert_eq!(m_back.process, "RockstarGamesLauncher.exe");
         assert_eq!(m_back.trigger, TriggerMode::Prompt);
+    }
+
+    /// The inverse of the test above, and the whole of what the detail pane's
+    /// Remove does.
+    #[test]
+    fn without_app_match_removes_the_field_and_keeps_every_other_one() {
+        let raw = r#"{
+            "id": "1",
+            "name": "Rockstar",
+            "type": 1,
+            "favorite": true,
+            "notes": "secret",
+            "fields": [
+                {"name": "PIN", "value": "1234", "type": 1},
+                {"name": "Recovery", "value": "abc", "type": 0}
+            ],
+            "login": {"username": "a", "password": "b"}
+        }"#;
+        let item: VaultItem = serde_json::from_str(raw).unwrap();
+        let bound = with_app_match(
+            &item,
+            &AppMatch::for_process("RockstarGamesLauncher.exe", TriggerMode::Prompt),
+        );
+        // The premise. Without it a `without_app_match` that did nothing at
+        // all would pass everything below.
+        assert!(extract_app_match(&bound).is_some(), "nothing was bound to begin with");
+
+        let cleared = without_app_match(&bound);
+        assert!(
+            extract_app_match(&cleared).is_none(),
+            "the item is still bound to an app"
+        );
+        // REMOVED, not blanked: a field left in place with an empty value is
+        // still a `deskwarden:app-match` row in every other Bitwarden client.
+        assert!(
+            !cleared
+                .fields
+                .iter()
+                .any(|f| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME_FOR_TEST)),
+            "the field is still there, emptied rather than removed: {:?}",
+            cleared.fields
+        );
+        // The user's own custom fields, in their own order -- the PUT is
+        // state-replacing, so anything dropped here is dropped from the vault.
+        let names: Vec<&str> = cleared.fields.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert_eq!(names, vec!["PIN", "Recovery"]);
+        assert_eq!(cleared.fields[0].value.as_deref(), Some("1234"));
+        // ...and the `type` key riding `VaultField::other`, which no model
+        // here names.
+        assert_eq!(
+            cleared.fields[0].other.get("type"),
+            Some(&serde_json::json!(1)),
+            "an unmodelled key on a surviving field was dropped"
+        );
+
+        let value = serde_json::to_value(&cleared).unwrap();
+        assert_eq!(value["favorite"], serde_json::json!(true));
+        assert_eq!(value["notes"], serde_json::json!("secret"));
+        assert_eq!(
+            value["login"],
+            serde_json::json!({"username": "a", "password": "b"})
+        );
+    }
+
+    /// A Remove that races a Remove, and every item that never had a match:
+    /// nothing to do, and nothing broken by doing it.
+    #[test]
+    fn without_app_match_on_an_unbound_item_changes_nothing() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"1","name":"Site","type":1,"favorite":false,
+                "fields":[{"name":"PIN","value":"1234","type":1}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(without_app_match(&item)).unwrap(),
+            serde_json::to_value(&item).unwrap()
+        );
     }
 
     #[test]
