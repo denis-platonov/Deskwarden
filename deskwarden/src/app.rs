@@ -199,12 +199,14 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // (`prompt_request` is where the password is deliberately never
             // touched -- see its doc.)
             let item = cache.items().into_iter().find(|i| i.id == item_id);
-            // Every decision about the overlay is made in `prompt_request`,
-            // which is pure and directly tested; this function only reads the
-            // cache and drives Win32. See that function's doc for why.
-            let PromptRequest { label, matched, position } =
-                prompt_request(window, item.as_ref(), overlay_position(hwnd));
-            if overlay_ui::show_prompt_overlay(label, matched.as_ref(), position) {
+            // Every decision about the overlay -- what it says, and where it
+            // opens -- is made in `prompt_arm`, which a test drives with a
+            // recording presenter; this function only reads the cache and
+            // supplies the real presenter. **No value the overlay is given is
+            // computed on this line**, which is the point: this line is the
+            // one no test can reach, and an argument written here is an
+            // argument nothing can check (review 32's Important 1).
+            if prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
             }
             None
@@ -266,6 +268,113 @@ pub fn prompt_request<'a>(
         }),
         position,
     }
+}
+
+/// The two Win32-shaped things the Prompt arm does: work out where the overlay
+/// goes, and put it on screen.
+///
+/// **A trait so that the wiring between them is testable** (review 32's
+/// Important 1). [`prompt_request`] was pure and directly tested, but the
+/// value it was *handed* for `position` was computed on `handle_match`'s one
+/// unreachable line, as an argument -- and passing that argument through a
+/// `.map` that replaced its `y` with `0.0` (spelled out in
+/// `prompt_wiring_tests` below, where it cannot collide with the needles)
+/// pinned the overlay to the top of the screen on every Prompt match with the
+/// whole suite green and no warnings. A test can only see what a test can
+/// reach, and it could not reach that argument.
+///
+/// With the placement asked for *through* the presenter, the argument no
+/// longer exists at an unreachable call site: [`prompt_arm`] computes nothing
+/// and passes on what the presenter answered, and
+/// `the_overlay_opens_where_the_placement_answered_for_that_window` fails on
+/// any alteration of it, including ones nobody has thought of.
+///
+/// What is left unreachable is naming the two real functions, and that is
+/// [`REAL_OVERLAY`] -- a struct literal of two function *references*, with no
+/// arguments and no expression anywhere in it for a mutation to hide in, held
+/// by source position in `prompt_wiring_tests` below. Wrapping them in
+/// hand-written method bodies instead would have re-created the very hole this
+/// closes one level down: `overlay_position(hwnd)` inside an unreachable
+/// `fn position` can be given a `.map` exactly as easily as it could as an
+/// argument.
+pub trait PromptPresenter {
+    /// Where to open the overlay for the window `hwnd`, or `None` to let the
+    /// OS choose.
+    fn position(&self, hwnd: isize) -> Option<(f32, f32)>;
+    /// Shows the overlay and returns whether the user chose to fill.
+    fn show(
+        &self,
+        label: &str,
+        matched: Option<&overlay_ui::OverlayMatch>,
+        position: Option<(f32, f32)>,
+    ) -> bool;
+}
+
+/// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
+///
+/// **Function pointers rather than a hand-written `impl` per presenter**, so
+/// that the production presenter can be a struct literal naming two functions
+/// -- see [`REAL_OVERLAY`]. The forwarding below is the only code in the way,
+/// and unlike a Win32 body it is directly driven by
+/// `an_fn_presenter_forwards_to_the_two_functions_it_was_built_from`.
+pub struct FnPresenter {
+    /// Asked where the overlay for this window goes.
+    pub position: fn(isize) -> Option<(f32, f32)>,
+    /// Asked to put it on screen; answers whether the user chose to fill.
+    pub show: fn(&str, Option<&overlay_ui::OverlayMatch>, Option<(f32, f32)>) -> bool,
+}
+
+impl PromptPresenter for FnPresenter {
+    fn position(&self, hwnd: isize) -> Option<(f32, f32)> {
+        (self.position)(hwnd)
+    }
+
+    fn show(
+        &self,
+        label: &str,
+        matched: Option<&overlay_ui::OverlayMatch>,
+        position: Option<(f32, f32)>,
+    ) -> bool {
+        (self.show)(label, matched, position)
+    }
+}
+
+/// The production presenter: the real placement calculation and the real
+/// window, named and not called.
+///
+/// This is the whole of the Prompt arm that no test can execute, and it is
+/// data: two function references, no arguments, nothing computed. The two
+/// needles in `prompt_wiring_tests` cover each field from its name to its
+/// comma, so a wrapper closure around either -- the shape review 32's
+/// Important 1 was demonstrated with -- cannot be written here without
+/// failing.
+const REAL_OVERLAY: FnPresenter = FnPresenter {
+    position: overlay_position,
+    show: overlay_ui::show_prompt_overlay,
+};
+
+/// The whole of the Prompt arm except the vault lookup and the fill: ask
+/// [`prompt_request`] what to show, ask the presenter where to show it, show
+/// it, and answer whether the user clicked Fill.
+///
+/// Generic over the presenter so a test can drive this with a recorder and
+/// assert that **the overlay is opened at the placement that was answered for
+/// this window** -- the thing `the_position_it_is_handed_is_the_position_it_asks_for`
+/// could not assert, because it only proved `prompt_request` does not drop
+/// what it is given and nothing pinned what it was given.
+///
+/// The presenter is asked about `window.hwnd` rather than about a handle
+/// passed in beside the event, for the reason [`handle_match`]'s doc gives for
+/// taking one `ForegroundEvent`: a handle and a title that describe different
+/// windows place the overlay beside one and name the other.
+pub fn prompt_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    item: Option<&VaultItem>,
+) -> bool {
+    let PromptRequest { label, matched, position } =
+        prompt_request(window, item, presenter.position(window.hwnd));
+    presenter.show(label, matched.as_ref(), position)
 }
 
 /// What to call the app in a window a foreground event describes.
@@ -518,32 +627,207 @@ mod tests {
         let request = prompt_request(&w, None, None);
         assert_eq!(request.position, None);
     }
+
+    // ---- The Prompt arm's wiring (review 32's Important 1) ----
+
+    /// What the overlay was told, in a form a test can compare:
+    /// `overlay_ui::OverlayMatch` is a plain data carrier with no `PartialEq`,
+    /// and this is deliberately built from its fields rather than by cloning
+    /// the type, so a field added to it and dropped on the way here is a
+    /// compile error rather than a silently unchecked value.
+    type Shown = (String, Option<(String, Option<String>)>, Option<(f32, f32)>);
+
+    /// A [`PromptPresenter`] that answers with a fixed placement and records
+    /// what it was asked and what it was shown.
+    #[derive(Default)]
+    struct RecordingPresenter {
+        /// What `show` returns -- the user clicking Fill, or not.
+        answer: bool,
+        /// What `position` answers, standing in for the Win32 calculation.
+        placement: Option<(f32, f32)>,
+        asked_about: std::cell::Cell<Option<isize>>,
+        shown: std::cell::RefCell<Vec<Shown>>,
+    }
+
+    impl PromptPresenter for RecordingPresenter {
+        fn position(&self, hwnd: isize) -> Option<(f32, f32)> {
+            self.asked_about.set(Some(hwnd));
+            self.placement
+        }
+
+        fn show(
+            &self,
+            label: &str,
+            matched: Option<&overlay_ui::OverlayMatch>,
+            position: Option<(f32, f32)>,
+        ) -> bool {
+            self.shown.borrow_mut().push((
+                label.to_string(),
+                matched.map(|m| (m.item_name.clone(), m.username.clone())),
+                position,
+            ));
+            self.answer
+        }
+    }
+
+    /// **Review 32's Important 1, driven rather than pinned.** The overlay's
+    /// placement used to be computed as an argument on `handle_match`'s one
+    /// unreachable line, where mapping the placement's `y` to `0.0` -- the
+    /// overlay pinned to the top of the screen on every Prompt match -- left
+    /// 1211 lib and 111 bin tests green with no warnings.
+    #[test]
+    fn the_overlay_opens_where_the_placement_answered_for_that_window() {
+        let item = login_item("Ledgerline", "denis@example.com");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let presenter = RecordingPresenter {
+            placement: Some((120.0, 340.0)),
+            ..Default::default()
+        };
+
+        prompt_arm(&presenter, &w, Some(&item));
+
+        // Asked about the window that matched, not about some other handle.
+        assert_eq!(presenter.asked_about.get(), Some(w.hwnd));
+        let shown = presenter.shown.borrow();
+        assert_eq!(shown.len(), 1, "the overlay is shown exactly once");
+        assert_eq!(
+            shown[0].2,
+            Some((120.0, 340.0)),
+            "the overlay must open at the placement that was computed for this window -- \
+             anything else is the overlay landing somewhere the user's field is not"
+        );
+        // And the other two values, so this test also fails on a substituted
+        // label or a substituted item rather than only on the placement.
+        assert_eq!(shown[0].0, "Ledgerline.exe");
+        assert_eq!(
+            shown[0].1,
+            Some(("Ledgerline".to_string(), Some("denis@example.com".to_string())))
+        );
+    }
+
+    #[test]
+    fn a_placement_that_could_not_be_computed_is_passed_on_as_none() {
+        // The positive control for the test above: a `prompt_arm` that always
+        // handed the overlay a fixed pair would pass that one and fail this.
+        let w = window(HOST, "Speedtest");
+        let presenter = RecordingPresenter::default();
+
+        prompt_arm(&presenter, &w, None);
+
+        let shown = presenter.shown.borrow();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].2, None, "no placement is not a placement of (0, 0)");
+        // The title-matched Store frame is still named by its title here, on
+        // the path that actually reaches the overlay.
+        assert_eq!(shown[0].0, "Speedtest");
+        assert_eq!(shown[0].1, None);
+    }
+
+    #[test]
+    fn the_arm_answers_with_the_users_answer() {
+        // What the caller does with this is fill the user's password into the
+        // window, so an inverted or constant answer fills on Dismiss.
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let filled = RecordingPresenter {
+            answer: true,
+            ..Default::default()
+        };
+        assert!(prompt_arm(&filled, &w, None));
+        let dismissed = RecordingPresenter::default();
+        assert!(!prompt_arm(&dismissed, &w, None));
+    }
+
+    // ---- and the adapter the production presenter is built out of ----
+
+    /// Statics rather than captured state, because [`FnPresenter`] holds plain
+    /// `fn` pointers: that is the property that makes [`REAL_OVERLAY`] a
+    /// struct literal with no expression in it. Only the one test below uses
+    /// these.
+    static ASKED_HWND: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+    static FORWARDED: std::sync::Mutex<Vec<Shown>> = std::sync::Mutex::new(Vec::new());
+
+    fn recording_position(hwnd: isize) -> Option<(f32, f32)> {
+        ASKED_HWND.lock().unwrap().push(hwnd);
+        Some((11.0, 22.0))
+    }
+
+    fn recording_show(
+        label: &str,
+        matched: Option<&overlay_ui::OverlayMatch>,
+        position: Option<(f32, f32)>,
+    ) -> bool {
+        FORWARDED.lock().unwrap().push((
+            label.to_string(),
+            matched.map(|m| (m.item_name.clone(), m.username.clone())),
+            position,
+        ));
+        true
+    }
+
+    /// The forwarding is the only code between [`REAL_OVERLAY`]'s two named
+    /// functions and the screen, so it is driven here -- swapping the two
+    /// fields, or dropping an argument, fails.
+    #[test]
+    fn an_fn_presenter_forwards_to_the_two_functions_it_was_built_from() {
+        let presenter = FnPresenter {
+            position: recording_position,
+            show: recording_show,
+        };
+
+        assert_eq!(presenter.position(4242), Some((11.0, 22.0)));
+        assert_eq!(*ASKED_HWND.lock().unwrap(), vec![4242]);
+
+        let matched = overlay_ui::OverlayMatch {
+            item_name: "Ledgerline".to_string(),
+            username: Some("denis@example.com".to_string()),
+        };
+        assert!(presenter.show("Ledgerline.exe", Some(&matched), Some((3.0, 4.0))));
+
+        let forwarded = FORWARDED.lock().unwrap();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].0, "Ledgerline.exe");
+        assert_eq!(
+            forwarded[0].1,
+            Some(("Ledgerline".to_string(), Some("denis@example.com".to_string())))
+        );
+        assert_eq!(forwarded[0].2, Some((3.0, 4.0)));
+    }
 }
 
-/// Source-position guard for the one line of `handle_match` no test can reach:
-/// that it still asks [`prompt_request`] what to show, and hands the answer to
-/// the overlay unaltered.
+/// Source-position guard for the two places in the Prompt arm that no test can
+/// execute: `handle_match`'s one line, and [`REAL_OVERLAY`]'s two fields.
 ///
-/// `prompt_request` is pure and directly tested above, but `handle_match` needs
-/// a `VaultCache`, an `Injector` and a `FillStats` and then opens a real
-/// window, so nothing drives it. That is exactly how review 31's Important 2
-/// was found: `let label = &window.exe_name;` inside it left all 1300 tests
-/// green while restoring the reported bug. A pure function nothing is pinned to
-/// call is a pure function that can be deleted from the path it exists for.
+/// [`prompt_arm`] and [`prompt_request`] are both driven directly by the tests
+/// above, with a recording presenter -- so *what* the overlay is told, and
+/// *where* it is opened, are behavioural questions now, not textual ones. What
+/// is left over is naming: `handle_match` needs a `VaultCache`, an `Injector`
+/// and a `FillStats` and then opens a real window, and `REAL_OVERLAY` names the
+/// two Win32 functions. Neither can be run.
 ///
-/// **What this can and cannot see**: it pins the spelling and the count of the
-/// call and of the three values passed on from it. It cannot see a
-/// `prompt_request` whose result is computed and then ignored -- that is
-/// visible in any diff touching these lines. What it guards is the revert.
+/// That leftover is worth pinning because it is precisely where this crate's
+/// recurring defect lives. Review 31's Important 2 was `let label =
+/// &window.exe_name;` on `handle_match`'s line, leaving 1300 tests green while
+/// restoring the reported bug; review 32's Important 1 was the `position`
+/// argument on that same line, wrapped in a `.map` that zeroed its `y` --
+/// green, and with no warnings either. A decision nothing is pinned to *call*
+/// is a decision that can be dropped from the path it exists for.
+///
+/// **What this can and cannot see.** The `REAL_OVERLAY` needles run from each
+/// field's name to its comma, so neither can grow a wrapper closure or a `.map`
+/// without failing -- that is the shape review 32 was demonstrated with, and
+/// the reason `REAL_OVERLAY` is a struct literal of two function *references*
+/// with no expression anywhere in it. What remains invisible is a
+/// `prompt_arm` whose result is computed and then ignored; that is legible in
+/// any diff touching these lines. What this guards is the silent revert.
 #[cfg(test)]
 mod prompt_wiring_tests {
     // SPLIT ACROSS TWO LITERALS, on ONE line, in this crate's established idiom:
     // `include_str!` pulls this module in too, so a whole needle would match its
     // own declaration, and a needle containing a newline would pass on an LF
     // checkout and fail on a CRLF one (this repo has both).
-    const DECISION_CALL: &str = concat!("prompt_request", "(window, item.as_ref(), ");
-    const OVERLAY_CALL: &str =
-        concat!("show_prompt_overlay", "(label, matched.as_ref(), position)");
+    const ARM_CALL: &str = concat!("prompt_arm", "(&REAL_OVERLAY, window, item.as_ref())");
+    const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
+    const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
 
     fn source() -> &'static str {
         include_str!("app.rs")
@@ -555,39 +839,61 @@ mod prompt_wiring_tests {
 
     #[test]
     fn the_counter_finds_calls_that_are_really_there() {
-        let planted = concat!("prompt_request", "(window, item.as_ref(), overlay_position(hwnd))");
-        assert_eq!(occurrences(planted, DECISION_CALL), 1, "planted: {planted}");
-        assert_eq!(occurrences("nothing here", DECISION_CALL), 0);
+        let planted = concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+        assert_eq!(occurrences(planted, ARM_CALL), 1, "planted: {planted}");
+        assert_eq!(occurrences("nothing here", ARM_CALL), 0);
 
-        let planted = concat!("if overlay_ui::show_prompt_overlay", "(label, matched.as_ref(), position) {");
-        assert_eq!(occurrences(planted, OVERLAY_CALL), 1, "planted: {planted}");
-        // The mutation this needle exists for: the call survives, the decision
-        // does not.
-        let mutated = concat!("if overlay_ui::show_prompt_overlay", "(&window.exe_name, matched.as_ref(), position) {");
-        assert_eq!(occurrences(mutated, OVERLAY_CALL), 0, "planted: {mutated}");
+        // The mutations each needle exists for: the call survives, but what it
+        // is handed does not. Review 31's was the label, review 32's the
+        // placement -- and the placement one is now unwritable at the call site
+        // at all, so its modern form is a wrapper around the named function.
+        let mutated = concat!("if prompt_arm", "(&REAL_OVERLAY, window, None) {");
+        assert_eq!(occurrences(mutated, ARM_CALL), 0, "planted: {mutated}");
+
+        let planted = concat!("    position: ", "overlay_position,");
+        assert_eq!(occurrences(planted, REAL_POSITION), 1, "planted: {planted}");
+        let mutated = concat!("    position: ", "|hwnd| overlay_position(hwnd).map(|(x, _y)| (x, 0.0)),");
+        assert_eq!(occurrences(mutated, REAL_POSITION), 0, "planted: {mutated}");
+
+        let planted = concat!("    show: ", "overlay_ui::show_prompt_overlay,");
+        assert_eq!(occurrences(planted, REAL_SHOW), 1, "planted: {planted}");
+        let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
+        assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
     }
 
     #[test]
-    fn handle_match_asks_the_pure_decision_what_to_show() {
+    fn handle_match_asks_the_prompt_arm_rather_than_deciding_anything_itself() {
         assert_eq!(
-            occurrences(source(), DECISION_CALL),
+            occurrences(source(), ARM_CALL),
             1,
-            "expected {DECISION_CALL:?} exactly once in app.rs -- `handle_match`'s Prompt arm. \
-             Zero means the overlay's label, credentials and placement are being assembled \
-             inline again, where no test can see them, and the first thing to go wrong there \
-             was naming a title-matched Microsoft Store app ApplicationFrameHost.exe"
+            "expected {ARM_CALL:?} exactly once in app.rs -- `handle_match`'s Prompt arm. \
+             Zero means the overlay's label, credentials or placement are being assembled on \
+             that line again, where no test can reach them: the first thing to go wrong there \
+             was naming a title-matched Microsoft Store app ApplicationFrameHost.exe, and the \
+             second was a `.map` on the placement that pinned every overlay to the top of the \
+             screen with the whole suite green"
         );
     }
 
     #[test]
-    fn the_overlay_is_shown_exactly_what_that_decision_returned() {
+    fn the_real_presenter_names_the_two_functions_and_computes_nothing() {
         assert_eq!(
-            occurrences(source(), OVERLAY_CALL),
+            occurrences(source(), REAL_POSITION),
             1,
-            "expected {OVERLAY_CALL:?} exactly once in app.rs. Zero means one of the three \
-             values `prompt_request` decided was substituted on the way to the overlay -- \
-             `&window.exe_name` for the label is the mutation that restores the reported bug, \
-             and `None` for the position drops the overlay wherever Windows likes"
+            "expected {REAL_POSITION:?} exactly once in app.rs -- `REAL_OVERLAY`'s placement \
+             field. Zero means it is no longer the real calculation *named*, and the only \
+             reason to write anything else there is to alter what it answers -- which is \
+             review 32's Important 1, one level down from the call site that no longer \
+             accepts it"
+        );
+
+        assert_eq!(
+            occurrences(source(), REAL_SHOW),
+            1,
+            "expected {REAL_SHOW:?} exactly once in app.rs -- `REAL_OVERLAY`'s show field. \
+             Zero means the overlay is reached through something other than the real function \
+             named plainly, and a wrapper here can substitute any of the three values \
+             `prompt_arm` was careful to pass through unaltered"
         );
     }
 }
