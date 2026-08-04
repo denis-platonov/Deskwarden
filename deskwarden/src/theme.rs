@@ -1298,7 +1298,15 @@ const EYE_PUPIL_RADIUS: f32 = 2.4;
 /// than as a cog. Its neighbours are all one or two marks -- five points
 /// ([`STAR_VERTICES`]), three dots, one almond and a pupil, two chevron
 /// strokes -- and six teeth is what puts the gear in their company.
-const GEAR_TEETH: usize = 6;
+///
+/// **Nine, chosen from a rendered comparison rather than by argument.** Six
+/// read as a heavy cog; nine with the shallower tooth below reads as the
+/// rounder mark the user picked. It is nine and not the eight they were
+/// shown for one reason only: eight teeth at three vertices is 24, which is
+/// exactly [`EYE_VERTICES`], and `no_two_drawn_icons_share_a_vertex_count`
+/// refuses that -- see [`GEAR_VERTICES`]. At this size the ninth tooth is
+/// not a difference anyone can see; the collision is.
+const GEAR_TEETH: usize = 9;
 
 /// Vertices in the gear's outline: **three** per tooth (crown-out, crown-in,
 /// valley), so 18.
@@ -1327,7 +1335,7 @@ pub const GEAR_VERTICES: usize = GEAR_TEETH * 3;
 /// internal mark -- the counterpart of the eye's pupil -- and against a 6.6
 /// root radius a 3.2 ring sat nearly halfway out, making the mark read as
 /// three concentric bands.
-const GEAR_HUB_RADIUS: f32 = 2.8;
+const GEAR_HUB_RADIUS: f32 = 3.0;
 
 /// The weight every drawn icon in this titlebar/header family is stroked at:
 /// the gear's outline and hub, the eye's almond, the switcher's chevron
@@ -1499,7 +1507,7 @@ fn gear_outline(center: Pos2, tip: f32, root: f32) -> Vec<Pos2> {
     // sector and the notch between two crowns the rest -- at 0.34 that is a
     // 41° tooth and a 19° notch, so the flanks stay steep enough to read as
     // teeth rather than as a scalloped circle.
-    const CROWN_HALF: f32 = 0.34;
+    const CROWN_HALF: f32 = 0.30;
     let sector = std::f32::consts::TAU / GEAR_TEETH as f32;
     let at = |angle: f32, radius: f32| {
         center + Vec2::new(radius * angle.cos(), radius * angle.sin())
@@ -1552,8 +1560,8 @@ pub fn gear_button(ui: &mut Ui) -> Response {
     // 2.0 tall against a 6.6 root rather than 2.4, which is the last of the
     // three things that made the old mark busy (the other two being the
     // tooth count and the flat roots -- see `GEAR_TEETH` and `gear_outline`).
-    const TIP: f32 = 8.6;
-    const ROOT: f32 = 6.6;
+    const TIP: f32 = 8.8;
+    const ROOT: f32 = 7.2;
 
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
     if response.hovered() {
@@ -3096,7 +3104,7 @@ mod drawn_icon_family_tests {
     /// five is the floor below which the mark stops reading as a cog at all
     /// (a five-crowned ring is a flower).
     #[test]
-    fn the_gear_has_fewer_teeth_than_the_eight_it_had() {
+    fn the_gear_stays_a_cog_rather_than_a_flower_or_a_serrated_ring() {
         let center = Pos2::new(50.0, 50.0);
         let outline = gear_outline(center, 8.6, 6.6);
         let far = outline
@@ -3124,10 +3132,22 @@ mod drawn_icon_family_tests {
              teeth -- this measurement has stopped matching what `gear_outline` draws"
         );
         let teeth = crowns / 2;
+        // The bound moved when the user picked the rounder cog from a
+        // rendered comparison, having earlier called the original outdated.
+        // It is still a bound and not a fixed number: what it defends is that
+        // the mark stays a COG. Too few and the crowns are wide enough to
+        // read as a flower; too many and the notches close up at
+        // `GEAR_STROKE` until the outline is a serrated ring.
+        //
+        // The upper end is also where the vertex-count collision lives --
+        // eight teeth is exactly `EYE_VERTICES` -- but that is
+        // `no_two_drawn_icons_share_a_vertex_count`'s job to say, not this
+        // one's. Two tests asserting one fact is how one of them ends up
+        // being the only one anybody updates.
         assert!(
-            (5..8).contains(&teeth),
-            "the gear has {teeth} teeth: eight is what the user called outdated and five \
-             is where a cog becomes a flower"
+            (7..=10).contains(&teeth),
+            "the gear has {teeth} teeth: below seven it is the heavy cog the rounder one \
+             replaced, and above ten the notches close up at this stroke into a serrated ring"
         );
     }
 
