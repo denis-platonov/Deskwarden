@@ -2198,10 +2198,19 @@ fn describe_signer(subject_dn: Option<&str>) -> String {
 /// it may call) reads the vault from `VaultCache`'s snapshot rather than
 /// hitting `bw serve` directly, which is what lets autofill keep working with
 /// the backend stopped (see `backend_policy`).
-fn process_foreground_event(
+///
+/// **Generic over the two fillers**, rather than nailed to
+/// `Injector<RealUiAutomation, RealSendInput>`, purely so `mod tests` can drive
+/// this whole function with a recording injector. That is what pins the
+/// `handle_match` call below: with a concrete `Injector` nothing could call
+/// this, and replacing that call with `None::<(String, isize)>` -- autofill
+/// switched off for every trigger mode, the app's entire purpose -- compiled
+/// and left all 1217 lib and 113 bin tests green. See
+/// `tests::the_dispatch_that_actually_fills`.
+fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     event: &window_watch::ForegroundEvent,
     cache: &VaultCache,
-    injector: &Injector<RealUiAutomation, RealSendInput>,
+    injector: &Injector<A, B>,
     fill_stats: &fill_stats::FillStats,
     engine: &MatchEngine,
     pending_hotkey_fill: &mut Option<(String, isize)>,
@@ -10867,6 +10876,383 @@ mod tests {
                  channel. Whatever they are read through must put them first: a Quit the user \
                  clicked while the vault window was up would otherwise wait behind every event \
                  that has arrived since"
+            );
+        }
+    }
+
+    /// **Autofill's one production dispatch, driven end to end.**
+    ///
+    /// Two holes lived here, and both were behaviour that could be deleted
+    /// outright with the whole suite green:
+    ///
+    /// 1. Replacing `handle_match(cache, injector, fill_stats, item_id, m,
+    ///    event)` with `None::<(String, isize)>` -- autofill switched off for
+    ///    *every* trigger mode, which is the entirety of what this app is for
+    ///    -- compiled and left 1217 lib + 113 bin tests passing. `app.rs` pins
+    ///    what `handle_match` does (`prompt_request`, `window_label`), but
+    ///    every one of those pins lives *below* this call, and a call that is
+    ///    never made reaches none of them.
+    /// 2. Replacing the log line's `window_label(&event.exe_name,
+    ///    &event.title)` with `&event.exe_name` was equally invisible. Its
+    ///    sibling inside `handle_match` is the one that produced the reported
+    ///    "ApplicationFrameHost.exe wants your password" overlay; this one
+    ///    writes that same meaningless name into the log file a user is asked
+    ///    for when autofill misbehaves, so the record of which app was matched
+    ///    names the frame host instead of the app.
+    ///
+    /// **Why these are real tests and not a source guard.** Nothing in
+    /// `process_foreground_event` needs a window: `TriggerMode::Hotkey` only
+    /// arms a pair, and `TriggerMode::Auto` goes to `fill_from_vault`, which
+    /// takes an `Injector`. The only thing in the way was that this function
+    /// named `Injector<RealUiAutomation, RealSendInput>` concretely, so no
+    /// test could hand it a fake; making it generic is the whole of the
+    /// production change. `TriggerMode::Prompt` is deliberately *not* driven
+    /// here -- it opens a real overlay window -- and it does not need to be:
+    /// its decision is already a pure, directly tested `app::prompt_request`,
+    /// and what was missing was only that something reach `handle_match` at
+    /// all.
+    mod the_dispatch_that_actually_fills {
+        use super::*;
+        use deskwarden::app_match::{AppMatch, TriggerMode};
+        use std::sync::{Arc, Mutex};
+
+        const HOST: &str = "ApplicationFrameHost.exe";
+
+        /// A pid that is definitely not ours. `dispatch::is_own_process`
+        /// returns early on our own, and every test below would then pass by
+        /// dispatching nothing at all.
+        fn other_pid() -> u32 {
+            std::process::id().wrapping_add(1)
+        }
+
+        fn window(exe_name: &str, title: &str, hwnd: isize) -> window_watch::ForegroundEvent {
+            window_watch::ForegroundEvent {
+                hwnd,
+                pid: other_pid(),
+                exe_name: exe_name.to_string(),
+                title: title.to_string(),
+            }
+        }
+
+        /// Every `(hwnd, username, password)` the injector was asked to type.
+        #[derive(Clone, Default)]
+        struct Filled(Arc<Mutex<Vec<(isize, String, String)>>>);
+
+        impl Filled {
+            fn seen(&self) -> Vec<(isize, String, String)> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+
+        /// Records instead of driving UI Automation, and answers `Ok(true)` so
+        /// the fill is complete and the fallback is never consulted.
+        struct RecordingUi(Filled);
+        impl UiAutomationFiller for RecordingUi {
+            fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<bool, String> {
+                self.0 .0.lock().unwrap().push((hwnd, user.to_string(), pass.to_string()));
+                Ok(true)
+            }
+        }
+
+        /// The fallback must never run here: the real one types with
+        /// `SendInput`, into whatever window holds focus on the machine
+        /// running the suite.
+        struct NeverTypes;
+        impl SendInputFiller for NeverTypes {
+            fn fill(&self, _: isize, _: &str, _: &str) -> Result<(), String> {
+                panic!("the SendInput fallback must not be reached: UI Automation answered Ok(true)")
+            }
+        }
+
+        fn recording_injector(filled: &Filled) -> Injector<RecordingUi, NeverTypes> {
+            Injector { ui: RecordingUi(filled.clone()), fallback: NeverTypes }
+        }
+
+        /// A `FillStats` on its own throwaway file -- never the real one under
+        /// `%APPDATA%`, which a successful fill would write to.
+        fn scratch_fill_stats() -> (fill_stats::FillStats, std::path::PathBuf) {
+            let path = std::env::temp_dir().join(format!(
+                "deskwarden-test-fill-stats-{}-{:?}.json",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            (fill_stats::FillStats::new(path.clone()), path)
+        }
+
+        fn engine_with(entries: &[(&str, AppMatch)]) -> MatchEngine {
+            let owned: Vec<(String, AppMatch)> =
+                entries.iter().map(|(id, m)| ((*id).to_string(), m.clone())).collect();
+            let mut engine = MatchEngine::new();
+            engine.rebuild(&owned);
+            engine
+        }
+
+        /// A match as the picker saves it for a Microsoft Store app: the
+        /// attributed process, the title its host frame carried, and the
+        /// `hosted` flag that makes the title matchable.
+        fn hosted_match(process: &str, title: &str, trigger: TriggerMode) -> AppMatch {
+            AppMatch {
+                process: process.to_string(),
+                title: title.to_string(),
+                hosted: true,
+                path: String::new(),
+                trigger,
+            }
+        }
+
+        /// Captures this thread's `log` output for the duration of `f`.
+        ///
+        /// The log line under test returns nothing and changes nothing, so
+        /// there is no other observable to assert on. The logger is global and
+        /// installed once; the buffer is thread-local, so tests running in
+        /// parallel cannot see each other's lines. If the install ever loses a
+        /// race to some other logger the buffer simply stays empty -- which is
+        /// why every test using this also asserts on a string it knows the
+        /// line contains, so "captured nothing" fails rather than passes.
+        fn captured_logs(f: impl FnOnce()) -> Vec<String> {
+            use std::cell::RefCell;
+
+            thread_local! {
+                static LINES: RefCell<Option<Vec<String>>> = RefCell::new(None);
+            }
+
+            struct Capture;
+            impl log::Log for Capture {
+                fn enabled(&self, _: &log::Metadata) -> bool {
+                    true
+                }
+                fn log(&self, record: &log::Record) {
+                    LINES.with(|l| {
+                        if let Some(lines) = l.borrow_mut().as_mut() {
+                            lines.push(record.args().to_string());
+                        }
+                    });
+                }
+                fn flush(&self) {}
+            }
+
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                let _ = log::set_boxed_logger(Box::new(Capture));
+                log::set_max_level(log::LevelFilter::Trace);
+            });
+
+            LINES.with(|l| *l.borrow_mut() = Some(Vec::new()));
+            f();
+            LINES.with(|l| l.borrow_mut().take().unwrap_or_default())
+        }
+
+        /// The line `process_foreground_event` writes when the engine matched.
+        fn matched_line(lines: &[String]) -> &str {
+            lines
+                .iter()
+                .find(|l| l.starts_with("matched "))
+                .map(|l| l.as_str())
+                .unwrap_or_else(|| panic!("no \"matched ...\" line was logged; got {lines:?}"))
+        }
+
+        /// **Finding 1, for `TriggerMode::Auto`.** Deleting the `handle_match`
+        /// call leaves this with an empty `Filled`.
+        #[test]
+        fn an_auto_trigger_match_is_filled_from_the_vault_into_the_window_that_matched() {
+            let mut server = mockito::Server::new();
+            // The cache is empty, so this goes down `fill_from_vault`'s
+            // documented bridge fallback rather than needing a populate.
+            let _item = server
+                .mock("GET", "/object/item/1")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"success":true,"data":{"id":"1","name":"Ledgerline","fields":[],
+                        "login":{"username":"denis@example.com","password":"hunter2","totp":null}}}"#,
+                )
+                .create();
+
+            let cache = VaultCache::new(VaultBridge::new(server.url()));
+            let engine = engine_with(&[(
+                "1",
+                AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto),
+            )]);
+            let filled = Filled::default();
+            let (stats, stats_path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+
+            process_foreground_event(
+                &window("Ledgerline.exe", "Ledgerline -- Invoices", 0x4321),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+            );
+
+            assert_eq!(
+                filled.seen(),
+                vec![(0x4321, "denis@example.com".to_string(), "hunter2".to_string())],
+                "an Auto-trigger match must be filled, with that item's credentials, into the \
+                 window that matched. An empty list means `handle_match` was never called at \
+                 all -- autofill switched off, which is this app's whole purpose"
+            );
+            assert_eq!(stats.count("1"), 1, "a completed fill is counted for the detail pane");
+            assert_eq!(
+                pending_hotkey_fill, None,
+                "Auto fills now; there is nothing left for the fill hotkey to do"
+            );
+            assert_eq!(last_dispatched_hwnd, Some(0x4321));
+
+            let _ = std::fs::remove_file(stats_path);
+        }
+
+        /// **Finding 1, for `TriggerMode::Hotkey`** -- the arm whose entire
+        /// output is the value the mutation replaced with `None`.
+        #[test]
+        fn a_hotkey_trigger_match_arms_the_pending_fill_instead_of_filling_now() {
+            // Nothing here may reach the network: the Hotkey arm returns
+            // before any vault read, and a bridge pointed at a closed port
+            // proves it.
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[(
+                "7",
+                AppMatch::for_process("Ledgerline.exe", TriggerMode::Hotkey),
+            )]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+
+            process_foreground_event(
+                &window("Ledgerline.exe", "Ledgerline", 0x99),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+            );
+
+            assert_eq!(
+                pending_hotkey_fill,
+                Some(("7".to_string(), 0x99)),
+                "a Hotkey match must arm (item, hwnd) for the loop's separate fill-hotkey check. \
+                 `None` means `handle_match`'s answer is being dropped, so Ctrl+Alt+B would \
+                 never fill anything again"
+            );
+            assert!(
+                filled.seen().is_empty(),
+                "Hotkey must not fill until the user actually presses the hotkey"
+            );
+            assert_eq!(last_dispatched_hwnd, Some(0x99));
+        }
+
+        /// The positive control for both tests above: they would also pass
+        /// against a `process_foreground_event` that filled and armed
+        /// unconditionally, without asking the engine anything.
+        #[test]
+        fn a_window_that_matches_nothing_is_neither_filled_nor_armed() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[(
+                "1",
+                AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto),
+            )]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+
+            process_foreground_event(
+                &window("Solitaire.exe", "Solitaire", 0x11),
+                &cache,
+                &recording_injector(&filled),
+                &stats,
+                &engine,
+                &mut pending_hotkey_fill,
+                &mut last_dispatched_hwnd,
+            );
+
+            assert!(filled.seen().is_empty(), "an unmatched window must never be filled");
+            assert_eq!(pending_hotkey_fill, None, "an unmatched window arms nothing");
+        }
+
+        /// **Finding 2.** A Store app matched through the title table arrives
+        /// wearing the frame host's `exe_name`, and the log entry that records
+        /// which app was matched must not say that name -- it is the exact
+        /// string the user reported being shown, and this is the file they are
+        /// asked for when autofill goes wrong.
+        #[test]
+        fn the_matched_log_line_names_a_title_matched_store_app_by_its_title() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[(
+                "42",
+                hosted_match("Speedtest.exe", "Speedtest", TriggerMode::Hotkey),
+            )]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+
+            let lines = captured_logs(|| {
+                process_foreground_event(
+                    &window(HOST, "Speedtest", 0x55),
+                    &cache,
+                    &recording_injector(&filled),
+                    &stats,
+                    &engine,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                );
+            });
+
+            let line = matched_line(&lines);
+            // Proves the capture worked at all, so the two assertions below
+            // cannot pass on an empty buffer.
+            assert!(line.contains("vault item 42"), "captured the wrong line: {line}");
+            assert!(
+                line.contains("Speedtest"),
+                "a title-matched Store app must be logged under its own title, not the host \
+                 frame's name: {line}"
+            );
+            assert!(
+                !line.contains(HOST),
+                "this is the exact string the user reported being shown -- \
+                 `window_label` has been dropped from the log line: {line}"
+            );
+        }
+
+        /// The positive control for the test above: a log line that always
+        /// used the title would pass it and fail this one.
+        #[test]
+        fn the_matched_log_line_names_an_ordinary_app_by_its_executable() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let engine = engine_with(&[(
+                "8",
+                AppMatch::for_process("Ledgerline.exe", TriggerMode::Hotkey),
+            )]);
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+            let mut pending_hotkey_fill = None;
+            let mut last_dispatched_hwnd = None;
+
+            let lines = captured_logs(|| {
+                process_foreground_event(
+                    &window("Ledgerline.exe", "Ledgerline -- Invoices", 0x66),
+                    &cache,
+                    &recording_injector(&filled),
+                    &stats,
+                    &engine,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                );
+            });
+
+            let line = matched_line(&lines);
+            assert!(line.contains("vault item 8"), "captured the wrong line: {line}");
+            assert!(
+                line.contains("Ledgerline.exe"),
+                "an ordinary window is named by its executable, as every log line in this app \
+                 always has been: {line}"
             );
         }
     }
