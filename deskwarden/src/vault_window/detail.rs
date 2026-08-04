@@ -1708,6 +1708,11 @@ fn row(
 /// `clicking_the_eye_reveals_without_copying`, which asserts BOTH halves --
 /// the flag flipped, and no copy reported -- because the negative alone
 /// passes against a click that missed everything.
+///
+/// **The tooltip does not get that for free**, and assuming it did was a
+/// bug the user reported: over the eye and over the website link the tile
+/// still offered to copy. See the `hovered()` gate below for what egui does
+/// instead and why the gate has to be on the call.
 fn copy_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1735,8 +1740,27 @@ fn copy_row(
         shortcut_hint(ui, hint);
         controls(ui);
     };
-    let response = row_impl(ui, label, value, controls, egui::Sense::click())
-        .on_hover_text(copy_row_tooltip(hint));
+    let response = row_impl(ui, label, value, controls, egui::Sense::click());
+    // **Asked for only while the tile itself is what the pointer is on.**
+    // `Response::hovered` is egui's answer to "which one widget would a click
+    // go to", so over the eye or the website link it is the CHILD that is
+    // hovered and this tile is not -- the same layering the click already
+    // relies on, applied to the tooltip, which does not get it for free.
+    //
+    // Gating the CALL rather than trusting `on_hover_text` to gate itself is
+    // the whole fix. `Tooltip::should_show_tooltip` returns true, before it
+    // ever looks at `hovered`, for a tooltip that is ALREADY OPEN and whose
+    // widget rect still contains the pointer -- and the tile's rect contains
+    // the eye. So the real gesture (rest on the row, read "Click to copy",
+    // slide across to the eye) kept this tooltip up all the way onto the eye,
+    // and egui shows one tooltip per layer, so the eye's own "Reveal" was
+    // then refused. Hovering the eye offered to copy, which is not what a
+    // click there does.
+    let response = if response.hovered() {
+        response.on_hover_text(copy_row_tooltip(hint))
+    } else {
+        response
+    };
     if response.clicked() {
         *action = on_copy;
     }
@@ -5350,6 +5374,95 @@ mod tests {
                     hovered.strings()
                 );
             }
+        }
+    }
+
+    /// **A tooltip that is already up has to let go when the pointer reaches
+    /// a child of the tile.**
+    ///
+    /// The user: "Click to copy should disapear when hovered over eye or link
+    /// - not relevant". Clicking the eye reveals and clicking the link opens
+    /// a browser; neither copies. The CLICK was already theirs by layout (see
+    /// [`copy_row`]), and the tooltip did not inherit that -- it is a
+    /// different mechanism with a different rule.
+    ///
+    /// **This test arrives at the child the way a pointer does**, and that is
+    /// the entire difference between it and
+    /// `hovering_the_url_offers_to_open_it_rather_than_to_copy_it`, which
+    /// passed throughout: it settles on the tile FIRST, so the tile's tooltip
+    /// is up, and only then slides onto the child.
+    /// `Tooltip::should_show_tooltip` short-circuits to `true` for a tooltip
+    /// that is already open and whose widget rect still contains the pointer
+    /// -- before it consults `hovered` at all -- and the tile's rect contains
+    /// both children. egui then shows one tooltip per layer, first one wins,
+    /// so the child's own was refused on top of that. A test that lands on
+    /// the child out of nowhere opens no tile tooltip and cannot see any of
+    /// it.
+    ///
+    /// Both halves, for each child: the child's own tooltip present AND the
+    /// tile's gone. Suppressing both would be worse than the bug, and the
+    /// negative on its own passes against a pane that painted no tooltip at
+    /// all -- which is what the settle on the tile above it controls for.
+    #[test]
+    fn the_tiles_copy_tooltip_lets_go_when_the_pointer_reaches_the_eye_or_the_link() {
+        let item = a_login();
+        let totp = TotpState::NoSecret;
+        // The tile the pointer starts on, what that tile says, where the
+        // child inside it is, and what the child says instead. The eye paints
+        // no string of its own, so it is found by geometry; the link is its
+        // own URL.
+        let children: [(&str, &str, fn(&Frame) -> egui::Rect, &str); 2] = [
+            (
+                "Password",
+                "Click to copy · CTRL+B",
+                |frame| {
+                    *frame
+                        .eyes()
+                        .first()
+                        .expect("the Password row painted no eye to hover")
+                },
+                "Reveal",
+            ),
+            (
+                "Website",
+                "Click to copy · CTRL+SHIFT+U",
+                |frame| frame.rect_of(WEBSITE),
+                "Open in browser",
+            ),
+        ];
+        for (tile_label, tile_tooltip, child_of, child_tooltip) in children {
+            // A fresh pane per child: the gesture is stateful, and a tooltip
+            // left open by the previous one would be this one's premise.
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &totp);
+            let tile = laid_out.rect_of(tile_label);
+            let child = child_of(&laid_out);
+
+            let on_tile = pane.hover_settled(&item, &totp, tile.center());
+            assert!(
+                on_tile.painted(tile_tooltip),
+                "the {tile_label:?} tile painted no {tile_tooltip:?} to begin with, so \
+                 it never gives way to anything; the frame painted: {:?}",
+                on_tile.strings()
+            );
+
+            let on_child = pane.hover_settled(&item, &totp, child.center());
+            assert!(
+                on_child.painted(child_tooltip),
+                "sliding from the {tile_label:?} tile onto its child painted no \
+                 {child_tooltip:?}, so the child lost its own tooltip too; the frame \
+                 painted: {:?}",
+                on_child.strings()
+            );
+            assert!(
+                !on_child
+                    .strings()
+                    .iter()
+                    .any(|t| t.starts_with("Click to copy")),
+                "the {tile_label:?} tile's copy tooltip followed the pointer onto its \
+                 child, which does not copy; the frame painted: {:?}",
+                on_child.strings()
+            );
         }
     }
 
