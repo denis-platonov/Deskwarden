@@ -50,13 +50,17 @@ use deskwarden::vault_cache::{
     AppMatchWrite, PopulateOutcome, VaultCache, VaultEpoch, VaultEra, VaultSnapshot,
     VaultUnavailable,
 };
+use deskwarden::app_match::AppMatch;
+use deskwarden::app_window;
 use deskwarden::{
     fill_stats, hotkey, job_object, loading_ui, logging, login_ui, picker_ui,
     prefs_ui, session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::Path;
+use std::rc::Rc;
 use std::process::Child;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -432,20 +436,29 @@ fn main() {
     // A cached session token is worthless if it has since been invalidated
     // (manual `bw lock`, password change, reboot). Trusting it unconditionally
     // is how the app used to proceed "unlocked" with no recovery path.
-    let mut session_token = match store.load() {
+    // **Does this launch need a window at all?**
+    //
+    // A cached session that is still unlocked is the SILENT launch: nothing is
+    // shown, the app goes to the tray, and that is correct. The user asked for
+    // one window "when login (not lock) after entering" -- a launch that never
+    // asks for a master password has nothing to show a card for, and giving it
+    // a vault window it did not have before would be a window popping up on
+    // every boot. So the answer here is not a token but a question, and only
+    // the `None` arm below opens `app_window`.
+    let cached_session = match store.load() {
         Some(token) => match login_ui::check_bw_status_with_session(Some(&token)) {
             login_ui::BwStatus::Unlocked => {
                 log::info!("cached session token verified as unlocked");
-                token
+                Some(token)
             }
             other => {
                 log::warn!("cached session token reports {other:?}; re-authenticating");
-                reauthenticate(&store, login)
+                None
             }
         },
         None => {
-            log::info!("no cached session token; showing login flow");
-            reauthenticate(&store, login)
+            log::info!("no cached session token; showing the single startup window");
+            None
         }
     };
 
@@ -467,20 +480,48 @@ fn main() {
     let startup_epoch = cache.epoch();
     let mut engine = MatchEngine::new();
 
-    // `Option` rather than a plain `Child`: with `keep_backend_running`
-    // turned off, the backend is only up while the vault window is open (see
-    // `backend_policy::should_run`), so "not currently running" has to be
-    // representable. Always `Some` here at startup -- `start_backend` starts
-    // it unconditionally, since something has to answer the very first
-    // `wait_for_vault_ready_with_spinner` call below regardless of the
-    // setting.
-    let mut bw_serve_child: Option<Child> = Some(start_backend(&session_token, job_ref(&job)));
-
     // `bw serve` is a bundled Node binary: its cold start regularly takes
     // several seconds, far longer than the fixed 500ms sleep this replaces.
     // Losing that race used to leave the match engine permanently empty with
     // no diagnostic, so the app silently did nothing forever.
     let schedule = readiness_schedule(READINESS_DEADLINE);
+
+    // Built here rather than after the cache is filled, because the single
+    // startup window's VAULT STAGE needs it: that stage is `vault_window`'s own
+    // frame, and it fills from the same injector every later window uses.
+    let injector = Injector {
+        ui: RealUiAutomation,
+        fallback: RealSendInput,
+    };
+
+    // What the match engine is armed from, filled by whichever of the two
+    // startup paths below runs. An `Rc<RefCell<_>>` because the single window's
+    // `build_vault` closure is `'static` (it is moved into an eframe update
+    // closure) and so cannot borrow anything on this stack -- the same handoff
+    // every window in this crate uses to get an answer back, and safe for the
+    // same reason: `app_window::run` blocks THIS thread for its whole life.
+    let startup_entries: Rc<RefCell<Vec<(String, AppMatch)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    // The outcome of the vault the single window showed, if it showed one.
+    // Dispatched further down, once the tray exists -- see the call to
+    // `open_vault_window` just before the main loop, and its `first_result`
+    // parameter for why it is dispatched THERE rather than handled here.
+    let mut startup_vault: Option<vault_window::VaultWindowResult> = None;
+    // `Option` rather than a plain `Child`: with `keep_backend_running`
+    // turned off, the backend is only up while the vault window is open (see
+    // `backend_policy::should_run`), so "not currently running" has to be
+    // representable. Always `Some` by the end of both paths below -- something
+    // has to answer the very first readiness probe regardless of the setting.
+    let mut bw_serve_child: Option<Child> = None;
+    // Declared without a value and assigned in BOTH arms below, rather than
+    // seeded with an empty string: an empty token is a real value that would
+    // compile everywhere and authenticate nothing, and the compiler is a better
+    // check that both paths produce one than a reviewer is.
+    let mut session_token: String;
+
+    if let Some(token) = cached_session {
+    session_token = token;
+    bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
     let items = match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_MESSAGE) {
         VaultReadyOutcome::Ready(items) => items,
         VaultReadyOutcome::Dismissed => {
@@ -534,28 +575,154 @@ fn main() {
         ),
     };
 
-    let entries = match_entries(&items);
-    log::info!("match engine loaded with {} app match(es)", entries.len());
-    engine.rebuild(&entries);
+    *startup_entries.borrow_mut() = match_entries(&items);
+    seed_cache_at_startup(&cache, items, startup_epoch);
+    } else {
+    // **ONE WINDOW: the sign-in card, then the spinner, then the vault.**
+    //
+    // This is the launch the user reported. It used to be three windows -- the
+    // card closed, a 320x150 spinner opened and closed, and the app arrived in
+    // the tray having never shown the vault it had just unlocked. All three are
+    // now stages of one `eframe` app in one OS window, at the vault window's
+    // own geometry, which the user closes when they are done with it.
+    //
+    // The slow part between the stages runs on a worker thread (`prepare`), not
+    // here and not on the frame closure: `try_start_backend` alone is regularly
+    // several seconds, and any of it on the frame thread would freeze the window
+    // exactly where it is meant to be showing a spinner.
+    let job_for_work = job.clone();
+    let vault_for_work = vault.clone();
+    let schedule_for_work = schedule.clone();
 
-    // Seeds the cache with the `items` the readiness probe just fetched
-    // (`VaultCache::populate_with`), rather than a plain `populate()`
-    // listing them all over again right after -- the same request, for data
-    // that cannot have changed in the instant between the two calls. Still
-    // fetches folders, since nothing above needed those. This also means
-    // `items` doesn't need a separate `drop()`: it becomes the cache's own
-    // storage instead of a throwaway local that would otherwise keep the
-    // entire deserialized vault (potentially thousands of items, each
-    // carrying a serde_json::Map "other" catch-all) resident for the rest of
-    // the process's life doing nothing -- this app spends nearly all its
-    // runtime idle in the tray with no window open.
-    match cache.populate_with(items, startup_epoch) {
-        Ok(PopulateOutcome::Populated) => {}
-        Ok(PopulateOutcome::DiscardedStale) => {
-            log::warn!("the vault cache was cleared during startup's populate; it stays empty")
-        }
-        Err(e) => log::warn!("could not populate the vault cache at startup: {e:?}"),
+    let cache_for_vault = cache.clone();
+    let fill_stats_for_vault = fill_stats.clone();
+    let injector_for_vault = injector.clone();
+    let icon_cache_dir_for_vault = icon_cache_dir.clone();
+    let auto_lock_for_vault = settings.auto_lock();
+    let accounts_for_vault = accounts_state.clone();
+    let entries_out = startup_entries.clone();
+
+    let outcome = app_window::run(
+        login.account,
+        login.first_run,
+        SETUP_MESSAGE,
+        // ON A WORKER THREAD. `try_start_backend` rather than `start_backend`:
+        // the fatal variant puts a modal message box up, and doing that from a
+        // worker while an eframe window owns the main thread is a dialog behind
+        // a window nobody can reach. The failure is carried back instead and is
+        // just as fatal, one frame later, on the thread that can show it.
+        move |token| StartupWork::produce(
+            &token,
+            &job_for_work,
+            &vault_for_work,
+            &schedule_for_work,
+        ),
+        // ON THE MAIN THREAD, in the frame that drains the worker. The cache
+        // has to be filled BEFORE the vault frame is built, or the window's
+        // first vault frame paints an empty vault as data.
+        move |token, work: &mut StartupWork| {
+            // Annotated: without it, deref coercion picks `&mut [VaultItem]`
+            // and `mem::take` asks for a `Default` slice.
+            let items: Vec<deskwarden::vault_bridge::VaultItem> =
+                std::mem::take(work.items.as_mut().ok()?);
+            *entries_out.borrow_mut() = match_entries(&items);
+            seed_cache_at_startup(&cache_for_vault, items, startup_epoch);
+            let (_options, frame, handles) = vault_window::build_frame(
+                cache_for_vault.clone(),
+                fill_stats_for_vault,
+                &injector_for_vault,
+                work.details.server_url.clone(),
+                work.details.user_email.clone(),
+                token.to_string(),
+                icon_cache_dir_for_vault,
+                auto_lock_for_vault,
+                // The readiness probe in `prepare` has just answered, so the
+                // backend is up and the vault's own initial load may skip its
+                // readiness wait -- the same exemption `open_vault_window`
+                // makes when it finds the backend already running.
+                true,
+                accounts_for_vault,
+                // This window's first frame already installed the fonts,
+                // rounded the corners and raised it, three stages ago.
+                true,
+            );
+            Some((frame, handles))
+        },
+    );
+
+    // Closing the card is the same gesture, and costs the same thing, as
+    // closing the old login window: every downstream operation needs a session.
+    // `login_ui::run_login_flow` is where that decision lives for every OTHER
+    // caller and it exits the process; this window cannot go through it (it
+    // does not open a window of its own), so it says the same thing here.
+    let Some(token) = outcome.token else {
+        log::error!("the startup window was closed without producing a session token; exiting");
+        std::process::exit(1);
+    };
+    if let Err(e) = store.save(&token) {
+        log::error!("failed to persist session token: {e}");
     }
+    session_token = token;
+    startup_vault = outcome.vault;
+
+    match outcome.prepared {
+        Some(work) => {
+            // Fatal exactly where it was before this change -- `start_backend`
+            // used to end the process itself -- and now on the main thread,
+            // where the message box it puts up is in front of the user.
+            let child = match work.child {
+                Ok(child) => child,
+                Err(e) => fatal_startup_error(&format!(
+                    "Deskwarden could not start its Bitwarden backend.\n\n{e}"
+                )),
+            };
+            bw_serve_child = Some(child);
+            // `build_vault` above already armed `startup_entries` and filled the
+            // cache on the happy path; this arm is the one where the readiness
+            // probe failed, and it is the SAME recovery startup has always run.
+            if let Err(e) = work.items {
+                let items = recover_from_failed_vault_wait(
+                    &e,
+                    &vault,
+                    &schedule,
+                    &mut bw_serve_child,
+                    &mut session_token,
+                    &job,
+                    &store,
+                    &config_dir,
+                    login,
+                );
+                *startup_entries.borrow_mut() = match_entries(&items);
+                seed_cache_at_startup(&cache, items, startup_epoch);
+            }
+        }
+        None => {
+            // The window ended before the work landed. Nothing started a
+            // backend, so there is no child to adopt and nothing to recover
+            // from -- the same recovery startup has always run takes it from
+            // here, and it begins by authenticating again.
+            let items = recover_from_failed_vault_wait(
+                "the startup window closed before the vault backend was ready",
+                &vault,
+                &schedule,
+                &mut bw_serve_child,
+                &mut session_token,
+                &job,
+                &store,
+                &config_dir,
+                login,
+            );
+            *startup_entries.borrow_mut() = match_entries(&items);
+            seed_cache_at_startup(&cache, items, startup_epoch);
+        }
+    }
+    }
+
+    log::info!(
+        "match engine loaded with {} app match(es)",
+        startup_entries.borrow().len()
+    );
+    engine.rebuild(&startup_entries.borrow());
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
     // the cache once -> *then* obey the policy. The backend has had to be up
@@ -568,11 +735,6 @@ fn main() {
     // only for as long as it is actually needed and reconciles again
     // afterwards -- see `stop_backend_if_idle` and the main loop below.
     stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
-
-    let injector = Injector {
-        ui: RealUiAutomation,
-        fallback: RealSendInput,
-    };
 
     // The tray icon and the global hotkey manager each create a hidden
     // Win32 window on the thread that builds them (here, the main thread)
@@ -765,6 +927,65 @@ fn main() {
     // `requests_outliving_a_window`.
     let mut pending_menu_events: VecDeque<MenuEvent> = VecDeque::new();
 
+    // **The startup window's vault outcome, dispatched by the one dispatcher.**
+    //
+    // The single window showed the vault, and the user may have locked it,
+    // asked for Preferences, or switched account from its titlebar before
+    // closing it. Every one of those is a thing `open_vault_window` already
+    // knows how to do -- and the lock/re-auth one is `resettle_session`, the one
+    // hardened teardown-and-repopulate sequence in this app, which must keep
+    // being reached from the code that already reaches it rather than from a
+    // second copy written here.
+    //
+    // So the result is HANDED IN rather than acted on: `open_vault_window`'s
+    // first pass dispatches it instead of opening a window, and every pass after
+    // that opens a real one. That is what "the window closes and reopens" now
+    // means for a switch or Preferences when the window that closed was the
+    // startup window -- it closed, and the vault comes back in a window of its
+    // own, exactly as it does from a tray click.
+    //
+    // HERE and not next to `app_window::run`, because all of that needs the tray
+    // -- `resettle_session` takes `&tray`, and a switch rebuilds the accounts
+    // submenu -- and the tray does not exist until a few lines above this one.
+    // Nothing in between can act on the session: the update-check thread and the
+    // hotkey registration do not touch it.
+    if startup_vault.is_some() {
+        open_vault_window(
+            &cache,
+            &fill_stats,
+            &injector,
+            &mut session_token,
+            &mut bw_serve_child,
+            &job,
+            &mut store,
+            &schedule,
+            &mut engine,
+            &icon_cache_dir,
+            &mut cached_status_details,
+            &config_dir,
+            &mut active_account,
+            &mut accounts_state,
+            first_run_account.as_ref(),
+            &mut settings,
+            &settings_path,
+            &tray,
+            &backend_op_tx,
+            &backend_op_rx,
+            &mut backend_task_in_progress,
+            // The one caller that hands an outcome in.
+            startup_vault.take(),
+        );
+        rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+        // The third door into the vault window, swept exactly like the other
+        // two: a tray click made while the startup window was up is already
+        // answered -- the window was open -- and must not reopen it.
+        drop_vault_requests_queued_behind_the_window(
+            &mut pending_menu_events,
+            &tray.open_vault_id,
+        );
+        last_dispatched_hwnd = None;
+    }
+
     loop {
         pump_windows_messages();
 
@@ -815,6 +1036,9 @@ fn main() {
                     &backend_op_tx,
                     &backend_op_rx,
                     &mut backend_task_in_progress,
+                    // This door opens its own window; there is no outcome to
+                    // hand it.
+                    None,
                 );
                 rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
                 // Everything the user clicked at the tray while the window was
@@ -1401,6 +1625,9 @@ fn main() {
                 &backend_op_tx,
                 &backend_op_rx,
                 &mut backend_task_in_progress,
+                // This door opens its own window; there is no outcome to hand
+                // it.
+                None,
             );
             rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
             // The second door into the same window, swept the same way and
@@ -2369,6 +2596,18 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
     backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
+    // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
+    // the loop below on its first pass instead of that pass opening a window.
+    //
+    // `Some` from exactly one caller: `main`, once, after the single startup
+    // window has drawn the sign-in card, the spinner and then the vault in one
+    // event loop and the user has closed it. That window can lock, ask for
+    // Preferences or switch account exactly as any other vault session can, and
+    // every one of those outcomes has a handler here already. Handing the
+    // result in rather than growing a second dispatch next to the startup code
+    // is what keeps `resettle_session` reached from one place and keeps the
+    // switch/add/remove wiring the tray's guards pin the only wiring there is.
+    mut first_result: Option<vault_window::VaultWindowResult>,
 ) {
     // Reopened, not merely opened once: the titlebar gear asks for the
     // preferences window, and `prefs_ui::run` is its own `eframe` window on
@@ -2385,70 +2624,94 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // spawn is seconds, a backend start is seconds, and eframe's own window
     // and GPU setup is not free either), and which one dominates depends on
     // what the backend was doing beforehand.
-    let opened_at = Instant::now();
-    let status_details = match cached_status_details.take() {
-        Some(details) => details,
+    // A vault session that ran SOMEWHERE ELSE: the single startup window drew
+    // the vault in its own event loop, and its outcome has to be acted on by
+    // THE CODE BELOW rather than by a second copy of it written next to the
+    // call. Lock, re-auth, Preferences and an account switch each mean the
+    // same thing however the window that reported them was opened, and the
+    // lock/re-auth arm in particular runs `resettle_session` -- the one
+    // hardened teardown-and-repopulate sequence in this app, which exists
+    // exactly once and must keep existing exactly once.
+    //
+    // `take`, so this is the FIRST PASS ONLY. Everything that reopens the
+    // window (Preferences, a switch) goes round the loop again and opens a
+    // real one -- which is what "the window closes and reopens" now means when
+    // the window that closed was the startup window: it closed, and the vault
+    // comes back in a window of its own.
+    let result = match first_result.take() {
+        Some(result) => {
+            log::info!(
+                "dispatching the outcome of the vault session the startup window already ran"
+            );
+            result
+        }
         None => {
-            log::info!("vault window: status details were not prefetched; spawning `bw status`");
-            login_ui::check_bw_status_details()
+        let opened_at = Instant::now();
+        let status_details = match cached_status_details.take() {
+            Some(details) => details,
+            None => {
+                log::info!("vault window: status details were not prefetched; spawning `bw status`");
+                login_ui::check_bw_status_details()
+            }
+        };
+        log::info!("vault window: account details ready in {:?}", opened_at.elapsed());
+        // Refill the cache with what this open just used -- a cheap clone in the
+        // common (already-cached) case, and what lets the *next* open skip the
+        // spawn too when this call itself was the one that had to fall back.
+        *cached_status_details = Some(status_details.clone());
+
+        // Read once, before the `if` below might short-circuit past it, and
+        // reused for `vault_window::run`'s own `backend_already_running`
+        // (review Minor 3): whether `bw serve` was already up at this exact
+        // moment -- before this function might kick off a start of its own --
+        // is also exactly the fact `spawn_vault_load` needs to know it can skip
+        // its readiness wait. Nothing between here and `vault_window::run`
+        // returning stops or restarts the backend out from under this snapshot
+        // (the only paths that do -- lock/reauth recovery -- close the window
+        // and return first), so it stays valid for the window's whole session.
+        let backend_already_running = backend_is_running(bw_serve_child);
+
+        // Reads don't need `bw serve` at all (`vault_window::run` paints
+        // entirely from `cache`); writes and TOTP do. If save-memory mode tore
+        // the backend down after the last close (or it crashed -- review Minor
+        // 8: `backend_is_running` catches a `Some(dead child)` that a plain
+        // `.is_none()` check would miss), kick a start off in the background and
+        // move straight on to opening the window rather than waiting for it --
+        // see this function's doc for why waiting here used to be a real freeze.
+        if needs_backend_start(backend_task_in_progress, backend_already_running) {
+            *backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+            spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
+        }
+
+        // The last thing before the window exists. Everything after this is
+        // eframe's own startup -- creating the OS window, picking a graphics
+        // backend, building the font atlas -- which this app does not control
+        // and which is invisible to any timing inside the frame closure, since
+        // the first closure call happens after all of it.
+        log::info!(
+            "vault window: handing off to eframe after {:?} (backend was {})",
+            opened_at.elapsed(),
+            if backend_already_running { "already up" } else { "being started" }
+        );
+        vault_window::run(
+            cache.clone(),
+            fill_stats.clone(),
+            injector,
+            status_details.server_url,
+            status_details.user_email,
+            session_token.clone(),
+            icon_cache_dir.to_path_buf(),
+            // Read fresh on every pass, so a timeout changed in the preferences
+            // window below governs the window this loop is about to reopen.
+            settings.auto_lock(),
+            backend_already_running,
+            // Cloned per pass, not once outside the loop: a switch below replaces
+            // the state, and the window reopened after it has to offer the account
+            // the user just left rather than the one they are now on.
+            accounts.clone(),
+        )
         }
     };
-    log::info!("vault window: account details ready in {:?}", opened_at.elapsed());
-    // Refill the cache with what this open just used -- a cheap clone in the
-    // common (already-cached) case, and what lets the *next* open skip the
-    // spawn too when this call itself was the one that had to fall back.
-    *cached_status_details = Some(status_details.clone());
-
-    // Read once, before the `if` below might short-circuit past it, and
-    // reused for `vault_window::run`'s own `backend_already_running`
-    // (review Minor 3): whether `bw serve` was already up at this exact
-    // moment -- before this function might kick off a start of its own --
-    // is also exactly the fact `spawn_vault_load` needs to know it can skip
-    // its readiness wait. Nothing between here and `vault_window::run`
-    // returning stops or restarts the backend out from under this snapshot
-    // (the only paths that do -- lock/reauth recovery -- close the window
-    // and return first), so it stays valid for the window's whole session.
-    let backend_already_running = backend_is_running(bw_serve_child);
-
-    // Reads don't need `bw serve` at all (`vault_window::run` paints
-    // entirely from `cache`); writes and TOTP do. If save-memory mode tore
-    // the backend down after the last close (or it crashed -- review Minor
-    // 8: `backend_is_running` catches a `Some(dead child)` that a plain
-    // `.is_none()` check would miss), kick a start off in the background and
-    // move straight on to opening the window rather than waiting for it --
-    // see this function's doc for why waiting here used to be a real freeze.
-    if needs_backend_start(backend_task_in_progress, backend_already_running) {
-        *backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
-        spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
-    }
-
-    // The last thing before the window exists. Everything after this is
-    // eframe's own startup -- creating the OS window, picking a graphics
-    // backend, building the font atlas -- which this app does not control
-    // and which is invisible to any timing inside the frame closure, since
-    // the first closure call happens after all of it.
-    log::info!(
-        "vault window: handing off to eframe after {:?} (backend was {})",
-        opened_at.elapsed(),
-        if backend_already_running { "already up" } else { "being started" }
-    );
-    let result = vault_window::run(
-        cache.clone(),
-        fill_stats.clone(),
-        injector,
-        status_details.server_url,
-        status_details.user_email,
-        session_token.clone(),
-        icon_cache_dir.to_path_buf(),
-        // Read fresh on every pass, so a timeout changed in the preferences
-        // window below governs the window this loop is about to reopen.
-        settings.auto_lock(),
-        backend_already_running,
-        // Cloned per pass, not once outside the loop: a switch below replaces
-        // the state, and the window reopened after it has to offer the account
-        // the user just left rather than the one they are now on.
-        accounts.clone(),
-    );
 
     // Handled before the lock/re-auth branch and with its own `continue`,
     // never folded into it. `locked` and `needs_reauth` both mean the
@@ -4579,6 +4842,86 @@ fn try_start_backend(
 
 /// Startup variant of [`try_start_backend`]: there is nothing to fall back to
 /// before the main loop exists, so a failure here is fatal.
+/// Seeds the cache with the `items` a readiness probe just fetched
+/// (`VaultCache::populate_with`), rather than a plain `populate()` listing them
+/// all over again right after -- the same request, for data that cannot have
+/// changed in the instant between the two calls. Still fetches folders, since
+/// nothing above needed those. This also means `items` doesn't need a separate
+/// `drop()`: it becomes the cache's own storage instead of a throwaway local
+/// that would otherwise keep the entire deserialized vault (potentially
+/// thousands of items, each carrying a serde_json::Map "other" catch-all)
+/// resident for the rest of the process's life doing nothing -- this app spends
+/// nearly all its runtime idle in the tray with no window open.
+///
+/// A function rather than the inline block it used to be, because startup now
+/// has two shapes -- the silent cached-session launch and the single window --
+/// and the second fills the cache from inside an eframe frame closure. Two
+/// hand-written copies would be two chances to drop the `DiscardedStale` arm,
+/// which is the one that stops a cache cleared mid-populate being painted as an
+/// empty vault.
+fn seed_cache_at_startup(
+    cache: &VaultCache,
+    items: Vec<deskwarden::vault_bridge::VaultItem>,
+    epoch: VaultEpoch,
+) {
+    match cache.populate_with(items, epoch) {
+        Ok(PopulateOutcome::Populated) => {}
+        Ok(PopulateOutcome::DiscardedStale) => {
+            log::warn!("the vault cache was cleared during startup's populate; it stays empty")
+        }
+        Err(e) => log::warn!("could not populate the vault cache at startup: {e:?}"),
+    }
+}
+
+/// Everything the single startup window's WORKER THREAD produces: the backend
+/// it started, the vault the readiness probe fetched, and who the CLI says is
+/// signed in.
+///
+/// All three used to happen on the main thread between the login window closing
+/// and the tray appearing, with nothing on screen. Inside one window none of it
+/// may run on the frame thread -- `try_start_backend` alone is regularly several
+/// seconds -- so it runs here, off-thread, and the frame closure drains the
+/// result. Every field is a `Result` or plain data rather than something that
+/// needs the main thread: that is what `Send` is enforcing, and it is also why
+/// the resettle sequence cannot be expressed this way (it borrows a
+/// thread-bound `tray::AppTray` and opens two eframe windows of its own).
+struct StartupWork {
+    /// `Err` is fatal, but not HERE -- see `produce`.
+    child: Result<Child, String>,
+    items: Result<Vec<deskwarden::vault_bridge::VaultItem>, String>,
+    details: login_ui::BwStatusDetails,
+}
+
+impl StartupWork {
+    /// Runs on the worker thread. Never exits the process and never puts a
+    /// window up: `try_start_backend` rather than `start_backend`, because the
+    /// fatal variant shows a modal message box, and a message box raised from a
+    /// worker while an eframe window owns the main thread is a dialog behind a
+    /// window the user cannot reach. The failure is carried back and is just as
+    /// fatal one frame later, on the thread that can show it.
+    fn produce(
+        token: &str,
+        job: &Arc<Option<job_object::KillOnCloseJob>>,
+        vault: &VaultBridge,
+        schedule: &[Duration],
+    ) -> Self {
+        let child = try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE)
+            .map_err(|e| e.to_string());
+        let items = match &child {
+            Ok(_) => wait_for_vault_ready(vault, schedule),
+            // No backend, so there is nothing to probe -- and spending the whole
+            // ~30s readiness deadline on a port nothing is listening on is the
+            // same waste `resettle_session_with` already refuses to make.
+            Err(e) => Err(format!("the vault backend did not start: {e}")),
+        };
+        // Last, and unconditional: the toolbar's account name and server come
+        // from here, and a window that shows the vault with no idea whose it is
+        // is worse than one that waited another moment for the answer.
+        let details = login_ui::check_bw_status_details();
+        Self { child, items, details }
+    }
+}
+
 fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
     match try_start_backend(session_token, job, bw_serve::PORT_RELEASE_GRACE) {
         Ok(child) => child,
@@ -9236,5 +9579,195 @@ mod tests {
                  that has arrived since"
             );
         }
+    }
+}
+
+/// **Startup's two shapes, and the one that must not gain a window.**
+///
+/// None of this can be observed by running anything: `main` is the process
+/// entry point and every window it opens blocks on a real winit event loop. So
+/// it is held at the source, and the slices below are bounded by real syntax in
+/// the code rather than by byte counts.
+#[cfg(test)]
+mod startup_shape_tests {
+    /// The `} else {` at `main`'s own indentation -- the one that ends the
+    /// cached-session arm, and not one of the many nested inside it. The
+    /// leading newline is what makes the indentation load-bearing, and it
+    /// matches under LF and CRLF alike.
+    const OUTER_ELSE: &str = concat!("\n    } else", " {");
+
+    /// Everything before the big test module. Named separately from
+    /// `tests::production_half_of_this_file` because this module cannot reach
+    /// into that one, and split with `concat!` for the same reason it is there:
+    /// a plain literal would match its own declaration.
+    fn production() -> &'static str {
+        let source = include_str!("main.rs");
+        let production = source
+            .split_once(concat!("mod te", "sts {"))
+            .expect("main.rs must still have its test module")
+            .0;
+        assert!(
+            production.len() < source.len(),
+            "control: the split really cut the test module off the end"
+        );
+        production
+    }
+
+    /// The arm taken when the session on disk is still good, bounded by the
+    /// `if let` that opens it and the `} else {` that ends it.
+    fn cached_session_arm() -> &'static str {
+        let production = production();
+        let head = concat!("if let Some(token) = cached_", "session {");
+        let at = production.find(head).unwrap_or_else(|| {
+            panic!(
+                "no {head:?} in main.rs -- startup no longer tells a launch with a good \
+                 cached session apart from one that has to sign in, which is the whole of \
+                 what decides whether a window opens at all"
+            )
+        });
+        let rest = &production[at + head.len()..];
+        let end = rest
+            .find(OUTER_ELSE)
+            .expect("the cached-session arm is never closed by an `} else {`");
+        &rest[..end]
+    }
+
+    /// The arm taken when the launch has to sign in.
+    fn signing_in_arm() -> &'static str {
+        let production = production();
+        let head = concat!("if let Some(token) = cached_", "session {");
+        let at = production.find(head).expect("no cached-session gate in main.rs");
+        let rest = &production[at..];
+        let start = rest
+            .find(OUTER_ELSE)
+            .expect("no `} else {` closing the cached-session arm");
+        &rest[start..]
+    }
+
+    /// **A launch with a good cached session must open no window.** The app
+    /// starting silently into the tray is what it has always done and is not
+    /// what the user reported; the single window is for the launch that signs
+    /// in. This is precisely the kind of property that quietly stops holding
+    /// while someone is chasing "one window from the beginning".
+    #[test]
+    fn a_launch_with_a_good_cached_session_opens_no_startup_window() {
+        let arm = cached_session_arm();
+        let single_window = concat!("app_window::", "run(");
+        assert!(
+            !arm.contains(single_window),
+            "a launch that never asks for a master password now opens the sign-in window \
+             anyway -- a window popping up on every boot, for an app whose whole shape is \
+             that it lives in the tray: {arm:?}"
+        );
+        // Paired positive control on the same needle: the single window really
+        // is reached from the OTHER arm, so the negative above is about which
+        // arm it is in and not about a needle that never matches anything.
+        assert!(
+            signing_in_arm().contains(single_window),
+            "the single startup window is never opened at all, so signing in is back to \
+             three windows"
+        );
+        // And the silent launch really is still the old path, so the slice
+        // above is the launch it claims to be.
+        assert!(
+            arm.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
+            "the cached-session launch no longer waits for the backend at all: {arm:?}"
+        );
+    }
+
+    /// **The vault stage is reached, and its answer is acted on.**
+    ///
+    /// `app_window::advance` can be a perfect transition table and the vault
+    /// still never enter production -- this codebase has shipped complete,
+    /// correct and unreachable code three functions at a time. Two halves are
+    /// pinned here: `main` asks for a vault frame at all, and what that vault
+    /// session reported is dispatched rather than dropped.
+    #[test]
+    fn the_startup_window_builds_a_vault_frame_and_dispatches_what_it_reports() {
+        let arm = signing_in_arm();
+        assert!(
+            arm.contains(concat!("vault_window::build_", "frame(")),
+            "the single window's `build_vault` never builds a vault frame, so the window \
+             shows the spinner and then closes -- the user signs in and is dropped to the \
+             tray without the vault they just unlocked, which is the half of the report \
+             that was never about window count: {arm:?}"
+        );
+        assert!(
+            arm.contains(concat!("startup_vault = outcome.", "vault;")),
+            "what the vault session reported is thrown away at the call site: {arm:?}"
+        );
+
+        let production = production();
+        let handed_in = concat!("startup_vault.", "take()");
+        assert_eq!(
+            production.matches(handed_in).count(),
+            1,
+            "expected exactly one hand-in of the startup window's outcome. None means a \
+             Lock, a Preferences click or an account switch made in that window is silently \
+             ignored -- the vault stays unlocked after the user locked it. More than one \
+             means it is dispatched twice."
+        );
+        // It is handed to the ONE dispatcher, not acted on beside it. Bounded
+        // by the statement's own end rather than by a byte window, which is the
+        // shape that has already overrun an arm in this file.
+        // Bounded from the hand-in BACKWARDS to the nearest call, rather than
+        // from a call forwards: there are three `open_vault_window(` sites and
+        // only one of them is this one, so a slice anchored on a call picks
+        // whichever happens to be last in the file.
+        let hand = production.find(handed_in).expect("checked just above");
+        let call = concat!("open_vault", "_window(");
+        let call_at = production[..hand]
+            .rfind(call)
+            .expect("main.rs no longer calls the vault-window dispatcher at all");
+        let between = &production[call_at..hand];
+        assert!(
+            !between.contains(");"),
+            "the startup window's outcome is not an argument to `open_vault_window` -- there \
+             is a closed call between the two -- so it is being acted on somewhere else. For \
+             a lock that means a SECOND call of `resettle_session`, the one sequence this \
+             app has hardened and must reach from one place: {between:?}"
+        );
+        // Positive control on that boundary: a closed call really is detectable
+        // by this needle, so the negative above is not vacuous.
+        assert!(
+            production[..call_at].contains(");"),
+            "control: a closed call is undetectable by this needle, so the check above \
+             passes against anything"
+        );
+    }
+
+    /// The work between the stages must not run on the frame thread, and it
+    /// must not try to talk to the user from the thread it does run on.
+    #[test]
+    fn the_startup_work_handed_to_the_window_is_the_off_thread_one() {
+        let arm = signing_in_arm();
+        assert!(
+            arm.contains(concat!("StartupWork::", "produce(")),
+            "the single window is handed something other than `StartupWork::produce`; that \
+             is the function whose whole contract is that it never opens a window and never \
+             exits the process, because it runs on a worker thread: {arm:?}"
+        );
+
+        let production = production();
+        let body = production
+            .split_once(concat!("fn produce", "("))
+            .expect("`StartupWork::produce` is gone")
+            .1;
+        let body = &body[..body
+            .find(concat!("fn start_", "backend("))
+            .expect("`start_backend` is expected to follow `produce`, and bounds this slice")];
+        assert!(
+            !body.contains(concat!(" start_", "backend(token")),
+            "`StartupWork::produce` calls the FATAL backend start, on a worker thread: the \
+             message box it raises goes up behind the window that owns the main thread, \
+             where the user cannot reach it: {body:?}"
+        );
+        // Positive control on that negative: `produce` does start a backend, so
+        // the assertion above is about WHICH one and not about a needle that
+        // never matches.
+        assert!(
+            body.contains(concat!("try_start_", "backend(")),
+            "control: `produce` does not start a backend at all: {body:?}"
+        );
     }
 }

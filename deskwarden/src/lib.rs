@@ -12,6 +12,7 @@
 pub mod accounts;
 pub mod app;
 pub mod app_match;
+pub mod app_window;
 pub mod backend_policy;
 pub mod bw_path;
 pub mod bw_serve;

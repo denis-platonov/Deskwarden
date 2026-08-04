@@ -554,8 +554,15 @@ mod tests {
     #[test]
     fn every_window_this_crate_opens_asks_to_be_brought_to_the_front() {
         // (name, source, the title identifier it opens under, how many windows)
-        let sites: [(&str, &str, &str, usize); 5] = [
+        let sites: [(&str, &str, &str, usize); 6] = [
             ("vault_window/mod.rs", include_str!("vault_window/mod.rs"), "WINDOW_TITLE", 1),
+            // The single startup window: sign-in, spinner and vault in one
+            // event loop. It is the ONLY window on the launch that signs in,
+            // so a raise it does not ask for is a launch that lands behind
+            // whatever the user was doing -- with no second window afterwards
+            // to correct it, which is what the three-window flow accidentally
+            // provided.
+            ("app_window.rs", include_str!("app_window.rs"), "WINDOW_TITLE", 1),
             // Added when the login window got its raise. It was excluded
             // while another agent owned that file, and an excluded site is
             // an unguarded one: the raise was applied there and nothing in
@@ -594,6 +601,97 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// **The list above is hand-enumerated, and that is its one weakness.** A
+    /// module added to this crate that opens a window is simply absent from it:
+    /// every assertion still passes, and the new window is unguarded -- which
+    /// is exactly what happened when `app_window` was added, and was caught by
+    /// reading rather than by anything failing.
+    ///
+    /// So every module this crate declares must be classified, here, as one
+    /// that opens windows or one that does not. Adding a module and not
+    /// deciding is the failure. The module list is read out of `lib.rs` rather
+    /// than written out again, because a second hand-written list would have
+    /// the same hole one level up.
+    #[test]
+    fn every_module_in_this_crate_is_classified_as_opening_windows_or_not() {
+        /// The modules `every_window_this_crate_opens_asks_to_be_brought_to_
+        /// the_front` covers.
+        const OPENS_WINDOWS: [&str; 7] = [
+            "app_window",
+            "loading_ui",
+            "login_ui",
+            "overlay_ui",
+            "picker_ui",
+            "prefs_ui",
+            "vault_window",
+        ];
+        /// Everything else. Listed rather than inferred, because "this module
+        /// does not open a window" is a decision someone has to make; a module
+        /// missing from BOTH lists fails below rather than being quietly
+        /// unguarded.
+        const OPENS_NO_WINDOW: [&str; 29] = [
+            "accounts",
+            "app",
+            "app_match",
+            "backend_policy",
+            "bw_path",
+            "bw_serve",
+            "dispatch",
+            "favicon",
+            "fill_stats",
+            "foreground",
+            "hello",
+            "hotkey",
+            "http_agent",
+            "icon",
+            "injector",
+            "job_object",
+            "logging",
+            "match_engine",
+            "password_strength",
+            "session_store",
+            "settings",
+            "signature",
+            "theme",
+            "tray",
+            "updater",
+            "vault_bridge",
+            "vault_cache",
+            "window_list",
+            "window_watch",
+        ];
+
+        let declared: Vec<&str> = include_str!("lib.rs")
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("pub mod "))
+            .filter_map(|rest| rest.strip_suffix(';'))
+            .collect();
+        // Positive control: the parse really found the module list, rather
+        // than an empty vector every loop below would skip.
+        assert!(
+            declared.len() > 20,
+            "only {} modules parsed out of lib.rs -- the parse is wrong, and every check              below is vacuous: {declared:?}",
+            declared.len()
+        );
+        assert!(
+            declared.contains(&"vault_window"),
+            "control: the parse did not find a module known to be there: {declared:?}"
+        );
+
+        for module in OPENS_WINDOWS.iter().chain(OPENS_NO_WINDOW.iter()) {
+            assert!(
+                declared.contains(module),
+                "`{module}` is classified here but is not declared in lib.rs; if it was                  renamed or removed, update this list"
+            );
+        }
+        for module in &declared {
+            assert!(
+                OPENS_WINDOWS.contains(module) != OPENS_NO_WINDOW.contains(module),
+                "`{module}` is in neither list (or in both). Every module in this crate has                  to be classified: if it opens a window, add it to the `sites` table in                  `every_window_this_crate_opens_asks_to_be_brought_to_the_front` AND to                  `OPENS_WINDOWS` here, so its raise is guarded. If it does not, say so in                  `OPENS_NO_WINDOW`. A module in neither is a window nothing checks -- which                  is how `app_window` was added, unguarded, and the whole reason this test                  exists."
+            );
+        }
     }
 
     // ---- the real desktop, weakly ------------------------------------------
