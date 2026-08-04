@@ -22,8 +22,31 @@ impl MatchEngine {
     ///
     /// A match contributes to the process table unless its process is a window
     /// host ([`crate::window_watch::is_host_process`]), and to the title table
-    /// whenever it recorded a title. Most matches are in both; the two are
-    /// built independently because they answer for different windows.
+    /// only when it recorded a title **and** recorded that the window it came
+    /// off was owned by a host frame ([`crate::app_match::AppMatch::hosted`]).
+    /// A hosted match is in both -- awake it is matched by its process, asleep
+    /// by its title -- and an ordinary desktop app is in the process table
+    /// alone.
+    ///
+    /// **`hosted`, not "has a title", is the gate (review 31's Important 1).**
+    /// The filter here used to be `!m.title.is_empty()` while the picker
+    /// recorded a title for every row, which made an ordinary desktop app's
+    /// title a live needle for any frame `ApplicationFrameHost.exe` owns: a
+    /// Store-packaged app whose title follows its content (a reader, a chat
+    /// client) could wear `Ledgerline - Invoices` and be handed the bank's
+    /// credentials. The picker no longer records a title for a row that was not
+    /// hosted, so the data is fixed at the source; this filter is what makes
+    /// the titles ALREADY saved by that commit -- indistinguishable from
+    /// legitimate ones, and not ours to rewrite -- inert where they sit.
+    ///
+    /// Two matches that recorded the same title collide, and the last one in
+    /// `entries` order wins silently (that order follows the vault item list,
+    /// so it is at least deterministic). Unlike the host case below this is not
+    /// logged: after the narrowing above, a collision needs two *hosted* rows
+    /// with byte-identical titles, which is two Store apps that present under
+    /// one name -- rare enough that a log line on every rebuild would be noise,
+    /// and the user-visible symptom (the wrong item offered for one Store app)
+    /// is the same thing the picker's Save flow already lets them correct.
     ///
     /// **Host-named entries are still dropped from the process table, and a
     /// host-named entry that recorded no title is dropped entirely.** That is
@@ -67,7 +90,7 @@ impl MatchEngine {
 
         self.by_title = entries
             .iter()
-            .filter(|(_, m)| !m.title.is_empty())
+            .filter(|(_, m)| m.hosted && !m.title.is_empty())
             .map(|(item_id, m)| (m.title.to_lowercase(), (item_id.clone(), m.clone())))
             .collect();
 
@@ -191,18 +214,28 @@ mod tests {
         (item_id.to_string(), AppMatch::for_process(process, trigger))
     }
 
-    /// A match as the picker now saves it: the attributed process AND the
-    /// title the window carried at the moment it was picked.
-    fn captured(item_id: &str, process: &str, title: &str) -> (String, AppMatch) {
+    /// A match as the picker saves it for a **hosted** row: the attributed
+    /// process, the title the frame carried at the moment it was picked, and
+    /// the `hosted` flag that says the title may be matched on.
+    fn hosted(item_id: &str, process: &str, title: &str) -> (String, AppMatch) {
         (
             item_id.to_string(),
             AppMatch {
                 process: process.to_string(),
                 title: title.to_string(),
                 path: format!(r"C:\Apps\{process}"),
+                hosted: true,
                 trigger: TriggerMode::Prompt,
             },
         )
+    }
+
+    /// A match carrying a title but NOT the hosted flag -- which is exactly the
+    /// shape the previous commit wrote for every ordinary desktop app, and the
+    /// shape sitting in users' vaults right now. The title must be inert.
+    fn titled_but_not_hosted(item_id: &str, process: &str, title: &str) -> (String, AppMatch) {
+        let (id, m) = hosted(item_id, process, title);
+        (id, AppMatch { hosted: false, ..m })
     }
 
     /// A window as `window_watch` reports it, which is the only thing the
@@ -225,7 +258,7 @@ mod tests {
         //     "the public lookup dropped the event's title"
         // while leaving every other test in this file green.
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
 
         assert_eq!(
             engine.lookup(&window(HOST, "KeepSolid")).map(|(id, _)| id),
@@ -271,7 +304,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[
             entry("1", "RockstarGamesLauncher.exe", TriggerMode::Prompt),
-            captured("2", "Speedtest.exe", "Speedtest"),
+            hosted("2", "Speedtest.exe", "Speedtest"),
         ]);
 
         engine.clear();
@@ -386,8 +419,8 @@ mod tests {
         // Changing `self.by_title = ...` to an `extend` gives
         //     "the previous title survived a rebuild"
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("1", "Speedtest.exe", "Speedtest")]);
-        engine.rebuild(&[captured("2", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("1", "Speedtest.exe", "Speedtest")]);
+        engine.rebuild(&[hosted("2", "KeepSolid.exe", "KeepSolid")]);
 
         assert!(
             engine.lookup_parts(HOST, "Speedtest").is_none(),
@@ -410,7 +443,7 @@ mod tests {
         // assignment from `rebuild`) gives
         //     "a suspended Store app has nothing but its title to be matched by"
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
 
         let (id, m) = engine
             .lookup_parts(HOST, "KeepSolid")
@@ -428,7 +461,7 @@ mod tests {
         // the `by_process` filter to also exclude entries that carry a title
         // gives "a match that recorded a title stopped matching by process".
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
 
         assert!(
             engine.lookup_parts("KeepSolid.exe", "KeepSolid").is_some(),
@@ -443,8 +476,8 @@ mod tests {
     fn a_title_saved_for_one_app_does_not_match_an_ordinary_window_that_wears_it() {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[
-            captured("mabl", "mabl.exe", "Mabl"),
-            captured("keepsolid", "KeepSolid.exe", "KeepSolid"),
+            hosted("mabl", "mabl.exe", "Mabl"),
+            hosted("keepsolid", "KeepSolid.exe", "KeepSolid"),
         ]);
 
         // Changing `lookup` to fall back to `by_title` when the process misses
@@ -486,7 +519,7 @@ mod tests {
     #[test]
     fn a_title_is_matched_whole_and_not_as_a_substring() {
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("settings", "Settings.exe", "Settings")]);
+        engine.rebuild(&[hosted("settings", "Settings.exe", "Settings")]);
 
         // Loosening `lookup`'s title comparison to `contains` gives
         //     left: Some("settings")  right: None
@@ -502,7 +535,7 @@ mod tests {
         // `to_lowercase` gives "the stored title stopped matching its own
         // window".
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
 
         assert!(
             engine.lookup_parts(HOST, "keepsolid").is_some(),
@@ -518,7 +551,7 @@ mod tests {
         // unnameable frame on the desktop; `rebuild`'s own filter is the other
         // half of that, tested below.
         let mut engine = MatchEngine::new();
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
 
         assert!(engine.lookup_parts(HOST, "").is_none());
     }
@@ -533,7 +566,63 @@ mod tests {
 
         assert!(engine.by_title.is_empty(), "an empty title became a key: {:?}", engine.by_title);
         // Positive control: a captured title does become one.
-        engine.rebuild(&[captured("keepsolid", "KeepSolid.exe", "KeepSolid")]);
+        engine.rebuild(&[hosted("keepsolid", "KeepSolid.exe", "KeepSolid")]);
         assert_eq!(engine.by_title.len(), 1);
+    }
+
+    /// **Review 31's Important 1.** The title table used to take a title from
+    /// every match that had one, and the picker recorded one for every row --
+    /// so an ORDINARY DESKTOP app's title was a live needle for any frame the
+    /// host owns. A Store-packaged app whose title is content-derived (a
+    /// reader, a chat client, a browser showing a file or contact name) could
+    /// wear it and claim a match saved for something else entirely.
+    ///
+    /// Deleting `rebuild`'s `m.hosted` filter gives
+    ///     left: Some("bank")  right: None
+    #[test]
+    fn a_title_saved_for_an_ordinary_desktop_app_is_not_a_needle_for_a_store_frame() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[titled_but_not_hosted("bank", "Ledgerline.exe", "Ledgerline - Invoices")]);
+
+        assert_eq!(
+            engine.lookup_parts(HOST, "Ledgerline - Invoices").map(|(id, _)| id),
+            None,
+            "a hosted frame wearing a desktop app's title claimed that app's match"
+        );
+        // Both sides are case-folded, so the obvious near-miss is not a defence.
+        assert_eq!(
+            engine.lookup_parts("APPLICATIONFRAMEHOST.EXE", "ledgerline - invoices").map(|(id, _)| id),
+            None
+        );
+        // Positive controls, on the same engine and the same strings, so the
+        // `None`s above cannot be an engine that matches nothing: the desktop
+        // app still matches by its own process name...
+        assert_eq!(
+            engine.lookup_parts("Ledgerline.exe", "").map(|(id, _)| id),
+            Some("bank"),
+            "narrowing the title table must not cost the process table its entry"
+        );
+        // ...and the SAME title, recorded off a hosted row, is still a needle.
+        engine.rebuild(&[hosted("bank", "Ledgerline.exe", "Ledgerline - Invoices")]);
+        assert_eq!(
+            engine.lookup_parts(HOST, "Ledgerline - Invoices").map(|(id, _)| id),
+            Some("bank")
+        );
+    }
+
+    /// The rule that makes the titles ALREADY in users' vaults safe without a
+    /// migration: the flag's absence means "do not match on this title". Old
+    /// JSON has no `hosted` key, `#[serde(default)]` makes it `false`, and such
+    /// a match contributes nothing to the title table.
+    #[test]
+    fn a_title_from_a_vault_written_before_the_hosted_flag_existed_is_inert() {
+        let stored = r#"{"process":"Ledgerline.exe","title":"Ledgerline - Invoices","path":"C:\\Apps\\Ledgerline.exe","trigger":"prompt"}"#;
+        let m = AppMatch::from_field_value(stored).expect("the shipped four-key shape must parse");
+        assert!(!m.hosted, "an absent `hosted` key must not read as true");
+
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[("bank".to_string(), m)]);
+
+        assert!(engine.by_title.is_empty(), "an old title became a needle: {:?}", engine.by_title);
     }
 }

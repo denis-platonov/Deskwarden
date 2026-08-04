@@ -839,15 +839,25 @@ fn selected_window(windows: &[WindowInfo], selected: Option<isize>) -> Option<&W
 /// is the image of the process being named -- the invariant
 /// [`AppMatch::launchable_path`] re-checks before anything runs it.
 ///
-/// The title is recorded for *every* app, not just Store apps, because this
-/// window cannot tell which is which -- a visible Store app is attributed to
-/// its own executable and looks exactly like an ordinary one. Recording it
-/// costs nothing: `MatchEngine::lookup` will only ever consult a title for a
-/// window that `ApplicationFrameHost.exe` owns.
+/// **The title is recorded only for a HOSTED row** -- one whose top-level
+/// window an `ApplicationFrameHost.exe` frame owned while a real app resolved
+/// inside it (`WindowInfo::hosted`). Review 31's Important 1: it used to be
+/// recorded for every row, on the reasoning that `MatchEngine::lookup` only
+/// consults titles for host-owned windows anyway. That reasoning was about who
+/// may READ the table and said nothing about what is IN it -- and what was in
+/// it was every saved app's title, so a Store app whose title follows its
+/// content could wear an ordinary desktop app's title and claim its match. The
+/// row already knows which kind it is, so the fix is to record the truth rather
+/// than to filter for it on every lookup.
+///
+/// The flag is stored beside the title rather than being re-derived later,
+/// because it cannot be re-derived: `process` alone cannot say whether the
+/// window it came off was inside a frame.
 fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
     AppMatch {
         process: w.exe_name.clone(),
-        title: w.title.clone(),
+        title: if w.hosted { w.title.clone() } else { String::new() },
+        hosted: w.hosted,
         path: w.exe_path.clone(),
         trigger,
     }
@@ -2093,7 +2103,17 @@ mod tests {
             exe_path: "C:\\Windows\\System32\\ApplicationFrameHost.exe".into(),
             exe_name: HOST.into(),
             title: title.into(),
+            // An UNRESOLVED frame: nothing was found inside it, so it is listed
+            // under the host's own name and its title names nothing.
+            hosted: false,
         }
+    }
+
+    /// A row for a Microsoft Store app that WAS resolved inside its frame: the
+    /// app's own executable, and the one kind of row whose title is an identity
+    /// worth saving.
+    fn hosted_row(exe_name: &str, title: &str) -> WindowInfo {
+        WindowInfo { hosted: true, ..app_row(exe_name, title) }
     }
 
     /// A row for an ordinary, attributed application -- the only kind the save
@@ -2105,6 +2125,7 @@ mod tests {
             exe_path: format!("C:\\Program Files\\Vendor\\{exe_name}"),
             exe_name: exe_name.into(),
             title: title.into(),
+            hosted: false,
         }
     }
 
@@ -2115,11 +2136,32 @@ mod tests {
         // anything not copied here can never be recovered. Reverting
         // `app_match_for` to the `{ process, trigger }` it used to build gives
         //     left: ""  right: "KeepSolid"
-        let m = app_match_for(&app_row("KeepSolid.exe", "KeepSolid"), TriggerMode::Auto);
+        let m = app_match_for(&hosted_row("KeepSolid.exe", "KeepSolid"), TriggerMode::Auto);
 
         assert_eq!(m.process, "KeepSolid.exe");
         assert_eq!(m.title, "KeepSolid");
+        assert!(m.hosted, "the flag that makes the title matchable at all");
         assert_eq!(m.path, "C:\\Program Files\\Vendor\\KeepSolid.exe");
+        assert_eq!(m.trigger, TriggerMode::Auto);
+    }
+
+    /// **Review 31's Important 1.** An ordinary desktop app's title is not an
+    /// identity anything is allowed to match on, so it is not recorded --
+    /// otherwise it sits in the vault indistinguishable from a Store app's, and
+    /// any frame that can be made to wear it claims this item's credentials.
+    #[test]
+    fn an_ordinary_row_records_no_title_to_be_matched_by() {
+        // Changing the title arm back to `w.title.clone()` gives
+        //     left: "Ledgerline - Invoices"  right: ""
+        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline - Invoices"), TriggerMode::Auto);
+
+        assert_eq!(m.title, "", "a desktop app's title must not become a needle");
+        assert!(!m.hosted);
+        // Positive controls, so "records nothing" cannot be how this passes:
+        // everything else about the row is still captured, and the ONLY
+        // difference from the test above is which kind of row it was.
+        assert_eq!(m.process, "Ledgerline.exe");
+        assert_eq!(m.path, "C:\\Program Files\\Vendor\\Ledgerline.exe");
         assert_eq!(m.trigger, TriggerMode::Auto);
     }
 
@@ -2268,7 +2310,14 @@ mod save_gate_placement_tests {
     /// trigger)` compiles, saves, closes the window, and quietly writes a
     /// match that records neither the title a suspended Store app is
     /// recognised by nor the path the detail pane shows.
-    const CAPTURE_CALL: &str = concat!("app_match_for", "(w,");
+    /// **The ARGUMENT is part of the needle** (review 31's Minor 4). The
+    /// previous spelling was `app_match_for(w,` and stopped at the comma, so
+    /// `app_match_for(w, TriggerMode::Prompt)` -- which silently discards the
+    /// trigger the user chose in this very window, on every save -- left the
+    /// whole suite green. Same shape as `window_title(` in the ledger and as
+    /// `MUT-6` in `app_window.rs`: pinning a call without its arguments pins
+    /// the wrong half.
+    const CAPTURE_CALL: &str = concat!("app_match_for", "(w, trigger)");
 
     fn source() -> &'static str {
         include_str!("picker_ui.rs")
@@ -2295,6 +2344,10 @@ mod save_gate_placement_tests {
         let planted = concat!("let m = app_match_for", "(w, trigger);");
         assert_eq!(planted.matches(CAPTURE_CALL).count(), 1, "planted: {planted}");
         assert_eq!("nothing here".matches(CAPTURE_CALL).count(), 0);
+        // And the mutation the old needle could not see: the call is still
+        // there, the trigger is not.
+        let discarded = concat!("let m = app_match_for", "(w, TriggerMode::Prompt);");
+        assert_eq!(discarded.matches(CAPTURE_CALL).count(), 0, "planted: {discarded}");
     }
 
     #[test]
@@ -2302,10 +2355,12 @@ mod save_gate_placement_tests {
         assert_eq!(
             source().matches(CAPTURE_CALL).count(),
             1,
-            "expected {CAPTURE_CALL:?} exactly once -- the value Save writes. Zero means the \
-             saved match went back to being built from the row's process name alone, so a \
-             Microsoft Store app records no title and can never be matched once Windows \
-             suspends it, and no item has a path to open"
+            "expected {CAPTURE_CALL:?} exactly once -- the value Save writes, built from the \
+             whole selected row AND the trigger the user chose. Zero means either the saved \
+             match went back to being built from the row's process name alone (so a Microsoft \
+             Store app records no title and can never be matched once Windows suspends it, and \
+             no item has a path to open), or the trigger argument stopped being `trigger` and \
+             every save now writes one fixed mode"
         );
     }
 

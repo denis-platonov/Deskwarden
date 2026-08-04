@@ -18,6 +18,25 @@ pub struct WindowInfo {
     pub exe_path: String,
     pub exe_name: String,
     pub title: String,
+    /// Whether this window's **top-level owner** is a window host
+    /// ([`window_watch::is_host_process`]) while `exe_name` names something
+    /// else -- a Microsoft Store / UWP app presenting inside an
+    /// `ApplicationFrameHost.exe` frame.
+    ///
+    /// It is the one thing about a row that says whether its title may ever be
+    /// matched on (`picker_ui::app_match_for` copies it into
+    /// `AppMatch::hosted`, and `MatchEngine::rebuild` files a title only for a
+    /// match that carries it). It has to be recorded HERE, at capture time,
+    /// because it is the only place both names are known: by the time the row
+    /// reaches the picker, `exe_name` is the attributed app's and the owner's
+    /// name is gone.
+    ///
+    /// `false` for an unattributable host frame as well as for an ordinary
+    /// window: such a row is listed under the host's own name and the picker
+    /// refuses to save it at all (`picker_ui::host_process_refusal`), so
+    /// "hosted" here means specifically "a host frame with a real app resolved
+    /// inside it", which is the only row whose title identifies anything.
+    pub hosted: bool,
 }
 
 /// Lists visible, titled top-level windows, excluding `exclude_pid` (so the
@@ -97,10 +116,17 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // declines the save and says why and what to do instead. Silently
     // removing the row would be the same "silent no-op" this window has twice
     // been patched to stop doing.
+    // Whether the OWNER is a host is read before the attribution result
+    // replaces the owner's name, because that pair -- "a host frame, with a
+    // real app resolved inside it" -- is what makes the row's title an
+    // identity worth saving. See `WindowInfo::hosted`.
+    let owner_is_host = window_watch::is_host_process(&owner_exe);
     let hwnd_value = hwnd.0 as isize;
-    let (pid, exe_name) =
+    let (pid, exe_name, hosted) =
         match window_watch::resolve_window_attribution(hwnd_value, owner_pid, &owner_exe) {
-            window_watch::Attribution::Attributed { pid, exe_name } => (pid, exe_name),
+            window_watch::Attribution::Attributed { pid, exe_name } => {
+                (pid, exe_name, owner_is_host)
+            }
             // The HOST's pid, because there is no other one to give: the whole
             // of `UnresolvedHost` is "no child process could be identified".
             // So every unattributable row on a machine shares one pid -- both
@@ -108,7 +134,10 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
             // therefore NOT a key for these rows.
             // `picker_ui::selected_window` keys the picker's selection by
             // `hwnd` for exactly that reason.
-            window_watch::Attribution::UnresolvedHost { host } => (owner_pid, host),
+            // `hosted: false`, because nothing was resolved inside the frame:
+            // the row is listed under the host's own name and the picker
+            // refuses to save it, so there is no app for its title to name.
+            window_watch::Attribution::UnresolvedHost { host } => (owner_pid, host, false),
         };
 
     // Resolved from the ATTRIBUTED pid, not the owner's: for a hosted app the
@@ -125,6 +154,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         exe_path,
         exe_name,
         title,
+        hosted,
     });
 
     CONTINUE
@@ -152,6 +182,14 @@ mod attribution_wiring_tests {
     // containing a newline would pass on an LF checkout and fail on a CRLF one
     // (this repo has both).
     const CALL: &str = concat!("resolve_window_attribution", "(");
+    /// The other piece of glue only this callback can perform: reading whether
+    /// the window's OWNER is a host, which is what makes the row's title
+    /// matchable at all (`WindowInfo::hosted`, review 31's Important 1). The
+    /// mutation is a one-liner -- `let owner_is_host = false;` compiles, every
+    /// row records `hosted: false`, the picker stops recording a title for
+    /// Store apps, and a suspended one can never be matched again. No test can
+    /// see it: the picker's own tests build `WindowInfo` by hand.
+    const OWNER_HOST_CHECK: &str = concat!("is_host_process", "(&owner_exe)");
 
     fn source() -> &'static str {
         include_str!("window_list.rs")
@@ -168,6 +206,21 @@ mod attribution_wiring_tests {
         let planted = concat!("match resolve_window_attribution", "(h, p, e) {");
         assert_eq!(occurrences(planted, CALL), 1, "planted: {planted}");
         assert_eq!(occurrences("nothing here", CALL), 0);
+        let planted_check = concat!("let owner_is_host = window_watch::is_host_process", "(&owner_exe);");
+        assert_eq!(occurrences(planted_check, OWNER_HOST_CHECK), 1, "planted: {planted_check}");
+        assert_eq!(occurrences("nothing here", OWNER_HOST_CHECK), 0);
+    }
+
+    #[test]
+    fn each_row_records_whether_a_host_frame_owned_it() {
+        assert_eq!(
+            occurrences(source(), OWNER_HOST_CHECK),
+            1,
+            "expected {OWNER_HOST_CHECK:?} exactly once in window_list.rs -- the row's `hosted` \
+             flag. Zero means every row is recorded as not hosted, the picker stops capturing a \
+             title for the Microsoft Store apps that are the only reason titles are stored at \
+             all, and a suspended Store app can never be matched again"
+        );
     }
 
     #[test]

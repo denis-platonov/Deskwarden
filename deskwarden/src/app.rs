@@ -196,31 +196,75 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // degrading every Prompt-mode overlay to the bare
             // "fill something?" this comment used to call unacceptable.
             //
-            // The username is read straight off the login object rather than
-            // through `credentials_for`: that helper also clones the
-            // plaintext password into a `String` this path has no use for,
-            // and which would then be dropped without being zeroized. The
-            // overlay never shows a password, so it should never hold one.
-            let matched = cache.items().into_iter().find(|i| i.id == item_id).map(|item| {
-                let username = item.login.as_ref().and_then(|l| l.username.clone());
-                overlay_ui::OverlayMatch {
-                    item_name: item.name.clone(),
-                    username: username.filter(|u| !u.is_empty()),
-                }
-            });
-            // `window_label`, not `exe_name`: a match found through the title
-            // table belongs to a window whose `exe_name` is the frame host's,
-            // and "ApplicationFrameHost.exe wants your password" names nothing
-            // the user has ever heard of. The label is computed here rather
-            // than by the caller so the two strings cannot be assembled wrong
-            // at a call site no test can reach.
-            let label = window_label(&window.exe_name, &window.title);
-            if overlay_ui::show_prompt_overlay(label, matched.as_ref(), overlay_position(hwnd)) {
+            // (`prompt_request` is where the password is deliberately never
+            // touched -- see its doc.)
+            let item = cache.items().into_iter().find(|i| i.id == item_id);
+            // Every decision about the overlay is made in `prompt_request`,
+            // which is pure and directly tested; this function only reads the
+            // cache and drives Win32. See that function's doc for why.
+            let PromptRequest { label, matched, position } =
+                prompt_request(window, item.as_ref(), overlay_position(hwnd));
+            if overlay_ui::show_prompt_overlay(label, matched.as_ref(), position) {
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
             }
             None
         }
         TriggerMode::Hotkey => Some((item_id.to_string(), hwnd)),
+    }
+}
+
+/// Everything the autofill overlay is told about a Prompt-mode match: what to
+/// call the window, which credentials are being offered, and where to put the
+/// window.
+///
+/// A struct rather than three returned values, so a caller cannot pass them to
+/// `show_prompt_overlay` in the wrong order or quietly substitute one.
+pub struct PromptRequest<'a> {
+    pub label: &'a str,
+    pub matched: Option<overlay_ui::OverlayMatch>,
+    pub position: Option<(f32, f32)>,
+}
+
+/// **The whole of the Prompt decision, as a pure function** (review 31's
+/// Important 2).
+///
+/// This used to be three statements inside [`handle_match`], which nothing can
+/// call: it needs a `VaultCache`, an `Injector` and a `FillStats`, and it opens
+/// a real window. So `let label = &window.exe_name;` -- reinstating the exact
+/// bug the user reported, an overlay reading "ApplicationFrameHost.exe wants
+/// your password" for a title-matched Store app -- compiled and left all 1300
+/// tests green. [`window_label`] was tested, but only as a pure function that
+/// nothing was pinned to call. Moving the computation into `handle_match` (as
+/// the previous commit did) moved it from one untested call site to another.
+///
+/// The label is `window_label`, not `exe_name`: a match found through the title
+/// table belongs to a window whose `exe_name` is the frame host's, and that
+/// name means nothing to the user.
+///
+/// `item` is passed in rather than looked up here, because the lookup is the
+/// one part that needs the cache; `position` likewise, because computing it
+/// needs Win32. What is left is the part that can be got wrong silently.
+///
+/// The username is read straight off the login object rather than through
+/// [`credentials_for`]: that helper also clones the plaintext password into a
+/// `String` this path has no use for, and which would then be dropped without
+/// being zeroized. The overlay never shows a password, so it should never hold
+/// one.
+pub fn prompt_request<'a>(
+    window: &'a crate::window_watch::ForegroundEvent,
+    item: Option<&VaultItem>,
+    position: Option<(f32, f32)>,
+) -> PromptRequest<'a> {
+    PromptRequest {
+        label: window_label(&window.exe_name, &window.title),
+        matched: item.map(|item| {
+            let username = item.login.as_ref().and_then(|l| l.username.clone());
+            overlay_ui::OverlayMatch {
+                item_name: item.name.clone(),
+                username: username.filter(|u| !u.is_empty()),
+            }
+        }),
+        position,
     }
 }
 
@@ -358,6 +402,7 @@ mod tests {
                 exe_path: r"C:\Games\EpicGamesLauncher.exe".into(),
                 exe_name: "EpicGamesLauncher.exe".into(),
                 title: "Epic Games Launcher".into(),
+                hosted: false,
             },
             crate::window_list::WindowInfo {
                 hwnd: 2,
@@ -365,6 +410,7 @@ mod tests {
                 exe_path: r"C:\Windows\notepad.exe".into(),
                 exe_name: "notepad.exe".into(),
                 title: "Untitled - Notepad".into(),
+                hosted: false,
             },
         ];
         let found = find_window_for_process(&windows, "epicgameslauncher.exe").unwrap();
@@ -393,5 +439,155 @@ mod tests {
     #[test]
     fn an_untitled_host_frame_falls_back_to_the_host_name_rather_than_to_nothing() {
         assert_eq!(window_label(HOST, ""), HOST);
+    }
+
+    // ---- The Prompt decision itself (review 31's Important 2) ----
+
+    fn window(exe_name: &str, title: &str) -> crate::window_watch::ForegroundEvent {
+        crate::window_watch::ForegroundEvent {
+            hwnd: 0x1234,
+            pid: 4242,
+            exe_name: exe_name.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    fn login_item(name: &str, username: &str) -> VaultItem {
+        VaultItem {
+            name: name.to_string(),
+            login: Some(serde_json::from_str(&format!(r#"{{"username":"{username}"}}"#)).unwrap()),
+            ..item("1", None)
+        }
+    }
+
+    /// **The user's bug, at the place the overlay's words are actually
+    /// decided.** A Store app matched through the title table arrives with the
+    /// frame host's `exe_name`, and the overlay must not say that name.
+    /// Replacing the `window_label` call with `&window.exe_name` gives
+    ///     left: "ApplicationFrameHost.exe"  right: "Speedtest"
+    #[test]
+    fn a_title_matched_store_frame_is_prompted_for_under_its_own_title() {
+        let w = window(HOST, "Speedtest");
+        let request = prompt_request(&w, None, None);
+        assert_eq!(request.label, "Speedtest");
+    }
+
+    #[test]
+    fn an_ordinary_matched_window_is_prompted_for_under_its_executable() {
+        // The positive control: a `prompt_request` that always answered with
+        // the title would pass the test above and fail this one.
+        let w = window("Ledgerline.exe", "Ledgerline -- Invoices");
+        let request = prompt_request(&w, None, None);
+        assert_eq!(request.label, "Ledgerline.exe");
+    }
+
+    #[test]
+    fn the_prompt_names_the_credentials_it_is_offering() {
+        let item = login_item("Ledgerline", "denis@example.com");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let request = prompt_request(&w, Some(&item), None);
+
+        let matched = request.matched.expect("design 2a: never a bare \"fill something?\"");
+        assert_eq!(matched.item_name, "Ledgerline");
+        assert_eq!(matched.username.as_deref(), Some("denis@example.com"));
+    }
+
+    #[test]
+    fn an_item_with_no_usable_username_still_prompts_by_name() {
+        // An empty username is "no username", not a blank line in the overlay.
+        let item = login_item("Ledgerline", "");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let request = prompt_request(&w, Some(&item), None);
+        let matched = request.matched.expect("the item is still named");
+        assert_eq!(matched.item_name, "Ledgerline");
+        assert_eq!(matched.username, None);
+
+        // And a cache miss is not fatal to the prompt at all.
+        let request = prompt_request(&w, None, None);
+        assert!(request.matched.is_none());
+    }
+
+    #[test]
+    fn the_position_it_is_handed_is_the_position_it_asks_for() {
+        // The overlay's placement is computed from Win32 and cannot be
+        // computed here; what CAN be got wrong is dropping it on the way
+        // through, which lands the overlay wherever the OS likes.
+        let w = window("a.exe", "A");
+        let request = prompt_request(&w, None, Some((120.0, 340.0)));
+        assert_eq!(request.position, Some((120.0, 340.0)));
+        let request = prompt_request(&w, None, None);
+        assert_eq!(request.position, None);
+    }
+}
+
+/// Source-position guard for the one line of `handle_match` no test can reach:
+/// that it still asks [`prompt_request`] what to show, and hands the answer to
+/// the overlay unaltered.
+///
+/// `prompt_request` is pure and directly tested above, but `handle_match` needs
+/// a `VaultCache`, an `Injector` and a `FillStats` and then opens a real
+/// window, so nothing drives it. That is exactly how review 31's Important 2
+/// was found: `let label = &window.exe_name;` inside it left all 1300 tests
+/// green while restoring the reported bug. A pure function nothing is pinned to
+/// call is a pure function that can be deleted from the path it exists for.
+///
+/// **What this can and cannot see**: it pins the spelling and the count of the
+/// call and of the three values passed on from it. It cannot see a
+/// `prompt_request` whose result is computed and then ignored -- that is
+/// visible in any diff touching these lines. What it guards is the revert.
+#[cfg(test)]
+mod prompt_wiring_tests {
+    // SPLIT ACROSS TWO LITERALS, on ONE line, in this crate's established idiom:
+    // `include_str!` pulls this module in too, so a whole needle would match its
+    // own declaration, and a needle containing a newline would pass on an LF
+    // checkout and fail on a CRLF one (this repo has both).
+    const DECISION_CALL: &str = concat!("prompt_request", "(window, item.as_ref(), ");
+    const OVERLAY_CALL: &str =
+        concat!("show_prompt_overlay", "(label, matched.as_ref(), position)");
+
+    fn source() -> &'static str {
+        include_str!("app.rs")
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn the_counter_finds_calls_that_are_really_there() {
+        let planted = concat!("prompt_request", "(window, item.as_ref(), overlay_position(hwnd))");
+        assert_eq!(occurrences(planted, DECISION_CALL), 1, "planted: {planted}");
+        assert_eq!(occurrences("nothing here", DECISION_CALL), 0);
+
+        let planted = concat!("if overlay_ui::show_prompt_overlay", "(label, matched.as_ref(), position) {");
+        assert_eq!(occurrences(planted, OVERLAY_CALL), 1, "planted: {planted}");
+        // The mutation this needle exists for: the call survives, the decision
+        // does not.
+        let mutated = concat!("if overlay_ui::show_prompt_overlay", "(&window.exe_name, matched.as_ref(), position) {");
+        assert_eq!(occurrences(mutated, OVERLAY_CALL), 0, "planted: {mutated}");
+    }
+
+    #[test]
+    fn handle_match_asks_the_pure_decision_what_to_show() {
+        assert_eq!(
+            occurrences(source(), DECISION_CALL),
+            1,
+            "expected {DECISION_CALL:?} exactly once in app.rs -- `handle_match`'s Prompt arm. \
+             Zero means the overlay's label, credentials and placement are being assembled \
+             inline again, where no test can see them, and the first thing to go wrong there \
+             was naming a title-matched Microsoft Store app ApplicationFrameHost.exe"
+        );
+    }
+
+    #[test]
+    fn the_overlay_is_shown_exactly_what_that_decision_returned() {
+        assert_eq!(
+            occurrences(source(), OVERLAY_CALL),
+            1,
+            "expected {OVERLAY_CALL:?} exactly once in app.rs. Zero means one of the three \
+             values `prompt_request` decided was substituted on the way to the overlay -- \
+             `&window.exe_name` for the label is the mutation that restores the reported bug, \
+             and `None` for the position drops the overlay wherever Windows likes"
+        );
     }
 }
