@@ -76,16 +76,41 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str) {
                 .inner_margin(Margin::same(24)),
         )
         .show(ui, |ui| {
+            // **Centred in whatever it is given**, rather than a fixed offset
+            // from the top. This body is drawn in two very differently sized
+            // windows: the standalone spinner window, which is small enough
+            // that a top offset passed for centred, and the single startup
+            // window, which is the vault window's full size -- where the same
+            // offset left the mark and the message huddled against the top
+            // edge of an otherwise empty screen.
+            let leftover = ui.available_height() - CONTENT_HEIGHT;
+            ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| {
-                ui.add_space(18.0);
-                theme::mark(ui, 32.0);
-                ui.add_space(14.0);
-                ui.add(egui::Spinner::new().size(22.0).color(theme::BLUE));
-                ui.add_space(10.0);
-                ui.label(theme::semibold(message, 13.0).color(theme::TEXT_SECONDARY));
+                theme::mark(ui, MARK_SIZE);
+                ui.add_space(MARK_TO_SPINNER);
+                ui.add(egui::Spinner::new().size(SPINNER_SIZE).color(theme::BLUE));
+                ui.add_space(SPINNER_TO_LABEL);
+                ui.label(theme::semibold(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
             });
         });
 }
+
+const MARK_SIZE: f32 = 32.0;
+const MARK_TO_SPINNER: f32 = 14.0;
+const SPINNER_SIZE: f32 = 22.0;
+const SPINNER_TO_LABEL: f32 = 10.0;
+const LABEL_SIZE: f32 = 13.0;
+
+/// What [`draw_spinner_body`]'s stack occupies, used to centre it.
+///
+/// Summed from the pieces above rather than written as one number, so it
+/// cannot drift from them -- a hand-written total is the kind of constant
+/// that stays put while the thing it describes changes underneath it. The
+/// label's line box is its font size times egui's default line height for
+/// this face; being a pixel or two out is invisible in a centring, whereas
+/// the top-anchored version this replaces was out by hundreds.
+const CONTENT_HEIGHT: f32 =
+    MARK_SIZE + MARK_TO_SPINNER + SPINNER_SIZE + SPINNER_TO_LABEL + LABEL_SIZE * 1.4;
 
 pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T> {
     let result: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
@@ -266,6 +291,100 @@ mod spinner_body_tests {
         assert!(
             !rects.is_empty(),
             "control: no filled rectangles were painted at all"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spinner_centring_tests {
+    use super::*;
+    use eframe::egui::{Rect, pos2, vec2};
+
+    fn styled_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(input(600.0), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(input(600.0), |_ui| {});
+        ctx
+    }
+
+    fn input(height: f32) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(840.0, height))),
+            ..Default::default()
+        }
+    }
+
+    /// The vertical span of everything actually painted -- text glyphs and the
+    /// spinner's own shapes alike, so this measures the whole stack rather
+    /// than whichever piece happens to be a rect.
+    fn painted_span(output: &egui::FullOutput) -> Option<(f32, f32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                // The panel's own full-height background fill would swamp the
+                // measurement, so only marks smaller than the window count.
+                other => {
+                    let r = other.visual_bounding_rect();
+                    if r.is_finite() && r.height() > 0.0 && r.height() < 400.0 {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        let top = rects.iter().map(|r| r.min.y).fold(f32::INFINITY, f32::min);
+        let bottom = rects.iter().map(|r| r.max.y).fold(f32::NEG_INFINITY, f32::max);
+        (top.is_finite() && bottom.is_finite()).then_some((top, bottom))
+    }
+
+    /// **The stack sits in the middle of whatever it is given.**
+    ///
+    /// It used to start at a fixed 18px from the top, which looked centred in
+    /// the small standalone spinner window and left everything huddled
+    /// against the top edge of the full-size startup window -- which is what
+    /// the user saw and called "bad looking". A test that only asserts the
+    /// message is painted cannot tell the two apart; this asserts where.
+    #[test]
+    fn the_spinner_stack_is_centred_in_a_tall_window() {
+        let tall = 600.0;
+        let ctx = styled_ctx();
+        let output = ctx.run_ui(input(tall), |ui| draw_spinner_body(ui, "Setting up your vault..."));
+
+        let (top, bottom) = painted_span(&output).expect("the spinner body painted nothing at all");
+        let centre = (top + bottom) / 2.0;
+
+        // Generous: this is about "middle of the window" versus "pinned to the
+        // top", a difference of hundreds of pixels. The old layout put the
+        // stack's centre near 75px in a 600px window.
+        assert!(
+            (centre - tall / 2.0).abs() < 60.0,
+            "the spinner stack is centred at y={centre:.1} in a {tall:.0}px window, not near \
+             {:.0} -- it is anchored to an edge rather than centred",
+            tall / 2.0
+        );
+    }
+
+    /// The control for the test above: in a SMALL window the same body still
+    /// paints, and still near the middle. Without this, "centred" could be
+    /// satisfied by a body that only ever draws at one fixed offset which
+    /// happens to suit one height.
+    #[test]
+    fn the_same_body_is_still_centred_in_a_short_window() {
+        let short = 180.0;
+        let ctx = styled_ctx();
+        let output =
+            ctx.run_ui(input(short), |ui| draw_spinner_body(ui, "Setting up your vault..."));
+
+        let (top, bottom) = painted_span(&output).expect("the spinner body painted nothing at all");
+        let centre = (top + bottom) / 2.0;
+        assert!(
+            (centre - short / 2.0).abs() < 60.0,
+            "the spinner stack is centred at y={centre:.1} in a {short:.0}px window, not near {:.0}",
+            short / 2.0
         );
     }
 }
