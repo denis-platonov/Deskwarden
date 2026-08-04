@@ -1020,6 +1020,33 @@ fn copy_shortcut_action(
     }
 }
 
+/// The header's second line, under the item's name.
+///
+/// Design 2b, line 803: `Login · Engineering` -- **one line carrying the kind
+/// and the folder**, not the kind with a folder line added under it. The pane
+/// already painted the kind here; the folder joins it.
+///
+/// The user asked for the folder "under the title like design has it - if no
+/// folder just don't print anything". "Nothing" is the separator and the name:
+/// the line still reads `Login`, because the kind was never the part that was
+/// missing. A subtitle that vanished with the folder would take the one fact
+/// this line has always carried with it.
+///
+/// `folder` is a NAME the caller has already resolved (`sidebar::folder_name`,
+/// which is where a folder id becomes a name and where every reason there
+/// might be no name is decided). This function never sees an id, so it cannot
+/// paint one.
+///
+/// Pure, and separate from the closure that draws it, for this file's standing
+/// reason: a decision reachable only from inside an eframe closure is a
+/// decision that will not be tested.
+fn header_subtitle(kind: ItemKind, folder: Option<&str>) -> String {
+    match folder {
+        Some(name) => format!("{} · {name}", kind.label()),
+        None => kind.label(),
+    }
+}
+
 /// How the header strip arranges itself at a given width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HeaderLayout {
@@ -1131,6 +1158,11 @@ fn consume_chord(
 pub fn draw_detail_read(
     ui: &mut egui::Ui,
     item: &VaultItem,
+    // The name of the folder this item is in, for the header's subtitle --
+    // already resolved by `sidebar::folder_name`, which owns that lookup and
+    // every reason there might not be one. A NAME, never an id: see
+    // [`header_subtitle`].
+    folder: Option<&str>,
     fill_count: u32,
     totp: &TotpState,
     // Whether *this* item currently has a delete armed (its first click
@@ -1277,7 +1309,11 @@ pub fn draw_detail_read(
                         title.wrap =
                             egui::text::TextWrapping::truncate_at_width(ui.available_width());
                         ui.label(title);
-                        ui.label(RichText::new(kind.label()).size(12.0).color(theme::TEXT_FAINT));
+                        ui.label(
+                            RichText::new(header_subtitle(kind, folder))
+                                .size(12.0)
+                                .color(theme::TEXT_FAINT),
+                        );
                     });
                 });
             };
@@ -2472,7 +2508,10 @@ mod tests {
 
         let mut reveal = reveal;
         let output = ctx.run_ui(input(), |ui| {
-            draw_detail_read(ui, item, 3, totp, delete_pending, &mut reveal, None);
+            // No folder: this harness reads the pane's BODY, and every one of
+            // its callers would have to gain a folder to keep saying what it
+            // says. The header's own subtitle has `Pane`, which carries one.
+            draw_detail_read(ui, item, None, 3, totp, delete_pending, &mut reveal, None);
         });
 
         let mut texts = Vec::new();
@@ -2782,7 +2821,7 @@ mod tests {
 
         let mut reveal = reveal;
         ctx.run_ui(input(), |ui| {
-            draw_detail_read(ui, item, 3, totp, false, &mut reveal, None);
+            draw_detail_read(ui, item, None, 3, totp, false, &mut reveal, None);
         })
         .shapes
     }
@@ -2847,6 +2886,9 @@ mod tests {
         width: f32,
         reveal: RevealState,
         delete_pending: bool,
+        /// The folder name the window would have resolved for this item --
+        /// `None` unless a test sets it, which is the vault's usual case.
+        folder: Option<String>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -3053,7 +3095,15 @@ mod tests {
                 width,
                 reveal: RevealState::default(),
                 delete_pending: false,
+                folder: None,
             }
+        }
+
+        /// The same pane, drawing an item the window has resolved a folder
+        /// name for.
+        fn in_folder(mut self, name: &str) -> Self {
+            self.folder = Some(name.to_string());
+            self
         }
 
         fn frame(&mut self, item: &VaultItem, totp: &TotpState, events: Vec<egui::Event>) -> Frame {
@@ -3071,6 +3121,7 @@ mod tests {
                     action = draw_detail_read(
                         ui,
                         item,
+                        self.folder.as_deref(),
                         3,
                         totp,
                         self.delete_pending,
@@ -3190,6 +3241,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The folder joins that line; it does not get one of its own.**
+    ///
+    /// Design 2b line 803 is `Login · Engineering` in a single 12px run. The
+    /// user asked for the folder "under the title like design has it - if no
+    /// folder just don't print anything", and "nothing" is the separator and
+    /// the name: the line still reads `Login`. It is asserted for every kind,
+    /// so a subtitle wired to a fixed "Login" cannot pass.
+    ///
+    /// The no-folder half is here as well as in
+    /// `the_header_subtitle_is_the_items_own_kind` because that test reads the
+    /// rendered pane and this one reads the decision; between them the two
+    /// mutations that produce a bare kind line -- dropping the folder, and
+    /// dropping the subtitle -- are both caught.
+    #[test]
+    fn the_header_subtitle_carries_the_folder_after_the_kind_and_nothing_when_there_is_none() {
+        for kind in EVERY_KIND {
+            assert_eq!(
+                header_subtitle(kind, Some("Engineering")),
+                format!("{} · Engineering", kind.label()),
+                "{kind:?} does not read as the design's `<kind> · <folder>`"
+            );
+            assert_eq!(
+                header_subtitle(kind, None),
+                kind.label(),
+                "{kind:?} with no folder does not still name its kind"
+            );
+        }
+    }
+
+    /// **And the header really paints it, on the title's own line-under.**
+    ///
+    /// The decision above is pure; this is the other half. It also holds the
+    /// shape: ONE run, so a folder painted as a second line under the kind --
+    /// which is what "show Folder under the title" could equally have meant --
+    /// fails here rather than shipping.
+    ///
+    /// An item whose `folder_id` names a folder that is not in the list never
+    /// reaches this function with a name at all: `sidebar::folder_name`
+    /// answers `None` for it (see
+    /// `a_folder_is_named_only_when_the_list_really_has_it`) and the pane then
+    /// draws the no-folder case, which is the line the kind test above pins.
+    #[test]
+    fn the_header_paints_the_folder_beside_the_kind_under_the_item_name() {
+        let mut pane = Pane::new().in_folder("Engineering");
+        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+
+        assert!(
+            frame.painted("Login · Engineering"),
+            "the header painted no `<kind> · <folder>` subtitle; it painted: {:?}",
+            frame.strings()
+        );
+        // Neither half on its own: a bare "Login" beside the combined line
+        // would be the old subtitle still there, and a bare "Engineering"
+        // would be the second line the design does not draw.
+        for stray in ["Login", "Engineering"] {
+            assert!(
+                !frame.strings().iter().any(|t| *t == stray),
+                "the header painted {stray:?} as a run of its own, so the subtitle is \
+                 not the design's single line; it painted: {:?}",
+                frame.strings()
+            );
+        }
+
+        let title = frame.rect_of("Sample");
+        let subtitle = frame.rect_of("Login · Engineering");
+        assert!(
+            (subtitle.left() - title.left()).abs() < 0.5,
+            "the subtitle at {subtitle:?} does not share the title's column ({title:?})"
+        );
+        assert!(
+            subtitle.top() > title.top(),
+            "the subtitle at {subtitle:?} is not UNDER the title at {title:?}"
+        );
     }
 
     /// A Fill button on a card would type two empty strings into whatever

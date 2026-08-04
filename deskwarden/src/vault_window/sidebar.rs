@@ -352,6 +352,36 @@ pub fn is_virtual_folder(folder: &Folder) -> bool {
     folder.id.is_empty()
 }
 
+/// What to call the folder an item says it is in -- or `None`, meaning there
+/// is nothing here anyone can be told.
+///
+/// **In this module because this module is where a folder id becomes a name.**
+/// The FOLDERS section resolves ids to names for every row it draws; the
+/// detail pane's header needs the same answer for one item, and a second
+/// lookup written beside that header is a second place for the virtual bucket
+/// and the missing-folder case to be decided differently.
+///
+/// The three `None`s, each of them a case a caller can reach:
+///
+///  - **The item is in no folder** (`folder_id: None`), which is most of a
+///    vault.
+///  - **The id names nothing in `folders`** -- a folder deleted from another
+///    client, or a header drawn before the folder list has loaded. Returning
+///    the raw id would put a uuid in front of the user, which is the mistake
+///    [`crate::accounts::account_label`] exists to avoid; inventing "No
+///    folder" would state something this function does not know.
+///  - **The id is the virtual "No Folder" bucket's empty one.** It is in the
+///    list `bw serve` sends, so a naive `find` matches it and would report an
+///    item in a broken `folderId: ""` state (see `detail_edit`'s folder
+///    dropdown, which has met one) as deliberately unfiled.
+pub fn folder_name<'a>(folders: &'a [Folder], folder_id: Option<&str>) -> Option<&'a str> {
+    let id = folder_id?;
+    folders
+        .iter()
+        .find(|folder| folder.id == id && !is_virtual_folder(folder))
+        .map(|folder| folder.name.as_str())
+}
+
 /// How many of `items` fall under `filter`. Pure and separate from drawing
 /// so the sidebar's counts are testable without an egui context.
 /// **`items` must be `filter`'s own source list** -- see
@@ -1627,6 +1657,56 @@ mod tests {
         assert!(is_virtual_folder(&virtual_bucket));
         assert!(!is_virtual_folder(&real_folder_same_name));
         assert!(!is_virtual_folder(&ordinary));
+    }
+
+    /// **What an item's folder is called, and the three ways there is nothing
+    /// to call it.**
+    ///
+    /// The detail pane's header subtitle reads this, so each `None` here is a
+    /// line the user sees. The positive case is asserted first and by name:
+    /// a `folder_name` that returned `None` for everything would satisfy every
+    /// negative below on its own.
+    #[test]
+    fn a_folder_is_named_only_when_the_list_really_has_it() {
+        let folders = vec![
+            Folder {
+                id: String::new(),
+                name: "No Folder".into(),
+                other: serde_json::Map::new(),
+            },
+            Folder {
+                id: "957b860f-1130-42d9-a72c-7814f828b4d5".into(),
+                name: "Engineering".into(),
+                other: serde_json::Map::new(),
+            },
+        ];
+
+        assert_eq!(
+            folder_name(&folders, Some("957b860f-1130-42d9-a72c-7814f828b4d5")),
+            Some("Engineering"),
+            "an item in a real folder is not given that folder's name"
+        );
+        assert_eq!(
+            folder_name(&folders, None),
+            None,
+            "an item in no folder was given a folder anyway"
+        );
+        // A folder deleted from another client, or a header drawn before the
+        // folder list has arrived. The alternatives are a raw uuid in front of
+        // the user and a claim ("No folder") this cannot know.
+        assert_eq!(
+            folder_name(&folders, Some("d0e5e0da-9b6a-4c2a-9a4a-1c2f0f8f0c11")),
+            None,
+            "an id that names nothing in the list was resolved to something"
+        );
+        // `bw serve` ships the bucket IN the list, so a plain `find` matches
+        // it -- and an item carrying `folderId: \"\"` is in a broken state,
+        // not deliberately unfiled.
+        assert_eq!(
+            folder_name(&folders, Some("")),
+            None,
+            "the virtual \"No Folder\" bucket was reported as a folder an item is in"
+        );
     }
 
     /// Same walk `detail.rs`'s `collect_text_rects` does: every painted

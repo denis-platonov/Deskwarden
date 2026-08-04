@@ -2227,6 +2227,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                             let action = draw_read_arm(
                                 ui,
                                 item,
+                                sidebar::folder_name(&folders, item.folder_id.as_deref()),
                                 fill_count,
                                 &totp_state,
                                 delete_pending,
@@ -3647,6 +3648,10 @@ impl AuxLoadError {
 fn draw_read_arm(
     ui: &mut egui::Ui,
     item: &VaultItem,
+    // The item's folder, already resolved to a name by `sidebar::folder_name`
+    // out of the folder list this window is already holding -- the pane paints
+    // it in the header subtitle and never sees an id.
+    folder: Option<&str>,
     fill_count: u32,
     totp_state: &TotpState,
     delete_pending: bool,
@@ -3656,6 +3661,7 @@ fn draw_read_arm(
     let mut action = draw_detail_read(
         ui,
         item,
+        folder,
         fill_count,
         totp_state,
         delete_pending,
@@ -9210,7 +9216,11 @@ mod draw_read_arm_tests {
     /// `theme::apply`'s font set only takes effect at the start of the *next*
     /// frame, so two throwaway frames run first -- same reason `detail.rs`'s
     /// `painted_text` harness does.
-    fn run_read_arm(item: &VaultItem, hotkey_pressed: bool) -> (DetailAction, Vec<String>) {
+    fn run_read_arm(
+        item: &VaultItem,
+        folder: Option<&str>,
+        hotkey_pressed: bool,
+    ) -> (DetailAction, Vec<String>) {
         let ctx = egui::Context::default();
         let hotkey_modifiers = egui::Modifiers {
             ctrl: true,
@@ -9250,6 +9260,7 @@ mod draw_read_arm_tests {
             action = draw_read_arm(
                 ui,
                 item,
+                folder,
                 3,
                 &TotpState::NoSecret,
                 false,
@@ -9295,7 +9306,7 @@ mod draw_read_arm_tests {
     fn the_read_arm_paints_a_real_pane_for_every_kind() {
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
-            let (_, texts) = run_read_arm(&item, false);
+            let (_, texts) = run_read_arm(&item, None, false);
             assert!(
                 texts.contains(&kind.label()),
                 "{kind:?}: the read arm painted no {:?} subtitle, so `draw_detail_read` \
@@ -9331,7 +9342,7 @@ mod draw_read_arm_tests {
     fn the_fill_hotkey_gate_is_wired_at_the_call_site_for_every_kind() {
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
-            let (action, _) = run_read_arm(&item, true);
+            let (action, _) = run_read_arm(&item, None, true);
             let expected = if crate::vault_window::detail::kind_offers_fill(kind) {
                 DetailAction::Fill
             } else {
@@ -9347,8 +9358,97 @@ mod draw_read_arm_tests {
     /// The other half: the gate must not manufacture a fill out of nothing.
     #[test]
     fn an_unpressed_hotkey_returns_no_action_on_a_login() {
-        let (action, _) = run_read_arm(&an_item(Some(1)), false);
+        let (action, _) = run_read_arm(&an_item(Some(1)), None, false);
         assert_eq!(action, DetailAction::None);
+    }
+
+    /// **The folder this arm is handed reaches the header.**
+    ///
+    /// `detail.rs` proves the subtitle is built and painted; this proves the
+    /// arm between `run` and it does not drop the name on the floor -- a
+    /// `draw_read_arm` that took the parameter and passed `None` on would
+    /// leave every one of those tests green and every real header folderless.
+    ///
+    /// Paired with its control: the same item with no folder still names its
+    /// kind, so "the folder is absent" cannot be satisfied by a subtitle that
+    /// stopped painting.
+    #[test]
+    fn the_read_arm_hands_the_folder_it_is_given_to_the_header() {
+        let item = an_item(Some(1));
+
+        let (_, texts) = run_read_arm(&item, Some("Engineering"), false);
+        assert!(
+            texts.contains(&"Login · Engineering".to_string()),
+            "the read arm painted no `<kind> · <folder>` subtitle for an item in a \
+             folder; painted: {texts:?}"
+        );
+
+        let (_, texts) = run_read_arm(&item, None, false);
+        assert!(
+            texts.contains(&"Login".to_string()),
+            "the read arm painted no subtitle at all for an item in no folder; \
+             painted: {texts:?}"
+        );
+    }
+}
+
+/// Where the header's folder NAME comes from, guarded at source level.
+///
+/// The pane is handed a name, not an id, and `sidebar::folder_name` is what
+/// turns one into the other -- including the three cases where the answer is
+/// "nothing": no folder, an id the list does not have, and `bw serve`'s
+/// virtual bucket. The call that does it is inside `run`'s eframe closure, so
+/// no harness in this crate can reach it (see `draw_read_arm_tests`' own
+/// header for why that is a wall and not an omission). What it can have wrong
+/// is precise: a second lookup written inline here, agreeing with the sidebar
+/// today and drifting from it later, or a raw `item.folder_id` handed
+/// straight to the pane -- which paints a uuid under the item's name.
+///
+/// Split-literal needles, single line, for this file's standing reasons: a
+/// whole-literal needle matches its own declaration, and one carrying a line
+/// ending passes on LF and fails on CRLF.
+#[cfg(test)]
+mod header_folder_placement_tests {
+    const RESOLVED: &str = concat!(
+        "sidebar::folder_",
+        "name(&folders, item.folder_id.as_deref())"
+    );
+    const CALL: &str = concat!("let action = draw_read_", "arm(");
+    const TESTS_BEGIN: &str = concat!("#[cfg(", "test)]");
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        let end = source
+            .find(TESTS_BEGIN)
+            .expect("no test marker in this file -- see `window_era_placement_tests`");
+        &source[..end]
+    }
+
+    #[test]
+    fn the_read_arms_folder_is_resolved_through_the_sidebars_lookup() {
+        let production = production();
+        let call = production.find(CALL).unwrap_or_else(|| {
+            panic!(
+                "{CALL:?} is not in the production code -- the read arm's call site was \
+                 reshaped, so this guard no longer knows where to look"
+            )
+        });
+        let resolved = production.find(RESOLVED).unwrap_or_else(|| {
+            panic!(
+                "{RESOLVED:?} is not in the production code. The header's folder is no \
+                 longer resolved through `sidebar::folder_name`, which is where the \
+                 virtual bucket and the missing-folder case are decided"
+            )
+        });
+        // Bounded FORWARD from the call and short: the argument is the third
+        // one, a few lines in. A window wide enough to reach the next
+        // statement would pass against a resolution that had drifted out of
+        // this call entirely.
+        assert!(
+            call < resolved && resolved - call < 200,
+            "the folder-name resolution is not inside the read arm's call (call at \
+             {call}, resolution at {resolved})"
+        );
     }
 }
 
