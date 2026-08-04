@@ -807,11 +807,22 @@ fn main() {
     // `update_rx`; `open_vault_window` still falls back to a synchronous
     // call itself if a click lands before this has reported back.
     let mut cached_status_details: Option<login_ui::BwStatusDetails> = None;
-    let (status_details_tx, status_details_rx) = mpsc::channel::<login_ui::BwStatusDetails>();
+    // **Which account the prefetch is ABOUT, carried with its answer.** `bw
+    // status` reports on whatever profile the CLI is pointed at when it runs,
+    // and this one is spawned before the startup window's outcome is dispatched
+    // -- a window that can switch, add or remove an account. Its answer can
+    // therefore land describing somebody else. Checked at the drain rather than
+    // assumed, because what is done with it now is not only a toolbar label:
+    // `learn_active_account_details` WRITES it into `settings.json`, and an
+    // address learned into the wrong account is the hash bug with a worse
+    // failure mode.
+    let prefetch_for = active_account.as_ref().map(|a| a.id.clone());
+    let (status_details_tx, status_details_rx) =
+        mpsc::channel::<(Option<accounts::AccountId>, login_ui::BwStatusDetails)>();
     {
         let tx = status_details_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(login_ui::check_bw_status_details());
+            let _ = tx.send((prefetch_for, login_ui::check_bw_status_details()));
         });
     }
 
@@ -1287,41 +1298,7 @@ fn main() {
                 };
 
                 if let Some((what, outcome)) = reported {
-                    match outcome {
-                        // Nothing to say: the app is where the user wanted it.
-                        SwitchOutcome::Switched => log::info!("{what}: done"),
-                        // Not an error and not raised as one. The submenu gates
-                        // "Add account..." on `can_add()`, so this is the
-                        // cancelled sign-in and never the refused gate -- the
-                        // two are the same variant, and a message box saying
-                        // "cancelled" for a `relativeDataDir` block would be
-                        // naming something that never happened.
-                        SwitchOutcome::Declined => {
-                            log::info!("the request to {what} was cancelled; nothing changed")
-                        }
-                        SwitchOutcome::RolledBack { reason } => {
-                            log::warn!("could not {what}: {reason}");
-                            message_box(
-                                "Deskwarden",
-                                &format!(
-                                    "Could not {what}.\n\n{reason}\n\nYou are still signed in \
-                                     to the account you were on.",
-                                ),
-                                MB_ICONERROR | MB_OK,
-                            );
-                        }
-                        SwitchOutcome::StoodDown { reason } => {
-                            log::error!("could not {what}, and could not go back: {reason}");
-                            message_box(
-                                "Deskwarden",
-                                &format!(
-                                    "Could not {what}.\n\n{reason}\n\nAutofill is stood down. \
-                                     Use the tray's \"Sync\" to bring it back.",
-                                ),
-                                MB_ICONERROR | MB_OK,
-                            );
-                        }
-                    }
+                    report_account_action(&what, outcome);
                 }
             }
             // **Unconditional, and outside the borrow above.** Every one of the
@@ -1772,8 +1749,25 @@ fn main() {
         // synchronous call inside `open_vault_window`) reports back, keep
         // the cache warm so the next "Open Vault" doesn't pay the `bw
         // status` spawn again.
-        if let Ok(details) = status_details_rx.try_recv() {
-            cached_status_details = Some(details);
+        if let Ok((about, details)) = status_details_rx.try_recv() {
+            if about.is_some() && about.as_ref() == active_account.as_ref().map(|a| &a.id) {
+                learn_active_account_details(
+                    &settings_path,
+                    &mut accounts_state,
+                    &mut active_account,
+                    &details,
+                );
+                cached_status_details = Some(details);
+            } else {
+                // Dropped rather than cached. A stale email under a new account
+                // is worse than a blank one -- it is the same claim the window
+                // makes about whose vault is on screen, made about the wrong
+                // person -- and the next open pays one `bw status` instead.
+                log::info!(
+                    "discarding the startup `bw status` prefetch: it describes the account \
+                     this app started on, not the one it is on now"
+                );
+            }
         }
 
         if let Ok(release) = update_rx.try_recv() {
@@ -1856,6 +1850,128 @@ fn message_box(title: &str, text: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_R
             &HSTRING::from(title),
             style | MB_SETFOREGROUND | MB_SYSTEMMODAL,
         )
+    }
+}
+
+/// How every account action that lands in a [`SwitchOutcome`] is reported —
+/// `what` naming the request in the words the message box will use ("add an
+/// account", "switch to ana@example.com").
+///
+/// One function since the vault window's account menu grew the same two actions
+/// the tray's Accounts submenu has. Reporting each in its own arm is how one of
+/// them quietly stops raising the failure the other one does — and the two
+/// menus offer the same operations, so a user who found "Add account..." in the
+/// window must not get a quieter failure than one who found it in the tray.
+///
+/// [`SwitchOutcome::Declined`] is deliberately not raised. Both menus gate
+/// "Add account..." on [`AccountsState::can_add`](accounts::AccountsState::can_add),
+/// so the only `Declined` this reporting can see is a sign-in the user
+/// cancelled — `add_account` answers the same variant for the refused gate, and
+/// a message box saying "cancelled" for a `relativeDataDir` block would be
+/// naming something that never happened.
+fn report_account_action(what: &str, outcome: SwitchOutcome) {
+    match outcome {
+        // Nothing to say: the app is where the user wanted it.
+        SwitchOutcome::Switched => log::info!("{what}: done"),
+        SwitchOutcome::Declined => {
+            log::info!("the request to {what} was cancelled; nothing changed")
+        }
+        SwitchOutcome::RolledBack { reason } => {
+            log::warn!("could not {what}: {reason}");
+            message_box(
+                "Deskwarden",
+                &format!(
+                    "Could not {what}.\n\n{reason}\n\nYou are still signed in to the account \
+                     you were on.",
+                ),
+                MB_ICONERROR | MB_OK,
+            );
+        }
+        SwitchOutcome::StoodDown { reason } => {
+            log::error!("could not {what}, and could not go back: {reason}");
+            message_box(
+                "Deskwarden",
+                &format!(
+                    "Could not {what}.\n\n{reason}\n\nAutofill is stood down. Use the tray's \
+                     \"Sync\" to bring it back.",
+                ),
+                MB_ICONERROR | MB_OK,
+            );
+        }
+    }
+}
+
+/// **The one place a `bw status` answer becomes something this app remembers
+/// about the account it is on**, and writes to `settings.json`.
+///
+/// The hole it closes: `resolve_startup` mints a first-install account with an
+/// EMPTY email — nobody has signed in, so there is nothing to record — and
+/// until now nothing filled it in afterwards. `accounts::account_label` falls
+/// back to the account id for an empty email, so every menu naming that account
+/// named a 32-character hash: the tray's Accounts submenu, and now the vault
+/// window's account menu, which is where the user met it ("not some random
+/// hash"). The sign-in that follows the mint is when the address becomes
+/// knowable, and `bw status` is the only thing that knows it.
+///
+/// **The caller must already have established that `details` describes the
+/// ACTIVE account.** This function cannot check: `BwStatusDetails` carries a
+/// status, an email and a server URL, and no directory. Both call sites do —
+/// `open_vault_window` refills from a window's own session before any switch
+/// runs, and `main`'s drain compares the id the prefetch was started for.
+///
+/// Both copies of the account are updated, and the copies are checked to be the
+/// same account first. `active_account` is what `login_context` and
+/// `switch_to_account` name the account by; `AccountsState` is what every menu
+/// reads and what gets persisted. They are kept in step by `adopt`, so a
+/// disagreement here is a bug elsewhere — and writing one account's address
+/// into the other is not the way to find out.
+///
+/// Persists only on a change, so an app sitting idle does not rewrite
+/// `settings.json` every time a window opens. A failed write is survivable: the
+/// address is right in memory for this session and is relearned on the next
+/// launch, which is the same cost the mint itself already carries.
+fn learn_active_account_details(
+    settings_path: &Path,
+    accounts_state: &mut Option<accounts::AccountsState>,
+    active_account: &mut Option<Account>,
+    details: &login_ui::BwStatusDetails,
+) {
+    let (Some(state), Some(active)) = (accounts_state.as_mut(), active_account.as_mut()) else {
+        // `StartupAccounts::NoAccountList`: this app has no `Account` of its
+        // own, so there is nothing to record an address against and
+        // `Settings::save` refuses to write over the file anyway.
+        return;
+    };
+    let (email, server_url) = (details.user_email.as_deref(), details.server_url.as_deref());
+    let changed = state.learn_active_details(email, server_url);
+    if active.id == state.active().id {
+        accounts::learn_account_details(active, email, server_url);
+    } else {
+        log::error!(
+            "the active account ({}) is not the one `AccountsState` is on ({}); its address \
+             was left alone rather than overwritten with the other one's",
+            active.id,
+            state.active().id
+        );
+    }
+    if !changed {
+        return;
+    }
+
+    let active_id = state.active().id.clone();
+    log::info!(
+        "recording that account {active_id} is {}",
+        account_label(state.active())
+    );
+    if let Err(e) =
+        settings::Settings::persist_accounts(settings_path, state.all(), Some(&active_id))
+    {
+        log::warn!(
+            "could not record that {} is {}: {e}; it will be asked for again on the next \
+             launch",
+            active_id,
+            account_label(state.active())
+        );
     }
 }
 
@@ -2752,6 +2868,18 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // them, this would put a stale email in the toolbar of a window signed
     // into somebody else.
     if let Some(details) = result.account_details.clone() {
+        // **And the account learns its own address from the same answer**, here
+        // and for the same ordering reason. These details were fetched for the
+        // profile this window was pointed at, which is the active account
+        // *until one of the branches below changes it* -- so this is the last
+        // moment at which "the active account" and "who this describes" are
+        // provably the same account. Below the switch it would write one
+        // account's address into another's entry.
+        //
+        // This is what fills the email in for an account `resolve_startup`
+        // minted on a first install, which is why the account menu's identity
+        // block and the switcher's rows stop naming a 32-character directory.
+        learn_active_account_details(settings_path, accounts, active_account, &details);
         *cached_status_details = Some(details);
     }
 
@@ -2796,12 +2924,71 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         continue;
     }
 
-    // **Before the lock/re-auth branch, and with its own `continue`.** A
-    // switch is not a lost session: the recovery below re-authenticates
-    // against the account this process is ALREADY on, so a switch folded into
-    // it would prompt for the master password of the account the user asked to
-    // leave and then leave them on it. See `VaultWindowResult::switch_to`.
+    // **The three things the titlebar's account menu can ask for, before the
+    // lock/re-auth branch and with one `continue` between them.** None of them
+    // is a lost session: the recovery below re-authenticates against the
+    // account this process is ALREADY on, so any of them folded into it would
+    // prompt for the master password of the account the user asked to leave and
+    // then leave them on it. See `VaultWindowResult::switch_to`.
     //
+    // **ONE resettle closure for all three**, exactly as the tray's Accounts
+    // submenu has one for its three -- three copies would be three chances to
+    // get the hardest sequence in this codebase subtly different, and
+    // `the_vault_windows_account_actions_settle_through_the_one_sequence` pins
+    // that what is in here is that sequence and not a fourth teardown path
+    // written inline. Scoped to this block so the lock branch below, which
+    // needs the same `&mut`s directly, still borrows them.
+    if result.switch_to.is_some() || result.add_account || result.remove_account {
+        // **The injected resettle, and it calls the one
+        // teardown-and-repopulate sequence.** Nothing else may
+        // live in here: `a_switch_reimplements_none_of_the_
+        // sequence_it_is_supposed_to_reuse` pins that
+        // `switch_to_account` did not do the work itself, and
+        // `the_production_switch_resettles_through_the_one_
+        // sequence` pins that this closure -- the only thing that
+        // gets to decide what "resettle" means in production --
+        // did not either.
+        let mut resettle = |config_dir: &std::path::Path,
+                            to: &Account,
+                            store: &session_store::SessionStore|
+         -> ResettleReport {
+            // Built for the account being settled ONTO. A context
+            // for the account being left would put the master-password prompt
+            // up for the wrong account and seal the Hello blob
+            // under the wrong id.
+            let login = login_context(config_dir, Some(to), first_run_account);
+            let mut declined = false;
+            let outcome = resettle_session(
+                cache,
+                engine,
+                bw_serve_child,
+                job,
+                schedule,
+                tray,
+                backend_op_rx,
+                backend_task_in_progress,
+                cached_status_details,
+                session_token,
+                || {
+                    let token = authenticate_for_switch(store, login);
+                    declined = token.is_none();
+                    token
+                },
+            );
+            // The three-way answer `ResettleOutcome`'s two
+            // variants cannot give: only whoever built the
+            // `authenticate` closure can tell "the user closed the
+            // prompt" from "nothing came up to serve it", and a
+            // switch that reported a backend failure because the
+            // user pressed Cancel would be naming something that
+            // never happened.
+            match outcome {
+                ResettleOutcome::BackendStarted => ResettleReport::Settled,
+                ResettleOutcome::BackendNotStarted if declined => ResettleReport::Declined,
+                ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
+            }
+        };
+
     // Everything the switch itself does is `switch_to_account`'s -- the data
     // directory, the token store, the teardown, the authentication, the
     // restart, the rollback. This block is the caller's three jobs and no
@@ -2821,61 +3008,8 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         match (picked, accounts.as_mut(), active_account.as_mut()) {
             (Some(to), Some(state), Some(active)) => {
                 let from = active.clone();
-                let outcome = switch_to_account(
-                    config_dir,
-                    &from,
-                    &to,
-                    active,
-                    store,
-                    // **The injected resettle, and it calls the one
-                    // teardown-and-repopulate sequence.** Nothing else may
-                    // live in here: `a_switch_reimplements_none_of_the_
-                    // sequence_it_is_supposed_to_reuse` pins that
-                    // `switch_to_account` did not do the work itself, and
-                    // `the_production_switch_resettles_through_the_one_
-                    // sequence` pins that this closure -- the only thing that
-                    // gets to decide what "resettle" means in production --
-                    // did not either.
-                    |config_dir, to, store| {
-                        // Built for the account being switched TO. A context
-                        // for `from` here would put the master-password prompt
-                        // up for the wrong account and seal the Hello blob
-                        // under the wrong id.
-                        let login = login_context(config_dir, Some(to), first_run_account);
-                        let mut declined = false;
-                        let outcome = resettle_session(
-                            cache,
-                            engine,
-                            bw_serve_child,
-                            job,
-                            schedule,
-                            tray,
-                            backend_op_rx,
-                            backend_task_in_progress,
-                            cached_status_details,
-                            session_token,
-                            || {
-                                let token = authenticate_for_switch(store, login);
-                                declined = token.is_none();
-                                token
-                            },
-                        );
-                        // The three-way answer `ResettleOutcome`'s two
-                        // variants cannot give: only whoever built the
-                        // `authenticate` closure can tell "the user closed the
-                        // prompt" from "nothing came up to serve it", and a
-                        // switch that reported a backend failure because the
-                        // user pressed Cancel would be naming something that
-                        // never happened.
-                        match outcome {
-                            ResettleOutcome::BackendStarted => ResettleReport::Settled,
-                            ResettleOutcome::BackendNotStarted if declined => {
-                                ResettleReport::Declined
-                            }
-                            ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
-                        }
-                    },
-                );
+                let outcome =
+                    switch_to_account(config_dir, &from, &to, active, store, &mut resettle);
                 match outcome {
                     SwitchOutcome::Switched => {
                         // `adopt`, which moves this state's `active` and
@@ -2939,7 +3073,80 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
                  switch to right now"
             ),
         }
-        continue;
+    } else if result.add_account {
+        // **Everything the add does is `add_account`'s** -- minting the
+        // directory, running the sign-in inside it, asking `bw status` who
+        // signed in, the two persists, and the rollback that leaves nothing
+        // behind if any of it fails. This block is the caller's two jobs: hand
+        // it the two windows it cannot open for itself, and report the outcome
+        // through the same `SwitchOutcome` match the tray uses, so neither menu
+        // can quietly stop raising a failure the other one raises.
+        match (accounts.as_mut(), active_account.as_mut()) {
+            (Some(state), Some(active)) => {
+                let outcome = add_account(
+                    config_dir,
+                    settings_path,
+                    state,
+                    active,
+                    store,
+                    // The sign-in window, run against whatever profile
+                    // `add_account` has pointed the CLI at -- which is the NEW
+                    // account's directory, and is the whole reason this is
+                    // injected rather than called in there.
+                    |prepared| {
+                        let login = login_context(config_dir, Some(prepared), first_run_account);
+                        login_ui::run_login_flow_for(login.account, login.first_run)
+                    },
+                    // Asked of a NAMED directory. The active-profile form would
+                    // report the account being left.
+                    login_ui::check_bw_status_details_in,
+                    &mut resettle,
+                );
+                report_account_action("add an account", outcome);
+            }
+            _ => log::warn!("cannot add an account: this app has none to add one to"),
+        }
+    } else if result.remove_account {
+        // The active account, which is the one the menu's identity block names
+        // and the one its row says "this account" about. Re-asked of
+        // `can_remove_active` rather than trusted: the row is gated on it too,
+        // and a state that changed between the two would otherwise reach a
+        // removal that can only fail.
+        match (accounts.as_mut(), active_account.as_mut()) {
+            (Some(state), Some(active)) if state.can_remove_active() => {
+                let doomed = state.active().id.clone();
+                let label = account_label(state.active()).to_string();
+                // **The existing confirmation, not a second one.** It defaults
+                // to No and `the_removal_confirmation_defaults_to_no` pins that;
+                // a copy written beside this call site would not have it.
+                if confirm_account_removal(&label) {
+                    if let Err(reason) = remove_account(
+                        config_dir,
+                        settings_path,
+                        state,
+                        &doomed,
+                        active,
+                        store,
+                        &mut resettle,
+                        // **The directory form, never the active-profile one.**
+                        // That one acts on whatever this process is pointed at,
+                        // and by the time the logout runs the app has already
+                        // settled onto the SURVIVOR -- so it would sign out the
+                        // account the user is keeping and leave the doomed one
+                        // signed in on the server.
+                        login_ui::bw_logout_in,
+                    ) {
+                        log::warn!("could not remove {label}: {reason}");
+                        message_box("Deskwarden", &reason, MB_ICONERROR | MB_OK);
+                    }
+                }
+            }
+            _ => log::warn!(
+                "the vault window asked to remove an account this app cannot remove right now"
+            ),
+        }
+    }
+    continue;
     }
 
     if result.locked || result.needs_reauth {
@@ -6098,29 +6305,52 @@ mod tests {
     mod the_switch_the_vault_window_asks_for {
         use super::production_half_of_this_file;
 
+        /// Where `open_vault_window` reads the account menu's answers: the one
+        /// `if` that all three of switch, add and remove sit inside, and that
+        /// holds the single `resettle` closure they share.
+        fn account_actions_request() -> String {
+            concat!(
+                "if result.switch_to.is_some() || result.add_account ",
+                "|| result.remove_account {"
+            )
+            .to_string()
+        }
+
         /// Where `open_vault_window` reads the switcher's answer.
         fn switch_request() -> String {
             concat!("if let Some(target) = result.switch", "_to.clone()").to_string()
+        }
+
+        fn add_request() -> String {
+            concat!("} else if result.add", "_account {").to_string()
+        }
+
+        fn remove_request() -> String {
+            concat!("} else if result.remove", "_account {").to_string()
         }
 
         fn lock_recovery() -> String {
             concat!("if result.locked ", "|| result.needs_reauth {").to_string()
         }
 
-        /// The body of the `if let` above, depth-counted to its closing brace.
-        fn switch_block() -> &'static str {
+        /// The body of `head`'s block, depth-counted to its closing brace.
+        ///
+        /// Depth-counted rather than taken as a fixed number of bytes: a window
+        /// long enough to hold one branch is long enough to overrun into the
+        /// next, and this file has already watched that let one branch satisfy
+        /// another's assertion.
+        fn block_after(head: &str) -> &'static str {
             let production = production_half_of_this_file();
-            let request = switch_request();
-            let at = production.find(&request).unwrap_or_else(|| {
+            let at = production.find(head).unwrap_or_else(|| {
                 panic!(
-                    "{request:?} is not in the production code -- `open_vault_window` never \
-                     reads the switcher's result, so the whole control is inert"
+                    "{head:?} is not in the production code -- `open_vault_window` never reads \
+                     that answer, so the control that produces it is inert"
                 )
             });
             let after_open = &production[at..];
             let open = after_open
                 .find('{')
-                .expect("the switch request has no block to slice");
+                .expect("the request has no block to slice");
             let after_open = &after_open[open + 1..];
 
             let mut depth = 1usize;
@@ -6133,9 +6363,14 @@ mod tests {
                             let body = &after_open[..offset];
                             assert!(
                                 body.len() > 200,
-                                "the sliced switch block is {} bytes, which is not a switch: \
-                                 every assertion over it would pass against nothing",
+                                "the block sliced from {head:?} is {} bytes, which is not a \
+                                 branch: every assertion over it would pass against nothing",
                                 body.len()
+                            );
+                            assert!(
+                                body.len() < production.len() / 4,
+                                "control: the slice isolated a branch rather than running on \
+                                 into the rest of the function"
                             );
                             return body;
                         }
@@ -6143,7 +6378,15 @@ mod tests {
                     _ => {}
                 }
             }
-            panic!("the switch request's block is never closed");
+            panic!("the block sliced from {head:?} is never closed");
+        }
+
+        fn account_actions_block() -> &'static str {
+            block_after(&account_actions_request())
+        }
+
+        fn switch_block() -> &'static str {
+            block_after(&switch_request())
         }
 
         /// The plan's own wiring pin. A `switch_to` that `open_vault_window`
@@ -6180,9 +6423,210 @@ mod tests {
             );
 
             assert!(
-                switch_block().contains("continue;"),
-                "the switch does not reopen the window, so asking to switch closes the vault \
-                 window for good and the user is left staring at the tray"
+                account_actions_block().contains("continue;"),
+                "the account actions do not reopen the window, so asking to switch closes the \
+                 vault window for good and the user is left staring at the tray"
+            );
+        }
+
+        /// **The other two rows of the same menu have to reach `main` too.**
+        /// "Add account..." and "Remove this account..." are decided in
+        /// `account_menu`, carried back through `VaultWindowResult`, and would
+        /// then be dropped on the floor by an `open_vault_window` that never
+        /// reads them -- complete, correct and unreachable, which is precisely
+        /// the shape `switch_to_account`, `add_account` and `remove_account`
+        /// each shipped in before Task 14/15.
+        ///
+        /// Each branch sliced by itself, and each watched calling the ONE
+        /// function that does the work rather than a second copy of it.
+        #[test]
+        fn open_vault_window_acts_on_the_add_and_the_remove_the_menu_can_ask_for() {
+            let source = production_half_of_this_file();
+            let lock_at = source
+                .find(&lock_recovery())
+                .expect("the lock recovery must still exist");
+
+            for (head, calls, why) in [
+                (
+                    add_request(),
+                    concat!("add", "_account("),
+                    "the menu's \"Add account...\" is inert, or adds an account by some other \
+                     means than the one function with the rollback",
+                ),
+                (
+                    remove_request(),
+                    concat!("remove", "_account("),
+                    "the menu's \"Remove this account...\" is inert, or deletes a profile by \
+                     some other means than the one function that settles onto the survivor \
+                     first",
+                ),
+            ] {
+                let at = source
+                    .find(&head)
+                    .unwrap_or_else(|| panic!("{head:?} is not in the production code -- {why}"));
+                assert!(
+                    at < lock_at,
+                    "{head:?} is handled AFTER the lock/re-auth branch, so it would be \
+                     swallowed by a recovery that re-authenticates the account being left"
+                );
+                let block = block_after(&head);
+                assert!(block.contains(calls), "{why}: {block:?}");
+            }
+        }
+
+        /// **`learn_active_account_details` is reached, and reached in the one
+        /// place where "the active account" and "who these details describe"
+        /// are provably the same account.**
+        ///
+        /// Every test of that function injects its arguments, so all of them go
+        /// on passing against an app that never calls it — and the symptom of
+        /// that is exactly the bug this whole change is about: the account menu
+        /// naming a 32-character directory forever. Its two call sites are both
+        /// in code no harness can run (`open_vault_window` opens a real eframe
+        /// window; the other is `main`'s own loop), so they are read.
+        ///
+        /// **Above the switch/add/remove branch, and that ordering is the whole
+        /// safety argument.** These details were fetched for the profile this
+        /// window was pointed at. Below those branches, the active account may
+        /// be a different one — so the address of the account the user just
+        /// left would be written into the entry of the account they are now on.
+        #[test]
+        fn the_window_teaches_the_active_account_its_own_address_before_anything_changes_it() {
+            let production = production_half_of_this_file();
+            let learn = concat!("learn_active_account", "_details(");
+            let refill = concat!("if let Some(details) = result.account", "_details.clone() {");
+
+            assert_eq!(
+                production.matches(learn).count(),
+                3,
+                "expected the definition and exactly two call sites -- the vault window's own \
+                 session, and `main`'s startup prefetch -- found {}",
+                production.matches(learn).count()
+            );
+
+            let refill_at = production.find(refill).unwrap_or_else(|| {
+                panic!("{refill:?} is gone -- the window's `bw status` answer is never read back")
+            });
+            let block = block_after(refill);
+            assert!(
+                block.contains(learn),
+                "the window's `bw status` answer warms the cache and teaches the account \
+                 nothing, so an account minted on a first install keeps its directory name in \
+                 every menu forever: {block:?}"
+            );
+
+            let actions_at = production
+                .find(&account_actions_request())
+                .expect("the account actions must still exist");
+            assert!(
+                refill_at < actions_at,
+                "the address is learned AFTER the switch/add/remove branch, so a switch writes \
+                 the address of the account the user just left into the entry of the account \
+                 they are now on"
+            );
+        }
+
+        /// **The startup prefetch is checked against the account it was started
+        /// for before anything is learned from it.**
+        ///
+        /// `bw status` reports on whatever profile the CLI was pointed at when
+        /// it ran, and this one is spawned before the startup window's outcome
+        /// is dispatched — a window that can switch, add or remove an account.
+        /// Its answer can therefore land describing somebody else, and what is
+        /// done with it is not only a toolbar label: it is WRITTEN to
+        /// `settings.json`. Reachable, unfalsifiable from the outside, and the
+        /// worse version of the bug this change is closing.
+        #[test]
+        fn the_startup_prefetch_is_dropped_unless_it_still_describes_the_active_account() {
+            let drain = concat!("if let Ok((about, details)) = status_details_rx.try_", "recv() {");
+            let block = block_after(drain);
+            let check = concat!("about.as_ref() == active_account.as_ref()", ".map(|a| &a.id)");
+            assert!(
+                block.contains(check),
+                "the startup `bw status` answer is used without checking it still describes \
+                 the account this app is on: {block:?}"
+            );
+            let guarded = block
+                .split_once(check)
+                .expect("the check is there, per the assertion above")
+                .1;
+            for (needle, what) in [
+                (concat!("learn_active_account", "_details("), "learned from"),
+                (concat!("cached_status_details = Some(", "details);"), "cached"),
+            ] {
+                assert!(
+                    guarded.contains(needle),
+                    "the prefetch is {what} outside the check, so a startup window that \
+                     switched account leaves this describing the wrong one: {block:?}"
+                );
+                assert_eq!(
+                    block.matches(needle).count(),
+                    1,
+                    "expected exactly one place the prefetch is {what}: {block:?}"
+                );
+            }
+        }
+
+        /// **The removal reuses the one confirmation, and never writes a
+        /// second.** `confirm_account_removal` defaults to No and
+        /// `the_removal_confirmation_defaults_to_no` pins that; a dialog
+        /// written beside this call site would not have it, and this is the
+        /// second most destructive thing this app does.
+        #[test]
+        fn the_windows_removal_asks_before_it_deletes_and_reuses_the_one_dialog() {
+            let block = block_after(&remove_request());
+            let confirm = concat!("confirm_account", "_removal(");
+            assert!(
+                block.contains(confirm),
+                "the vault window's removal deletes a profile without asking: {block:?}"
+            );
+            assert!(
+                !block.contains(concat!("MB_YES", "NO")),
+                "a second confirmation dialog was written beside the removal instead of \
+                 reusing the one that defaults to No: {block:?}"
+            );
+            // The removal must be gated on the same door the row is drawn from,
+            // so a state that changed between the two cannot reach a removal
+            // that can only fail.
+            assert!(
+                block.contains(concat!("state.can_remove", "_active()")),
+                "the removal is not re-checked against the door the menu row is gated on: \
+                 {block:?}"
+            );
+            // And the logout runs in the DOOMED account's own directory. The
+            // active-profile form would sign out the survivor the app has just
+            // settled onto and leave the doomed account signed in on the server.
+            assert!(
+                block.contains(concat!("login_ui::bw_logout", "_in,")),
+                "the removal does not hand `remove_account` the directory form of the logout: \
+                 {block:?}"
+            );
+        }
+
+        /// **One resettle for all three actions, not three.** Three copies
+        /// would be three chances to get the hardest sequence in this codebase
+        /// subtly different, and each copy would be a teardown path with none
+        /// of `resettle_session_with`'s tests. The tray's submenu already has
+        /// exactly one for its three; this is the same rule for this window.
+        #[test]
+        fn the_vault_windows_account_actions_settle_through_the_one_sequence() {
+            let block = account_actions_block();
+            let sequence = concat!("resettle_", "session(");
+            assert_eq!(
+                block.matches(sequence).count(),
+                1,
+                "expected exactly ONE resettle closure shared by the switch, the add and the \
+                 remove; found {}: {block:?}",
+                block.matches(sequence).count()
+            );
+            // And all three really are handed it -- one closure that only the
+            // switch reaches is the same duplication with a longer fuse, since
+            // the other two would each have to grow one.
+            let handed = block.matches(concat!("&mut ", "resettle")).count();
+            assert_eq!(
+                handed, 3,
+                "expected the one resettle closure to be handed to all three actions (the \
+                 switch, the add and the remove); it reaches {handed}: {block:?}"
             );
         }
 
@@ -6195,7 +6639,7 @@ mod tests {
         /// one written inline.
         #[test]
         fn the_production_switch_resettles_through_the_one_sequence() {
-            let block = switch_block();
+            let block = account_actions_block();
             let sequence = concat!("resettle_", "session(");
             assert!(
                 block.contains(sequence),
@@ -6568,9 +7012,41 @@ mod tests {
         /// which is exactly what happened when this was written with a 900-byte
         /// window, and it survived the mutation that deletes the `RolledBack`
         /// message box entirely.
+        ///
+        /// **Sliced from `report_account_action`, which both menus now share.**
+        /// The vault window's account menu grew the same add and remove, and
+        /// two copies of this reporting is how one of them quietly stops
+        /// raising the failure the other one raises -- so there is one, and
+        /// this guards it for both.
         #[test]
         fn every_outcome_of_a_tray_account_action_is_reported() {
-            let block = tray_block();
+            let production = production_half_of_this_file();
+            let head = concat!("fn report_account", "_action(what: &str, outcome: SwitchOutcome) {");
+            let block = production
+                .split_once(head)
+                .unwrap_or_else(|| {
+                    panic!("no {head:?} in production code -- neither menu reports its outcomes")
+                })
+                .1;
+            // Ending-agnostic: a `"\r\n}"` needle stops matching the moment a
+            // tool rewrites this file with LF endings.
+            let block = block
+                .split_once("\n}")
+                .expect("its body must be closed")
+                .0
+                .trim_end_matches('\r');
+            assert!(
+                block.len() < production.len() / 10,
+                "control: the split isolated a body rather than keeping the rest of the file"
+            );
+            // And both menus really do route through it, so this guard is about
+            // what the user is told rather than about an unused function.
+            assert_eq!(
+                production.matches(concat!("report_account", "_action(")).count(),
+                3,
+                "expected the one reporting to be reached from both the tray's submenu and \
+                 the vault window's account menu, beside its own definition"
+            );
             let variant = concat!("SwitchOutcome", "::");
             for (arm, must_contain, why) in [
                 (
@@ -6593,7 +7069,7 @@ mod tests {
             ] {
                 let at = block
                     .find(arm)
-                    .unwrap_or_else(|| panic!("no {arm:?} arm in the tray block: {block:?}"));
+                    .unwrap_or_else(|| panic!("no {arm:?} arm in the reporting: {block:?}"));
                 let rest = &block[at + arm.len()..];
                 let arm_body = match rest.find(variant) {
                     Some(next) => &rest[..next],
@@ -7518,6 +7994,185 @@ mod tests {
             user_email: Some(email.to_string()),
             server_url: Some("https://vault.example.com".to_string()),
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Filling in the email an account was minted without.
+    // ---------------------------------------------------------------------
+
+    /// **The "random hash" bug, end to end.** `resolve_startup` mints a
+    /// first-install account with an empty email, `account_label` falls back to
+    /// the 32-character directory name, and every menu that names the account
+    /// names that. This is where the address arrives and where it is written
+    /// down so the next launch does not have to ask again.
+    #[test]
+    fn a_first_run_accounts_address_is_learned_and_written_to_settings() {
+        let scratch = ScratchConfig::with_accounts("learn", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+
+        let blank = account(ACCOUNT_A, "");
+        let other = account(ACCOUNT_B, "other@example.com");
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![blank.clone(), other.clone()],
+            &blank,
+        ));
+        let mut active = Some(blank.clone());
+        assert_eq!(
+            account_label(state.as_ref().unwrap().active()),
+            ACCOUNT_A,
+            "control: before it learns anything the account really is named by its directory"
+        );
+
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana@example.com"),
+        );
+
+        assert_eq!(
+            account_label(state.as_ref().unwrap().active()),
+            "ana@example.com",
+            "the menus still name this account by its directory"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().email,
+            "ana@example.com",
+            "`active_account` -- which `login_context` and `switch_to_account` name the \
+             account by -- did not learn it, so a master-password prompt still says the hash"
+        );
+
+        // And it SURVIVES the launch, which is the half a purely in-memory fix
+        // would not have: `settings.json` is what `resolve_startup` reads next
+        // time.
+        let reloaded = settings::Settings::load(&settings_path);
+        assert_eq!(
+            reloaded.accounts.first().map(|a| a.email.as_str()),
+            Some("ana@example.com"),
+            "the address was learned but never written down, so the next launch shows the \
+             hash again; the file holds: {:?}",
+            reloaded.accounts
+        );
+        assert_eq!(
+            reloaded.accounts.get(1).map(|a| a.email.as_str()),
+            Some("other@example.com"),
+            "the other account's entry was rewritten by the active account's status"
+        );
+        assert_eq!(
+            reloaded.active_account.as_ref(),
+            Some(&blank.id),
+            "the active account was moved by something that only learns an address"
+        );
+    }
+
+    /// `bw status` answers `null` for both fields when the CLI is logged out or
+    /// could not be spawned at all — `check_bw_status_details_in` returns
+    /// exactly that on a failed spawn. Writing that would put the hash back and
+    /// then persist it.
+    #[test]
+    fn a_silent_bw_status_writes_nothing_at_all() {
+        let scratch = ScratchConfig::with_accounts("learn-silent", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+
+        let known = account(ACCOUNT_A, "ana@example.com");
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![known.clone(), account(ACCOUNT_B, "other@example.com")],
+            &known,
+        ));
+        let mut active = Some(known.clone());
+
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &login_ui::BwStatusDetails {
+                status: login_ui::BwStatus::Unauthenticated,
+                user_email: None,
+                server_url: None,
+            },
+        );
+        assert_eq!(active.as_ref().unwrap().email, "ana@example.com");
+        assert!(
+            !settings_path.exists(),
+            "an answer that said nothing still rewrote settings.json, so an idle app writes \
+             the file on every window it opens"
+        );
+
+        // The positive control on the same scratch directory: a real answer
+        // that changes something DOES write.
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana@example.com"),
+        );
+        assert!(
+            settings_path.exists(),
+            "control: nothing in this harness can write settings.json, so the assertion above \
+             says nothing"
+        );
+    }
+
+    /// Learning an address is not a reason to rewrite the file. An app that
+    /// persists on every open writes `settings.json` on a schedule set by how
+    /// often the user looks at their vault.
+    #[test]
+    fn learning_nothing_new_persists_nothing() {
+        let scratch = ScratchConfig::with_accounts("learn-again", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+
+        let known = account(ACCOUNT_A, "ana@example.com");
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![known.clone(), account(ACCOUNT_B, "other@example.com")],
+            &known,
+        ));
+        let mut active = Some(known.clone());
+
+        // The first call has a server URL to learn, so it writes.
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana@example.com"),
+        );
+        assert!(settings_path.exists(), "control: the first call wrote the file");
+        let written = std::fs::metadata(&settings_path).unwrap().len();
+        let _ = std::fs::remove_file(&settings_path);
+        assert!(written > 0);
+
+        // The second says exactly the same thing, so there is nothing to write.
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana@example.com"),
+        );
+        assert!(
+            !settings_path.exists(),
+            "the same answer twice wrote settings.json twice"
+        );
+    }
+
+    /// `StartupAccounts::NoAccountList`: this app has no `Account` of its own,
+    /// so there is nothing to record an address against — and `Settings::save`
+    /// refuses to write over the unreadable file anyway.
+    #[test]
+    fn an_app_with_no_account_list_records_nothing() {
+        let scratch = ScratchConfig::with_accounts("learn-none", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let mut state = None;
+        let mut active = None;
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana@example.com"),
+        );
+        assert!(state.is_none() && active.is_none());
+        assert!(!settings_path.exists());
     }
 
     /// The whole of a cancelled sign-in: no directory, no entry, no change of

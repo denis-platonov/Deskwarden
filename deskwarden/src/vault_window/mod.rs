@@ -239,6 +239,35 @@ pub struct VaultWindowResult {
     /// the account they were leaving, and would then be left on it. Folded into
     /// `open_preferences` it would open the preferences window instead.
     pub switch_to: Option<crate::accounts::AccountId>,
+    /// True if the account menu's "Add account..." was clicked. The caller runs
+    /// `add_account`, which opens a sign-in window and then settles onto the
+    /// new account with the same switch every other account change goes
+    /// through, and reopens this window afterwards.
+    ///
+    /// **A fifth field, distinct from all four above**, for the reason
+    /// [`switch_to`](Self::switch_to) is distinct from
+    /// [`locked`](Self::locked): the session was never lost, so the lock
+    /// recovery would prompt for the master password of the account the user is
+    /// on and leave them there. Distinct from `switch_to` too, which names an
+    /// account that already exists — there is no id to send back for one that
+    /// does not exist yet.
+    pub add_account: bool,
+    /// True if the account menu's "Remove this account..." was clicked. The
+    /// caller confirms (`confirm_account_removal`, the one dialog, which
+    /// defaults to No) and then runs `remove_account` on the **active**
+    /// account.
+    ///
+    /// A sixth field for the same reason, and a bool rather than an id because
+    /// the row removes the account this window is showing — the one the
+    /// identity block at the top of that menu names. An id would be a second
+    /// answer to "which account?" that could disagree with it.
+    ///
+    /// Only ever set when
+    /// [`can_remove_active`](crate::accounts::AccountsState::can_remove_active)
+    /// allowed the row to be drawn at all, so this is not a request the caller
+    /// is expected to refuse — but the caller re-asks anyway, the way the switch
+    /// re-asks `switchable()`.
+    pub remove_account: bool,
     /// The account details this session ENDED UP WITH -- handed in
     /// [`AccountDetails::Ready`], or drained from the channel while the window
     /// was up. `None` only when the window was closed before a
@@ -405,6 +434,12 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     let switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>> =
         Rc::new(RefCell::new(None));
     let switch_to_for_closure = switch_to.clone();
+    // See `VaultWindowResult::add_account` and `::remove_account`. Two more
+    // cells rather than a share of any above, for the reason those fields give.
+    let add_account = Rc::new(RefCell::new(false));
+    let add_account_for_closure = add_account.clone();
+    let remove_account = Rc::new(RefCell::new(false));
+    let remove_account_for_closure = remove_account.clone();
     let mut sync_status: Option<Result<(), String>> = None;
     // When the most recent successful sync completed, for the toolbar's
     // sync pill ("Synced N min ago" per design spec 4.8) -- set below
@@ -1196,7 +1231,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
             |ui| {
                 // Right-to-left, so this reads left-to-right (nearest the title,
                 // furthest from the window controls, first) as: Sync status
-                // pill, "Lock CTRL+L", avatar, account switcher, settings gear.
+                // pill, avatar, account-menu chevron, settings gear.
                 // Added here in the
                 // opposite order (the gear closest to the window controls, sync
                 // pill furthest) since `right_to_left` packs each new widget
@@ -1228,51 +1263,77 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                     *open_preferences_for_closure.borrow_mut() = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                // **Between the gear and the avatar, and therefore added between
-                // them**, since this strip packs right-to-left: the mark that
-                // opens the account menu belongs against the account it names, and
-                // the conventional place for a disclosure chevron is the avatar's
-                // right-hand side. `the_switcher_sits_between_the_avatar_and_the_
-                // gear` measures the painted rects rather than trusting this
-                // ordering, which is inverted and is exactly the kind of thing
-                // reasoning gets backwards.
+                // **The avatar, the chevron beside it, and the menu they open
+                // together**, all inside one call -- see `account_menu`, which
+                // owns both marks so that "an app with no account list draws no
+                // menu control" is a decision a test can reach rather than an
+                // `if` in this closure, which nothing can.
                 //
-                // Design 2b has no switcher (it has one account), so this is the
-                // user's direction the way the gear is. What it takes from 2b is
-                // its metrics: `theme::account_switcher_button` is 28px square,
-                // matching the gear, the avatar and the Lock pill either side.
-                if let Some(picked) = account_switcher(ui, accounts.as_ref()) {
+                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
+                // draws a rounded square (used elsewhere: item-list rows,
+                // the detail pane header, neither of which were asked to
+                // change), so it is painted directly rather than by changing
+                // that shared helper's shape for every caller. 2b has no
+                // switcher and no menu (it has one account), so those are the
+                // user's direction the way the gear is; what they take from 2b
+                // is its metrics, 28px square to match the gear and the avatar,
+                // and the kebab menu in the detail pane for the rows.
+                //
+                // **Design 2b's "Lock CTRL+L" pill used to sit here and is
+                // gone**, at the user's direction, now that Lock is a row in
+                // this menu. `CTRL+L` still works -- it is handled by the key
+                // check a few lines below, which never went through the pill --
+                // and its hint rides the menu row so it stays discoverable.
+                match account_menu(
+                    ui,
+                    accounts.as_ref(),
+                    // Empty until the details land, and empty rather than
+                    // `theme::initials("")`'s "?" placeholder: a question mark
+                    // reads as an answer ("this account has no name"), and the
+                    // truthful state here is that nothing has been said yet.
+                    // The circle itself is drawn either way, so nothing left of
+                    // it shifts sideways when the email arrives.
+                    &avatar_initials(account_email.as_deref()),
+                    account_email.as_deref(),
+                    server_url.as_deref(),
+                    // **The same fact the favicons wait on**, asked once. "No
+                    // server URL" means Bitwarden's own cloud once `bw status`
+                    // has answered and means nothing at all before it has, and
+                    // this window already has exactly one name for that
+                    // distinction.
+                    icon_base_known,
+                ) {
                     // The gear's two-step dance, for the same reason and one more:
                     // `main` cannot tear this account's backend down and bring the
                     // other one up while this window owns the event loop, and the
                     // master-password prompt the switch may raise is itself
                     // another eframe window on this same thread.
-                    *switch_to_for_closure.borrow_mut() = Some(picked);
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
-                // draws a rounded square (used elsewhere: item-list rows,
-                // the detail pane header, neither of which were asked to
-                // change), so this is painted directly here rather than
-                // changing that shared helper's shape for every caller.
-                //
-                // ALWAYS drawn, even with no email yet, which is why it is no
-                // longer inside an `if let`. The circle is the account's place in
-                // the toolbar; drawn only once the email lands, everything left of
-                // it (the Lock pill, the sync pill, the title) would shift sideways
-                // a second or two into the session -- a flicker for a thing the
-                // user was not looking at, on a strip they may be reaching for.
-                // Empty until then, and empty rather than `theme::initials("")`'s
-                // "?" placeholder: a question mark reads as an answer ("this
-                // account has no name"), and the truthful state here is that
-                // nothing has been said yet.
-                draw_circle_avatar(ui, &avatar_initials(account_email.as_deref()));
-                // Design 2b's Lock control carries its own "CTRL+L" shortcut
-                // nested inside the same bordered pill, not as a separate
-                // floating `kbd_chip` beside it.
-                if theme::toolbar_button_with_shortcut(ui, "Lock", "CTRL+L").clicked() {
-                    *locked_for_closure.borrow_mut() = true;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    Some(AccountAction::Switch(picked)) => {
+                        *switch_to_for_closure.borrow_mut() = Some(picked);
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    // **The `locked` flag the pill used to set**, not a path of
+                    // its own: locking from the menu has to end exactly where
+                    // locking from the pill and from `CTRL+L` end, which is the
+                    // caller's one lock recovery -- sign-in for the account that
+                    // was locked, and no switch anywhere else.
+                    Some(AccountAction::Lock) => {
+                        *locked_for_closure.borrow_mut() = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    // Both open a window of their own on this same thread -- a
+                    // sign-in for the add, a confirmation for the remove -- and
+                    // both then run the switch sequence, so both leave this
+                    // window exactly the way Preferences and a switch do.
+                    Some(AccountAction::Add) => {
+                        *add_account_for_closure.borrow_mut() = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Some(AccountAction::Remove) => {
+                        *remove_account_for_closure.borrow_mut() = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    None => {}
                 }
                 // Manual sync: this app has nowhere that auto-syncs on a timer
                 // (see `main()`'s own single startup-time `bw sync` -- everything
@@ -2663,7 +2724,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     (
         options,
         Box::new(vault_frame_fn),
-        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, account_details, last_geometry, settings_path },
+        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, add_account, remove_account, account_details, last_geometry, settings_path },
     )
 }
 
@@ -2685,6 +2746,10 @@ pub struct VaultFrameHandles {
     needs_reauth: Rc<RefCell<bool>>,
     open_preferences: Rc<RefCell<bool>>,
     switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>>,
+    /// See [`VaultWindowResult::add_account`] and
+    /// [`VaultWindowResult::remove_account`].
+    add_account: Rc<RefCell<bool>>,
+    remove_account: Rc<RefCell<bool>>,
     /// See [`VaultWindowResult::account_details`]. Written either before the
     /// window opened (a `Ready` hand-in) or by the frame that drained the
     /// fetch, and read back out by [`finish`](Self::finish) so the caller's
@@ -2725,12 +2790,14 @@ impl VaultFrameHandles {
         // preference fields only, so it cannot clobber the geometry either.
         let open_preferences = *self.open_preferences.borrow();
         let switch_to = self.switch_to.borrow_mut().take();
+        let add_account = *self.add_account.borrow();
+        let remove_account = *self.remove_account.borrow();
         // Cloned rather than taken: `finish` is documented "call once", but a
         // second call returning a result with no details in it would silently
         // cost the caller its warm cache rather than failing, and this is the
         // one field whose absence means "spawn the CLI again".
         let account_details = self.account_details.borrow().clone();
-        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to, account_details }
+        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to, add_account, remove_account, account_details }
     }
 }
 
@@ -4301,9 +4368,18 @@ fn avatar_initials(email: Option<&str>) -> String {
     }
 }
 
-fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) {
+/// The titlebar avatar, and **a button**: the user asked for the account menu
+/// to open on a click of the avatar itself, not only of the chevron beside it.
+///
+/// Returns its `Response` so [`account_menu`] can hand `egui::Popup::menu` the
+/// union of this and the chevron — one popup with two hit areas, rather than
+/// two popups that could both be open.
+fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) -> egui::Response {
     const SIZE: f32 = 28.0;
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(SIZE), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(SIZE), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     ui.painter().circle_filled(rect.center(), SIZE / 2.0, theme::INK);
     ui.painter().text(
         rect.center(),
@@ -4312,87 +4388,321 @@ fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) {
         egui::FontId::new(11.0, egui::FontFamily::Name(theme::BOLD.into())),
         egui::Color32::WHITE,
     );
+    response
 }
 
-/// What the switcher's menu says when there is nothing to switch to and
+/// What the account menu says when there is nothing to switch to and
 /// nothing is stopping one. One account is the overwhelmingly common state, and
 /// an empty menu is indistinguishable from a menu that failed to build.
 const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
 
-/// How wide the switcher's menu is allowed to get.
+/// The menu's Lock row, and the chord it also answers to.
+///
+/// **The titlebar's "Lock CTRL+L" pill is gone** — design 2b has one, and this
+/// is the user's direction over it ("we can also remove Lock button in that
+/// case if it lives in the dropdown menu"). `CTRL+L` itself is untouched: it is
+/// handled by `run`'s own key check, not by the pill, so removing the pill
+/// removes an affordance and not a shortcut. The hint moves onto this row so
+/// the chord stays discoverable, which is the rule every copy chord in this app
+/// already follows.
+const LOCK_LABEL: &str = "Lock";
+const LOCK_SHORTCUT: &str = "CTRL+L";
+
+/// The menu's two account-management rows. Spelled with `...` rather than `…`,
+/// matching `tray::ADD_ACCOUNT` and `tray::remove_account_label` — both menus
+/// say the same thing about the same two actions.
+const ADD_ACCOUNT: &str = "Add account...";
+const REMOVE_ACCOUNT: &str = "Remove this account...";
+
+/// How wide the account menu is allowed to get.
 ///
 /// A blocked state paints [`AccountsState::blocked_reason`] in here, and those
 /// sentences name a directory path — unwrapped, one of them is a menu wider
-/// than the window it hangs off.
+/// than the window it hangs off. A self-hosted server URL is long enough to
+/// want it too.
 const SWITCHER_MENU_WIDTH: f32 = 300.0;
 
-/// The titlebar's account switcher: the chevron beside the avatar, and the
-/// menu it opens.
+/// What a click in the titlebar's account menu asked for.
 ///
-/// **It asks [`AccountsState`](crate::accounts::AccountsState) and derives
-/// nothing.** The rows it offers are exactly
-/// [`switchable`](crate::accounts::AccountsState::switchable) — never
-/// [`all`](crate::accounts::AccountsState::all), which still reports every
-/// configured account including the active one and including duplicate ids, so
-/// a menu built from it could offer a row that switches to where the user
-/// already is, and two rows for one directory. `switchable` is also already
-/// empty whenever switching is refused, which is why nothing here re-reads why.
+/// One enum rather than four flags out of [`account_menu`], because exactly one
+/// of these can happen per click and three of them close the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountAction {
+    /// Switch to another configured account.
+    Switch(crate::accounts::AccountId),
+    /// Lock this account's vault. **Not "log out"** — this app does not use
+    /// that word, because it has two different meanings here and the menu
+    /// offers both separately: Lock clears the session and a master password
+    /// brings it back, [`Remove`](Self::Remove) deletes the profile.
+    ///
+    /// It lands on the sign-in state **for the account that was locked**, and
+    /// deliberately does not switch anywhere: a security action must not leave
+    /// the user somewhere unlocked they did not ask to be. That is not a
+    /// decision made here — it is what the caller's existing `locked` recovery
+    /// already does, which is why this reuses that flag rather than adding a
+    /// path of its own.
+    Lock,
+    /// Sign in to a further account and settle onto it.
+    Add,
+    /// Delete this account's local profile and drop it from the list.
+    Remove,
+}
+
+/// What the titlebar's account menu shows, decided apart from the drawing.
 ///
-/// **A blocked state paints the reason rather than an empty menu**, and that is
-/// the only thing this window does with `blocked_reason`. Silently offering no
-/// rows would read as "you have one account"; the refusal this gate exists for
-/// (a `bitwarden-cli` directory beside `bw.exe`) is something the user can go
-/// and act on, and it is not visible anywhere else in this window.
+/// A plan, the way `tray::AccountsMenuPlan` is one, and for the same reason:
+/// the drawing needs a live `egui::Context` and the *decisions* are what go
+/// wrong. The two menus are deliberately not one type — they have different
+/// rows and different wording — but every decision either of them makes is
+/// asked of [`AccountsState`](crate::accounts::AccountsState) and of nothing
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountMenuPlan {
+    /// The identity block, top to bottom, strongest line first: **the address,
+    /// then the host**. Two lines whenever the host is known at all, which is
+    /// every session past the first second of one.
+    ///
+    /// **There is no display name and none is invented.** `bw status` — the
+    /// only thing that knows anything about the signed-in identity — reports a
+    /// status, a `userEmail` and a `serverUrl` and nothing else; Bitwarden's
+    /// own name field is a vault-level profile value this app never fetches. So
+    /// the address is the primary line rather than a subtitle under a name, and
+    /// nothing here derives one from the local part of the address: "Ana Novak"
+    /// guessed from `ana.novak@` is an assertion about a person, and the one it
+    /// would get wrong is the one that matters.
+    ///
+    /// The first line is [`account_label`](crate::accounts::account_label) when
+    /// nothing better has arrived, which always has something to say. The
+    /// second is [`account_host_line`] — see it for the three cases a user can
+    /// be in and the one case that has no line at all.
+    identity: Vec<String>,
+    /// One row per account the user may switch **to**, in
+    /// [`switchable`](crate::accounts::AccountsState::switchable) order. Never
+    /// [`all`](crate::accounts::AccountsState::all), which still reports the
+    /// active account and still reports duplicate ids — a menu built from that
+    /// offers a row that switches to where the user already is, and two rows
+    /// onto one directory.
+    switch_to: Vec<(crate::accounts::AccountId, String)>,
+    /// Why there is nothing to switch to, when there is nothing to switch to.
+    /// `None` whenever [`switch_to`](Self::switch_to) is non-empty.
+    notice: Option<String>,
+    /// Whether "Add account..." is offered, per
+    /// [`can_add`](crate::accounts::AccountsState::can_add).
+    can_add: bool,
+    /// Whether "Remove this account..." is offered, per
+    /// [`can_remove_active`](crate::accounts::AccountsState::can_remove_active)
+    /// — which is where both of `remove_account`'s refusals are answered. A row
+    /// that can only fail is worse than one that is not there.
+    can_remove: bool,
+}
+
+/// The account menu's second identity line: **which of the three servers a user
+/// can be on this account lives on**, or `None` when nothing has said yet.
 ///
-/// `None` accounts — `StartupAccounts::NoAccountList`, where this app has no
-/// `Account` at all — draws no control whatsoever. There is nothing to say
-/// about accounts in an app whose account list could not be read.
-fn account_switcher(
+/// > "it's either whatever self-host URL or bitwarden.com or bitwarden.eu"
+///
+/// Which region an official-cloud account is in is real information, not noise:
+/// with a self-hosted server beside them, this line is what tells three
+/// accounts apart at a glance. So the four answers are:
+///
+/// * **A self-hosted URL** → its bare host, through
+///   [`login_ui::server_host`](crate::login_ui::server_host) — the login
+///   window's footer already answers "which server?" for this user, and a
+///   second normalisation here would be a second answer. It strips the scheme
+///   and the path, so `https://nw37.example.net/api` reads as
+///   `nw37.example.net`.
+/// * **`bitwarden.com` or any subdomain of it** → `bitwarden.com`.
+/// * **`bitwarden.eu` or any subdomain of it** → `bitwarden.eu`.
+///
+///   Both through [`favicon::bitwarden_cloud`](crate::favicon::bitwarden_cloud),
+///   which is the crate's one host test and matches by exact host or
+///   host-suffix rather than by substring: `vault.bitwarden.community` is a
+///   self-hosted domain that *contains* `bitwarden.com`, and a naive check
+///   tells that user their vault is on Bitwarden's cloud. The REGION is
+///   painted rather than the host that was matched, because `vault.bitwarden.eu`
+///   and `bitwarden.eu` are one answer to the question this line asks.
+/// * **The CLI answered and named no server** → `bitwarden.com`. That is the
+///   CLI's own default rather than a guess, and it is the identical reading
+///   `login_ui::server_host(None)` and `favicon::icon_base_url(None)` already
+///   make.
+///
+/// And the one case with **no line at all**: nothing has answered yet and
+/// nothing is stored — an account `resolve_startup` minted on a first install
+/// has `server_url: None` for the same reason it has no email, and `bw status`
+/// has not come back. Printing `bitwarden.com` there states something *false*
+/// about a self-hosted account that simply has not been asked about, which is
+/// the mistake the empty avatar and the waiting favicons both already avoid.
+/// `server_known` is that distinction, and it is the window's own
+/// `icon_base_known` — the same fact, asked once.
+fn account_host_line(
+    server_url: Option<&str>,
+    stored: Option<&str>,
+    server_known: bool,
+) -> Option<String> {
+    let url = server_url
+        .or(stored)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match url {
+        Some(url) => Some(
+            crate::favicon::bitwarden_cloud(&crate::favicon::host_from_url(url))
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::login_ui::server_host(Some(url))),
+        ),
+        None if server_known => Some(crate::login_ui::server_host(None)),
+        None => None,
+    }
+}
+
+/// Decides the account menu's contents. See [`AccountMenuPlan`].
+///
+/// `email` and `server_url` are what `bw status` said about the profile this
+/// window is pointed at — the same two values the avatar's initials and the
+/// favicon host come from, and the freshest thing the app has. They fall back
+/// to what is stored against the account, which is what a window whose
+/// `AccountDetails` have not arrived yet is left with.
+fn account_menu_plan(
+    state: &crate::accounts::AccountsState,
+    email: Option<&str>,
+    server_url: Option<&str>,
+    server_known: bool,
+) -> AccountMenuPlan {
+    let active = state.active();
+    // `account_label` rather than the email directly: an account minted on a
+    // first install has none until a sign-in fills it in, and a blank first
+    // line would be a strip of menu with nothing on it. Preferring the live
+    // answer over the stored one is what makes the very first session -- the
+    // one before anything has been persisted -- show an address rather than the
+    // directory name.
+    let primary = email
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::accounts::account_label(active).to_string());
+    let mut identity = vec![primary];
+    identity.extend(account_host_line(
+        server_url.filter(|s| !s.is_empty()),
+        active.server_url.as_deref(),
+        server_known,
+    ));
+
+    let switch_to: Vec<(crate::accounts::AccountId, String)> = state
+        .switchable()
+        .iter()
+        .map(|a| (a.id.clone(), crate::accounts::account_label(a).to_string()))
+        .collect();
+    // The blocked reason outranks "no other accounts yet", and it has to: a
+    // blocked state may well hold several accounts, and telling the user they
+    // have one would be false as well as unactionable. It is also the only
+    // thing this window does with `blocked_reason` -- silently offering no rows
+    // would read as "you have one account", and this refusal is one the user
+    // can go and act on.
+    let notice = switch_to.is_empty().then(|| {
+        state
+            .blocked_reason()
+            .map(str::to_string)
+            .unwrap_or_else(|| NO_OTHER_ACCOUNTS.to_string())
+    });
+
+    AccountMenuPlan {
+        identity,
+        switch_to,
+        notice,
+        can_add: state.can_add(),
+        can_remove: state.can_remove_active(),
+    }
+}
+
+/// The titlebar's account control: the avatar circle, the chevron beside it,
+/// and the menu the two of them open together.
+///
+/// **Both marks open one menu.** The user asked for it on the avatar; the
+/// chevron is the conventional disclosure mark and was already there. Hanging
+/// two `egui::Popup`s off them would be two menus that can both be open, so the
+/// popup is hung off `chevron | avatar` — egui's `Response::union`, whose
+/// `clicked()` is either one's and whose rect covers both, so the menu also
+/// drops under the pair rather than under half of it.
+///
+/// **The avatar is drawn unconditionally and the chevron is not.** `None`
+/// accounts — `StartupAccounts::NoAccountList`, where this app has no `Account`
+/// at all — is an app with nothing to say about accounts, so there is no menu
+/// and no mark that opens one. The circle stays: it is the account's place in
+/// the toolbar, and everything left of it shifts sideways if it comes and goes.
+fn account_menu(
     ui: &mut egui::Ui,
     accounts: Option<&crate::accounts::AccountsState>,
-) -> Option<crate::accounts::AccountId> {
-    let state = accounts?;
-    let mut picked = None;
-    let chevron = theme::account_switcher_button(ui);
-    egui::Popup::menu(&chevron).show(|ui| {
+    initials: &str,
+    email: Option<&str>,
+    server_url: Option<&str>,
+    server_known: bool,
+) -> Option<AccountAction> {
+    // The chevron FIRST and the avatar second, because this strip packs
+    // right-to-left: earlier is further right. The chevron belongs on the
+    // avatar's right-hand side, which is where a disclosure mark goes -- and
+    // `the_switcher_paints_between_the_avatar_and_the_gear` measures the
+    // painted rects rather than trusting this ordering, which is inverted and
+    // is exactly the kind of thing reasoning gets backwards.
+    let chevron = accounts.map(|_| theme::account_switcher_button(ui));
+    let avatar = draw_circle_avatar(ui, initials);
+    let (state, chevron) = (accounts?, chevron?);
+    let plan = account_menu_plan(state, email, server_url, server_known);
+
+    let mut action = None;
+    egui::Popup::menu(&(chevron | avatar)).show(|ui| {
         ui.set_max_width(SWITCHER_MENU_WIDTH);
-        // The account this window is showing, first and not a button: the
-        // switcher's first job is to answer "whose vault am I looking at?",
-        // which the avatar's two initials can only hint at. `account_label`
-        // rather than the email directly -- an account minted on a first
-        // install has none until a sign-in fills it in, and a blank row here
-        // would be a strip of menu with nothing on it.
-        ui.label(
-            egui::RichText::new(crate::accounts::account_label(state.active()))
-                .size(12.0)
-                .color(theme::TEXT_FAINT),
-        );
-        if let Some(why) = state.blocked_reason() {
+        // Whose vault am I looking at? -- the menu's first job, and the one the
+        // avatar's two initials can only hint at. Labels, not buttons: there is
+        // nowhere to go from the account you are already on.
+        for (row, line) in plan.identity.iter().enumerate() {
+            // The address reads as the heading it is; everything under it (the
+            // server) is a subtitle, exactly the weight relationship the detail
+            // pane's own header/subtitle pair uses.
+            let text = egui::RichText::new(line).size(12.0);
+            let text = if row == 0 {
+                text.color(theme::INK)
+                    .family(egui::FontFamily::Name(theme::SEMIBOLD.into()))
+            } else {
+                text.color(theme::TEXT_FAINT)
+            };
+            ui.add(egui::Label::new(text).wrap());
+        }
+
+        ui.separator();
+        for (id, label) in &plan.switch_to {
+            if ui.button(label).clicked() {
+                action = Some(AccountAction::Switch(id.clone()));
+                ui.close();
+            }
+        }
+        if let Some(notice) = &plan.notice {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(why).size(12.0).color(theme::TEXT_SECONDARY),
+                    egui::RichText::new(notice)
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
                 )
                 .wrap(),
             );
-        } else if state.switchable().is_empty() {
-            ui.label(
-                egui::RichText::new(NO_OTHER_ACCOUNTS)
-                    .size(12.0)
-                    .color(theme::TEXT_SECONDARY),
-            );
-        } else {
-            for account in state.switchable() {
-                if ui
-                    .button(crate::accounts::account_label(account))
-                    .clicked()
-                {
-                    picked = Some(account.id.clone());
-                    ui.close();
-                }
-            }
+        }
+
+        ui.separator();
+        // The chord rides the row, the way design 2b's pill carried it.
+        if ui
+            .add(egui::Button::new(LOCK_LABEL).shortcut_text(LOCK_SHORTCUT))
+            .clicked()
+        {
+            action = Some(AccountAction::Lock);
+            ui.close();
+        }
+        if plan.can_add && ui.button(ADD_ACCOUNT).clicked() {
+            action = Some(AccountAction::Add);
+            ui.close();
+        }
+        if plan.can_remove && ui.button(REMOVE_ACCOUNT).clicked() {
+            action = Some(AccountAction::Remove);
+            ui.close();
         }
     });
-    picked
+    action
 }
 
 /// The toolbar sync pill's relative-time wording for a successful sync:
@@ -9552,13 +9862,20 @@ mod settings_gear_placement_tests {
         concat!("theme::gear_", "button(ui).clicked()").to_string()
     }
 
-    fn avatar_needle() -> String {
-        concat!("draw_circle_", "avatar(ui,").to_string()
+    /// **The strip's call, not the avatar's own definition.** The avatar used
+    /// to be drawn by `run` itself, so `draw_circle_avatar(ui,` located it in
+    /// the strip; it is drawn by `account_menu` now, and that call sits several
+    /// thousand lines BELOW the strip in this file -- so the old needle would
+    /// have gone on comparing `gear_at < avatar_at` and passing however the
+    /// strip was reordered. What is in the strip is the `account_menu` call,
+    /// which draws the chevron and then the avatar.
+    fn account_menu_needle() -> String {
+        concat!("match account_", "menu(").to_string()
     }
 
-    /// **The gear must be added BEFORE the avatar**, because the strip packs
-    /// right-to-left: `right_to_left` puts each new widget just to the LEFT
-    /// of the previous one, so the widget added earlier ends up further
+    /// **The gear must be added BEFORE the account menu**, because the strip
+    /// packs right-to-left: `right_to_left` puts each new widget just to the
+    /// LEFT of the previous one, so the widget added earlier ends up further
     /// right. The user asked for the gear to the right of the avatar, and
     /// reasoning about that inversion is precisely how it lands on the wrong
     /// side -- so it is pinned rather than argued.
@@ -9566,7 +9883,7 @@ mod settings_gear_placement_tests {
     fn the_settings_gear_sits_to_the_right_of_the_avatar() {
         let production = production();
         let gear = gear_needle();
-        let avatar = avatar_needle();
+        let menu = account_menu_needle();
 
         // Positive controls. Without these, a rename of either call would
         // leave both `find`s returning `None` and the ordering assertion
@@ -9574,8 +9891,8 @@ mod settings_gear_placement_tests {
         let gear_at = production
             .find(&gear)
             .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
-        let avatar_at = production.find(&avatar).unwrap_or_else(|| {
-            panic!("no {avatar:?} in production code -- the titlebar avatar is gone")
+        let menu_at = production.find(&menu).unwrap_or_else(|| {
+            panic!("no {menu:?} in production code -- the titlebar account menu is gone")
         });
         assert_eq!(
             production.matches(&gear).count(),
@@ -9584,9 +9901,9 @@ mod settings_gear_placement_tests {
         );
 
         assert!(
-            gear_at < avatar_at,
-            "the settings gear is added AFTER the avatar, so the right-to-left strip paints it \
-             to the LEFT of the avatar -- the opposite of what was asked for"
+            gear_at < menu_at,
+            "the settings gear is added AFTER the account menu, so the right-to-left strip \
+             paints it to the LEFT of the avatar -- the opposite of what was asked for"
         );
     }
 
@@ -9765,16 +10082,21 @@ mod auto_lock_never_wiring_tests {
     }
 }
 
-/// **The titlebar's account switcher**, driven through real frames.
+/// **The titlebar's account menu**, driven through real frames.
 ///
 /// The gear beside it could only ever be source-guarded (see
 /// `settings_gear_placement_tests`) because it *is* a click in a closure `run`
-/// owns. The switcher is not: its whole decision -- which accounts are
-/// offered, what a blocked state says, and what a click reports -- lives in
-/// `account_switcher`, which is an ordinary function a headless
-/// `egui::Context` can press. So these are click tests, and only the two
-/// things that genuinely cannot be reached (that `run`'s strip calls it, and
-/// where in that strip) are guarded by source below.
+/// owns. The menu is not: its whole decision -- what it says about the account
+/// this window is on, which other accounts are offered, what a blocked state
+/// says, which of Lock/Add/Remove are offered at all, and what a click on any
+/// of them reports -- lives in `account_menu`, which is an ordinary function a
+/// headless `egui::Context` can press. So these are click tests, and only the
+/// two things that genuinely cannot be reached (that `run`'s strip calls it,
+/// and what it does with each answer) are guarded by source below.
+///
+/// **Every row is clicked, not merely read.** This feature set has repeatedly
+/// shipped a menu whose contents were right and whose clicks reached nothing;
+/// a test that only reads the painted strings passes against exactly that.
 ///
 /// Modelled on `detail.rs`'s `Pane`, including its two hard-won details: a
 /// press *and* a release is what egui counts as a click, and **a popup only
@@ -9872,7 +10194,7 @@ mod account_switcher_tests {
     const PANE: f32 = 420.0;
 
     struct Frame {
-        picked: Option<AccountId>,
+        picked: Option<AccountAction>,
         texts: Vec<(String, egui::Rect)>,
         /// The characters really laid out, which `Galley::text()` is blind to
         /// -- see `detail.rs`'s `Frame::rendered`. A menu row elided down to
@@ -9935,12 +10257,29 @@ mod account_switcher_tests {
             );
             self.chevrons[0]
         }
+
+        /// The avatar circle, located by the initials painted in the middle of
+        /// it -- the real drawn position, not the rect the harness asked for.
+        fn avatar(&self) -> egui::Rect {
+            self.rect_of("AN")
+        }
     }
 
-    /// The harness. Draws the real `account_switcher` and nothing else, so
-    /// every string and every stroke a frame reports is the switcher's.
+    /// The harness. Draws the real `account_menu` and nothing else, so
+    /// every string and every stroke a frame reports is the menu's.
+    ///
+    /// `email`/`server_url` are the `bw status` answers the window was handed.
+    /// `None` for both is the state before they arrive -- which is the state
+    /// every pre-existing test here ran in, and is left as the default so that
+    /// the identity block's fallback to `account_label` is what they exercise.
     struct Switcher {
         ctx: egui::Context,
+        email: Option<String>,
+        server_url: Option<String>,
+        /// Whether `bw status` has answered at all -- the window's own
+        /// `icon_base_known`. `with_details` sets it, because a harness that
+        /// hands over an answer has by definition had one.
+        server_known: bool,
     }
 
     impl Switcher {
@@ -9952,7 +10291,22 @@ mod account_switcher_tests {
             let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
             theme::apply(&ctx);
             let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
-            Self { ctx }
+            Self {
+                ctx,
+                email: None,
+                server_url: None,
+                server_known: false,
+            }
+        }
+
+        /// The same harness with `bw status`'s answers in hand.
+        fn with_details(email: Option<&str>, server_url: Option<&str>) -> Self {
+            Self {
+                email: email.map(str::to_string),
+                server_url: server_url.map(str::to_string),
+                server_known: true,
+                ..Self::new()
+            }
         }
 
         fn input(events: Vec<egui::Event>) -> egui::RawInput {
@@ -9967,11 +10321,25 @@ mod account_switcher_tests {
         }
 
         fn frame(&mut self, accounts: Option<&AccountsState>, events: Vec<egui::Event>) -> Frame {
-            let mut picked = None;
+            let mut action = None;
+            let (email, server_url, server_known) =
+                (self.email.clone(), self.server_url.clone(), self.server_known);
             let output = self.ctx.run_ui(Self::input(events), |ui| {
-                picked = account_switcher(ui, accounts);
+                action = account_menu(
+                    ui,
+                    accounts,
+                    // A fixed pair of initials: what the circle carries is
+                    // `avatar_initials`' decision and has its own tests, and a
+                    // harness that recomputed it here would be a second copy of
+                    // that rule. "AN" is also two characters no menu row
+                    // contains, so `rect_of` cannot confuse the two.
+                    "AN",
+                    email.as_deref(),
+                    server_url.as_deref(),
+                    server_known,
+                );
             });
-            frame_from(picked, &output)
+            frame_from(action, &output)
         }
 
         fn idle(&mut self, accounts: Option<&AccountsState>) -> Frame {
@@ -9989,9 +10357,35 @@ mod account_switcher_tests {
             let _ = self.click(accounts, chevron.center());
             self.idle(accounts)
         }
+
+        /// The same, opened by clicking the AVATAR rather than the chevron --
+        /// which is what the user actually asked for ("on avatar icon click").
+        fn open_from_avatar(&mut self, accounts: Option<&AccountsState>) -> Frame {
+            let avatar = self.idle(accounts).avatar();
+            let _ = self.click(accounts, avatar.center());
+            self.idle(accounts)
+        }
+
     }
 
-    fn frame_from(picked: Option<AccountId>, output: &egui::FullOutput) -> Frame {
+    /// Opens a menu on a **fresh** harness and clicks the row painted from
+    /// `label`, reporting what that click asked for.
+    ///
+    /// Fresh every time, and not a method, because opening is a toggle: a
+    /// second `open` on a harness whose menu is already up closes it, and every
+    /// assertion afterwards then runs against a bare avatar.
+    fn pick(accounts: Option<&AccountsState>, label: &str) -> Option<AccountAction> {
+        let mut switcher = Switcher::new();
+        let open = switcher.open(accounts);
+        assert!(
+            open.painted(label),
+            "the open menu has no {label:?} row to click; it painted: {:?}",
+            open.strings()
+        );
+        switcher.click(accounts, open.rect_of(label).center()).picked
+    }
+
+    fn frame_from(picked: Option<AccountAction>, output: &egui::FullOutput) -> Frame {
         // ONE tree, not one call per clipped shape: a probe run per clipped
         // shape could never see a chevron whose two arms landed in different
         // ones.
@@ -10056,7 +10450,7 @@ mod account_switcher_tests {
         let picked = switcher.click(Some(&state), row.center());
         assert_eq!(
             picked.picked,
-            Some(b().id),
+            Some(AccountAction::Switch(b().id)),
             "the click on {:?} reported {:?}",
             b().email,
             picked.picked
@@ -10171,7 +10565,7 @@ mod account_switcher_tests {
         );
         // And it is really clickable, not just readable.
         let picked = switcher.click(Some(&state), open.rect_of(C).center());
-        assert_eq!(picked.picked, Some(blank().id));
+        assert_eq!(picked.picked, Some(AccountAction::Switch(blank().id)));
     }
 
     /// One account and nothing blocking is the overwhelmingly common state.
@@ -10202,21 +10596,364 @@ mod account_switcher_tests {
 
     /// `StartupAccounts::NoAccountList`: this app has no `Account` at all,
     /// because `settings.json` could not be read. There is nothing to say
-    /// about accounts, so there is no control.
+    /// about accounts, so there is no menu and no mark that opens one -- but
+    /// the circle stays, because everything left of it in the titlebar shifts
+    /// sideways if it comes and goes.
     #[test]
-    fn an_app_with_no_account_list_draws_no_switcher_at_all() {
+    fn an_app_with_no_account_list_still_wears_its_avatar_but_opens_no_menu() {
         let mut switcher = Switcher::new();
+        let idle = switcher.idle(None);
         assert!(
-            switcher.idle(None).chevrons.is_empty(),
-            "a switcher was drawn for an app that has no accounts"
+            idle.chevrons.is_empty(),
+            "a menu control was drawn for an app that has no accounts"
+        );
+        assert!(
+            idle.painted("AN"),
+            "the avatar vanished along with the menu, so the whole toolbar shifts sideways \
+             for an app whose account list could not be read; painted: {:?}",
+            idle.strings()
+        );
+        // Clicking it opens nothing and asks for nothing -- there is no
+        // `AccountsState` to build a menu from.
+        let clicked = switcher.click(None, idle.avatar().center());
+        assert_eq!(clicked.picked, None);
+        assert!(
+            !switcher.idle(None).painted(LOCK_LABEL),
+            "a menu opened for an app that has no accounts: {:?}",
+            switcher.idle(None).strings()
         );
         // The positive control: the same harness, the same frame, one
         // difference.
         assert_eq!(
             switcher.idle(Some(&available_state())).chevrons.len(),
             1,
-            "the harness draws no chevron even WITH accounts, so the assertion above is \
-             about the harness rather than about the switcher"
+            "the harness draws no chevron even WITH accounts, so the assertions above are \
+             about the harness rather than about the menu"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // The menu the user asked for: an identity block, the other accounts,
+    // then Lock / Add / Remove.
+    // ------------------------------------------------------------------
+
+    /// **The avatar is the trigger.** "on avatar icon click there should be a
+    /// list with something meaningful" — the chevron beside it was the only way
+    /// in before, and it is a 28px mark next to a 28px circle that reads as the
+    /// obvious thing to press.
+    #[test]
+    fn clicking_the_avatar_opens_the_same_menu_the_chevron_does() {
+        let state = available_state();
+
+        let mut from_avatar = Switcher::new();
+        let opened = from_avatar.open_from_avatar(Some(&state));
+        assert!(
+            opened.painted(&b().email),
+            "clicking the avatar opened nothing; painted: {:?}",
+            opened.strings()
+        );
+        assert!(opened.painted(LOCK_LABEL), "painted: {:?}", opened.strings());
+
+        // The same menu, not merely *a* menu: every row the chevron produces.
+        let mut from_chevron = Switcher::new();
+        let by_chevron = from_chevron.open(Some(&state));
+        assert_eq!(
+            opened.strings(),
+            by_chevron.strings(),
+            "the avatar and the chevron open two different menus"
+        );
+
+        // And a click on the avatar really reaches a row: `Popup::menu` is hung
+        // off the union of the two responses, so an implementation that hung it
+        // off the chevron alone would open on the avatar's click only by
+        // accident of the rects overlapping.
+        let row = opened.rect_of(&b().email);
+        assert_eq!(
+            from_avatar.click(Some(&state), row.center()).picked,
+            Some(AccountAction::Switch(b().id))
+        );
+    }
+
+    /// The identity block: **two lines, the address and the host**. There is no
+    /// display name — `bw status` reports a status, an email and a server URL
+    /// and nothing else — so the address is the heading, and nothing is
+    /// invented from it.
+    #[test]
+    fn the_menu_names_the_account_and_its_host_rather_than_a_hash() {
+        let mut switcher =
+            Switcher::with_details(Some("ana@example.com"), Some("https://nw37.example.net/api"));
+        let open = switcher.open(Some(&available_state()));
+
+        assert!(
+            open.painted("ana@example.com"),
+            "the menu does not say whose vault this is: {:?}",
+            open.strings()
+        );
+        // The HOST, scheme and path stripped, which is what the login window's
+        // footer already shows this user. A literal, not a call to
+        // `server_host` -- a test that re-derives its expectation from the
+        // function under test passes against whatever that function does.
+        assert!(
+            open.painted("nw37.example.net"),
+            "the menu does not say which host this account is on -- the one fact a \
+             self-hosted user needs from it -- or says it as a raw URL: {:?}",
+            open.strings()
+        );
+        assert!(
+            !open.painted("https://nw37.example.net/api"),
+            "the menu paints the raw `bw status` URL rather than the host treatment the \
+             login footer uses: {:?}",
+            open.strings()
+        );
+        // Drawn, not merely laid out: a host elided to "nw37.exa..." would
+        // satisfy the assertion above and tell the user nothing.
+        let drawn = open.glyphs("nw37.example.net");
+        assert!(
+            !drawn.contains('\u{2026}'),
+            "the host was elided rather than wrapped; drawn as {drawn:?}"
+        );
+        // And no name was conjured out of the local part of the address.
+        for invented in ["Ana", "ana", "Ana Novak"] {
+            assert!(
+                !open.painted(invented),
+                "the menu painted {invented:?} as though it knew a display name; nothing this \
+                 app can ask reports one: {:?}",
+                open.strings()
+            );
+        }
+    }
+
+    /// The bug behind "not some random hash": an account minted on a first
+    /// install has no stored email, so `account_label` names it by its
+    /// directory. The live `bw status` answer outranks it the moment it lands.
+    #[test]
+    fn the_menu_prefers_the_live_address_to_the_id_it_would_otherwise_show() {
+        // The active account is the blank one, so `account_label` would say C.
+        let state = AccountsState::from_blocked_reason(vec![blank(), a()], blank().id, None)
+            .expect("these accounts are not empty");
+
+        let mut cold = Switcher::new();
+        let before = cold.open(Some(&state));
+        assert!(
+            before.painted(C),
+            "control: with no details in hand the menu really does fall back to the id, which \
+             is what makes the assertion below about the details rather than about nothing: \
+             {:?}",
+            before.strings()
+        );
+
+        let mut warm = Switcher::with_details(Some("ana@example.com"), None);
+        let after = warm.open(Some(&state));
+        assert!(
+            after.painted("ana@example.com"),
+            "the menu shows the directory name even though `bw status` has answered: {:?}",
+            after.strings()
+        );
+        assert!(
+            !after.painted(C),
+            "the menu shows the account id beside the address it now knows: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **The three servers a user can be on, and the fourth state that is not
+    /// one of them.**
+    ///
+    /// > "it's either whatever self-host URL or bitwarden.com or bitwarden.eu"
+    ///
+    /// The whole table, so no case can be special-cased into working while
+    /// another silently is not — and including `vault.bitwarden.community`,
+    /// which is a self-hosted domain that *contains* `bitwarden.com` and which
+    /// a substring test tells the user is Bitwarden's cloud.
+    #[test]
+    fn the_host_line_tells_self_hosted_from_bitwarden_com_from_bitwarden_eu() {
+        // Literals, never `server_host`/`bitwarden_cloud` re-run here: a test
+        // that re-derives its expectation from the code under test passes
+        // against whatever that code does.
+        for (reported, expected) in [
+            ("https://nw37.example.net/api", "nw37.example.net"),
+            ("https://vault.bitwarden.com", "bitwarden.com"),
+            ("https://bitwarden.com", "bitwarden.com"),
+            ("https://vault.bitwarden.eu", "bitwarden.eu"),
+            ("https://bitwarden.eu", "bitwarden.eu"),
+            // The trap: a self-hosted domain that contains "bitwarden.com".
+            ("https://vault.bitwarden.community", "vault.bitwarden.community"),
+        ] {
+            let mut switcher = Switcher::with_details(Some("ana@example.com"), Some(reported));
+            let open = switcher.open(Some(&available_state()));
+            assert!(
+                open.painted(expected),
+                "an account on {reported:?} is not reported as {expected:?}; the menu \
+                 painted: {:?}",
+                open.strings()
+            );
+            assert!(
+                !open.painted(reported),
+                "the menu paints the raw `bw status` URL rather than the host treatment the \
+                 login footer uses: {:?}",
+                open.strings()
+            );
+        }
+
+        // The CLI answered and named no server: that is its own default, which
+        // is Bitwarden's cloud, and the same reading the login footer makes.
+        let mut cloud = Switcher::with_details(Some("ana@example.com"), None);
+        let cloud = cloud.open(Some(&available_state()));
+        assert!(
+            cloud.painted("bitwarden.com"),
+            "an account the CLI reported no server for says nothing about where it lives: {:?}",
+            cloud.strings()
+        );
+    }
+
+    /// **The fourth state: nothing has answered yet.** An account
+    /// `resolve_startup` minted on a first install has `server_url: None` for
+    /// the same reason it has no email, and `bw status` has not come back —
+    /// so printing `bitwarden.com` states something FALSE about a self-hosted
+    /// account that has simply not been asked about. No line, which is what
+    /// the empty avatar and the waiting favicons already do with this exact
+    /// fact.
+    #[test]
+    fn a_server_nothing_has_reported_yet_gets_no_line_rather_than_a_default() {
+        // `Switcher::new` is the un-answered harness: `server_known` is false.
+        let mut switcher = Switcher::new();
+        let open = switcher.open(Some(&available_state()));
+        for premature in ["bitwarden.com", "bitwarden.eu"] {
+            assert!(
+                !open.painted(premature),
+                "the menu claims this account is on {premature:?} before anything has said \
+                 so: {:?}",
+                open.strings()
+            );
+        }
+        // The positive control: the identity block IS there, so "no host line"
+        // is not "no menu at all".
+        assert!(open.painted(&a().email), "{:?}", open.strings());
+        assert!(open.painted(LOCK_LABEL), "{:?}", open.strings());
+
+        // And what IS stored still counts as knowing, even before `bw status`
+        // answers -- `settings.json` remembering a server is an answer.
+        let hosted = Account {
+            server_url: Some("https://nw37.example.net".to_string()),
+            ..a()
+        };
+        let state = AccountsState::from_blocked_reason(vec![hosted.clone(), b()], hosted.id, None)
+            .expect("these accounts are not empty");
+        let mut stored = Switcher::new();
+        let open = stored.open(Some(&state));
+        assert!(
+            open.painted("nw37.example.net"),
+            "a server this app already wrote down is not shown until `bw status` repeats it: \
+             {:?}",
+            open.strings()
+        );
+    }
+
+    /// Lock, and its chord, and what the click reports. **Not "log out"** —
+    /// this app has two different things that could mean, and this menu offers
+    /// both under their own names.
+    #[test]
+    fn the_menu_offers_lock_with_its_shortcut_and_reports_the_click() {
+        let mut switcher = Switcher::new();
+        let open = switcher.open(Some(&available_state()));
+        assert!(
+            open.painted("Lock"),
+            "the menu has no Lock row, and the titlebar pill it replaced is gone: {:?}",
+            open.strings()
+        );
+        assert!(
+            open.painted("CTRL+L"),
+            "the Lock row carries no shortcut hint; the chord still works but nothing on \
+             screen says so any more: {:?}",
+            open.strings()
+        );
+        // The word this app does not use, in either menu.
+        for banned in ["Log out", "Log Out", "Logout", "Sign out"] {
+            assert!(
+                !open.painted(banned),
+                "the menu offers {banned:?}, which means either Lock or Remove and says which \
+                 of the two it is not: {:?}",
+                open.strings()
+            );
+        }
+        assert_eq!(
+            pick(Some(&available_state()), "Lock"),
+            Some(AccountAction::Lock)
+        );
+    }
+
+    /// Add and Remove, and the gates on them. Removing is offered only when
+    /// `can_remove_active` says the app has somewhere to land — a row that can
+    /// only fail is worse than one that is not there.
+    #[test]
+    fn add_and_remove_are_offered_when_they_can_work_and_report_their_clicks() {
+        let mut switcher = Switcher::new();
+        let state = available_state();
+        let open = switcher.open(Some(&state));
+        assert!(
+            open.painted("Add account..."),
+            "the menu offers no way to add an account, which the user asked to sit under the \
+             list: {:?}",
+            open.strings()
+        );
+        assert!(
+            open.painted("Remove this account..."),
+            "the menu offers no removal for an account that has a survivor to settle onto: \
+             {:?}",
+            open.strings()
+        );
+        assert_eq!(
+            pick(Some(&state), "Add account..."),
+            Some(AccountAction::Add)
+        );
+        assert_eq!(
+            pick(Some(&state), "Remove this account..."),
+            Some(AccountAction::Remove)
+        );
+    }
+
+    /// The two refusals, each paired with the control above: a lone account has
+    /// nowhere to land after a removal, and a blocked state cannot reach the
+    /// survivor it would have to settle onto first. `add` survives the first
+    /// and not the second, which is what makes these two states rather than
+    /// one.
+    #[test]
+    fn a_removal_that_could_only_fail_is_not_offered_at_all() {
+        let mut lone = Switcher::new();
+        let open = lone.open(Some(&lone_state()));
+        assert!(
+            !open.painted("Remove this account..."),
+            "the only account was offered for removal, which `remove_account` refuses -- there \
+             is no profile left to point the CLI at: {:?}",
+            open.strings()
+        );
+        assert!(
+            open.painted("Add account..."),
+            "control: a lone account can still ADD one, so the menu is not simply empty below \
+             the separator: {:?}",
+            open.strings()
+        );
+        assert!(open.painted("Lock"), "control: {:?}", open.strings());
+
+        let mut blocked = Switcher::new();
+        let open = blocked.open(Some(&blocked_state()));
+        assert!(
+            !open.painted("Remove this account..."),
+            "a removal was offered while the app cannot reach the survivor to settle onto it: \
+             {:?}",
+            open.strings()
+        );
+        assert!(
+            !open.painted("Add account..."),
+            "an account was addable into one shared profile: {:?}",
+            open.strings()
+        );
+        assert!(
+            open.painted("Lock"),
+            "control: Lock is refused by nothing and is still there, so the two assertions \
+             above are about the gates rather than about a menu that stopped drawing rows: \
+             {:?}",
+            open.strings()
         );
     }
 }
@@ -10323,12 +11060,12 @@ mod titlebar_switcher_placement_tests {
                     true,
                     CloseControl::Active,
                     |ui| {
-                        // The gear FIRST, the switcher between, the avatar
-                        // last: right-to-left packing means earlier is further
-                        // right.
+                        // The gear FIRST, then `account_menu`, which draws the
+                        // chevron and then the avatar itself: right-to-left
+                        // packing means earlier is further right, so this lands
+                        // as avatar, chevron, gear from the left.
                         gear = theme::gear_button(ui).rect;
-                        let _ = account_switcher(ui, Some(&state));
-                        draw_circle_avatar(ui, "AN");
+                        let _ = account_menu(ui, Some(&state), "AN", None, None, false);
                     },
                 );
             });
@@ -10517,120 +11254,152 @@ mod switcher_wiring_tests {
     }
 
     fn switcher_needle() -> String {
-        concat!("account_switcher(ui, ", "accounts.as_ref())").to_string()
+        concat!("match account_", "menu(").to_string()
     }
 
     fn gear_needle() -> String {
         concat!("theme::gear_", "button(ui).clicked()").to_string()
     }
 
-    fn avatar_needle() -> String {
-        concat!("draw_circle_", "avatar(ui,").to_string()
-    }
-
     /// The strip packs right-to-left, so the widget added EARLIER ends up
-    /// further right: the gear first, then the switcher, then the avatar puts
-    /// the chevron between the other two.
+    /// further right: the gear first, then `account_menu`, which draws the
+    /// chevron and then the avatar and so puts the chevron between the gear
+    /// and the avatar.
     /// `the_switcher_paints_between_the_avatar_and_the_gear` measures the
     /// consequence; this is what ties that measurement to `run`.
     #[test]
-    fn the_switcher_is_added_between_the_gear_and_the_avatar() {
+    fn the_account_menu_is_added_after_the_gear_and_exactly_once() {
         let production = production();
-        let (gear, switcher, avatar) = (gear_needle(), switcher_needle(), avatar_needle());
+        let (gear, switcher) = (gear_needle(), switcher_needle());
 
-        // Positive controls. Without these, a rename of any of the three would
-        // leave the `find`s returning `None` and the ordering below comparing
-        // nothing at all.
+        // Positive controls. Without these, a rename of either would leave the
+        // `find`s returning `None` and the ordering below comparing nothing.
         let gear_at = production
             .find(&gear)
             .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
         let switcher_at = production.find(&switcher).unwrap_or_else(|| {
             panic!(
-                "no {switcher:?} in production code -- the titlebar switcher is gone, so every \
-                 click test over it is testing a function nothing calls"
+                "no {switcher:?} in production code -- the titlebar account menu is gone, so \
+                 every click test over it is testing a function nothing calls"
             )
         });
-        let avatar_at = production
-            .find(&avatar)
-            .unwrap_or_else(|| panic!("no {avatar:?} in production code -- the avatar is gone"));
         assert_eq!(
             production.matches(&switcher).count(),
             1,
-            "expected exactly one titlebar switcher; more than one and this ordering says \
+            "expected exactly one titlebar account menu; more than one and this ordering says \
              nothing"
         );
 
         assert!(
             gear_at < switcher_at,
-            "the switcher is added BEFORE the gear, so the right-to-left strip paints it to \
-             the RIGHT of the gear rather than between the gear and the avatar"
-        );
-        assert!(
-            switcher_at < avatar_at,
-            "the switcher is added AFTER the avatar, so the right-to-left strip paints it to \
-             the LEFT of the avatar -- on the far side of the account it names"
+            "the account menu is added BEFORE the gear, so the right-to-left strip paints the \
+             avatar to the RIGHT of the gear rather than to its left"
         );
     }
 
-    /// The click has to do both halves. Recording the pick without closing
-    /// leaves it sitting in a cell nobody reads until the user closes the
-    /// window by hand; closing without recording it loses the request and
-    /// reads as a window that shut for no reason.
+    /// **Every row of the menu has to REACH `main`.** This feature set has
+    /// repeatedly shipped code complete, correct and unreachable: `account_menu`
+    /// can decide all four actions perfectly and `run` can drop three of them
+    /// on the floor, with every click test in `account_switcher_tests` still
+    /// green. So each arm is sliced out by itself and watched doing its own two
+    /// halves -- record the request, then close the window -- because `main`
+    /// cannot serve any of them while this window owns the event loop.
+    ///
+    /// Sliced per arm rather than over one fixed window of bytes: a window that
+    /// overran into the next arm would let one arm satisfy another's assertion,
+    /// which is precisely the mistake being guarded against.
     #[test]
-    fn the_pick_is_recorded_and_then_closes_the_window() {
-        let body = switcher_click_body();
-        let records = concat!("*switch_to_for_", "closure.borrow_mut() = Some(picked);");
+    fn every_row_of_the_account_menu_records_its_request_and_closes_the_window() {
         let closes = concat!("ViewportCommand::", "Close");
-
-        assert!(
-            body.contains(records),
-            "the switcher's click does not record which account was picked; `main` has \
-             nothing to act on: {body:?}"
-        );
-        assert!(
-            body.contains(closes),
-            "the switcher's click does not close the window, so `main` -- which cannot tear \
-             one backend down and start another while this window owns the event loop -- can \
-             never run the switch: {body:?}"
-        );
-    }
-
-    /// **A switch is not a lock, not an expired session, and not
-    /// Preferences.** The first two run the full recovery, which
-    /// re-authenticates against the account this process is ALREADY on: folded
-    /// into either, asking to switch would prompt for the master password of
-    /// the account being left and then leave the user on it. That is why
-    /// `switch_to` is its own field, and this is what stops a later tidy-up
-    /// from collapsing the four.
-    #[test]
-    fn picking_an_account_is_neither_a_lock_nor_an_expired_session_nor_preferences() {
-        let body = switcher_click_body();
-        for (needle, consequence) in [
+        for (arm, records) in [
             (
-                concat!("*locked_for_", "closure.borrow_mut()"),
-                "sets the LOCK flag, so the switch runs the lock recovery for the account \
-                 being left",
+                "Switch(picked)",
+                concat!("*switch_to_for_", "closure.borrow_mut() = Some(picked);"),
             ),
             (
+                "Lock",
+                concat!("*locked_for_", "closure.borrow_mut() = true;"),
+            ),
+            (
+                "Add",
+                concat!("*add_account_for_", "closure.borrow_mut() = true;"),
+            ),
+            (
+                "Remove",
+                concat!("*remove_account_for_", "closure.borrow_mut() = true;"),
+            ),
+        ] {
+            let body = menu_arm_body(arm);
+            assert!(
+                body.contains(records),
+                "the account menu's {arm} row does not record its request, so `main` has \
+                 nothing to act on: {body:?}"
+            );
+            assert!(
+                body.contains(closes),
+                "the account menu's {arm} row does not close the window, so `main` -- which \
+                 cannot run it while this window owns the event loop -- never gets to: {body:?}"
+            );
+        }
+    }
+
+    /// **Four distinct outcomes, and none of them is another.** `locked` and
+    /// `needs_reauth` mean the session is gone and both run the full recovery,
+    /// which re-authenticates against the account this process is ALREADY on:
+    /// folded into either, asking to switch would prompt for the master
+    /// password of the account being left and then leave the user on it, and
+    /// asking to add would do the same for an account that does not exist yet.
+    /// `open_preferences` opens a different window entirely. Lock is the one
+    /// row that SHOULD set `locked`, and must set nothing else — it is a
+    /// security action, and it lands on sign-in for the account that was
+    /// locked rather than switching anywhere.
+    #[test]
+    fn each_row_of_the_account_menu_sets_its_own_flag_and_no_others() {
+        let flags = [
+            ("Switch(picked)", concat!("switch_to_for_", "closure")),
+            ("Lock", concat!("locked_for_", "closure")),
+            ("Add", concat!("add_account_for_", "closure")),
+            ("Remove", concat!("remove_account_for_", "closure")),
+        ];
+        // Never set by any row: Preferences is a different window, and an
+        // expired session is something a click cannot mean.
+        let never = [
+            (
                 concat!("needs_reauth_for_", "closure"),
-                "flags an expired session, so the switch runs the re-authentication path",
+                "flags an expired session, so it runs the re-authentication path",
             ),
             (
                 concat!("open_preferences_for_", "closure"),
-                "asks for the Preferences window instead of a switch",
+                "asks for the Preferences window instead",
             ),
-        ] {
+        ];
+
+        for (arm, own) in flags {
+            let body = menu_arm_body(arm);
+            // The positive control, per arm: the slice really is this row's
+            // block, which every `!contains` below would otherwise pass against.
             assert!(
-                !body.contains(needle),
-                "the switcher's click also {consequence}: {body:?}"
+                body.contains(own),
+                "the sliced body is not the {arm} row at all: {body:?}"
             );
+            for (other, _) in flags.iter().filter(|(label, _)| *label != arm) {
+                // `locked_for_closure` is a substring of nothing else here, but
+                // `add_account_for_closure` is NOT a substring of
+                // `remove_account_for_closure` either way round, so a plain
+                // `contains` is sound for every pair.
+                assert!(
+                    !body.contains(other),
+                    "the account menu's {arm} row also writes {other:?}, so two outcomes \
+                     leave this window as one: {body:?}"
+                );
+            }
+            for (needle, consequence) in never {
+                assert!(
+                    !body.contains(needle),
+                    "the account menu's {arm} row also {consequence}: {body:?}"
+                );
+            }
         }
-        // Positive control: the body really is the switcher's click and not an
-        // empty slice, which every assertion above would pass against.
-        assert!(
-            body.contains(concat!("switch_to_for_", "closure")),
-            "the sliced body is not the switcher's click at all: {body:?}"
-        );
     }
 
     /// The last hop, and the one with nothing else watching it: the cell the
@@ -10642,14 +11411,27 @@ mod switcher_wiring_tests {
     #[test]
     fn the_recorded_pick_is_read_back_out_into_the_result() {
         let production = production();
-        let read_back = concat!("let switch_to = self.switch_to.borrow_mut()", ".take();");
         let result = concat!("VaultWindowResult { locked, needs_reauth,", " open_preferences,");
 
-        assert!(
-            production.contains(read_back),
-            "the cell the switcher writes into is never read back, so the pick dies with the \
-             window"
-        );
+        for (read_back, what) in [
+            (
+                concat!("let switch_to = self.switch_to.borrow_mut()", ".take();"),
+                "the switcher's pick",
+            ),
+            (
+                concat!("let add_account = *self.add_", "account.borrow();"),
+                "the \"Add account...\" request",
+            ),
+            (
+                concat!("let remove_account = *self.remove_", "account.borrow();"),
+                "the \"Remove this account...\" request",
+            ),
+        ] {
+            assert!(
+                production.contains(read_back),
+                "the cell {what} is written into is never read back, so it dies with the window"
+            );
+        }
         let at = production
             .find(result)
             .expect("no `VaultWindowResult` construction in production code");
@@ -10659,10 +11441,17 @@ mod switcher_wiring_tests {
         // the construction (`account_details` follows it), and a needle that
         // spelled the closing brace would fail for a reason that has nothing
         // to do with the switcher the moment another field is appended.
-        assert!(
-            construction.contains(concat!("switch", "_to, ")),
-            "the result is built without the switcher's answer: {construction:?}"
-        );
+        for field in [
+            concat!("switch", "_to, "),
+            concat!("add_", "account, "),
+            concat!("remove_", "account, "),
+        ] {
+            assert!(
+                construction.contains(field),
+                "the result is built without {field:?}, so that row's answer never leaves the \
+                 window: {construction:?}"
+            );
+        }
         // Positive control: the construction really was isolated, rather than
         // being the whole rest of the file.
         assert!(
@@ -10671,19 +11460,33 @@ mod switcher_wiring_tests {
         );
     }
 
-    /// The body of the switcher's `if let Some(picked) = ...` block, depth-
-    /// counted to its closing brace.
-    fn switcher_click_body() -> &'static str {
+    /// The body of one arm of the strip's `match account_menu(...)`, depth-
+    /// counted from that arm's own `{` to its matching `}`.
+    ///
+    /// Depth-counted rather than taken as a fixed number of bytes: a byte
+    /// window long enough to hold one arm is long enough to overrun into the
+    /// next, and the failure that produces is one arm quietly satisfying
+    /// another's assertion.
+    ///
+    /// **Searched from the `match` rather than from the top of the file**, so a
+    /// second `AccountAction::Lock` somewhere else in production cannot be what
+    /// gets sliced.
+    fn menu_arm_body(arm: &str) -> &'static str {
         let production = production();
         let switcher = switcher_needle();
         let at = production.find(&switcher).unwrap_or_else(|| {
-            panic!("no {switcher:?} in production code -- the titlebar switcher is gone")
+            panic!("no {switcher:?} in production code -- the titlebar account menu is gone")
         });
-        let after_open = &production[at..];
-        let open = after_open
-            .find('{')
-            .expect("the switcher's click has no block to slice");
-        let after_open = &after_open[open + 1..];
+        let region = &production[at..];
+        // Single-line needle, and split so it cannot match this line itself.
+        let head = format!("{}{arm}) => {{", concat!("Some(AccountAction", "::"));
+        let arm_at = region.find(&head).unwrap_or_else(|| {
+            panic!(
+                "the strip's `match` has no {head:?} arm -- the {arm} row decides something \
+                 nothing acts on"
+            )
+        });
+        let after_open = &region[arm_at + head.len()..];
 
         let mut depth = 1usize;
         for (offset, ch) in after_open.char_indices() {
@@ -10695,8 +11498,13 @@ mod switcher_wiring_tests {
                         let body = &after_open[..offset];
                         assert!(
                             !body.trim().is_empty(),
-                            "the switcher's click block is empty, so every assertion over it \
-                             would pass against nothing"
+                            "the {arm} arm's block is empty, so every assertion over it would \
+                             pass against nothing"
+                        );
+                        assert!(
+                            body.len() < region.len() / 4,
+                            "control: the slice isolated one arm rather than running on into \
+                             the rest of the strip"
                         );
                         return body;
                     }
@@ -10704,7 +11512,7 @@ mod switcher_wiring_tests {
                 _ => {}
             }
         }
-        panic!("the switcher's click block is never closed");
+        panic!("the {arm} arm's block is never closed");
     }
 }
 
@@ -10920,6 +11728,8 @@ mod account_details_tests {
             needs_reauth: Rc::new(RefCell::new(false)),
             open_preferences: Rc::new(RefCell::new(false)),
             switch_to: Rc::new(RefCell::new(None)),
+            add_account: Rc::new(RefCell::new(false)),
+            remove_account: Rc::new(RefCell::new(false)),
             account_details: Rc::new(RefCell::new(Some(details.clone()))),
             last_geometry: Rc::new(RefCell::new(None)),
             // No path, so `finish` writes no file: this test is about the
@@ -10941,6 +11751,8 @@ mod account_details_tests {
             needs_reauth: Rc::new(RefCell::new(false)),
             open_preferences: Rc::new(RefCell::new(false)),
             switch_to: Rc::new(RefCell::new(None)),
+            add_account: Rc::new(RefCell::new(false)),
+            remove_account: Rc::new(RefCell::new(false)),
             account_details: Rc::new(RefCell::new(None)),
             last_geometry: Rc::new(RefCell::new(None)),
             settings_path: None,
@@ -10982,18 +11794,23 @@ mod account_details_tests {
         );
     }
 
-    /// The avatar is drawn unconditionally.
+    /// The avatar is drawn unconditionally, and shows `avatar_initials`.
     ///
     /// It used to be inside `if let Some(email) = &account_email`, which is
     /// correct-looking and, once the email can arrive a second into the
     /// session, means the toolbar RELAYOUTS while the user is looking at it:
-    /// the Lock pill, the sync pill and the title all slide sideways when a
-    /// 28px circle appears between them.
+    /// the sync pill and the title slide sideways when a 28px circle appears
+    /// between them.
+    ///
+    /// Source-level for the strip's half only. `account_menu` now owns the
+    /// circle, and that it draws one even for an app with no account list is
+    /// pressed rather than read -- see
+    /// `an_app_with_no_account_list_still_wears_its_avatar_but_opens_no_menu`.
     #[test]
     fn the_toolbar_reserves_the_avatar_rather_than_growing_one_later() {
         let production = production();
         assert!(
-            production.contains(concat!("draw_circle_avatar(ui, &avatar_", "initials(")),
+            production.contains(concat!("&avatar_initials(account_email", ".as_deref()),")),
             "the titlebar avatar is no longer painted through `avatar_initials`, so nothing \
              says what it shows before the account details arrive"
         );
@@ -11054,5 +11871,47 @@ mod account_details_tests {
                  window reads"
             );
         }
+    }
+
+    /// **The account menu is handed the same fact, not a fresh reading of it.**
+    /// Its host line has the identical problem the favicons have: "no server
+    /// URL" means Bitwarden's own cloud once `bw status` has answered and means
+    /// nothing at all before it has. `account_host_line`'s three cases are
+    /// tested by clicking, but which value the strip passes for `server_known`
+    /// is inside `run`'s closure, which no harness here can call -- and `true`
+    /// hard-coded there compiles and makes every one of those tests go on
+    /// passing while the real window claims a first-run account is on
+    /// Bitwarden's cloud.
+    #[test]
+    fn the_account_menu_waits_for_the_server_url_the_way_the_favicons_do() {
+        let production = production();
+        let call = concat!("match account_", "menu(");
+        let at = production
+            .find(call)
+            .expect("the titlebar account menu is gone");
+        let rest = &production[at..];
+        // Forward from the call to its closing paren, comments stripped: the
+        // comment above the argument names `icon_base_known` out loud, and a
+        // window that included it would pass against an argument that had been
+        // changed to `true`.
+        let end = rest.find(") {").expect("the account menu call is never closed");
+        let args = code_only(&rest[..end]);
+        assert!(
+            args.contains("icon_base_known"),
+            "the account menu is not handed `icon_base_known`, so its host line answers \
+             \"which server?\" from a second reading of a fact this window already has one \
+             name for: {args:?}"
+        );
+        assert!(
+            !args.contains("true"),
+            "the account menu is told the server is known unconditionally, so a first-run \
+             account -- which has no server URL and has not been asked about -- is reported \
+             as being on Bitwarden's cloud: {args:?}"
+        );
+        assert!(
+            args.len() < 1200,
+            "control: the slice isolated the call's arguments rather than running on into the \
+             rest of the strip"
+        );
     }
 }
