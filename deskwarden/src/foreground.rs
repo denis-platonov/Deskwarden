@@ -365,6 +365,30 @@ mod tests {
         }
     }
 
+    /// A module's source with its comments cut off, so a needle counted below
+    /// can only be satisfied by code.
+    ///
+    /// The same helper `app_window.rs`'s source-position tests use, and for the
+    /// same reason: `include_str!` hands back the file's raw bytes, so a guard
+    /// that counts `with_always_on_top(` was satisfiable by writing that text
+    /// into a doc comment. The M2E escape (delist `loading_ui` from
+    /// [`RAISING_SITES`], excuse it, delete its `raise_window` call) went green
+    /// with one planted line reading
+    /// `/// Kept above everything with with_always_on_top( in the builder.`
+    /// Everything from the first `//` on a line is dropped, which also takes
+    /// the tail of a line whose *string literal* contains `//` -- accepted,
+    /// because the needles here name Rust call syntax and never a URL.
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn window(hwnd: isize, title: &str) -> OwnWindow {
         OwnWindow {
             hwnd,
@@ -552,6 +576,32 @@ mod tests {
     /// compared with the module list parsed out of `lib.rs` without a second
     /// mapping in between (`vault_window` is the only one where those differ,
     /// and it is exactly the row a hand-written mapping would get wrong).
+    /// The modules that put a window on screen. Each must then appear in
+    /// exactly one of [`RAISING_SITES`] (it raises, and
+    /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front` holds
+    /// that) or [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] (it does
+    /// not, and carries the reason). This list used to claim to be "the modules
+    /// that test covers", which was false: `overlay_ui` was in it and covered
+    /// by nothing.
+    ///
+    /// At this scope rather than inside
+    /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
+    /// where it used to live, so that
+    /// `only_one_window_of_this_process_can_exist_at_a_time` can count against
+    /// it. That test's coverage control used to re-derive its expectation from
+    /// the two tables it was chaining, which made it unfailable; this list is
+    /// reconciled with `lib.rs` by a different test, so counting against it is
+    /// a claim that can actually come out false.
+    const OPENS_WINDOWS: [&str; 7] = [
+        "app_window",
+        "loading_ui",
+        "login_ui",
+        "overlay_ui",
+        "picker_ui",
+        "prefs_ui",
+        "vault_window",
+    ];
+
     const RAISING_SITES: [(&str, &str, &str, usize); 6] = [
         ("vault_window", include_str!("vault_window/mod.rs"), "WINDOW_TITLE", 1),
         // The single startup window: sign-in, spinner and vault in one
@@ -676,23 +726,6 @@ mod tests {
     /// lists and nothing in none.
     #[test]
     fn every_module_in_this_crate_is_classified_as_opening_windows_or_not() {
-        /// The modules that put a window on screen. Each must then appear in
-        /// exactly one of [`RAISING_SITES`] (it raises, and
-        /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front`
-        /// holds that) or
-        /// [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] (it does not, and
-        /// carries the reason). This list used to claim to be "the modules that
-        /// test covers", which was false: `overlay_ui` was in it and covered by
-        /// nothing.
-        const OPENS_WINDOWS: [&str; 7] = [
-            "app_window",
-            "loading_ui",
-            "login_ui",
-            "overlay_ui",
-            "picker_ui",
-            "prefs_ui",
-            "vault_window",
-        ];
         /// Everything else. Listed rather than inferred, because "this module
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
@@ -820,6 +853,15 @@ mod tests {
             // appears exactly once in `overlay_ui.rs` and nowhere else in this
             // crate, so this both holds the real excuse to its claim and fails
             // any module moved here that cannot make it.
+            //
+            // **Counted over `code()`, not the raw file.** Against the raw
+            // `include_str!` bytes the whole M2E escape went green with one
+            // extra planted line -- a doc comment mentioning
+            // `with_always_on_top(` -- because a comment can hold the needle
+            // as well as a call can. Stripping comments first means only a
+            // real builder call satisfies this, and only a real call site
+            // trips the `raise_window(` count below.
+            let source = code(source);
             assert_eq!(
                 source.matches("with_always_on_top(").count(),
                 1,
@@ -836,16 +878,41 @@ mod tests {
                  {reason:?}"
             );
         }
-        // Positive control for that last needle: it can find a raise where one
-        // really is, so a count of 0 above is an absence and not a typo.
+        // Positive control for that last needle, through the same
+        // comment-stripping the loop uses: it can find a raise where one
+        // really is, so a count of 0 above is an absence and not a typo -- and
+        // `code()` does not eat the real calls while eating the fake ones.
         assert_eq!(
             RAISING_SITES
                 .iter()
-                .filter(|(_, source, ..)| source.contains("raise_window("))
+                .filter(|(_, source, ..)| code(source).contains("raise_window("))
                 .count(),
             RAISING_SITES.len(),
             "control: every raising site's source really does contain the needle this counted \
              to zero in the exempt ones"
+        );
+        // And a control on `code()` itself, in both directions -- a stripper
+        // that stripped everything, or nothing, would make one of the two
+        // counts above vacuous. The first line is the exact plant that took
+        // the M2E escape green.
+        let sample = code(concat!(
+            "/// Kept above everything with with_always_on_top( in the builder.\n",
+            "    let builder = builder.with_always_on_top();\n",
+            "    raise_window(WINDOW_TITLE); // and this trailing one goes too\n",
+        ));
+        assert_eq!(
+            sample.matches("with_always_on_top(").count(),
+            1,
+            "control: `code()` drops the needle written in a comment and keeps the one written \
+             as a call -- if it dropped both, the exemption's always-on-top check passes for \
+             every module; if it dropped neither, a comment is still enough to satisfy it: \
+             {sample:?}"
+        );
+        assert_eq!(
+            sample.matches("raise_window(").count(),
+            1,
+            "control: `code()` strips a trailing comment without eating the code before it: \
+             {sample:?}"
         );
     }
 
@@ -897,15 +964,56 @@ mod tests {
                     .iter()
                     .map(|(module, source, _)| (*module, *source)),
             );
-        // Positive control: the loop below really walks every window module,
-        // rather than a short list whose absent members are unchecked.
+        // Positive control: the loop below really walks every window module.
+        //
+        // Counted against [`OPENS_WINDOWS`] and not against the lengths of the
+        // two tables being chained. That is what this used to do --
+        // `sources.count() == RAISING_SITES.len() + EXCUSED.len()` -- and
+        // `sources` is *built* by chaining exactly those two iterators, so it
+        // re-derived its expectation from the thing under test and could not
+        // come out false for any edit at all. `OPENS_WINDOWS` is an
+        // independently written list, reconciled with `lib.rs`'s `pub mod`
+        // lines by
+        // `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
+        // so a window module dropped from both tables now fails here too.
+        let walked: Vec<&str> = sources.clone().map(|(module, _)| module).collect();
+        for module in OPENS_WINDOWS {
+            assert!(
+                walked.contains(&module),
+                "`{module}` opens a window but no source for it reaches the checks below, so \
+                 nothing says it cannot open a second one off the main thread: {walked:?}"
+            );
+        }
         assert_eq!(
-            sources.clone().count(),
-            RAISING_SITES.len() + OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE.len(),
-            "control: one source per window-opening module"
+            walked.len(),
+            OPENS_WINDOWS.len(),
+            "the window modules walked here do not match `OPENS_WINDOWS` one for one -- either \
+             a module is listed in both raise tables, or one is checked here that is not \
+             classified as opening a window at all: {walked:?}"
         );
 
         for (module, source) in sources {
+            // Control on the string, not on the needle: both counts below are
+            // zero, and a zero over the wrong string -- an `include_str!`
+            // pointed elsewhere, or a table row whose module stopped opening a
+            // window -- is indistinguishable from a zero over the right one.
+            // Every window-opening module in this crate builds a viewport.
+            //
+            // The two counts below are deliberately NOT taken over `code()`,
+            // unlike the exemption's needles: those must be 1, so a comment
+            // holding the needle is an escape; these must be 0, so a comment
+            // holding it is a false alarm and nothing worse. Raw is the
+            // stricter side of that trade, and the strict side is the one a
+            // zero-count guard wants. (The cost is that documenting
+            // `with_any_thread` by name inside a window module fails this test
+            // -- which is a build failure that says exactly what it means.)
+            assert!(
+                source.contains("ViewportBuilder"),
+                "control: `{module}`'s source does not build a viewport, so it is either not 
+                 the file this thinks it is or not a window-opening module -- and the two 
+                 counts below are then zero for a reason that has nothing to do with the 
+                 invariant"
+            );
             assert_eq!(
                 source.matches("with_any_thread").count(),
                 0,
@@ -925,17 +1033,73 @@ mod tests {
             );
         }
 
-        // Positive controls on both needles: they can find what they counted
-        // to zero, so the zeros above are absences and not typos.
-        assert_eq!(
-            "builder.with_any_thread(true);".matches("with_any_thread").count(),
-            1,
-            "control: the `with_any_thread` needle matches a real call"
-        );
-        assert_eq!(
-            "ctx.show_viewport_deferred(id, b, f);".matches("show_viewport").count(),
-            1,
-            "control: the `show_viewport` needle matches a real call"
+        // **The controls on the two needles, and why they are not `matches`
+        // against a string literal.**
+        //
+        // They used to be exactly that: `"builder.with_any_thread(true);"
+        // .matches("with_any_thread").count() == 1`. That proved `str::matches`
+        // works on a literal written three lines above it in this same file --
+        // it could not fail for any edit to this crate, and it never showed the
+        // needle naming anything real. Worse, it read as coverage.
+        //
+        // What the zeros above actually depend on is that these two needles
+        // name the *real* spellings of two APIs, and that the strings they are
+        // counted over are the real sources.
+        //
+        // Neither can be controlled the way the rest of this file controls a
+        // needle -- by finding it somewhere it really occurs -- because "this
+        // crate contains no such call" is the invariant itself: a source-text
+        // control would have to match a call that must not exist. What the
+        // previous controls did instead was count each needle in a string
+        // literal written three lines above them. That proved `str::matches`
+        // works on a literal in the same file. It could not fail for any edit
+        // to this crate, and it read as coverage.
+        //
+        // (They also cannot be turned into scans of `foreground.rs` itself:
+        // the literal `with_any_thread` occurs in this file, so adding it to
+        // the scanned set would fail the zero above on this test's own text.)
+        //
+        // So the two halves are controlled separately, and both can fail:
+        //
+        // 1. **The sources are real** -- controlled in the loop above, by a
+        //    needle every window-opening module must contain. An
+        //    `include_str!` pointed at the wrong file, or a table row whose
+        //    source no longer opens a window, is a zero for the wrong reason.
+        // 2. **`show_viewport_deferred` is the real API name** -- controlled
+        //    by the compiler in `_the_show_viewport_needle_names_a_real_api`
+        //    below, which calls it. A rename upstream is then a build failure
+        //    here, not a needle that counts to zero forever.
+        //
+        // `with_any_thread` gets no compiler control, and that is a gap worth
+        // naming rather than papering over: it is a `winit` trait method, and
+        // `winit` is not a direct dependency of this crate (`eframe` re-exports
+        // `EventLoopBuilder` and `UserEvent`, but not
+        // `platform::windows::EventLoopBuilderExtWindows`, so the method cannot
+        // be named here). Taking a dependency on `winit` to hold a test needle
+        // was rejected as the larger risk -- it pins a second version of a
+        // crate whose renderer version conflicts are already documented on this
+        // crate's `eframe` dependency. What holds it instead is that the same
+        // method name appears in `NativeOptions::event_loop_builder`'s own
+        // documentation, which is what anyone adding the call would read.
+        let _control = _the_show_viewport_needle_names_a_real_api;
+    }
+
+    /// **The compiler-checked half of the `show_viewport` needle in
+    /// [`only_one_window_of_this_process_can_exist_at_a_time`].**
+    ///
+    /// Never called -- referenced from that test only so it cannot be dropped
+    /// without the test noticing. Its whole content is that it compiles:
+    /// `show_viewport_deferred` is named here in call position on the real
+    /// `egui` context, so if that API is renamed upstream this file stops
+    /// building instead of silently counting a stale needle to zero in every
+    /// window module forever.
+    #[allow(dead_code)]
+    fn _the_show_viewport_needle_names_a_real_api() {
+        let ctx = eframe::egui::Context::default();
+        ctx.show_viewport_deferred(
+            eframe::egui::ViewportId::ROOT,
+            eframe::egui::ViewportBuilder::default(),
+            |_, _| {},
         );
     }
 

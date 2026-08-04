@@ -1258,12 +1258,29 @@ pub struct LoginForm {
 /// the form is move-captured by the frame closure and that function can no
 /// longer reach it after the event loop returns.
 ///
+/// **Every `String` the form owns, not only `password`.** `password` is the
+/// only field that holds the master password today, and for a while this body
+/// wiped only that one. What made that the wrong shape is not a leak that
+/// exists -- it is that nothing anywhere would notice one: a form whose
+/// `server_url` or `email` or `error` had picked up a copy of the plaintext
+/// (an error message built from the wrong variable, a "remember this" that
+/// assigned the wrong field) would be released to the allocator in the clear
+/// with the whole suite green, because the backstop only looked at one field.
+/// Wiping all four costs three `zeroize` calls on strings that are almost
+/// always short or empty, and makes the guarantee this docstring states true of
+/// the struct rather than of one of its fields.
+///
 /// Tested by `password_lifetime_tests`, which watches the global allocator for
 /// the plaintext going past on the way out -- emptying this body makes those
 /// tests fail.
 impl Drop for LoginForm {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.server_url.zeroize();
+        self.email.zeroize();
+        if let Some(error) = self.error.as_mut() {
+            error.zeroize();
+        }
     }
 }
 
@@ -4639,9 +4656,35 @@ mod auth_in_flight_tests {
 /// with no destructor, so touching it from inside `dealloc` cannot re-enter the
 /// allocator.
 ///
-/// Every assertion below is paired with a positive control that a bare `String`
-/// on the same path IS caught -- otherwise "the form did not leak" would be
-/// indistinguishable from a watcher that never sees anything.
+/// Every allocator-watch assertion below is paired with a positive control
+/// that a bare `String` on the same path IS caught -- otherwise "the form did
+/// not leak" would be indistinguishable from a watcher that never sees
+/// anything. That promise was false as written for one revision: the success
+/// test was the only one of the three without such a control, and that is
+/// precisely the test in which two vacuities then went unnoticed. A `!leaked`
+/// assertion whose control is missing is not a weaker guard, it is no guard.
+///
+/// **Two ways a watch assertion can be vacuous, and how each is closed here.**
+///
+/// * The **instrument** sees nothing -- a watch that was never armed, or a
+///   probe short enough that `dealloc`'s size filter skips the block. Closed by
+///   the bare-`String` control at the head of each test.
+/// * The **subject** is nothing -- the buffer handed to the measured closure is
+///   already empty, so its drop frees no memory and no probe could fire whatever
+///   the code did. This is what a wipe that *reallocates* produces: it frees the
+///   plaintext-bearing allocation inside `apply_auth_result`, before any watch
+///   is armed, and leaves behind a zero-capacity `String`. Closed in
+///   `a_successful_sign_in_wipes_the_password_while_the_window_stays_open` by
+///   arming the watch around the `apply_auth_result` call itself -- which tests
+///   the property this module is named for rather than a proxy for it -- and
+///   again by asserting the taken buffer still has capacity before it is
+///   measured.
+///
+/// **What is watched, and what is only forgotten.** The two `Drop` tests
+/// measure the whole form; the success test measures every `String` field taken
+/// out of the form, and forgets the rest, which after that take is three `Copy`
+/// fields. An exhaustive (non-binding) destructuring pattern in that test makes
+/// a newly added field a compile error there rather than a silent hole.
 ///
 /// **What this cannot prove**, and the README says so too: `Zeroize for String`
 /// wipes the allocation the `String` owns *now*. A `TextEdit` that grew the
@@ -4725,6 +4768,32 @@ mod password_lifetime_tests {
         String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8")
     }
 
+    /// A form with the probe in **every** `String` field, not only `password`.
+    ///
+    /// The two `Drop` tests below drop the whole form, so what they can see is
+    /// bounded by what `Drop` wipes. While that impl zeroized `password` alone,
+    /// a copy of the master password in any other field was released to the
+    /// allocator in the clear on both of those exits with the whole suite
+    /// green. Filling all four is what makes the other three `zeroize` calls in
+    /// `impl Drop for LoginForm` load-bearing: delete any one of them and the
+    /// field it wiped frees its buffer with the probe still in it.
+    ///
+    /// The exhaustive destructuring in
+    /// `a_successful_sign_in_wipes_the_password_while_the_window_stays_open` is
+    /// what stops a newly added `String` field from quietly missing this list:
+    /// it is a compile error there until someone decides.
+    fn form_with_the_probe_in_every_string_field() -> LoginForm {
+        LoginForm {
+            server_choice: ServerChoice::default(),
+            server_url: probe_password(),
+            email: probe_password(),
+            password: probe_password(),
+            reveal_password: false,
+            enable_hello: false,
+            error: Some(probe_password()),
+        }
+    }
+
     /// **The exit the `close_on_success: false` host never takes.** A window
     /// the user typed a master password into and then closed: no answer ever
     /// arrives, so `apply_auth_result` never runs and `Drop` is the only thing
@@ -4738,12 +4807,13 @@ mod password_lifetime_tests {
              assertion below is about an instrument that sees nothing"
         );
 
-        let mut form = LoginForm::default();
-        form.password = probe_password();
+        let form = form_with_the_probe_in_every_string_field();
         assert!(
             !plaintext_reached_the_allocator(move || drop(form)),
             "a LoginForm released the plaintext master password to the allocator -- this is the \
-             exit taken by every user who typed a password and then closed the window"
+             exit taken by every user who typed a password and then closed the window. Every \
+             String field of the form holds the probe here, so this fires for a copy left in \
+             `server_url`, `email` or `error` just as it does for `password` itself"
         );
     }
 
@@ -4766,8 +4836,7 @@ mod password_lifetime_tests {
              below is about an instrument that sees nothing"
         );
 
-        let mut form = LoginForm::default();
-        form.password = probe_password();
+        let form = form_with_the_probe_in_every_string_field();
         assert!(
             !plaintext_reached_the_allocator(move || {
                 let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
@@ -4775,7 +4844,8 @@ mod password_lifetime_tests {
                     panic!("deliberate: unwinding past a live master password");
                 }));
             }),
-            "an unwind out of the login window released the plaintext master password"
+            "an unwind out of the login window released the plaintext master password (from \
+             any String field of the form -- all four hold the probe here)"
         );
     }
 
@@ -4794,11 +4864,58 @@ mod password_lifetime_tests {
     /// nothing -- and then look at the form that is still alive.
     #[test]
     fn a_successful_sign_in_wipes_the_password_while_the_window_stays_open() {
+        // **The positive control this test spent three revisions without.**
+        // Its two siblings each have one; this one did not, which is the
+        // structural reason both vacuities below survived for as long as they
+        // did. Everything measured here is measured with an instrument that
+        // has just been shown to see a plain `String`'s buffer go past.
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: an ordinary String's plaintext went past the allocator unnoticed, so \
+             every assertion below is about an instrument that sees nothing"
+        );
+
         let mut form = LoginForm::default();
         form.password = probe_password();
 
-        let outcome = apply_auth_result(Ok("session-token".to_string()), &mut form);
-        let AuthOutcome::Succeeded(token) = outcome else {
+        // Built before the watch is armed, so this String's own allocation is
+        // nothing the measurement below is about.
+        let answer = Ok("session-token".to_string());
+
+        // **The stated property, measured directly: signing in does not
+        // release the plaintext to the allocator.**
+        //
+        // This used to be measured only after the fact, on the buffer left in
+        // the field -- which says nothing at all about a wipe that *frees* the
+        // plaintext-bearing allocation instead of overwriting it. Each of
+        // `form.password = String::new()`,
+        // `mem::replace(&mut form.password, String::new())` and
+        // `clear(); shrink_to_fit()` does exactly that; each is a leak lasting
+        // the whole vault session on the `close_on_success: false` host; and
+        // each left the entire suite green. The free happened in here, before
+        // anything was armed, and the `mem::take` afterwards then yielded a
+        // zero-capacity String whose drop deallocates nothing, so the
+        // assertion at the end of this test passed vacuously. The third
+        // variant is the one to fear -- `clear()` plus `shrink_to_fit()` reads
+        // as an honest tidy-up.
+        //
+        // Arming around the call is free of unrelated traffic because the `Ok`
+        // arm allocates and frees nothing of its own: it assigns `None` over an
+        // `error` that is already `None`, moves the token out of `answer`, and
+        // zeroizes in place.
+        let mut outcome = None;
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                outcome = Some(apply_auth_result(answer, &mut form));
+            }),
+            "the successful sign-in released the plaintext master password to the allocator. A \
+             wipe that REPLACES the field (`= String::new()`, `mem::replace`, or `clear()` \
+             followed by `shrink_to_fit()`) frees the buffer the plaintext is in rather than \
+             overwriting it, and the freed bytes are still the password"
+        );
+
+        let Some(AuthOutcome::Succeeded(token)) = outcome else {
             panic!("a successful `bw unlock` produced no token, so this test proves nothing");
         };
         // The ordering the wipe depends on: the token is already out before
@@ -4813,28 +4930,68 @@ mod password_lifetime_tests {
              plaintext living for the whole vault session: {:?}",
             form.password
         );
+
         // ...and it was wiped, not merely truncated: the bytes are gone from
-        // the allocation the String still owns.
+        // the allocation the String still owns. This is the in-place half --
+        // `zeroize()` replaced by `clear()`, `truncate(0)` or `drain(..)`
+        // leaves the plaintext sitting in a buffer that is freed later, when
+        // the form finally dies.
         //
-        // **Why the buffer is taken out of the form first.** This assertion
+        // **Why the buffers are taken out of the form first.** This assertion
         // used to measure `drop(form)`, which runs `impl Drop for LoginForm`
         // -- and that zeroizes. The closure being measured performed the very
         // wipe it was trying to detect, so it could not fail for the reason it
-        // states: replacing the success arm with `form.password.clear()`, a
-        // truncate that leaves the plaintext in the allocation for the whole
-        // vault session on the `close_on_success: false` host, left this test
-        // and the entire suite green. `mem::take` moves the String -- the same
-        // allocation, untouched -- out from under `Drop`, and `mem::forget`
-        // then makes sure nothing else wipes it before the free that is being
-        // watched. What leaks is the form's other fields, which no assertion
-        // above still reads: the token was checked already, and
-        // `form.password` was read for emptiness before the take.
-        let stolen = std::mem::take(&mut form.password);
+        // states. `mem::take` moves each String -- the same allocation,
+        // untouched -- out from under `Drop`, and `mem::forget` then makes sure
+        // nothing else wipes them before the frees that are being watched.
+        //
+        // **And EVERY String field is taken, not just `password`.** With only
+        // `password` taken, `mem::forget` meant the other three were never
+        // freed at all, so no probe could see them even in principle: adding
+        // `form.server_url = form.password.clone();` to the success arm left
+        // the whole suite green. The exhaustive pattern below is the guard
+        // against that returning -- it binds nothing, and exists so that adding
+        // a field to `LoginForm` fails to compile here until whoever added it
+        // decides whether it belongs in `stolen`. (By reference, because
+        // `LoginForm` has a `Drop` impl and nothing can be moved out of it.)
+        let LoginForm {
+            server_choice: _,
+            server_url: _,
+            email: _,
+            password: _,
+            reveal_password: _,
+            enable_hello: _,
+            error: _,
+        } = &form;
+        let stolen = [
+            std::mem::take(&mut form.password),
+            std::mem::take(&mut form.server_url),
+            std::mem::take(&mut form.email),
+            form.error.take().unwrap_or_default(),
+        ];
         std::mem::forget(form);
+
+        // Control on the measurement, and the second thing closing the
+        // reallocating wipes: a `stolen[0]` with no capacity is a `String`
+        // whose drop frees nothing at all, so `!plaintext_reached_the_allocator`
+        // would hold for the emptiest possible reason. A real wipe leaves the
+        // allocation in place and only overwrites what is in it.
+        assert!(
+            stolen[0].capacity() >= PROBE.len(),
+            "control: the password buffer taken out of the form has capacity {} -- the \
+             allocation the probe would have found was already freed inside \
+             `apply_auth_result`, so dropping this String deallocates nothing and the assertion \
+             below cannot fail",
+            stolen[0].capacity()
+        );
+
         assert!(
             !plaintext_reached_the_allocator(move || drop(stolen)),
-            "the successful sign-in only emptied the String's length -- the plaintext is still \
-             sitting in the allocation and reaches the allocator when the form finally dies"
+            "a String field of the form still holds the plaintext master password. If it is \
+             `password`, the successful sign-in only emptied the String's length and the \
+             plaintext is still in the allocation, reaching the allocator when the form finally \
+             dies. If it is any other field, a copy of the master password was made into it and \
+             lives exactly as long"
         );
     }
 }
