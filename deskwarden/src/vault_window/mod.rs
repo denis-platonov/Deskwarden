@@ -14,7 +14,9 @@ pub mod sidebar;
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
 use crate::fill_stats::FillStats;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
-use crate::login_ui::{draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics};
+use crate::login_ui::{
+    draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics, CloseControl,
+};
 use crate::settings::AutoLock;
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultError, VaultItem};
@@ -1182,116 +1184,126 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
         // sidebar's VAULT/FOLDERS rows.
         let saved_item_spacing_y = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
-        match draw_window_chrome_with_extra(ui, WINDOW_TITLE, ChromeMetrics::VAULT, true, |ui| {
-            // Right-to-left, so this reads left-to-right (nearest the title,
-            // furthest from the window controls, first) as: Sync status
-            // pill, "Lock CTRL+L", avatar, account switcher, settings gear.
-            // Added here in the
-            // opposite order (the gear closest to the window controls, sync
-            // pill furthest) since `right_to_left` packs each new widget
-            // just to the left of the previous one.
-            //
-            // The gear is therefore added FIRST precisely because it is
-            // asked to sit to the RIGHT of the avatar -- in this layout,
-            // earlier is further right. `the_settings_gear_sits_to_the_right_
-            // of_the_avatar` asserts the painted rects rather than this
-            // order, because reasoning about it is exactly how it would end
-            // up on the wrong side.
-            //
-            // Design 2b specifies no settings affordance at all (there is no
-            // gear, cog or "Settings" anywhere in `Deskwarden.dc.html`), so
-            // this is the user's direction rather than the design's, the
-            // same way the detail pane's star, kebab and eye were. What it
-            // does take from 2b is its metrics: `theme::gear_button` is 28px
-            // square, matching the Lock pill's height and the avatar's
-            // diameter beside it.
-            if theme::gear_button(ui).clicked() {
-                // The same two-step dance Lock does immediately below -- set
-                // the flag, then ask the window to close -- and for a reason
-                // specific to this control: `prefs_ui::run` is its own
-                // `eframe` window on this same thread, and eframe cannot
-                // nest one native event loop inside another. Calling it from
-                // inside this frame closure is not an option, so the request
-                // has to leave this window entirely and be served by the
-                // caller once this loop has ended.
-                *open_preferences_for_closure.borrow_mut() = true;
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            // **Between the gear and the avatar, and therefore added between
-            // them**, since this strip packs right-to-left: the mark that
-            // opens the account menu belongs against the account it names, and
-            // the conventional place for a disclosure chevron is the avatar's
-            // right-hand side. `the_switcher_sits_between_the_avatar_and_the_
-            // gear` measures the painted rects rather than trusting this
-            // ordering, which is inverted and is exactly the kind of thing
-            // reasoning gets backwards.
-            //
-            // Design 2b has no switcher (it has one account), so this is the
-            // user's direction the way the gear is. What it takes from 2b is
-            // its metrics: `theme::account_switcher_button` is 28px square,
-            // matching the gear, the avatar and the Lock pill either side.
-            if let Some(picked) = account_switcher(ui, accounts.as_ref()) {
-                // The gear's two-step dance, for the same reason and one more:
-                // `main` cannot tear this account's backend down and bring the
-                // other one up while this window owns the event loop, and the
-                // master-password prompt the switch may raise is itself
-                // another eframe window on this same thread.
-                *switch_to_for_closure.borrow_mut() = Some(picked);
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
-            // draws a rounded square (used elsewhere: item-list rows,
-            // the detail pane header, neither of which were asked to
-            // change), so this is painted directly here rather than
-            // changing that shared helper's shape for every caller.
-            //
-            // ALWAYS drawn, even with no email yet, which is why it is no
-            // longer inside an `if let`. The circle is the account's place in
-            // the toolbar; drawn only once the email lands, everything left of
-            // it (the Lock pill, the sync pill, the title) would shift sideways
-            // a second or two into the session -- a flicker for a thing the
-            // user was not looking at, on a strip they may be reaching for.
-            // Empty until then, and empty rather than `theme::initials("")`'s
-            // "?" placeholder: a question mark reads as an answer ("this
-            // account has no name"), and the truthful state here is that
-            // nothing has been said yet.
-            draw_circle_avatar(ui, &avatar_initials(account_email.as_deref()));
-            // Design 2b's Lock control carries its own "CTRL+L" shortcut
-            // nested inside the same bordered pill, not as a separate
-            // floating `kbd_chip` beside it.
-            if theme::toolbar_button_with_shortcut(ui, "Lock", "CTRL+L").clicked() {
-                *locked_for_closure.borrow_mut() = true;
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            }
-            // Manual sync: this app has nowhere that auto-syncs on a timer
-            // (see `main()`'s own single startup-time `bw sync` -- everything
-            // after that only re-reads whatever's already local). A change
-            // made on another device otherwise wouldn't show up here until
-            // the whole app restarts, so the sync status readout itself is
-            // also the sync button -- clicking "● Synced 1 min ago" (design
-            // 4.8's pill) starts a fresh sync rather than needing a separate
-            // "Sync" button beside it. Blue for success (there's no
-            // dedicated "success" green in this app's palette -- see
-            // `theme.rs`'s module doc on "one blue hue... red reserved for
-            // actual errors" -- so blue is the existing color that reads as
-            // "good" here), the design's error red for failure, and a
-            // neutral ghost dot both while in flight and before the first
-            // sync has reported anything.
-            //
-            // The wording decision itself lives in `sync_pill` so it can be
-            // asserted (review 29's Minor 3) -- this pill is the only place
-            // any of these states is spelled for the user.
-            let (dot, label) = sync_pill(
-                sync_in_progress,
-                sync_status.as_ref(),
-                vault_load_error.as_deref(),
-                last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
-            );
-            if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
-                sync_in_progress = true;
-                spawn_vault_sync(sync_tx.clone(), session_token.clone());
-            }
-        }) {
+        match draw_window_chrome_with_extra(
+            ui,
+            WINDOW_TITLE,
+            ChromeMetrics::VAULT,
+            true,
+            // The vault's ✕ is always live: this window owns nothing that a
+            // close would strand. (The startup window's spinner stage does,
+            // and disables it -- see `loading_ui::draw_spinner_body`.)
+            CloseControl::Active,
+            |ui| {
+                // Right-to-left, so this reads left-to-right (nearest the title,
+                // furthest from the window controls, first) as: Sync status
+                // pill, "Lock CTRL+L", avatar, account switcher, settings gear.
+                // Added here in the
+                // opposite order (the gear closest to the window controls, sync
+                // pill furthest) since `right_to_left` packs each new widget
+                // just to the left of the previous one.
+                //
+                // The gear is therefore added FIRST precisely because it is
+                // asked to sit to the RIGHT of the avatar -- in this layout,
+                // earlier is further right. `the_settings_gear_sits_to_the_right_
+                // of_the_avatar` asserts the painted rects rather than this
+                // order, because reasoning about it is exactly how it would end
+                // up on the wrong side.
+                //
+                // Design 2b specifies no settings affordance at all (there is no
+                // gear, cog or "Settings" anywhere in `Deskwarden.dc.html`), so
+                // this is the user's direction rather than the design's, the
+                // same way the detail pane's star, kebab and eye were. What it
+                // does take from 2b is its metrics: `theme::gear_button` is 28px
+                // square, matching the Lock pill's height and the avatar's
+                // diameter beside it.
+                if theme::gear_button(ui).clicked() {
+                    // The same two-step dance Lock does immediately below -- set
+                    // the flag, then ask the window to close -- and for a reason
+                    // specific to this control: `prefs_ui::run` is its own
+                    // `eframe` window on this same thread, and eframe cannot
+                    // nest one native event loop inside another. Calling it from
+                    // inside this frame closure is not an option, so the request
+                    // has to leave this window entirely and be served by the
+                    // caller once this loop has ended.
+                    *open_preferences_for_closure.borrow_mut() = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // **Between the gear and the avatar, and therefore added between
+                // them**, since this strip packs right-to-left: the mark that
+                // opens the account menu belongs against the account it names, and
+                // the conventional place for a disclosure chevron is the avatar's
+                // right-hand side. `the_switcher_sits_between_the_avatar_and_the_
+                // gear` measures the painted rects rather than trusting this
+                // ordering, which is inverted and is exactly the kind of thing
+                // reasoning gets backwards.
+                //
+                // Design 2b has no switcher (it has one account), so this is the
+                // user's direction the way the gear is. What it takes from 2b is
+                // its metrics: `theme::account_switcher_button` is 28px square,
+                // matching the gear, the avatar and the Lock pill either side.
+                if let Some(picked) = account_switcher(ui, accounts.as_ref()) {
+                    // The gear's two-step dance, for the same reason and one more:
+                    // `main` cannot tear this account's backend down and bring the
+                    // other one up while this window owns the event loop, and the
+                    // master-password prompt the switch may raise is itself
+                    // another eframe window on this same thread.
+                    *switch_to_for_closure.borrow_mut() = Some(picked);
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
+                // draws a rounded square (used elsewhere: item-list rows,
+                // the detail pane header, neither of which were asked to
+                // change), so this is painted directly here rather than
+                // changing that shared helper's shape for every caller.
+                //
+                // ALWAYS drawn, even with no email yet, which is why it is no
+                // longer inside an `if let`. The circle is the account's place in
+                // the toolbar; drawn only once the email lands, everything left of
+                // it (the Lock pill, the sync pill, the title) would shift sideways
+                // a second or two into the session -- a flicker for a thing the
+                // user was not looking at, on a strip they may be reaching for.
+                // Empty until then, and empty rather than `theme::initials("")`'s
+                // "?" placeholder: a question mark reads as an answer ("this
+                // account has no name"), and the truthful state here is that
+                // nothing has been said yet.
+                draw_circle_avatar(ui, &avatar_initials(account_email.as_deref()));
+                // Design 2b's Lock control carries its own "CTRL+L" shortcut
+                // nested inside the same bordered pill, not as a separate
+                // floating `kbd_chip` beside it.
+                if theme::toolbar_button_with_shortcut(ui, "Lock", "CTRL+L").clicked() {
+                    *locked_for_closure.borrow_mut() = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                // Manual sync: this app has nowhere that auto-syncs on a timer
+                // (see `main()`'s own single startup-time `bw sync` -- everything
+                // after that only re-reads whatever's already local). A change
+                // made on another device otherwise wouldn't show up here until
+                // the whole app restarts, so the sync status readout itself is
+                // also the sync button -- clicking "● Synced 1 min ago" (design
+                // 4.8's pill) starts a fresh sync rather than needing a separate
+                // "Sync" button beside it. Blue for success (there's no
+                // dedicated "success" green in this app's palette -- see
+                // `theme.rs`'s module doc on "one blue hue... red reserved for
+                // actual errors" -- so blue is the existing color that reads as
+                // "good" here), the design's error red for failure, and a
+                // neutral ghost dot both while in flight and before the first
+                // sync has reported anything.
+                //
+                // The wording decision itself lives in `sync_pill` so it can be
+                // asserted (review 29's Minor 3) -- this pill is the only place
+                // any of these states is spelled for the user.
+                let (dot, label) = sync_pill(
+                    sync_in_progress,
+                    sync_status.as_ref(),
+                    vault_load_error.as_deref(),
+                    last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
+                );
+                if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
+                    sync_in_progress = true;
+                    spawn_vault_sync(sync_tx.clone(), session_token.clone());
+                }
+            },
+        ) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
@@ -10209,6 +10221,7 @@ mod titlebar_switcher_placement_tests {
                     WINDOW_TITLE,
                     ChromeMetrics::VAULT,
                     true,
+                    CloseControl::Active,
                     |ui| {
                         // The gear FIRST, the switcher between, the avatar
                         // last: right-to-left packing means earlier is further

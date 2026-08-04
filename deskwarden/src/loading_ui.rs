@@ -8,6 +8,9 @@
 //! more than one report) filled that silence, reading as "the app opened an
 //! empty terminal" rather than "the app is still starting up".
 
+use crate::login_ui::{
+    draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics, CloseControl,
+};
 use crate::theme;
 use eframe::egui::{self, Margin};
 use std::cell::RefCell;
@@ -38,9 +41,11 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// closure regardless of where it was created.
 ///
 /// Returns `None` if the window closed without `rx` ever yielding a value --
-/// either the user closed it via the title bar's X or Alt+F4 (this is a
-/// normal decorated window; nothing about "loading" makes it modal or
-/// un-closable), or the worker thread disconnected the channel without
+/// either the user closed it via the heading's ✕ or Alt+F4 (that ✕ is drawn
+/// live -- `CloseControl::Active` -- because nothing about "loading" makes
+/// THIS window modal or un-closable; the startup window's working stage is the
+/// one that cannot be closed, and it says so by ghosting its own), or the
+/// worker thread disconnected the channel without
 /// sending (e.g. it panicked). Review 11's Critical: this used to
 /// `.expect()` on exactly that case, which meant a user closing this spinner
 /// while `pick_vault_item`'s populate ran panicked the main thread, and
@@ -49,8 +54,29 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// caller must now decide for itself what "the user closed this" means
 /// (abandon quietly, treat as a failure, etc.) rather than that decision
 /// being made for it by a crash.
-/// The spinner itself: the mark, the spinner and one line of prose, centred on
-/// a flat [`theme::CANVAS`] panel that fills whatever it is given.
+/// The spinner itself: **this app's window heading**, and under it a spinner
+/// and one line of prose centred on a flat [`theme::CANVAS`] panel that fills
+/// whatever is left.
+///
+/// The heading is the same [`draw_window_chrome_with_extra`] every other window
+/// in this app draws, not a second titlebar -- there was no chrome here at all
+/// until the user asked for it ("keep the same window heading as the rest of
+/// the windows"), which made this the one screen in the app with no title, no
+/// drag zone and no window controls.
+///
+/// Under it, the treatment is the vault window's OWN loading body
+/// (`vault_window`'s `VaultBodyState::Loading`), which is the screen this one
+/// hands over to: a 28px [`theme::BLUE`] spinner over one line of 13px prose.
+/// Matched rather than re-proportioned, because the two are seen seconds apart
+/// in the same window and the second must not look like a different app's idea
+/// of waiting. The mark that used to sit above the spinner is gone with it --
+/// the heading already carries the wordmark, so drawing it a second time in the
+/// middle of the screen was saying the app's name twice on a screen that has
+/// one thing to say.
+///
+/// Returns what the heading asked for, which the host serves -- the two hosts
+/// have different windows to serve it in. `close` is the host's answer to
+/// whether its window may be closed AT ALL right now; see [`CloseControl`].
 ///
 /// A function and not the inline body of [`show_while`] because there are two
 /// places this look has to appear and they must not drift. `show_while` is one
@@ -68,7 +94,18 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// window. That is also what makes it the one part of this feature a headless
 /// `egui::Context` can actually render and read glyphs back from; everything
 /// else here needs a live `eframe::Frame`, which no test can construct.
-pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str) {
+pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) -> ChromeAction {
+    // `advance_cursor_after_rect` inside the chrome reads `item_spacing.y`
+    // EAGERLY and bakes it into the cursor it leaves behind, so the gap between
+    // the bar and the panel under it has to be zeroed before the call, not
+    // after -- the same dance, for the same reason, as `vault_window`'s own
+    // chrome call. Restored immediately, so this does not silently become the
+    // ambient spacing of whatever the host draws next.
+    let saved_item_spacing_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let action = draw_window_chrome_with_extra(ui, WINDOW_TITLE, HEADING, false, close, |_ui| {});
+    ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
+
     egui::CentralPanel::default()
         .frame(
             egui::Frame::new()
@@ -76,29 +113,41 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str) {
                 .inner_margin(Margin::same(24)),
         )
         .show(ui, |ui| {
-            // **Centred in whatever it is given**, rather than a fixed offset
-            // from the top. This body is drawn in two very differently sized
-            // windows: the standalone spinner window, which is small enough
-            // that a top offset passed for centred, and the single startup
-            // window, which is the vault window's full size -- where the same
-            // offset left the mark and the message huddled against the top
-            // edge of an otherwise empty screen.
+            // **Centred in the area BELOW THE HEADING**, rather than a fixed
+            // offset from the top and no longer in the whole window either:
+            // `available_height` here is what the panel was given, which the
+            // chrome above has already taken its bar out of. This body is drawn
+            // in two very differently sized windows -- the standalone spinner
+            // window, small enough that a top offset once passed for centred,
+            // and the single startup window, which is the vault window's full
+            // size, where the same offset left everything huddled against the
+            // top edge of an otherwise empty screen.
             let leftover = ui.available_height() - CONTENT_HEIGHT;
             ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| {
-                theme::mark(ui, MARK_SIZE);
-                ui.add_space(MARK_TO_SPINNER);
                 ui.add(egui::Spinner::new().size(SPINNER_SIZE).color(theme::BLUE));
                 ui.add_space(SPINNER_TO_LABEL);
                 ui.label(theme::semibold(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
             });
         });
+    action
 }
 
-const MARK_SIZE: f32 = 32.0;
-const MARK_TO_SPINNER: f32 = 14.0;
-const SPINNER_SIZE: f32 = 22.0;
-const SPINNER_TO_LABEL: f32 = 10.0;
+/// The heading's metrics: the VAULT window's, not the login window's.
+///
+/// The startup window's working stage IS the vault window a second later -- the
+/// spinner is replaced by the vault in the same window -- so a 46px bar that
+/// becomes a 46px bar is a heading that does not move when the vault arrives.
+/// `show_while`'s own small window uses it too, for the reason this body is
+/// shared at all: two hosts, one look.
+const HEADING: ChromeMetrics = ChromeMetrics::VAULT;
+
+/// Sized from the vault window's own loading body (28px spinner, 12px gap, 13px
+/// label), which is the screen this one hands over to. The user asked for the
+/// spinner to be bigger and the mark to go; this is the size the app already
+/// uses for exactly this wait, rather than a third number invented here.
+const SPINNER_SIZE: f32 = 28.0;
+const SPINNER_TO_LABEL: f32 = 12.0;
 const LABEL_SIZE: f32 = 13.0;
 
 /// What [`draw_spinner_body`]'s stack occupies, used to centre it.
@@ -109,8 +158,18 @@ const LABEL_SIZE: f32 = 13.0;
 /// label's line box is its font size times egui's default line height for
 /// this face; being a pixel or two out is invisible in a centring, whereas
 /// the top-anchored version this replaces was out by hundreds.
-const CONTENT_HEIGHT: f32 =
-    MARK_SIZE + MARK_TO_SPINNER + SPINNER_SIZE + SPINNER_TO_LABEL + LABEL_SIZE * 1.4;
+const CONTENT_HEIGHT: f32 = SPINNER_SIZE + SPINNER_TO_LABEL + LABEL_SIZE * 1.4;
+
+/// This window GREW when the heading arrived: 320×150 had exactly enough room
+/// for a mark, a 22px spinner and a line of text, and none at all for a 46px bar
+/// above them -- at that size the stack overruns the panel's own bottom margin
+/// and ends 19px off the window's edge, which is a cramped dialog rather than
+/// the same screen the full-size window shows.
+/// `the_standalone_window_has_room_for_the_heading_and_the_stack` is that
+/// arithmetic asserted rather than eyeballed. Wider as well as taller, because
+/// the bar has a minimum of its own: mark, wordmark and three 42px control zones
+/// side by side.
+const WINDOW_SIZE: [f32; 2] = [360.0, 220.0];
 
 pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T> {
     let result: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
@@ -119,8 +178,12 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([320.0, 150.0])
+            .with_inner_size(WINDOW_SIZE)
             .with_resizable(false)
+            // Frameless, like every other window this app opens, because as of
+            // the heading this body now draws there would otherwise be two
+            // titlebars stacked on this one: the OS's and the app's.
+            .with_decorations(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -136,10 +199,14 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             // starts on the next one, once the fonts are actually live.
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
-            // The OS window exists by this first painted frame (the same
-            // hook `round_window_corners` uses), and this is where it is
-            // brought to the front. See `foreground`: a refusal from Windows
-            // flashes the taskbar button rather than being ignored.
+            // Frameless windows in this app ask DWM for the rounded corners and
+            // shadow the OS frame would have given them. The OS window exists by
+            // this first painted frame, which is the hook both this and the
+            // raise below rely on.
+            round_window_corners(WINDOW_TITLE);
+            // This is where the window is brought to the front. See
+            // `foreground`: a refusal from Windows flashes the taskbar button
+            // rather than being ignored.
             crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
@@ -150,7 +217,18 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             *result_for_closure.borrow_mut() = Some(value);
         }
 
-        draw_spinner_body(ui, &message);
+        // **This window's ✕ is live.** Nothing here holds a process the way the
+        // startup window's working stage does; closing it returns `None` and
+        // every caller already decides for itself what that means (see this
+        // function's doc comment). With the frame gone, the chrome's ✕ and — are
+        // the only mouse-operable way to close or minimise it.
+        match draw_spinner_body(ui, &message, CloseControl::Active) {
+            ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            ChromeAction::Minimize => ui
+                .ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            ChromeAction::None => {}
+        }
 
         if result_for_closure.borrow().is_some() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -192,11 +270,13 @@ mod spinner_body_tests {
         ctx
     }
 
+    /// The standalone spinner window's real size, so what these tests render is
+    /// what that window renders.
     fn raw_input() -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(320.0, 150.0),
+                egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]),
             )),
             ..Default::default()
         }
@@ -204,7 +284,9 @@ mod spinner_body_tests {
 
     fn frame(message: &str) -> egui::FullOutput {
         let ctx = styled_ctx();
-        ctx.run_ui(raw_input(), |ui| draw_spinner_body(ui, message))
+        ctx.run_ui(raw_input(), |ui| {
+            draw_spinner_body(ui, message, CloseControl::Active);
+        })
     }
 
     /// Every character actually RENDERED, glyph by glyph off the galleys --
@@ -275,6 +357,31 @@ mod spinner_body_tests {
         );
     }
 
+    /// **The same window heading as the rest of the app.**
+    ///
+    /// The user's words: "keep the same window heading as the rest of the
+    /// windows". This screen was the only one in the app that painted no chrome
+    /// at all -- no title, no drag zone, no window controls -- and a glyph
+    /// reader is exactly the instrument that says whether the heading's title is
+    /// really being drawn, since the bar itself is just a filled rect that an
+    /// empty titlebar would paint too.
+    #[test]
+    fn the_spinner_body_wears_the_window_heading() {
+        let painted = rendered(&frame("Setting up your vault..."));
+        assert!(
+            painted.contains(WINDOW_TITLE),
+            "the wait screen paints no window title, so it is the one screen in this app with \
+             no heading -- and, being frameless, with nothing to drag or close it by: {painted:?}"
+        );
+        // Positive control: the same reader, on the same frame, finds the body's
+        // own message -- so a missing title above is a missing title rather than
+        // a frame that rendered no text at all.
+        assert!(
+            painted.contains("Setting up your vault..."),
+            "control: nothing at all was rendered: {painted:?}"
+        );
+    }
+
     /// The flat fill is the half a glyph reader cannot see, and it is the half
     /// that makes the working stage read as the SAME window as the sign-in
     /// card behind it rather than as a bare grey dialog.
@@ -315,18 +422,32 @@ mod spinner_centring_tests {
         }
     }
 
-    /// The vertical span of everything actually painted -- text glyphs and the
-    /// spinner's own shapes alike, so this measures the whole stack rather
-    /// than whichever piece happens to be a rect.
-    fn painted_span(output: &egui::FullOutput) -> Option<(f32, f32)> {
+    /// The heading's height, written out rather than read from
+    /// [`ChromeMetrics::VAULT`], so these tests state where they expect the
+    /// stack to be instead of re-deriving it from the thing they are checking.
+    /// If the design's bar height ever changes, the numbers below are meant to
+    /// be re-decided, not to follow along quietly.
+    const BAR: f32 = 46.0;
+
+    /// The vertical span of everything painted BELOW THE HEADING -- text glyphs
+    /// and the spinner's own shapes alike, so this measures the whole stack
+    /// rather than whichever piece happens to be a rect.
+    ///
+    /// Two exclusions, and they are different:
+    /// * anything starting at or above the bar's bottom edge is the heading
+    ///   itself (its background, its hairline, its title, its ✕/▢/— glyphs),
+    ///   which is not what "centred" is about here;
+    /// * anything taller than 100px is a background fill -- the window body, the
+    ///   canvas panel -- which would swamp the measurement. A height bound, not
+    ///   a "smaller than the window" bound: the canvas panel in a SHORT window is
+    ///   smaller than the window and still fills all of it.
+    fn painted_span_below_the_heading(output: &egui::FullOutput) -> Option<(f32, f32)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<Rect>) {
             match shape {
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
-                // The panel's own full-height background fill would swamp the
-                // measurement, so only marks smaller than the window count.
                 other => {
                     let r = other.visual_bounding_rect();
-                    if r.is_finite() && r.height() > 0.0 && r.height() < 400.0 {
+                    if r.is_finite() && r.height() > 0.0 && r.height() < 100.0 && r.min.y >= BAR {
                         out.push(r);
                     }
                 }
@@ -341,50 +462,126 @@ mod spinner_centring_tests {
         (top.is_finite() && bottom.is_finite()).then_some((top, bottom))
     }
 
-    /// **The stack sits in the middle of whatever it is given.**
+    fn spinner_frame(height: f32) -> egui::FullOutput {
+        let ctx = styled_ctx();
+        ctx.run_ui(input(height), |ui| {
+            draw_spinner_body(ui, "Setting up your vault...", CloseControl::Active);
+        })
+    }
+
+    /// **The stack sits in the middle of the area below the heading.**
     ///
     /// It used to start at a fixed 18px from the top, which looked centred in
     /// the small standalone spinner window and left everything huddled
     /// against the top edge of the full-size startup window -- which is what
     /// the user saw and called "bad looking". A test that only asserts the
     /// message is painted cannot tell the two apart; this asserts where.
+    ///
+    /// What "centred" means changed when the heading arrived: the middle of the
+    /// window would sit the stack `BAR / 2` too high, with more empty space
+    /// under it than over it. The expected centre is written out below rather
+    /// than derived from `CONTENT_HEIGHT` or the metrics -- a test that computes
+    /// its expectation from the constants under test agrees with itself no
+    /// matter what they say.
     #[test]
-    fn the_spinner_stack_is_centred_in_a_tall_window() {
+    fn the_spinner_stack_is_centred_below_the_heading_in_a_tall_window() {
         let tall = 600.0;
-        let ctx = styled_ctx();
-        let output = ctx.run_ui(input(tall), |ui| draw_spinner_body(ui, "Setting up your vault..."));
+        let output = spinner_frame(tall);
 
-        let (top, bottom) = painted_span(&output).expect("the spinner body painted nothing at all");
+        let (top, bottom) = painted_span_below_the_heading(&output)
+            .expect("the spinner body painted nothing below the heading at all");
         let centre = (top + bottom) / 2.0;
 
-        // Generous: this is about "middle of the window" versus "pinned to the
-        // top", a difference of hundreds of pixels. The old layout put the
-        // stack's centre near 75px in a 600px window.
+        // (46 + 600) / 2. Generous: this is about "middle" versus "pinned to an
+        // edge", a difference of hundreds of pixels. The layout before the
+        // centring fix put the stack's centre near 75px in a 600px window.
         assert!(
-            (centre - tall / 2.0).abs() < 60.0,
-            "the spinner stack is centred at y={centre:.1} in a {tall:.0}px window, not near \
-             {:.0} -- it is anchored to an edge rather than centred",
-            tall / 2.0
+            (centre - 323.0).abs() < 60.0,
+            "the spinner stack is centred at y={centre:.1} in a {tall:.0}px window, not near 323 \
+             -- it is anchored to an edge rather than centred in the area below the heading"
         );
     }
 
-    /// The control for the test above: in a SMALL window the same body still
-    /// paints, and still near the middle. Without this, "centred" could be
-    /// satisfied by a body that only ever draws at one fixed offset which
-    /// happens to suit one height.
+    /// **No logo above the spinner.** The user: "no need for logo in the middle
+    /// of the screen - just bigger spinner".
+    ///
+    /// Measured rather than asserted about the source, because "the mark is
+    /// gone" is a claim about the screen. A 28px spinner over one 13px line is
+    /// about 58px tall; the mark that used to sit above it was 32px with a 14px
+    /// gap under it, so restoring it takes the stack past 100. The heading's own
+    /// wordmark is excluded by `painted_span_below_the_heading`, which is the
+    /// point -- the app's name is drawn once, up there.
     #[test]
-    fn the_same_body_is_still_centred_in_a_short_window() {
-        let short = 180.0;
-        let ctx = styled_ctx();
-        let output =
-            ctx.run_ui(input(short), |ui| draw_spinner_body(ui, "Setting up your vault..."));
-
-        let (top, bottom) = painted_span(&output).expect("the spinner body painted nothing at all");
-        let centre = (top + bottom) / 2.0;
+    fn the_stack_is_a_spinner_and_a_line_of_text_and_not_a_logo_as_well() {
+        let output = spinner_frame(600.0);
+        let (top, bottom) = painted_span_below_the_heading(&output)
+            .expect("the spinner body painted nothing below the heading at all");
+        let height = bottom - top;
         assert!(
-            (centre - short / 2.0).abs() < 60.0,
-            "the spinner stack is centred at y={centre:.1} in a {short:.0}px window, not near {:.0}",
-            short / 2.0
+            height < 80.0,
+            "the stack under the heading is {height:.1}px tall, which is more than a spinner and \
+             one line of prose -- the mark is being drawn in the middle of the screen again"
+        );
+        // Positive control: it is not empty either, which is the other way a
+        // height bound can be satisfied by accident.
+        assert!(
+            height > 20.0,
+            "control: the stack under the heading is only {height:.1}px tall, so the bound above \
+             is satisfied by nothing being drawn"
+        );
+    }
+
+    /// **The standalone window is big enough for both.**
+    ///
+    /// The one test here that renders the REAL [`WINDOW_SIZE`] rather than a
+    /// chosen height, because that constant is the decision this makes: the
+    /// window it describes used to be 320×150, which fit a spinner and a line of
+    /// text and nothing above them. 40px is "clearly more than the panel's own
+    /// 24px margin"; at the old size the stack overruns that margin and ends
+    /// 19px off the bottom edge, which is the stack wedged against it.
+    #[test]
+    fn the_standalone_window_has_room_for_the_heading_and_the_stack() {
+        let height = WINDOW_SIZE[1];
+        let output = spinner_frame(height);
+        let (top, bottom) = painted_span_below_the_heading(&output)
+            .expect("the spinner body painted nothing below the heading at all");
+
+        let above = top - BAR;
+        let below = height - bottom;
+        assert!(
+            above >= 40.0 && below >= 40.0,
+            "in the {height:.0}px standalone window the stack has {above:.1}px of clearance \
+             under the heading and {below:.1}px above the bottom edge -- the window is too \
+             short for a heading and a spinner both, so the two are jammed together"
+        );
+    }
+
+    /// The control for the centring test, and the arithmetic behind
+    /// [`WINDOW_SIZE`]: in a SHORT window the same body still paints, still near
+    /// the middle, and -- newly load-bearing -- still FITS between the heading
+    /// and the bottom edge. The previous centring bug was invisible at small
+    /// sizes and only showed at full size, so the short case stays; the fit is
+    /// the opposite risk, and it is the one the heading introduced.
+    #[test]
+    fn the_stack_fits_below_the_heading_in_the_small_window() {
+        let short = 180.0;
+        let output = spinner_frame(short);
+
+        let (top, bottom) = painted_span_below_the_heading(&output)
+            .expect("the spinner body painted nothing below the heading at all");
+        let centre = (top + bottom) / 2.0;
+        // (46 + 180) / 2.
+        assert!(
+            (centre - 113.0).abs() < 30.0,
+            "the spinner stack is centred at y={centre:.1} in a {short:.0}px window, not near 113"
+        );
+        // Deliberately not an assertion that `top >= BAR` -- the span filter
+        // already drops everything above the bar, so that would be a test of the
+        // filter. The bottom edge is the one nothing has already guaranteed.
+        assert!(
+            bottom <= short,
+            "the stack ends at y={bottom:.1} in a {short:.0}px window -- the heading pushed it \
+             off the bottom edge, which is what a window too short for both looks like"
         );
     }
 }

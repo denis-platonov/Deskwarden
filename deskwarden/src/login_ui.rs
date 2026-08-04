@@ -617,6 +617,31 @@ pub enum ChromeAction {
     Close,
 }
 
+/// Whether the chrome's ✕ is live this frame.
+///
+/// A window that cannot be closed right now is a real state in this app -- the
+/// single startup window's WORKING stage holds the only handle to a `bw serve`
+/// that is still coming up, and closing would strand that process on the port
+/// the recovery then needs to bind. That stage used to have no chrome at all,
+/// so the question never arose; now that it wears the same heading as every
+/// other window, it has a ✕, and a ✕ that silently refuses is worse than one
+/// that shows it is unavailable. This is how the chrome says so, rather than a
+/// second copy of the titlebar that would start diverging from this one.
+///
+/// The same judgement the sign-in card already makes about its credential
+/// fields, which grey out while a sign-in is in flight instead of staying live
+/// and ignoring input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseControl {
+    /// Clickable, and reports [`ChromeAction::Close`]. Every window whose ✕
+    /// means something.
+    Active,
+    /// Drawn ghosted in [`theme::TEXT_GHOST`] -- the same treatment the ▢ gets
+    /// on a fixed-size window -- with no hover and no interaction registered
+    /// at all, so it cannot report a close for a host to have to refuse.
+    Disabled,
+}
+
 /// Sizing/color knobs for [`draw_window_chrome_with_extra`]'s bar, mark, and
 /// title. The login window (design 3h) and the vault window (design 2b)
 /// share every other line of the chrome-painting logic but use different
@@ -679,11 +704,19 @@ impl ChromeMetrics {
 /// rounding comes from DWM (see [`round_window_corners`]).
 ///
 /// Thin wrapper around [`draw_window_chrome_with_extra`] with no extra
-/// content, [`ChromeMetrics::LOGIN`]'s sizing, and `maximizable: false` --
-/// this window is fixed-size, so ▢ stays the inert, ghosted affordance it
-/// has always been. See that function for the shared implementation.
+/// content, [`ChromeMetrics::LOGIN`]'s sizing, `maximizable: false` -- this
+/// window is fixed-size, so ▢ stays the inert, ghosted affordance it has
+/// always been -- and a live ✕. See that function for the shared
+/// implementation.
 pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
-    draw_window_chrome_with_extra(ui, title, ChromeMetrics::LOGIN, false, |_ui| {})
+    draw_window_chrome_with_extra(
+        ui,
+        title,
+        ChromeMetrics::LOGIN,
+        false,
+        CloseControl::Active,
+        |_ui| {},
+    )
 }
 
 /// Same as [`draw_window_chrome`], but calls `extra_content` to draw
@@ -693,6 +726,8 @@ pub fn draw_window_chrome(ui: &mut egui::Ui, title: &str) -> ChromeAction {
 /// [`ChromeMetrics`]), and -- when `maximizable` is true -- makes the ▢
 /// control a real, clickable maximize/restore toggle instead of the
 /// permanently-ghosted affordance both windows used to show unconditionally.
+/// `close` says whether the ✕ is live or drawn disabled (see
+/// [`CloseControl`]).
 /// `extra_content` is laid out right-to-left, packed against the left edge
 /// of the window-control zones, so it reads as continuing naturally into
 /// ✕/▢/—. The draggable region is shrunk to end where `extra_content`'s
@@ -705,6 +740,7 @@ pub fn draw_window_chrome_with_extra(
     title: &str,
     metrics: ChromeMetrics,
     maximizable: bool,
+    close: CloseControl,
     extra_content: impl FnOnce(&mut egui::Ui),
 ) -> ChromeAction {
     let mut action = ChromeAction::None;
@@ -790,26 +826,38 @@ pub fn draw_window_chrome_with_extra(
         controls_left
     };
 
-    // Close (✕).
+    // Close (✕). When `CloseControl::Disabled`, NO interaction is registered
+    // for it at all and the glyph is drawn in `TEXT_GHOST` -- exactly the
+    // ghosted ▢ treatment below, for exactly the same reason: the control is
+    // there because the heading is, and it cannot do anything right now. Not
+    // registering the interaction is the load-bearing half; a hover-less but
+    // still-clickable ✕ would hand the host a `Close` it has to refuse, which
+    // is the silent refusal this avoids.
     let close_rect = control(0);
-    let close = ui.interact(close_rect, ui.id().with("chrome-close"), Sense::click());
-    if close.hovered() {
-        ui.painter()
-            .rect_filled(close_rect, CornerRadius::ZERO, theme::CANVAS);
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+    let close_stroke = match close {
+        CloseControl::Active => {
+            let close = ui.interact(close_rect, ui.id().with("chrome-close"), Sense::click());
+            if close.hovered() {
+                ui.painter()
+                    .rect_filled(close_rect, CornerRadius::ZERO, theme::CANVAS);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if close.clicked() {
+                action = ChromeAction::Close;
+            }
+            glyph_stroke
+        }
+        CloseControl::Disabled => Stroke::new(1.2, theme::TEXT_GHOST),
+    };
     let c = close_rect.center();
     ui.painter().line_segment(
         [c + egui::vec2(-4.5, -4.5), c + egui::vec2(4.5, 4.5)],
-        glyph_stroke,
+        close_stroke,
     );
     ui.painter().line_segment(
         [c + egui::vec2(-4.5, 4.5), c + egui::vec2(4.5, -4.5)],
-        glyph_stroke,
+        close_stroke,
     );
-    if close.clicked() {
-        action = ChromeAction::Close;
-    }
 
     // Maximize (▢). When `maximizable` (the vault window): the same active
     // glyph/hover treatment as ✕/— below, and a click toggles the OS-level
@@ -2037,6 +2085,7 @@ pub fn build_login_frame(
             VAULT_WINDOW_TITLE,
             ChromeMetrics::VAULT,
             false,
+            CloseControl::Active,
             |_ui| {},
         ) {
             ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
@@ -2390,6 +2439,201 @@ pub fn run_login_flow(account: Option<(&Path, &Account)>, first_run: bool) -> St
             log::error!("login window was closed without producing a session token; exiting");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod close_control_tests {
+    //! The chrome's ✕, in both of its states.
+    //!
+    //! [`CloseControl::Disabled`] exists because one host -- the single startup
+    //! window's working stage -- must not be closed while it holds a `bw serve`
+    //! that is still coming up, and, now that stage wears the same heading as
+    //! every other window, it has a ✕ to account for. Both halves of "disabled"
+    //! are asserted here, because either alone is a bug that ships: a ghosted ✕
+    //! that still closes the window strands the backend, and a live-looking ✕
+    //! that quietly does nothing is the thing this was written to avoid.
+
+    use super::*;
+    use eframe::egui::{Color32, Pos2};
+
+    const WIDTH: f32 = 840.0;
+    const HEIGHT: f32 = 600.0;
+
+    fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                egui::vec2(WIDTH, HEIGHT),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// A context with `theme::apply`'s fonts live -- the chrome draws its title
+    /// in one of them, and a frame that looks up a family which does not exist
+    /// yet panics.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(Vec::new()), |_ui| {});
+        ctx
+    }
+
+    /// A full primary press-and-release at `pos`: egui reports
+    /// `Response::clicked` on the RELEASE, so a press alone is not a click.
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// Every straight line segment painted, as (start, end, colour). The ✕ is
+    /// two diagonals and the — is one horizontal; nothing else in the chrome is
+    /// a line segment, so the two are told apart by their own geometry rather
+    /// than by paint order.
+    fn segments(output: &egui::FullOutput) -> Vec<(Pos2, Pos2, Color32)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(Pos2, Pos2, Color32)>) {
+            match shape {
+                egui::Shape::LineSegment { points, stroke } => {
+                    out.push((points[0], points[1], stroke.color))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn diagonal_colors(output: &egui::FullOutput) -> Vec<Color32> {
+        segments(output)
+            .into_iter()
+            .filter(|(a, b, _)| (a.y - b.y).abs() > 1.0)
+            .map(|(_, _, color)| color)
+            .collect()
+    }
+
+    fn horizontal_colors(output: &egui::FullOutput) -> Vec<Color32> {
+        segments(output)
+            .into_iter()
+            .filter(|(a, b, _)| (a.y - b.y).abs() <= 1.0)
+            .map(|(_, _, color)| color)
+            .collect()
+    }
+
+    /// One frame of the vault window's chrome, with `close` and `events`.
+    fn chrome(ctx: &egui::Context, close: CloseControl, events: Vec<egui::Event>) -> ChromeAction {
+        let mut action = ChromeAction::None;
+        let _ = ctx.run_ui(raw_input(events), |ui| {
+            action = draw_window_chrome_with_extra(
+                ui,
+                "Deskwarden",
+                ChromeMetrics::VAULT,
+                true,
+                close,
+                |_ui| {},
+            );
+        });
+        action
+    }
+
+    fn painted(close: CloseControl) -> egui::FullOutput {
+        let ctx = styled_context();
+        ctx.run_ui(raw_input(Vec::new()), |ui| {
+            let _ = draw_window_chrome_with_extra(
+                ui,
+                "Deskwarden",
+                ChromeMetrics::VAULT,
+                true,
+                close,
+                |_ui| {},
+            );
+        })
+    }
+
+    /// **A disabled ✕ looks disabled** -- `TEXT_GHOST`, the same ink the ▢
+    /// wears on a window that cannot be maximized, and the same ink the sign-in
+    /// card's field labels take while a sign-in is in flight.
+    #[test]
+    fn a_disabled_close_is_ghosted_and_a_live_one_is_not() {
+        let ghosted = diagonal_colors(&painted(CloseControl::Disabled));
+        assert!(
+            !ghosted.is_empty(),
+            "control: no ✕ glyph was painted at all, so its colour proves nothing"
+        );
+        assert!(
+            ghosted.iter().all(|color| *color == theme::TEXT_GHOST),
+            "the disabled ✕ is painted in {ghosted:?} rather than `theme::TEXT_GHOST` -- it \
+             looks exactly like a working close button and does nothing"
+        );
+
+        // The pairing: the ACTIVE ✕ is not ghosted, so the assertion above is
+        // about `CloseControl` rather than about a ✕ that is always grey.
+        let live = diagonal_colors(&painted(CloseControl::Active));
+        assert!(
+            live.iter().all(|color| *color == theme::TEXT_FAINT),
+            "control: the live ✕ is painted in {live:?}, not the chrome's usual \
+             `theme::TEXT_FAINT`"
+        );
+
+        // And the disabling is aimed at the ✕ alone: minimising a window whose
+        // backend is still starting strands nothing, so — stays live in both.
+        for close in [CloseControl::Active, CloseControl::Disabled] {
+            let flat = horizontal_colors(&painted(close));
+            assert!(
+                flat.iter().any(|color| *color == theme::TEXT_FAINT),
+                "{close:?} ghosted the — control as well: {flat:?}"
+            );
+        }
+    }
+
+    /// **A disabled ✕ acts disabled.** No interaction is registered for it, so
+    /// a click cannot produce a `Close` for a host to have to refuse.
+    #[test]
+    fn only_a_live_close_reports_a_close_when_it_is_clicked() {
+        // The rightmost control zone's centre, from the metrics the frame is
+        // drawn with -- where the ✕ is, not what it is expected to do.
+        let at = Pos2::new(
+            WIDTH - ChromeMetrics::VAULT.control_width / 2.0,
+            ChromeMetrics::VAULT.bar_height / 2.0,
+        );
+
+        let ctx = styled_context();
+        let _ = chrome(&ctx, CloseControl::Active, Vec::new());
+        assert_eq!(
+            chrome(&ctx, CloseControl::Active, click(at)),
+            ChromeAction::Close,
+            "control: clicking the ✕ of a normal window does not close it either, so the \
+             assertion below is about the click never landing"
+        );
+
+        let ctx = styled_context();
+        let _ = chrome(&ctx, CloseControl::Disabled, Vec::new());
+        assert_eq!(
+            chrome(&ctx, CloseControl::Disabled, click(at)),
+            ChromeAction::None,
+            "the disabled ✕ still reports a close when clicked, so the one stage that must not \
+             close is relying on its host to refuse -- and the startup window's refusal leaves \
+             the user clicking a control that visibly does nothing"
+        );
     }
 }
 

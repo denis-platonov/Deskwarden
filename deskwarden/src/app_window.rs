@@ -305,16 +305,35 @@ where
                 }
             }
             Stage::Working => {
-                loading_ui::draw_spinner_body(ui, working_message);
+                // **This stage cannot be closed, and its ✕ says so.** It owns
+                // the only handle to a `bw serve` that is starting up, and that
+                // handle is inside the worker's answer -- closing here would
+                // strand the process holding the port, so the recovery `main`
+                // would then run could not bind it. The spinner now wears the
+                // same heading as every other window, so there IS a ✕ on this
+                // stage; `CloseControl::Disabled` draws it ghosted and registers
+                // no interaction for it, rather than leaving it looking live and
+                // silently refusing every click. The guard below is therefore
+                // about the routes that do not go through the chrome at all --
+                // Alt+F4 and the system menu -- and it is bounded: the readiness
+                // probe gives up after its own deadline and this stage ends
+                // itself with `WorkFailed`.
+                match loading_ui::draw_spinner_body(
+                    ui,
+                    working_message,
+                    login_ui::CloseControl::Disabled,
+                ) {
+                    // Minimising strands nothing, so it is served.
+                    login_ui::ChromeAction::Minimize => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    // Unreachable while the ✕ is disabled, and deliberately not
+                    // wired to a close: if the chrome ever stops honouring
+                    // `CloseControl`, the failure is a ✕ that does nothing
+                    // rather than an orphaned `bw serve`.
+                    login_ui::ChromeAction::Close | login_ui::ChromeAction::None => {}
+                }
 
-                // **This stage cannot be closed.** It owns the only handle to a
-                // `bw serve` that is starting up, and that handle is inside the
-                // worker's answer -- closing here would strand the process
-                // holding the port, so the recovery `main` would then run could
-                // not bind it. There is no affordance to close with (the
-                // spinner paints no chrome), so this only catches Alt+F4, and
-                // it is bounded: the readiness probe gives up after its own
-                // deadline and this stage ends itself with `WorkFailed`.
                 if ui.ctx().input(|i| i.viewport().close_requested()) {
                     log::info!(
                         "the single window was asked to close while the vault backend was \
@@ -533,7 +552,7 @@ mod startup_window_tests {
                 concat!("Stage::Working ", "=>"),
                 (
                     "the spinner is never drawn",
-                    "loading_ui::draw_spinner_body(ui, working_message);",
+                    "loading_ui::draw_spinner_body(",
                 ),
             ),
             (
@@ -557,6 +576,72 @@ mod startup_window_tests {
         assert!(
             !closure.contains(concat!("pub fn ", "advance(")),
             "control: the sliced region reaches back above the closure"
+        );
+    }
+
+    /// Everything on a line before a `//`.
+    ///
+    /// Load-bearing for the guard below, not tidiness: the comment above the
+    /// spinner call names `CloseControl::Disabled` out loud, so a guard that
+    /// matched the raw source would go on passing after the argument itself was
+    /// changed. This crate has already shipped exactly that mistake once (the
+    /// icon guard that matched the comment naming the thing it was looking for).
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `Stage::Working` arm alone, comments stripped. Bounded forward to the
+    /// next arm rather than by a byte count, so it cannot overrun into the
+    /// vault's own chrome call -- which passes `CloseControl::Active` and would
+    /// satisfy a careless search.
+    fn working_arm() -> String {
+        let closure = closure();
+        let start = closure
+            .find(concat!("Stage::Working ", "=>"))
+            .expect("the closure has no working stage at all");
+        let rest = &closure[start..];
+        let end = rest
+            .find(concat!("Stage::Vault ", "=>"))
+            .expect("the working arm is not followed by the vault arm");
+        code(&rest[..end])
+    }
+
+    /// **The stage that refuses to close shows a ✕ that refuses to be clicked.**
+    ///
+    /// Before the spinner wore a heading there was no ✕ here at all, so the
+    /// refusal below was invisible by accident. Now it is a decision, and this
+    /// is where it is made -- passing `Active` here would ship a control that
+    /// looks live, does nothing, and logs a line the user never sees.
+    #[test]
+    fn the_stage_that_refuses_to_close_draws_a_disabled_close_control() {
+        let arm = working_arm();
+        assert!(
+            arm.contains(concat!("CloseControl::", "Disabled")),
+            "the spinner stage's ✕ is live while the stage refuses every close, so clicking it \
+             does nothing at all: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("Cancel", "Close")),
+            "the working stage no longer refuses a close it did not draw the affordance for \
+             (Alt+F4, the system menu), so a `bw serve` still starting up is stranded on the \
+             port the recovery needs"
+        );
+        // Positive control on the slice: it really is the working arm and stops
+        // before the vault's, whose chrome passes `CloseControl::Active`.
+        assert!(
+            arm.contains(concat!("draw_spinner_", "body(")),
+            "control: the sliced region is not the arm that draws the spinner: {arm}"
+        );
+        assert!(
+            !arm.contains(concat!("vault_fn(ui, ", "frame);")),
+            "control: the sliced region runs on into the vault arm: {arm}"
         );
     }
 
