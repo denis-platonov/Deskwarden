@@ -277,7 +277,7 @@ pub fn poll_working(err: mpsc::TryRecvError, elapsed: Duration) -> WorkPoll {
 ///
 /// A function rather than two lines in the frame closure because the two lines
 /// are not independent and the second one is invisible to every test that
-/// checks the first. `closing = true` on its own leaves the window exactly as
+/// checks the first. `closing.decide()` on its own leaves the window exactly as
 /// unleaveable as the bug: the stage stops ending itself, the ✕ is still
 /// `Disabled`, and only Alt+F4 gets through. `send_viewport_cmd` on its own is
 /// worse -- the refusal below cancels the window's own exit. Here they cannot be
@@ -287,8 +287,8 @@ pub fn poll_working(err: mpsc::TryRecvError, elapsed: Duration) -> WorkPoll {
 /// The flag is set BEFORE the command deliberately: eframe reports this very
 /// command back as a `close_requested` on a later frame, while `Stage::Working`
 /// is still the stage being drawn.
-fn close_this_window(ctx: &egui::Context, closing: &mut bool) {
-    *closing = true;
+fn close_this_window(ctx: &egui::Context, closing: &mut Closing) {
+    closing.decide();
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
 }
 
@@ -302,8 +302,8 @@ fn close_this_window(ctx: &egui::Context, closing: &mut bool) {
 /// Returns whether it actually refused, so a test can tell "declined to refuse"
 /// from "was never asked" -- two states that are identical in the viewport
 /// output when no command is sent.
-fn refuse_close_while_working(ctx: &egui::Context, closing: bool) -> bool {
-    if closing || !ctx.input(|i| i.viewport().close_requested()) {
+fn refuse_close_while_working(ctx: &egui::Context, closing: Closing) -> bool {
+    if closing.decided() || !ctx.input(|i| i.viewport().close_requested()) {
         return false;
     }
     log::info!(
@@ -340,7 +340,7 @@ fn give_up_message(why: WorkFailure, elapsed: Duration) -> String {
 /// away.
 fn give_up_working(
     ctx: &egui::Context,
-    closing: &mut bool,
+    closing: &mut Closing,
     why: WorkFailure,
     elapsed: Duration,
 ) -> Next {
@@ -351,6 +351,55 @@ fn give_up_working(
     }
     next
 }
+
+/// **Whether the working stage has already decided to end**, as a type rather
+/// than as a `bool` a single token can invert.
+///
+/// The value the stage starts on is load-bearing twice over, and neither use is
+/// visible from outside the frame closure, which no test can call. Started at
+/// "already decided", `refuse_close_while_working` returns on its first branch
+/// forever -- the stage refuses NOTHING, so an Alt+F4 or a system-menu close
+/// during `bw serve`'s startup is honoured and strands a listening backend on
+/// the port the recovery needs -- and the closure's drain guard never opens, so
+/// the worker's answer is never taken: the vault never appears, the watchdog
+/// never runs, and the spinner spins forever behind a ghosted close control
+/// with no tray icon and no Quit item anywhere in the process. That is the
+/// originally reported bug, strictly worse, and as a bare `bool` it was one
+/// token away with the whole suite green.
+///
+/// So the field is private to this module: [`Closing::not_yet`] is the only way
+/// to make one and [`Closing::decide`] the only way to move one. The starting
+/// value is therefore something a test can CALL -- see
+/// `the_stage_starts_out_refusing_every_close_and_still_draining_the_worker` --
+/// rather than a literal inside a closure a test can only read.
+mod closing {
+    /// Constructed only by [`Closing::not_yet`]. The field is private so that
+    /// `= true` cannot be written at a call site at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Closing(bool);
+
+    impl Closing {
+        /// What the working stage starts on: nothing has asked to close yet, so
+        /// every close that arrives belongs to somebody else.
+        pub const fn not_yet() -> Self {
+            Self(false)
+        }
+
+        /// Whether the stage has decided to end itself.
+        pub const fn decided(self) -> bool {
+            self.0
+        }
+
+        /// Record that it has. Reached from `close_this_window` and nowhere
+        /// else, which is counted by
+        /// `the_refusal_starts_armed_and_is_stood_down_in_exactly_one_place`.
+        pub fn decide(&mut self) {
+            self.0 = true;
+        }
+    }
+}
+
+use closing::Closing;
 
 /// What one run of the single window produced.
 pub struct StartupOutcome<P> {
@@ -495,7 +544,12 @@ where
     // frame, and the working stage is still the stage being drawn when it
     // arrives. Without this flag the stage cancels its own exit and the window
     // is exactly as unleaveable as before.
-    let mut closing = false;
+    //
+    // A `Closing` and not a `bool`: what it starts as decides both whether the
+    // stage refuses anything at all and whether the worker's answer is ever
+    // drained, and the token that would say so sits inside a closure no test can
+    // call. See the type's own doc.
+    let mut closing = Closing::not_yet();
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
         if !styled {
@@ -616,7 +670,7 @@ where
                 // has already asked the window to close, so nothing live is
                 // skipped here: the deadline cannot still be owed to a stage
                 // that has already ended itself.
-                if !closing {
+                if !closing.decided() {
                     match work_rx.try_recv() {
                         Ok(mut work) => {
                             let signed_in = token_for_closure.borrow().clone();
@@ -990,14 +1044,17 @@ mod working_watchdog_tests {
              sleep budget, which is the mistake this sum was rewritten to fix"
         );
 
-        // **An absolute bound, not another spelling of the definition.** The
-        // assertion above cannot fail for any change to the source constants,
-        // however large -- doubling `BACKEND_OP_TIMEOUT` moves both sides
-        // together. These two cannot move with it.
-        assert!(
-            WORKING_DEADLINE > BACKEND_OP_TIMEOUT,
-            "the window gives up before a single backend operation is even considered wedged"
-        );
+        // **The absolute bounds -- and the only ones here that are.** Every
+        // assertion above is a restatement of `WORKING_DEADLINE`'s own
+        // definition: each right-hand side is a sub-expression of it, so
+        // `WORKING_DEADLINE` minus the nominal three-phase budget is identically
+        // `READINESS_ATTEMPTS * READ_DEADLINE`, which is never negative -- it
+        // cannot fail however far the source constants move. Not a
+        // hypothetical: halving `BACKEND_OP_TIMEOUT` drops this deadline from
+        // 320s to 230s with all of the above green, which is precisely what the
+        // comment that used to stand here claimed could not happen. The two
+        // below are compared against LITERALS declared in this module, so
+        // nothing in `bw_serve` or `vault_bridge` can move both sides at once.
         assert!(
             WORKING_DEADLINE <= SPINNER_PATIENCE,
             "the working stage may now hold a window the user cannot close for longer than \
@@ -1005,9 +1062,11 @@ mod working_watchdog_tests {
              past this the watchdog is not a way out, it is Task Manager with extra steps"
         );
         assert!(
-            WORKING_DEADLINE >= BACKEND_OP_TIMEOUT + READINESS_DEADLINE + BACKEND_OP_TIMEOUT,
-            "the deadline has shrunk back below the three phases' own nominal budgets, so a \
-             startup that is merely slow gets cut off"
+            WORKING_DEADLINE >= MINIMUM_STARTUP_GRACE,
+            "the working stage now abandons a startup after {WORKING_DEADLINE:?}, less than the \
+             {MINIMUM_STARTUP_GRACE:?} a cold start can legitimately need -- so a sign-in that \
+             is merely slow is thrown away and the user is sent back through a fresh login for \
+             nothing, which is the one harm this deadline's generosity exists to avoid"
         );
     }
 
@@ -1020,6 +1079,21 @@ mod working_watchdog_tests {
     /// cost, and deliberately not derived from them, so that it is a bound on the
     /// definition rather than a restatement of it.
     const SPINNER_PATIENCE: Duration = Duration::from_secs(6 * 60);
+
+    /// The shortest deadline a startup may ever be given before the window
+    /// abandons it.
+    ///
+    /// Five minutes, as a LITERAL and deliberately not as a sum of the constants
+    /// `WORKING_DEADLINE` is built from -- a floor spelled with those moves
+    /// whenever they do, which is exactly how a 320s deadline could become 230s
+    /// with this whole file green. The three phases the worker runs can
+    /// legitimately cost ~5m20s on a cold `bw serve`, and cutting a healthy
+    /// startup off costs the user the entire sign-in they have just completed
+    /// and buys nothing: the recovery `main` runs afterwards starts the same
+    /// backend over again from scratch. Below five minutes this deadline is
+    /// undoing its own stated reason, however the source constants were
+    /// rearranged to get there.
+    const MINIMUM_STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
 }
 
 /// **The window's own close, run for real.**
@@ -1068,7 +1142,7 @@ mod window_close_tests {
     #[test]
     fn the_stage_ending_itself_actually_asks_the_window_to_close() {
         let ctx = egui::Context::default();
-        let mut closing = false;
+        let mut closing = Closing::not_yet();
         let output = ctx.run_ui(input(false), |ui| {
             close_this_window(ui.ctx(), &mut closing);
         });
@@ -1079,7 +1153,7 @@ mod window_close_tests {
             commands_of(&output)
         );
         assert!(
-            closing,
+            closing.decided(),
             "the close was sent without disarming the refusal, so the next frame cancels the \
              window's own exit"
         );
@@ -1099,7 +1173,7 @@ mod window_close_tests {
         let ctx = egui::Context::default();
         let output = ctx.run_ui(input(true), |ui| {
             assert!(
-                refuse_close_while_working(ui.ctx(), false),
+                refuse_close_while_working(ui.ctx(), Closing::not_yet()),
                 "the working stage let an Alt+F4 through, stranding the `bw serve` it is \
                  holding on the port the recovery needs"
             );
@@ -1111,12 +1185,51 @@ mod window_close_tests {
         );
         // Not asked at all: no close request, so nothing to refuse.
         let output = ctx.run_ui(input(false), |ui| {
-            assert!(!refuse_close_while_working(ui.ctx(), false));
+            assert!(!refuse_close_while_working(ui.ctx(), Closing::not_yet()));
         });
         assert!(
             !commands_of(&output).contains(&egui::ViewportCommand::CancelClose),
             "the stage cancels a close nobody asked for, which is a `CancelClose` on every \
              frame of the spinner"
+        );
+    }
+
+    /// **The value the stage starts on, RUN rather than read.**
+    ///
+    /// `Closing::not_yet` is what the frame closure initialises its own local
+    /// to, and inverting it ships two failures at once with every other test in
+    /// this file green: a working stage that refuses no close at all, and a
+    /// worker whose answer is never drained. The closure cannot be called by a
+    /// test -- `eframe::Frame` has no public constructor -- but the starting
+    /// value itself is an ordinary function, so both halves are asserted here
+    /// against a real `egui::Context`, and only which local the closure builds
+    /// from it is left to source position.
+    #[test]
+    fn the_stage_starts_out_refusing_every_close_and_still_draining_the_worker() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(input(true), |ui| {
+            assert!(
+                refuse_close_while_working(ui.ctx(), Closing::not_yet()),
+                "the working stage starts out refusing NOTHING, so an Alt+F4 or a system-menu \
+                 close while `bw serve` is starting is honoured and leaves it listening on the \
+                 port the recovery needs"
+            );
+        });
+        assert!(
+            commands_of(&output).contains(&egui::ViewportCommand::CancelClose),
+            "the stage refused the close it did not ask for and sent nothing, so the window \
+             closes anyway: {:?}",
+            commands_of(&output)
+        );
+        // The other half of the same token, and the worse one: the closure
+        // drains the worker only while this is false. Started decided, the
+        // vault never appears, the watchdog never runs, and the spinner spins
+        // behind a ghosted close control with no tray and no Quit in existence.
+        assert!(
+            !Closing::not_yet().decided(),
+            "the working stage begins already believing it has decided to end, so the frame \
+             closure never drains the worker's answer: the vault is never shown and the spinner \
+             runs forever with no way out of it"
         );
     }
 
@@ -1128,7 +1241,7 @@ mod window_close_tests {
     #[test]
     fn the_close_the_stage_sends_itself_is_not_then_refused_by_the_stage() {
         let ctx = egui::Context::default();
-        let mut closing = false;
+        let mut closing = Closing::not_yet();
 
         let first = ctx.run_ui(input(false), |ui| {
             give_up_working(ui.ctx(), &mut closing, WorkFailure::Deadline, WORKING_DEADLINE);
@@ -1152,7 +1265,7 @@ mod window_close_tests {
         // frame refuses the window's own exit. This is what an unconditional
         // refusal ships.
         let bug = ctx.run_ui(input(true), |ui| {
-            refuse_close_while_working(ui.ctx(), false);
+            refuse_close_while_working(ui.ctx(), Closing::not_yet());
         });
         assert!(
             commands_of(&bug).contains(&egui::ViewportCommand::CancelClose),
@@ -1171,7 +1284,7 @@ mod window_close_tests {
     fn giving_up_leaves_the_window_rather_than_landing_on_a_blank_vault() {
         for why in [WorkFailure::WorkerDied, WorkFailure::Deadline] {
             let ctx = egui::Context::default();
-            let mut closing = false;
+            let mut closing = Closing::not_yet();
             let output = ctx.run_ui(input(false), |ui| {
                 assert_eq!(
                     give_up_working(ui.ctx(), &mut closing, why, Duration::ZERO),
@@ -1185,7 +1298,10 @@ mod window_close_tests {
                 commands_of(&output).contains(&egui::ViewportCommand::Close),
                 "{why:?} reached `Next::Close` and still did not ask the window to close"
             );
-            assert!(closing, "{why:?} left the refusal armed against its own close");
+            assert!(
+                closing.decided(),
+                "{why:?} left the refusal armed against its own close"
+            );
         }
     }
 
@@ -1247,16 +1363,56 @@ mod startup_window_tests {
         &source[..end]
     }
 
-    /// The frame closure: from its head to the end of production code.
-    fn closure() -> &'static str {
-        let production = production();
+    /// Everything on a line before a `//`.
+    ///
+    /// Load-bearing for the guards below, not tidiness, and in two ways.
+    ///
+    /// The first: the comment above the spinner call names
+    /// `CloseControl::Disabled` out loud, so a guard that matched the raw source
+    /// would go on passing after the argument itself was changed. This crate has
+    /// already shipped exactly that mistake once (the icon guard that matched
+    /// the comment naming the thing it was looking for).
+    ///
+    /// The second, and the reason this runs BEFORE the slices are cut rather
+    /// than after: the bounds are themselves needles. A comment inside the
+    /// working arm containing `Stage::Vault =>`, or one above the closure
+    /// carrying its head, would end a slice early -- and every guard whose
+    /// needle fell outside the truncated region would then be a statement about
+    /// code that is no longer in it. That is silent where it matters most: a
+    /// truncation that still satisfies the positive controls vacates the
+    /// negative guards entirely. Stripping first means a comment cannot be a
+    /// bound at all, and the length checks below catch anything else that
+    /// shortens one.
+    fn code(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The frame closure: from its head to the end of production code, comments
+    /// already stripped.
+    fn closure() -> String {
+        let production = code(production());
         let at = production
             .find(concat!("run_ui_", "native(WINDOW_TITLE, options, move |ui, frame|"))
             .expect(
                 "no frame closure in this file -- if `run` stopped opening a window, the \
                  single-window startup is gone entirely",
             );
-        &production[at..]
+        let closure = production[at..].to_string();
+        assert!(
+            closure.len() > 4_000,
+            "the frame closure sliced down to {} bytes, which is not the whole of it -- the \
+             guards below would then be statements about a region that stops short of the code \
+             they name",
+            closure.len()
+        );
+        closure
     }
 
     #[test]
@@ -1298,28 +1454,10 @@ mod startup_window_tests {
         );
     }
 
-    /// Everything on a line before a `//`.
-    ///
-    /// Load-bearing for the guard below, not tidiness: the comment above the
-    /// spinner call names `CloseControl::Disabled` out loud, so a guard that
-    /// matched the raw source would go on passing after the argument itself was
-    /// changed. This crate has already shipped exactly that mistake once (the
-    /// icon guard that matched the comment naming the thing it was looking for).
-    fn code(source: &str) -> String {
-        source
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(at) => &line[..at],
-                None => line,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// The `Stage::Working` arm alone, comments stripped. Bounded forward to the
-    /// next arm rather than by a byte count, so it cannot overrun into the
-    /// vault's own chrome call -- which passes `CloseControl::Active` and would
-    /// satisfy a careless search.
+    /// The `Stage::Working` arm alone, cut out of the already-stripped closure.
+    /// Bounded forward to the next arm rather than by a byte count, so it cannot
+    /// overrun into the vault's own chrome call -- which passes
+    /// `CloseControl::Active` and would satisfy a careless search.
     fn working_arm() -> String {
         let closure = closure();
         let start = closure
@@ -1329,7 +1467,15 @@ mod startup_window_tests {
         let end = rest
             .find(concat!("Stage::Vault ", "=>"))
             .expect("the working arm is not followed by the vault arm");
-        code(&rest[..end])
+        let arm = rest[..end].to_string();
+        assert!(
+            arm.len() > 3_000,
+            "the working arm sliced down to {} bytes, which is not the whole of it -- the \
+             negative guards below (no stand-down by hand, no `Err(_)`, no vault draw) would \
+             then be statements about a region that stops before the code they are about",
+            arm.len()
+        );
+        arm
     }
 
     /// **The stage that refuses to close shows a ✕ that refuses to be clicked.**
@@ -1438,7 +1584,7 @@ mod startup_window_tests {
         // `!closing`, and `closing` is set only by the two exits that have
         // already asked the window to close, so no live path loses its deadline.
         assert!(
-            arm.contains(concat!("if !", "closing {")),
+            arm.contains(concat!("if !closing.", "decided() {")),
             "the working arm polls the channel after the stage has decided to stop, so a \
              `build_vault` that answered `None` is logged a frame later as a worker that \
              panicked: {arm}"
@@ -1505,8 +1651,8 @@ mod startup_window_tests {
         // deleted without a behavioural test failing. If it comes back here, the
         // two have been split again.
         assert!(
-            !arm.contains("closing = true;"),
-            "the arm sets the refusal's flag by hand again, which is how it became possible to \
+            !arm.contains(concat!("closing.", "decide()")),
+            "the arm stands the refusal down by hand again, which is how it became possible to \
              delete the close it is supposed to accompany: {arm}"
         );
         // Positive control on the slice, in both directions.
@@ -1530,6 +1676,40 @@ mod startup_window_tests {
             arm.contains(concat!("give_up_", "working(ui.ctx(), &mut closing, why, elapsed)")),
             "the watchdog answered `Failed` and the arm does nothing with it -- the stage \
              computes that it should stop and then keeps waiting: {arm}"
+        );
+    }
+
+    /// **Where the refusal starts, and the one place it may be stood down.**
+    ///
+    /// What the starting value MEANS is behavioural -- see
+    /// `the_stage_starts_out_refusing_every_close_and_still_draining_the_worker`
+    /// -- but which value the frame closure builds its own local from, and
+    /// whether some other arm stands the refusal down before the working stage
+    /// has even begun, is inside the closure and therefore invisible to every
+    /// behavioural test in this file. A `closing.decide()` added to the
+    /// `Stage::SignIn` arm, before the transition to `Working`, leaves the
+    /// working stage refusing nothing for its whole life -- an Alt+F4 during
+    /// `bw serve`'s startup then strands it on the port the recovery needs --
+    /// and leaves the worker's answer undrained, with every other test green.
+    ///
+    /// Counted, not merely `contains`ed: there is exactly one place the stage
+    /// ends itself, and it is `close_this_window`, where the flag and the
+    /// command it must accompany cannot be separated.
+    #[test]
+    fn the_refusal_starts_armed_and_is_stood_down_in_exactly_one_place() {
+        let production = code(production());
+        assert!(
+            production.contains(concat!("let mut closing = Closing::", "not_yet();")),
+            "the frame closure no longer starts the working stage's refusal armed, so the stage \
+             refuses nothing AND never drains the worker: a close during `bw serve`'s startup \
+             strands it on the port the recovery needs, and the vault is never shown at all"
+        );
+        assert_eq!(
+            production.matches(concat!("closing.", "decide()")).count(),
+            1,
+            "the refusal is stood down somewhere other than `close_this_window` -- so a stage \
+             that has not asked to close is no longer refusing anything, and the frame closure \
+             has stopped draining the worker's answer"
         );
     }
 
