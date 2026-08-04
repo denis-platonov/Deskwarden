@@ -62,7 +62,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::rc::Rc;
 use std::process::Child;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tray_icon::menu::{MenuEvent, MenuId};
 use windows::core::HSTRING;
@@ -512,7 +512,14 @@ fn main() {
     // `backend_policy::should_run`), so "not currently running" has to be
     // representable. Always `Some` by the end of both paths below -- something
     // has to answer the very first readiness probe regardless of the setting.
-    let mut bw_serve_child: Option<Child> = None;
+    //
+    // Declared without a value, for the same reason `session_token` below is:
+    // both arms now decide it outright (the single-window arm by claiming the
+    // startup handoff -- see `StartupChildHandoff`), and a `= None` seed here
+    // would let a future arm silently skip that decision and carry on with
+    // "no backend running", which is precisely the false belief that made the
+    // deadline path kill the app on its own orphan.
+    let mut bw_serve_child: Option<Child>;
     // Declared without a value and assigned in BOTH arms below, rather than
     // seeded with an empty string: an empty token is a real value that would
     // compile everywhere and authenticate nothing, and the compiler is a better
@@ -590,6 +597,12 @@ fn main() {
     // here and not on the frame closure: `try_start_backend` alone is regularly
     // several seconds, and any of it on the frame thread would freeze the window
     // exactly where it is meant to be showing a spinner.
+    // Where the worker publishes the `bw serve` it starts, so that a
+    // `WORKING_DEADLINE` expiry -- which throws the worker's whole result
+    // away -- cannot also throw away the handle to a live backend. See
+    // `StartupChildHandoff`.
+    let startup_child = Arc::new(StartupChildHandoff::new());
+    let handoff_for_work = startup_child.clone();
     let job_for_work = job.clone();
     let vault_for_work = vault.clone();
     let schedule_for_work = schedule.clone();
@@ -616,6 +629,7 @@ fn main() {
             &job_for_work,
             &vault_for_work,
             &schedule_for_work,
+            &handoff_for_work,
         ),
         // ON THE MAIN THREAD, in the frame that drains the worker. The cache
         // has to be filled BEFORE the vault frame is built, or the window's
@@ -671,18 +685,30 @@ fn main() {
     session_token = token;
     startup_vault = outcome.vault;
 
+    // **Before the arms split, not inside them.** Whether the worker finished
+    // or `app_window::WORKING_DEADLINE` fired, this process may have a
+    // `bw serve` listening on `BW_SERVE_PORT`; the two arms differ in what
+    // they do next, not in whether that is possible. Asking here is what
+    // stops the `None` arm from assuming the answer is no and then failing
+    // fatally on its own orphan -- see `StartupChildHandoff`.
+    bw_serve_child = startup_child.claim();
+
     match outcome.prepared {
         Some(work) => {
             // Fatal exactly where it was before this change -- `start_backend`
             // used to end the process itself -- and now on the main thread,
             // where the message box it puts up is in front of the user.
-            let child = match work.child {
-                Ok(child) => child,
-                Err(e) => fatal_startup_error(&format!(
+            if let Err(e) = work.child {
+                fatal_startup_error(&format!(
                     "Deskwarden could not start its Bitwarden backend.\n\n{e}"
-                )),
-            };
-            bw_serve_child = Some(child);
+                ));
+            }
+            if bw_serve_child.is_none() {
+                log::error!(
+                    "the startup worker reported that `bw serve` started but parked no handle \
+                     for it; the backend cannot be stopped or restarted from here"
+                );
+            }
             // `build_vault` above already armed `startup_entries` and filled the
             // cache on the happy path; this arm is the one where the readiness
             // probe failed, and it is the SAME recovery startup has always run.
@@ -703,10 +729,24 @@ fn main() {
             }
         }
         None => {
-            // The window ended before the work landed. Nothing started a
-            // backend, so there is no child to adopt and nothing to recover
-            // from -- the same recovery startup has always run takes it from
-            // here, and it begins by authenticating again.
+            // The window ended before the work landed -- the user closed it,
+            // or `WORKING_DEADLINE` fired on a worker still blocked in the
+            // readiness probe or in `check_bw_status_details`.
+            //
+            // **The worker may well have started a backend by then**, and
+            // this arm used to state the opposite and pass `None` down. The
+            // claim above has already adopted it if so, which is what lets
+            // the recovery below actually kill it: recovery's first act is
+            // `stop_bw_serve`, and with `None` it stopped nothing, re-asked
+            // for the master password, then died on the port its own orphan
+            // was holding.
+            if bw_serve_child.is_some() {
+                log::warn!(
+                    "the startup window gave up while a `bw serve` this process started was \
+                     already running; adopting it so the recovery below can stop it instead of \
+                     colliding with it"
+                );
+            }
             let items = recover_from_failed_vault_wait(
                 "the startup window closed before the vault backend was ready",
                 &vault,
@@ -4410,6 +4450,120 @@ fn adopt_started_child(bw_serve_child: &mut Option<Child>, mut child: Child) -> 
     true
 }
 
+/// What became of a child handed to [`StartupChildHandoff::deposit`].
+///
+/// Returned rather than swallowed so the worker can log honestly, and so the
+/// decision itself can be asserted on directly instead of being inferred from
+/// whether a process happens to still be alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoffDeposit {
+    /// Parked in the slot. Whoever claims next gets it.
+    Parked,
+    /// The slot had already been claimed -- the startup window hit its
+    /// `WORKING_DEADLINE` and `main` moved on without waiting for this
+    /// worker. Nobody will ever look in the slot again, so the child was
+    /// stopped here instead of being left listening on `BW_SERVE_PORT` with
+    /// no handle anywhere in the process.
+    StoppedAfterClaim,
+    /// A second child arrived while one was still parked. Not reachable from
+    /// the one production depositor (`StartupWork::produce` deposits at most
+    /// once), but stopping the newcomer is the only answer that cannot orphan
+    /// anything: overwriting the slot would drop the parked handle, and
+    /// `Child::drop` does not kill its process.
+    StoppedAsRedundant,
+}
+
+/// The state of a [`StartupChildHandoff`]'s single slot.
+enum HandoffSlot {
+    /// Nothing deposited yet, and nobody has given up.
+    Empty,
+    /// A `bw serve` is waiting to be collected.
+    Parked(Child),
+    /// Somebody called `claim`. The handoff is closed for good.
+    Claimed,
+}
+
+/// A one-shot channel for the `bw serve` the startup window's WORKER THREAD
+/// starts, separate from the worker's *result*.
+///
+/// **The defect this exists for.** The single startup window's `Working`
+/// stage has a wall-clock deadline (`app_window::WORKING_DEADLINE`). The
+/// worker's result -- `StartupWork` -- only reaches `main` if the worker
+/// finishes first; when the deadline fires instead, `main` takes the `None`
+/// arm and the worker's `StartupWork`, including its `Child`, is eventually
+/// dropped on the worker thread and forgotten. But `StartupWork::produce`
+/// spawns `bw serve` as its FIRST act and can then block for a long time
+/// (the readiness probe, and an untimed `check_bw_status_details` after it),
+/// so by the time the deadline fires there is very often a `bw serve`
+/// listening on `BW_SERVE_PORT` whose only handle is a local in a thread
+/// nobody is waiting on. `recover_from_failed_vault_wait` then asks the user
+/// for their master password again, tries to start a backend, finds the port
+/// held by that very process, and kills the app with
+/// "Deskwarden could not start its Bitwarden backend".
+///
+/// The `bw serve` is spawned into a `KillOnCloseJob`, so the orphan normally
+/// dies with this process and the damage stops at one wasted re-auth. It does
+/// NOT when `KillOnCloseJob::new()` failed and `job` is `None`: there the
+/// orphan outlives the process and every subsequent launch hits the same
+/// held port until the user kills it by hand. That case is why this is a slot
+/// and not a comment.
+///
+/// So the child is published the moment it exists, before anything that can
+/// block, and ownership passes through here rather than through the result:
+/// whichever side gets to `claim` first owns it, and a deposit that loses the
+/// race stops the child itself rather than leaking it. There is no window in
+/// which a spawned `bw serve` is owned by nobody.
+struct StartupChildHandoff {
+    slot: Mutex<HandoffSlot>,
+}
+
+impl StartupChildHandoff {
+    fn new() -> Self {
+        Self { slot: Mutex::new(HandoffSlot::Empty) }
+    }
+
+    /// Publishes a freshly spawned `bw serve`. Called on the worker thread.
+    fn deposit(&self, mut child: Child) -> HandoffDeposit {
+        // `unwrap_or_else(PoisonError::into_inner)`: a panic elsewhere while
+        // holding this lock must not turn "there is a live `bw serve` to
+        // account for" into a second panic that loses it. The slot is three
+        // states and a handle; there is no invariant a poisoned lock could
+        // have left half-written.
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match &*slot {
+            HandoffSlot::Empty => {
+                *slot = HandoffSlot::Parked(child);
+                HandoffDeposit::Parked
+            }
+            HandoffSlot::Claimed => {
+                bw_serve::stop_bw_serve(&mut child);
+                HandoffDeposit::StoppedAfterClaim
+            }
+            HandoffSlot::Parked(_) => {
+                bw_serve::stop_bw_serve(&mut child);
+                HandoffDeposit::StoppedAsRedundant
+            }
+        }
+    }
+
+    /// Takes whatever is parked and closes the handoff for good, so a deposit
+    /// that arrives afterwards stops its own child instead of parking it
+    /// where nobody will look again.
+    ///
+    /// Called on the main thread, on BOTH arms of `match outcome.prepared`:
+    /// the worker succeeding and the deadline firing are the same question
+    /// here -- "is there a `bw serve` this process started?" -- and answering
+    /// it in one place is what stops the `None` arm from assuming the answer
+    /// is no.
+    fn claim(&self) -> Option<Child> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match std::mem::replace(&mut *slot, HandoffSlot::Claimed) {
+            HandoffSlot::Parked(child) => Some(child),
+            HandoffSlot::Empty | HandoffSlot::Claimed => None,
+        }
+    }
+}
+
 /// Kicks off a background attempt to make sure `bw serve` is running,
 /// reporting the outcome through `tx` rather than being joined -- see
 /// `BackendOp`'s doc for why this can't just be awaited inline.
@@ -5192,6 +5346,22 @@ fn try_start_backend(
     // could orphan an unlocked-vault server. See `job_object::spawn_in_job`.
     let command =
         bw_serve::bw_serve_command(session_token).map_err(BackendStartError::NoVerifiedCli)?;
+    // Said once per spawn, not once per launch. `job == None` (the job object
+    // could not be created -- see `main`) is the case with no backstop at
+    // all: nothing kills this process's `bw serve` if we lose the handle, so
+    // an orphan survives the app and holds `BW_SERVE_PORT` against every
+    // later launch. Every path that can drop a handle -- most of all the
+    // startup window's `WORKING_DEADLINE`, see `StartupChildHandoff` -- has
+    // to be exact about ownership, and when a report says "could not start
+    // its Bitwarden backend" this line is how the log says whether the
+    // process now holding the port could have been ours.
+    if job.is_none() {
+        log::warn!(
+            "spawning `bw serve` with no kill-on-close job object: if this process loses track \
+             of the child, nothing will stop it and it will hold localhost:{} after we exit",
+            bw_serve::BW_SERVE_PORT
+        );
+    }
     job_object::spawn_in_job(job, command).map_err(BackendStartError::Spawn)
 }
 
@@ -5241,8 +5411,17 @@ fn seed_cache_at_startup(
 /// the resettle sequence cannot be expressed this way (it borrows a
 /// thread-bound `tray::AppTray` and opens two eframe windows of its own).
 struct StartupWork {
-    /// `Err` is fatal, but not HERE -- see `produce`.
-    child: Result<Child, String>,
+    /// Whether `bw serve` started. `Err` is fatal, but not HERE -- see
+    /// `produce`.
+    ///
+    /// **Deliberately not the `Child` itself.** The handle travels through
+    /// `StartupChildHandoff` instead, published the moment the process
+    /// exists rather than carried here and only delivered if the worker beats
+    /// `app_window::WORKING_DEADLINE` -- see that type for the orphan this
+    /// closes. Keeping a `Child` in this struct as well would give the same
+    /// process two owners and put back exactly the "which copy did we
+    /// forget?" question the handoff removes.
+    child: Result<(), String>,
     items: Result<Vec<deskwarden::vault_bridge::VaultItem>, String>,
     details: login_ui::BwStatusDetails,
 }
@@ -5259,11 +5438,28 @@ impl StartupWork {
         job: &Arc<Option<job_object::KillOnCloseJob>>,
         vault: &VaultBridge,
         schedule: &[Duration],
+        handoff: &StartupChildHandoff,
     ) -> Self {
-        let child = try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE)
-            .map_err(|e| e.to_string());
+        // Published BEFORE the readiness probe and before
+        // `check_bw_status_details`, both of which can block past
+        // `app_window::WORKING_DEADLINE`. From this line on the child is
+        // reachable from the main thread whatever happens to this one.
+        let child = match try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE) {
+            Ok(child) => {
+                match handoff.deposit(child) {
+                    HandoffDeposit::Parked => {}
+                    outcome => log::warn!(
+                        "the startup window had already given up on this worker ({outcome:?}); \
+                         the `bw serve` it just started was stopped here rather than left \
+                         holding the port"
+                    ),
+                }
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        };
         let items = match &child {
-            Ok(_) => wait_for_vault_ready(vault, schedule),
+            Ok(()) => wait_for_vault_ready(vault, schedule),
             // No backend, so there is nothing to probe -- and spending the whole
             // ~30s readiness deadline on a port nothing is listening on is the
             // same waste `resettle_session_with` already refuses to make.
@@ -5528,6 +5724,292 @@ mod tests {
         );
 
         kill_and_reap(&mut bw_serve_child);
+    }
+
+    // ---- the startup window's `bw serve` handoff -------------------------
+    //
+    // The defect: `StartupWork::produce` spawns `bw serve` as its first act
+    // and then blocks -- the readiness probe, then an untimed
+    // `check_bw_status_details`. If that outlasts
+    // `app_window::WORKING_DEADLINE` the window closes, `main` takes the
+    // `None` arm, and the worker's `StartupWork` (and its `Child`) is dropped
+    // on a thread nobody joins. `Child::drop` does not kill its process, so a
+    // `bw serve` was left listening on `BW_SERVE_PORT` with no handle
+    // anywhere -- and `recover_from_failed_vault_wait`, running with
+    // `bw_serve_child: &mut None`, stopped nothing, re-asked for the master
+    // password, and then died on `PortHeld` against its own orphan.
+    //
+    // These drive `StartupChildHandoff` directly with ordinary long-lived
+    // child processes. NOTHING here spawns `bw serve`, binds
+    // `BW_SERVE_PORT`, or touches the real profile: the handoff is about
+    // ownership of a `Child`, and any `Child` proves it.
+
+    #[test]
+    fn a_deposited_startup_child_is_handed_to_whoever_claims() {
+        let handoff = StartupChildHandoff::new();
+        let child = long_lived_command().spawn().unwrap();
+        let pid = child.id();
+
+        assert_eq!(handoff.deposit(child), HandoffDeposit::Parked);
+
+        let mut claimed = handoff.claim();
+        assert_eq!(
+            claimed.as_ref().map(Child::id),
+            Some(pid),
+            "the claimer must receive the very child the worker started"
+        );
+        assert!(
+            is_pid_running(pid),
+            "control: parking and claiming must not have stopped the child -- the point is to \
+             hand a LIVE backend over, so recovery can stop it deliberately"
+        );
+        kill_and_reap(&mut claimed);
+    }
+
+    /// **The orphan, exactly.** The startup window gives up first (`claim`),
+    /// and only afterwards does the worker finish spawning and deposit. There
+    /// is nobody left to collect it, so the handoff must stop it here rather
+    /// than park it where no one will look again.
+    #[test]
+    fn a_child_that_arrives_after_the_deadline_gave_up_is_stopped_not_orphaned() {
+        let handoff = StartupChildHandoff::new();
+
+        assert!(
+            handoff.claim().is_none(),
+            "control: the deadline fired before anything was deposited, so there was nothing \
+             to adopt at that moment"
+        );
+
+        let late = long_lived_command().spawn().unwrap();
+        let pid = late.id();
+        assert_eq!(handoff.deposit(late), HandoffDeposit::StoppedAfterClaim);
+
+        // `stop_bw_serve` kills and then `wait()`s, so the process is already
+        // reaped by the time this runs -- the same reasoning
+        // `adopt_started_child_stops_a_late_arrival_...` relies on.
+        assert!(
+            !is_pid_running(pid),
+            "a `bw serve` deposited after the startup window gave up must be stopped; leaving \
+             it is the orphan that holds localhost:8087 against the next launch"
+        );
+    }
+
+    #[test]
+    fn the_startup_child_can_only_be_claimed_once() {
+        let handoff = StartupChildHandoff::new();
+        let mut claimed = {
+            let child = long_lived_command().spawn().unwrap();
+            handoff.deposit(child);
+            handoff.claim()
+        };
+        assert!(claimed.is_some(), "control: the first claim takes the child");
+        assert!(
+            handoff.claim().is_none(),
+            "a second claim must not hand the same process out twice -- two owners is how a \
+             kill lands on a handle the other side is still using"
+        );
+        kill_and_reap(&mut claimed);
+    }
+
+    #[test]
+    fn a_second_deposit_stops_the_newcomer_and_keeps_the_parked_child() {
+        let handoff = StartupChildHandoff::new();
+        let first = long_lived_command().spawn().unwrap();
+        let first_pid = first.id();
+        assert_eq!(handoff.deposit(first), HandoffDeposit::Parked);
+
+        let second = long_lived_command().spawn().unwrap();
+        let second_pid = second.id();
+        assert_eq!(handoff.deposit(second), HandoffDeposit::StoppedAsRedundant);
+
+        let mut claimed = handoff.claim();
+        assert_eq!(
+            claimed.as_ref().map(Child::id),
+            Some(first_pid),
+            "the parked child must not be overwritten -- overwriting drops its handle, and a \
+             dropped `Child` keeps running"
+        );
+        assert!(!is_pid_running(second_pid), "the redundant newcomer must be stopped");
+        kill_and_reap(&mut claimed);
+    }
+
+    #[test]
+    fn an_untouched_handoff_hands_over_nothing() {
+        assert!(
+            StartupChildHandoff::new().claim().is_none(),
+            "control: no worker ever got as far as spawning, so there is genuinely nothing to \
+             adopt and recovery is right to start from scratch"
+        );
+    }
+
+    /// `StartupWork::produce`'s body, bounded by the function defined
+    /// immediately after `impl StartupWork` rather than by a closing brace: a
+    /// `"\n}"` needle passes on LF and fails on CRLF, and `main.rs` is CRLF.
+    fn the_produce_body() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("fn produce", "("))
+            .expect("`StartupWork::produce` must still exist")
+            .1;
+        let body = after
+            .split_once(concat!("fn account_details", "_source("))
+            .expect("`account_details_source` must still be the function defined after it")
+            .0;
+        assert!(
+            body.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            body.contains(concat!("try_start_", "backend(token,")),
+            "control: the region really is `produce`'s own body"
+        );
+        body
+    }
+
+    /// The wiring half of the fix. Depositing the child is only worth
+    /// anything if it happens BEFORE the calls that can outlast
+    /// `WORKING_DEADLINE`; deposited afterwards it is exactly as unreachable
+    /// as carrying it in the return value was.
+    #[test]
+    fn the_startup_worker_publishes_bw_serve_before_anything_that_can_block() {
+        let body = the_produce_body();
+        let deposit = body
+            .find(concat!("handoff.dep", "osit(child)"))
+            .expect("`produce` must publish the child it started through the handoff");
+        for later in [
+            concat!("wait_for_vault", "_ready(vault, schedule)"),
+            concat!("login_ui::check_bw_", "status_details()"),
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("`produce` must still call `{later}`"));
+            assert!(
+                deposit < at,
+                "`{later}` can block past `app_window::WORKING_DEADLINE`; the child must be \
+                 published before it, or the deadline still finds no handle to adopt"
+            );
+        }
+    }
+
+    /// `StartupWork` must not also carry the handle. Two owners for one
+    /// process is the ambiguity the handoff exists to remove, and a `Child`
+    /// back in this struct would restore the arm-only delivery that the
+    /// deadline throws away.
+    #[test]
+    fn the_startup_work_result_carries_no_child_handle() {
+        let production = production_half_of_this_file();
+        let decl = production
+            .split_once(concat!("struct Startup", "Work {"))
+            .expect("`StartupWork` must still exist")
+            .1;
+        let fields = decl
+            .split_once(concat!("impl Startup", "Work {"))
+            .expect("`impl StartupWork` must still follow the struct")
+            .0;
+        assert!(
+            fields.contains(concat!("child: Result<(), ", "String>")),
+            "`StartupWork::child` must report only whether the backend started; the handle \
+             travels through `StartupChildHandoff`"
+        );
+        assert!(
+            !fields.contains(concat!("Result<Child", ",")),
+            "a `Child` is back in `StartupWork`, so it is once again delivered only on the arm \
+             the deadline discards"
+        );
+    }
+
+    /// The single startup window's region of `main`, bounded at both ends by
+    /// single-line anchors that cannot drift into a neighbouring branch.
+    fn the_single_window_startup_region() -> &'static str {
+        let production = production_half_of_this_file();
+        let after = production
+            .split_once(concat!("let handoff_for", "_work = startup_child.clone();"))
+            .expect("the single startup window must still hand the worker a handoff clone")
+            .1;
+        let region = after
+            .split_once(concat!("match engine loaded with ", "{} app match(es)"))
+            .expect("the region must still end at the post-startup engine log")
+            .0;
+        assert!(
+            region.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            region.contains(concat!("match outcome.pre", "pared {")),
+            "control: the region really is the one that decides on the worker's result"
+        );
+        region
+    }
+
+    /// **The whole point of the fix, as wiring.** The claim has to happen
+    /// before the `Some`/`None` split, because the `None` arm is the one that
+    /// used to assume no backend had been started. If it moves inside the
+    /// `Some` arm, the deadline path is orphaning again with every unit test
+    /// above still green.
+    #[test]
+    fn the_single_window_claims_the_startup_child_before_the_arms_split() {
+        let region = the_single_window_startup_region();
+        let claim = region
+            .find(concat!("bw_serve_child = startup_child.cl", "aim();"))
+            .expect("`main` must claim the startup handoff into `bw_serve_child`");
+        let split = region
+            .find(concat!("match outcome.pre", "pared {"))
+            .expect("control: the region must still contain the split");
+        assert!(
+            claim < split,
+            "the claim must precede `match outcome.prepared`; inside the `Some` arm it never \
+             runs on the deadline path, which is the path that orphans"
+        );
+        let recovery = region
+            .find(concat!("recover_from_failed_vault", "_wait("))
+            .expect("the region must still reach the startup recovery");
+        assert!(
+            claim < recovery,
+            "recovery's first act is `stop_bw_serve` on whatever it is handed; claiming after \
+             it would hand it `None` again"
+        );
+        assert_eq!(
+            production_half_of_this_file()
+                .matches(concat!("startup_child.cl", "aim()"))
+                .count(),
+            1,
+            "exactly one place may take ownership of the startup child; a second claim would \
+             silently get `None` and conclude no backend is running"
+        );
+        // Claiming and then throwing the answer away is the original bug
+        // wearing the fix's clothes: the `None` arm's whole defect was that
+        // it went into recovery believing `bw_serve_child` was `None`.
+        assert!(
+            !region[claim..].contains(concat!("bw_serve_child = ", "None")),
+            "nothing after the claim may put `bw_serve_child` back to `None`; recovery would \
+             then stop nothing and collide with the very backend just adopted"
+        );
+    }
+
+    #[test]
+    fn the_startup_worker_is_given_the_same_handoff_main_claims_from() {
+        let production = production_half_of_this_file();
+        assert_eq!(
+            production
+                .matches(concat!("let startup_child = Arc::new(StartupChildHan", "doff::new())"))
+                .count(),
+            1,
+            "there must be exactly one startup handoff, or the worker deposits into one slot \
+             while `main` claims from another and the orphan is back"
+        );
+        assert_eq!(
+            production
+                .matches(concat!("let handoff_for", "_work = startup_child.clone();"))
+                .count(),
+            1,
+            "the worker's handoff must be a clone of that same one"
+        );
+        let region = the_single_window_startup_region();
+        assert!(
+            region.contains(concat!("&handoff_for", "_work,")),
+            "the worker closure must actually be passed the handoff; without the argument \
+             `produce` has nowhere to publish and the deposit is unreachable"
+        );
     }
 
     fn vault_item_with_match(id: &str, process: &str) -> String {
