@@ -939,6 +939,197 @@ fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
         .expect("COPY_SHORTCUTS covers every CopyShortcut variant")
 }
 
+/// **The one place a chord-bound field's NAME is written.**
+///
+/// The row paints this as its label and the copy confirmation names the same
+/// string, so the two cannot drift: there is no second list of field names to
+/// fall out of step with the first. That is the whole reason this exists
+/// rather than the toast carrying its own words -- this crate has been bitten
+/// repeatedly by parallel tables, and a confirmation reading "Password
+/// copied" beside a row labelled something else is exactly that bug wearing a
+/// new hat.
+///
+/// It is deliberately keyed on [`CopyShortcut`] rather than on
+/// [`DetailAction`]: a `DetailAction`-keyed table would have to name
+/// [`DetailAction::CopyValue`], which is one variant shared by the website,
+/// every identity field and three card fields, and could not tell them apart
+/// without -- again -- a second list. Rows with no chord name themselves the
+/// same way they always have, with the literal they paint, which
+/// [`copy_row`] reads straight off the row it just drew.
+fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
+    match which {
+        CopyShortcut::Username => "Username",
+        CopyShortcut::Password => "Password",
+        CopyShortcut::Totp => "One-time code",
+        CopyShortcut::Url => "Website",
+    }
+}
+
+/// How long a copy confirmation stays up, in seconds. The user asked for
+/// "5 seconds tooltip".
+const COPY_TOAST_SECONDS: f64 = 5.0;
+
+/// How far the confirmation sits in from the window's bottom-right corner.
+///
+/// Clear of `login_ui`'s resize handles, which live in their own foreground
+/// layer along the very edge, and clear of the detail pane's own controls --
+/// every one of which (Edit, Fill, the kebab, the star) is in the header
+/// strip at the TOP of the pane. It also cannot cover the row that was just
+/// clicked: the rows are laid out from the top of the body downwards and this
+/// is anchored to the opposite corner.
+const COPY_TOAST_INSET: f32 = 20.0;
+
+/// The confirmation's type size -- the pane's own body size (`ROW_VALUE_SIZE`
+/// is 15, a row label 12); 13 is the design's plain-text size, used here so
+/// the toast reads as this app rather than as a system notification.
+const COPY_TOAST_TEXT_SIZE: f32 = 13.0;
+
+/// What was copied, and when -- on egui's own frame clock (`InputState::time`,
+/// seconds), not `Instant`, so a test can drive the whole lifetime by running
+/// frames or by handing `RawInput::time` a number.
+///
+/// Kept in the context's temporary data rather than threaded through
+/// [`draw_detail_read`]'s signature because the two writers are a widget deep
+/// inside the pane ([`copy_row`]) and the chord resolution at the end of the
+/// pane, and neither can reach a local of the other without a new out-param
+/// on five row helpers. The DECISION does not live in there: see
+/// [`copy_toast_now`], which is a pure function of this value and the time,
+/// and is what the tests call.
+#[derive(Clone, Debug, PartialEq)]
+struct CopyToast {
+    /// The row's label. **Never the value.** See [`copy_toast_text`].
+    label: String,
+    shown_at: f64,
+}
+
+/// Where [`CopyToast`] lives in `egui`'s temporary data.
+fn copy_toast_id() -> egui::Id {
+    egui::Id::new("detail-copy-toast")
+}
+
+/// The sentence a confirmation shows for a row labelled `label`.
+///
+/// **The label and nothing else.** The whole point of the confirmation is to
+/// say that *something happened*, and the one thing it must never say is the
+/// thing that just went on the clipboard: this pane's rows are passwords,
+/// card numbers, security codes and private keys, and a 5-second banner in
+/// the corner of the window is precisely the surface a shoulder-surfer reads.
+/// The value is not a parameter here, so it cannot be interpolated by
+/// accident.
+fn copy_toast_text(label: &str) -> String {
+    format!("{label} copied")
+}
+
+/// What the confirmation should say **now**, and how many seconds are left --
+/// or `None` once it has expired.
+///
+/// The remainder is returned rather than kept private because the caller owes
+/// egui a `request_repaint_after` for exactly that long. egui only redraws on
+/// input, so a toast whose deadline nobody schedules stays on screen until
+/// the next mouse move; that is this feature's most likely bug and the reason
+/// the deadline is part of this function's answer instead of a separate
+/// calculation somewhere else.
+///
+/// A second copy overwrites the whole [`CopyToast`], label and timestamp
+/// together, so it replaces the message and restarts the clock -- nothing
+/// queues and nothing stacks.
+///
+/// Pure, and separate from the closure that draws it, for this file's
+/// standing reason: a decision reachable only from inside an eframe closure
+/// is a decision that will not be tested.
+fn copy_toast_now(toast: Option<&CopyToast>, now: f64) -> Option<(String, f64)> {
+    let toast = toast?;
+    let left = COPY_TOAST_SECONDS - (now - toast.shown_at);
+    (left > 0.0).then(|| (copy_toast_text(&toast.label), left))
+}
+
+/// Records that `label`'s row was just copied, starting the confirmation.
+///
+/// Called from BOTH copy paths -- [`copy_row`]'s click and
+/// [`draw_detail_read`]'s chord -- so a keyboard copy confirms exactly as a
+/// clicked one does. That is not a nicety: a chord is the case where the user
+/// has least evidence anything happened at all, since there is no row under
+/// the pointer to have reacted.
+fn note_copied(ctx: &egui::Context, label: &str) {
+    let shown_at = ctx.input(|i| i.time);
+    ctx.data_mut(|data| {
+        data.insert_temp(
+            copy_toast_id(),
+            CopyToast {
+                label: label.to_string(),
+                shown_at,
+            },
+        )
+    });
+}
+
+/// Paints the copy confirmation, if one is live, and schedules the repaint
+/// that retires it.
+///
+/// **A floating toast, not an `on_hover_text` tooltip**, despite the word the
+/// user used. An egui tooltip is bound to a widget and to the pointer: it
+/// appears only while the pointer rests on the row, and it vanishes the
+/// instant the pointer moves. Neither half survives what was actually asked
+/// for. "Five seconds" is a duration the pointer will not sit still for, and
+/// a chord copy has no pointer on the row at all -- CTRL+B with the mouse
+/// parked over the item list would have shown nothing whatsoever. The
+/// behaviour described ("you don't know what happened") is what is built
+/// here; the surface named is the one thing that cannot deliver it.
+///
+/// Its own `Order::Foreground` [`egui::Area`], and non-interactable, so it
+/// floats over the pane's cards without stealing a click from the row
+/// underneath -- the same treatment `login_ui`'s resize handles and
+/// `folder_modal`'s scrim already use.
+fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
+    let now = ui.input(|i| i.time);
+    let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
+    let Some((text, left)) = copy_toast_now(toast.as_ref(), now) else {
+        return;
+    };
+    // The deadline, handed to egui. Without this the toast expires only when
+    // something else happens to cause a frame.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_secs_f64(left));
+
+    // **Measured here and placed with `fixed_pos`, not handed to `anchor`.**
+    // An `Area` whose size egui does not yet know runs an INVISIBLE sizing
+    // pass on its first frame when it has to align itself -- so an anchored
+    // toast paints nothing on the very frame the copy happened and only
+    // appears on the next one. The copy and its confirmation are one gesture;
+    // a frame of silence in between is the bug this whole feature exists to
+    // remove. Laying the text out first makes the size known, which makes the
+    // placement arithmetic this function's own and the paint immediate.
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        egui::FontId::proportional(COPY_TOAST_TEXT_SIZE),
+        theme::CARD,
+    );
+    let pad = egui::vec2(14.0, 10.0);
+    let size = galley.size() + pad * 2.0;
+    // `max` on the near edges so a pane narrower than the message keeps the
+    // START of the sentence on screen rather than the end of it.
+    let pos = egui::pos2(
+        (pane.right() - COPY_TOAST_INSET - size.x).max(pane.left() + COPY_TOAST_INSET),
+        (pane.bottom() - COPY_TOAST_INSET - size.y).max(pane.top() + COPY_TOAST_INSET),
+    );
+    // **A painter on a foreground layer, not an `egui::Area`.** An `Area`
+    // that has never been laid out before runs its first pass invisibly to
+    // learn its own size, so an `Area`-based toast painted NOTHING on the
+    // frame the copy happened and only appeared on the next one -- measured,
+    // not assumed: `clicking_a_row_confirms_the_copy_by_name` failed against
+    // exactly that version while the placement test, which reads the frame
+    // after, passed. A painter has no layout and no state to warm up, and a
+    // confirmation is only ever painted: it takes no input, so it wants none
+    // of what an `Area` is for, and cannot swallow a click meant for the row
+    // beneath it.
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(egui::Order::Foreground, copy_toast_id()));
+    let rect = egui::Rect::from_min_size(pos, size);
+    painter.rect_filled(rect, CornerRadius::same(8), theme::INK);
+    painter.galley(rect.min + pad, galley, theme::CARD);
+}
+
 /// What a copy-on-click tile says when the pointer rests on it.
 ///
 /// **Two invisible things, one sentence.** Neither of them is discoverable
@@ -1508,7 +1699,10 @@ pub fn draw_detail_read(
             card(ui, "LOGIN CREDENTIALS", |ui| {
                 credential_row(
                     ui,
-                    "Username",
+                    // The label is read out of `copy_shortcut_label` rather
+                    // than typed here, so this row and its copy confirmation
+                    // are literally the same string.
+                    copy_shortcut_label(CopyShortcut::Username),
                     username,
                     Some(CopyShortcut::Username),
                     &mut action,
@@ -1606,7 +1800,9 @@ pub fn draw_detail_read(
             let mut opened = false;
             copy_row(
                 ui,
-                "Website",
+                // See `copy_shortcut_label`: one string for the row and its
+                // toast.
+                copy_shortcut_label(CopyShortcut::Url),
                 |ui| {
                     opened = theme::link_label(ui, website, ROW_VALUE_SIZE)
                         .on_hover_text("Open in browser")
@@ -1651,9 +1847,17 @@ pub fn draw_detail_read(
         if let Some(which) = shortcut {
             if let Some(copy) = copy_shortcut_action(which, username, password, totp, website) {
                 action = copy;
+                // The same confirmation a click gets, named out of
+                // `copy_shortcut_label` -- which is also what the row for
+                // this chord painted as its label, so the two agree by
+                // construction rather than by inspection.
+                note_copied(ui.ctx(), copy_shortcut_label(which));
             }
         }
     }
+    // Last, so a copy reported anywhere above -- click or chord -- is already
+    // on the clock by the time this reads it and shows it in the same frame.
+    draw_copy_toast(ui, pane);
     action
 }
 
@@ -1799,6 +2003,9 @@ fn copy_row(
     };
     if response.clicked() {
         *action = on_copy;
+        // The row names its own confirmation, off the very label it just
+        // painted -- so the toast cannot say a field the row does not.
+        note_copied(ui.ctx(), label);
     }
 }
 
@@ -1933,7 +2140,8 @@ fn credential_row(
 fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
     masked_row(
         ui,
-        "Password",
+        // See `copy_shortcut_label`: one string for the row and its toast.
+        copy_shortcut_label(CopyShortcut::Password),
         password,
         revealed,
         action,
@@ -2266,7 +2474,10 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
 fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
     copy_row(
         ui,
-        "One-time code",
+        // See `copy_shortcut_label`: one string for the row and its toast.
+        // The three NON-code One-time code rows keep their own literal --
+        // they copy nothing, so they have no toast to disagree with.
+        copy_shortcut_label(CopyShortcut::Totp),
         |ui| {
             // The design lays these three out along one centred line, `gap:
             // 12px` apart: the code, a 96x4 track, then the seconds left.
@@ -2549,6 +2760,9 @@ mod tests {
             eyes: Vec::new(),
             kebab_dots: Vec::new(),
             segments: Vec::new(),
+            // The out-of-vault pane copies nothing, so it has no deadline of
+            // its own; no test here reads this.
+            repaint_delay: std::time::Duration::MAX,
         };
         // One tree -- see `Pane::frame`, which explains why per-clipped-shape
         // probing cannot see a filled star.
@@ -2919,6 +3133,14 @@ mod tests {
         eyes: Vec<egui::Rect>,
         kebab_dots: Vec<(egui::Rect, egui::Color32)>,
         segments: Vec<egui::Rect>,
+        /// The soonest this frame asked egui to come back on its own.
+        ///
+        /// egui redraws on input; anything with a DEADLINE has to say so, or
+        /// it stays on screen until something else happens to cause a frame.
+        /// The copy confirmation is the one thing on this pane with a
+        /// deadline, so this is how a test can see that it scheduled its own
+        /// disappearance rather than hoping for a mouse move.
+        repaint_delay: std::time::Duration,
     }
 
     impl Frame {
@@ -3140,6 +3362,12 @@ mod tests {
                 eyes: Vec::new(),
                 kebab_dots: Vec::new(),
                 segments: Vec::new(),
+                repaint_delay: output
+                    .viewport_output
+                    .values()
+                    .map(|viewport| viewport.repaint_delay)
+                    .min()
+                    .unwrap_or(std::time::Duration::MAX),
             };
             // ONE tree, not one call per clipped shape: `paint_star` adds
             // the star's outline and its ten fill triangles as separate
@@ -6438,6 +6666,483 @@ mod tests {
         assert!(
             contains(&texts, "Earlier"),
             "a dated-less history row lost its label entirely: {texts:?}"
+        );
+    }
+
+    /// ------------------------------------------------------------------
+    /// The copy confirmation ("Password copied"), the user's request:
+    /// "when clicked on password - it gets copied but you don't know what
+    /// happened - should be like 5 seconds tooltip".
+    /// ------------------------------------------------------------------
+
+    /// **One name per copyable chord, and no two the same.**
+    ///
+    /// The twin of the `COPY_SHORTCUTS` coverage/collision pair one table
+    /// over: the field NAME is now as load-bearing as the chord is, because
+    /// the row paints it and the confirmation says it. Two fields sharing a
+    /// name would produce a toast that cannot be told apart from another
+    /// field's.
+    #[test]
+    fn every_copy_shortcut_names_one_field_and_no_two_name_the_same_one() {
+        let all = [
+            CopyShortcut::Username,
+            CopyShortcut::Password,
+            CopyShortcut::Totp,
+            CopyShortcut::Url,
+        ];
+        for (index, first) in all.iter().enumerate() {
+            let name = copy_shortcut_label(*first);
+            assert!(
+                !name.is_empty(),
+                "{first:?} has no field name, so its toast would read \" copied\""
+            );
+            for second in &all[index + 1..] {
+                assert_ne!(
+                    name,
+                    copy_shortcut_label(*second),
+                    "{first:?} and {second:?} are both called {name:?}, so their \
+                     confirmations are indistinguishable"
+                );
+            }
+        }
+        // Absolute, not re-derived: these are the four words the user reads.
+        assert_eq!(copy_shortcut_label(CopyShortcut::Password), "Password");
+        assert_eq!(copy_shortcut_label(CopyShortcut::Username), "Username");
+        assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "One-time code");
+        assert_eq!(copy_shortcut_label(CopyShortcut::Url), "Website");
+    }
+
+    /// **The row paints the name the confirmation says.**
+    ///
+    /// This is the promise `copy_shortcut_label` exists to make, and it is
+    /// only a promise if the rows really do read it. A row labelled anything
+    /// else beside a toast naming this string is the parallel-table bug this
+    /// crate keeps shipping.
+    #[test]
+    fn each_chord_bound_row_paints_the_name_its_confirmation_uses() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let totp = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &totp);
+        for which in [
+            CopyShortcut::Username,
+            CopyShortcut::Password,
+            CopyShortcut::Totp,
+            CopyShortcut::Url,
+        ] {
+            let name = copy_shortcut_label(which);
+            assert!(
+                laid_out.painted(name),
+                "{which:?}'s confirmation would say {name:?}, but no row on the pane \
+                 is labelled that; painted: {:?}",
+                laid_out.strings()
+            );
+        }
+    }
+
+    /// **The confirmation names the field. It cannot carry the value.**
+    ///
+    /// This pane's copyable rows are passwords, card numbers, security codes
+    /// and private keys, and the confirmation is a banner that sits in the
+    /// corner of the window for five seconds -- exactly the surface a
+    /// shoulder-surfer reads. `copy_toast_text` takes no value parameter at
+    /// all, so the strongest form of this assertion is that the real secrets
+    /// of the real fixtures cannot appear in it however it is called.
+    #[test]
+    fn the_confirmation_names_the_field_and_never_the_copied_value() {
+        // The fixtures' actual secrets, spelled out here rather than read off
+        // the items, so this test still fails if a fixture changes.
+        let secrets = ["hunter2", "4242424242424242", "a.novak@ledgerline.com"];
+        for label in ["Password", "Username", "One-time code", "Website", "Number"] {
+            let text = copy_toast_text(label);
+            assert_eq!(text, format!("{label} copied"));
+            for secret in secrets {
+                assert!(
+                    !text.contains(secret),
+                    "the {label:?} confirmation put {secret:?} on screen: {text:?}"
+                );
+            }
+        }
+        // The control: the needle-check above is only worth something if
+        // `contains` would actually find these strings when they ARE present.
+        for secret in secrets {
+            assert!(
+                format!("prefix {secret} suffix").contains(secret),
+                "the secret-leak check cannot detect {secret:?} at all"
+            );
+        }
+        // And the fixture's password really is "hunter2", so the needle above
+        // is not a string with no bearing on anything this pane holds.
+        assert_eq!(
+            a_login()
+                .login
+                .and_then(|l| l.password)
+                .map(|p| p.to_string()),
+            Some("hunter2".to_string()),
+            "the fixture's password is not the one this test guards against"
+        );
+    }
+
+    /// **The clipboard's contents never reach the screen through a real
+    /// copy either** -- the pure check above, driven end to end.
+    #[test]
+    fn a_real_copy_puts_the_field_name_on_screen_and_not_the_secret() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let row = laid_out.rect_of("Password");
+        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert_eq!(
+            copied.action,
+            DetailAction::CopyPassword,
+            "the click did not copy, so the assertions below are about nothing"
+        );
+        assert!(copied.painted("Password copied"));
+        // The row itself is masked, so "hunter2" is not on the pane at all --
+        // which is exactly what the confirmation must not change.
+        assert!(
+            !contains(
+                &copied.strings().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "hunter2"
+            ),
+            "copying the password painted it on screen: {:?}",
+            copied.strings()
+        );
+        // The control: revealing it DOES paint it, so the check above can
+        // fail. Without this, a harness that saw no text would also pass.
+        pane.reveal.password = true;
+        let revealed = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            contains(
+                &revealed.strings().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "hunter2"
+            ),
+            "the harness cannot see the password even when the row reveals it, so \
+             the negative above proves nothing: {:?}",
+            revealed.strings()
+        );
+    }
+
+    /// **Five seconds, and then nothing** -- the number the user asked for.
+    ///
+    /// Every time here is an absolute second count, never one computed from
+    /// `COPY_TOAST_SECONDS`: a test that derives its expectation from the
+    /// constant under test passes at any value of it.
+    #[test]
+    fn the_confirmation_lasts_five_seconds_and_reports_the_time_left() {
+        let toast = CopyToast {
+            label: "Password".to_string(),
+            shown_at: 100.0,
+        };
+        assert_eq!(
+            copy_toast_now(Some(&toast), 100.0),
+            Some(("Password copied".to_string(), 5.0)),
+            "the confirmation is not up on the very frame the copy happened"
+        );
+        let (text, left) = copy_toast_now(Some(&toast), 104.9)
+            .expect("the confirmation is gone before five seconds are up");
+        assert_eq!(text, "Password copied");
+        assert!(
+            (left - 0.1).abs() < 1e-6,
+            "0.1s before the deadline the confirmation reported {left}s left, so a \
+             repaint scheduled from it would come at the wrong time"
+        );
+        assert_eq!(
+            copy_toast_now(Some(&toast), 105.0),
+            None,
+            "the confirmation outlived its five seconds"
+        );
+        assert_eq!(copy_toast_now(Some(&toast), 900.0), None);
+        assert_eq!(
+            copy_toast_now(None, 100.0),
+            None,
+            "a pane that has copied nothing is showing a confirmation"
+        );
+    }
+
+    /// **A second copy replaces the first and restarts the clock** -- it does
+    /// not queue behind it, and two do not stack.
+    #[test]
+    fn a_second_copy_replaces_the_message_and_restarts_the_five_seconds() {
+        let first = CopyToast {
+            label: "Password".to_string(),
+            shown_at: 100.0,
+        };
+        // Four seconds in, one second left.
+        let (text, left) = copy_toast_now(Some(&first), 104.0).expect("still up at 4s");
+        assert_eq!(text, "Password copied");
+        assert!((left - 1.0).abs() < 1e-6, "reported {left}s left at 4s in");
+
+        // The username is copied at that moment. One value, overwritten
+        // whole, so the label and the deadline move together.
+        let second = CopyToast {
+            label: "Username".to_string(),
+            shown_at: 104.0,
+        };
+        assert_eq!(
+            copy_toast_now(Some(&second), 104.0),
+            Some(("Username copied".to_string(), 5.0)),
+            "the second copy did not take over the confirmation"
+        );
+        // And the first one's original deadline no longer retires anything:
+        // at 105.5 -- past the FIRST five seconds -- the second is still up.
+        assert_eq!(
+            copy_toast_now(Some(&second), 105.5),
+            Some(("Username copied".to_string(), 3.5)),
+            "the second copy inherited the first one's deadline instead of its own"
+        );
+    }
+
+    /// The same replacement, through the pane: two copies in a row leave ONE
+    /// message on screen, the second one's.
+    #[test]
+    fn a_second_copy_through_the_pane_leaves_only_the_newer_message() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let password = laid_out.rect_of("Password");
+        let username = laid_out.rect_of("Username");
+        let first = pane.click(&item, &TotpState::NoSecret, password.center());
+        assert!(first.painted("Password copied"), "the first copy said nothing");
+        let second = pane.click(&item, &TotpState::NoSecret, username.center());
+        assert!(
+            second.painted("Username copied"),
+            "the second copy did not take over: {:?}",
+            second.strings()
+        );
+        assert!(
+            !second.painted("Password copied"),
+            "both confirmations are on screen at once: {:?}",
+            second.strings()
+        );
+    }
+
+    /// **The click path is wired.** The decision above is pure; this is the
+    /// other half, driven with a real click on a real row.
+    ///
+    /// Deliberately separate from the chord test below: they are two call
+    /// sites, and one of them passing proves nothing about the other.
+    #[test]
+    fn clicking_a_row_confirms_the_copy_by_name() {
+        for (row, want) in [
+            ("Password", "Password copied"),
+            ("Username", "Username copied"),
+            ("Website", "Website copied"),
+        ] {
+            let item = a_login();
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                !laid_out.painted(want),
+                "the pane showed {want:?} before anything was copied"
+            );
+            let target = laid_out.rect_of(row);
+            let clicked = pane.click(&item, &TotpState::NoSecret, target.center());
+            assert!(
+                !matches!(clicked.action, DetailAction::None),
+                "the click on the {row:?} row copied nothing, so the confirmation \
+                 below is about a click that hit nothing"
+            );
+            assert!(
+                clicked.painted(want),
+                "clicking the {row:?} row copied silently -- the frame painted: {:?}",
+                clicked.strings()
+            );
+        }
+    }
+
+    /// **A keyboard chord confirms exactly as a click does**, and this is the
+    /// case that needs it most: there is no row under the pointer to have
+    /// reacted, so without this the user has no evidence at all.
+    ///
+    /// Driven with key events and NO pointer anywhere on the pane -- which is
+    /// also why an `on_hover_text` tooltip could not have been the surface.
+    #[test]
+    fn a_chord_confirms_the_copy_exactly_as_a_click_does() {
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let totp = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 9,
+        };
+        let shift_ctrl = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+        for (modifiers, key, want) in [
+            (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
+            (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "One-time code copied"),
+            (shift_ctrl, egui::Key::U, "Website copied"),
+        ] {
+            let mut pane = Pane::new();
+            let idle = pane.idle(&item, &totp);
+            assert!(
+                !idle.painted(want),
+                "the pane showed {want:?} with no chord pressed"
+            );
+            let pressed = pane.frame(
+                &item,
+                &totp,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+            );
+            assert!(
+                !matches!(pressed.action, DetailAction::None),
+                "the chord for {want:?} copied nothing, so the assertion below is \
+                 about a chord that did not fire"
+            );
+            assert!(
+                pressed.painted(want),
+                "a chord copied silently; expected {want:?}, the frame painted: {:?}",
+                pressed.strings()
+            );
+        }
+    }
+
+    /// **The confirmation retires itself.** egui only redraws on input, so a
+    /// toast with a deadline that nobody schedules stays on screen until the
+    /// user happens to move the mouse. This is the single most likely bug in
+    /// the feature, so it is pinned twice: the frame asks for a repaint, and
+    /// the message really is gone five seconds later.
+    ///
+    /// The repaint half asserts the request SHRINKS as the deadline nears --
+    /// a constant delay (or egui's own idle default) cannot do that, and a
+    /// bare "is it under five seconds" could be satisfied by an unrelated
+    /// animation.
+    #[test]
+    fn the_confirmation_schedules_the_repaint_that_retires_it_and_then_goes_away() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let row = laid_out.rect_of("Password");
+        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert!(copied.painted("Password copied"), "nothing was copied");
+        // The frame the click landed on asks for an immediate repaint for
+        // reasons of its own -- egui always does after a pointer event -- so
+        // the countdown is read off the quiet frames that follow. egui
+        // advances its own clock by one predicted frame (1/60s) per
+        // input-less pass, the same trick `hover_settled` uses.
+        //
+        // 121 frames is 2.02s, so a five-second deadline started at the copy
+        // has about 2.98s left. Every number below is ABSOLUTE: none is
+        // computed from `COPY_TOAST_SECONDS`, and no constant delay and no
+        // unrelated animation can land in this window AND in the next one a
+        // second later.
+        for _ in 0..120 {
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+        }
+        let two_seconds_in = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            two_seconds_in.painted("Password copied"),
+            "the confirmation was gone two seconds after the copy; the frame painted: {:?}",
+            two_seconds_in.strings()
+        );
+        let left = two_seconds_in.repaint_delay.as_secs_f64();
+        assert!(
+            (2.7..3.2).contains(&left),
+            "two seconds after the copy the frame asked egui back in {left}s; a \
+             five-second deadline started at the copy has about 2.98s left"
+        );
+
+        // One more second of frames, and the request must have shrunk by
+        // about exactly that second.
+        for _ in 0..60 {
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+        }
+        let three_seconds_in = pane.idle(&item, &TotpState::NoSecret);
+        let left = three_seconds_in.repaint_delay.as_secs_f64();
+        assert!(
+            (1.7..2.2).contains(&left),
+            "a second later the frame asked egui back in {left}s, so the request is \
+             not counting the confirmation down"
+        );
+
+        // Past five seconds. 200 more frames is 3.33s, taking the total to
+        // 6.35s -- past the deadline without being computed from it.
+        for _ in 0..200 {
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+        }
+        let expired = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !expired.painted("Password copied"),
+            "the confirmation was still up more than five seconds after the copy: {:?}",
+            expired.strings()
+        );
+    }
+
+    /// **Where it sits: the window's bottom-right, clear of everything that
+    /// matters.**
+    ///
+    /// It must not cover the row that was just clicked (the rows lay out from
+    /// the top of the body down; this is anchored to the opposite corner), it
+    /// must not sit under the pane's own controls (Edit, Fill, the kebab and
+    /// the star are all in the header strip at the top), and it must still
+    /// read at the smallest window the app can be resized to.
+    ///
+    /// Every number is absolute against the pane, never re-derived from
+    /// `COPY_TOAST_INSET`.
+    #[test]
+    fn the_confirmation_sits_in_the_bottom_right_clear_of_the_row_and_the_header() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let header = laid_out.header_strip();
+        let row = laid_out.rect_of("Password");
+        let _ = pane.click(&item, &TotpState::NoSecret, row.center());
+        // One more frame: an `Area` only knows its own size once it has been
+        // laid out, so its placement settles on the frame after it appears.
+        let settled = pane.idle(&item, &TotpState::NoSecret);
+        let toast = settled.rect_of("Password copied");
+        assert_eq!(
+            settled.rendered_glyphs("Password copied"),
+            "Password copied",
+            "the confirmation was elided; `Galley::text` would not have shown it"
+        );
+
+        assert!(
+            toast.right() > 450.0 && toast.bottom() > 450.0,
+            "the confirmation is not in the pane's bottom-right quadrant: {toast:?}"
+        );
+        assert!(
+            toast.right() <= 900.0 && toast.bottom() <= 900.0,
+            "the confirmation runs off the bottom-right of a 900x900 pane: {toast:?}"
+        );
+        assert!(
+            !toast.intersects(row),
+            "the confirmation covers the very row that was clicked: {toast:?} over {row:?}"
+        );
+        assert!(
+            toast.top() > header.bottom(),
+            "the confirmation sits over the header strip, where the pane's own \
+             controls are: {toast:?} over {header:?}"
+        );
+
+        // The smallest the window can get. Same message, still whole, still
+        // inside the pane.
+        let mut narrow = Pane::wide(MIN_PANE);
+        let narrow_laid_out = narrow.idle(&item, &TotpState::NoSecret);
+        let narrow_row = narrow_laid_out.rect_of("Password");
+        let _ = narrow.click(&item, &TotpState::NoSecret, narrow_row.center());
+        let narrow_settled = narrow.idle(&item, &TotpState::NoSecret);
+        assert_eq!(
+            narrow_settled.rendered_glyphs("Password copied"),
+            "Password copied",
+            "at the minimum window size the confirmation was elided"
+        );
+        let narrow_toast = narrow_settled.rect_of("Password copied");
+        assert!(
+            narrow_toast.left() >= 0.0 && narrow_toast.right() <= MIN_PANE,
+            "at the minimum window size the confirmation ({narrow_toast:?}) runs \
+             outside the {MIN_PANE}pt pane"
         );
     }
 }
