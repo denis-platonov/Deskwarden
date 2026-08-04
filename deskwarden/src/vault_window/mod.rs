@@ -166,6 +166,32 @@ fn geometry_to_record(
     })
 }
 
+/// How this window gets the account email and server URL its toolbar shows:
+/// already in hand, or on its way.
+///
+/// **The window does not wait for them.** They come from `bw status`, which
+/// spawns the Bitwarden CLI and regularly takes 1-3 seconds on Windows (2.39s
+/// measured on the user's machine), and `open_vault_window` used to call it
+/// synchronously before eframe was even asked for a window -- so on a prefetch
+/// miss the user clicked the tray and looked at nothing at all for that long.
+/// What that call fetches is an avatar's initials and the host a favicon is
+/// fetched from; neither is worth a second of blank screen.
+///
+/// [`Pending`](Self::Pending) is therefore the miss: the fetch runs on its own
+/// thread, the window opens immediately, and the details are drained frame by
+/// frame exactly the way [`spawn_vault_load`]'s item list already is -- the
+/// same mechanism, not a second one. `Ready` is the hit (`main`'s prefetch, or
+/// the startup window's own off-thread `bw status`), where the toolbar has
+/// them on its very first frame and nothing appears late.
+pub enum AccountDetails {
+    /// Known before the window opens. The common case: `main` prefetches on a
+    /// thread at startup and re-warms the cache from every window's result.
+    Ready(crate::login_ui::BwStatusDetails),
+    /// Not known yet, arriving over this channel. Never waited on -- see
+    /// `details_rx`'s drain in [`build_frame`]'s closure.
+    Pending(Receiver<crate::login_ui::BwStatusDetails>),
+}
+
 pub struct VaultWindowResult {
     pub locked: bool,
     /// True if a write in this window failed with `VaultError::Unauthorized`
@@ -211,6 +237,21 @@ pub struct VaultWindowResult {
     /// the account they were leaving, and would then be left on it. Folded into
     /// `open_preferences` it would open the preferences window instead.
     pub switch_to: Option<crate::accounts::AccountId>,
+    /// The account details this session ENDED UP WITH -- handed in
+    /// [`AccountDetails::Ready`], or drained from the channel while the window
+    /// was up. `None` only when the window was closed before a
+    /// [`Pending`](AccountDetails::Pending) fetch reported back.
+    ///
+    /// **Not an outcome; the warm cache.** `open_vault_window` keeps one
+    /// `cached_status_details` so the *next* open pays no `bw status` spawn,
+    /// and it used to be refilled with the value that open had already
+    /// blocked on. Nothing blocks on one any more, so the value the window
+    /// actually used has to come back out the way every other thing the
+    /// window learns does -- through here. Read by the caller immediately, so
+    /// the account switch and the lock recovery still invalidate it
+    /// afterwards: a stale email under a new account is worse than a blank
+    /// one.
+    pub account_details: Option<crate::login_ui::BwStatusDetails>,
 }
 
 enum DetailMode {
@@ -251,14 +292,20 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
     injector: &Injector<A, B>,
-    server_url: Option<String>,
-    // The account email for the toolbar's avatar initials. Passed in from
-    // `main.rs`'s single `check_bw_status_details()` call rather than this
-    // function calling it again itself -- that call spawns the `bw` CLI
-    // (~1-3s on Windows), and this window used to pay that cost twice on
-    // every open (once here, once in `main.rs` for `server_url`) with no UI
-    // feedback before the window even appeared.
-    account_email: Option<String>,
+    // The account email (the toolbar avatar's initials) and the server URL
+    // (the host a favicon is fetched from), either in hand or on their way --
+    // see [`AccountDetails`]. Passed in from `main.rs`'s single
+    // `check_bw_status_details()` call rather than this function calling it
+    // again itself -- that call spawns the `bw` CLI (~1-3s on Windows), and
+    // this window used to pay that cost twice on every open (once here, once
+    // in `main.rs`) with no UI feedback before the window even appeared.
+    //
+    // An enum rather than the two `Option<String>`s it used to be, because
+    // "not known yet" and "known to be absent" are different states and only
+    // the second may be painted as an answer: the toolbar draws an EMPTY
+    // avatar circle while a fetch is in flight and favicons wait for the
+    // server URL rather than guessing it (see the drain in the closure).
+    details: AccountDetails,
     session_token: String,
     // Directory the on-disk favicon cache lives in (`main.rs`'s
     // `project_dirs.cache_dir().join("icons")`). Not created here --
@@ -308,6 +355,34 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     // is trivial for the real fillers (`RealUiAutomation`/`RealSendInput` are
     // zero-sized), so this is not a meaningful runtime cost.
     let injector = injector.clone();
+
+    // **The account details, and the fact that this window never waits for
+    // them.** On a hit they are here already and every frame including the
+    // first paints them. On a miss `details_rx` is `Some` and these two stay
+    // `None` until the drain in the closure below fills them in -- which is
+    // the whole change: the 2.39s `bw status` spawn that used to happen
+    // before eframe was asked for a window now happens beside a window that
+    // is already up.
+    let (ready, mut details_rx) = match details {
+        AccountDetails::Ready(details) => (Some(details), None),
+        AccountDetails::Pending(rx) => (None, Some(rx)),
+    };
+    let mut server_url = ready.as_ref().and_then(|d| d.server_url.clone());
+    let mut account_email = ready.as_ref().and_then(|d| d.user_email.clone());
+    // What the caller re-warms its cache from -- see
+    // `VaultWindowResult::account_details`. Seeded whole on the `Ready` path
+    // (the window used those, so the next open should too) and set by the
+    // drain below on the `Pending` one. The whole struct, never one rebuilt
+    // from the two fields this window happens to read: `status` is the third
+    // field and this window has no business inventing it.
+    let account_details: Rc<RefCell<Option<crate::login_ui::BwStatusDetails>>> =
+        Rc::new(RefCell::new(ready));
+    let account_details_for_closure = account_details.clone();
+    // When this frame was built, for the arrival log below. Not `opened_at`
+    // in `main`: that clock now stops at the eframe handoff, because there is
+    // nothing left between the click and the window for it to measure.
+    let details_requested_at = Instant::now();
+
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
     // See `VaultWindowResult::needs_reauth`'s doc. Set from any write's
@@ -803,6 +878,41 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
             }
         }
 
+        // The account details, arriving from the thread `open_vault_window`
+        // spawned instead of waiting for. Non-blocking exactly like the vault
+        // load below and for the same reason: this window opened without
+        // them, and a blocking receive here would be the freeze this whole
+        // change removes, just moved inside the window where it would look
+        // like a hang instead of a slow launch.
+        //
+        // One shot -- `details_rx` is dropped once a value lands, so this
+        // costs one `try_recv` per frame until then and nothing afterwards.
+        let arrived = details_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(details) = arrived {
+            log::info!(
+                "vault window: account details arrived {:?} after the window was handed to \
+                 eframe (email {}, server {})",
+                details_requested_at.elapsed(),
+                if details.user_email.is_some() { "present" } else { "absent" },
+                if details.server_url.is_some() { "present" } else { "absent" },
+            );
+            server_url = details.server_url.clone();
+            account_email = details.user_email.clone();
+            *account_details_for_closure.borrow_mut() = Some(details);
+            details_rx = None;
+        }
+        // Whether the favicon base URL is KNOWN, not merely present:
+        // `favicon::icon_base_url(None)` is Bitwarden's own cloud, which is
+        // the right answer for an account that has no `serverUrl` and the
+        // wrong one for a self-hosted account whose URL simply has not
+        // arrived yet. `ensure_icon_loaded` marks every id it touches as
+        // requested and the on-disk icon cache is keyed by DOMAIN ALONE, so
+        // guessing here would not just draw the wrong icons in this window --
+        // it would write them to disk under the right domain and serve them
+        // to every later window that does know the server. Icons wait; the
+        // rows they sit on do not.
+        let icon_base_known = details_rx.is_none();
+
         // The initial vault load, arriving from the thread spawned before
         // the window opened. Non-blocking like every other drain here, so
         // the window stays responsive (draggable, closable) throughout.
@@ -1129,14 +1239,23 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                 *switch_to_for_closure.borrow_mut() = Some(picked);
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            if let Some(email) = &account_email {
-                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
-                // draws a rounded square (used elsewhere: item-list rows,
-                // the detail pane header, neither of which were asked to
-                // change), so this is painted directly here rather than
-                // changing that shared helper's shape for every caller.
-                draw_circle_avatar(ui, &theme::initials(email));
-            }
+            // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
+            // draws a rounded square (used elsewhere: item-list rows,
+            // the detail pane header, neither of which were asked to
+            // change), so this is painted directly here rather than
+            // changing that shared helper's shape for every caller.
+            //
+            // ALWAYS drawn, even with no email yet, which is why it is no
+            // longer inside an `if let`. The circle is the account's place in
+            // the toolbar; drawn only once the email lands, everything left of
+            // it (the Lock pill, the sync pill, the title) would shift sideways
+            // a second or two into the session -- a flicker for a thing the
+            // user was not looking at, on a strip they may be reaching for.
+            // Empty until then, and empty rather than `theme::initials("")`'s
+            // "?" placeholder: a question mark reads as an answer ("this
+            // account has no name"), and the truthful state here is that
+            // nothing has been said yet.
+            draw_circle_avatar(ui, &avatar_initials(account_email.as_deref()));
             // Design 2b's Lock control carries its own "CTRL+L" shortcut
             // nested inside the same bordered pill, not as a separate
             // floating `kbd_chip` beside it.
@@ -1529,7 +1648,15 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
         // own already-resolved check makes this cheap on every frame after
         // the first for a given scroll position -- it's a HashMap/HashSet
         // lookup per id, not a fetch.
+        //
+        // Skipped entirely until the server URL is known -- see
+        // `icon_base_known`. Nothing is lost by waiting: `favicon_requested`
+        // is only marked by a call that actually runs, so the frame after the
+        // details land asks for every icon this one skipped.
         for id in &visible_ids {
+            if !icon_base_known {
+                break;
+            }
             if let Some(item) = items.iter().find(|i| &i.id == id) {
                 ensure_icon_loaded(
                     ui.ctx(),
@@ -1919,7 +2046,10 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                 // `visible_ids` (it's a row in `item_list`'s scrolled range) --
                 // if it's selected, it's effectively "visible" too. Cheap to
                 // call every frame: see `ensure_icon_loaded`'s doc comment.
-                if let Some(item) = &selected_item {
+                //
+                // And, like that loop, not before the server URL is known:
+                // see `icon_base_known`.
+                if let Some(item) = selected_item.as_ref().filter(|_| icon_base_known) {
                     ensure_icon_loaded(
                         ui.ctx(),
                         item,
@@ -2520,7 +2650,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     (
         options,
         Box::new(vault_frame_fn),
-        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, last_geometry, settings_path },
+        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, account_details, last_geometry, settings_path },
     )
 }
 
@@ -2542,6 +2672,11 @@ pub struct VaultFrameHandles {
     needs_reauth: Rc<RefCell<bool>>,
     open_preferences: Rc<RefCell<bool>>,
     switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>>,
+    /// See [`VaultWindowResult::account_details`]. Written either before the
+    /// window opened (a `Ready` hand-in) or by the frame that drained the
+    /// fetch, and read back out by [`finish`](Self::finish) so the caller's
+    /// cache is warm for the next open.
+    account_details: Rc<RefCell<Option<crate::login_ui::BwStatusDetails>>>,
     last_geometry: Rc<RefCell<Option<crate::settings::WindowGeometry>>>,
     settings_path: Option<std::path::PathBuf>,
 }
@@ -2577,7 +2712,12 @@ impl VaultFrameHandles {
         // preference fields only, so it cannot clobber the geometry either.
         let open_preferences = *self.open_preferences.borrow();
         let switch_to = self.switch_to.borrow_mut().take();
-        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to }
+        // Cloned rather than taken: `finish` is documented "call once", but a
+        // second call returning a result with no details in it would silently
+        // cost the caller its warm cache rather than failing, and this is the
+        // one field whose absence means "spawn the CLI again".
+        let account_details = self.account_details.borrow().clone();
+        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to, account_details }
     }
 }
 
@@ -2592,8 +2732,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
     injector: &Injector<A, B>,
-    server_url: Option<String>,
-    account_email: Option<String>,
+    details: AccountDetails,
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
     auto_lock: AutoLock,
@@ -2604,8 +2743,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         cache,
         fill_stats,
         injector,
-        server_url,
-        account_email,
+        details,
         session_token,
         icon_cache_dir,
         auto_lock,
@@ -4128,6 +4266,23 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
 /// rather than added to `theme::avatar` itself, since that helper's rounded-
 /// square shape is still correct for its other callers (item-list rows, the
 /// detail pane header).
+/// What the titlebar avatar shows for `email`, including when there is no
+/// email yet.
+///
+/// `None` is EMPTY, not [`theme::initials`]'s `"?"`. The two cases this
+/// function separates are "the account details have not arrived" and "they
+/// arrived and named nobody", and only the first is reachable now that the
+/// window opens without waiting for `bw status` -- but `initials` answers
+/// both with a glyph that reads as a value the app is asserting about the
+/// account. An empty circle asserts nothing, holds the toolbar's layout
+/// still, and is replaced by the real initials in one step rather than two.
+fn avatar_initials(email: Option<&str>) -> String {
+    match email {
+        Some(email) => theme::initials(email),
+        None => String::new(),
+    }
+}
+
 fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) {
     const SIZE: f32 = 28.0;
     let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(SIZE), egui::Sense::hover());
@@ -10387,8 +10542,12 @@ mod switcher_wiring_tests {
             .expect("no `VaultWindowResult` construction in production code");
         let rest = &production[at..];
         let construction = &rest[..rest.len().min(200)];
+        // `switch_to,` and not `switch_to }`: this field is no longer last in
+        // the construction (`account_details` follows it), and a needle that
+        // spelled the closing brace would fail for a reason that has nothing
+        // to do with the switcher the moment another field is appended.
         assert!(
-            construction.contains(concat!("switch", "_to }")),
+            construction.contains(concat!("switch", "_to, ")),
             "the result is built without the switcher's answer: {construction:?}"
         );
         // Positive control: the construction really was isolated, rather than
@@ -10547,5 +10706,240 @@ mod frame_host_tests {
             1,
             "expected exactly one event loop in this file, in `run`"
         );
+    }
+}
+
+/// **The window opens without the account details, and says nothing untrue
+/// while it waits for them.**
+///
+/// `open_vault_window` used to begin with a synchronous `bw status` on a
+/// prefetch miss -- 2.39 seconds measured on the user's machine, spent before
+/// eframe was asked for a window, so the click produced nothing on screen at
+/// all. What it fetched is the avatar's initials and the host favicons come
+/// from. The window now opens first and drains them, the way the item list is
+/// already drained.
+///
+/// Half of that is drawing, which no test can run: `eframe::Frame` has no
+/// public constructor, so the frame closure cannot be called. What CAN be run
+/// is what the toolbar shows for an absent email and what `finish` reports;
+/// the rest is held from the source, the way this file already holds its
+/// other closure-only decisions.
+#[cfg(test)]
+mod account_details_tests {
+    use super::*;
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// Everything before the first `#[cfg(test)]`. `concat!`-split so this
+    /// needle does not find its own declaration and leave every slice empty.
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file");
+        &source[..end]
+    }
+
+    /// `source` with every `//` line comment removed, so an assertion about
+    /// the CODE cannot be satisfied by prose that merely names the thing.
+    ///
+    /// A `//` inside a string literal over-strips the rest of that line. That
+    /// only ever removes text a check is looking for, so it can turn a pass
+    /// into a failure and never the other way round -- the safe direction for
+    /// a guard.
+    fn code_only(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_account_whose_details_have_not_arrived_gets_an_empty_circle() {
+        assert_eq!(
+            avatar_initials(None),
+            "",
+            "the avatar paints something for an account nothing is known about yet"
+        );
+        // The value this must NOT be, read off the helper it would come from
+        // rather than asserted as a literal: routing `None` through
+        // `theme::initials` is the one-character edit that breaks this, and
+        // "?" is what it produces.
+        assert_ne!(
+            avatar_initials(None),
+            theme::initials(""),
+            "the avatar shows `theme::initials`' placeholder for an account whose details are \
+             merely still in flight -- a glyph that reads as an answer about the account \
+             (\"this one has no name\") when nothing has been said about it yet"
+        );
+    }
+
+    /// The positive control for the test above, and the case that is not a
+    /// placeholder at all: details that HAVE arrived are drawn.
+    #[test]
+    fn an_account_that_is_known_gets_its_initials() {
+        assert_eq!(
+            avatar_initials(Some("a.novak@ledgerline.com")),
+            "AN",
+            "a known account's avatar is not its initials, so the empty case above is not a \
+             transition to anything"
+        );
+    }
+
+    /// The details the window ended up with have to leave it: `main` refills
+    /// its one-entry cache from here, and that cache is what keeps the NEXT
+    /// open from spawning the CLI at all.
+    #[test]
+    fn the_details_the_window_used_are_read_back_out_into_the_result() {
+        let details = crate::login_ui::BwStatusDetails {
+            status: crate::login_ui::BwStatus::Unlocked,
+            user_email: Some("held@example.eu".to_string()),
+            server_url: Some("https://vault.example.eu".to_string()),
+        };
+        let handles = VaultFrameHandles {
+            locked: Rc::new(RefCell::new(false)),
+            needs_reauth: Rc::new(RefCell::new(false)),
+            open_preferences: Rc::new(RefCell::new(false)),
+            switch_to: Rc::new(RefCell::new(None)),
+            account_details: Rc::new(RefCell::new(Some(details.clone()))),
+            last_geometry: Rc::new(RefCell::new(None)),
+            // No path, so `finish` writes no file: this test is about the
+            // outcome read, and geometry has its own tests.
+            settings_path: None,
+        };
+
+        assert_eq!(
+            handles.finish().account_details.as_ref(),
+            Some(&details),
+            "`finish` drops the account details, so every open re-spawns `bw status` -- the \
+             cache `main` keeps can never be warm again"
+        );
+
+        // The other half: a window closed before its fetch reported back has
+        // nothing to hand back, and must not invent something.
+        let unheld = VaultFrameHandles {
+            locked: Rc::new(RefCell::new(false)),
+            needs_reauth: Rc::new(RefCell::new(false)),
+            open_preferences: Rc::new(RefCell::new(false)),
+            switch_to: Rc::new(RefCell::new(None)),
+            account_details: Rc::new(RefCell::new(None)),
+            last_geometry: Rc::new(RefCell::new(None)),
+            settings_path: None,
+        };
+        assert!(
+            unheld.finish().account_details.is_none(),
+            "control: `finish` reports details even when the cell is empty, so the assertion \
+             above is satisfied by a constant"
+        );
+    }
+
+    /// The drain is non-blocking, like every other drain in this closure.
+    ///
+    /// `recv()` here would be the freeze this change removes, moved inside the
+    /// window where it looks like a hang instead of a slow launch: the frame
+    /// closure would sit on the channel and the window would stop repainting,
+    /// stop dragging and stop closing for the whole `bw status` spawn.
+    #[test]
+    fn the_frame_never_blocks_on_the_account_details() {
+        let production = production();
+        assert!(
+            production
+                .contains(concat!("details_rx.as_ref().and_then(|rx| rx.try_", "recv().ok())")),
+            "the frame no longer drains the account-details channel with `try_recv`"
+        );
+        assert!(
+            !production.contains(concat!("details_rx.", "recv()")),
+            "the frame closure BLOCKS on the account details, which freezes the window for as \
+             long as the `bw` CLI takes -- exactly the wait this change moved off the open, \
+             now paid with a window on screen that does not respond"
+        );
+        // Positive control: `recv` is findable in this file at all, so the
+        // negative above is about `details_rx` and not about a needle that
+        // could never match anything.
+        assert!(
+            production.contains(concat!("try_", "recv()")),
+            "control: this file has no channel drains at all, so the assertion above says \
+             nothing"
+        );
+    }
+
+    /// The avatar is drawn unconditionally.
+    ///
+    /// It used to be inside `if let Some(email) = &account_email`, which is
+    /// correct-looking and, once the email can arrive a second into the
+    /// session, means the toolbar RELAYOUTS while the user is looking at it:
+    /// the Lock pill, the sync pill and the title all slide sideways when a
+    /// 28px circle appears between them.
+    #[test]
+    fn the_toolbar_reserves_the_avatar_rather_than_growing_one_later() {
+        let production = production();
+        assert!(
+            production.contains(concat!("draw_circle_avatar(ui, &avatar_", "initials(")),
+            "the titlebar avatar is no longer painted through `avatar_initials`, so nothing \
+             says what it shows before the account details arrive"
+        );
+        assert!(
+            !production.contains(concat!("if let Some(email) = &account", "_email")),
+            "the avatar is drawn only once the email has arrived, so the toolbar shifts \
+             sideways mid-session when it does"
+        );
+    }
+
+    /// Favicons wait for the server URL instead of guessing it.
+    ///
+    /// `favicon::icon_base_url(None)` is Bitwarden's own cloud, and the
+    /// on-disk icon cache is keyed by DOMAIN ALONE -- so a self-hosted
+    /// account whose URL simply had not arrived yet would not just draw the
+    /// wrong icons in this window, it would write them to disk for every
+    /// later window that does know the server.
+    #[test]
+    fn no_icon_is_fetched_before_the_server_url_is_known() {
+        let production = production();
+        assert!(
+            production.contains(concat!("let icon_base_known = details_rx.is_", "none();")),
+            "nothing in the frame records whether the favicon base URL is known yet"
+        );
+
+        let call = concat!("ensure_icon_", "loaded(");
+        let sites: Vec<usize> = production
+            .match_indices(call)
+            // The definition, not a call.
+            .filter(|(at, _)| !production[..*at].ends_with("fn "))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected the two icon call sites (the visible rows and the detail pane); found \
+             {} -- if one was added, it needs the same guard, and if one was removed this \
+             test is checking less than it says",
+            sites.len()
+        );
+        for at in sites {
+            let before = &production[..at];
+            // 400 bytes back: each call site's guard sits within ~200 of it
+            // (a `for`/`if let` head). Bounded rather than "anywhere
+            // earlier", which would be satisfied by the declaration itself
+            // thousands of lines up and would assert nothing.
+            //
+            // COMMENTS STRIPPED FIRST, and that is not a detail: both call
+            // sites are preceded by a comment that explains the guard by
+            // name, so the first version of this test passed against a call
+            // site whose guard had been deleted and whose comment had not.
+            let window = code_only(&before[before.len().saturating_sub(400)..]);
+            assert!(
+                window.contains("icon_base_known"),
+                "an `ensure_icon_loaded` call at byte {at} is not guarded by \
+                 `icon_base_known`: with no server URL yet it fetches from Bitwarden's cloud \
+                 and writes the result into a domain-keyed disk cache that every later \
+                 window reads"
+            );
+        }
     }
 }

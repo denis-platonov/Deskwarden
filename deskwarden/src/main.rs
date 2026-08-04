@@ -631,8 +631,14 @@ fn main() {
                 cache_for_vault.clone(),
                 fill_stats_for_vault,
                 &injector_for_vault,
-                work.details.server_url.clone(),
-                work.details.user_email.clone(),
+                // `Ready`, not a fetch of its own: `StartupWork::produce`
+                // already asked `bw status` on the worker thread, beside the
+                // spinner this window was showing at the time. That is the
+                // same "never on the frame thread" rule the tray path now
+                // follows by fetching alongside its window -- one mechanism,
+                // reached differently -- so the vault stage paints the avatar
+                // on its first frame and nothing appears late here.
+                vault_window::AccountDetails::Ready(work.details.clone()),
                 token.to_string(),
                 icon_cache_dir_for_vault,
                 auto_lock_for_vault,
@@ -2647,18 +2653,22 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         }
         None => {
         let opened_at = Instant::now();
-        let status_details = match cached_status_details.take() {
-            Some(details) => details,
-            None => {
-                log::info!("vault window: status details were not prefetched; spawning `bw status`");
-                login_ui::check_bw_status_details()
-            }
-        };
-        log::info!("vault window: account details ready in {:?}", opened_at.elapsed());
-        // Refill the cache with what this open just used -- a cheap clone in the
-        // common (already-cached) case, and what lets the *next* open skip the
-        // spawn too when this call itself was the one that had to fall back.
-        *cached_status_details = Some(status_details.clone());
+        // **Never waited for.** This used to be a `bw status` spawn on a miss
+        // -- 2.39s measured on the user's machine -- run BEFORE eframe was
+        // asked for a window, so the click produced nothing on screen at all
+        // for that long. What it fetches is the toolbar avatar's initials and
+        // the host favicons come from; the window opens without them and they
+        // fill in, exactly the way the item list already does.
+        //
+        // The cache is refilled from the RESULT now (just below the window),
+        // not here: on a miss there is nothing to refill it with yet, and the
+        // value the window ended up with is the one the next open should
+        // reuse. See `account_details_source`.
+        let details = account_details_source(cached_status_details.take(), |tx| {
+            std::thread::spawn(move || {
+                let _ = tx.send(login_ui::check_bw_status_details());
+            });
+        });
 
         // Read once, before the `if` below might short-circuit past it, and
         // reused for `vault_window::run`'s own `backend_already_running`
@@ -2688,17 +2698,29 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         // backend, building the font atlas -- which this app does not control
         // and which is invisible to any timing inside the frame closure, since
         // the first closure call happens after all of it.
+        //
+        // The account details are named here rather than timed: on a hit the
+        // toolbar has them on its first frame, and on a miss the fetch is
+        // running beside this window instead of in front of it, so the only
+        // honest number for it is the one the window itself logs when it
+        // arrives ("account details arrived ... after the window was handed
+        // to eframe").
         log::info!(
-            "vault window: handing off to eframe after {:?} (backend was {})",
+            "vault window: handing off to eframe after {:?} (backend was {}, account details \
+             were {})",
             opened_at.elapsed(),
-            if backend_already_running { "already up" } else { "being started" }
+            if backend_already_running { "already up" } else { "being started" },
+            match details {
+                vault_window::AccountDetails::Ready(_) => "prefetched",
+                vault_window::AccountDetails::Pending(_) =>
+                    "not prefetched; fetching alongside the window",
+            }
         );
         vault_window::run(
             cache.clone(),
             fill_stats.clone(),
             injector,
-            status_details.server_url,
-            status_details.user_email,
+            details,
             session_token.clone(),
             icon_cache_dir.to_path_buf(),
             // Read fresh on every pass, so a timeout changed in the preferences
@@ -2712,6 +2734,26 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         )
         }
     };
+
+    // **Refill the cache with what this window actually used, so the *next*
+    // open pays no `bw status` spawn.** This is the same guarantee the
+    // pre-fetch-or-block version made one line above the window; it moved
+    // here because nothing blocks any more, so on a miss the details do not
+    // exist until the window has drained them (see
+    // `VaultWindowResult::account_details`). `None` -- a window closed before
+    // its fetch reported back -- leaves the cache empty and the next open
+    // starts another one, which is exactly what a miss has always cost.
+    //
+    // BEFORE the branches below, and that ordering is the whole safety
+    // argument: an account switch and the lock/re-auth recovery both run
+    // `resettle_session`, which sets this to `None` deliberately, and both are
+    // reached from below this line -- so a switch still leaves the next window
+    // to re-fetch rather than showing the account the user just left. Above
+    // them, this would put a stale email in the toolbar of a window signed
+    // into somebody else.
+    if let Some(details) = result.account_details.clone() {
+        *cached_status_details = Some(details);
+    }
 
     // Handled before the lock/re-auth branch and with its own `continue`,
     // never folded into it. `locked` and `needs_reauth` both mean the
@@ -4922,6 +4964,40 @@ impl StartupWork {
     }
 }
 
+/// Where a vault window's account details come from: the warm cache if it has
+/// them, otherwise a fetch that runs BESIDE the window rather than in front of
+/// it.
+///
+/// **The blocking call this replaces is the whole point.** `open_vault_window`
+/// began with a synchronous `bw status` on the miss path -- a `bw` CLI
+/// spawn, measured at 2.39s on the user's machine -- and it ran before eframe
+/// was asked for a window, so a tray click that missed the prefetch produced
+/// nothing on screen for that long. The miss is not exotic: the prefetch is
+/// only a thread started at launch, and the cache is deliberately emptied on
+/// every re-auth and every account switch.
+///
+/// `spawn` is handed the `Sender` and is expected to start a thread; it is a
+/// parameter so this decision can be tested without a `bw` CLI, and so the
+/// hit path can be shown to never call it. The one production caller passes a
+/// `std::thread::spawn` of `check_bw_status_details`.
+fn account_details_source(
+    cached: Option<login_ui::BwStatusDetails>,
+    spawn: impl FnOnce(mpsc::Sender<login_ui::BwStatusDetails>),
+) -> vault_window::AccountDetails {
+    match cached {
+        Some(details) => vault_window::AccountDetails::Ready(details),
+        None => {
+            log::info!(
+                "vault window: account details were not prefetched; fetching them on a thread \
+                 and opening the window without them"
+            );
+            let (tx, rx) = mpsc::channel();
+            spawn(tx);
+            vault_window::AccountDetails::Pending(rx)
+        }
+    }
+}
+
 fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
     match try_start_backend(session_token, job, bw_serve::PORT_RELEASE_GRACE) {
         Ok(child) => child,
@@ -5728,6 +5804,265 @@ mod tests {
             "the re-authentication itself succeeded, and a later tray Sync starts a backend \
              from this token: throwing it away would make the named recovery fail"
         );
+    }
+
+    /// **What the vault window is opened WITH, now that it is never opened
+    /// LATE.**
+    ///
+    /// The user's own two measurements of the same click: `account details
+    /// ready in 300ns` (the prefetch had landed) and `account details ready in
+    /// 2.3911946s` (it had not, so `open_vault_window` spawned the `bw` CLI
+    /// and waited) -- the second of those 2.39 seconds spent before eframe was
+    /// asked for a window, i.e. with nothing on screen at all. The window does
+    /// not wait any more; these tests are what says so.
+    mod the_account_details_a_window_opens_with {
+        use super::*;
+
+        fn some_details(email: &str) -> login_ui::BwStatusDetails {
+            login_ui::BwStatusDetails {
+                status: login_ui::BwStatus::Unlocked,
+                user_email: Some(email.to_string()),
+                server_url: Some("https://vault.example.eu".to_string()),
+            }
+        }
+
+        /// The hit: the prefetch (or the last window's own result) already has
+        /// them, so nothing is fetched and the toolbar is complete on the
+        /// first frame.
+        #[test]
+        fn a_warm_cache_is_handed_to_the_window_ready_and_starts_no_fetch() {
+            let mut fetches = 0;
+            let source =
+                account_details_source(Some(some_details("held@example.eu")), |_tx| fetches += 1);
+
+            assert_eq!(
+                fetches, 0,
+                "a cache hit still started a `bw status` fetch -- the spawn this change was \
+                 made to avoid, now paid on every open instead of only on a miss"
+            );
+            match source {
+                vault_window::AccountDetails::Ready(details) => assert_eq!(
+                    details.user_email.as_deref(),
+                    Some("held@example.eu"),
+                    "the window was handed details that are not the cached ones"
+                ),
+                vault_window::AccountDetails::Pending(_) => panic!(
+                    "a cache HIT was handed to the window as pending: the toolbar would open \
+                     blank and fill in later even though the answer was already in hand"
+                ),
+            }
+        }
+
+        /// The miss, which is the whole bug: it must produce a CHANNEL, not an
+        /// answer. An answer here can only have been obtained by blocking.
+        #[test]
+        fn a_miss_hands_the_window_a_channel_and_leaves_the_fetch_to_a_thread() {
+            let (started_tx, started_rx) = mpsc::channel();
+            let answer = some_details("fetched@example.eu");
+            let source = account_details_source(None, move |tx| {
+                std::thread::spawn(move || {
+                    let _ = started_tx.send(());
+                    let _ = tx.send(answer);
+                });
+            });
+
+            let rx = match source {
+                vault_window::AccountDetails::Pending(rx) => rx,
+                vault_window::AccountDetails::Ready(_) => panic!(
+                    "the miss path answered with the details themselves, which it can only do \
+                     by WAITING for the `bw` CLI -- the window is opened seconds late again, \
+                     with nothing on screen while it waits"
+                ),
+            };
+            assert!(
+                started_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "the miss path never started the fetch at all, so the toolbar would stay blank \
+                 for the whole session and the next open would be cold too"
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("the fetch's answer never reached the window's channel")
+                    .user_email
+                    .as_deref(),
+                Some("fetched@example.eu"),
+                "the channel handed to the window does not carry what the fetch produced"
+            );
+        }
+
+        /// `open_vault_window`'s own body, depth-counted from its signature to
+        /// its closing brace.
+        ///
+        /// Sliced rather than checked against the whole file, because the
+        /// whole file legitimately contains other synchronous status calls --
+        /// the startup prefetch thread, and `StartupWork::produce`, which runs
+        /// on the worker `app_window` spawns. Neither is on the path a window
+        /// opens from; this function is.
+        fn open_vault_window_body() -> &'static str {
+            let production = production_half_of_this_file();
+            let at = production
+                .find(concat!("fn open_vault_", "window<A: UiAutomationFiller"))
+                .expect("no `open_vault_window` in this file -- the vault window's one door");
+            let after = &production[at..];
+            let open = after.find('{').expect("`open_vault_window` has no body to slice");
+            let after_open = &after[open + 1..];
+
+            let mut depth = 1usize;
+            for (offset, ch) in after_open.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = &after_open[..offset];
+                            assert!(
+                                body.contains("handing off to eframe"),
+                                "the sliced body is not `open_vault_window`: every assertion \
+                                 over it would be about the wrong code"
+                            );
+                            assert!(
+                                !body.contains(concat!("impl Startup", "Work {")),
+                                "the slice ran past the end of `open_vault_window` and swept \
+                                 up the startup worker, whose own status call is legitimately \
+                                 synchronous"
+                            );
+                            return body;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("`open_vault_window`'s body is never closed");
+        }
+
+        /// Every synchronous `bw status` call left on the path a window opens
+        /// from is inside a thread spawn.
+        ///
+        /// The runtime tests above check the DECISION; this checks that no
+        /// call site quietly makes it again on the thread that has not opened
+        /// the window yet. Written as "every occurrence, nearest preceding
+        /// spawn" rather than a count of call sites, because a second one
+        /// would be just as acceptable -- on a thread.
+        /// `()` in the needle, so `check_bw_status_details_in(` -- a different
+        /// function, called from the account flows -- is not matched by the
+        /// prefix.
+        fn status_call() -> &'static str {
+            concat!("check_bw_status", "_details()")
+        }
+
+        /// Whether the status call at `at` is inside a thread spawn.
+        ///
+        /// A 200-byte backward window, not "anywhere earlier in the file":
+        /// anywhere-earlier is satisfied by any of the eight unrelated spawns
+        /// in `main`, which says nothing about this call. Both call sites
+        /// spell `spawn(move || { let _ = tx.send(` before reaching it, which
+        /// is about 60 bytes. Exercised against a fabricated blocking snippet
+        /// below, so the window is known to be able to answer `false`.
+        fn is_inside_a_spawn(source: &str, at: usize) -> bool {
+            let spawn = concat!("std::thread::", "spawn(move ||");
+            let before = &source[..at];
+            match before.rfind(spawn) {
+                Some(nearest) => before.len() - nearest < 200,
+                None => false,
+            }
+        }
+
+        #[test]
+        fn no_status_call_in_this_file_runs_on_the_thread_a_window_opens_from() {
+            let body = open_vault_window_body();
+            let call = status_call();
+
+            let sites: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "expected exactly the one on-open fetch to call {call:?} inside \
+                 `open_vault_window`; found {} -- none at all means the miss path stopped \
+                 fetching and the cache can never warm up again",
+                sites.len()
+            );
+            for at in sites {
+                assert!(
+                    is_inside_a_spawn(body, at),
+                    "a {call:?} call at byte {at} is not inside a thread spawn: it spawns the \
+                     `bw` CLI on whichever thread reached it, which for `open_vault_window` is \
+                     the thread that has not opened the window yet -- 2.4 seconds of nothing \
+                     on screen"
+                );
+            }
+        }
+
+        /// The control for the test above, and the reason its window is 200
+        /// bytes rather than "somewhere earlier": the same predicate, given
+        /// the shape this change REMOVED, has to answer `false`.
+        #[test]
+        fn the_spawn_check_rejects_the_blocking_call_this_change_removed() {
+            let call = status_call();
+            let blocking = format!(
+                "let status_details = match cached_status_details.take() {{ Some(d) => d, None \
+                 => login_ui::{call} }};"
+            );
+            let at = blocking.find(call).expect("the fabricated snippet lost its call");
+            assert!(
+                !is_inside_a_spawn(&blocking, at),
+                "control: the predicate accepts a plain synchronous call, so the test above \
+                 would pass against exactly the code it exists to forbid"
+            );
+
+            // And the positive half: a spawned call is accepted, so a `false`
+            // from the predicate means something.
+            let spawned = format!(
+                "std::thread::spawn(move || {{ let _ = tx.send(login_ui::{call}); }});"
+            );
+            let at = spawned.find(call).expect("the fabricated snippet lost its call");
+            assert!(
+                is_inside_a_spawn(&spawned, at),
+                "control: the predicate rejects even a spawned call, so it can never be \
+                 satisfied and asserts nothing"
+            );
+        }
+
+        /// The cache is still refilled with what the open used -- and refilled
+        /// EARLY ENOUGH that a switch or a lock can still empty it.
+        ///
+        /// Both of those run `resettle_session`, which sets
+        /// `cached_status_details` to `None` on purpose so the next window
+        /// re-fetches rather than showing the account the user just left.
+        /// Refilling after them would put a stale email in the toolbar of a
+        /// window signed into somebody else; refilling not at all would make
+        /// every open pay the spawn this change moved off the critical path,
+        /// which is a slower app rather than a wrong one and is therefore the
+        /// second assertion, not the first.
+        #[test]
+        fn the_result_refills_the_cache_before_a_switch_or_a_lock_can_empty_it() {
+            let production = production_half_of_this_file();
+            let refill = concat!("if let Some(details) = result.account", "_details.clone() {");
+            // Re-declared rather than shared with
+            // `the_switch_the_vault_window_asks_for`: the same needle in two
+            // modules is two chances to notice it moved, and a helper made
+            // `pub(super)` for one caller is a wider door than this needs.
+            let lock = concat!("if result.locked ", "|| result.needs_reauth {");
+
+            let refill_at = production.find(refill).unwrap_or_else(|| {
+                panic!(
+                    "{refill:?} is not in the production code: nothing refills the cache from \
+                     the window's own details, so every open pays the `bw status` spawn again"
+                )
+            });
+            let lock_at = production.find(lock).unwrap_or_else(|| {
+                panic!("{lock:?} is not in the production code -- this guard needs it to say \
+                        which side of the recovery the refill is on")
+            });
+            assert_ne!(
+                refill_at, lock_at,
+                "positive control: the two needles are two distinct positions"
+            );
+            assert!(
+                refill_at < lock_at,
+                "the cache is refilled AFTER the lock/re-auth recovery, which deliberately \
+                 empties it -- so the next window opens showing the account whose session was \
+                 just torn down"
+            );
+        }
     }
 
     /// The `main.rs` half that is production code. `mod tests` drives
