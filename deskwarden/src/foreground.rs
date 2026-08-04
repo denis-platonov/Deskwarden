@@ -593,9 +593,13 @@ mod tests {
          opens while ANOTHER app is foreground -- anchored beside the field the user is in, \
          whose `hwnd` the fill is injected back into once the card is clicked -- so taking \
          the foreground is the opposite of what this window wants. And it opens through \
-         `eframe::run_native(\"Deskwarden\", ..)`, the same title `app_window` and \
-         `vault_window` use; `raise_window` matches this process's own windows BY TITLE, so \
-         a raise here could just as easily bring one of those forward instead.",
+         `eframe::run_native(\"Deskwarden\", ..)` -- the same literal title THREE other \
+         windows open under: `vault_window`, `app_window` and `loading_ui`, all of which do \
+         raise. (It said \"two\" while there were three; the count is now the one \
+         `only_one_window_of_this_process_can_exist_at_a_time` reads off the sources.) \
+         `raise_window` matches this process's own windows BY TITLE and `pick` takes the \
+         FIRST match in `EnumWindows` order, so a raise here could just as easily bring one \
+         of those forward instead.",
     )];
 
     /// Every window this crate opens must actually ask to be raised, and must
@@ -805,6 +809,24 @@ mod tests {
                 reason.len() > 40,
                 "`{module}` is excused from raising with no reason worth the name: {reason:?}"
             );
+            // **And the reason has to be true of the source, not merely long.**
+            // A reason string is prose: `loading_ui` was demonstrably
+            // delistable from `RAISING_SITES` into this list behind a
+            // plausible forty-character excuse, with its `raise_window` call
+            // deleted and the whole suite green. What separates the real
+            // exemption from that forgery is structural, and it is the
+            // exemption's own first sentence: the OS keeps this window above
+            // everything because the window asks it to. `with_always_on_top(`
+            // appears exactly once in `overlay_ui.rs` and nowhere else in this
+            // crate, so this both holds the real excuse to its claim and fails
+            // any module moved here that cannot make it.
+            assert_eq!(
+                source.matches("with_always_on_top(").count(),
+                1,
+                "`{module}` is excused from raising because the OS already keeps it above \
+                 everything -- but its window is not `with_always_on_top()`. A window that is \
+                 neither raised nor always-on-top is a window that can open behind something."
+            );
             assert_eq!(
                 source.matches("raise_window(").count(),
                 0,
@@ -824,6 +846,96 @@ mod tests {
             RAISING_SITES.len(),
             "control: every raising site's source really does contain the needle this counted \
              to zero in the exempt ones"
+        );
+    }
+
+    /// **The invariant that makes matching a window BY TITLE safe at all.**
+    ///
+    /// [`RAISING_SITES`] compares title *identifiers*; it never looks at their
+    /// values. Four modules open a window titled literally `"Deskwarden"` --
+    /// `vault_window`, `app_window` and `loading_ui`, which all raise, and
+    /// `overlay_ui`, which is excused. [`pick`] is a `find`, so if two of them
+    /// were ever on screen together a raise would take whichever `EnumWindows`
+    /// happened to hand back first, silently and non-deterministically.
+    ///
+    /// It is not reachable today, and the reason is worth naming because it is
+    /// the thing being pinned rather than the collision itself:
+    ///
+    /// * **No `with_any_thread`.** On Windows, `winit` refuses to build an
+    ///   event loop off the main thread -- it panics -- unless the builder was
+    ///   given `with_any_thread()`. So without that call anywhere, every
+    ///   `eframe::run_*native` in this crate is on the main thread, and a
+    ///   window opened from a spawned thread is not a second window but a
+    ///   crash. This is what makes the spawn side unnecessary to check
+    ///   separately: `with_any_thread` is the only door to it.
+    /// * **One viewport per loop.** `show_viewport*` opens a second OS window
+    ///   inside a running loop, on the same thread, with no `run_*native` call
+    ///   for `RAISING_SITES` to count and no title for it to compare. Nothing
+    ///   in this crate calls it.
+    ///
+    /// Together with `run_*native` blocking until its window closes -- which
+    /// the queued-tray-click behaviour is itself the evidence of -- that makes
+    /// the four windows strictly one-at-a-time, and `pick`'s `find` exact.
+    ///
+    /// **Why this rather than distinct titles.** Asserting the raising sites'
+    /// title strings are pairwise distinct would fail today, so it is not a
+    /// guard that can be added -- it is a demand to rename three windows. That
+    /// rename was rejected: the titles are load-bearing outside this crate.
+    /// `round_window_corners` (`login_ui.rs`) reaches for its window with
+    /// `FindWindowW(None, title)`, which is NOT scoped to this process and
+    /// matches on the string, and `raise_window` matches on it too; and all
+    /// three files are owned elsewhere. Distinct titles would also only remove
+    /// the *consequence*. Serialization is the property the code actually
+    /// relies on, so it is the one written down here.
+    #[test]
+    fn only_one_window_of_this_process_can_exist_at_a_time() {
+        let sources = RAISING_SITES
+            .iter()
+            .map(|(module, source, ..)| (*module, *source))
+            .chain(
+                OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
+                    .iter()
+                    .map(|(module, source, _)| (*module, *source)),
+            );
+        // Positive control: the loop below really walks every window module,
+        // rather than a short list whose absent members are unchecked.
+        assert_eq!(
+            sources.clone().count(),
+            RAISING_SITES.len() + OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE.len(),
+            "control: one source per window-opening module"
+        );
+
+        for (module, source) in sources {
+            assert_eq!(
+                source.matches("with_any_thread").count(),
+                0,
+                "`{module}` builds its event loop with `with_any_thread`, which lets a window \
+                 open off the main thread. Four of this crate's windows are titled literally \
+                 `\"Deskwarden\"`, and `raise_window` matches by title with `pick` taking the \
+                 first hit in `EnumWindows` order -- so two of them alive at once is a raise \
+                 that brings an arbitrary one forward. Without this call winit panics off the \
+                 main thread, which is what keeps them one at a time."
+            );
+            assert_eq!(
+                source.matches("show_viewport").count(),
+                0,
+                "`{module}` opens a second viewport, which is a second OS window on the same \
+                 event loop -- with no `run_*native` call for `RAISING_SITES` to count and no \
+                 title for it to compare. See the title collision described on this test."
+            );
+        }
+
+        // Positive controls on both needles: they can find what they counted
+        // to zero, so the zeros above are absences and not typos.
+        assert_eq!(
+            "builder.with_any_thread(true);".matches("with_any_thread").count(),
+            1,
+            "control: the `with_any_thread` needle matches a real call"
+        );
+        assert_eq!(
+            "ctx.show_viewport_deferred(id, b, f);".matches("show_viewport").count(),
+            1,
+            "control: the `show_viewport` needle matches a real call"
         );
     }
 

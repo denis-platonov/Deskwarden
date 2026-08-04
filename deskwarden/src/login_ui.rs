@@ -4669,9 +4669,19 @@ mod password_lifetime_tests {
 
     // SAFETY: every method forwards to `System`, which is a correct
     // `GlobalAlloc`. The only added work is a read of a thread-local `bool`
-    // and, when it is set, a read of the block that is about to be freed --
-    // which is still valid, still owned by this allocator, and not yet handed
-    // back. Neither allocates, so `dealloc` cannot re-enter.
+    // and, when it is set, a read of the block that is about to be freed.
+    // Neither allocates, so `dealloc` cannot re-enter.
+    //
+    // That read is where the honest caveat is. The block is still mapped,
+    // still owned by this allocator and not yet handed back -- but `layout`
+    // covers the WHOLE allocation, and a `String`/`Vec` whose capacity exceeds
+    // its length has never written the tail. So `from_raw_parts` below builds
+    // a slice over bytes that are, in the abstract machine, uninitialised, and
+    // reading them is UB by the letter of the rules. It is benign under the
+    // `System` allocator this forwards to (`HeapAlloc` hands back real,
+    // readable pages), and scanning the tail is what the probe wants anyway:
+    // a truncate leaves the plaintext exactly there. It is a deliberate
+    // trade inside a test-only instrument, not a soundness claim.
     unsafe impl GlobalAlloc for Watcher {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             unsafe { System.alloc(layout) }
@@ -4805,8 +4815,24 @@ mod password_lifetime_tests {
         );
         // ...and it was wiped, not merely truncated: the bytes are gone from
         // the allocation the String still owns.
+        //
+        // **Why the buffer is taken out of the form first.** This assertion
+        // used to measure `drop(form)`, which runs `impl Drop for LoginForm`
+        // -- and that zeroizes. The closure being measured performed the very
+        // wipe it was trying to detect, so it could not fail for the reason it
+        // states: replacing the success arm with `form.password.clear()`, a
+        // truncate that leaves the plaintext in the allocation for the whole
+        // vault session on the `close_on_success: false` host, left this test
+        // and the entire suite green. `mem::take` moves the String -- the same
+        // allocation, untouched -- out from under `Drop`, and `mem::forget`
+        // then makes sure nothing else wipes it before the free that is being
+        // watched. What leaks is the form's other fields, which no assertion
+        // above still reads: the token was checked already, and
+        // `form.password` was read for emptiness before the take.
+        let stolen = std::mem::take(&mut form.password);
+        std::mem::forget(form);
         assert!(
-            !plaintext_reached_the_allocator(move || drop(form)),
+            !plaintext_reached_the_allocator(move || drop(stolen)),
             "the successful sign-in only emptied the String's length -- the plaintext is still \
              sitting in the allocation and reaches the allocator when the form finally dies"
         );
