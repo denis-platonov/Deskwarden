@@ -65,6 +65,35 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// 80ms `loading_ui::show_while` has always used.
 const WORKING_POLL: Duration = Duration::from_millis(80);
 
+/// How long the working stage may go on before it ends itself.
+///
+/// **Derived from what the code already budgets, not chosen.** The worker runs
+/// `StartupWork::produce`, which is three phases and only the middle one is
+/// bounded by anything:
+///
+///   1. `try_start_backend` -> `bw_serve::run_bw_sync`, a bare
+///      `Command::output()` with no timeout. `bw_serve::BACKEND_OP_TIMEOUT` is
+///      the number this crate already uses everywhere else as the upper bound
+///      on a legitimate backend start or sync (`main`'s wedge check, the
+///      picker's probe), so it is what one such phase costs here.
+///   2. `wait_for_vault_ready` on `readiness_schedule(READINESS_DEADLINE)` --
+///      the only self-limiting part, and it runs AFTER the unbounded phase
+///      rather than over it.
+///   3. `login_ui::check_bw_status_details()`, unconditional and on the failure
+///      path too: a second untimed `bw` spawn, so a second
+///      `BACKEND_OP_TIMEOUT`.
+///
+/// Hence `2 * BACKEND_OP_TIMEOUT + READINESS_DEADLINE` = 210s. Deliberately
+/// generous: this is a watchdog on a stage the user cannot leave by any other
+/// route, and a false timeout on a slow machine throws away a healthy sign-in,
+/// while a slow one only makes a wait the user is already watching a spinner
+/// through longer. It bounds the WINDOW, not the subprocess -- `produce` is
+/// still untimed and its worker may still be running when this fires.
+pub const WORKING_DEADLINE: Duration = Duration::from_secs(
+    2 * crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
+        + crate::bw_serve::READINESS_DEADLINE.as_secs(),
+);
+
 /// What the one window is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -84,7 +113,9 @@ pub enum Event {
     SignedIn,
     /// The background work finished and there is a vault to show.
     WorkReady,
-    /// The background work finished and there is not. The window ends and
+    /// There is no vault to show: the work finished without one, OR the worker
+    /// died without finishing, OR it has been longer than `WORKING_DEADLINE`
+    /// and it is not coming. The window ends and
     /// `main` runs the recovery it has always run -- see
     /// `recover_from_failed_vault_wait`, which is why this is `Close` rather
     /// than a fourth stage that apologises.
@@ -117,6 +148,93 @@ pub fn advance(stage: Stage, event: Event) -> Next {
         (Stage::Working, Event::WorkReady) => Next::Show(Stage::Vault),
         (Stage::Working, Event::WorkFailed) => Next::Close,
         (stage, _) => Next::Show(stage),
+    }
+}
+
+/// Why the working stage gave up on itself.
+///
+/// Carried rather than collapsed to a bare `Event::WorkFailed`, because the two
+/// are the same decision reached for opposite reasons and the log line is the
+/// only thing that will ever tell them apart in the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkFailure {
+    /// The worker thread is gone without ever sending -- it panicked, or was
+    /// otherwise torn down. `try_recv` says `Disconnected`, which it can only
+    /// say once the closure has let go of its own sender.
+    WorkerDied,
+    /// The worker may well still be alive; the stage has simply been up longer
+    /// than [`WORKING_DEADLINE`].
+    Deadline,
+}
+
+impl WorkFailure {
+    /// What to log. `&'static str` so this cannot become a formatting site that
+    /// runs 12 times a second on the polling path.
+    pub fn reason(self) -> &'static str {
+        match self {
+            WorkFailure::WorkerDied => {
+                "the thread preparing the vault died without answering (it panicked); ending \
+                 the setup stage so the startup recovery can run"
+            }
+            WorkFailure::Deadline => {
+                "the vault backend did not finish starting within the setup stage's deadline; \
+                 ending the stage so the startup recovery can run, rather than leaving a \
+                 spinner up that has no ✕, no tray and no way out"
+            }
+        }
+    }
+}
+
+/// What the working stage does when `try_recv` produced no work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkPoll {
+    /// Nothing yet, and there is still time. Repaint and look again.
+    KeepWaiting,
+    /// The stage is over: `Event::WorkFailed`, for this reason.
+    Failed(WorkFailure),
+}
+
+/// The channel half of the decision: a failed `try_recv` on its own.
+///
+/// **The bug this exists to make impossible:** the poll arm used to be
+/// `Err(_) => request_repaint_after(..)`, which treats a dead worker exactly
+/// like a busy one. A `Disconnected` is not "not yet" -- nothing will ever
+/// arrive on that channel again, and the stage refuses every close, so treating
+/// it as "not yet" is a spinner that spins until Task Manager. Pure and total so
+/// it can be asserted directly; `TryRecvError` is `Copy` and has two variants,
+/// both spelled out.
+pub fn work_channel_poll(err: mpsc::TryRecvError) -> WorkPoll {
+    match err {
+        mpsc::TryRecvError::Empty => WorkPoll::KeepWaiting,
+        mpsc::TryRecvError::Disconnected => WorkPoll::Failed(WorkFailure::WorkerDied),
+    }
+}
+
+/// The clock half: how long the stage has been up.
+///
+/// A live worker that never answers -- `bw sync` on a hung network, the case
+/// `BACKEND_OP_TIMEOUT` exists for elsewhere -- keeps the channel open forever,
+/// so `work_channel_poll` alone would still spin. This is the bound that does
+/// not depend on the worker being well behaved at all.
+pub fn work_deadline_poll(elapsed: Duration) -> WorkPoll {
+    if elapsed >= WORKING_DEADLINE {
+        WorkPoll::Failed(WorkFailure::Deadline)
+    } else {
+        WorkPoll::KeepWaiting
+    }
+}
+
+/// Both halves, in the order the closure needs them: a dead worker is reported
+/// as a dead worker even if the deadline happens to have passed too, because
+/// "it panicked" and "it is slow" call for different investigations.
+///
+/// This is what the frame closure calls, once, so that deleting the call is a
+/// deletion of the whole watchdog rather than of one half of it -- and so that
+/// the closure holds no `if` of its own about any of this.
+pub fn poll_working(err: mpsc::TryRecvError, elapsed: Duration) -> WorkPoll {
+    match work_channel_poll(err) {
+        WorkPoll::Failed(why) => WorkPoll::Failed(why),
+        WorkPoll::KeepWaiting => work_deadline_poll(elapsed),
     }
 }
 
@@ -234,7 +352,14 @@ where
     let vault_handles_for_closure = vault_handles.clone();
     let stages_for_closure = stages.clone();
 
+    // **In an `Option`, and handed to the worker whole.** It used to be cloned
+    // into the thread, which left the original alive inside the closure for the
+    // window's whole life -- so a worker that panicked before sending left the
+    // receiver with a sender that would never send and never drop, and
+    // `try_recv` answered `Empty` forever instead of `Disconnected`. The closure
+    // must hold the receiving end and nothing else.
     let (work_tx, work_rx) = mpsc::channel::<P>();
+    let mut work_tx = Some(work_tx);
     let mut prepare = Some(prepare);
     let mut build_vault = Some(build_vault);
     let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
@@ -245,6 +370,18 @@ where
     // "and then it took a while" -- and it is not visible from either end
     // alone, which is why it is measured here rather than inside `prepare`.
     let mut signed_in_at: Option<Instant> = None;
+    // When the working stage was entered -- the stopwatch `WORKING_DEADLINE` is
+    // read against. Its own binding rather than a reuse of `signed_in_at`, whose
+    // job is a log line: one of the two could reasonably move later without the
+    // other, and only this one is load-bearing.
+    let mut working_since: Option<Instant> = None;
+    // Set once the stage has decided to end. The `close_requested` guard below
+    // refuses every close, INCLUDING the one this module sends itself: eframe
+    // reports `ViewportCommand::Close` back as a `close_requested` on the next
+    // frame, and the working stage is still the stage being drawn when it
+    // arrives. Without this flag the stage cancels its own exit and the window
+    // is exactly as unleaveable as before.
+    let mut closing = false;
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
         if !styled {
@@ -293,13 +430,19 @@ where
                     // would freeze the window on the frame that is supposed to
                     // start showing the spinner.
                     if let Some(prepare) = prepare.take() {
-                        let work_tx = work_tx.clone();
-                        std::thread::spawn(move || {
-                            let _ = work_tx.send(prepare(produced));
-                        });
+                        // `take`, not `clone`: the worker gets the only sender,
+                        // so its death is a `Disconnected` the stage can act on.
+                        if let Some(work_tx) = work_tx.take() {
+                            std::thread::spawn(move || {
+                                let _ = work_tx.send(prepare(produced));
+                            });
+                        }
                     }
                     if let Next::Show(next) = advance(stage, Event::SignedIn) {
                         stage = next;
+                        if next == Stage::Working {
+                            working_since = Some(Instant::now());
+                        }
                     }
                     ui.ctx().request_repaint();
                 }
@@ -315,9 +458,19 @@ where
                 // no interaction for it, rather than leaving it looking live and
                 // silently refusing every click. The guard below is therefore
                 // about the routes that do not go through the chrome at all --
-                // Alt+F4 and the system menu -- and it is bounded: the readiness
-                // probe gives up after its own deadline and this stage ends
-                // itself with `WorkFailed`.
+                // Alt+F4 and the system menu.
+                //
+                // **What bounds it is below, and it is not the readiness
+                // probe.** This comment used to claim the probe's own deadline
+                // ended the stage; it does not. The probe is one of three
+                // phases inside `prepare` and the two around it are untimed
+                // `bw` spawns, and a `prepare` that panics answers nothing at
+                // all. Since there is no tray icon yet at this point in
+                // `main` -- `tray::build_tray` runs after this window returns
+                // -- a stage that never ends has no Quit anywhere in the
+                // process, and Task Manager is the only way out. So the poll
+                // arm ends the stage on a dead worker, and `WORKING_DEADLINE`
+                // ends it on a live one that never answers.
                 match loading_ui::draw_spinner_body(
                     ui,
                     working_message,
@@ -334,7 +487,7 @@ where
                     login_ui::ChromeAction::Close | login_ui::ChromeAction::None => {}
                 }
 
-                if ui.ctx().input(|i| i.viewport().close_requested()) {
+                if !closing && ui.ctx().input(|i| i.viewport().close_requested()) {
                     log::info!(
                         "the single window was asked to close while the vault backend was \
                          still starting; refusing, so the backend it is holding is not \
@@ -375,12 +528,39 @@ where
                                     "the single window has no vault to show; closing so the \
                                      startup recovery can run"
                                 );
+                                closing = true;
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                             }
                         }
                         ui.ctx().request_repaint();
                     }
-                    Err(_) => ui.ctx().request_repaint_after(WORKING_POLL),
+                    // **Not `Err(_)`.** The decision is `poll_working`'s, whole
+                    // -- a `Disconnected` means the worker is gone and nothing
+                    // will ever arrive, and an `Empty` past the deadline means
+                    // it is alive and not coming back either. Both land on
+                    // `Event::WorkFailed`, which `advance` sends to
+                    // `Next::Close`: the window ends and `main`'s
+                    // `recover_from_failed_vault_wait` takes over, which is a
+                    // fresh login the user can close. That is the point of the
+                    // fix -- not a fourth stage that apologises with the same
+                    // disabled ✕.
+                    Err(err) => {
+                        let elapsed = working_since.map_or(Duration::ZERO, |at| at.elapsed());
+                        match poll_working(err, elapsed) {
+                            WorkPoll::KeepWaiting => {
+                                ui.ctx().request_repaint_after(WORKING_POLL)
+                            }
+                            WorkPoll::Failed(why) => {
+                                log::error!("{} (after {elapsed:?})", why.reason());
+                                if let Next::Close = advance(stage, Event::WorkFailed) {
+                                    closing = true;
+                                    ui.ctx()
+                                        .send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    }
                 }
             }
             Stage::Vault => {
@@ -499,6 +679,177 @@ mod transition_tests {
         assert_ne!(
             advance(Stage::SignIn, Event::SignedIn),
             Next::Show(Stage::SignIn)
+        );
+    }
+}
+
+/// The working stage's watchdog, decided away from the frame closure so it can
+/// be asserted at all.
+///
+/// Every test here is about a window the user cannot close: while the stage is
+/// up there is no live ✕, no tray icon (`tray::build_tray` runs after
+/// `app_window::run` returns) and therefore no Quit item anywhere in the
+/// process. Anything that reaches "keep waiting" and stays there is Task
+/// Manager.
+#[cfg(test)]
+mod working_watchdog_tests {
+    use super::*;
+
+    /// **The reported defect, as an assertion.** A worker that panics drops its
+    /// sender; with the closure holding no second one, `try_recv` answers
+    /// `Disconnected` -- and this is what that must mean.
+    #[test]
+    fn a_worker_that_died_ends_the_stage_rather_than_being_polled_forever() {
+        assert_eq!(
+            work_channel_poll(mpsc::TryRecvError::Disconnected),
+            WorkPoll::Failed(WorkFailure::WorkerDied),
+            "a dead worker is treated as a busy one, so the spinner polls a channel nothing \
+             can ever send on again -- with no ✕, no tray and no Quit, that is Task Manager"
+        );
+        assert_eq!(
+            work_channel_poll(mpsc::TryRecvError::Empty),
+            WorkPoll::KeepWaiting,
+            "a worker that simply has not answered yet ends the stage, which throws away a \
+             healthy sign-in on any machine slower than this one"
+        );
+    }
+
+    /// The `Disconnected` half is real only if the channel can actually produce
+    /// it -- which is the whole reason the closure hands the worker its sender
+    /// instead of a clone. Asserted against a live channel of the same shape,
+    /// because "the mapping is right" and "the input ever occurs" are the two
+    /// claims this codebase keeps shipping one of.
+    #[test]
+    fn a_sender_that_only_the_worker_holds_disconnects_when_the_worker_dies() {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let worker = std::thread::spawn(move || {
+            let _tx = tx;
+            panic!("the worker died before sending");
+        });
+        assert!(worker.join().is_err(), "control: the worker was supposed to panic");
+        assert_eq!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected),
+            "the receiver never learns its worker is gone, so `Disconnected` is a case that \
+             cannot occur and the arm handling it is dead code"
+        );
+        // The negative control: a second sender kept behind -- the shape the
+        // closure had -- and the same dead worker is indistinguishable from a
+        // slow one. This is the bug, reproduced.
+        let (tx, rx) = mpsc::channel::<u32>();
+        let kept = tx.clone();
+        let worker = std::thread::spawn(move || {
+            let _tx = tx;
+            panic!("the worker died before sending");
+        });
+        assert!(worker.join().is_err());
+        assert_eq!(
+            rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "control: with a sender kept behind, a dead worker no longer reads as Empty -- so \
+             the test above proves nothing about handing the worker the only sender"
+        );
+        drop(kept);
+    }
+
+    /// A worker that is alive and never answers keeps the channel open, so the
+    /// clock is the only thing left.
+    #[test]
+    fn a_live_worker_that_never_answers_is_bounded_by_the_deadline() {
+        assert_eq!(
+            work_deadline_poll(Duration::ZERO),
+            WorkPoll::KeepWaiting,
+            "the stage gives up on its own first frame"
+        );
+        assert_eq!(
+            work_deadline_poll(WORKING_DEADLINE - Duration::from_millis(1)),
+            WorkPoll::KeepWaiting,
+            "the stage gives up a millisecond early, which on a slow machine throws away a \
+             sign-in that was about to land"
+        );
+        assert_eq!(
+            work_deadline_poll(WORKING_DEADLINE),
+            WorkPoll::Failed(WorkFailure::Deadline),
+            "the stage is not bounded by the clock either, so an untimed `bw sync` on a hung \
+             network is a window with no way out"
+        );
+        assert_eq!(
+            work_deadline_poll(WORKING_DEADLINE * 100),
+            WorkPoll::Failed(WorkFailure::Deadline),
+            "the deadline is a moment rather than a bound: past it, the stage waits again"
+        );
+    }
+
+    /// The combination, including the ordering: a dead worker is reported as
+    /// dead even when the deadline has also passed.
+    #[test]
+    fn the_two_halves_combine_and_a_dead_worker_is_named_as_one() {
+        assert_eq!(
+            poll_working(mpsc::TryRecvError::Empty, Duration::ZERO),
+            WorkPoll::KeepWaiting
+        );
+        assert_eq!(
+            poll_working(mpsc::TryRecvError::Empty, WORKING_DEADLINE),
+            WorkPoll::Failed(WorkFailure::Deadline),
+            "`poll_working` ignores the clock, so only a dead worker can end the stage"
+        );
+        assert_eq!(
+            poll_working(mpsc::TryRecvError::Disconnected, Duration::ZERO),
+            WorkPoll::Failed(WorkFailure::WorkerDied),
+            "`poll_working` ignores the channel, so a panicking worker still polls forever"
+        );
+        assert_eq!(
+            poll_working(mpsc::TryRecvError::Disconnected, WORKING_DEADLINE * 10),
+            WorkPoll::Failed(WorkFailure::WorkerDied),
+            "a panicked worker is reported as a timeout, which sends the next person \
+             investigating this to the network rather than to the panic"
+        );
+        // Both reasons say something, and something different: this is the only
+        // record of which of the two happened on a user's machine.
+        assert_ne!(
+            WorkFailure::WorkerDied.reason(),
+            WorkFailure::Deadline.reason()
+        );
+        assert!(!WorkFailure::Deadline.reason().is_empty());
+    }
+
+    /// **Both endings are endings the user can leave.** `WorkFailed` is only a
+    /// fix if what it lands on is not another stage with a ghosted ✕ -- and
+    /// there is no fourth stage: it closes the window, which returns from `run`
+    /// and hands `main` its existing `recover_from_failed_vault_wait`.
+    #[test]
+    fn every_way_the_stage_can_give_up_closes_the_window() {
+        for (err, elapsed) in [
+            (mpsc::TryRecvError::Disconnected, Duration::ZERO),
+            (mpsc::TryRecvError::Empty, WORKING_DEADLINE),
+        ] {
+            let WorkPoll::Failed(_) = poll_working(err, elapsed) else {
+                panic!("{err:?} after {elapsed:?} does not end the stage at all");
+            };
+            assert_eq!(
+                advance(Stage::Working, Event::WorkFailed),
+                Next::Close,
+                "the stage gives up into a stage rather than out of the window -- and every \
+                 stage this window has except the vault refuses to close"
+            );
+        }
+    }
+
+    /// The deadline is derived from the two numbers the crate already agrees
+    /// on, so a change to either moves it rather than leaving it stale.
+    #[test]
+    fn the_deadline_covers_every_phase_the_worker_runs() {
+        use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE};
+        assert_eq!(
+            WORKING_DEADLINE,
+            BACKEND_OP_TIMEOUT + READINESS_DEADLINE + BACKEND_OP_TIMEOUT,
+            "the working stage's deadline is no longer the sum of the three phases \
+             `StartupWork::produce` runs -- an untimed backend start, the readiness probe, and \
+             an untimed `bw status` -- so a healthy-but-slow startup can be cut off"
+        );
+        assert!(
+            WORKING_DEADLINE > BACKEND_OP_TIMEOUT,
+            "the window gives up before a single backend operation is even considered wedged"
         );
     }
 }
@@ -664,6 +1015,91 @@ mod startup_window_tests {
             !closure.contains(concat!("work_rx.", "recv()")),
             "the closure BLOCKS on the worker, which freezes the window exactly as running \
              the work inline would"
+        );
+    }
+
+    /// **The watchdog is only a fix if the closure asks it anything.**
+    ///
+    /// `poll_working` and its tests are pure and would stay green with the call
+    /// deleted from the frame -- which is exactly the failure this crate keeps
+    /// shipping (three functions complete, correct and unreachable at once). The
+    /// arm's poll must therefore be pinned by source position, the same way the
+    /// spinner and the vault's own draw calls are.
+    #[test]
+    fn the_working_arm_asks_the_watchdog_and_does_not_swallow_the_error() {
+        let arm = working_arm();
+        assert!(
+            arm.contains(concat!("poll_", "working(")),
+            "the working arm never asks the watchdog, so a dead worker and a hung `bw sync` \
+             both leave a spinner up that has no live ✕, no tray and no Quit anywhere in the \
+             process yet: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("WorkPoll::", "Failed")),
+            "the working arm ignores what the watchdog answered, so it can only ever keep \
+             waiting: {arm}"
+        );
+        assert!(
+            !arm.contains(concat!("Err(_) ", "=>")),
+            "the poll arm is back to catching every `TryRecvError` the same way, which treats \
+             a worker that panicked as one that is merely slow: {arm}"
+        );
+        // **The ARGUMENT, not just the call.** A stopwatch that is never
+        // started reads zero forever, so `poll_working` would still be called,
+        // every deadline test would still pass, and the deadline would never
+        // fire on a user's machine. This crate has shipped exactly that shape
+        // once already (the observer that read a window title and then passed
+        // `""` on), so both needles are here.
+        assert!(
+            arm.contains(concat!("working_since.map_or(Duration::ZERO, ", "|at| at.elapsed())")),
+            "the watchdog is asked about something other than how long this stage has been \
+             up, so the deadline is measuring nothing: {arm}"
+        );
+        assert!(
+            closure().contains(concat!("working_since = Some(", "Instant::now());")),
+            "nothing ever starts the working stage's stopwatch, so it reads zero on every \
+             frame and the deadline can never fire"
+        );
+    }
+
+    /// The other half of the same fix, and the half that is invisible in the
+    /// arm: a `Disconnected` can only ever be observed if the closure lets go of
+    /// its sender. A `clone` here is the whole defect back, with every test
+    /// above still green.
+    #[test]
+    fn the_worker_gets_the_only_sender() {
+        let closure = closure();
+        assert!(
+            closure.contains(concat!("work_tx.", "take()")),
+            "the closure no longer hands the worker its sender outright, so it is keeping one \
+             of its own -- and a worker that panics leaves `try_recv` answering Empty forever \
+             instead of Disconnected, which is the spinner that never ends"
+        );
+        assert!(
+            !closure.contains(concat!("work_tx.", "clone()")),
+            "the closure keeps a sender of its own alive for the window's whole life, so the \
+             channel can never disconnect and the dead-worker arm is unreachable"
+        );
+    }
+
+    /// The refusal must not outlive the decision to stop. eframe reports this
+    /// module's own `ViewportCommand::Close` back as a `close_requested` on a
+    /// later frame, while `Stage::Working` is still the stage being drawn -- so
+    /// an unconditional `CancelClose` cancels the window's own exit and the
+    /// stage is exactly as unleaveable as it was before any of this.
+    #[test]
+    fn the_refusal_stands_down_once_the_stage_has_decided_to_close() {
+        let arm = working_arm();
+        assert!(
+            arm.contains(concat!("!closing && ", "ui.ctx().input(")),
+            "the working stage refuses EVERY close, including the one it sends itself when it \
+             gives up -- so `WorkFailed` never actually closes the window: {arm}"
+        );
+        assert_eq!(
+            arm.matches("closing = true;").count(),
+            2,
+            "one of the two ways the stage ends does not disarm the refusal first, so that one \
+             cancels its own close and hangs: {arm}"
         );
     }
 
