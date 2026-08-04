@@ -76,12 +76,12 @@ pub struct AccountsMenuPlan {
     /// possibly succeed -- `None` otherwise, because a menu item that can only
     /// fail is worse than one that is not there.
     ///
-    /// Two refusals, both `remove_account`'s own and both asked of the same
-    /// door: **the last account cannot be removed** (there is nowhere coherent
-    /// for the app to land), and a **blocked** state cannot remove anything
-    /// (the app cannot reach the survivor it would have to settle onto). Both
-    /// collapse to "there is at least one switchable account", because that is
-    /// exactly the survivor `next_active_after_removal` picks.
+    /// Both refusals are `remove_account`'s own and both are asked of the one
+    /// door, [`AccountsState::can_remove_active`](crate::accounts::AccountsState::can_remove_active)
+    /// — see it for why they collapse into a single question. The vault
+    /// window's account menu offers the same removal and asks the same door;
+    /// this used to spell the rule out here instead, which is one of the two
+    /// menus keeping an item that can only fail.
     pub remove: Option<String>,
 }
 
@@ -130,7 +130,9 @@ pub fn accounts_menu_plan(state: Option<&AccountsState>) -> AccountsMenuPlan {
     };
 
     AccountsMenuPlan {
-        remove: (!switch_to.is_empty()).then(|| remove_account_label(&active)),
+        remove: state
+            .can_remove_active()
+            .then(|| remove_account_label(&active)),
         active: Some(active),
         switch_to,
         notice,

@@ -32,7 +32,7 @@ pub fn icon_base_url(server_url: Option<&str>) -> String {
 
 /// Extracts just the host (no scheme, path, query, fragment, or port) from a
 /// server URL, e.g. `https://vault.example.com:8443/api` -> `vault.example.com`.
-fn host_from_url(url: &str) -> String {
+pub fn host_from_url(url: &str) -> String {
     let stripped = url
         .trim()
         .trim_start_matches("https://")
@@ -42,14 +42,39 @@ fn host_from_url(url: &str) -> String {
     host.to_string()
 }
 
+/// **Which** of Bitwarden's own clouds `host` belongs to -- `"bitwarden.com"`
+/// or `"bitwarden.eu"` -- or `None` for anything else, including a self-hosted
+/// server.
+///
+/// The answer is the region's own name rather than the host that was asked
+/// about, because `vault.bitwarden.eu` and `bitwarden.eu` are one answer to
+/// "which of the three is this account on?" -- which is what the vault window's
+/// account menu paints under the address. There are exactly three cases a user
+/// can be in (a self-hosted URL, `bitwarden.com`, `bitwarden.eu`) and this
+/// tells the last two apart.
+///
+/// Matched by exact host or host-suffix, never a substring: a substring check
+/// classifies the unrelated self-hosted domain `vault.bitwarden.community` as
+/// the default cloud, which in [`icon_base_url`] means silently leaking that
+/// user's icon requests to a third party and in the account menu means telling
+/// them their vault is somewhere it is not. **One host test, two callers** --
+/// a second copy is how the two come to disagree, and only one of them has a
+/// visible symptom.
+pub fn bitwarden_cloud(host: &str) -> Option<&'static str> {
+    if host == "bitwarden.com" || host.ends_with(".bitwarden.com") {
+        Some("bitwarden.com")
+    } else if host == "bitwarden.eu" || host.ends_with(".bitwarden.eu") {
+        Some("bitwarden.eu")
+    } else {
+        None
+    }
+}
+
 /// True only for `bitwarden.com`/`bitwarden.eu` themselves or a subdomain of
 /// one of them -- not for unrelated domains that merely contain those
 /// strings as a substring (e.g. `vault.bitwarden.community`).
 fn is_bitwarden_cloud_host(host: &str) -> bool {
-    host == "bitwarden.com"
-        || host.ends_with(".bitwarden.com")
-        || host == "bitwarden.eu"
-        || host.ends_with(".bitwarden.eu")
+    bitwarden_cloud(host).is_some()
 }
 
 /// Extracts a bare domain (`vault.example.com`, no scheme/path/port) from a

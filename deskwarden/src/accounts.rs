@@ -204,6 +204,46 @@ pub fn account_label(account: &Account) -> &str {
     }
 }
 
+/// Records what `bw status` has just said about **this account's own profile
+/// directory**, and answers whether it changed anything.
+///
+/// The hole this closes: an account minted by [`resolve_startup`] on a first
+/// install carries an empty email, and nothing filled it in afterwards — so
+/// [`account_label`] fell back to the id and every menu naming the account
+/// named a 32-character hash instead. The sign-in that follows the mint is the
+/// moment the address becomes knowable, and `bw status` is the only thing that
+/// knows it.
+///
+/// **`None` means "`bw status` did not say", never "there is nobody".** A CLI
+/// that is logged out, or that could not be spawned at all, answers `null` for
+/// both fields ([`check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in)
+/// returns exactly that on a failed spawn), and letting that erase an address
+/// already on disk would put the hash back in the menu for a locked vault.
+///
+/// A *different* non-empty answer does win, and has to: `bw login` replaces
+/// whatever profile it is pointed at, so a directory can genuinely change
+/// hands. A stale email is a menu row naming the wrong person.
+pub fn learn_account_details(
+    account: &mut Account,
+    email: Option<&str>,
+    server_url: Option<&str>,
+) -> bool {
+    let mut changed = false;
+    if let Some(email) = email.filter(|e| !e.is_empty()) {
+        if account.email != email {
+            account.email = email.to_string();
+            changed = true;
+        }
+    }
+    if let Some(server_url) = server_url.filter(|s| !s.is_empty()) {
+        if account.server_url.as_deref() != Some(server_url) {
+            account.server_url = Some(server_url.to_string());
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Which account becomes active when `removed` is deleted: the first survivor
 /// in configured order, or `None` when it was the last one.
 ///
@@ -575,6 +615,50 @@ impl AccountsState {
     /// on, or `None` when they are available.
     pub fn blocked_reason(&self) -> Option<&str> {
         self.blocked_reason.as_deref()
+    }
+
+    /// Whether the account this process is on could be removed at all.
+    ///
+    /// Two refusals, both of them `remove_account`'s own, and both answered
+    /// here so that no menu has to spell either for itself: **the last account
+    /// cannot be removed** (there would be nowhere coherent for the app to
+    /// land, and no directory left to point the CLI at), and a **blocked**
+    /// state cannot remove anything (the app cannot reach the survivor it
+    /// would have to settle onto first, and it will not delete a profile it
+    /// cannot reach). Both collapse to "there is at least one switchable
+    /// account", because that is exactly the survivor
+    /// [`next_active_after_removal`] picks and exactly what `remove_account`
+    /// then re-checks against [`switchable`](Self::switchable).
+    ///
+    /// Asked by both menus that offer a removal — the tray's Accounts submenu
+    /// and the vault window's account menu. A menu item that can only fail is
+    /// worse than one that is not there, and two spellings of the rule is one
+    /// of them offering it anyway.
+    pub fn can_remove_active(&self) -> bool {
+        !self.switchable.is_empty()
+    }
+
+    /// Fills the active account's email and server URL in from what `bw
+    /// status` reported about the directory this process is pointed at, and
+    /// answers whether anything changed — so the caller writes `settings.json`
+    /// only when there is something new to write.
+    ///
+    /// Applied to [`active`](Self::active) **and** to every entry of
+    /// [`all`](Self::all) carrying that id, because those are two copies of one
+    /// account and `all()` is what gets persisted. A hand-edited file can hold
+    /// the id twice, hence `filter` rather than `find`.
+    ///
+    /// [`switchable`](Self::switchable) is deliberately not recomputed: it never
+    /// contains the active id (see [`switch_targets`]), so no row it holds can
+    /// be the one this just rewrote, and rebuilding it here would be a second
+    /// place deciding what a switch target is.
+    pub fn learn_active_details(&mut self, email: Option<&str>, server_url: Option<&str>) -> bool {
+        let mut changed = learn_account_details(&mut self.active, email, server_url);
+        let id = self.active.id.clone();
+        for account in self.accounts.iter_mut().filter(|a| a.id == id) {
+            changed |= learn_account_details(account, email, server_url);
+        }
+        changed
     }
 
     /// Records the account this process has just moved onto, appending it to
@@ -1393,6 +1477,157 @@ mod tests {
             }
             assert!(MultiAccountAvailability::Available.is_available());
             assert_eq!(MultiAccountAvailability::Available.explanation(), None);
+        }
+
+        /// Both menus that offer "Remove this account" ask this, and both would
+        /// otherwise offer an item that can only fail: `remove_account` refuses
+        /// the last account (nowhere to land) and refuses while blocked (it
+        /// cannot reach the survivor). The whole table, so neither refusal can
+        /// be special-cased into working while the other silently is not.
+        #[test]
+        fn the_active_account_is_removable_only_when_there_is_a_survivor_to_reach() {
+            for availability in [
+                MultiAccountAvailability::BlockedByUnknownCliPath,
+                trap(),
+            ] {
+                assert!(
+                    !state(availability.clone(), vec![a(), b(), c()], &a().id).can_remove_active(),
+                    "{availability:?} offered a removal it cannot settle away from first"
+                );
+            }
+            assert!(
+                !state(MultiAccountAvailability::Available, vec![a()], &a().id)
+                    .can_remove_active(),
+                "the only account was offered for removal, which leaves the app with no \
+                 profile to point the CLI at"
+            );
+            // The positive controls, on the same call: two accounts and nothing
+            // blocking really is removable, from either end of the list.
+            assert!(
+                state(MultiAccountAvailability::Available, vec![a(), b()], &a().id)
+                    .can_remove_active()
+            );
+            assert!(
+                state(MultiAccountAvailability::Available, vec![a(), b()], &b().id)
+                    .can_remove_active()
+            );
+            // And it agrees with the survivor `remove_account` would actually
+            // pick, rather than being a second rule that happens to line up.
+            for list in [vec![a()], vec![a(), b()], vec![a(), b(), c()]] {
+                let s = state(MultiAccountAvailability::Available, list.clone(), &a().id);
+                assert_eq!(
+                    s.can_remove_active(),
+                    next_active_after_removal(&list, &a().id).is_some(),
+                    "for {list:?}"
+                );
+            }
+        }
+
+        /// The bug behind the "random hash": an account minted on a first
+        /// install has no email, so `account_label` names it by its directory.
+        #[test]
+        fn a_first_run_account_learns_its_address_and_stops_being_named_by_its_id() {
+            let blank = Account {
+                id: id(A),
+                email: String::new(),
+                server_url: None,
+            };
+            let mut s = state(
+                MultiAccountAvailability::Available,
+                vec![blank.clone(), b()],
+                &blank.id,
+            );
+            assert_eq!(
+                account_label(s.active()),
+                A,
+                "control: before it learns anything it really is named by its id"
+            );
+
+            assert!(s.learn_active_details(
+                Some("ana@example.com"),
+                Some("https://vault.example.eu")
+            ));
+            assert_eq!(account_label(s.active()), "ana@example.com");
+            assert_eq!(
+                s.active().server_url.as_deref(),
+                Some("https://vault.example.eu")
+            );
+            // What gets PERSISTED is `all()`, so the copy in there has to have
+            // learned it too -- otherwise the next launch reads the hash back.
+            assert_eq!(s.all()[0].email, "ana@example.com");
+            assert_eq!(s.all()[1], b(), "the other account was rewritten as well");
+            // Nothing new to say the second time, so nothing to write.
+            assert!(!s.learn_active_details(
+                Some("ana@example.com"),
+                Some("https://vault.example.eu")
+            ));
+        }
+
+        /// `bw status` answers `null` for both fields when the CLI is logged
+        /// out or could not be spawned at all. Treating that as an answer would
+        /// erase an address already on disk and put the hash back.
+        #[test]
+        fn a_silent_bw_status_never_unlearns_an_address_the_app_already_had() {
+            let mut s = state(MultiAccountAvailability::Available, vec![a(), b()], &a().id);
+            assert!(!s.learn_active_details(None, None));
+            assert!(!s.learn_active_details(Some(""), Some("")));
+            assert_eq!(s.active().email, "me@example.com");
+            assert_eq!(account_label(s.active()), "me@example.com");
+            // The positive control on the same state: a real answer still lands.
+            assert!(s.learn_active_details(Some("someone@example.com"), None));
+            assert_eq!(s.active().email, "someone@example.com");
+            assert_eq!(
+                s.active().server_url, None,
+                "a server URL was invented from an answer that did not carry one"
+            );
+        }
+
+        /// `bw login` replaces whatever profile it is pointed at, so a
+        /// directory really can change hands. Keeping the old address there
+        /// would name the wrong person in every menu.
+        #[test]
+        fn a_directory_that_changed_hands_is_relearned_rather_than_left_stale() {
+            let mut s = state(MultiAccountAvailability::Available, vec![a(), b()], &a().id);
+            assert!(s.learn_active_details(Some("someone-else@example.com"), None));
+            assert_eq!(s.active().email, "someone-else@example.com");
+            assert_eq!(s.all()[0].email, "someone-else@example.com");
+            assert_eq!(
+                s.all()[1].email,
+                "me@example.com",
+                "the OTHER account's address was rewritten by the active one's status"
+            );
+            assert_eq!(
+                switch_ids(&s),
+                vec![b().id],
+                "learning an address changed what the app offers to switch to"
+            );
+        }
+
+        /// A hand-edited `settings.json` can list one id twice. `all()` is what
+        /// gets written back, so both copies have to learn -- a stale one would
+        /// come back as the account's address on the next launch, and which of
+        /// the two wins is `account_for`'s "first entry only".
+        #[test]
+        fn a_duplicated_active_id_learns_in_every_copy_that_gets_persisted() {
+            let blank = Account {
+                id: id(A),
+                email: String::new(),
+                server_url: None,
+            };
+            let mut s = state(
+                MultiAccountAvailability::Available,
+                vec![blank.clone(), b(), blank.clone()],
+                &blank.id,
+            );
+            assert!(s.learn_active_details(Some("ana@example.com"), None));
+            assert_eq!(s.all()[0].email, "ana@example.com");
+            assert_eq!(
+                s.all()[2].email,
+                "ana@example.com",
+                "the second copy of the active account kept the empty email that put its id \
+                 in the menu"
+            );
+            assert_eq!(s.all()[1].email, "me@example.com", "control: not everything");
         }
 
         /// The files that must ask [`AccountsState`] rather than answer for
