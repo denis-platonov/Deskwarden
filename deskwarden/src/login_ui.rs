@@ -1880,10 +1880,20 @@ fn spawn_auth(
 /// master password openable by every other one.
 ///
 /// `first_run` draws [`FIRST_RUN_NOTICE`]; see [`draw_login_window`].
-pub fn run_login_flow_for(
+///
+/// This BUILDS the window's per-frame closure; it does not open a window. Two
+/// hosts run it: [`run_login_flow_for`], which gives it an event loop of its
+/// own, and `app_window`, which draws it as the first state of the single
+/// window that then becomes the spinner and the vault. eframe cannot nest
+/// event loops, so the second host cannot call a function that owns one --
+/// which is the whole reason this split exists. See `pre_styled` and
+/// `close_on_success` at their use sites for what each host asks for.
+pub fn build_login_frame(
     account: Option<(&Path, &Account)>,
     first_run: bool,
-) -> Option<String> {
+    pre_styled: bool,
+    close_on_success: bool,
+) -> (eframe::NativeOptions, LoginFrameFn, LoginFrameHandles) {
     // **Every `bw` this window runs is aimed at THIS account's directory**,
     // derived from the account it was already given rather than read off the
     // process-global. See `profile_dir_for`, which says what that buys and
@@ -1988,9 +1998,12 @@ pub fn run_login_flow_for(
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
 
-    let mut styled = false;
+    // `pre_styled` when someone else already owns this window's first frame
+    // -- see this function's doc. `false` is `run_login_flow_for`'s own value
+    // and the behaviour this window has always had.
+    let mut styled = pre_styled;
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
+    let login_frame_fn = move |ui: &mut egui::Ui, _frame: &mut eframe::Frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled
@@ -2069,7 +2082,21 @@ pub fn run_login_flow_for(
                         apply_auth_result(result, &mut form)
                     {
                         *token_for_closure.borrow_mut() = Some(session_token);
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        // The token is recorded either way; what differs is
+                        // whether producing one ENDS THE WINDOW.
+                        //
+                        // `run_login_flow_for` owns its window and has
+                        // nothing else to show in it, so it closes -- which
+                        // is how it returns at all. `app_window` owns a
+                        // window that is about to become the spinner and then
+                        // the vault, in that same frame's own event loop; it
+                        // passes `false`, reads the token out of the same
+                        // cell, and moves the window to its next state. A
+                        // `Close` here would be the exact three-window
+                        // flicker this whole change exists to remove.
+                        if close_on_success {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
                     }
                 }
 
@@ -2280,13 +2307,62 @@ pub fn run_login_flow_for(
                 }
             },
         );
-    });
+    };
+
+    (options, Box::new(login_frame_fn), LoginFrameHandles { token })
+}
+
+/// The login UI's per-frame closure, boxed so it can be stored in a struct and
+/// handed to either host.
+pub type LoginFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
+
+/// The cell [`build_login_frame`]'s closure reports a produced session token
+/// through.
+pub struct LoginFrameHandles {
+    token: Rc<RefCell<Option<String>>>,
+}
+
+impl LoginFrameHandles {
+    /// The session token the sign-in produced, TAKEN -- a second call answers
+    /// `None`.
+    ///
+    /// Taking rather than cloning is what makes this safe to poll every frame,
+    /// which is exactly what `app_window` does: the frame after the one that
+    /// produced the token is already the spinner, and a cell that kept
+    /// answering `Some` would drive that transition again on every frame for
+    /// the rest of the session.
+    pub fn take_token(&self) -> Option<String> {
+        self.token.borrow_mut().take()
+    }
+}
+
+/// Opens the sign-in window in its OWN event loop and blocks until it closes.
+///
+/// This is the host for every caller that has nothing to put in the window
+/// afterwards: the lock/re-auth recovery, an account switch, adding an
+/// account. Startup's host is `app_window`, which calls [`build_login_frame`]
+/// directly and keeps the same window for the spinner and the vault.
+pub fn run_login_flow_for(
+    account: Option<(&Path, &Account)>,
+    first_run: bool,
+) -> Option<String> {
+    let (options, mut frame_fn, handles) = build_login_frame(
+        account,
+        first_run,
+        // This host owns its window, so its first frame is the one that
+        // installs the fonts, rounds the corners and raises it...
+        false,
+        // ...and a produced token is the end of the window, because there is
+        // no next state for it to enter.
+        true,
+    );
+
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
 
     // `None` means the user closed the window with the X button rather than
     // completing the flow. What that *costs* is the caller's to decide, and
     // is decided in exactly one place: [`run_login_flow`].
-    let produced = token.borrow_mut().take();
-    produced
+    handles.take_token()
 }
 
 /// The login flow for the two callers that genuinely cannot continue without
@@ -3133,13 +3209,21 @@ mod login_entry_point_tests {
             .join("\n")
     }
 
-    /// `run_login_flow_for`'s body, from its declaration to the fatal
-    /// wrapper's -- the same slice `only_the_fatal_entry_point_can_end_the_
-    /// process` uses, named once so the two cannot disagree.
+    /// The login WINDOW's body: `build_login_frame`, plus the thin host
+    /// `run_login_flow_for` that follows it, up to the fatal wrapper -- the
+    /// same slice `only_the_fatal_entry_point_can_end_the_process` uses, named
+    /// once so the two cannot disagree.
+    ///
+    /// It starts at `build_login_frame` and not at `run_login_flow_for`
+    /// because that is where the window's frame closure went when the single
+    /// window took the login UI as its first state. Left aimed at
+    /// `run_login_flow_for`, this would slice the six-line host instead of the
+    /// window -- which the length assertion below would catch, and which is
+    /// why that assertion is there.
     fn window_body() -> &'static str {
         let body = SOURCE
-            .split_once("pub fn run_login_flow_for(")
-            .expect("the cancellable entry point must exist")
+            .split_once("pub fn build_login_frame(")
+            .expect("the login window's frame builder must exist")
             .1
             .split_once("pub fn run_login_flow(")
             .expect("the wrapper must follow it")
@@ -3184,8 +3268,8 @@ mod login_entry_point_tests {
         // separately so an exit put back into the body fails with the message
         // that says what it costs.
         let body = SOURCE
-            .split_once("pub fn run_login_flow_for(")
-            .expect("the cancellable entry point must exist")
+            .split_once("pub fn build_login_frame(")
+            .expect("the login window's frame builder must exist")
             .1;
         let body = body
             .split_once("pub fn run_login_flow(")
@@ -3671,8 +3755,8 @@ mod empty_app_behind_the_card_tests {
     fn the_window_opens_at_the_vault_windows_placement_and_paints_its_empty_panes() {
         let source = include_str!("login_ui.rs");
         let body = source
-            .split_once(concat!("pub fn run_login_flow", "_for("))
-            .expect("`run_login_flow_for` is gone")
+            .split_once(concat!("pub fn build_login", "_frame("))
+            .expect("`build_login_frame` is gone")
             .1
             .split_once(concat!("pub fn run_login", "_flow("))
             .expect("`run_login_flow` no longer follows it, so this slice is unbounded")
@@ -3718,7 +3802,7 @@ mod empty_app_behind_the_card_tests {
             assert_eq!(
                 body.matches(needle).count(),
                 1,
-                "expected exactly one {needle:?} in `run_login_flow_for`: {what}"
+                "expected exactly one {needle:?} in `build_login_frame`: {what}"
             );
         }
 
@@ -4156,7 +4240,7 @@ mod auth_in_flight_tests {
         );
     }
 
-    /// The half of this that no harness can reach: `run_login_flow_for`'s
+    /// The half of this that no harness can reach: `build_login_frame`'s
     /// frame closure runs only inside a live eframe event loop, so "the
     /// window routes its answer through `apply_auth_result`" and "submitting
     /// no longer wipes the field on the spot" are source guards.
@@ -4168,8 +4252,8 @@ mod auth_in_flight_tests {
     fn the_window_routes_its_answer_through_the_tested_decision_and_does_not_wipe_on_submit() {
         let source = include_str!("login_ui.rs");
         let body = source
-            .split_once(concat!("pub fn run_login_flow", "_for("))
-            .expect("`run_login_flow_for` is gone")
+            .split_once(concat!("pub fn build_login", "_frame("))
+            .expect("`build_login_frame` is gone")
             .1
             .split_once(concat!("pub fn run_login", "_flow("))
             .expect("`run_login_flow` no longer follows it, so this slice is unbounded")
@@ -4208,5 +4292,144 @@ mod auth_in_flight_tests {
             "no {wipe:?} anywhere in this file -- the needle has drifted and the assertion \
              above proves nothing"
         );
+    }
+}
+
+/// The seam [`build_login_frame`] opened, held from the source.
+///
+/// None of it can be observed by running anything: [`run_login_flow_for`]
+/// blocks on a real winit event loop and opens a real OS window, so no test in
+/// this crate calls it. What the split newly makes possible to get wrong is
+/// the `close_on_success` gate -- a window that records a token and then does
+/// not close is a window the user is stuck in forever, having signed in
+/// successfully, and every existing test in this file passes through it.
+#[cfg(test)]
+mod login_frame_host_tests {
+    fn source() -> &'static str {
+        include_str!("login_ui.rs")
+    }
+
+    /// Everything before the first `#[cfg(test)]`. Split with `concat!` so the
+    /// marker exists in the binary but appears in this file only where the
+    /// real attributes are -- otherwise this needle would find ITSELF, above
+    /// all the production code, and every slice below would be empty.
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file");
+        &source[..end]
+    }
+
+    /// The builder's body: from its signature to the host that follows it.
+    fn builder_body() -> &'static str {
+        let production = production();
+        let at = production
+            .find(concat!("pub fn build_login", "_frame("))
+            .expect("no `build_login_frame` in this file");
+        let end = production
+            .find(concat!("pub fn run_login_flow", "_for("))
+            .expect("no `run_login_flow_for` in this file");
+        assert!(
+            at < end,
+            "control: `build_login_frame` is expected above `run_login_flow_for`"
+        );
+        &production[at..end]
+    }
+
+    /// The own-event-loop host's body: from its signature to the fatal wrapper.
+    fn host_body() -> &'static str {
+        let production = production();
+        let at = production
+            .find(concat!("pub fn run_login_flow", "_for("))
+            .expect("no `run_login_flow_for` in this file");
+        let end = production
+            .find(concat!("pub fn run_login", "_flow("))
+            .expect("no `run_login_flow` in this file");
+        assert!(at < end, "control: the fatal wrapper is expected below the host");
+        &production[at..end]
+    }
+
+    #[test]
+    fn the_login_frame_is_built_without_opening_a_window() {
+        // The CALL, not the words: this file's prose says "run_ui_native" in
+        // doc comments, and a needle matching those would fail here for the
+        // wrong reason.
+        const CALL: &str = concat!("eframe::run_ui_", "native(");
+        assert!(
+            !builder_body().contains(CALL),
+            "`build_login_frame` opens its own event loop, so `app_window` calling it would \
+             nest one native event loop inside another -- which eframe cannot do, and which \
+             is the entire reason this function exists separately from `run_login_flow_for`."
+        );
+        // Paired positive control: the loop really is in this file, in the
+        // host, so the negative above is about WHERE it is rather than about a
+        // needle that never matches anything.
+        assert!(
+            host_body().contains(CALL),
+            "`run_login_flow_for` no longer opens a window at all, so nothing in this crate \
+             shows the sign-in card outside the single startup window"
+        );
+        assert_eq!(
+            production().matches(CALL).count(),
+            1,
+            "expected exactly one event loop in this file"
+        );
+    }
+
+    #[test]
+    fn the_own_window_host_closes_on_a_produced_token_and_reads_it_back() {
+        let host = host_body();
+        assert!(
+            host.contains(concat!("handles.take_", "token()")),
+            "`run_login_flow_for` never reads the token cell, so a completed sign-in reports \
+             `None` -- which its two fatal callers treat as 'the user closed the window' and \
+             end the process over: {host:?}"
+        );
+        // `true` for `close_on_success`, named by the comment that sits
+        // immediately above the argument, because a bare `true,` in an
+        // argument list names nothing and `pre_styled` is a `bool` two lines
+        // above it.
+        assert!(
+            host.contains(concat!("// ...and a produced token is the end of the window,")),
+            "the comment naming `run_login_flow_for`'s `close_on_success` argument is gone, \
+             so the two bare `bool`s in this call are unlabelled and can be swapped silently: \
+             {host:?}"
+        );
+    }
+
+    #[test]
+    fn recording_a_token_and_closing_the_window_are_separable() {
+        let builder = builder_body();
+        let record = concat!("*token_for_", "closure.borrow_mut() = Some(session_token);");
+        let close = concat!("send_viewport_cmd(egui::ViewportCommand::", "Close);");
+        let at = builder
+            .find(record)
+            .expect("the login frame no longer records the token it produced");
+        let rest = &builder[at + record.len()..];
+        // The window-ending command must be INSIDE the gate, not beside it.
+        // Bounded to the region between recording the token and the next
+        // statement block rather than a fixed byte window, which would either
+        // overrun into unrelated arms or stop short of a reworded gate.
+        let gate = concat!("if close_on_", "success {");
+        let gate_at = rest
+            .find(gate)
+            .expect("the `close_on_success` gate is gone: the single window now closes the \
+                     moment sign-in succeeds, which is the three-window flicker this change \
+                     removed");
+        let close_at = rest.find(close).expect(
+            "nothing closes the login window when it produces a token, so \
+             `run_login_flow_for` -- which returns only when its window closes -- never \
+             returns and the app hangs on a SUCCESSFUL sign-in",
+        );
+        assert!(
+            gate_at < close_at,
+            "the close is not inside the `close_on_success` gate, so the single startup \
+             window closes itself the instant the user signs in"
+        );
+        // Positive control: the two needles are really distinct positions in
+        // a region that contains both, rather than one needle matching twice.
+        assert_ne!(gate_at, close_at);
+        assert_eq!(builder.matches(close).count(), 1, "expected one close command");
     }
 }
