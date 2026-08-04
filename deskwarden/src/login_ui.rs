@@ -1243,19 +1243,24 @@ pub struct LoginForm {
     pub error: Option<String>,
 }
 
-/// **Wipes the master password whichever way the window ends.**
+/// **The backstop: no `LoginForm` is released to the allocator holding a
+/// plaintext master password.**
 ///
-/// This is the counterpart of moving the `zeroize` off the submit path and
-/// into [`apply_auth_result`]'s failure arm. Wiping at submission time meant
-/// the buffer was empty within a frame of the CLI being handed it, on every
-/// path; wiping only on failure leaves it live through a *successful* attempt
-/// -- and on success this window closes, so without this the plaintext would
-/// be released to the allocator unwiped.
+/// [`apply_auth_result`] wipes on every answer the CLI gives, which is the
+/// path that matters -- it is the only one that ends the plaintext's life while
+/// the window is still open, and on the `close_on_success: false` host the
+/// window stays open for the whole vault session. This covers the exits that
+/// never reach an answer at all: a window the user closed with the field
+/// filled in, and an unwind out of the event loop. It also covers a success on
+/// the host that does close, a second time, which costs nothing.
 ///
 /// On drop rather than at some chosen point in `run_login_flow_for`, because
-/// the form is move-captured by the frame closure and this function can no
-/// longer reach it after the event loop returns. Drop covers every exit: a
-/// completed sign-in, a window the user closed, and an unwind.
+/// the form is move-captured by the frame closure and that function can no
+/// longer reach it after the event loop returns.
+///
+/// Tested by `password_lifetime_tests`, which watches the global allocator for
+/// the plaintext going past on the way out -- emptying this body makes those
+/// tests fail.
 impl Drop for LoginForm {
     fn drop(&mut self) {
         self.password.zeroize();
@@ -1274,25 +1279,47 @@ pub enum AuthOutcome {
 
 /// Applies the answer from an in-flight `bw login`/`bw unlock` to the form.
 ///
-/// **The password is wiped on failure and ONLY on failure**, which is the
-/// user's instruction ("clear if unsuccessful only") and not an incidental
-/// detail of where the `zeroize` call sits. It used to happen at the moment
-/// of *submission*, one line after `spawn_auth` -- so the field emptied
-/// while the CLI was still running, and the window spent the whole attempt
-/// showing a blank master-password box that the user had just filled in. That
-/// is what `theme::disabled_password_field`'s fixed mask covers on screen;
-/// this is the other half, and the two have to agree, or the mask is painting
-/// over a buffer that was cleared for no reason anybody can see.
+/// **The password is wiped on EVERY answer, and the two arms differ only in
+/// what they say about it.** The user's instruction ("clear if unsuccessful
+/// only") was about what the *field* shows: a failed attempt empties the box
+/// the user must retype into, a successful one does not blank a box that is
+/// about to be replaced by a vault. It was never about how long the plaintext
+/// stays in memory, and reading it that way is what left the master password
+/// live for a whole session.
 ///
-/// Extracted from `run_login_flow_for`'s frame closure so it can be tested at
-/// all: that closure runs only inside a live eframe event loop, and the
-/// difference between "cleared on failure" and "cleared on both" is invisible
-/// from outside it -- on success the window closes, so nothing ever repaints
-/// to show which happened.
+/// What is NOT allowed is wiping at the moment of *submission*, which is where
+/// this call used to sit -- one line after `spawn_auth`, so the field emptied
+/// while the CLI was still running and the window spent the whole attempt
+/// showing a blank master-password box that the user had just filled in. That
+/// is what `theme::disabled_password_field`'s fixed mask covers on screen; this
+/// is the other half, and the two have to agree, or the mask is painting over a
+/// buffer that was cleared for no reason anybody can see. Wiping on the
+/// *answer* keeps the mask honest for the length of the attempt and still ends
+/// the plaintext's life within a frame of the attempt finishing.
+///
+/// **Why the success arm matters, given [`LoginForm`]'s [`Drop`].** Drop is a
+/// backstop, and it only fires when the form dies. One of this window's two
+/// hosts never lets it die on a success: `app_window` passes
+/// `close_on_success: false` and move-captures the frame closure -- form and
+/// all -- into a window that goes on to become the spinner and then the vault.
+/// Without the wipe here, the plaintext master password would sit in that
+/// closure for the entire vault session.
+///
+/// Extracted from the frame closure so it can be tested at all: that closure
+/// runs only inside a live eframe event loop, and none of this is observable
+/// from outside one -- the field is masked, and on the `close_on_success: true`
+/// host the window is closing anyway.
 pub fn apply_auth_result(result: Result<String, String>, form: &mut LoginForm) -> AuthOutcome {
     match result {
         Ok(session_token) => {
             form.error = None;
+            // **After the token is out of `result` and before anything else.**
+            // The session token is what this attempt was for; the master
+            // password has no further reader on any path -- the worker got its
+            // own copy at submit time (and wipes it), the Hello enrolment was
+            // done inside that worker, and no later frame reads this field
+            // except to paint a box that a successful sign-in replaces.
+            form.password.zeroize();
             AuthOutcome::Succeeded(session_token)
         }
         Err(e) => {
@@ -2124,9 +2151,18 @@ pub fn build_login_frame(
                 if let Ok(result) = auth_rx.try_recv() {
                     auth_in_progress = false;
                     // Every decision this answer implies -- the message, and
-                    // whether the master-password buffer is wiped -- lives in
+                    // the wipe of the master-password buffer -- lives in
                     // `apply_auth_result`, where it can be tested. All that
                     // is left here is the two things that need the window.
+                    //
+                    // **By the time this `if let` binds, `form.password` is
+                    // already empty**, on the success arm as well as the
+                    // failure one. That is load-bearing rather than tidy: this
+                    // window's other host passes `close_on_success: false` and
+                    // keeps this whole closure -- `form` included -- alive
+                    // through the spinner and the vault, so a wipe deferred to
+                    // `LoginForm`'s `Drop` would be a wipe deferred to the end
+                    // of the session.
                     if let AuthOutcome::Succeeded(session_token) =
                         apply_auth_result(result, &mut form)
                     {
@@ -2263,10 +2299,11 @@ pub fn build_login_frame(
                             // submission is what put a blank master-password
                             // box on screen for the length of the attempt --
                             // the state the user described as needing to keep
-                            // showing a mask. The buffer is now wiped by
-                            // `apply_auth_result`, on failure and only on
-                            // failure; on success this window is closing and
-                            // `form` drops with it.
+                            // showing a mask. The buffer is wiped instead when
+                            // the ANSWER arrives, by `apply_auth_result`, on
+                            // both arms; the mask therefore covers a real
+                            // buffer for exactly as long as the attempt runs,
+                            // and not one frame longer.
                             spawn_auth(
                                 auth_tx.clone(),
                                 args,
@@ -4066,6 +4103,46 @@ mod empty_app_behind_the_card_tests {
             "no ViewportCommand at all is spelled this way any more -- the needle has drifted \
              and the assertion above proves nothing"
         );
+
+        // **And the hazard the paragraph above actually names: writing the
+        // borrowed geometry back.** Forbidding `InnerSize` forbids this window
+        // RESIZING itself; it says nothing about this window SAVING. The
+        // geometry on disk belongs to the vault window, and a login window
+        // that persisted anything -- its own position after the user dragged
+        // it, or the placement it merely borrowed -- would silently re-home the
+        // vault window from a sign-in the user then abandoned. Nothing writes
+        // it today; this is what keeps it that way.
+        let settings = include_str!("settings.rs");
+        for (needle, control, what) in [
+            (
+                concat!("persist_vault_window_", "geometry("),
+                concat!("pub fn persist_vault_window_", "geometry("),
+                "the login window writes the vault window's saved geometry, so an abandoned \
+                 sign-in re-homes the vault window it only borrowed the placement of",
+            ),
+            // Belt and braces. `Settings::save` is private to the settings
+            // module today, so this route does not compile from here at all --
+            // which was verified by trying it. The needle is here for the day
+            // somebody makes it `pub`, because the whole-struct save carries
+            // `vault_window` and is the same hazard by a longer road.
+            (
+                concat!(".save", "("),
+                concat!("on_disk.save", "(path)"),
+                "the login window saves a whole `Settings` -- which carries `vault_window` -- so \
+                 an abandoned sign-in can rewrite the vault window's geometry the long way round",
+            ),
+        ] {
+            assert!(!body.contains(needle), "{what}");
+            // Paired positive control, cross-file: the needle is one the
+            // settings module really does spell this way, so counting zero in
+            // `build_login_frame` is a fact about this function rather than
+            // about a string nothing anywhere matches.
+            assert!(
+                settings.contains(control),
+                "the settings writer is no longer spelled {control:?} -- the assertion above \
+                 proves nothing"
+            );
+        }
     }
 }
 
@@ -4447,12 +4524,19 @@ mod auth_in_flight_tests {
         }
     }
 
-    /// **Cleared on failure, and only on failure.** The user's words. A
-    /// success that also cleared would look identical on screen -- the window
-    /// is closing -- which is exactly why this is a value test on the decision
-    /// rather than an observation of the window.
+    /// **Either answer clears the master password; only a failure says why.**
+    ///
+    /// This used to assert the opposite of its first half -- that a SUCCESS
+    /// deliberately left `form.password` full -- on the argument that the
+    /// window is closing anyway. It is not, on one of the two hosts:
+    /// `app_window` builds this frame with `close_on_success: false` and
+    /// move-captures it into a window that becomes the spinner and then the
+    /// vault, so "the window closes" happens when the user quits the app. The
+    /// user's "clear if unsuccessful only" is about what the FIELD shows
+    /// between attempts, which the second half still pins via `form.error`;
+    /// it was never a licence to keep the plaintext for a session.
     #[test]
-    fn a_failed_attempt_clears_the_password_and_a_successful_one_does_not() {
+    fn either_answer_clears_the_master_password_and_only_a_failure_leaves_a_message() {
         let mut form = LoginForm::default();
         form.password = "correct horse".to_string();
         let outcome = apply_auth_result(Ok("session-token".to_string()), &mut form);
@@ -4461,10 +4545,11 @@ mod auth_in_flight_tests {
             AuthOutcome::Succeeded("session-token".to_string()),
             "a successful attempt did not hand its session token back"
         );
-        assert_eq!(
-            form.password, "correct horse",
-            "a SUCCESSFUL attempt wiped the master password -- the field it is behind is \
-             masked, so nothing on screen would ever have shown this"
+        assert!(
+            form.password.is_empty(),
+            "a SUCCESSFUL attempt left the master password in the form: {:?} -- and the form \
+             outlives the sign-in on the single-window host",
+            form.password
         );
         assert!(form.error.is_none(), "a successful attempt left an error on screen");
 
@@ -4535,6 +4620,195 @@ mod auth_in_flight_tests {
             source.contains(wipe),
             "no {wipe:?} anywhere in this file -- the needle has drifted and the assertion \
              above proves nothing"
+        );
+    }
+}
+
+/// **How long the plaintext master password stays in memory.**
+///
+/// Every other test about the password is a test about what the *field* shows.
+/// These are about the buffer behind it, and they are here because the claim
+/// this module's production code makes -- "the plaintext is never released to
+/// the allocator in the clear" -- was, until these existed, entirely untested:
+/// emptying [`LoginForm`]'s `Drop` body left the whole suite green.
+///
+/// The instrument is a global allocator for this test binary that passes
+/// everything through to `System` and, while a thread has armed it, scans each
+/// block it is about to free for a probe string. Thread-local, so tests running
+/// in parallel cannot see each other's frees; `const`-initialised `Cell<bool>`
+/// with no destructor, so touching it from inside `dealloc` cannot re-enter the
+/// allocator.
+///
+/// Every assertion below is paired with a positive control that a bare `String`
+/// on the same path IS caught -- otherwise "the form did not leak" would be
+/// indistinguishable from a watcher that never sees anything.
+///
+/// **What this cannot prove**, and the README says so too: `Zeroize for String`
+/// wipes the allocation the `String` owns *now*. A `TextEdit` that grew the
+/// buffer while the user typed left earlier, shorter copies behind, and those
+/// were freed by `realloc` long before any of this. Fixing that means a
+/// capacity-reserving `Zeroizing<String>` and is not what these tests claim.
+#[cfg(test)]
+mod password_lifetime_tests {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::panic::AssertUnwindSafe;
+
+    /// Long and distinctive: it must not occur by chance in an unrelated
+    /// freed block, and it must be longer than a machine word so a partial
+    /// overwrite cannot look like a wipe.
+    const PROBE: &str = "deskwarden-drop-probe-master-password";
+
+    thread_local! {
+        static WATCHING: Cell<bool> = const { Cell::new(false) };
+        static SEEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    struct Watcher;
+
+    // SAFETY: every method forwards to `System`, which is a correct
+    // `GlobalAlloc`. The only added work is a read of a thread-local `bool`
+    // and, when it is set, a read of the block that is about to be freed --
+    // which is still valid, still owned by this allocator, and not yet handed
+    // back. Neither allocates, so `dealloc` cannot re-enter.
+    unsafe impl GlobalAlloc for Watcher {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if layout.size() >= PROBE.len() && WATCHING.with(Cell::get) {
+                let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                if block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()) {
+                    SEEN.with(|seen| seen.set(true));
+                }
+            }
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static WATCHER: Watcher = Watcher;
+
+    /// Runs `body` with this thread's watch armed and answers whether the probe
+    /// string went past the allocator in the clear.
+    fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
+        SEEN.with(|seen| seen.set(false));
+        WATCHING.with(|watching| watching.set(true));
+        body();
+        WATCHING.with(|watching| watching.set(false));
+        SEEN.with(Cell::get)
+    }
+
+    /// A heap copy of [`PROBE`], built *before* any watch is armed so that the
+    /// temporaries of building it are never what a test observes.
+    fn probe_password() -> String {
+        String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8")
+    }
+
+    /// **The exit the `close_on_success: false` host never takes.** A window
+    /// the user typed a master password into and then closed: no answer ever
+    /// arrives, so `apply_auth_result` never runs and `Drop` is the only thing
+    /// standing between the plaintext and the allocator.
+    #[test]
+    fn a_closed_window_does_not_release_the_master_password_in_the_clear() {
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: an ordinary String's plaintext went past the allocator unnoticed, so the \
+             assertion below is about an instrument that sees nothing"
+        );
+
+        let mut form = LoginForm::default();
+        form.password = probe_password();
+        assert!(
+            !plaintext_reached_the_allocator(move || drop(form)),
+            "a LoginForm released the plaintext master password to the allocator -- this is the \
+             exit taken by every user who typed a password and then closed the window"
+        );
+    }
+
+    /// The other exit no answer reaches: an unwind out of the event loop.
+    ///
+    /// The deliberate panic prints through the default hook. Replacing the hook
+    /// would be a process-global change and this suite runs its tests in
+    /// parallel, so the noise is left in rather than raced over.
+    #[test]
+    fn an_unwind_does_not_release_the_master_password_in_the_clear() {
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || {
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    let _held = bare;
+                    panic!("deliberate: unwinding past a live master password");
+                }));
+            }),
+            "control: an ordinary String unwound past the allocator unnoticed, so the assertion \
+             below is about an instrument that sees nothing"
+        );
+
+        let mut form = LoginForm::default();
+        form.password = probe_password();
+        assert!(
+            !plaintext_reached_the_allocator(move || {
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    let _held = form;
+                    panic!("deliberate: unwinding past a live master password");
+                }));
+            }),
+            "an unwind out of the login window released the plaintext master password"
+        );
+    }
+
+    /// **The leak this module was written for, in the shape the single-window
+    /// host runs it.**
+    ///
+    /// `app_window` builds the login frame with `close_on_success: false` and
+    /// move-captures it -- `LoginForm` and all -- into a window that goes on to
+    /// be the spinner and then the vault. Its success handling takes the token
+    /// out of the shared cell and advances the stage; it drops nothing. So on
+    /// that host `Drop` does not run until the user quits the app, and anything
+    /// left in `form.password` when the token is produced lives for the entire
+    /// vault session.
+    ///
+    /// This drives that shape: apply a successful answer, take the token, drop
+    /// nothing -- and then look at the form that is still alive.
+    #[test]
+    fn a_successful_sign_in_wipes_the_password_while_the_window_stays_open() {
+        let mut form = LoginForm::default();
+        form.password = probe_password();
+
+        let outcome = apply_auth_result(Ok("session-token".to_string()), &mut form);
+        let AuthOutcome::Succeeded(token) = outcome else {
+            panic!("a successful `bw unlock` produced no token, so this test proves nothing");
+        };
+        // The ordering the wipe depends on: the token is already out before
+        // anything touches the password.
+        assert_eq!(token, "session-token", "the produced token did not survive the wipe");
+
+        // Nothing has dropped `form`, and on this host nothing will.
+        assert!(
+            form.password.is_empty(),
+            "the master password is still in the form after a successful sign-in; on the \
+             single-window host nothing drops the form until the app quits, so this is the \
+             plaintext living for the whole vault session: {:?}",
+            form.password
+        );
+        // ...and it was wiped, not merely truncated: the bytes are gone from
+        // the allocation the String still owns.
+        assert!(
+            !plaintext_reached_the_allocator(move || drop(form)),
+            "the successful sign-in only emptied the String's length -- the plaintext is still \
+             sitting in the allocation and reaches the allocator when the form finally dies"
         );
     }
 }

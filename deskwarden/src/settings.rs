@@ -601,10 +601,104 @@ mod tests {
     use super::*;
     use std::env::temp_dir;
 
+    /// A scratch settings file, unique to this process **and to this call**.
+    ///
+    /// It used to be a bare fixed name in the shared system temp directory,
+    /// which is the one temp helper in this crate that disambiguated nothing
+    /// -- `fill_stats`, `accounts`, `hello`, `bw_path`, `updater` and
+    /// `session_store` all add `process::id()` or nanos. Two `cargo test` runs
+    /// at once therefore wrote each other's `deskwarden-settings-test-*.json`
+    /// mid-assertion, and the failure that surfaced
+    /// (`persisting_accounts_keeps_every_preference_and_the_geometry` reading
+    /// back `None` for an account it had just written) looked like a bug in
+    /// `persist_accounts` rather than like two processes sharing a path.
+    ///
+    /// Nanos as well as the pid because two tests in the SAME process can ask
+    /// for the same label -- `"absent"` is used twice in this module -- and
+    /// `cargo test` runs them on different threads at the same time.
+    ///
+    /// `temp_dir()` and nothing else, ever: no test in this module may go near
+    /// the real `%APPDATA%` `settings.json`, which is why nothing here calls
+    /// [`default_path`] (guarded by
+    /// `every_scratch_settings_file_is_unique_to_this_process_and_this_call`).
     fn temp_path(name: &str) -> std::path::PathBuf {
-        let p = temp_dir().join(format!("deskwarden-settings-test-{name}.json"));
+        let p = temp_dir().join(format!(
+            "deskwarden-settings-test-{name}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    /// **The guard the flake needed.** Every other assertion in this module is
+    /// about what `Settings` does to a file; this one is about the file being
+    /// this run's own.
+    #[test]
+    fn every_scratch_settings_file_is_unique_to_this_process_and_this_call() {
+        let a = temp_path("collision-probe");
+        let b = temp_path("collision-probe");
+        assert_ne!(
+            a, b,
+            "two scratch settings files with the same label are the same path, so two tests in \
+             this process -- or two `cargo test` runs -- overwrite each other mid-assertion"
+        );
+
+        let pid = std::process::id().to_string();
+        let scratch = temp_dir();
+        for path in [&a, &b] {
+            let name = path
+                .file_name()
+                .expect("a scratch settings path with no file name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                name.contains(&pid),
+                "the scratch settings file {name:?} does not name this process, so a second \
+                 concurrent `cargo test` run writes the same file"
+            );
+            // Positive control for the two assertions above: the uniqueness is
+            // not coming from the label having been dropped.
+            assert!(
+                name.contains("collision-probe"),
+                "the scratch settings file {name:?} no longer carries its label, so every test \
+                 in this module is writing an anonymous file and the names above prove nothing"
+            );
+            assert!(
+                path.starts_with(&scratch),
+                "a scratch settings file escaped the system temp directory: {path:?}"
+            );
+        }
+
+        // ...and no test in this module resolves the REAL settings file. A
+        // source guard because the hazard is a call that would silently
+        // succeed on the developer's own machine and quietly rewrite their
+        // account list. `concat!`-split and single-line: a needle written as
+        // one literal would match its own declaration, and one carrying a
+        // newline passes on LF and fails on CRLF.
+        let source = include_str!("settings.rs");
+        let tests = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file")
+            .1;
+        let resolver = concat!("default_", "path()");
+        assert_eq!(
+            tests.matches(resolver).count(),
+            0,
+            "a test in this module resolves the real %APPDATA% settings file -- every test here \
+             must stay inside `temp_dir()`"
+        );
+        // Positive control for that absence: production really does spell it
+        // this way, so counting zero in the tests means something.
+        assert_eq!(
+            source.matches(concat!("pub fn default_", "path()")).count(),
+            1,
+            "the real settings-path resolver is no longer spelled that way -- the needle above \
+             has drifted and its absence proves nothing"
+        );
     }
 
     #[test]
