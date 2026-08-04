@@ -98,7 +98,7 @@ mod tests {
     use crate::app_match::{AppMatch, TriggerMode};
 
     fn entry(item_id: &str, process: &str, trigger: TriggerMode) -> (String, AppMatch) {
-        (item_id.to_string(), AppMatch { process: process.to_string(), trigger })
+        (item_id.to_string(), AppMatch::for_process(process, trigger))
     }
 
     #[test]

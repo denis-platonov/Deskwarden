@@ -1921,10 +1921,7 @@ mod row_tile_tests {
         item.fields.push(VaultField {
             name: Some(APP_MATCH_FIELD_NAME.to_string()),
             value: Some(
-                AppMatch {
-                    process: "ledgerline.exe".to_string(),
-                    trigger: TriggerMode::Prompt,
-                }
+                AppMatch::for_process("ledgerline.exe", TriggerMode::Prompt)
                 .to_field_value(),
             ),
             other: serde_json::Map::new(),

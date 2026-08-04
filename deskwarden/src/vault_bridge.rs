@@ -2258,10 +2258,7 @@ mod tests {
         }"#;
         let item: VaultItem = serde_json::from_str(json).unwrap();
 
-        let m = AppMatch {
-            process: "RockstarGamesLauncher.exe".into(),
-            trigger: TriggerMode::Prompt,
-        };
+        let m = AppMatch::for_process("RockstarGamesLauncher.exe", TriggerMode::Prompt);
         let updated = with_app_match(&item, &m);
 
         let value = serde_json::to_value(&updated).unwrap();
@@ -2343,10 +2340,7 @@ mod tests {
 
         let updated = with_app_match(
             &item,
-            &AppMatch {
-                process: "new.exe".into(),
-                trigger: TriggerMode::Prompt,
-            },
+            &AppMatch::for_process("new.exe", TriggerMode::Prompt),
         );
         let names: Vec<&str> = updated
             .fields
@@ -2374,10 +2368,7 @@ mod tests {
 
         let updated = with_app_match(
             &item,
-            &AppMatch {
-                process: "game.exe".into(),
-                trigger: TriggerMode::Prompt,
-            },
+            &AppMatch::for_process("game.exe", TriggerMode::Prompt),
         );
         let value = serde_json::to_value(&updated).unwrap();
         let fields = value["fields"].as_array().unwrap();
@@ -2412,10 +2403,7 @@ mod tests {
 
         let updated = with_app_match(
             &item,
-            &AppMatch {
-                process: "new.exe".into(),
-                trigger: TriggerMode::Prompt,
-            },
+            &AppMatch::for_process("new.exe", TriggerMode::Prompt),
         );
         let value = serde_json::to_value(&updated).unwrap();
         let fields = value["fields"].as_array().unwrap();
@@ -2433,10 +2421,7 @@ mod tests {
         let item = a_bare_item();
         let updated = with_app_match(
             &item,
-            &AppMatch {
-                process: "game.exe".into(),
-                trigger: TriggerMode::Prompt,
-            },
+            &AppMatch::for_process("game.exe", TriggerMode::Prompt),
         );
         let value = serde_json::to_value(&updated).unwrap();
         let fields = value["fields"].as_array().unwrap();
@@ -2709,10 +2694,7 @@ mod tests {
         // destructive round-trip.
         let item: VaultItem =
             serde_json::from_str(r#"{"id":"1","name":"Note","fields":[],"notes":"n"}"#).unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert!(value.get("login").is_none(), "got: {value}");
     }
@@ -2724,10 +2706,7 @@ mod tests {
                 "login":{"username":"u","password":"p","totp":"seed","uris":[{"uri":"x"}]}}"#,
         )
         .unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert_eq!(value["login"]["totp"], serde_json::json!("seed"));
         assert_eq!(value["login"]["uris"], serde_json::json!([{"uri":"x"}]));
@@ -2746,10 +2725,7 @@ mod tests {
                 "login":{"username":"u","uris":[{"uri":"https://x.com","match":2}]}}"#,
         )
         .unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert_eq!(
             value["login"]["uris"],
@@ -2766,10 +2742,7 @@ mod tests {
         let item: VaultItem =
             serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{"password":"p"}}"#)
                 .unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
 
         assert!(
@@ -2783,10 +2756,7 @@ mod tests {
     fn an_empty_login_object_stays_empty_through_a_round_trip() {
         let item: VaultItem =
             serde_json::from_str(r#"{"id":"1","name":"A","fields":[],"login":{}}"#).unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert_eq!(value["login"], serde_json::json!({}), "got: {value}");
     }
@@ -2799,10 +2769,7 @@ mod tests {
             r#"{"id":"1","name":"A","fields":[],"login":{"username":null,"password":"p"}}"#,
         )
         .unwrap();
-        let m = AppMatch {
-            process: "a.exe".into(),
-            trigger: TriggerMode::Auto,
-        };
+        let m = AppMatch::for_process("a.exe", TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert!(value["login"].get("username").is_none(), "got: {value}");
     }
@@ -2843,10 +2810,7 @@ mod tests {
             r#"{"id":"1","name":"A","type":3,"favorite":true,"folderId":"f9","fields":[]}"#,
         )
         .unwrap();
-        let m = crate::app_match::AppMatch {
-            process: "a.exe".into(),
-            trigger: crate::app_match::TriggerMode::Auto,
-        };
+        let m = crate::app_match::AppMatch::for_process("a.exe", crate::app_match::TriggerMode::Auto);
         let value = serde_json::to_value(with_app_match(&item, &m)).unwrap();
         assert_eq!(value["type"], serde_json::json!(3));
         assert_eq!(value["favorite"], serde_json::json!(true));

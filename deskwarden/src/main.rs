@@ -5524,10 +5524,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[(
             "old".to_string(),
-            deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
         let epoch = cache.epoch();
 
@@ -5653,10 +5650,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[(
             "old".to_string(),
-            deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
         let epoch = cache.epoch();
         let seen = std::cell::RefCell::new(Vec::new());
@@ -5696,10 +5690,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[(
             "old".to_string(),
-            deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
         let epoch = cache.epoch();
         let seen = std::cell::RefCell::new(Vec::new());
@@ -5751,10 +5742,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[(
             "old".to_string(),
-            deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
 
         let child = restart_backend_after_unlock(&mut engine, || {
@@ -5783,10 +5771,7 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[(
             "old".to_string(),
-            deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
         )]);
 
         let started = restart_backend_after_unlock(&mut engine, || {
@@ -9511,10 +9496,7 @@ mod tests {
         cache
             .set_app_match(
                 &item,
-                &deskwarden::app_match::AppMatch {
-                    process: "notepad.exe".into(),
-                    trigger: deskwarden::app_match::TriggerMode::Auto,
-                },
+                &deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             )
             .unwrap();
         let mut engine = MatchEngine::new();
@@ -9595,10 +9577,7 @@ mod tests {
         cache
             .set_app_match(
                 &item,
-                &deskwarden::app_match::AppMatch {
-                    process: "notepad.exe".into(),
-                    trigger: deskwarden::app_match::TriggerMode::Auto,
-                },
+                &deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             )
             .unwrap();
         let mut engine = MatchEngine::new();
@@ -9721,10 +9700,7 @@ mod tests {
             serde_json::from_str(r#"{"id":"7","name":"Seven","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
         let saved = deskwarden::picker_ui::SavedAppMatch {
-            app_match: deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            app_match: deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             write: deskwarden::vault_cache::AppMatchWrite::ServerOnly,
         };
         // A populated, same-era snapshot that holds another item but not
@@ -9765,10 +9741,7 @@ mod tests {
             serde_json::from_str(r#"{"id":"1","name":"One","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
         let saved = deskwarden::picker_ui::SavedAppMatch {
-            app_match: deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            app_match: deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             write: deskwarden::vault_cache::AppMatchWrite::WroteThrough,
         };
         // No server needed: a `clear` supersedes without any request, which is
@@ -9801,10 +9774,7 @@ mod tests {
             serde_json::from_str(r#"{"id":"7","name":"Seven","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
         let saved = deskwarden::picker_ui::SavedAppMatch {
-            app_match: deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            app_match: deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             write: deskwarden::vault_cache::AppMatchWrite::WroteThrough,
         };
         let snapshot = Ok(deskwarden::vault_cache::VaultSnapshot {
@@ -9829,10 +9799,7 @@ mod tests {
             serde_json::from_str(r#"{"id":"1","name":"One","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
         let saved = deskwarden::picker_ui::SavedAppMatch {
-            app_match: deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            app_match: deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             write: deskwarden::vault_cache::AppMatchWrite::ServerOnly,
         };
         let snapshot = Ok(deskwarden::vault_cache::VaultSnapshot {
@@ -9862,10 +9829,7 @@ mod tests {
             serde_json::from_str(r#"{"id":"7","name":"Seven","type":1,"fields":[]}"#)
                 .expect("the fixture must deserialize");
         let saved = deskwarden::picker_ui::SavedAppMatch {
-            app_match: deskwarden::app_match::AppMatch {
-                process: "notepad.exe".into(),
-                trigger: deskwarden::app_match::TriggerMode::Auto,
-            },
+            app_match: deskwarden::app_match::AppMatch::for_process("notepad.exe", deskwarden::app_match::TriggerMode::Auto),
             write: deskwarden::vault_cache::AppMatchWrite::ServerOnly,
         };
 

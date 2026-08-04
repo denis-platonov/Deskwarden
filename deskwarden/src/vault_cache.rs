@@ -2089,7 +2089,7 @@ mod tests {
     }
 
     fn an_app_match() -> AppMatch {
-        AppMatch { process: "notepad.exe".to_string(), trigger: TriggerMode::Prompt }
+        AppMatch::for_process("notepad.exe", TriggerMode::Prompt)
     }
 
     #[test]

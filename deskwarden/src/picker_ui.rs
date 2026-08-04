@@ -1380,10 +1380,7 @@ pub fn run_picker(
                         // and means a future change to the gate can't turn
                         // this into a panic.
                         if let Some(w) = selected_window(&windows, selected_hwnd) {
-                            let m = AppMatch {
-                                process: w.exe_name.clone(),
-                                trigger,
-                            };
+                            let m = AppMatch::for_process(w.exe_name.clone(), trigger);
                             match cache.set_app_match(&target_item, &m) {
                                 Ok(written) => {
                                     // Matched exhaustively rather than

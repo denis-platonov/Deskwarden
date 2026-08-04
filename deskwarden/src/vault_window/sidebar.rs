@@ -1531,11 +1531,11 @@ mod tests {
 
         let matched = with_app_match(
             &item(Some(1), false, None),
-            &AppMatch { process: "Ledgerline.exe".into(), trigger: TriggerMode::Prompt },
+            &AppMatch::for_process("Ledgerline.exe", TriggerMode::Prompt),
         );
         let also_matched = with_app_match(
             &item(Some(3), false, None),
-            &AppMatch { process: "Vantage.exe".into(), trigger: TriggerMode::Auto },
+            &AppMatch::for_process("Vantage.exe", TriggerMode::Auto),
         );
         let plain = item(Some(1), false, None);
 
@@ -1579,10 +1579,7 @@ mod tests {
         // matches nothing at all.
         let readable = crate::vault_bridge::with_app_match(
             &broken,
-            &crate::app_match::AppMatch {
-                process: "Ledgerline.exe".into(),
-                trigger: crate::app_match::TriggerMode::Prompt,
-            },
+            &crate::app_match::AppMatch::for_process("Ledgerline.exe", crate::app_match::TriggerMode::Prompt),
         );
         assert!(SidebarFilter::Apps.scope_contains(&readable));
     }
