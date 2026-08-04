@@ -10529,6 +10529,112 @@ mod tests {
             }
         }
 
+        /// **The vault window has two doors, and the sweep has two halves.**
+        /// The sibling tests above walk the sweep's CALL SITES and read which
+        /// `&tray.*_id` each was handed -- both of them only ever see the
+        /// menu-event half. Neither looks inside
+        /// `drop_vault_requests_queued_behind_the_window`, so deleting the one
+        /// line in its body that drains the tray-icon channel left the entire
+        /// suite green: the menu half kept being swept, every assertion kept
+        /// passing, and the bug the report was actually made through came
+        /// straight back. Three left clicks on the icon while the vault loaded
+        /// became three windows.
+        ///
+        /// Held by reading the source, for the reason `foreground`'s raise
+        /// guard is: `tray::discard_queued_icon_events` reads the global
+        /// `tray-icon` channel, whose sender is `pub(crate)` to that crate, so
+        /// nothing here can put an event into it and no test can call this
+        /// function and observe anything at all.
+        ///
+        /// **Not touched, deliberately:** all three call sites drain after
+        /// `rebuild_after_vault_window` rather than the instant the window
+        /// returns. Nothing can arrive in that gap -- the rebuild is
+        /// synchronous `muda` menu calls with no message pump, and both
+        /// channels are fed from the window-message pump on this same thread --
+        /// so the ordering is a reading nit rather than a race.
+        #[test]
+        fn the_vault_sweep_drains_the_tray_icon_channel_and_not_only_the_menu_one() {
+            let production = production_half_of_this_file();
+            // `concat!`-split and single-line, this file's usual two reasons.
+            // No needle here carries a `\n`: one that did would pass on LF and
+            // fail on CRLF, which has burned this repo.
+            let decl = concat!("fn drop_vault_requests_queued_behind", "_the_window(");
+            let icon_sweep = concat!("tray::discard_queued", "_icon_events(");
+            let menu_sweep = concat!("drain_requests_queued_behind", "_a_window(");
+
+            assert_eq!(
+                production.matches(decl).count(),
+                1,
+                "control: the sweep helper is declared exactly once here, so the body sliced \
+                 below is unambiguous"
+            );
+            // `<= 1`, not `== 1`. An equality here is what a deleted drain
+            // trips FIRST, and it would fail with a message about needles
+            // rather than about the bug -- the assertion at the bottom of this
+            // test is the one that should report a missing drain, and it
+            // cannot if this fires ahead of it. A SECOND spelling still fails,
+            // which is what this control is actually for: the slice below
+            // would then be reasoning about a call other than the one this
+            // test is named for.
+            assert!(
+                production.matches(icon_sweep).count() <= 1,
+                "control: the tray-icon drain is spelled more than once in the production half, \
+                 so `{icon_sweep}` no longer names one call and the slice below is about the \
+                 wrong one"
+            );
+
+            // The body, by brace matching from the declaration's own `{`. A
+            // byte count is the shape that already overran an arm in this file
+            // once, and "up to the next `fn`" depends on the order these
+            // helpers happen to sit in. Braces are neither: this body holds no
+            // string or comment carrying one, and the two controls below refuse
+            // a slice that got the wrong region anyway.
+            let at = production.find(decl).expect("checked above");
+            let open = at + production[at..].find('{').expect("the helper has a body");
+            let mut depth = 0usize;
+            let mut close = None;
+            for (offset, ch) in production[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &production[open..close.expect("the helper's body is closed")];
+
+            // Controls on the slice itself, in both directions: it reached the
+            // whole body (the menu half of the sweep is in there), and it did
+            // not run past the end into whatever follows (no second `fn`).
+            assert!(
+                body.contains(menu_sweep),
+                "control: the sliced body is not this helper's -- it does not even call the \
+                 menu-event sweep. It reads: {body:?}"
+            );
+            assert!(
+                !body.contains("fn "),
+                "control: the slice overran this helper's body into the next function, so the \
+                 assertion below could be satisfied by code that is not the sweep. It reads: \
+                 {body:?}"
+            );
+
+            assert!(
+                body.contains(icon_sweep),
+                "`drop_vault_requests_queued_behind_the_window` no longer drains the tray-icon \
+                 channel, only the menu-event one. The vault window has TWO doors and the tray \
+                 icon is the one the report came through: every left click on the icon while \
+                 the window was up is still queued, and `main`'s loop replays them the moment \
+                 it closes -- three clicks while the vault loads, three windows. The call sites \
+                 are no help here; they hand this function a `MenuId` and cannot see inside it. \
+                 The body reads: {body:?}"
+            );
+        }
+
         /// The queue is not a write-only sink: `main`'s loop has to actually
         /// pop from it, and pop from it BEFORE the live channel, or a survivor
         /// sits behind everything that has arrived since and is handled out of

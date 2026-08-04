@@ -535,47 +535,92 @@ mod tests {
 
     // ---- the wiring at each window site ------------------------------------
 
+    /// **Every module that opens a window and raises it**, with the source it
+    /// lives in, the title identifier it opens under, and how many windows.
+    ///
+    /// A `const` rather than a local of
+    /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front`, because
+    /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`
+    /// reconciles `OPENS_WINDOWS` against *this exact list*. It used to hold a
+    /// second, hand-written copy of the same knowledge, and two lists that
+    /// agree by hand is not a guard: deleting `loading_ui`'s row from here and
+    /// its `raise_window` call from `loading_ui.rs` left the whole suite green,
+    /// because the classification test still found `loading_ui` in
+    /// `OPENS_WINDOWS` and asked nothing further.
+    ///
+    /// First field is the MODULE name, not the file name, so it can be
+    /// compared with the module list parsed out of `lib.rs` without a second
+    /// mapping in between (`vault_window` is the only one where those differ,
+    /// and it is exactly the row a hand-written mapping would get wrong).
+    const RAISING_SITES: [(&str, &str, &str, usize); 6] = [
+        ("vault_window", include_str!("vault_window/mod.rs"), "WINDOW_TITLE", 1),
+        // The single startup window: sign-in, spinner and vault in one
+        // event loop. It is the ONLY window on the launch that signs in,
+        // so a raise it does not ask for is a launch that lands behind
+        // whatever the user was doing -- with no second window afterwards
+        // to correct it, which is what the three-window flow accidentally
+        // provided.
+        ("app_window", include_str!("app_window.rs"), "WINDOW_TITLE", 1),
+        // Added when the login window got its raise. It was excluded
+        // while another agent owned that file, and an excluded site is
+        // an unguarded one: the raise was applied there and nothing in
+        // this test would have noticed it being deleted again.
+        ("login_ui", include_str!("login_ui.rs"), "WINDOW_TITLE", 1),
+        ("prefs_ui", include_str!("prefs_ui.rs"), "WINDOW_TITLE", 1),
+        ("loading_ui", include_str!("loading_ui.rs"), "WINDOW_TITLE", 1),
+        // Two windows, two titles; the second is checked just below the
+        // loop rather than in it.
+        ("picker_ui", include_str!("picker_ui.rs"), "PICK_ITEM_TITLE", 1),
+    ];
+
+    /// **Opens a window, and deliberately does not raise it -- because.**
+    ///
+    /// The third category, and the one whose absence made the docstring on
+    /// `OPENS_WINDOWS` false as written: `overlay_ui` opens a window, has never
+    /// had a row in [`RAISING_SITES`], and nothing anywhere recorded that this
+    /// was a decision rather than the same omission that let `app_window` in
+    /// unguarded. "Not in the raise list" and "must not be in the raise list"
+    /// are different claims and now live in different places.
+    ///
+    /// The reason is carried in the source because it is the whole content of
+    /// the exemption; the test below refuses a blank one, and refuses a module
+    /// listed here that turns out to raise after all.
+    const OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE: [(&str, &str, &str); 1] = [(
+        "overlay_ui",
+        include_str!("overlay_ui.rs"),
+        "The autofill prompt is `with_always_on_top()`, so the OS already keeps it above \
+         everything and a raise would buy nothing. It is also the one window of ours that \
+         opens while ANOTHER app is foreground -- anchored beside the field the user is in, \
+         whose `hwnd` the fill is injected back into once the card is clicked -- so taking \
+         the foreground is the opposite of what this window wants. And it opens through \
+         `eframe::run_native(\"Deskwarden\", ..)`, the same title `app_window` and \
+         `vault_window` use; `raise_window` matches this process's own windows BY TITLE, so \
+         a raise here could just as easily bring one of those forward instead.",
+    )];
+
     /// Every window this crate opens must actually ask to be raised, and must
     /// ask for the SAME title it opened under. Neither can be asserted by
     /// running anything: `eframe::run_ui_native` blocks on a real OS event
     /// loop and opens a real window, so no test in this crate calls any of
-    /// these four functions -- deleting a `raise_window` call leaves the whole
-    /// suite green, and the user gets the window-behind-everything they
-    /// reported back. So it is held by source position instead.
+    /// these window functions -- deleting a `raise_window` call leaves the
+    /// whole suite green, and the user gets the window-behind-everything they
+    /// reported back. So it is held by source position instead. ("these four"
+    /// is what this said while there were four; a count in prose goes stale
+    /// silently, and every count in this test is now read off
+    /// [`RAISING_SITES`].)
     ///
     /// What it can see: the call is present, once per window. What it cannot:
     /// that it runs on the frame the window first exists on rather than
     /// somewhere unreachable. That much is visible in any diff touching these
     /// lines, and is what the comment at each call site is for.
     ///
-    /// `login_ui.rs` is deliberately absent -- its raise is a follow-up and
-    /// asserting a count of zero there would have to be deleted the moment it
-    /// lands.
+    /// The list itself is [`RAISING_SITES`], and a module missing from it is
+    /// not merely unchecked here -- it fails
+    /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
+    /// which is what makes delisting alone insufficient to escape this test.
     #[test]
     fn every_window_this_crate_opens_asks_to_be_brought_to_the_front() {
-        // (name, source, the title identifier it opens under, how many windows)
-        let sites: [(&str, &str, &str, usize); 6] = [
-            ("vault_window/mod.rs", include_str!("vault_window/mod.rs"), "WINDOW_TITLE", 1),
-            // The single startup window: sign-in, spinner and vault in one
-            // event loop. It is the ONLY window on the launch that signs in,
-            // so a raise it does not ask for is a launch that lands behind
-            // whatever the user was doing -- with no second window afterwards
-            // to correct it, which is what the three-window flow accidentally
-            // provided.
-            ("app_window.rs", include_str!("app_window.rs"), "WINDOW_TITLE", 1),
-            // Added when the login window got its raise. It was excluded
-            // while another agent owned that file, and an excluded site is
-            // an unguarded one: the raise was applied there and nothing in
-            // this test would have noticed it being deleted again.
-            ("login_ui.rs", include_str!("login_ui.rs"), "WINDOW_TITLE", 1),
-            ("prefs_ui.rs", include_str!("prefs_ui.rs"), "WINDOW_TITLE", 1),
-            ("loading_ui.rs", include_str!("loading_ui.rs"), "WINDOW_TITLE", 1),
-            // Two windows, two titles; the second is checked just below the
-            // loop rather than in it.
-            ("picker_ui.rs", include_str!("picker_ui.rs"), "PICK_ITEM_TITLE", 1),
-        ];
-
-        for (name, source, title, opens) in sites {
+        for (name, source, title, opens) in RAISING_SITES {
             assert_eq!(
                 source.matches(&format!("run_ui_native({title},")).count(),
                 opens,
@@ -614,10 +659,27 @@ mod tests {
     /// deciding is the failure. The module list is read out of `lib.rs` rather
     /// than written out again, because a second hand-written list would have
     /// the same hole one level up.
+    ///
+    /// **And being classified as opening a window is not enough on its own.**
+    /// Until this test reconciled the two, `OPENS_WINDOWS` and the raise list
+    /// were independent hand-written lists that merely happened to agree, so a
+    /// module could be dropped from the raise table and lose its raise with
+    /// every assertion still passing -- `loading_ui` was demonstrably deletable
+    /// that way. It also let `overlay_ui` sit in `OPENS_WINDOWS` with no row in
+    /// the raise table at all and nothing recording why. Both are closed below,
+    /// by requiring `OPENS_WINDOWS` to be exactly `RAISING_SITES` plus
+    /// `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`, with nothing in two
+    /// lists and nothing in none.
     #[test]
     fn every_module_in_this_crate_is_classified_as_opening_windows_or_not() {
-        /// The modules `every_window_this_crate_opens_asks_to_be_brought_to_
-        /// the_front` covers.
+        /// The modules that put a window on screen. Each must then appear in
+        /// exactly one of [`RAISING_SITES`] (it raises, and
+        /// `every_window_this_crate_opens_asks_to_be_brought_to_the_front`
+        /// holds that) or
+        /// [`OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE`] (it does not, and
+        /// carries the reason). This list used to claim to be "the modules that
+        /// test covers", which was false: `overlay_ui` was in it and covered by
+        /// nothing.
         const OPENS_WINDOWS: [&str; 7] = [
             "app_window",
             "loading_ui",
@@ -692,6 +754,77 @@ mod tests {
                 "`{module}` is in neither list (or in both). Every module in this crate has                  to be classified: if it opens a window, add it to the `sites` table in                  `every_window_this_crate_opens_asks_to_be_brought_to_the_front` AND to                  `OPENS_WINDOWS` here, so its raise is guarded. If it does not, say so in                  `OPENS_NO_WINDOW`. A module in neither is a window nothing checks -- which                  is how `app_window` was added, unguarded, and the whole reason this test                  exists."
             );
         }
+
+        // ---- and the raise lists reconcile with OPENS_WINDOWS --------------
+        let raises: Vec<&str> = RAISING_SITES.iter().map(|(module, ..)| *module).collect();
+        let excused: Vec<&str> = OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE
+            .iter()
+            .map(|(module, ..)| *module)
+            .collect();
+
+        // Positive controls on the two projections, so every check below is
+        // reading real names rather than iterating an empty vector.
+        assert_eq!(raises.len(), RAISING_SITES.len(), "control: a name per raising site");
+        assert!(
+            raises.contains(&"vault_window"),
+            "control: the raise table is being read, and by module name rather than file name \
+             -- `vault_window` lives in `vault_window/mod.rs` and is the one row where those \
+             differ: {raises:?}"
+        );
+        assert!(!excused.is_empty(), "control: the exemption list is being read");
+
+        for module in OPENS_WINDOWS {
+            assert!(
+                raises.contains(&module) != excused.contains(&module),
+                "`{module}` opens a window but is in neither `RAISING_SITES` nor \
+                 `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE` (or is in both). Saying a \
+                 module opens a window is only half the decision; the other half is whether it \
+                 brings that window to the front. If it should raise, add its row to \
+                 `RAISING_SITES` so \
+                 `every_window_this_crate_opens_asks_to_be_brought_to_the_front` holds the call \
+                 -- delisting it from there is otherwise enough to delete the raise with the \
+                 whole suite green, which is exactly what `loading_ui` was shown to do. If it \
+                 should not, say so in the exemption list AND say why."
+            );
+        }
+        for module in raises.iter().chain(excused.iter()) {
+            assert!(
+                OPENS_WINDOWS.contains(module),
+                "`{module}` is listed as opening a window by the raise tables but is missing \
+                 from `OPENS_WINDOWS`, so the two disagree about what this crate even puts on \
+                 screen"
+            );
+        }
+
+        // The exemption has to be falsifiable, or it is just a place to put
+        // modules to make this test stop asking. A blank reason is not a
+        // decision, and a module that DOES raise is in the wrong list -- which
+        // is the failure mode of an excuse nobody rereads.
+        for (module, source, reason) in OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE {
+            assert!(
+                reason.len() > 40,
+                "`{module}` is excused from raising with no reason worth the name: {reason:?}"
+            );
+            assert_eq!(
+                source.matches("raise_window(").count(),
+                0,
+                "`{module}` is listed as deliberately not raising, but its source calls \
+                 `raise_window(`. Move it to `RAISING_SITES` -- with the title identifier it \
+                 opens under -- so the call is actually guarded. The stale excuse reads: \
+                 {reason:?}"
+            );
+        }
+        // Positive control for that last needle: it can find a raise where one
+        // really is, so a count of 0 above is an absence and not a typo.
+        assert_eq!(
+            RAISING_SITES
+                .iter()
+                .filter(|(_, source, ..)| source.contains("raise_window("))
+                .count(),
+            RAISING_SITES.len(),
+            "control: every raising site's source really does contain the needle this counted \
+             to zero in the exempt ones"
+        );
     }
 
     // ---- the real desktop, weakly ------------------------------------------
