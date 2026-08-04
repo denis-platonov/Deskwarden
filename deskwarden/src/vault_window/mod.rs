@@ -226,11 +226,28 @@ struct FaviconResult {
     pixels: Option<(usize, usize, Vec<u8>)>,
 }
 
-/// Opens the vault window and blocks until it's closed (the X/window-close
-/// path) or locked (the `Lock` button or the auto-lock timer). Mirrors
-/// `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
+/// Builds the vault window's per-frame closure, its viewport options, and the
+/// handles its outcome is read back through -- WITHOUT opening a window.
+///
+/// The split exists because this UI now has two hosts. [`run`] is the one it
+/// has always had: its own `eframe::run_ui_native`, which is what a tray
+/// click still opens. The other is `app_window`, the single window that
+/// carries sign-in, the spinner and then this vault inside ONE event loop, so
+/// that signing in no longer closes one window and opens two more. eframe
+/// cannot nest event loops, so the second host cannot call `run`; it needs
+/// the closure without the loop around it, which is exactly what this returns.
+///
+/// `pre_styled` is the one behavioural knob. The closure's first frame
+/// normally installs the fonts, rounds the window's corners and raises it --
+/// work that belongs to whoever OWNS the window. `run` owns its window and
+/// passes `false`; `app_window` did all three on its own first frame, long
+/// before this vault frame existed, and passes `true` so the vault does not
+/// re-raise a window the user may have deliberately sent behind something.
+///
+/// Mirrors `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
 /// update closure is `FnMut + 'static` and can't return anything directly.
-pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+#[allow(clippy::too_many_arguments)]
+pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
     injector: &Injector<A, B>,
@@ -279,7 +296,8 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // `StartupAccounts::NoAccountList`, where this app has no `Account` at all
     // -- and the titlebar then carries no switcher.
     accounts: Option<crate::accounts::AccountsState>,
-) -> VaultWindowResult {
+    pre_styled: bool,
+) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
     // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
     // to a real winit event loop, not run on a borrowed stack), but `injector`
     // arrives here as a plain `&Injector<A, B>` borrowed from the caller's
@@ -608,7 +626,10 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // the caller's job.
     let mut generate_error: Option<String> = None;
 
-    let mut styled = false;
+    // `pre_styled` when someone else already owns this window's first frame
+    // -- see this function's doc. `false` is `run`'s own value and the
+    // behaviour this window has always had.
+    let mut styled = pre_styled;
     // Where this window was when it was last closed, re-homed onto the
     // monitors that exist right now. Read here, on the main thread, before
     // the window exists -- `Settings::load` is a small file read and every
@@ -664,7 +685,7 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // here, and it is reported once rather than every frame.
     let eframe_handoff = std::time::Instant::now();
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
+    let vault_frame_fn = move |ui: &mut egui::Ui, _frame: &mut eframe::Frame| {
         if !styled {
             log::info!("vault window: first frame {:?} after eframe was asked", eframe_handoff.elapsed());
             theme::paint_window_background(ui);
@@ -2494,33 +2515,110 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
         // only in the `Vault` state, because two branches of the body match
         // return before it -- see the hoisted call at the TOP of the closure,
         // next to `draw_resize_handles`, and review 31's Important 1.
-    });
+    };
 
-    // One write, here, after the window is gone -- not per frame, which
-    // during a resize drag would be a file write per repaint. A failure is
-    // logged and otherwise ignored: losing the remembered size is a smaller
-    // problem than anything worth failing a lock/close over, and
-    // `Settings::load` treats whatever is (or is not) on disk as advisory
-    // anyway. Read-modify-write, so a preference changed in the preferences
-    // window while this one was open is not reverted -- see
-    // `persist_vault_window_geometry`.
-    if let (Some(path), Some(geometry)) = (settings_path.as_deref(), *last_geometry.borrow()) {
-        if let Err(e) = crate::settings::Settings::persist_vault_window_geometry(path, geometry) {
-            log::warn!("could not save the vault window's geometry: {e}");
+    (
+        options,
+        Box::new(vault_frame_fn),
+        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, last_geometry, settings_path },
+    )
+}
+
+/// The vault UI's per-frame closure, boxed so it can be stored in a struct
+/// and handed to either host.
+pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
+
+/// The cells [`build_frame`]'s closure reports its outcome through, and the
+/// one file write that outcome implies.
+///
+/// A struct rather than four loose `Rc`s so that BOTH hosts end a vault
+/// session the same way: by calling [`VaultFrameHandles::finish`]. The
+/// geometry write in particular used to sit inline in `run` after the event
+/// loop returned, where a second host would simply not have had it -- a vault
+/// session that forgot the window's size, silently, on exactly the path this
+/// split was made for.
+pub struct VaultFrameHandles {
+    locked: Rc<RefCell<bool>>,
+    needs_reauth: Rc<RefCell<bool>>,
+    open_preferences: Rc<RefCell<bool>>,
+    switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>>,
+    last_geometry: Rc<RefCell<Option<crate::settings::WindowGeometry>>>,
+    settings_path: Option<std::path::PathBuf>,
+}
+
+impl VaultFrameHandles {
+    /// Ends a vault session: persists the geometry and reads the four
+    /// outcome cells. Call once, after the frame closure has stopped running.
+    pub fn finish(&self) -> VaultWindowResult {
+        // One write, here, after the window is gone -- not per frame, which
+        // during a resize drag would be a file write per repaint. A failure is
+        // logged and otherwise ignored: losing the remembered size is a smaller
+        // problem than anything worth failing a lock/close over, and
+        // `Settings::load` treats whatever is (or is not) on disk as advisory
+        // anyway. Read-modify-write, so a preference changed in the preferences
+        // window while this one was open is not reverted -- see
+        // `persist_vault_window_geometry`.
+        if let (Some(path), Some(geometry)) =
+            (self.settings_path.as_deref(), *self.last_geometry.borrow())
+        {
+            if let Err(e) = crate::settings::Settings::persist_vault_window_geometry(path, geometry)
+            {
+                log::warn!("could not save the vault window's geometry: {e}");
+            }
         }
-    }
 
-    let locked = *locked.borrow();
-    let needs_reauth = *needs_reauth.borrow();
-    // Read out of its own cell and reported as its own field. The geometry
-    // write just above has already happened by this point, which is what
-    // makes the caller's `persist_preferences` safe to run next: this
-    // window's `settings.json` write is done, so the preferences save cannot
-    // race it, and `persist_preferences` is a read-modify-write of the two
-    // preference fields only, so it cannot clobber the geometry either.
-    let open_preferences = *open_preferences.borrow();
-    let switch_to = switch_to.borrow_mut().take();
-    VaultWindowResult { locked, needs_reauth, open_preferences, switch_to }
+        let locked = *self.locked.borrow();
+        let needs_reauth = *self.needs_reauth.borrow();
+        // Read out of its own cell and reported as its own field. The geometry
+        // write just above has already happened by this point, which is what
+        // makes the caller's `persist_preferences` safe to run next: this
+        // window's `settings.json` write is done, so the preferences save cannot
+        // race it, and `persist_preferences` is a read-modify-write of the two
+        // preference fields only, so it cannot clobber the geometry either.
+        let open_preferences = *self.open_preferences.borrow();
+        let switch_to = self.switch_to.borrow_mut().take();
+        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to }
+    }
+}
+
+/// Opens the vault window in its OWN event loop and blocks until it's closed
+/// (the X/window-close path) or locked (the `Lock` button or the auto-lock
+/// timer).
+///
+/// This is the tray-click host. The startup host is `app_window`, which calls
+/// [`build_frame`] directly -- see that function's doc.
+#[allow(clippy::too_many_arguments)]
+pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+    cache: std::sync::Arc<VaultCache>,
+    fill_stats: FillStats,
+    injector: &Injector<A, B>,
+    server_url: Option<String>,
+    account_email: Option<String>,
+    session_token: String,
+    icon_cache_dir: std::path::PathBuf,
+    auto_lock: AutoLock,
+    backend_already_running: bool,
+    accounts: Option<crate::accounts::AccountsState>,
+) -> VaultWindowResult {
+    let (options, mut frame_fn, handles) = build_frame(
+        cache,
+        fill_stats,
+        injector,
+        server_url,
+        account_email,
+        session_token,
+        icon_cache_dir,
+        auto_lock,
+        backend_already_running,
+        accounts,
+        // This host owns its window, so its first frame is the one that
+        // installs the fonts, rounds the corners and raises it.
+        false,
+    );
+
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
+
+    handles.finish()
 }
 
 /// If `e` is `VaultError::Unauthorized`, flags the window to close and
@@ -4995,10 +5093,15 @@ mod reveal_state_placement_tests {
     // that, not this comment: re-joining any needle makes it appear one extra
     // time, in its own const, and fails that needle's count.
     const DECLARATION: &str = concat!("let mut reveal = detail::", "RevealState::default();");
-    // Deliberately stops before the closure's parameter list: a rename of
-    // `_frame` (that parameter will be used eventually) is an unrelated
-    // refactor and must not be able to invalidate this needle.
-    const FRAME_CLOSURE: &str = concat!("run_ui_native(", "WINDOW_TITLE, options,");
+    // The head of the PER-FRAME CLOSURE ITSELF, not the `run_ui_native` call
+    // that used to wrap it. Those were the same position until `build_frame`
+    // split the closure out from the event loop; they are not any more, and
+    // `run_ui_native` is now BELOW every line of the closure, so a needle
+    // aimed at it would put "before the closure" past the end of the closure
+    // and this guard would pass against a `RevealState` declared anywhere at
+    // all inside it. Aimed at the closure's own head, "before the closure"
+    // still means what it says.
+    const FRAME_CLOSURE: &str = concat!("let vault_frame_fn = ", "move |ui: &mut egui::Ui");
     const RESET_GUARD: &str = concat!("if selected_id != ", "last_selected_id {");
     // The bare assignment, which is also the tail of `DECLARATION` -- hence the
     // "exactly two occurrences" shape in the reset test below.
@@ -10271,7 +10374,7 @@ mod switcher_wiring_tests {
     #[test]
     fn the_recorded_pick_is_read_back_out_into_the_result() {
         let production = production();
-        let read_back = concat!("let switch_to = switch_to.borrow_mut()", ".take();");
+        let read_back = concat!("let switch_to = self.switch_to.borrow_mut()", ".take();");
         let result = concat!("VaultWindowResult { locked, needs_reauth,", " open_preferences,");
 
         assert!(
@@ -10330,5 +10433,119 @@ mod switcher_wiring_tests {
             }
         }
         panic!("the switcher's click block is never closed");
+    }
+}
+
+/// The seam [`build_frame`] opened, held from the source.
+///
+/// None of this can be observed by running anything: [`run`] blocks on a real
+/// winit event loop and opens a real OS window, so no test in this crate calls
+/// it. What the split newly makes *possible to get wrong* is the tray-click
+/// host quietly losing a step that used to be inline -- the geometry write and
+/// the outcome read both moved into [`VaultFrameHandles::finish`], and a `run`
+/// that dropped the handles and returned a fresh `VaultWindowResult` compiles,
+/// passes every other test in this file, and ships a vault window that forgets
+/// its size and can never lock, switch account or open Preferences again.
+#[cfg(test)]
+mod frame_host_tests {
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// Everything before the first `#[cfg(test)]`. Split with `concat!` so the
+    /// marker exists in the binary but appears in this file only where the
+    /// real attributes are -- otherwise this needle would find ITSELF, at a
+    /// position above all the production code, and every slice below would be
+    /// empty (and every `!contains` assertion vacuously true).
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file");
+        &source[..end]
+    }
+
+    /// `run`'s body: from its signature to the end of production code.
+    fn run_body() -> &'static str {
+        let production = production();
+        let at = production
+            .find(concat!("pub fn run<A: UiAutomationFiller", " + Clone + 'static,"))
+            .expect(
+                "no `pub fn run` in this file -- the tray-click host was renamed or deleted; \
+                 if renamed, update this needle",
+            );
+        &production[at..]
+    }
+
+    #[test]
+    fn the_tray_click_host_runs_the_shared_frame_rather_than_a_second_copy_of_it() {
+        let body = run_body();
+        assert!(
+            body.contains(concat!("build_", "frame(")),
+            "`run` no longer calls `build_frame`, so the vault UI the tray opens is not the \
+             one the single-window host draws: {body:?}"
+        );
+        // The whole point of the split: the closure body lives in ONE place.
+        // A second `move |ui: &mut egui::Ui` inside `run` would be a copy of
+        // it, which is the shape this refactor exists to prevent.
+        assert_eq!(
+            production().matches(concat!("move |ui: ", "&mut egui::Ui")).count(),
+            1,
+            "there is more than one vault frame closure in this file; `build_frame`'s is \
+             meant to be the only one"
+        );
+    }
+
+    #[test]
+    fn the_tray_click_host_still_ends_its_session_through_finish() {
+        let body = run_body();
+        assert!(
+            body.contains(concat!("handles.", "finish()")),
+            "`run` never calls `finish`, so closing the vault window neither saves its \
+             geometry nor reports a lock, a re-auth, a Preferences request or an account \
+             switch -- all four outcomes die with the window: {body:?}"
+        );
+        // Positive control on the slice: `run_body` really isolated `run` and
+        // did not hand back something that trivially contains anything.
+        assert!(
+            !body.contains(concat!("let mut styled = ", "pre_styled;")),
+            "control: `run_body` reaches back into `build_frame`, so the assertions above \
+             may be satisfied by `build_frame`'s own text rather than `run`'s"
+        );
+    }
+
+    #[test]
+    fn the_shared_frame_is_built_without_opening_a_window() {
+        let production = production();
+        let build_at = production
+            .find(concat!("pub fn build_", "frame<A: UiAutomationFiller"))
+            .expect("no `build_frame` in this file");
+        let run_at = production
+            .find(concat!("pub fn run<A: UiAutomationFiller", " + Clone + 'static,"))
+            .expect("no `run` in this file");
+        assert!(
+            build_at < run_at,
+            "control: `build_frame` is expected above `run`, and the slice below assumes it"
+        );
+        let build_body = &production[build_at..run_at];
+        // The CALL, not the words: this file's prose says "run_ui_native" in
+        // several doc comments, and a needle that matched those would fail
+        // here for the wrong reason and, worse, would pass the count below
+        // only by accident of how much prose happened to be written.
+        const CALL: &str = concat!("eframe::run_ui_", "native(");
+        assert!(
+            !build_body.contains(CALL),
+            "`build_frame` opens its own event loop, so the single-window host calling it \
+             would nest one native event loop inside another -- which eframe cannot do. \
+             The loop belongs to the host, not to the frame."
+        );
+        // Positive control: `run_ui_native` really is findable in this file,
+        // so the negative above is about where it is and not about a needle
+        // that never matches anything.
+        assert_eq!(
+            production.matches(CALL).count(),
+            1,
+            "expected exactly one event loop in this file, in `run`"
+        );
     }
 }
