@@ -4464,6 +4464,18 @@ enum HandoffDeposit {
     /// worker. Nobody will ever look in the slot again, so the child was
     /// stopped here instead of being left listening on `BW_SERVE_PORT` with
     /// no handle anywhere in the process.
+    ///
+    /// **A belt, not the mechanism.** Reaching this needs the worker still
+    /// inside `try_start_backend` when `WORKING_DEADLINE` fires, and that
+    /// call is bounded by `PORT_RELEASE_GRACE` plus a spawn -- seconds, not
+    /// the minutes the deadline allows -- so in production the deposit has
+    /// essentially always landed before the claim. What actually stops the
+    /// orphan is the ordering: the deposit is `produce`'s first act and the
+    /// claim happens before `match outcome.prepared` splits, so the deadline
+    /// arm inherits a real handle. This arm is what keeps the invariant
+    /// ("there is no window in which a spawned `bw serve` is owned by
+    /// nobody") total rather than merely likely, and it is exercised
+    /// directly by tests because the schedule will not produce it.
     StoppedAfterClaim,
     /// A second child arrived while one was still parked. Not reachable from
     /// the one production depositor (`StartupWork::produce` deposits at most
@@ -5983,6 +5995,98 @@ mod tests {
             !region[claim..].contains(concat!("bw_serve_child = ", "None")),
             "nothing after the claim may put `bw_serve_child` back to `None`; recovery would \
              then stop nothing and collide with the very backend just adopted"
+        );
+    }
+
+    /// **The claim's VALUE, not merely its position.** The guard above proves
+    /// only where `startup_child.claim()` sits relative to the split and to
+    /// recovery. Substituting the *argument* -- `&mut None` in place of
+    /// `&mut bw_serve_child` at either recovery call site -- reinstates the
+    /// original defect verbatim and violates nothing it checks: the claim
+    /// still happens first, the assignment still happens, `bw_serve_child` is
+    /// still `Some(child)`, and `&mut None` contains no `bw_serve_child =
+    /// None` spelling. Recovery's `stop_bw_serve` then stops nothing,
+    /// `reauthenticate` runs, `try_start_backend` meets the live orphan on
+    /// `BW_SERVE_PORT`, and the process dies fatally leaving it behind to
+    /// block every later launch. Both arms are equally exposed, so both are
+    /// checked here.
+    ///
+    /// **Why a needle and not a type.** The sibling fix in `app_window.rs`
+    /// closed an identical class by making the bad state unwritable, and that
+    /// worked because `Closing(true)` is never a legitimate value. Here it is
+    /// the opposite: `None` is a *correct* value for this slot on the
+    /// deadline path -- the worker may have been killed before it ever
+    /// reached `try_start_backend` and deposited anything -- so no newtype can
+    /// make the empty case unrepresentable, and no constructor can be
+    /// restricted to "only the claim may produce this" when three further
+    /// call sites in the cached-session arm legitimately pass a slot that
+    /// `start_backend` filled instead. `&mut Option<Child>` is also the shape
+    /// a dozen other functions in this file already take. What remains
+    /// checkable is the one thing that actually matters: that the argument at
+    /// these call sites is the binding the claim wrote into, spelled out.
+    #[test]
+    fn startup_recovery_is_handed_the_claimed_child_on_both_arms() {
+        let region = the_single_window_startup_region();
+        let call = concat!("recover_from_failed_vault", "_wait(");
+        let claimed = concat!("&mut bw_serve_", "child,");
+        // The last argument every call site passes, and the only bound in
+        // this argument list that cannot drift: it is one token on one line,
+        // and no reason string or earlier argument contains it.
+        let last_arg = concat!("log", "in,");
+
+        assert_eq!(
+            region.matches(call).count(),
+            2,
+            "control: the single-window region must still hold exactly the two recoveries this \
+             guard was written for -- the `Some` arm's failed `work.items` and the deadline arm"
+        );
+        assert_eq!(
+            region.matches(claimed).count(),
+            2,
+            "the claimed child must be handed to both recoveries; a count of one means one arm \
+             was switched to something else and stops nothing"
+        );
+
+        let mut checked = 0;
+        let mut rest = region;
+        while let Some(at) = rest.find(call) {
+            let after = &rest[at + call.len()..];
+            let args = after
+                .split_once(last_arg)
+                .expect("every startup recovery call must still end its argument list at `login`")
+                .0;
+            assert!(
+                !args.contains(call),
+                "control: the argument window swallowed the next call site, so the bound drifted"
+            );
+            assert!(
+                !args.is_empty() && args.len() < 600,
+                "control: the argument window must be a real, single argument list -- got {} bytes",
+                args.len()
+            );
+            assert!(
+                args.contains(claimed),
+                "a startup recovery is called with something other than `&mut bw_serve_child`; \
+                 its first act is `stop_bw_serve` on whatever it is handed, so anything else \
+                 (`&mut None` above all) stops nothing and leaves the claimed `bw serve` alive \
+                 to hold `BW_SERVE_PORT` against the restart two lines later"
+            );
+            checked += 1;
+            rest = after;
+        }
+        assert_eq!(
+            checked, 2,
+            "control: both recovery call sites must have been inspected, not zero or one"
+        );
+
+        // A tripwire on the whole file, so a sixth call site cannot appear
+        // outside this region and escape the check above: five calls plus the
+        // one `fn` definition.
+        assert_eq!(
+            production_half_of_this_file().matches(call).count(),
+            6,
+            "the number of `recover_from_failed_vault_wait` sites changed; a new one is not \
+             covered by the argument check above -- extend the guard to reach it"
         );
     }
 

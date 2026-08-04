@@ -616,11 +616,18 @@ where
                 }
             }
             Stage::Working => {
-                // **This stage cannot be closed, and its ✕ says so.** It owns
-                // the only handle to a `bw serve` that is starting up, and that
-                // handle is inside the worker's answer -- closing here would
-                // strand the process holding the port, so the recovery `main`
-                // would then run could not bind it. The spinner now wears the
+                // **This stage cannot be closed, and its ✕ says so.** It no
+                // longer owns the only handle to a `bw serve` that is starting
+                // up: the worker publishes its `Child` through
+                // `StartupChildHandoff` the instant it spawns, and `main`
+                // claims it before the arms split, so a close here strands
+                // nothing and the recovery `main` then runs is handed the real
+                // process to stop. What a close here still costs is the work
+                // itself -- the whole `prepare` result is discarded, and the
+                // user is sent back through the master password for a backend
+                // that was very likely seconds from ready. That is the reason
+                // the refusal stays, and it is a worse-experience reason now
+                // rather than a stranded-port one. The spinner now wears the
                 // same heading as every other window, so there IS a ✕ on this
                 // stage; `CloseControl::Disabled` draws it ghosted and registers
                 // no interaction for it, rather than leaving it looking live and
