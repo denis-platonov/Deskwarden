@@ -65,33 +65,76 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// 80ms `loading_ui::show_while` has always used.
 const WORKING_POLL: Duration = Duration::from_millis(80);
 
+/// How many times `wait_for_vault_ready` calls `vault.list_items()` on the
+/// schedule the working stage runs it with.
+///
+/// **One more than the number of delays, not the same as it.**
+/// `bw_serve::wait_for_vault_ready` calls first and sleeps second, giving up
+/// only once `attempt >= schedule.len()` -- so a 10-delay schedule is 11 calls.
+/// That off-by-one is the difference between crediting the readiness phase 100s
+/// of network budget and crediting it 110s.
+///
+/// Reconciled against the real `readiness_schedule` by
+/// `the_deadline_covers_every_phase_the_worker_runs`, rather than agreed with it
+/// by hand: `readiness_schedule` is not a `const fn` (it builds a `Vec`), so the
+/// count cannot be computed where a `const` needs it. A test that recomputes it
+/// from the live function is the reconciliation.
+const READINESS_ATTEMPTS: u64 = 11;
+
+/// The bridge's whole-request budget for one `vault.list_items()`.
+///
+/// **This is a copy of a constant, and the copy is the honest part.**
+/// `vault_bridge::READ_DEADLINE` is module-private and `vault_bridge` exports no
+/// constants at all, so this cannot be `use`d and no test in this file can
+/// reconcile the two. The rest of the crate already depends on this number from
+/// a distance and does it in prose -- five comments across `vault_window` saying
+/// "~10s" -- so naming it here is strictly better than the alternative, which is
+/// a sum that pretends the readiness phase's network calls cost nothing. It is
+/// still an unreconciled pair, and the fix is `pub(crate)` on the original; that
+/// belongs to the next change that touches `vault_bridge`.
+const BRIDGE_READ_BUDGET: Duration = Duration::from_secs(10);
+
 /// How long the working stage may go on before it ends itself.
 ///
-/// **Derived from what the code already budgets, not chosen.** The worker runs
-/// `StartupWork::produce`, which is three phases and only the middle one is
-/// bounded by anything:
+/// **Derived from what actually bounds each phase, which is not what each phase
+/// is named after.** The worker runs `StartupWork::produce`, three phases:
 ///
 ///   1. `try_start_backend` -> `bw_serve::run_bw_sync`, a bare
 ///      `Command::output()` with no timeout. `bw_serve::BACKEND_OP_TIMEOUT` is
 ///      the number this crate already uses everywhere else as the upper bound
 ///      on a legitimate backend start or sync (`main`'s wedge check, the
-///      picker's probe), so it is what one such phase costs here.
-///   2. `wait_for_vault_ready` on `readiness_schedule(READINESS_DEADLINE)` --
-///      the only self-limiting part, and it runs AFTER the unbounded phase
-///      rather than over it.
+///      picker's probe), so it is what one such phase costs here. Its unlisted
+///      sub-step, `wait_for_port_free` up to `bw_serve::PORT_RELEASE_GRACE`
+///      (5s), fits inside that 90s rather than adding to it.
+///   2. `wait_for_vault_ready` on `readiness_schedule(READINESS_DEADLINE)`.
+///      **`READINESS_DEADLINE` does not bound this phase.** It bounds the
+///      *sleeps* only -- `readiness_schedule` stops once the accumulated wait
+///      would exceed it -- and the phase is sleeps INTERLEAVED WITH network
+///      calls, each of which is bounded separately by the bridge's own
+///      whole-request budget. `readiness_schedule(30s)` yields 10 delays
+///      summing 27.75s and therefore 11 `list_items()` calls, so the real worst
+///      case is 30s of sleeping plus 110s of waiting on a backend that answers
+///      slowly instead of not at all: ~140s, not 30s.
 ///   3. `login_ui::check_bw_status_details()`, unconditional and on the failure
 ///      path too: a second untimed `bw` spawn, so a second
 ///      `BACKEND_OP_TIMEOUT`.
 ///
-/// Hence `2 * BACKEND_OP_TIMEOUT + READINESS_DEADLINE` = 210s. Deliberately
-/// generous: this is a watchdog on a stage the user cannot leave by any other
-/// route, and a false timeout on a slow machine throws away a healthy sign-in,
-/// while a slow one only makes a wait the user is already watching a spinner
-/// through longer. It bounds the WINDOW, not the subprocess -- `produce` is
-/// still untimed and its worker may still be running when this fires.
+/// Hence 90 + (30 + 11*10) + 90 = **320s**. The previous sum credited phase 2
+/// with 30s and came to 210s -- which a slow-but-healthy startup can exceed
+/// while still being on its way to succeeding, and the deadline would then have
+/// thrown it away. That is exactly the outcome the generosity below is for, so
+/// the number was undoing its own stated reason.
+///
+/// Deliberately generous: this is a watchdog on a stage the user cannot leave by
+/// any other route, and a false timeout on a slow machine throws away a healthy
+/// sign-in, while an over-long one only extends a wait the user is already
+/// watching a spinner through. It bounds the WINDOW, not the subprocess --
+/// `produce` is still untimed and its worker may still be running when this
+/// fires.
 pub const WORKING_DEADLINE: Duration = Duration::from_secs(
     2 * crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
-        + crate::bw_serve::READINESS_DEADLINE.as_secs(),
+        + crate::bw_serve::READINESS_DEADLINE.as_secs()
+        + READINESS_ATTEMPTS * BRIDGE_READ_BUDGET.as_secs(),
 );
 
 /// What the one window is showing.
@@ -236,6 +279,85 @@ pub fn poll_working(err: mpsc::TryRecvError, elapsed: Duration) -> WorkPoll {
         WorkPoll::Failed(why) => WorkPoll::Failed(why),
         WorkPoll::KeepWaiting => work_deadline_poll(elapsed),
     }
+}
+
+/// **Ask this window to close, and stand the refusal down first.**
+///
+/// A function rather than two lines in the frame closure because the two lines
+/// are not independent and the second one is invisible to every test that
+/// checks the first. `closing = true` on its own leaves the window exactly as
+/// unleaveable as the bug: the stage stops ending itself, the ✕ is still
+/// `Disabled`, and only Alt+F4 gets through. `send_viewport_cmd` on its own is
+/// worse -- the refusal below cancels the window's own exit. Here they cannot be
+/// separated, and `the_stage_ending_itself_actually_asks_the_window_to_close`
+/// runs this against a real `egui::Context` and reads the command back out.
+///
+/// The flag is set BEFORE the command deliberately: eframe reports this very
+/// command back as a `close_requested` on a later frame, while `Stage::Working`
+/// is still the stage being drawn.
+fn close_this_window(ctx: &egui::Context, closing: &mut bool) {
+    *closing = true;
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+/// **The working stage's refusal to be closed by anything but itself.**
+///
+/// The ✕ is drawn `Disabled` and registers no interaction, so this is about the
+/// routes that do not go through the chrome at all -- Alt+F4 and the system
+/// menu. Refusing them keeps the `bw serve` the worker is holding off the port
+/// the recovery needs.
+///
+/// Returns whether it actually refused, so a test can tell "declined to refuse"
+/// from "was never asked" -- two states that are identical in the viewport
+/// output when no command is sent.
+fn refuse_close_while_working(ctx: &egui::Context, closing: bool) -> bool {
+    if closing || !ctx.input(|i| i.viewport().close_requested()) {
+        return false;
+    }
+    log::info!(
+        "the single window was asked to close while the vault backend was still starting; \
+         refusing, so the backend it is holding is not orphaned on the port the recovery needs"
+    );
+    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+    true
+}
+
+/// What gets logged when the stage gives up, as a value rather than as a
+/// `log::error!` the tests cannot see.
+///
+/// Split out so [`WorkFailure::reason`] is on a path a test can run. Folded into
+/// the `log::error!` it used to be, the two reasons could be replaced by one
+/// fixed string with every test green -- `assert_ne!(WorkerDied.reason(),
+/// Deadline.reason())` would then be a true statement about two functions
+/// nothing called, since both variants reach the same `Event::WorkFailed` and
+/// the same `Next::Close` and the log line is their only user-visible
+/// difference.
+fn give_up_message(why: WorkFailure, elapsed: Duration) -> String {
+    format!("{} (after {elapsed:?})", why.reason())
+}
+
+/// **What a `WorkPoll::Failed` does to the window**, whole: name the reason,
+/// take the transition, and -- only if the transition really is out of the
+/// window -- close it.
+///
+/// `advance(Stage::Working, Event::WorkFailed)` is spelled here rather than in
+/// the closure so that it is under test. Swapped to `Event::WorkReady` this
+/// returns `Next::Show(Stage::Vault)` and sends nothing: a `Vault` stage whose
+/// `vault_fn` is `None`, which the `Vault` arm draws as a permanently blank
+/// window. That is a worse outcome than the bug and it used to be one token
+/// away.
+fn give_up_working(
+    ctx: &egui::Context,
+    closing: &mut bool,
+    why: WorkFailure,
+    elapsed: Duration,
+) -> Next {
+    log::error!("{}", give_up_message(why, elapsed));
+    let next = advance(Stage::Working, Event::WorkFailed);
+    if let Next::Close = next {
+        close_this_window(ctx, closing);
+    }
+    next
 }
 
 /// What one run of the single window produced.
@@ -487,77 +609,79 @@ where
                     login_ui::ChromeAction::Close | login_ui::ChromeAction::None => {}
                 }
 
-                if !closing && ui.ctx().input(|i| i.viewport().close_requested()) {
-                    log::info!(
-                        "the single window was asked to close while the vault backend was \
-                         still starting; refusing, so the backend it is holding is not \
-                         orphaned on the port the recovery needs"
-                    );
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                }
+                refuse_close_while_working(ui.ctx(), closing);
 
-                match work_rx.try_recv() {
-                    Ok(mut work) => {
-                        let signed_in = token_for_closure.borrow().clone();
-                        let built = match (build_vault.take(), signed_in.as_deref()) {
-                            (Some(build), Some(token)) => build(token, &mut work),
-                            _ => None,
-                        };
-                        *prepared_for_closure.borrow_mut() = Some(work);
-                        let event = match built {
-                            Some((vault, handles)) => {
-                                vault_fn = Some(vault);
-                                *vault_handles_for_closure.borrow_mut() = Some(handles);
-                                Event::WorkReady
-                            }
-                            None => Event::WorkFailed,
-                        };
-                        match advance(stage, event) {
-                            Next::Show(next) => {
-                                if let Some(at) = signed_in_at {
-                                    log::info!(
-                                        "single window: vault ready {:?} after sign-in was \
-                                         accepted",
-                                        at.elapsed()
+                // **Not polled once the stage has decided to stop.** After an
+                // `Ok(work)` is drained the worker has ended and dropped the
+                // only sender; if `build_vault` answered `None` the stage stays
+                // `Working` and the `request_repaint` below guarantees another
+                // Working frame, whose `try_recv` would now say `Disconnected`.
+                // That is a true fact about the channel and a false story about
+                // the run -- it would be logged at error level as "the thread
+                // preparing the vault died without answering (it panicked)" on
+                // the one path that already logged the real reason a frame
+                // earlier. `closing` is set only by the two exits, each of which
+                // has already asked the window to close, so nothing live is
+                // skipped here: the deadline cannot still be owed to a stage
+                // that has already ended itself.
+                if !closing {
+                    match work_rx.try_recv() {
+                        Ok(mut work) => {
+                            let signed_in = token_for_closure.borrow().clone();
+                            let built = match (build_vault.take(), signed_in.as_deref()) {
+                                (Some(build), Some(token)) => build(token, &mut work),
+                                _ => None,
+                            };
+                            *prepared_for_closure.borrow_mut() = Some(work);
+                            let event = match built {
+                                Some((vault, handles)) => {
+                                    vault_fn = Some(vault);
+                                    *vault_handles_for_closure.borrow_mut() = Some(handles);
+                                    Event::WorkReady
+                                }
+                                None => Event::WorkFailed,
+                            };
+                            match advance(stage, event) {
+                                Next::Show(next) => {
+                                    if let Some(at) = signed_in_at {
+                                        log::info!(
+                                            "single window: vault ready {:?} after sign-in \
+                                             was accepted",
+                                            at.elapsed()
+                                        );
+                                    }
+                                    stage = next;
+                                }
+                                Next::Close => {
+                                    log::warn!(
+                                        "the single window has no vault to show; closing so \
+                                         the startup recovery can run"
                                     );
+                                    close_this_window(ui.ctx(), &mut closing);
                                 }
-                                stage = next;
                             }
-                            Next::Close => {
-                                log::warn!(
-                                    "the single window has no vault to show; closing so the \
-                                     startup recovery can run"
-                                );
-                                closing = true;
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                            }
+                            ui.ctx().request_repaint();
                         }
-                        ui.ctx().request_repaint();
-                    }
-                    // **Not `Err(_)`.** The decision is `poll_working`'s, whole
-                    // -- a `Disconnected` means the worker is gone and nothing
-                    // will ever arrive, and an `Empty` past the deadline means
-                    // it is alive and not coming back either. Both land on
-                    // `Event::WorkFailed`, which `advance` sends to
-                    // `Next::Close`: the window ends and `main`'s
-                    // `recover_from_failed_vault_wait` takes over, which is a
-                    // fresh login the user can close. That is the point of the
-                    // fix -- not a fourth stage that apologises with the same
-                    // disabled ✕.
-                    Err(err) => {
-                        let elapsed = working_since.map_or(Duration::ZERO, |at| at.elapsed());
-                        match poll_working(err, elapsed) {
-                            WorkPoll::KeepWaiting => {
-                                ui.ctx().request_repaint_after(WORKING_POLL)
-                            }
-                            WorkPoll::Failed(why) => {
-                                log::error!("{} (after {elapsed:?})", why.reason());
-                                if let Next::Close = advance(stage, Event::WorkFailed) {
-                                    closing = true;
-                                    ui.ctx()
-                                        .send_viewport_cmd(egui::ViewportCommand::Close);
+                        // **Not `Err(_)`.** The decision is `poll_working`'s,
+                        // whole -- a `Disconnected` means the worker is gone and
+                        // nothing will ever arrive, and an `Empty` past the
+                        // deadline means it is alive and not coming back either.
+                        // Both land on `Event::WorkFailed`, which `advance`
+                        // sends to `Next::Close`: the window ends and `main`'s
+                        // `recover_from_failed_vault_wait` takes over, which is
+                        // a fresh login the user can close. That is the point of
+                        // the fix -- not a fourth stage that apologises with the
+                        // same disabled ✕.
+                        Err(err) => {
+                            let elapsed = working_since.map_or(Duration::ZERO, |at| at.elapsed());
+                            match poll_working(err, elapsed) {
+                                WorkPoll::KeepWaiting => {
+                                    ui.ctx().request_repaint_after(WORKING_POLL)
                                 }
-                                ui.ctx().request_repaint();
+                                WorkPoll::Failed(why) => {
+                                    give_up_working(ui.ctx(), &mut closing, why, elapsed);
+                                    ui.ctx().request_repaint();
+                                }
                             }
                         }
                     }
@@ -835,22 +959,273 @@ mod working_watchdog_tests {
         }
     }
 
-    /// The deadline is derived from the two numbers the crate already agrees
-    /// on, so a change to either moves it rather than leaving it stale.
+    /// The deadline is derived from the numbers the crate already agrees on, so
+    /// a change to any of them moves it rather than leaving it stale.
     #[test]
     fn the_deadline_covers_every_phase_the_worker_runs() {
-        use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE};
+        use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE, readiness_schedule};
         assert_eq!(
             WORKING_DEADLINE,
-            BACKEND_OP_TIMEOUT + READINESS_DEADLINE + BACKEND_OP_TIMEOUT,
-            "the working stage's deadline is no longer the sum of the three phases \
-             `StartupWork::produce` runs -- an untimed backend start, the readiness probe, and \
-             an untimed `bw status` -- so a healthy-but-slow startup can be cut off"
+            BACKEND_OP_TIMEOUT
+                + READINESS_DEADLINE
+                + BRIDGE_READ_BUDGET * READINESS_ATTEMPTS as u32
+                + BACKEND_OP_TIMEOUT,
+            "the working stage's deadline is no longer the sum of what actually bounds the \
+             three phases `StartupWork::produce` runs -- an untimed backend start, the \
+             readiness probe's sleeps AND its per-attempt bridge reads, and an untimed `bw \
+             status` -- so a healthy-but-slow startup can be cut off"
         );
+        // **The claim `READINESS_ATTEMPTS` makes, checked against the real
+        // function rather than agreed with it.** `wait_for_vault_ready` calls
+        // first and sleeps second, giving up once `attempt >= schedule.len()`,
+        // so the call count is one more than the delay count. Recomputed here
+        // because `readiness_schedule` builds a `Vec` and cannot run in a
+        // `const`.
+        assert_eq!(
+            readiness_schedule(READINESS_DEADLINE).len() as u64 + 1,
+            READINESS_ATTEMPTS,
+            "the readiness schedule no longer makes {READINESS_ATTEMPTS} attempts, so the \
+             deadline is crediting that phase the wrong amount of network time"
+        );
+        // The phase the old sum got wrong, stated on its own: the readiness
+        // probe costs far more than the deadline it is named after, because
+        // `READINESS_DEADLINE` bounds only the sleeps between its attempts.
+        assert!(
+            READINESS_DEADLINE + BRIDGE_READ_BUDGET * READINESS_ATTEMPTS as u32
+                > READINESS_DEADLINE * 4,
+            "control: the readiness phase's real bound has collapsed back to roughly its \
+             sleep budget, which is the mistake this sum was rewritten to fix"
+        );
+
+        // **An absolute bound, not another spelling of the definition.** The
+        // assertion above cannot fail for any change to the source constants,
+        // however large -- doubling `BACKEND_OP_TIMEOUT` moves both sides
+        // together. These two cannot move with it.
         assert!(
             WORKING_DEADLINE > BACKEND_OP_TIMEOUT,
             "the window gives up before a single backend operation is even considered wedged"
         );
+        assert!(
+            WORKING_DEADLINE <= SPINNER_PATIENCE,
+            "the working stage may now hold a window the user cannot close for longer than \
+             anyone will sit in front of it ({WORKING_DEADLINE:?} > {SPINNER_PATIENCE:?}); \
+             past this the watchdog is not a way out, it is Task Manager with extra steps"
+        );
+        assert!(
+            WORKING_DEADLINE >= BACKEND_OP_TIMEOUT + READINESS_DEADLINE + BACKEND_OP_TIMEOUT,
+            "the deadline has shrunk back below the three phases' own nominal budgets, so a \
+             startup that is merely slow gets cut off"
+        );
+    }
+
+    /// The longest anyone will sit in front of a spinner with no ✕, no tray and
+    /// no Quit before Task Manager is the reasonable response -- and therefore
+    /// the point past which a longer watchdog buys nothing, because the user has
+    /// already killed the process.
+    ///
+    /// Six minutes: generous against the ~5m20s the phases above can legitimately
+    /// cost, and deliberately not derived from them, so that it is a bound on the
+    /// definition rather than a restatement of it.
+    const SPINNER_PATIENCE: Duration = Duration::from_secs(6 * 60);
+}
+
+/// **The window's own close, run for real.**
+///
+/// The frame closure cannot be called by a test -- `eframe::Frame` has no public
+/// constructor -- but the three things it does to the viewport are ordinary
+/// functions over an `egui::Context`, and a headless `Context` records every
+/// command sent to it. So these are behavioural: they send the command and read
+/// it back, rather than searching the source for the line that sends it.
+///
+/// This is the file's central property. The reviewer of `6fc3792` could not
+/// construct a state the user cannot leave, but observed that deleting the two
+/// `ViewportCommand::Close` lines -- keeping `closing = true` -- left the whole
+/// suite green while restoring most of the hang.
+#[cfg(test)]
+mod window_close_tests {
+    use super::*;
+
+    /// Every viewport command one frame sent, in order.
+    fn commands_of(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// A frame's input, optionally carrying the close the OS reports when the
+    /// user hits Alt+F4 -- or that eframe echoes back after this module's own
+    /// `ViewportCommand::Close`.
+    fn input(close_requested: bool) -> egui::RawInput {
+        let mut raw = egui::RawInput::default();
+        if close_requested {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .events
+                .push(egui::ViewportEvent::Close);
+        }
+        raw
+    }
+
+    /// **The deleted line, as an assertion.** `closing = true` on its own leaves
+    /// the stage refusing nothing and ending nothing: the ✕ is still `Disabled`,
+    /// so the window stops asking to close and only Alt+F4 gets through.
+    #[test]
+    fn the_stage_ending_itself_actually_asks_the_window_to_close() {
+        let ctx = egui::Context::default();
+        let mut closing = false;
+        let output = ctx.run_ui(input(false), |ui| {
+            close_this_window(ui.ctx(), &mut closing);
+        });
+        assert!(
+            commands_of(&output).contains(&egui::ViewportCommand::Close),
+            "the stage decided to stop and never asked the window to close, so the spinner \
+             stays up with a ghosted ✕, no tray and no Quit anywhere in the process: {:?}",
+            commands_of(&output)
+        );
+        assert!(
+            closing,
+            "the close was sent without disarming the refusal, so the next frame cancels the \
+             window's own exit"
+        );
+        // Positive control on the harness: a frame that sends nothing records
+        // nothing, so `contains` above is a statement about `close_this_window`
+        // and not about every frame.
+        let quiet = ctx.run_ui(input(false), |_ui| {});
+        assert!(
+            !commands_of(&quiet).contains(&egui::ViewportCommand::Close),
+            "control: the harness reports a Close for a frame that sent none"
+        );
+    }
+
+    /// The refusal, both ways round.
+    #[test]
+    fn the_stage_refuses_a_close_it_did_not_ask_for_and_only_that_one() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(input(true), |ui| {
+            assert!(
+                refuse_close_while_working(ui.ctx(), false),
+                "the working stage let an Alt+F4 through, stranding the `bw serve` it is \
+                 holding on the port the recovery needs"
+            );
+        });
+        assert!(
+            commands_of(&output).contains(&egui::ViewportCommand::CancelClose),
+            "the refusal decided to refuse and sent nothing, so the window closes anyway: {:?}",
+            commands_of(&output)
+        );
+        // Not asked at all: no close request, so nothing to refuse.
+        let output = ctx.run_ui(input(false), |ui| {
+            assert!(!refuse_close_while_working(ui.ctx(), false));
+        });
+        assert!(
+            !commands_of(&output).contains(&egui::ViewportCommand::CancelClose),
+            "the stage cancels a close nobody asked for, which is a `CancelClose` on every \
+             frame of the spinner"
+        );
+    }
+
+    /// **The property the whole fix exists for, end to end.** Frame one: the
+    /// stage gives up and asks to close. Frame two: eframe reports that very
+    /// close back while `Stage::Working` is still the stage being drawn -- and
+    /// the refusal must stand down for it, or the window cancels its own exit
+    /// and is exactly as unleaveable as the bug.
+    #[test]
+    fn the_close_the_stage_sends_itself_is_not_then_refused_by_the_stage() {
+        let ctx = egui::Context::default();
+        let mut closing = false;
+
+        let first = ctx.run_ui(input(false), |ui| {
+            give_up_working(ui.ctx(), &mut closing, WorkFailure::Deadline, WORKING_DEADLINE);
+        });
+        assert!(
+            commands_of(&first).contains(&egui::ViewportCommand::Close),
+            "giving up does not ask the window to close at all"
+        );
+
+        let second = ctx.run_ui(input(true), |ui| {
+            refuse_close_while_working(ui.ctx(), closing);
+        });
+        assert!(
+            !commands_of(&second).contains(&egui::ViewportCommand::CancelClose),
+            "the stage cancelled the close IT sent, so `WorkFailed` never actually ends the \
+             window and the user is back to Task Manager: {:?}",
+            commands_of(&second)
+        );
+
+        // The control, and the bug: with the flag never set, the same second
+        // frame refuses the window's own exit. This is what an unconditional
+        // refusal ships.
+        let bug = ctx.run_ui(input(true), |ui| {
+            refuse_close_while_working(ui.ctx(), false);
+        });
+        assert!(
+            commands_of(&bug).contains(&egui::ViewportCommand::CancelClose),
+            "control: the second frame cannot refuse anything, so the assertion above holds \
+             for a reason other than the flag"
+        );
+    }
+
+    /// **Which transition giving up takes, and that it is the one that leaves.**
+    ///
+    /// `advance(Stage::Working, Event::WorkReady)` returns `Next::Show(Vault)`,
+    /// and the vault stage's `vault_fn` is `None` on this path -- the `Vault` arm
+    /// then draws nothing at all. A permanently blank window is worse than the
+    /// spinner it replaces, and it was one token away with the suite green.
+    #[test]
+    fn giving_up_leaves_the_window_rather_than_landing_on_a_blank_vault() {
+        for why in [WorkFailure::WorkerDied, WorkFailure::Deadline] {
+            let ctx = egui::Context::default();
+            let mut closing = false;
+            let output = ctx.run_ui(input(false), |ui| {
+                assert_eq!(
+                    give_up_working(ui.ctx(), &mut closing, why, Duration::ZERO),
+                    Next::Close,
+                    "{why:?} moves the window to another stage instead of out of it -- and the \
+                     only stage it can reach that way is a vault with no frame built for it, \
+                     which paints nothing"
+                );
+            });
+            assert!(
+                commands_of(&output).contains(&egui::ViewportCommand::Close),
+                "{why:?} reached `Next::Close` and still did not ask the window to close"
+            );
+            assert!(closing, "{why:?} left the refusal armed against its own close");
+        }
+    }
+
+    /// **The reason survives, and the two reasons stay different.**
+    ///
+    /// Both variants reach the same `Event::WorkFailed` and the same
+    /// `Next::Close`, so this line is their ONLY user-visible difference and the
+    /// only record of which happened on a user's machine. Asserted through
+    /// `give_up_message`, which is what production logs, so replacing
+    /// `why.reason()` with a fixed string fails here -- rather than through
+    /// `reason()` alone, which nothing on the live path would then call.
+    #[test]
+    fn the_two_ways_of_giving_up_are_told_apart_in_the_log() {
+        let elapsed = Duration::from_secs(7);
+        let died = give_up_message(WorkFailure::WorkerDied, elapsed);
+        let timed_out = give_up_message(WorkFailure::Deadline, elapsed);
+        assert_ne!(
+            died, timed_out,
+            "a panicked worker and a hung backend log the same line, so the next person \
+             investigating this cannot tell which one they are looking at"
+        );
+        for (message, why) in [(&died, WorkFailure::WorkerDied), (&timed_out, WorkFailure::Deadline)]
+        {
+            assert!(
+                message.contains(why.reason()),
+                "{why:?} is logged as something other than its own reason: {message}"
+            );
+            assert!(
+                message.contains("7s"),
+                "the log line drops how long the stage had been up, which is the one number \
+                 that says whether the deadline or the worker ended it: {message}"
+            );
+        }
     }
 }
 
@@ -979,10 +1354,11 @@ mod startup_window_tests {
              does nothing at all: {arm}"
         );
         assert!(
-            arm.contains(concat!("Cancel", "Close")),
+            arm.contains(concat!("refuse_close_while_", "working(ui.ctx(), closing)")),
             "the working stage no longer refuses a close it did not draw the affordance for \
              (Alt+F4, the system menu), so a `bw serve` still starting up is stranded on the \
-             port the recovery needs"
+             port the recovery needs. What it refuses and when is behavioural -- see \
+             `window_close_tests` -- but nothing there can tell whether the arm CALLS it: {arm}"
         );
         // Positive control on the slice: it really is the working arm and stops
         // before the vault's, whose chrome passes `CloseControl::Active`.
@@ -1060,6 +1436,20 @@ mod startup_window_tests {
             "nothing ever starts the working stage's stopwatch, so it reads zero on every \
              frame and the deadline can never fire"
         );
+        // **A stage that has already stopped is not polled again.** After an
+        // `Ok(work)` whose `build_vault` answered `None`, the worker has ended
+        // and dropped the only sender, and the repaint that follows guarantees
+        // another Working frame -- whose `try_recv` says `Disconnected`, which
+        // this arm would report at error level as a panic that never happened,
+        // on the one path that already logged the real reason. The guard is
+        // `!closing`, and `closing` is set only by the two exits that have
+        // already asked the window to close, so no live path loses its deadline.
+        assert!(
+            arm.contains(concat!("if !", "closing {")),
+            "the working arm polls the channel after the stage has decided to stop, so a \
+             `build_vault` that answered `None` is logged a frame later as a worker that \
+             panicked: {arm}"
+        );
     }
 
     /// The other half of the same fix, and the half that is invisible in the
@@ -1082,24 +1472,71 @@ mod startup_window_tests {
         );
     }
 
-    /// The refusal must not outlive the decision to stop. eframe reports this
-    /// module's own `ViewportCommand::Close` back as a `close_requested` on a
-    /// later frame, while `Stage::Working` is still the stage being drawn -- so
-    /// an unconditional `CancelClose` cancels the window's own exit and the
-    /// stage is exactly as unleaveable as it was before any of this.
+    /// **Both ways the stage ends go through the one function that ends it.**
+    ///
+    /// What that function does -- set the flag AND send the command, in that
+    /// order -- is behavioural, in `window_close_tests`. What no test there can
+    /// see is whether the arm still calls it on both of its exits, because the
+    /// arm is inside the frame closure. So the call sites are counted here, and
+    /// only the call sites.
+    ///
+    /// Counted rather than merely `contains`ed: the stage has exactly two exits
+    /// -- work that produced no vault, and the watchdog giving up -- and a fix
+    /// that reaches one of them is the defect this file keeps shipping.
     #[test]
-    fn the_refusal_stands_down_once_the_stage_has_decided_to_close() {
+    fn both_of_the_stages_exits_go_through_the_window_close() {
+        let arm = working_arm();
+        // One each, not two between them: a sum would still read 2 if one exit
+        // were duplicated and the other deleted, which is the exact shape of
+        // "the fix reached one of the two paths".
+        for (call, exit) in [
+            (
+                concat!("close_this_", "window(ui.ctx(), &mut closing)"),
+                "work arrived but built no vault",
+            ),
+            (
+                concat!("give_up_", "working(ui.ctx(), &mut closing,"),
+                "the watchdog gave up on a dead or hung worker",
+            ),
+        ] {
+            assert_eq!(
+                arm.matches(call).count(),
+                1,
+                "the working stage's exit for {exit:?} no longer ends the window -- it stops \
+                 the stage without asking to close, leaving a ghosted ✕, no tray and no Quit \
+                 anywhere in the process: {arm}"
+            );
+        }
+        // The flag is never set in the arm any more; it is set inside
+        // `close_this_window`, where the command it must accompany cannot be
+        // deleted without a behavioural test failing. If it comes back here, the
+        // two have been split again.
+        assert!(
+            !arm.contains("closing = true;"),
+            "the arm sets the refusal's flag by hand again, which is how it became possible to \
+             delete the close it is supposed to accompany: {arm}"
+        );
+        // Positive control on the slice, in both directions.
+        assert!(
+            arm.contains(concat!("poll_", "working(err, elapsed)")),
+            "control: the sliced region is not the arm that polls the watchdog: {arm}"
+        );
+    }
+
+    /// **The watchdog's verdict must reach the window as a close.**
+    ///
+    /// `give_up_working` is behaviourally tested -- it sends the command, and
+    /// swapping its `Event::WorkFailed` for `WorkReady` fails
+    /// `giving_up_leaves_the_window_rather_than_landing_on_a_blank_vault`. This
+    /// is the one link that test cannot cover: that the `WorkPoll::Failed` arm
+    /// hands its verdict to it rather than dropping it.
+    #[test]
+    fn the_watchdogs_verdict_is_handed_to_the_window() {
         let arm = working_arm();
         assert!(
-            arm.contains(concat!("!closing && ", "ui.ctx().input(")),
-            "the working stage refuses EVERY close, including the one it sends itself when it \
-             gives up -- so `WorkFailed` never actually closes the window: {arm}"
-        );
-        assert_eq!(
-            arm.matches("closing = true;").count(),
-            2,
-            "one of the two ways the stage ends does not disarm the refusal first, so that one \
-             cancels its own close and hangs: {arm}"
+            arm.contains(concat!("give_up_", "working(ui.ctx(), &mut closing, why, elapsed)")),
+            "the watchdog answered `Failed` and the arm does nothing with it -- the stage \
+             computes that it should stop and then keeps waiting: {arm}"
         );
     }
 
