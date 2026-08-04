@@ -515,12 +515,14 @@ const SCRIM: Color32 = Color32::from_black_alpha(56);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VaultSkeleton {
     pub bar: egui::Rect,
-    /// Everything under the bar -- the three panes' union, and what [`SCRIM`]
-    /// covers.
+    /// Everything under the bar: one flat region, and what [`SCRIM`] covers.
+    ///
+    /// This used to be divided into the vault window's three panes, painted
+    /// in their real fills with the hairlines between them. It read as a
+    /// mock of the app rather than as the app waiting, and the user asked
+    /// for the divisions gone. The bar stays -- it is the same bar the vault
+    /// window keeps, so it is continuity rather than decoration.
     pub body: egui::Rect,
-    pub sidebar: egui::Rect,
-    pub list: egui::Rect,
-    pub detail: egui::Rect,
 }
 
 /// Divides `full` the way `vault_window::run` divides its window.
@@ -537,46 +539,23 @@ pub fn vault_skeleton(full: egui::Rect) -> VaultSkeleton {
         Pos2::new(full.max.x, full.min.y + ChromeMetrics::VAULT.bar_height),
     );
     let body = egui::Rect::from_min_max(Pos2::new(full.min.x, bar.max.y), full.max);
-    // Clamped to the body, so a window narrower than sidebar+list (which
-    // `MIN_VAULT_WINDOW_SIZE` forbids, but nothing here should depend on
-    // that) yields panes inside the window rather than off the right edge.
-    let sidebar_right = (body.min.x + crate::vault_window::SIDEBAR_WIDTH).min(body.max.x);
-    let list_right = (sidebar_right + crate::vault_window::LIST_WIDTH).min(body.max.x);
-    VaultSkeleton {
-        bar,
-        body,
-        sidebar: egui::Rect::from_min_max(body.min, Pos2::new(sidebar_right, body.max.y)),
-        list: egui::Rect::from_min_max(
-            Pos2::new(sidebar_right, body.min.y),
-            Pos2::new(list_right, body.max.y),
-        ),
-        detail: egui::Rect::from_min_max(Pos2::new(list_right, body.min.y), body.max),
-    }
+    VaultSkeleton { bar, body }
 }
 
-/// Paints the empty app: the three panes in their real fills, the hairlines
-/// `egui::Panel` would draw between them, and the scrim over the lot.
+/// Paints the body behind the card: one flat [`theme::CANVAS`] region under
+/// the scrim, and nothing else.
 ///
-/// The fills are `vault_window`'s own -- [`theme::CARD`] for the sidebar,
-/// [`theme::CANVAS`] for the item list and the detail pane -- so this reads as
-/// the app with nothing in it yet rather than as a blank rectangle. Nothing is
-/// drawn INSIDE the panes: there is no vault to list, and inventing
-/// placeholder rows would be inventing content the user is about to find out
-/// they do or do not have.
+/// It was the vault window's three panes in their own fills with the
+/// hairlines between them. That drew a picture *of* the app, and a picture of
+/// an app with nothing in it is a mock -- the divisions promise a sidebar and
+/// a list that are not there and cannot be interacted with. One region
+/// promises nothing and simply gets out of the card's way.
+///
+/// The bar above it is still painted (by the caller): that one is not
+/// decoration, it is the same titlebar the vault window keeps afterwards, so
+/// it is the part that makes this window and the next one feel continuous.
 pub fn paint_vault_skeleton(painter: &egui::Painter, skeleton: &VaultSkeleton) {
-    painter.rect_filled(skeleton.sidebar, CornerRadius::ZERO, theme::CARD);
-    painter.rect_filled(skeleton.list, CornerRadius::ZERO, theme::CANVAS);
-    painter.rect_filled(skeleton.detail, CornerRadius::ZERO, theme::CANVAS);
-    for pane in [skeleton.sidebar, skeleton.list] {
-        painter.rect_filled(
-            egui::Rect::from_min_max(
-                Pos2::new(pane.max.x - 1.0, pane.min.y),
-                Pos2::new(pane.max.x, pane.max.y),
-            ),
-            CornerRadius::ZERO,
-            theme::HAIRLINE,
-        );
-    }
+    painter.rect_filled(skeleton.body, CornerRadius::ZERO, theme::CANVAS);
     painter.rect_filled(skeleton.body, CornerRadius::ZERO, SCRIM);
 }
 
@@ -3470,47 +3449,32 @@ mod empty_app_behind_the_card_tests {
         Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(width, height))
     }
 
-    /// **The panes are the vault window's, not numbers written out again.**
-    /// A placeholder whose sidebar is the wrong width is worse than none: the
-    /// window would visibly re-flow at the instant of sign-in, which is the
-    /// jump this whole change exists to remove.
+    /// **The bar is the vault window's own, not a number written out again.**
+    /// It is the one piece of the next window this one still shows, so a
+    /// different height here is a visible jump at the instant of sign-in --
+    /// which is the whole reason this window borrows the vault window's
+    /// placement in the first place.
+    ///
+    /// The panes this used to check are gone: the body is one flat region
+    /// now, because a drawn sidebar and item list promise controls that are
+    /// not there.
     #[test]
-    fn the_placeholder_panes_are_the_vault_windows_own_widths() {
-        // The positive control for the two assertions below: these are
-        // different numbers, so a sidebar/list swap is detectable at all.
-        assert_ne!(
-            crate::vault_window::SIDEBAR_WIDTH,
-            crate::vault_window::LIST_WIDTH,
-            "the two pane widths are equal, so nothing below could tell a swap from a match"
-        );
-
+    fn the_placeholder_bar_is_the_vault_windows_own_height() {
         let skeleton = vault_skeleton(full(1240.0, 740.0));
-        assert_eq!(
-            skeleton.sidebar.width(),
-            crate::vault_window::SIDEBAR_WIDTH,
-            "the placeholder sidebar is {}px against the vault window's {}px",
-            skeleton.sidebar.width(),
-            crate::vault_window::SIDEBAR_WIDTH
-        );
-        assert_eq!(
-            skeleton.list.width(),
-            crate::vault_window::LIST_WIDTH,
-            "the placeholder item list is {}px against the vault window's {}px",
-            skeleton.list.width(),
-            crate::vault_window::LIST_WIDTH
-        );
         assert_eq!(
             skeleton.bar.height(),
             ChromeMetrics::VAULT.bar_height,
-            "the placeholder titlebar is not the vault window's own bar height"
+            "the placeholder titlebar is {}px against the vault window's {}px",
+            skeleton.bar.height(),
+            ChromeMetrics::VAULT.bar_height
         );
     }
 
-    /// The three panes tile the body with no seam and no overlap, and the body
-    /// starts under the bar. A gap here paints the window background through
-    /// the middle of the app.
+    /// The bar and the body tile the window with no seam and no overlap. A
+    /// gap here paints the window background through the middle of the app,
+    /// which is the one way a single flat region can still look wrong.
     #[test]
-    fn the_three_panes_tile_the_body_under_the_titlebar() {
+    fn the_bar_and_the_body_tile_the_window() {
         let window = full(1240.0, 740.0);
         let skeleton = vault_skeleton(window);
 
@@ -3519,23 +3483,12 @@ mod empty_app_behind_the_card_tests {
             skeleton.body.min.y, skeleton.bar.max.y,
             "the body does not begin where the titlebar ends"
         );
+        assert_eq!(skeleton.body.min.x, window.min.x, "the body does not reach the left edge");
         assert_eq!(skeleton.body.max, window.max, "the body does not reach the window's edges");
-
-        assert_eq!(skeleton.sidebar.min, skeleton.body.min);
-        assert_eq!(skeleton.sidebar.max.x, skeleton.list.min.x, "a seam between sidebar and list");
-        assert_eq!(skeleton.list.max.x, skeleton.detail.min.x, "a seam between list and detail");
-        assert_eq!(skeleton.detail.max, skeleton.body.max, "the detail pane does not fill the rest");
-        for (pane, named) in [
-            (skeleton.sidebar, "sidebar"),
-            (skeleton.list, "list"),
-            (skeleton.detail, "detail"),
-        ] {
-            assert_eq!(
-                (pane.min.y, pane.max.y),
-                (skeleton.body.min.y, skeleton.body.max.y),
-                "the {named} pane does not run the full height of the body"
-            );
-        }
+        assert!(
+            skeleton.body.height() > 0.0,
+            "the body has no height, so every assertion about what is painted in it is vacuous"
+        );
     }
 
     /// **The card is centred in the BODY**, not in the whole window. Centred
@@ -3678,17 +3631,15 @@ mod empty_app_behind_the_card_tests {
         };
 
         assert!(
-            painted(skeleton.sidebar, theme::CARD),
-            "the placeholder sidebar is not painted in the vault window's own CARD fill; \
-             painted: {rects:?}"
+            painted(skeleton.body, theme::CANVAS),
+            "the body behind the card is not one flat CANVAS region; painted: {rects:?}"
         );
+        // The divisions are gone and must stay gone: a CARD-filled rect in
+        // the body is the old sidebar coming back, and it promises a control
+        // that is not there.
         assert!(
-            painted(skeleton.list, theme::CANVAS),
-            "the placeholder item list is not painted in the vault window's own CANVAS fill"
-        );
-        assert!(
-            painted(skeleton.detail, theme::CANVAS),
-            "the placeholder detail pane is not painted in the vault window's own CANVAS fill"
+            !rects.iter().any(|(r, f)| *f == theme::CARD && skeleton.body.contains(r.center())),
+            "something is painted as a pane inside the body again; painted: {rects:?}"
         );
         assert!(
             painted(skeleton.body, SCRIM),
