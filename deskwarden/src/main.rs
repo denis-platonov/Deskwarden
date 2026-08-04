@@ -1750,7 +1750,10 @@ fn main() {
         // the cache warm so the next "Open Vault" doesn't pay the `bw
         // status` spawn again.
         if let Ok((about, details)) = status_details_rx.try_recv() {
-            if about.is_some() && about.as_ref() == active_account.as_ref().map(|a| &a.id) {
+            if prefetch_still_describes_the_active_account(
+                about.as_ref(),
+                active_account.as_ref().map(|a| &a.id),
+            ) {
                 learn_active_account_details(
                     &settings_path,
                     &mut accounts_state,
@@ -1901,6 +1904,38 @@ fn report_account_action(what: &str, outcome: SwitchOutcome) {
     }
 }
 
+/// **May the startup `bw status` prefetch be adopted?** — given the account it
+/// was started FOR, and the account this app is on NOW.
+///
+/// A pure function on purpose. The decision used to live inline in `main`'s
+/// frame loop, which no harness can run, and the only test over it read the
+/// condition's source text: flipping its `&&` to `||` — which adopts a prefetch
+/// for account A onto account B, and PERSISTS it — left the whole suite green.
+///
+/// `bw status` reports on whatever profile the CLI was pointed at when it ran,
+/// and this one is spawned before the startup window's outcome is dispatched —
+/// a window that can switch, add or remove an account. So the answer can land
+/// describing somebody else.
+///
+/// Both halves must be a *known* account and they must be the SAME one:
+///
+/// * no `started_for` — the app had no account when the prefetch was spawned,
+///   so `bw status` was pointed at whatever the CLI's default profile is, and
+///   nothing says that is the account now active;
+/// * no `active_now` — there is nothing to learn the answer onto;
+/// * different ids — the startup window moved the app to another account, and
+///   writing this address into that account's entry is the "random hash" bug
+///   with a worse failure mode: a confident, persisted, WRONG address.
+fn prefetch_still_describes_the_active_account(
+    started_for: Option<&accounts::AccountId>,
+    active_now: Option<&accounts::AccountId>,
+) -> bool {
+    match (started_for, active_now) {
+        (Some(started), Some(now)) => started == now,
+        _ => false,
+    }
+}
+
 /// **The one place a `bw status` answer becomes something this app remembers
 /// about the account it is on**, and writes to `settings.json`.
 ///
@@ -1919,8 +1954,9 @@ fn report_account_action(what: &str, outcome: SwitchOutcome) {
 /// `open_vault_window` refills from a window's own session before any switch
 /// runs, and `main`'s drain compares the id the prefetch was started for.
 ///
-/// Both copies of the account are updated, and the copies are checked to be the
-/// same account first. `active_account` is what `login_context` and
+/// The two copies are checked to be the same account BEFORE either of them is
+/// touched, and then both are updated. `active_account` is what `login_context`
+/// and
 /// `switch_to_account` name the account by; `AccountsState` is what every menu
 /// reads and what gets persisted. They are kept in step by `adopt`, so a
 /// disagreement here is a bug elsewhere — and writing one account's address
@@ -1943,17 +1979,23 @@ fn learn_active_account_details(
         return;
     };
     let (email, server_url) = (details.user_email.as_deref(), details.server_url.as_deref());
-    let changed = state.learn_active_details(email, server_url);
-    if active.id == state.active().id {
-        accounts::learn_account_details(active, email, server_url);
-    } else {
+    if active.id != state.active().id {
+        // NEITHER copy is touched, and nothing is persisted. This used to
+        // write `AccountsState` -- the copy `state.all()` persists -- BEFORE
+        // reaching this check, so the answer landed in `settings.json` under
+        // the other account's id while this very line claimed the address had
+        // been left alone. The log was the only thing that was wrong, and it
+        // was the only thing anyone would have read.
         log::error!(
-            "the active account ({}) is not the one `AccountsState` is on ({}); its address \
-             was left alone rather than overwritten with the other one's",
+            "the active account ({}) is not the one `AccountsState` is on ({}); this `bw \
+             status` answer was discarded rather than written into either of them",
             active.id,
             state.active().id
         );
+        return;
     }
+    let changed = state.learn_active_details(email, server_url);
+    accounts::learn_account_details(active, email, server_url);
     if !changed {
         return;
     }
@@ -6526,29 +6568,42 @@ mod tests {
             );
         }
 
-        /// **The startup prefetch is checked against the account it was started
-        /// for before anything is learned from it.**
+        /// **The startup prefetch's drain ASKS the decision, rather than
+        /// re-deciding inline.**
         ///
-        /// `bw status` reports on whatever profile the CLI was pointed at when
-        /// it ran, and this one is spawned before the startup window's outcome
-        /// is dispatched — a window that can switch, add or remove an account.
-        /// Its answer can therefore land describing somebody else, and what is
-        /// done with it is not only a toolbar label: it is WRITTEN to
-        /// `settings.json`. Reachable, unfalsifiable from the outside, and the
-        /// worse version of the bug this change is closing.
+        /// The decision itself is evaluated by
+        /// `the_prefetch_is_adopted_only_by_the_account_it_was_started_for`.
+        /// This pins only the wiring — that `main`'s frame loop calls it, and
+        /// that BOTH things the answer is used for sit on the true side.
+        ///
+        /// This test exists because its predecessor did not do that: it
+        /// asserted the condition's SOURCE TEXT appeared, so flipping the
+        /// condition's `&&` to `||` — which adopts account A's `bw status`
+        /// answer onto account B and persists it — left the entire suite
+        /// green. Source text is pinned here only where nothing else can
+        /// reach: `main`'s loop opens a real window and no harness can run it.
         #[test]
         fn the_startup_prefetch_is_dropped_unless_it_still_describes_the_active_account() {
+            let production = production_half_of_this_file();
+            let decision = concat!("prefetch_still_describes_the_active", "_account(");
+            assert_eq!(
+                production.matches(decision).count(),
+                2,
+                "expected the definition and exactly one call site -- `main`'s drain of the \
+                 startup prefetch; if the call is gone the decision is a pure function \
+                 nothing consults, and any answer is adopted onto whatever account is active"
+            );
+
             let drain = concat!("if let Ok((about, details)) = status_details_rx.try_", "recv() {");
             let block = block_after(drain);
-            let check = concat!("about.as_ref() == active_account.as_ref()", ".map(|a| &a.id)");
             assert!(
-                block.contains(check),
-                "the startup `bw status` answer is used without checking it still describes \
-                 the account this app is on: {block:?}"
+                block.contains(decision),
+                "the startup `bw status` answer is used without asking whether it still \
+                 describes the account this app is on: {block:?}"
             );
             let guarded = block
-                .split_once(check)
-                .expect("the check is there, per the assertion above")
+                .split_once(decision)
+                .expect("the call is there, per the assertion above")
                 .1;
             for (needle, what) in [
                 (concat!("learn_active_account", "_details("), "learned from"),
@@ -7999,6 +8054,166 @@ mod tests {
     // ---------------------------------------------------------------------
     // Filling in the email an account was minted without.
     // ---------------------------------------------------------------------
+
+    /// **The startup prefetch's staleness decision, evaluated.**
+    ///
+    /// `bw status` is spawned before the startup window's outcome is
+    /// dispatched, and that window can switch, add or remove an account. So its
+    /// answer can land describing somebody else — and it is not only a toolbar
+    /// label, it is WRITTEN to `settings.json` by
+    /// `learn_active_account_details`.
+    ///
+    /// The predecessor of this test asserted only that the condition's source
+    /// text appeared in `main.rs`; flipping that condition's `&&` to `||` — so
+    /// that account A's answer is adopted onto, and persisted against, account
+    /// B — left the whole suite green. Every row below is a case that mutation
+    /// gets wrong.
+    #[test]
+    fn the_prefetch_is_adopted_only_by_the_account_it_was_started_for() {
+        let a = account(ACCOUNT_A, "ana@example.com").id;
+        let b = account(ACCOUNT_B, "ben@example.com").id;
+        let a_again = account(ACCOUNT_A, "someone-else@example.com").id;
+
+        for (started_for, active_now, adopt, why) in [
+            (
+                Some(&a),
+                Some(&a),
+                true,
+                "the app is on the very account the prefetch was started for, so the one \
+                 `bw status` spawn the startup paid for is thrown away for nothing",
+            ),
+            (
+                Some(&a),
+                Some(&a_again),
+                true,
+                "control: the decision compares ids, not the `Account` values around them -- \
+                 the same account carrying a different email must still be the same account",
+            ),
+            (
+                Some(&a),
+                Some(&b),
+                false,
+                "the startup window switched account, and account A's address is adopted \
+                 onto -- and persisted against -- account B",
+            ),
+            (
+                None,
+                Some(&a),
+                false,
+                "there was no account when the prefetch was spawned, so `bw status` reported \
+                 on whatever profile the CLI defaults to; nothing says that is this account",
+            ),
+            (
+                Some(&a),
+                None,
+                false,
+                "there is no active account to learn the answer onto",
+            ),
+            (None, None, false, "neither side names an account at all"),
+        ] {
+            assert_eq!(
+                prefetch_still_describes_the_active_account(started_for, active_now),
+                adopt,
+                "started for {started_for:?}, now on {active_now:?}: {why}"
+            );
+        }
+    }
+
+    /// **Two copies that disagree teach each other nothing, and nothing is
+    /// written.**
+    ///
+    /// `AccountsState` is what `state.all()` persists; `active_account` is what
+    /// `login_context` and `switch_to_account` name the account by. They are
+    /// kept in step by `adopt`, so a disagreement here is a bug elsewhere — and
+    /// the guard exists precisely so that bug does not become a confident,
+    /// PERSISTED, wrong address.
+    ///
+    /// The guard used to be checked one line too late: `AccountsState` — the
+    /// copy that gets written to `settings.json` — was updated first, so the
+    /// answer landed in the file under the other account's id while the `else`
+    /// arm logged that the address "was left alone". Deleting the guard
+    /// entirely left the whole suite green.
+    #[test]
+    fn details_are_learned_onto_neither_copy_when_the_two_copies_disagree() {
+        let scratch = ScratchConfig::with_accounts("learn-disagree", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+
+        let a = account(ACCOUNT_A, "ana@example.com");
+        let b = account(ACCOUNT_B, "ben@example.com");
+        // The disagreement: `AccountsState` has settled onto B, `active_account`
+        // is still A, and the answer that arrives describes A.
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone(), b.clone()],
+            &b,
+        ));
+        let mut active = Some(a.clone());
+
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana-NEW@example.com"),
+        );
+
+        let state_ref = state.as_ref().unwrap();
+        assert_eq!(
+            state_ref.active().email,
+            "ben@example.com",
+            "account A's address was written into account B's entry -- the copy that gets \
+             persisted -- which is the address bug with a confident wrong answer instead of a \
+             blank one"
+        );
+        assert_eq!(
+            state_ref.active().server_url,
+            None,
+            "account B learned account A's SERVER, so this app would go on to talk to the \
+             wrong host for it"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().email,
+            "ana@example.com",
+            "`active_account` learned from an answer the two copies could not agree described \
+             it"
+        );
+        assert!(
+            !settings_path.exists(),
+            "the disagreement was written to settings.json, so it survives the launch: {:?}",
+            std::fs::read_to_string(&settings_path)
+        );
+
+        // The positive control, on the same scratch directory and the same
+        // details: with the two copies agreed, all of the above DOES happen.
+        // Without this every assertion above passes against a function that
+        // learns nothing from anything.
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![a.clone(), b.clone()],
+            &a,
+        ));
+        let mut active = Some(a.clone());
+        learn_active_account_details(
+            &settings_path,
+            &mut state,
+            &mut active,
+            &signed_in_as("ana-NEW@example.com"),
+        );
+        assert_eq!(
+            state.as_ref().unwrap().active().email,
+            "ana-NEW@example.com",
+            "control: the agreeing case must learn, or the assertions above say nothing"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().email,
+            "ana-NEW@example.com",
+            "control: `active_account` must learn in the agreeing case"
+        );
+        assert!(
+            settings_path.exists(),
+            "control: nothing in this harness can write settings.json, so the file assertion \
+             above says nothing"
+        );
+    }
 
     /// **The "random hash" bug, end to end.** `resolve_startup` mints a
     /// first-install account with an empty email, `account_label` falls back to
