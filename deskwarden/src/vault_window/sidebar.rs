@@ -1121,6 +1121,7 @@ mod drag_and_drop_tests {
                                 &icons,
                                 &mut visible,
                                 None,
+                                false,
                             );
                         },
                     );

@@ -448,6 +448,122 @@ pub fn search_hint(count: Option<usize>, filter: &SidebarFilter) -> String {
     }
 }
 
+/// What this pane draws where the rows would be, when there are no rows.
+///
+/// **Three distinguishable situations wearing one appearance.** Until this
+/// existed, a list with nothing in it painted literally nothing -- an empty
+/// grey rectangle under the search box -- whether the answer had not arrived
+/// yet, had arrived and was empty, or had been filtered down to nothing. A
+/// blank pane is the shape of a broken window, and it is the thing the report
+/// behind this work describes: "you need to show a window instantly with
+/// spinner and then whatever it takes to show something".
+///
+/// The live vault's own initial load is NOT one of these. It is handled a
+/// level up, by `vault_body_state`, which replaces the whole window body --
+/// sidebar included -- with one centred spinner and never reaches this pane at
+/// all. That is deliberate and stays: half-drawn chrome around an empty list
+/// reads as an empty vault. See `list_unless_unfetched`, whose `LiveVault` arm
+/// says the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListPlaceholder {
+    /// The list this scope reads has not been answered yet. Reached by the
+    /// Trash and Archive rows, which are on-demand queries against `bw serve`
+    /// -- measured at 3.46s on a cold backend, which is a long time to look
+    /// at an empty box.
+    Loading,
+    /// Answered, and this scope genuinely holds nothing: an empty Trash, a
+    /// folder with nothing filed in it, a type the vault has none of.
+    Empty,
+    /// This scope has contents; the search matched none of them.
+    NoMatches,
+}
+
+impl ListPlaceholder {
+    /// The one wording for each state. A method rather than three literals at
+    /// the draw site so the states can be asserted without a rendered frame,
+    /// and so the draw site cannot grow a fourth wording nothing decided on.
+    pub fn message(self) -> &'static str {
+        match self {
+            ListPlaceholder::Loading => "Loading…",
+            ListPlaceholder::Empty => "Nothing here yet",
+            ListPlaceholder::NoMatches => "No items match your search",
+        }
+    }
+}
+
+/// Decides between the three (see [`ListPlaceholder`]), or `None` when there
+/// are rows to draw and no placeholder belongs on screen at all.
+///
+/// Every argument is a fact the caller already had; none of them is a new
+/// "is a fetch in flight" flag:
+///
+///  * `fetched` -- `items.is_some()`, the `Option` this function's caller is
+///    already handed precisely because "no answer yet" and "no items" are
+///    different (see `draw_item_list`'s own doc, and `list_unless_unfetched`).
+///  * `fetch_failed` -- the window's `aux_error` for the row that is selected
+///    right now, i.e. `AuxList::error`. It is `None` for the live vault.
+///  * `matched` -- how many rows survived the filter and the search.
+///  * `searching` -- whether the search box has anything in it.
+///
+/// **A failed fetch draws no placeholder, and that is the important arm.** A
+/// spinner that never resolves is worse than the blank pane it replaced, and
+/// `!fetched` alone cannot tell "in flight" from "gave up" -- `AuxList` clears
+/// neither `items` nor much else on failure. The failure already reaches the
+/// user through the inline notice band this pane draws above the list
+/// (`inline_notice`/`NoticeSource::Aux`), which also carries the retry, so
+/// this returns `None` and lets that band be the answer rather than sitting a
+/// second, contradictory message underneath it.
+pub fn list_placeholder(
+    fetched: bool,
+    fetch_failed: bool,
+    matched: usize,
+    searching: bool,
+) -> Option<ListPlaceholder> {
+    if matched > 0 {
+        return None;
+    }
+    if fetch_failed {
+        return None;
+    }
+    if !fetched {
+        return Some(ListPlaceholder::Loading);
+    }
+    if searching {
+        return Some(ListPlaceholder::NoMatches);
+    }
+    Some(ListPlaceholder::Empty)
+}
+
+/// Paints one [`ListPlaceholder`] where the rows would be.
+///
+/// **Deliberately the same visual language as `loading_ui::show_while`**, the
+/// window this app already shows while `bw serve` starts: a `theme::BLUE`
+/// spinner over a `theme::semibold` line in `theme::TEXT_SECONDARY`, at the
+/// same sizes. Two spinners invented separately would read as two apps.
+///
+/// The repaint request is `super::LOADING_FRAME_INTERVAL` -- the same constant
+/// the whole-window loading body uses, not a second number -- because the
+/// window's ambient cadence is `FRAME_INTERVAL` (500ms), at which a spinner
+/// does not animate so much as twitch. It is asked for only in the `Loading`
+/// arm; the other two are static text with nothing to drive.
+fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
+    let available = ui.available_height();
+    ui.vertical_centered(|ui| {
+        // Roughly half the spinner-plus-label block, so the pair sits centred
+        // rather than the spinner alone -- the same arithmetic the window
+        // body's spinner uses.
+        ui.add_space((available / 2.0 - 30.0).max(0.0));
+        if placeholder == ListPlaceholder::Loading {
+            ui.add(egui::Spinner::new().size(22.0).color(theme::BLUE));
+            ui.add_space(10.0);
+        }
+        ui.label(theme::semibold(placeholder.message(), 13.0).color(theme::TEXT_SECONDARY));
+    });
+    if placeholder == ListPlaceholder::Loading {
+        ui.ctx().request_repaint_after(super::LOADING_FRAME_INTERVAL);
+    }
+}
+
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
 const AVATAR_SIZE: f32 = 32.0;
 
@@ -508,6 +624,12 @@ pub fn draw_item_list(
     icons: &IconCache,
     visible_ids: &mut Vec<String>,
     move_error: Option<&str>,
+    // Whether the fetch that would have filled `items` gave up -- the window's
+    // `aux_error` for the row selected right now, which is `AuxList::error`
+    // and nothing new. Read by `list_placeholder` alone, and only so that a
+    // list which is empty BECAUSE the fetch failed does not get a spinner that
+    // can never resolve. See that function.
+    fetch_failed: bool,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -668,6 +790,20 @@ pub fn draw_item_list(
             // maths on the old pitch, which puts the list out of register
             // with its own scrollbar.
             ui.spacing_mut().item_spacing.y = ROW_GAP;
+            // No rows: say which of the three reasons this is, instead of
+            // leaving a blank rectangle that reads the same for all of them.
+            // Drawn INSTEAD OF the scroll area rather than inside it -- an
+            // empty `show_rows` has no rows to hang anything off, and the
+            // reserved scrollbar gutter has nothing to scroll.
+            if let Some(placeholder) = list_placeholder(
+                items.is_some(),
+                fetch_failed,
+                filtered.len(),
+                !search_lower.trim().is_empty(),
+            ) {
+                draw_list_placeholder(ui, placeholder);
+                return;
+            }
             theme::scrollbar_in_gutter(ui, LIST_PADDING);
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1972,6 +2108,10 @@ mod row_tile_tests {
                     // has no business growing a parameter for it; the band
                     // has its own module below.
                     None,
+                    // Nothing failed here, and nothing in this module's
+                    // harnesses draws an empty list -- `list_placeholder` is
+                    // asserted directly, by `list_placeholder_tests`.
+                    false,
                 );
             })
         };
@@ -3684,6 +3824,7 @@ mod toolbar_strip_tests {
                     &icons,
                     &mut visible,
                     None,
+                    false,
                 );
             })
         };
@@ -4128,6 +4269,7 @@ mod move_error_band_tests {
                     &icons,
                     &mut visible,
                     move_error,
+                    false,
                 );
             })
         };
@@ -4281,5 +4423,303 @@ mod move_error_band_tests {
                  pitch and the painted pitch have diverged"
             );
         }
+    }
+}
+
+/// **The three ways this pane can have no rows**, which until now all painted
+/// the same blank rectangle.
+///
+/// The distinction is not academic: a user can reach all three in one session
+/// -- select Trash (loading), watch it come back empty (empty), type into the
+/// search box (no matches) -- and the pane said nothing at any point.
+#[cfg(test)]
+mod list_placeholder_tests {
+    use super::{list_placeholder, ListPlaceholder};
+
+    /// The state the report is about: an on-demand list that has been asked
+    /// for and has not answered yet. `/list/object/items` is 3.46s cold.
+    #[test]
+    fn an_unanswered_list_says_it_is_loading() {
+        assert_eq!(
+            list_placeholder(false, false, 0, false),
+            Some(ListPlaceholder::Loading),
+            "a list that has not been fetched yet and has not failed is still in flight, and \
+             must say so rather than look like an empty vault"
+        );
+    }
+
+    /// The positive control for every negative below, and for the feature as a
+    /// whole: rows on screen means no placeholder at all. A build that always
+    /// returned `Some(Loading)` satisfies the test above and fails here.
+    #[test]
+    fn a_list_with_rows_draws_no_placeholder() {
+        assert_eq!(
+            list_placeholder(true, false, 12, false),
+            None,
+            "there are rows to draw; a placeholder would be painted over a populated list"
+        );
+    }
+
+    /// And it stays `None` while a fetch is still in flight, so a list that
+    /// already has something on screen is never replaced by a spinner.
+    #[test]
+    fn rows_on_screen_outrank_a_fetch_still_in_flight() {
+        assert_eq!(list_placeholder(false, false, 3, false), None);
+    }
+
+    /// A real vault with nothing in this scope -- an empty Trash, a folder
+    /// with nothing filed in it.
+    #[test]
+    fn an_answered_empty_list_says_it_is_empty_rather_than_loading() {
+        assert_eq!(
+            list_placeholder(true, false, 0, false),
+            Some(ListPlaceholder::Empty),
+            "the answer arrived and it was \"nothing\"; a spinner here would never resolve"
+        );
+    }
+
+    /// The search box narrowed a scope that does have contents. Distinct from
+    /// `Empty` because the way out is different -- clear the search.
+    #[test]
+    fn a_search_that_matches_nothing_says_so_rather_than_claiming_the_scope_is_empty() {
+        assert_eq!(
+            list_placeholder(true, false, 0, true),
+            Some(ListPlaceholder::NoMatches),
+            "the user typed something; \"Nothing here yet\" would blame the vault for the \
+             search box"
+        );
+    }
+
+    /// **A failed fetch gets no spinner.** `!fetched` alone cannot tell "in
+    /// flight" from "gave up", and a spinner that can never resolve is worse
+    /// than the blank pane it replaced. The failure has its own channel: the
+    /// inline notice band above the list, which also carries the retry.
+    #[test]
+    fn a_failed_fetch_does_not_spin_forever() {
+        assert_eq!(
+            list_placeholder(false, true, 0, false),
+            None,
+            "this list has no answer because the fetch FAILED. A spinner would claim a fetch \
+             is running when none is, and nothing would ever take it down -- `AuxList` does \
+             not retry on its own. The inline notice band says what happened and carries the \
+             retry."
+        );
+    }
+
+    /// The same, with a search active: the failure still outranks it. There is
+    /// nothing that could have matched.
+    #[test]
+    fn a_failed_fetch_outranks_the_search_wording_too() {
+        assert_eq!(list_placeholder(false, true, 0, true), None);
+    }
+
+    /// Every state has its own words. Written out rather than derived from the
+    /// enum, so a message silently becoming another state's fails here instead
+    /// of agreeing with whatever it is handed.
+    #[test]
+    fn each_state_says_a_different_thing() {
+        assert_eq!(ListPlaceholder::Loading.message(), "Loading…");
+        assert_eq!(ListPlaceholder::Empty.message(), "Nothing here yet");
+        assert_eq!(
+            ListPlaceholder::NoMatches.message(),
+            "No items match your search"
+        );
+    }
+}
+
+/// The placeholder as the user meets it: painted into a real `egui::Context`
+/// and read back off the frame, because none of it is observable from
+/// `list_placeholder` alone -- a correct decision that the draw site ignores
+/// is the blank pane all over again.
+#[cfg(test)]
+mod list_placeholder_paint_tests {
+    use super::*;
+    use crate::theme;
+
+    const PANE_WIDTH: f32 = 390.0;
+
+    fn an_item(name: &str) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// One real frame of `draw_item_list`, at the item pane's own width, with
+    /// the two inputs `run_item_list` fixes and this module has to vary: the
+    /// unfetched `None` list, and a failed fetch.
+    fn painted_pane(items: Option<&[VaultItem]>, search: &str, fetch_failed: bool) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(PANE_WIDTH, 700.0),
+            )),
+            ..Default::default()
+        };
+        // Two throwaway frames so `theme::apply`'s font set is live -- the
+        // same reason every other painted-output harness in this crate runs
+        // them.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut search = search.to_string();
+        let mut selected = None;
+        let icons = IconCache::default();
+        let mut visible = Vec::new();
+        let mut draw = |search: &mut String| {
+            ctx.run_ui(input(), |ui| {
+                draw_item_list(
+                    ui,
+                    items,
+                    &[],
+                    &SidebarFilter::All,
+                    search,
+                    &mut selected,
+                    None,
+                    &icons,
+                    &mut visible,
+                    None,
+                    fetch_failed,
+                );
+            })
+        };
+        let _ = draw(&mut search);
+        let output = draw(&mut search);
+
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// **The control every negative below is worth nothing without**: a
+    /// populated list paints its row and none of the three messages.
+    #[test]
+    fn a_populated_list_paints_its_rows_and_no_placeholder() {
+        let texts = painted_pane(Some(&[an_item("Ledgerline")]), "", false);
+        assert!(
+            texts.iter().any(|t| t == "Ledgerline"),
+            "control: the row itself is painted. Painted: {texts:?}"
+        );
+        for state in [
+            ListPlaceholder::Loading,
+            ListPlaceholder::Empty,
+            ListPlaceholder::NoMatches,
+        ] {
+            assert!(
+                !texts.iter().any(|t| t == state.message()),
+                "a populated list painted {:?} over its own rows. Painted: {texts:?}",
+                state.message()
+            );
+        }
+    }
+
+    /// The report's state, painted: an unfetched list says it is loading
+    /// instead of showing an empty box.
+    #[test]
+    fn an_unfetched_list_paints_the_loading_message() {
+        let texts = painted_pane(None, "", false);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == ListPlaceholder::Loading.message()),
+            "an unfetched list painted no loading message, so it is the blank pane this work \
+             is about. Painted: {texts:?}"
+        );
+    }
+
+    /// A fetched, empty list says it is empty -- and specifically does NOT say
+    /// it is loading, which is the untruth a single "no rows" placeholder
+    /// would have shipped.
+    #[test]
+    fn an_empty_list_paints_the_empty_message_and_not_the_loading_one() {
+        let texts = painted_pane(Some(&[]), "", false);
+        assert!(
+            texts.iter().any(|t| t == ListPlaceholder::Empty.message()),
+            "an empty list painted nothing at all. Painted: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t == ListPlaceholder::Loading.message()),
+            "an empty list claims to be loading, and nothing would ever take that down. \
+             Painted: {texts:?}"
+        );
+    }
+
+    /// A search that matches nothing, over a list that does have contents.
+    #[test]
+    fn a_search_matching_nothing_paints_the_no_matches_message() {
+        let texts = painted_pane(Some(&[an_item("Ledgerline")]), "zzzzz", false);
+        assert!(
+            texts
+                .iter()
+                .any(|t| t == ListPlaceholder::NoMatches.message()),
+            "a search matching nothing painted an empty pane. Painted: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|t| t == ListPlaceholder::Empty.message()),
+            "a search matching nothing blamed the vault for being empty. Painted: {texts:?}"
+        );
+    }
+
+    /// The spinner-that-never-resolves guard, painted: a failed fetch leaves
+    /// the pane to the inline notice band above it.
+    #[test]
+    fn a_failed_fetch_paints_no_loading_message() {
+        let texts = painted_pane(None, "", true);
+        assert!(
+            !texts
+                .iter()
+                .any(|t| t == ListPlaceholder::Loading.message()),
+            "a failed fetch is spinning. Nothing is running and nothing will land, so that \
+             spinner stays for the rest of the session. Painted: {texts:?}"
+        );
+    }
+
+    /// **The window must hand this pane the failure fact, and the right one.**
+    /// `list_placeholder`'s failure arm is unreachable if `vault_window::mod`
+    /// passes a constant, and WRONG if it passes `notice.is_some()` -- that
+    /// band also carries Generate and Move failures, neither of which says
+    /// anything about whether this list's fetch is still running.
+    #[test]
+    fn the_window_passes_this_lists_own_failure_and_not_the_bands() {
+        let source = include_str!("mod.rs");
+        let needle = concat!("aux_error", ".is_some(),");
+        assert!(
+            source.contains(needle),
+            "`vault_window::mod` no longer hands `draw_item_list` this row's own \
+             `AuxList::error`. If it passes a constant, the failure arm is dead and a failed \
+             Trash fetch spins forever; if it passes `notice.is_some()`, an unrelated \
+             Generate failure suppresses a spinner for a fetch that really is running."
+        );
+        assert!(
+            !source.contains(concat!("notice", ".is_some(),")),
+            "control: the band's own \"is anything on screen\" is not what is passed"
+        );
     }
 }

@@ -385,7 +385,11 @@ pub fn next_menu_event() -> Option<MenuEvent> {
 /// release, not the press -- Windows reports both as separate `Click`
 /// events with a `button_state`, and reacting on `Down` as well would fire
 /// this twice per physical click).
-pub fn is_left_click(event: &TrayIconEvent) -> bool {
+/// PRIVATE, and that is load-bearing rather than tidiness. `TrayIconEvent`
+/// does not leave this module: [`next_left_click`] is the only way anything
+/// outside it reads that channel, so no caller can be acting on a variant that
+/// [`discard_queued_icon_events`] throws away. See that function.
+fn is_left_click(event: &TrayIconEvent) -> bool {
     matches!(
         event,
         TrayIconEvent::Click {
@@ -396,8 +400,48 @@ pub fn is_left_click(event: &TrayIconEvent) -> bool {
     )
 }
 
-pub fn next_tray_icon_event() -> Option<TrayIconEvent> {
+/// Private for the reason [`is_left_click`] is: this channel is read from
+/// outside this module through [`next_left_click`] and nothing else.
+fn next_tray_icon_event() -> Option<TrayIconEvent> {
     TrayIconEvent::receiver().try_recv().ok()
+}
+
+/// The next queued tray-icon event, reduced to the only question this app asks
+/// of that channel: was it a completed left click?
+///
+/// `None` when the channel is empty. `Some(false)` is an event that is not a
+/// left click -- a button-down, a pointer move, the right click that opens the
+/// menu (which `muda` delivers on its own separate channel anyway) -- and the
+/// caller ignores it, exactly as it did back when it was handed the event
+/// itself and tested it with `is_left_click`.
+///
+/// **The reduction is the point, not a convenience.** It is what makes
+/// [`discard_queued_icon_events`] provably lossless: that function throws away
+/// every queued tray-icon event, and no caller can have been acting on the
+/// variants it discards, because outside this module no caller can see them.
+/// Restoring `pub` to either function below reopens exactly that gap.
+pub fn next_left_click() -> Option<bool> {
+    next_tray_icon_event().as_ref().map(is_left_click)
+}
+
+/// Throws away every tray-icon event sitting in the channel RIGHT NOW, and
+/// reports how many of them were left clicks (i.e. how many "open the vault"
+/// requests are being dropped as already answered).
+///
+/// Called immediately after the vault window returns; see `main`'s
+/// `requests_outliving_a_window` for the rule, and why "queued at this instant"
+/// is a boundary rather than a race.
+///
+/// Draining the whole channel rather than only the left clicks is safe here
+/// because of the module boundary [`next_left_click`] draws -- see its doc.
+pub fn discard_queued_icon_events() -> usize {
+    let mut left_clicks = 0;
+    while let Some(was_left_click) = next_left_click() {
+        if was_left_click {
+            left_clicks += 1;
+        }
+    }
+    left_clicks
 }
 
 /// Enables the "Update available" tray item and labels it with the version

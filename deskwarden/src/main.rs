@@ -55,10 +55,12 @@ use deskwarden::{
     prefs_ui, session_store, settings, tray, vault_window, window_watch,
 };
 use semver::Version;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Child;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+use tray_icon::menu::{MenuEvent, MenuId};
 use windows::core::HSTRING;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR,
@@ -755,11 +757,18 @@ fn main() {
     // stall in terms of what was actually requested (review Minor 4) instead
     // of always assuming a sync.
     let mut backend_task_in_progress: Option<(Instant, BackendOpKind)> = None;
+    // Tray menu clicks that arrived while one of this app's blocking windows
+    // was up and SURVIVED the sweep that runs when it closes -- i.e. requests
+    // that window did not answer. Popped before the channel below, so they are
+    // handled in the order the user made them rather than behind whatever has
+    // arrived since. Empty on every ordinary iteration; see
+    // `requests_outliving_a_window`.
+    let mut pending_menu_events: VecDeque<MenuEvent> = VecDeque::new();
 
     loop {
         pump_windows_messages();
 
-        if let Some(event) = tray::next_menu_event() {
+        if let Some(event) = pending_menu_events.pop_front().or_else(tray::next_menu_event) {
             if event.id == tray.quit_id {
                 // `bw serve` doesn't get killed on its own: `Child` doesn't
                 // kill its process on `Drop`, and `process::exit` below
@@ -808,6 +817,16 @@ fn main() {
                     &mut backend_task_in_progress,
                 );
                 rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+                // Everything the user clicked at the tray while the window was
+                // up is queued behind this line. Asking for the vault window
+                // again is already answered -- it was open, and raised -- so
+                // those requests stop here instead of reopening it once per
+                // click. Anything else queued behind them is kept and handled
+                // on the next iterations. See `requests_outliving_a_window`.
+                drop_vault_requests_queued_behind_the_window(
+                    &mut pending_menu_events,
+                    &tray.open_vault_id,
+                );
                 last_dispatched_hwnd = None;
             }
 
@@ -832,6 +851,18 @@ fn main() {
                         log::warn!("could not save settings: {e}");
                     }
                 }
+                // The vault window is not the only blocking one, and this is
+                // the other one the TRAY can open: repeat clicks on
+                // Preferences queue behind it exactly the same way and used to
+                // reopen it once per click. Swept for the request it answers
+                // and no other -- a tray-icon left click made while
+                // Preferences was up is a genuine "open the vault" that
+                // nothing has served, so that channel is deliberately left
+                // alone here.
+                drain_requests_queued_behind_a_window(
+                    &mut pending_menu_events,
+                    &tray.preferences_id,
+                );
                 last_dispatched_hwnd = None;
             }
 
@@ -1253,6 +1284,14 @@ fn main() {
                     }
                 }
 
+                // THE THIRD BLOCKING WINDOW THIS TRAY OPENS, and it opens
+                // TWO of them back to back (`AddAppFlow::begin`'s item picker,
+                // then `run_picker`) -- so this is the longest any tray click
+                // can sit queued, and repeat clicks on "Add app..." ran the
+                // whole two-window flow again once per click. Swept for the
+                // request it answers and no other; see
+                // `requests_outliving_a_window`.
+                drain_requests_queued_behind_a_window(&mut pending_menu_events, &tray.add_app_id);
                 // Our own picker windows just stole and released foreground.
                 // Forget the last-dispatched hwnd so the window the user
                 // returns to is treated as a fresh switch rather than being
@@ -1339,34 +1378,41 @@ fn main() {
         // menu (built with `with_menu_on_left_click(false)` specifically so
         // the two aren't the same action). Same event, same recovery path as
         // the menu's "Open Vault" item above -- just a different trigger.
-        if let Some(event) = tray::next_tray_icon_event() {
-            if tray::is_left_click(&event) {
-                open_vault_window(
-                    &cache,
-                    &fill_stats,
-                    &injector,
-                    &mut session_token,
-                    &mut bw_serve_child,
-                    &job,
-                    &mut store,
-                    &schedule,
-                    &mut engine,
-                    &icon_cache_dir,
-                    &mut cached_status_details,
-                    &config_dir,
-                    &mut active_account,
-                    &mut accounts_state,
-                    first_run_account.as_ref(),
-                    &mut settings,
-                    &settings_path,
-                    &tray,
-                    &backend_op_tx,
-                    &backend_op_rx,
-                    &mut backend_task_in_progress,
-                );
-                rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
-                last_dispatched_hwnd = None;
-            }
+        if tray::next_left_click() == Some(true) {
+            open_vault_window(
+                &cache,
+                &fill_stats,
+                &injector,
+                &mut session_token,
+                &mut bw_serve_child,
+                &job,
+                &mut store,
+                &schedule,
+                &mut engine,
+                &icon_cache_dir,
+                &mut cached_status_details,
+                &config_dir,
+                &mut active_account,
+                &mut accounts_state,
+                first_run_account.as_ref(),
+                &mut settings,
+                &settings_path,
+                &tray,
+                &backend_op_tx,
+                &backend_op_rx,
+                &mut backend_task_in_progress,
+            );
+            rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+            // The second door into the same window, swept the same way and
+            // through the same name -- see the tray menu's "Open Vault"
+            // handler above. This is the door the report was made through:
+            // three left clicks while the vault loaded became three
+            // windows.
+            drop_vault_requests_queued_behind_the_window(
+                &mut pending_menu_events,
+                &tray.open_vault_id,
+            );
+            last_dispatched_hwnd = None;
         }
 
         if hotkey::fill_hotkey_pressed(&fill_hotkey) {
@@ -2145,6 +2191,94 @@ fn rebuild_after_vault_window(tray: &mut tray::AppTray, state: Option<&accounts:
     tray.rebuild_accounts_menu(state);
 }
 
+/// Which of the tray requests that piled up behind a blocking window still
+/// need handling.
+///
+/// **The bug.** Every window this app opens from the tray owns the main thread
+/// for as long as it is up -- `open_vault_window`, `prefs_ui::run`,
+/// `picker_ui::run_picker` all block `main`'s loop. The tray's event channels
+/// do not stop during that: `muda` and `tray-icon` deliver into unbounded
+/// `crossbeam` channels from the window-message pump, and the pump keeps
+/// running because eframe/winit is pumping the very same thread. So a user who
+/// clicks the tray icon three times while waiting for the vault to load queues
+/// three requests, and the loop faithfully replays all three the moment the
+/// window closes -- opening it again, and again. That is the report: "if user
+/// clicks 3 times on tray icon (while waiting for a window) - if you close it,
+/// it will launch 2 more times once closed".
+///
+/// **The rule is not "discard whatever is queued".** A click asking for the
+/// window that was ALREADY on screen has been served -- it was shown, and
+/// `foreground::raise_window` brought it to the front on its first frame, so
+/// "show me the window" is precisely what happened. A click asking for
+/// anything else -- Quit, Preferences, Sync, an account switch -- was served by
+/// nothing and is still owed an answer; dropping those would trade one report
+/// for a worse one (a Quit clicked at the tray while the vault window was up
+/// would be silently ignored). So `satisfied` names the request the window
+/// answers, and only that request is dropped.
+///
+/// **"While it was running" is a boundary, not a guess.** The caller drains the
+/// channel ONCE, immediately after the blocking call returns, so what it hands
+/// here is exactly what was already queued at that instant -- which is to say,
+/// what arrived while the window was up, since the loop had drained everything
+/// before it opened. A click a moment after the close lands after that drain
+/// and is handled normally on the next iteration; it is never seen by this
+/// function at all. Nothing here compares timestamps, and none of the two
+/// event types carries one.
+///
+/// Order is preserved: the survivors are replayed as if the window had never
+/// been in the way.
+fn requests_outliving_a_window(queued: Vec<MenuEvent>, satisfied: &MenuId) -> Vec<MenuEvent> {
+    queued
+        .into_iter()
+        .filter(|event| {
+            if &event.id == satisfied {
+                log::info!(
+                    "ignoring a tray request for `{}` queued while that window was already open",
+                    event.id.0
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+/// [`requests_outliving_a_window`] against the live tray channel: drains
+/// whatever is queued right now, drops the requests the window that just
+/// closed already satisfied, and appends the rest to `pending` for `main`'s
+/// loop to handle on its next iterations.
+///
+/// `pending` is appended to rather than replaced because a previous window can
+/// have left survivors of its own that have not been handled yet -- the tray's
+/// Preferences item opens a window from inside the same block that would
+/// otherwise be popping them.
+/// [`drain_requests_queued_behind_a_window`] for the vault window
+/// specifically, which is the one window this app has TWO doors into: the
+/// tray menu's "Open Vault" item and a left click on the tray icon itself.
+/// Both doors queue, so both have to be swept, and one name at both call sites
+/// is what stops a future third door from sweeping only half of it.
+fn drop_vault_requests_queued_behind_the_window(
+    pending: &mut VecDeque<MenuEvent>,
+    open_vault_id: &MenuId,
+) {
+    drain_requests_queued_behind_a_window(pending, open_vault_id);
+    let clicks = tray::discard_queued_icon_events();
+    if clicks > 0 {
+        log::info!(
+            "ignoring {clicks} tray-icon click(s) queued while the vault window was already open"
+        );
+    }
+}
+
+fn drain_requests_queued_behind_a_window(pending: &mut VecDeque<MenuEvent>, satisfied: &MenuId) {
+    let mut queued = Vec::new();
+    while let Some(event) = tray::next_menu_event() {
+        queued.push(event);
+    }
+    pending.extend(requests_outliving_a_window(queued, satisfied));
+}
+
 /// Opens the vault window and handles it locking itself before returning.
 /// Shared by both ways of asking for it -- the tray menu's "Open Vault" item
 /// and a left click on the tray icon -- so the recovery sequence (mirroring
@@ -2244,10 +2378,22 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
     // Every other outcome (closed, locked, needs re-auth) still leaves this
     // function exactly once, on its first pass.
     loop {
+    // Opening this window is the app's slowest visible action and the one a
+    // user times with their own patience, so each stage of it says how long
+    // it took. Without this the only honest answer to "why did that take ten
+    // seconds" is a guess: the stages have very different costs (a `bw`
+    // spawn is seconds, a backend start is seconds, and eframe's own window
+    // and GPU setup is not free either), and which one dominates depends on
+    // what the backend was doing beforehand.
+    let opened_at = Instant::now();
     let status_details = match cached_status_details.take() {
         Some(details) => details,
-        None => login_ui::check_bw_status_details(),
+        None => {
+            log::info!("vault window: status details were not prefetched; spawning `bw status`");
+            login_ui::check_bw_status_details()
+        }
     };
+    log::info!("vault window: account details ready in {:?}", opened_at.elapsed());
     // Refill the cache with what this open just used -- a cheap clone in the
     // common (already-cached) case, and what lets the *next* open skip the
     // spawn too when this call itself was the one that had to fall back.
@@ -2276,6 +2422,16 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
     }
 
+    // The last thing before the window exists. Everything after this is
+    // eframe's own startup -- creating the OS window, picking a graphics
+    // backend, building the font atlas -- which this app does not control
+    // and which is invisible to any timing inside the frame closure, since
+    // the first closure call happens after all of it.
+    log::info!(
+        "vault window: handing off to eframe after {:?} (backend was {})",
+        opened_at.elapsed(),
+        if backend_already_running { "already up" } else { "being started" }
+    );
     let result = vault_window::run(
         cache.clone(),
         fill_stats.clone(),
@@ -8827,5 +8983,258 @@ mod tests {
             block.contains(concat!("StartupAccounts::", "Ready")),
             "control: the region really does name the variants it resolves to"
         );
+    }
+
+    /// **A tray click made while one of this app's blocking windows was up.**
+    ///
+    /// The report: "if user clicks 3 times on tray icon (while waiting for a
+    /// window) - if you close it, it will launch 2 more times once closed".
+    /// `open_vault_window` owns the main thread for as long as the window is
+    /// up, and the tray's channels keep filling behind it because eframe is
+    /// pumping the same thread's messages -- so the clicks were queued, then
+    /// replayed one window at a time.
+    mod requests_queued_behind_a_window {
+        use super::*;
+        use tray_icon::menu::{MenuEvent, MenuId};
+
+        fn click(id: &str) -> MenuEvent {
+            MenuEvent { id: MenuId::new(id) }
+        }
+
+        fn labels(events: &[MenuEvent]) -> Vec<&str> {
+            events.iter().map(|e| e.id.0.as_str()).collect()
+        }
+
+        const OPEN_VAULT: &str = "open-vault";
+        const PREFERENCES: &str = "preferences";
+        const QUIT: &str = "quit";
+
+        /// The report itself. Three clicks, one window: the two that landed
+        /// while it was already open asked for a window that was already on
+        /// screen and already raised, so they have been answered.
+        #[test]
+        fn the_extra_clicks_made_while_the_window_was_up_do_not_reopen_it() {
+            let survivors = requests_outliving_a_window(
+                vec![click(OPEN_VAULT), click(OPEN_VAULT)],
+                &MenuId::new(OPEN_VAULT),
+            );
+            assert!(
+                survivors.is_empty(),
+                "two \"open the vault\" clicks queued behind the vault window survived the \
+                 sweep, so closing it opens it {} more time(s) -- the report. They read: {:?}",
+                survivors.len(),
+                labels(&survivors)
+            );
+        }
+
+        /// **The positive control for the test above**, and the reason this is
+        /// a rule rather than a blanket drain of the channel. An
+        /// implementation that threw the whole queue away passes that test and
+        /// fails this one: a Quit clicked at the tray while the vault window
+        /// sat there loading is a request nothing has served, and swallowing
+        /// it trades one report for a worse one.
+        #[test]
+        fn a_request_the_window_did_not_answer_is_still_honoured() {
+            let survivors = requests_outliving_a_window(
+                vec![click(OPEN_VAULT), click(QUIT), click(OPEN_VAULT)],
+                &MenuId::new(OPEN_VAULT),
+            );
+            assert_eq!(
+                labels(&survivors),
+                vec![QUIT],
+                "the sweep is \"drop the requests this window already answered\", not \"drop \
+                 everything that is queued\" -- a Quit clicked while the window was up must \
+                 still quit"
+            );
+        }
+
+        /// A window answers ONE request, named by the caller. Preferences
+        /// closing does not entitle it to swallow a queued "Open Vault".
+        #[test]
+        fn a_sweep_only_drops_requests_for_the_window_that_was_actually_up() {
+            let survivors = requests_outliving_a_window(
+                vec![click(PREFERENCES), click(OPEN_VAULT), click(PREFERENCES)],
+                &MenuId::new(PREFERENCES),
+            );
+            assert_eq!(
+                labels(&survivors),
+                vec![OPEN_VAULT],
+                "only the id the caller named as satisfied may be dropped"
+            );
+        }
+
+        /// The survivors are replayed as if the window had never been in the
+        /// way, so they keep the order the user made them in.
+        #[test]
+        fn the_survivors_keep_the_order_the_user_clicked_them_in() {
+            let survivors = requests_outliving_a_window(
+                vec![click(PREFERENCES), click(OPEN_VAULT), click(QUIT)],
+                &MenuId::new(OPEN_VAULT),
+            );
+            assert_eq!(
+                labels(&survivors),
+                vec![PREFERENCES, QUIT],
+                "order is the user's; a sweep that reordered them would run Quit before the \
+                 Preferences window they asked for first"
+            );
+        }
+
+        /// Nothing queued is the overwhelmingly common case -- a window closed
+        /// with the user's hands nowhere near the tray -- and it must not
+        /// invent work.
+        #[test]
+        fn an_empty_queue_survives_as_an_empty_queue() {
+            assert!(requests_outliving_a_window(Vec::new(), &MenuId::new(OPEN_VAULT)).is_empty());
+        }
+
+        /// **Both doors into the vault window sweep on the way out.** The
+        /// window has two -- the tray menu's "Open Vault" item and a left
+        /// click on the icon -- and the report came through the second one, so
+        /// sweeping only the first would have left it standing.
+        ///
+        /// Per call site, not a count, for the reason the sibling
+        /// `every_way_into_the_vault_window_rebuilds_the_submenu_on_the_way_out`
+        /// gives: a third door that forgets the sweep must fail this with
+        /// nothing to "update".
+        #[test]
+        fn every_way_into_the_vault_window_sweeps_the_requests_queued_behind_it() {
+            let production = production_half_of_this_file();
+            // `concat!`-split and single-line, this file's usual two reasons.
+            // The call needle does not match `fn open_vault_window<A: ...>(`,
+            // whose `(` comes after the generics.
+            let call = concat!("open_vault", "_window(");
+            let sweep = concat!("drop_vault_requests_queued_behind", "_the_window(");
+            // The end of each call's statement -- a real boundary in the code
+            // (both sites forget the last dispatched window on the way out),
+            // not a byte count, which is the shape that already overran an arm
+            // in this file once.
+            let end_of_statement = concat!("last_dispatched_hwnd", " = None;");
+
+            let mut sites = 0usize;
+            let mut from = 0usize;
+            while let Some(offset) = production[from..].find(call) {
+                let at = from + offset;
+                from = at + call.len();
+                sites += 1;
+                let rest = &production[from..];
+                let end = rest.find(end_of_statement).unwrap_or_else(|| {
+                    panic!(
+                        "the vault-window call at byte {at} is not followed by \
+                         {end_of_statement:?}, so this test cannot tell where its statement \
+                         ends -- give it one, or reshape this boundary"
+                    )
+                });
+                let statement = &rest[..end];
+                assert!(
+                    statement.contains(sweep),
+                    "the vault-window call at byte {at} does not sweep the tray requests that \
+                     queued behind it. Every click the user made at the tray while the window \
+                     was up is still in the channel, and the loop replays them -- so closing \
+                     the window opens it again, once per click. The statement reads: \
+                     {statement:?}"
+                );
+            }
+
+            // Controls for that loop: it walked real call sites, and the
+            // needles are spelled the way the production code spells them.
+            // `>=`, not `== 2`, for the reason the sibling test records: an
+            // equality here makes a legitimate third door fail a test whose
+            // only green is editing a number.
+            assert!(
+                sites >= 2,
+                "control: the two known ways of opening the vault window -- the tray menu's \
+                 \"Open Vault\" item and a left click on the tray icon -- are what this walked; \
+                 finding {sites} means the needle stopped matching"
+            );
+            assert!(
+                production.contains(concat!(
+                    "fn drop_vault_requests_queued_behind",
+                    "_the_window("
+                )),
+                "control: the sweep helper is still declared here"
+            );
+        }
+
+
+        /// **The vault window is not the only one that blocks the loop**, and
+        /// the tray can open three of them: "Open Vault", "Preferences", and
+        /// "Add app...", which is the longest of the three because it opens
+        /// two windows back to back. All three queued repeat clicks and
+        /// replayed them, so all three sweep.
+        ///
+        /// Read off the argument each sweep is actually given, not off a
+        /// count: a fourth blocking tray window that forgets to sweep fails
+        /// this by name, and a sweep given the wrong window's id fails it too.
+        #[test]
+        fn every_blocking_window_the_tray_opens_sweeps_the_requests_queued_behind_it() {
+            /// The window, and the tray id a sweep for it must be handed.
+            const WINDOWS: [(&str, &str); 3] = [
+                ("the vault window", concat!("&tray.open_vault", "_id")),
+                ("the preferences window", concat!("&tray.preferences", "_id")),
+                ("the \"Add app...\" picker", concat!("&tray.add_app", "_id")),
+            ];
+            let production = production_half_of_this_file();
+            // Both spellings of a sweep. The declarations match these needles
+            // too and contribute nothing, because a parameter list holds no
+            // `&tray.` -- so they need no special case.
+            let sweeps = [
+                concat!("drain_requests_queued_behind", "_a_window("),
+                concat!("drop_vault_requests_queued_behind", "_the_window("),
+            ];
+
+            let mut swept: Vec<&str> = Vec::new();
+            for needle in sweeps {
+                let mut from = 0usize;
+                while let Some(offset) = production[from..].find(needle) {
+                    let at = from + offset;
+                    from = at + needle.len();
+                    let rest = &production[from..];
+                    // The end of the call's own argument list -- a real
+                    // boundary in the code rather than a byte count, which is
+                    // the shape that already overran an arm in this file once.
+                    let end = rest.find(");").unwrap_or_else(|| {
+                        panic!(
+                            "the sweep at byte {at} has no closing `);`, so this test cannot \
+                             read which window it was given"
+                        )
+                    });
+                    for (window, id) in WINDOWS {
+                        if rest[..end].contains(id) {
+                            swept.push(window);
+                        }
+                    }
+                }
+            }
+
+            for (window, id) in WINDOWS {
+                assert!(
+                    swept.contains(&window),
+                    "nothing sweeps the tray requests queued behind {window}. It blocks \
+                     `main`'s loop for as long as it is up, so every repeat click on its own \
+                     tray item is queued and replayed -- opening it again, once per click. \
+                     Hand {id} to a sweep after it returns. Swept: {swept:?}"
+                );
+            }
+        }
+
+        /// The queue is not a write-only sink: `main`'s loop has to actually
+        /// pop from it, and pop from it BEFORE the live channel, or a survivor
+        /// sits behind everything that has arrived since and is handled out of
+        /// order (or, if the user never touches the tray again, never).
+        #[test]
+        fn the_loop_prefers_a_survivor_to_a_freshly_arrived_event() {
+            let production = production_half_of_this_file();
+            let needle = concat!(
+                "pending_menu_events.pop_front()",
+                ".or_else(tray::next_menu_event)"
+            );
+            assert!(
+                production.contains(needle),
+                "`main`'s loop no longer reads the survivors of a sweep before the live tray \
+                 channel. Whatever they are read through must put them first: a Quit the user \
+                 clicked while the vault window was up would otherwise wait behind every event \
+                 that has arrived since"
+            );
+        }
     }
 }

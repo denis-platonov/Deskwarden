@@ -427,6 +427,23 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     // unlock -- see `spawn_vault_load`'s doc comment. `skip_readiness_wait`:
     // see `backend_already_running`'s own doc -- skips the readiness wait
     // when the caller already knows `bw serve` is up.
+    // **The number nothing in this app reported, and the one the user was
+    // actually timing.** `main.rs` logs how long it takes to hand off to
+    // eframe (microseconds) and this module logs how long eframe takes to
+    // paint a first frame (tens of milliseconds); between them they account
+    // for a tenth of a second of the ten the report describes. The rest of it
+    // is this: the window is up, painting its spinner, waiting for the load
+    // below. Measured against the live backend, `/list/object/items` is 3.46s
+    // cold and 0.065s warm, and a window opened occasionally is always the
+    // cold case -- plus a readiness wait when `bw serve` was only just
+    // started.
+    //
+    // Taken (not merely read) by the first result the drain actually APPLIES,
+    // so it reports the initial load and never a later refresh, and so a
+    // result dropped as superseded does not stop the clock on a load still in
+    // flight. `log::info!` and one `Instant`, i.e. free: this app's slowest
+    // visible action should be able to say what it spent the time on.
+    let mut initial_load_started = Some(Instant::now());
     spawn_vault_load(
         cache.clone(),
         vault_tx.clone(),
@@ -639,8 +656,17 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
 
+    // Measured from just before `run_ui_native` to the first frame the
+    // closure is handed, which is the span the user experiences as "nothing
+    // is happening yet" -- eframe creating the OS window, choosing a
+    // graphics backend and building the font atlas. None of it is
+    // observable from inside the closure, so it has to be taken from out
+    // here, and it is reported once rather than every frame.
+    let eframe_handoff = std::time::Instant::now();
+
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
+            log::info!("vault window: first frame {:?} after eframe was asked", eframe_handoff.elapsed());
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
@@ -776,6 +802,25 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                 &mut sync_status,
                 &mut totp_state,
             );
+            // `vault_loading` is cleared by `apply_vault_load_result` only for
+            // a result it actually applied -- a superseded one is dropped and
+            // leaves it set -- so this is the moment the spinner comes off the
+            // screen, whether that is because items landed or because the load
+            // gave up. Both are reported: a ten-second wait that ends in a
+            // failure is the worse of the two and the one most worth timing.
+            if !vault_loading {
+                if let Some(started) = initial_load_started.take() {
+                    log::info!(
+                        "vault window: vault load settled in {:?} -- {} items on screen{}",
+                        started.elapsed(),
+                        items.len(),
+                        match vault_load_error.as_deref() {
+                            Some(reason) => format!(", gave up: {reason}"),
+                            None => String::new(),
+                        }
+                    );
+                }
+            }
             // A vault that has just been re-read makes both on-demand lists
             // suspect: the same `bw sync` that changed `items` can have
             // trashed, restored, archived or unarchived something elsewhere.
@@ -1393,6 +1438,12 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
                     &icons,
                     &mut visible_ids,
                     notice.map(|(_, message)| message),
+                    // NOT `notice.is_some()`: the band can be carrying a
+                    // Generate or a Move failure, neither of which says
+                    // anything about whether this list's fetch is still
+                    // running. `aux_error` is this row's own `AuxList::error`
+                    // and is the only one of the three that does.
+                    aux_error.is_some(),
                 ) {
                     // The kind the `+ New` menu was clicked on -- `empty_of`,
                     // not `empty`, which would open a login form whatever row
