@@ -822,6 +822,37 @@ fn selected_window(windows: &[WindowInfo], selected: Option<isize>) -> Option<&W
     windows.iter().find(|w| w.hwnd == hwnd)
 }
 
+/// The match that gets written for the row the user selected.
+///
+/// **Everything is copied off the live window, here, at the moment Save is
+/// clicked -- nothing is resolved later.** That is not tidiness, it is the
+/// only order that works: the title is what identifies a Microsoft Store app
+/// once Windows suspends it, and by then the app has no `CoreWindow`, no
+/// nameable process and no reachable image path (see
+/// [`window_watch::attribute_window`]). A design that stored the process name
+/// and looked the rest up on demand would be able to answer only for apps that
+/// never needed it.
+///
+/// All three come from the SAME `WindowInfo`, which is what makes them
+/// consistent with each other: `window_list::enum_proc` builds the row's
+/// `exe_name` and `exe_path` from the one attributed pid, so the path really
+/// is the image of the process being named -- the invariant
+/// [`AppMatch::launchable_path`] re-checks before anything runs it.
+///
+/// The title is recorded for *every* app, not just Store apps, because this
+/// window cannot tell which is which -- a visible Store app is attributed to
+/// its own executable and looks exactly like an ordinary one. Recording it
+/// costs nothing: `MatchEngine::lookup` will only ever consult a title for a
+/// window that `ApplicationFrameHost.exe` owns.
+fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
+    AppMatch {
+        process: w.exe_name.clone(),
+        title: w.title.clone(),
+        path: w.exe_path.clone(),
+        trigger,
+    }
+}
+
 fn can_save_app_match(selected_process: Option<&str>, backend_ready: &BackendReadiness) -> bool {
     let Some(process) = selected_process else {
         return false;
@@ -1380,7 +1411,7 @@ pub fn run_picker(
                         // and means a future change to the gate can't turn
                         // this into a panic.
                         if let Some(w) = selected_window(&windows, selected_hwnd) {
-                            let m = AppMatch::for_process(w.exe_name.clone(), trigger);
+                            let m = app_match_for(w, trigger);
                             match cache.set_app_match(&target_item, &m) {
                                 Ok(written) => {
                                     // Matched exhaustively rather than
@@ -2065,6 +2096,50 @@ mod tests {
         }
     }
 
+    /// A row for an ordinary, attributed application -- the only kind the save
+    /// gate lets through.
+    fn app_row(exe_name: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            hwnd: 501,
+            pid: 4242,
+            exe_path: format!("C:\\Program Files\\Vendor\\{exe_name}"),
+            exe_name: exe_name.into(),
+            title: title.into(),
+        }
+    }
+
+    #[test]
+    fn saving_captures_the_title_and_the_path_off_the_row_as_well_as_the_process() {
+        // The whole point of capturing at add-time: a Store app that is later
+        // suspended has no process to name and no image path to resolve, so
+        // anything not copied here can never be recovered. Reverting
+        // `app_match_for` to the `{ process, trigger }` it used to build gives
+        //     left: ""  right: "KeepSolid"
+        let m = app_match_for(&app_row("KeepSolid.exe", "KeepSolid"), TriggerMode::Auto);
+
+        assert_eq!(m.process, "KeepSolid.exe");
+        assert_eq!(m.title, "KeepSolid");
+        assert_eq!(m.path, "C:\\Program Files\\Vendor\\KeepSolid.exe");
+        assert_eq!(m.trigger, TriggerMode::Auto);
+    }
+
+    #[test]
+    fn a_captured_match_carries_a_path_that_names_its_own_process() {
+        // The invariant anything that later OPENS the app re-checks
+        // (`AppMatch::launchable_path`): the row's `exe_name` and `exe_path`
+        // both come from the one attributed pid, so what this window writes
+        // satisfies the check by construction. Copying the path from a
+        // different row -- or storing the window title in `path` -- gives
+        //     "the picker wrote a path its own launch check rejects"
+        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline"), TriggerMode::Prompt);
+
+        assert_eq!(
+            m.launchable_path(),
+            Some("C:\\Program Files\\Vendor\\Ledgerline.exe"),
+            "the picker wrote a path its own launch check rejects"
+        );
+    }
+
     #[test]
     fn an_ordinary_process_is_not_refused() {
         // The positive control for the test above: a `host_process_refusal`
@@ -2187,6 +2262,13 @@ mod save_gate_placement_tests {
     // comment: re-joining a needle makes it appear one extra time and fails.
     const FLAG_SET: &str = concat!("already_saved", " = true;");
     const GATE_ARGUMENT: &str = concat!("already_saved", ")");
+    /// The capture. `app_match_for` is pure and directly tested above, but the
+    /// only call to it is inside the same unreachable closure, and the
+    /// mutation is a one-liner: `AppMatch::for_process(w.exe_name.clone(),
+    /// trigger)` compiles, saves, closes the window, and quietly writes a
+    /// match that records neither the title a suspended Store app is
+    /// recognised by nor the path the detail pane shows.
+    const CAPTURE_CALL: &str = concat!("app_match_for", "(w,");
 
     fn source() -> &'static str {
         include_str!("picker_ui.rs")
@@ -2201,6 +2283,29 @@ mod save_gate_placement_tests {
              match. One occurrence means a success arm leaves Save clickable for the frames \
              between `done` and the window actually closing, and a second click re-PUTs a \
              match the server already has"
+        );
+    }
+
+    #[test]
+    fn the_counter_finds_a_capture_call_that_is_really_there() {
+        // Positive control for the count below, in this module's own idiom:
+        // without it a needle that never matched anything would satisfy a
+        // `== 0` assertion, and one that matched everything would satisfy any
+        // other.
+        let planted = concat!("let m = app_match_for", "(w, trigger);");
+        assert_eq!(planted.matches(CAPTURE_CALL).count(), 1, "planted: {planted}");
+        assert_eq!("nothing here".matches(CAPTURE_CALL).count(), 0);
+    }
+
+    #[test]
+    fn save_writes_the_match_built_from_the_whole_selected_row() {
+        assert_eq!(
+            source().matches(CAPTURE_CALL).count(),
+            1,
+            "expected {CAPTURE_CALL:?} exactly once -- the value Save writes. Zero means the \
+             saved match went back to being built from the row's process name alone, so a \
+             Microsoft Store app records no title and can never be matched once Windows \
+             suspends it, and no item has a path to open"
         );
     }
 
