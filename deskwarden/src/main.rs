@@ -1750,26 +1750,26 @@ fn main() {
         // the cache warm so the next "Open Vault" doesn't pay the `bw
         // status` spawn again.
         if let Ok((about, details)) = status_details_rx.try_recv() {
-            if prefetch_still_describes_the_active_account(
+            // Everything this answer is allowed to DO -- the staleness guard,
+            // the two copies it teaches, and the `settings.json` write -- lives
+            // in `adopt_startup_prefetch`, which is a plain function the tests
+            // call with account A's answer and account B active. What is left
+            // here is the one thing that cannot move: the cache this loop owns,
+            // filled from what that function hands back.
+            //
+            // The shape matters as much as the split. There is exactly ONE
+            // account id passed in -- the one the prefetch was started FOR --
+            // because the id this app is on NOW is read inside, off
+            // `active_account`. So the guard cannot be handed the active
+            // account twice, and the answer cannot be used without binding it.
+            if let Some(adopted) = adopt_startup_prefetch(
+                &settings_path,
+                &mut accounts_state,
+                &mut active_account,
                 about.as_ref(),
-                active_account.as_ref().map(|a| &a.id),
+                details,
             ) {
-                learn_active_account_details(
-                    &settings_path,
-                    &mut accounts_state,
-                    &mut active_account,
-                    &details,
-                );
-                cached_status_details = Some(details);
-            } else {
-                // Dropped rather than cached. A stale email under a new account
-                // is worse than a blank one -- it is the same claim the window
-                // makes about whose vault is on screen, made about the wrong
-                // person -- and the next open pays one `bw status` instead.
-                log::info!(
-                    "discarding the startup `bw status` prefetch: it describes the account \
-                     this app started on, not the one it is on now"
-                );
+                cached_status_details = Some(adopted);
             }
         }
 
@@ -1934,6 +1934,63 @@ fn prefetch_still_describes_the_active_account(
         (Some(started), Some(now)) => started == now,
         _ => false,
     }
+}
+
+/// **The whole of what `main`'s frame loop does with a startup `bw status`
+/// answer** — the staleness guard, the two copies it teaches, the
+/// `settings.json` write, and the decision to cache — in one function a test
+/// can call.
+///
+/// This body used to sit inline in that loop, which no harness can run, so the
+/// only thing anyone could say about it was that its SOURCE TEXT looked right.
+/// A reviewer killed it three ways with the entire suite green:
+///
+/// * negating the guard, so the answer is adopted exactly when it describes
+///   somebody else;
+/// * passing the ACTIVE account's id as BOTH of the guard's arguments, so it
+///   compares the active account with itself and is `true` for any `Some`
+///   (`about` becomes unused, warnings are not denied here, and it compiles);
+/// * calling the guard, discarding its `bool`, and branching on `if true` —
+///   this repo's signature defect verbatim.
+///
+/// Under all three, account A's email and server URL are written into account
+/// B's entry in `settings.json`, and NOTHING DOWNSTREAM CAN NOTICE:
+/// `learn_active_account_details`' own guard compares `active_account` against
+/// `accounts_state` — two copies `adopt` keeps in step, both naming B — never
+/// against the id the prefetch was started for. So the check has to happen
+/// here, and something has to evaluate it.
+///
+/// **`started_for` is the only account id this takes.** The one the app is on
+/// NOW is read here, off `active_account`, so there is no second id argument
+/// for a caller to get wrong, and no way to hand the guard the active account
+/// twice. And the answer is RETURNED rather than written into the loop's cache
+/// from in here, so a caller that ignores the result has nothing to cache and
+/// does not compile.
+///
+/// Returns what the caller should cache: `Some(details)` when the answer really
+/// is the active account's own, `None` when it was dropped. Dropped rather than
+/// cached, because a stale email under a new account is worse than a blank one
+/// — it is the same claim the window makes about whose vault is on screen, made
+/// about the wrong person — and the next open pays one `bw status` instead.
+fn adopt_startup_prefetch(
+    settings_path: &Path,
+    accounts_state: &mut Option<accounts::AccountsState>,
+    active_account: &mut Option<Account>,
+    started_for: Option<&accounts::AccountId>,
+    details: login_ui::BwStatusDetails,
+) -> Option<login_ui::BwStatusDetails> {
+    if !prefetch_still_describes_the_active_account(
+        started_for,
+        active_account.as_ref().map(|a| &a.id),
+    ) {
+        log::info!(
+            "discarding the startup `bw status` prefetch: it describes the account this app \
+             started on, not the one it is on now"
+        );
+        return None;
+    }
+    learn_active_account_details(settings_path, accounts_state, active_account, &details);
+    Some(details)
 }
 
 /// **The one place a `bw status` answer becomes something this app remembers
@@ -6577,58 +6634,99 @@ mod tests {
             );
         }
 
-        /// **The startup prefetch's drain ASKS the decision, rather than
-        /// re-deciding inline.**
+        /// **The startup prefetch's drain hands the answer to the one function
+        /// whose tests EVALUATE what happens to it.**
         ///
-        /// The decision itself is evaluated by
+        /// What the drain does is `adopt_startup_prefetch`, and that is driven
+        /// end to end by
+        /// `a_prefetch_for_the_account_left_behind_is_neither_learned_nor_persisted`
+        /// and `a_prefetch_that_names_nobody_is_dropped_by_the_drain` — real
+        /// tests, over a scratch `settings.json`, with account A's answer and
+        /// account B active. The guard's own truth table is
         /// `the_prefetch_is_adopted_only_by_the_account_it_was_started_for`.
-        /// This pins only the wiring — that `main`'s frame loop calls it, and
-        /// that BOTH things the answer is used for sit on the true side.
         ///
-        /// This test exists because its predecessor did not do that: it
-        /// asserted the condition's SOURCE TEXT appeared, so flipping the
-        /// condition's `&&` to `||` — which adopts account A's `bw status`
-        /// answer onto account B and persists it — left the entire suite
-        /// green. Source text is pinned here only where nothing else can
-        /// reach: `main`'s loop opens a real window and no harness can run it.
+        /// So this pins only what is left in `main`'s frame loop, which no
+        /// harness can run: that the drain calls that function, hands it the
+        /// PREFETCH's id (not the active account's), BINDS what comes back, and
+        /// does neither half of the adoption out here where nothing evaluates
+        /// it.
+        ///
+        /// Its predecessor pinned the guard's wiring by source text alone, and
+        /// three one-line edits at this drain — negating the condition, passing
+        /// the active account's id as both of the guard's arguments, and
+        /// `let _ = guard(..); if true {` — each persisted account A's address
+        /// under account B's id with all 1330 tests green. The shape asserted
+        /// below is what makes two of those three not compile.
         #[test]
-        fn the_startup_prefetch_is_dropped_unless_it_still_describes_the_active_account() {
+        fn the_startup_prefetch_is_drained_through_the_function_that_guards_it() {
             let production = production_half_of_this_file();
             let decision = concat!("prefetch_still_describes_the_active", "_account(");
             assert_eq!(
                 production.matches(decision).count(),
                 2,
-                "expected the definition and exactly one call site -- `main`'s drain of the \
-                 startup prefetch; if the call is gone the decision is a pure function \
+                "expected the definition and exactly one call site -- inside \
+                 `adopt_startup_prefetch`; if the call is gone the decision is a pure function \
                  nothing consults, and any answer is adopted onto whatever account is active"
+            );
+
+            let adopt = concat!("adopt_startup_", "prefetch(");
+            assert_eq!(
+                production.matches(adopt).count(),
+                2,
+                "expected the definition and exactly one call site -- `main`'s drain of the \
+                 startup prefetch; a second caller is a second copy of this decision, and an \
+                 absent one means the tested function is dead code"
             );
 
             let drain = concat!("if let Ok((about, details)) = status_details_rx.try_", "recv() {");
             let block = block_after(drain);
+            // Bound, not discarded. `let _ = adopt_startup_prefetch(..);
+            // if true {` -- the repo's signature defect -- has nothing to put
+            // in the cache afterwards and does not compile against this shape,
+            // but the spelling is pinned anyway so a future edit cannot quietly
+            // reintroduce a discarded answer beside a cache filled from
+            // somewhere else.
+            let bound = concat!("if let Some(adopted) = adopt_startup_", "prefetch(");
             assert!(
-                block.contains(decision),
-                "the startup `bw status` answer is used without asking whether it still \
-                 describes the account this app is on: {block:?}"
+                block.contains(bound),
+                "the startup `bw status` answer is not drained through \
+                 `adopt_startup_prefetch`, or its result is not bound -- so nothing the tests \
+                 drive decides whether it is adopted: {block:?}"
             );
-            let guarded = block
-                .split_once(decision)
-                .expect("the call is there, per the assertion above")
-                .1;
-            for (needle, what) in [
-                (concat!("learn_active_account", "_details("), "learned from"),
-                (concat!("cached_status_details = Some(", "details);"), "cached"),
-            ] {
-                assert!(
-                    guarded.contains(needle),
-                    "the prefetch is {what} outside the check, so a startup window that \
-                     switched account leaves this describing the wrong one: {block:?}"
-                );
-                assert_eq!(
-                    block.matches(needle).count(),
-                    1,
-                    "expected exactly one place the prefetch is {what}: {block:?}"
-                );
-            }
+            // The id it is handed is the PREFETCH's. Handing it the active
+            // account's instead is the mutation that makes the guard compare
+            // the active account with itself and answer `true` for any `Some`.
+            assert!(
+                block.contains(concat!("about.as_", "ref(),")),
+                "the id the prefetch was started FOR is not what the drain hands over, so the \
+                 guard is deciding about some other pair of accounts: {block:?}"
+            );
+            assert!(
+                !block.contains(concat!("active_account.as_ref().map(|a| &", "a.id)")),
+                "the drain reads the active account's id itself instead of leaving that to the \
+                 one function whose tests evaluate the comparison -- which is how the same id \
+                 came to be passed as both sides of it: {block:?}"
+            );
+            // Neither half of the adoption may happen out here, where no test
+            // can reach it: the persistence belongs to the guarded function,
+            // and the cache must be filled from what that function returns
+            // rather than from the raw answer.
+            assert!(
+                !block.contains(concat!("learn_active_account", "_details(")),
+                "the drain persists the prefetch itself, outside the guarded function, so the \
+                 guard's answer is not what decides whether it is written: {block:?}"
+            );
+            let cache = concat!("cached_status_details = Some(", "adopted);");
+            assert_eq!(
+                block.matches(cache).count(),
+                1,
+                "expected exactly one place the drain caches what it was handed back: {block:?}"
+            );
+            assert!(
+                !block.contains(concat!("cached_status_details = Some(", "details);")),
+                "the RAW prefetch is cached rather than what the guarded function handed back, \
+                 so a dropped answer is cached anyway: {block:?}"
+            );
         }
 
         /// **The removal reuses the one confirmation, and never writes a
@@ -8126,6 +8224,213 @@ mod tests {
                 "started for {started_for:?}, now on {active_now:?}: {why}"
             );
         }
+    }
+
+    /// **The drain itself, evaluated: a prefetch started for account A is
+    /// neither learned nor persisted once the startup window has moved this app
+    /// to account B.**
+    ///
+    /// This is the assertion no amount of reading `main`'s source could make,
+    /// and the reason `adopt_startup_prefetch` exists as a function at all.
+    /// Three one-line edits at the old INLINE drain — negating the guard,
+    /// handing it the active account's id as BOTH arguments (so it compares
+    /// that account with itself), and `let _ = guard(..); if true {` — each
+    /// wrote account A's email and server URL into account B's entry in
+    /// `settings.json`, and each left all 1330 tests green, because the only
+    /// test over the drain read its source text.
+    ///
+    /// Nothing downstream could have caught them either:
+    /// `learn_active_account_details` compares `active_account` against
+    /// `accounts_state`, two copies `adopt` keeps in step and which both name
+    /// B, never against the id the prefetch was started for.
+    #[test]
+    fn a_prefetch_for_the_account_left_behind_is_neither_learned_nor_persisted() {
+        let scratch = ScratchConfig::with_accounts("prefetch-drain", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+
+        let signed_in = account(ACCOUNT_A, "ana@example.com");
+        let blank_a = account(ACCOUNT_A, "");
+        // Account B is the one the startup window settled this app onto, and it
+        // is the blank first-install account -- so if account A's answer is
+        // adopted here, B's entry gains a confident, persisted, WRONG address.
+        let b = account(ACCOUNT_B, "");
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![signed_in.clone(), b.clone()],
+            &b,
+        ));
+        let mut active = Some(b.clone());
+
+        let cached = adopt_startup_prefetch(
+            &settings_path,
+            &mut state,
+            &mut active,
+            Some(&signed_in.id),
+            signed_in_as("ana@example.com"),
+        );
+
+        assert!(
+            cached.is_none(),
+            "account A's `bw status` answer was handed back to be cached, so the vault window \
+             would go on to say account B's vault belongs to ana@example.com: {cached:?}"
+        );
+        let state_ref = state.as_ref().unwrap();
+        assert_eq!(
+            state_ref.active().email,
+            "",
+            "account A's address was written into account B's entry -- the copy that gets \
+             persisted -- which is the \"random hash\" bug with a confident wrong answer \
+             instead of a blank one"
+        );
+        assert_eq!(
+            state_ref.active().server_url,
+            None,
+            "account B learned account A's SERVER, so this app would go on to talk to the \
+             wrong host for it"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().email,
+            "",
+            "`active_account` -- what `login_context` and the master-password prompt name the \
+             account by -- learned the address of the account this app is NOT on"
+        );
+        assert!(
+            !settings_path.exists(),
+            "account A's address was persisted under account B's id, so it survives the launch \
+             and no later `bw status` ever corrects it: {:?}",
+            std::fs::read_to_string(&settings_path)
+        );
+
+        // The positive control, on the same scratch directory and the same
+        // answer: with the prefetch's OWN account active, every one of the
+        // above happens. Without it each assertion passes just as well against
+        // a function that adopts nothing at all -- including the file check,
+        // since only a real write can create `settings.json` here.
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![blank_a.clone(), b.clone()],
+            &blank_a,
+        ));
+        let mut active = Some(blank_a.clone());
+        let cached = adopt_startup_prefetch(
+            &settings_path,
+            &mut state,
+            &mut active,
+            Some(&blank_a.id),
+            signed_in_as("ana@example.com"),
+        );
+        assert_eq!(
+            cached.as_ref().and_then(|d| d.user_email.as_deref()),
+            Some("ana@example.com"),
+            "control: the matching case must hand the answer back to be cached, or the \
+             `is_none` above says nothing"
+        );
+        assert_eq!(
+            state.as_ref().unwrap().active().email,
+            "ana@example.com",
+            "control: the matching case must teach `AccountsState`"
+        );
+        assert_eq!(
+            active.as_ref().unwrap().email,
+            "ana@example.com",
+            "control: the matching case must teach `active_account`"
+        );
+        assert!(
+            settings_path.exists(),
+            "control: nothing else in this harness can write settings.json, so the file \
+             assertion above says nothing"
+        );
+        let reloaded = settings::Settings::load(&settings_path);
+        assert_eq!(
+            reloaded
+                .accounts
+                .iter()
+                .find(|a| a.id == b.id)
+                .map(|a| a.email.as_str()),
+            Some(""),
+            "control: account B's entry on disk gained an address from a run in which only \
+             account A was ever active: {:?}",
+            reloaded.accounts
+        );
+    }
+
+    /// The two other ways a prefetch can fail to describe the active account,
+    /// driven through the drain rather than through the pure guard: no account
+    /// at all when it was spawned (so `bw status` reported on whatever profile
+    /// the CLI defaults to), and no active account to learn it onto.
+    #[test]
+    fn a_prefetch_that_names_nobody_is_dropped_by_the_drain() {
+        let scratch = ScratchConfig::with_accounts("prefetch-nobody", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let blank = account(ACCOUNT_A, "");
+
+        let mut state = Some(accounts_state(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![blank.clone()],
+            &blank,
+        ));
+        let mut active = Some(blank.clone());
+
+        // Spawned before this app had an account of its own.
+        assert!(
+            adopt_startup_prefetch(
+                &settings_path,
+                &mut state,
+                &mut active,
+                None,
+                signed_in_as("ana@example.com"),
+            )
+            .is_none(),
+            "an answer about the CLI's default profile was adopted as this account's own"
+        );
+        assert_eq!(
+            state.as_ref().unwrap().active().email,
+            "",
+            "the CLI's default profile taught this account an address"
+        );
+        assert!(
+            !settings_path.exists(),
+            "the CLI's default profile was persisted as this account's address: {:?}",
+            std::fs::read_to_string(&settings_path)
+        );
+
+        // Nothing to learn it onto: `StartupAccounts::NoAccountList`.
+        let mut no_state = None;
+        let mut no_active = None;
+        assert!(
+            adopt_startup_prefetch(
+                &settings_path,
+                &mut no_state,
+                &mut no_active,
+                Some(&blank.id),
+                signed_in_as("ana@example.com"),
+            )
+            .is_none(),
+            "an app with no account list cached an answer it has nowhere to attribute"
+        );
+        assert!(
+            !settings_path.exists(),
+            "an app with no account list wrote settings.json anyway: {:?}",
+            std::fs::read_to_string(&settings_path)
+        );
+
+        // The positive control, same scratch directory, same answer.
+        assert!(
+            adopt_startup_prefetch(
+                &settings_path,
+                &mut state,
+                &mut active,
+                Some(&blank.id),
+                signed_in_as("ana@example.com"),
+            )
+            .is_some(),
+            "control: the matching case must be adopted, or the `is_none`s above say nothing"
+        );
+        assert!(
+            settings_path.exists(),
+            "control: nothing else in this harness can write settings.json, so the file \
+             assertions above say nothing"
+        );
     }
 
     /// **Two copies that disagree teach each other nothing, and nothing is
