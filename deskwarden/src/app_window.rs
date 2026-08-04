@@ -81,19 +81,6 @@ const WORKING_POLL: Duration = Duration::from_millis(80);
 /// from the live function is the reconciliation.
 const READINESS_ATTEMPTS: u64 = 11;
 
-/// The bridge's whole-request budget for one `vault.list_items()`.
-///
-/// **This is a copy of a constant, and the copy is the honest part.**
-/// `vault_bridge::READ_DEADLINE` is module-private and `vault_bridge` exports no
-/// constants at all, so this cannot be `use`d and no test in this file can
-/// reconcile the two. The rest of the crate already depends on this number from
-/// a distance and does it in prose -- five comments across `vault_window` saying
-/// "~10s" -- so naming it here is strictly better than the alternative, which is
-/// a sum that pretends the readiness phase's network calls cost nothing. It is
-/// still an unreconciled pair, and the fix is `pub(crate)` on the original; that
-/// belongs to the next change that touches `vault_bridge`.
-const BRIDGE_READ_BUDGET: Duration = Duration::from_secs(10);
-
 /// How long the working stage may go on before it ends itself.
 ///
 /// **Derived from what actually bounds each phase, which is not what each phase
@@ -111,10 +98,15 @@ const BRIDGE_READ_BUDGET: Duration = Duration::from_secs(10);
 ///      *sleeps* only -- `readiness_schedule` stops once the accumulated wait
 ///      would exceed it -- and the phase is sleeps INTERLEAVED WITH network
 ///      calls, each of which is bounded separately by the bridge's own
-///      whole-request budget. `readiness_schedule(30s)` yields 10 delays
-///      summing 27.75s and therefore 11 `list_items()` calls, so the real worst
-///      case is 30s of sleeping plus 110s of waiting on a backend that answers
-///      slowly instead of not at all: ~140s, not 30s.
+///      whole-request budget, `vault_bridge::READ_DEADLINE` -- the sum below
+///      reads that constant rather than restating its value, so raising it
+///      lengthens this deadline instead of quietly making it too short. (It is
+///      `READ_DEADLINE` and not `WRITE_DEADLINE`: `wait_for_vault_ready` probes
+///      with `list_items`, a GET on the bridge's `read_agent`.)
+///      `readiness_schedule(30s)` yields 10 delays summing 27.75s and therefore
+///      11 `list_items()` calls, so the real worst case is 30s of sleeping plus
+///      110s of waiting on a backend that answers slowly instead of not at all:
+///      ~140s, not 30s.
 ///   3. `login_ui::check_bw_status_details()`, unconditional and on the failure
 ///      path too: a second untimed `bw` spawn, so a second
 ///      `BACKEND_OP_TIMEOUT`.
@@ -134,7 +126,7 @@ const BRIDGE_READ_BUDGET: Duration = Duration::from_secs(10);
 pub const WORKING_DEADLINE: Duration = Duration::from_secs(
     2 * crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
         + crate::bw_serve::READINESS_DEADLINE.as_secs()
-        + READINESS_ATTEMPTS * BRIDGE_READ_BUDGET.as_secs(),
+        + READINESS_ATTEMPTS * crate::vault_bridge::READ_DEADLINE.as_secs(),
 );
 
 /// What the one window is showing.
@@ -964,11 +956,12 @@ mod working_watchdog_tests {
     #[test]
     fn the_deadline_covers_every_phase_the_worker_runs() {
         use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE, readiness_schedule};
+        use crate::vault_bridge::READ_DEADLINE;
         assert_eq!(
             WORKING_DEADLINE,
             BACKEND_OP_TIMEOUT
                 + READINESS_DEADLINE
-                + BRIDGE_READ_BUDGET * READINESS_ATTEMPTS as u32
+                + READ_DEADLINE * READINESS_ATTEMPTS as u32
                 + BACKEND_OP_TIMEOUT,
             "the working stage's deadline is no longer the sum of what actually bounds the \
              three phases `StartupWork::produce` runs -- an untimed backend start, the \
@@ -991,7 +984,7 @@ mod working_watchdog_tests {
         // probe costs far more than the deadline it is named after, because
         // `READINESS_DEADLINE` bounds only the sleeps between its attempts.
         assert!(
-            READINESS_DEADLINE + BRIDGE_READ_BUDGET * READINESS_ATTEMPTS as u32
+            READINESS_DEADLINE + READ_DEADLINE * READINESS_ATTEMPTS as u32
                 > READINESS_DEADLINE * 4,
             "control: the readiness phase's real bound has collapsed back to roughly its \
              sleep budget, which is the mistake this sum was rewritten to fix"

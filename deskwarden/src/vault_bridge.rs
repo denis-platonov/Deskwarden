@@ -1278,7 +1278,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// [`crate::http_agent`] for the full trace. Bounding the body along with the
 /// head costs nothing here -- every response is JSON from a process on
 /// loopback, not a bulk transfer.
-const READ_DEADLINE: Duration = Duration::from_secs(10);
+///
+/// `pub(crate)` -- the only constant in this module that is, and for one named
+/// reason. [`crate::app_window::WORKING_DEADLINE`] is a **sum over the startup
+/// worker's phases**, and one of those phases is `bw_serve::wait_for_vault_ready`
+/// making 11 [`VaultBridge::list_items`] calls, each bounded by this. That sum
+/// used to carry a hand-copied `BRIDGE_READ_BUDGET = 10s` mirror of this value,
+/// because this was private -- so raising this number silently left the window's
+/// watchdog too short and it would have started killing healthy startups.
+/// Deriving the sum from the source is what removed the mirror. Exported to that
+/// one reader only; the rest of this module's constants
+/// ([`CONNECT_TIMEOUT`], [`WRITE_DEADLINE`]) bound nothing outside it and stay
+/// private.
+pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Total-time bound for [`VaultBridge::write_agent`]: the longest a single
 /// *write* may take before it is treated as failed.
