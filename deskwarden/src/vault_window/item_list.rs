@@ -805,6 +805,24 @@ pub fn draw_item_list(
                 return;
             }
             theme::scrollbar_in_gutter(ui, LIST_PADDING);
+            // ... and hidden outright when there is nothing to scroll. The
+            // lane is still reserved (that is what `AlwaysVisible` below is
+            // for, and the tiles must not resize), but a full-height 6pt bar
+            // painted down a list that cannot move leaves 2pt of clear space
+            // on the right against 10pt on the left -- the tiles are
+            // symmetric and the bar is what reads as the smaller padding.
+            //
+            // Predicted from the row count rather than read back from last
+            // frame's `ScrollArea` output, which would be a frame late and so
+            // would flash a bar for one frame whenever the filter changed.
+            // The pitch is `show_rows`' own: one tile per row plus a gap
+            // BETWEEN rows. Ties go to SHOWING the bar -- being wrong the
+            // other way would hide a bar on a list that really can scroll.
+            let content_height = filtered.len() as f32 * ROW_TILE_HEIGHT
+                + filtered.len().saturating_sub(1) as f32 * ROW_GAP;
+            if content_height < ui.available_height() {
+                theme::hide_scrollbar(ui);
+            }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 // Required by `scrollbar_in_gutter`: the reserved lane is
@@ -2304,7 +2322,13 @@ mod row_tile_tests {
         let items: Vec<VaultItem> = (0..40)
             .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
             .collect();
-        let p = paint(&items, None);
+        // SETTLED frames, not the first one. egui fades a floating bar in
+        // over several frames, so on frame 1 the track and the handle are
+        // both emitted at alpha 0 -- an earlier version of this test read
+        // that frame and so asserted the placement of a bar that was not yet
+        // being drawn at all. `SETTLE_FRAMES` also parks the pointer over the
+        // list, which is what a floating bar fades in for.
+        let p = paint_with(&items, None, SETTLE_FRAMES);
 
         for tile in row_tiles(&p) {
             assert!(
@@ -2320,18 +2344,19 @@ mod row_tile_tests {
 
         // The scroll bar's own two rects (track and handle) are the only
         // things painted in the gutter at all. Found by geometry -- they are
-        // the rects that lie strictly right of the tiles.
-        let in_gutter: Vec<egui::Rect> = p
-            .rects
-            .iter()
-            .map(|r| r.rect)
+        // the rects that lie strictly right of the tiles -- and required to
+        // be VISIBLE, because an overflowing list must actually show the user
+        // where it is: `visibly_painted` rejects the alpha-0 shapes egui
+        // still emits for a bar it is not drawing.
+        let in_gutter: Vec<egui::Rect> = visibly_painted(&p)
             .filter(|r| r.right() > PANE_WIDTH - LIST_PADDING + 0.5 && r.width() < LIST_PADDING)
             .collect();
         assert!(
             !in_gutter.is_empty(),
-            "nothing at all was painted in the list's right padding, so there is no scrollbar \
-             there to centre; painted: {:?}",
-            p.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
+            "nothing VISIBLE was painted in the list's right padding, so a list of {} rows on a \
+             {PANE_HEIGHT}pt pane is not showing the user that it can scroll; painted: {:?}",
+            items.len(),
+            p.rects.iter().map(|r| (r.rect, r.fill)).collect::<Vec<_>>()
         );
         for bar in &in_gutter {
             assert!(
@@ -2349,6 +2374,92 @@ mod row_tile_tests {
                  its right -- it is not centred"
             );
         }
+    }
+
+    /// Frames to run before measuring anything about the scroll bar.
+    ///
+    /// Long enough for egui's floating-bar fade to finish, and it parks the
+    /// pointer over the list, which is the state the bar is most visible in
+    /// -- so a test that expects NOTHING there is being asked the hardest
+    /// version of the question.
+    const SETTLE_FRAMES: usize = 20;
+
+    /// The painted rects that a user can actually SEE: a rect whose fill and
+    /// whose stroke are both fully transparent occupies space in the shape
+    /// list and none on screen. egui emits exactly such rects for a floating
+    /// scroll bar it is holding at opacity 0, so geometry alone cannot tell
+    /// "the bar is centred in the gutter" from "there is no bar".
+    fn visibly_painted(p: &Painted) -> impl Iterator<Item = egui::Rect> + '_ {
+        p.rects
+            .iter()
+            .filter(|r| {
+                r.fill.a() > 0 || (r.stroke.width > 0.0 && r.stroke.color.a() > 0)
+            })
+            .map(|r| r.rect)
+    }
+
+    #[test]
+    fn a_list_that_fits_leaves_the_same_clear_space_on_both_sides_of_its_tiles() {
+        // THE REPORT: a three-item vault, nothing to scroll, and "the right
+        // padding feels smaller".
+        //
+        // It was not smaller. Both gaps measured exactly `LIST_PADDING`, and
+        // the older geometry test above said so and passed. What the reader
+        // was seeing is that `AlwaysVisible` -- which the reserved gutter
+        // needs, so the tiles do not resize when the bar comes and goes --
+        // painted a 6pt bar down the FULL height of a list that could not
+        // move, leaving 2pt of clear space on the right against 10pt on the
+        // left.
+        //
+        // So this asserts what the eye measures, not what the layout says:
+        // the clear space beside the tiles, with anything visible painted in
+        // it counted against that side. A test that only compared tile edges
+        // is what let the complaint through.
+        let items: Vec<VaultItem> = (0..3)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let p = paint_with(&items, None, SETTLE_FRAMES);
+
+        let tiles = row_tiles(&p);
+        assert_eq!(tiles.len(), items.len(), "every row should have drawn a tile");
+        let tile = tiles[0].rect;
+        assert!(
+            (tile.left() - LIST_PADDING).abs() < 0.5
+                && (tile.right() - (PANE_WIDTH - LIST_PADDING)).abs() < 0.5,
+            "a row tile spans {}..{}, expected {LIST_PADDING}..{} -- a list that FITS must lay \
+             its tiles out exactly like one that overflows, or they resize as items are added",
+            tile.left(),
+            tile.right(),
+            PANE_WIDTH - LIST_PADDING
+        );
+
+        // Strictly outside the tile on one side or the other. The pane's own
+        // background spans the full width, so it straddles both edges and is
+        // excluded by "strictly" rather than by a colour test.
+        let mut clear_left = tile.left();
+        let mut clear_right = PANE_WIDTH - tile.right();
+        for r in visibly_painted(&p) {
+            if r.right() <= tile.left() + 0.01 {
+                clear_left = clear_left.min(tile.left() - r.right());
+            }
+            if r.left() >= tile.right() - 0.01 {
+                clear_right = clear_right.min(r.left() - tile.right());
+            }
+        }
+        assert!(
+            (clear_left - clear_right).abs() < 0.51,
+            "the tiles have {clear_left}pt of clear space to their left and {clear_right}pt to \
+             their right. The tile EDGES are symmetric ({}..{}); something is being painted in \
+             one of the gutters of a list that cannot scroll. Visible rects: {:?}",
+            tile.left(),
+            tile.right(),
+            visibly_painted(&p).collect::<Vec<_>>()
+        );
+        assert!(
+            (clear_right - LIST_PADDING).abs() < 0.51,
+            "the clear space beside the tiles is {clear_right}pt, not the design's \
+             {LIST_PADDING}pt -- both gutters are occupied"
+        );
     }
 
     #[test]

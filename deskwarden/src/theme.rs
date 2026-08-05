@@ -2022,6 +2022,41 @@ pub fn scrollbar_in_gutter(ui: &mut Ui, gutter: f32) {
     scroll.bar_outer_margin = (gutter - SCROLLBAR_WIDTH) / 2.0;
 }
 
+/// Makes the floating bar of an [`egui::ScrollArea`] shown inside `ui` paint
+/// NOTHING, while leaving every measurement [`scrollbar_in_gutter`] set alone.
+///
+/// This is for the list that fits: `AlwaysVisible` is what keeps the reserved
+/// lane -- and therefore the content's width -- from changing as items are
+/// added and removed, but it also paints a full-height bar for a list with
+/// nothing to scroll. A 6pt line running the whole height of the 10pt gutter
+/// leaves only 2pt of clear space between it and the tiles, against 10pt on
+/// the left, which is what a reader sees as "the right padding is smaller".
+/// The tiles are symmetric; the bar is what is not.
+///
+/// It works by zeroing the six opacities egui multiplies a FLOATING bar's
+/// track and handle colours by, rather than by changing the visibility mode
+/// or any width. Nothing about the layout moves, so the bar can be turned
+/// back on the moment the content overflows without the tiles resizing --
+/// which is the whole reason [`scrollbar_in_gutter`] demands `AlwaysVisible`.
+/// All SIX, and not just the pair that happens to matter today. egui picks
+/// one of the three pairs per frame from how close the pointer is (dormant /
+/// pointer-in-the-area / pointer-on-the-bar), and its floating defaults
+/// already leave the dormant pair at 0 -- so the bar a reader of this list
+/// actually sees is the `active_*` one, which is what the item-list test
+/// kills a mutation of. Setting only that pair would leave the bar to
+/// reappear the moment the pointer crossed into the gutter itself, and
+/// "hidden unless you point at where it would be" is not a state worth
+/// having.
+pub fn hide_scrollbar(ui: &mut Ui) {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.dormant_background_opacity = 0.0;
+    scroll.active_background_opacity = 0.0;
+    scroll.interact_background_opacity = 0.0;
+    scroll.dormant_handle_opacity = 0.0;
+    scroll.active_handle_opacity = 0.0;
+    scroll.interact_handle_opacity = 0.0;
+}
+
 /// A muted field label ("User name", "Master password").
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
