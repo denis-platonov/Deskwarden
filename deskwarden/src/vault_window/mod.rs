@@ -2148,6 +2148,132 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                     );
                 }
 
+                // -- the one TOTP poll, and the one countdown, for BOTH panes --
+                //
+                // HOISTED out of the `Read` arm rather than run in both of
+                // them. The trigger and the `seconds_left` refresh used to
+                // live inside that arm, and the `Edit` arm issued neither --
+                // so opening the editor on an item whose code had already
+                // been fetched showed THAT code, unrefreshed and with no
+                // countdown, for the whole edit session. The keystroke
+                // preview's `{TOTP}` was frozen: the user's own case
+                // (`2134{TOTP}` -> `2134776699`) rendered a number that had
+                // long since expired, and it never moved to
+                // `NoCodeReported` either.
+                //
+                // Hoisted rather than copied because a second copy of the
+                // trigger and the countdown is a second thing to keep in
+                // step, and one-poll-one-answer is the very decision the
+                // editor's `&totp_state` argument exists to express: the
+                // form reads the vault window's one `TotpState` instead of
+                // opening a poll of its own. Running the trigger in both
+                // arms would keep one poll but grow two schedulers for it.
+                // There is still exactly one of each, and now its scope is
+                // the two panes that can show a code rather than one of
+                // them.
+                //
+                // Gated to those two, and not simply run unconditionally:
+                //
+                //  * `out_of_vault` -- that pane deliberately drives NONE of
+                //    this (see its arm: every action it could offer reads
+                //    through the live list, which by definition does not
+                //    hold the item). Polling for it would be the round trip
+                //    that arm exists to refuse.
+                //  * `Create` -- there is no item, which is exactly why the
+                //    create form is handed `None` at the seam below.
+                //
+                // `item_delete_pending`'s expiry stays in the `Read` arm: it
+                // is that pane's own armed confirmation, not a vault fact.
+                if out_of_vault.is_none() && !matches!(mode, DetailMode::Create(_)) {
+                    if let Some(item) = &selected_item {
+                        // Only poll `bw serve` for a TOTP code if this
+                        // item's own login data says one is configured.
+                        // `LoginData::totp` is known locally (Task 1),
+                        // so items with no TOTP secret at all no longer
+                        // pay for a real HTTP round-trip to `bw serve`
+                        // every ~1s just to be told "no code" again.
+                        let has_totp_secret = item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some();
+                        // Unconditional, every frame -- not just on
+                        // selection change. This is the fix for review
+                        // Important 1 (independent review of a7b33cb):
+                        // an item with TOTP selected and fetched, whose
+                        // secret is then removed elsewhere, used to keep
+                        // rendering the last-fetched code under a live
+                        // countdown forever, because the poll that would
+                        // have blanked it was gated off by the very same
+                        // `has_totp_secret` that went false. Forcing
+                        // `NoSecret` here every frame closes that gap
+                        // regardless of how `has_totp_secret` got to be
+                        // false -- selection change, a sync reload
+                        // landing mid-session, or anything else.
+                        totp_state = totp_state_for_secret_presence(has_totp_secret, totp_state.clone());
+                        if !has_totp_secret {
+                            // A failure streak belongs to an item that
+                            // still has a secret to poll for; carrying it
+                            // over would log a false "recovered" later if
+                            // this item's secret ever comes back and the
+                            // very first poll happens to succeed.
+                            totp_poll_failing = false;
+                        } else if should_start_totp_poll(
+                            totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
+                            totp_poll_in_flight,
+                            totp_state_wants_poll(&totp_state),
+                        ) {
+                            totp_last_poll = Instant::now();
+                            totp_poll_in_flight = true;
+                            // The deliberate exception: TOTP codes are
+                            // generated by the CLI per request and are
+                            // not cacheable, so this stays on the bridge.
+                            //
+                            // Backgrounded on a one-shot thread rather
+                            // than called inline, the same reason
+                            // `spawn_vault_load`/`spawn_vault_sync` are:
+                            // `get_totp` is a real HTTP round-trip to
+                            // `bw serve`, and a stalled backend holds it
+                            // -- and this window's entire UI thread with
+                            // it -- for as long as the bridge's whole-
+                            // request `READ_DEADLINE` allows, up to 10s,
+                            // once per `TOTP_POLL_INTERVAL`. Bounded is
+                            // not the same as short. The
+                            // result lands on `totp_rx`, drained further
+                            // up (see that drain's doc for why it isn't
+                            // nested in this same block); the actual
+                            // state transition still goes through
+                            // `apply_totp_poll_result` there, so the fix
+                            // for review Important 1 on commit 1d6c5ab
+                            // (any error moves the pane to `Unavailable`
+                            // rather than leaving a stale code rendering
+                            // under a countdown that keeps ticking as if
+                            // it were live) is unchanged.
+                            let item_id = item.id.clone();
+                            let bridge = cache.bridge().clone();
+                            let tx = totp_tx.clone();
+                            // Tagged with the vault state this poll is
+                            // being fetched against, so a reload
+                            // spawned while it is in flight can drop it
+                            // rather than let it overwrite the state
+                            // that reload re-armed (review 15's Minor
+                            // 5) -- see `totp_poll_result_is_current`.
+                            let generation = load_generation;
+                            std::thread::spawn(move || {
+                                let result = bridge.get_totp(&item_id);
+                                let _ = tx.send((generation, item_id, result));
+                            });
+                        }
+                        // Refreshed every frame regardless of whether a
+                        // poll happened this tick: the TOTP window is
+                        // wall-clock-derived, not tied to the fetch, so
+                        // a `Code` left over from a poll several hundred
+                        // milliseconds ago still needs its countdown to
+                        // read as live rather than frozen at the moment
+                        // of that poll.
+                        let seconds_left = current_totp_seconds_left();
+                        if let TotpState::Code { seconds_left: code_seconds_left, .. } = &mut totp_state {
+                            *code_seconds_left = seconds_left;
+                        }
+                    }
+                }
+
                 match &mut mode {
                     // AN ITEM OUTSIDE THE LIVE VAULT GETS ITS OWN PANE, not
                     // the ordinary read pane with some buttons hidden. Every
@@ -2197,92 +2323,6 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                             // real_pane_for_every_kind` fails for all five
                             // non-login kinds if any early return reappears
                             // inside `draw_read_arm`.
-
-                            // Only poll `bw serve` for a TOTP code if this
-                            // item's own login data says one is configured.
-                            // `LoginData::totp` is known locally (Task 1),
-                            // so items with no TOTP secret at all no longer
-                            // pay for a real HTTP round-trip to `bw serve`
-                            // every ~1s just to be told "no code" again.
-                            let has_totp_secret = item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some();
-                            // Unconditional, every frame -- not just on
-                            // selection change. This is the fix for review
-                            // Important 1 (independent review of a7b33cb):
-                            // an item with TOTP selected and fetched, whose
-                            // secret is then removed elsewhere, used to keep
-                            // rendering the last-fetched code under a live
-                            // countdown forever, because the poll that would
-                            // have blanked it was gated off by the very same
-                            // `has_totp_secret` that went false. Forcing
-                            // `NoSecret` here every frame closes that gap
-                            // regardless of how `has_totp_secret` got to be
-                            // false -- selection change, a sync reload
-                            // landing mid-session, or anything else.
-                            totp_state = totp_state_for_secret_presence(has_totp_secret, totp_state.clone());
-                            if !has_totp_secret {
-                                // A failure streak belongs to an item that
-                                // still has a secret to poll for; carrying it
-                                // over would log a false "recovered" later if
-                                // this item's secret ever comes back and the
-                                // very first poll happens to succeed.
-                                totp_poll_failing = false;
-                            } else if should_start_totp_poll(
-                                totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
-                                totp_poll_in_flight,
-                                totp_state_wants_poll(&totp_state),
-                            ) {
-                                totp_last_poll = Instant::now();
-                                totp_poll_in_flight = true;
-                                // The deliberate exception: TOTP codes are
-                                // generated by the CLI per request and are
-                                // not cacheable, so this stays on the bridge.
-                                //
-                                // Backgrounded on a one-shot thread rather
-                                // than called inline, the same reason
-                                // `spawn_vault_load`/`spawn_vault_sync` are:
-                                // `get_totp` is a real HTTP round-trip to
-                                // `bw serve`, and a stalled backend holds it
-                                // -- and this window's entire UI thread with
-                                // it -- for as long as the bridge's whole-
-                                // request `READ_DEADLINE` allows, up to 10s,
-                                // once per `TOTP_POLL_INTERVAL`. Bounded is
-                                // not the same as short. The
-                                // result lands on `totp_rx`, drained further
-                                // up (see that drain's doc for why it isn't
-                                // nested in this same block); the actual
-                                // state transition still goes through
-                                // `apply_totp_poll_result` there, so the fix
-                                // for review Important 1 on commit 1d6c5ab
-                                // (any error moves the pane to `Unavailable`
-                                // rather than leaving a stale code rendering
-                                // under a countdown that keeps ticking as if
-                                // it were live) is unchanged.
-                                let item_id = item.id.clone();
-                                let bridge = cache.bridge().clone();
-                                let tx = totp_tx.clone();
-                                // Tagged with the vault state this poll is
-                                // being fetched against, so a reload
-                                // spawned while it is in flight can drop it
-                                // rather than let it overwrite the state
-                                // that reload re-armed (review 15's Minor
-                                // 5) -- see `totp_poll_result_is_current`.
-                                let generation = load_generation;
-                                std::thread::spawn(move || {
-                                    let result = bridge.get_totp(&item_id);
-                                    let _ = tx.send((generation, item_id, result));
-                                });
-                            }
-                            // Refreshed every frame regardless of whether a
-                            // poll happened this tick: the TOTP window is
-                            // wall-clock-derived, not tied to the fetch, so
-                            // a `Code` left over from a poll several hundred
-                            // milliseconds ago still needs its countdown to
-                            // read as live rather than frozen at the moment
-                            // of that poll.
-                            let seconds_left = current_totp_seconds_left();
-                            if let TotpState::Code { seconds_left: code_seconds_left, .. } = &mut totp_state {
-                                *code_seconds_left = seconds_left;
-                            }
 
                             // Auto-expire a stale armed item delete the same
                             // way the sidebar's folder delete does above.
@@ -13872,5 +13912,152 @@ mod copy_toast_wiring_tests {
                  {branch}"
             );
         }
+    }
+}
+/// The two arguments the EDIT form is handed at [`build_frame`]'s seam, and
+/// the scope of the one TOTP poll behind them -- held from the source.
+///
+/// Same mechanism, and the same reason, as [`app_block_wiring_tests`]: the
+/// seam lives inside `build_frame`'s update closure, which needs a real
+/// `VaultCache` over a live `bw serve`, so no test in this crate runs it.
+///
+/// `app_block_wiring_tests::PASSES_THE_CACHE` is not a substitute. It matches
+/// BOTH editor calls, so what it pins is that *a* cache is passed at all --
+/// it says nothing about which item or which `TotpState` either arm gets, and
+/// both of those survived the whole suite:
+///
+///  * `selected_item.as_ref()` -> `None` (what the Create arm legitimately
+///    passes) kills `{TOTP}` and every `{S:...}` in the keystroke palette and
+///    makes every custom-field reference unresolvable in the preview. The
+///    `{S:PIN}` discoverability the feature exists for, gone silently.
+///  * `&totp_state` -> `&TotpState::NoSecret` makes the eye report "no
+///    one-time code on this item" for every item forever.
+///
+/// Each needle carries all four correlated arguments of its own arm, so
+/// either arm taking the other's is a failure here, in both directions.
+#[cfg(test)]
+mod edit_seam_argument_tests {
+    // EVERY NEEDLE IS SPLIT WITH `concat!` and is a single line with no line
+    // ending, for `app_block_wiring_tests`' reasons: `include_str!("mod.rs")`
+    // pulls this module in too, so an unsplit needle matches its own
+    // declaration, and a needle carrying a newline passes on one checkout's
+    // line endings and fails on the other's.
+    //
+    // The split points are also chosen so that no literal here contains
+    // `app_block_wiring_tests::PASSES_THE_CACHE` -- one that did would break
+    // that module's count of exactly two.
+    const EDIT_ARM: &str =
+        concat!("&folders, false, &mut app_ident", "ities, selected_item.as_ref(), &totp_state) {");
+    const CREATE_ARM: &str =
+        concat!("&folders, true, &mut app_ident", "ities, None, &totp_state) {");
+    const BOTH_EDITORS: &str = concat!("draw_detail_", "edit(ui,");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// Everything before the first `#[cfg(test)]`. Same split, and the same
+    /// self-matching hazard, as `frame_host_tests::production`.
+    fn production() -> &'static str {
+        let source = source();
+        let end = source
+            .find(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file -- see `frame_host_tests`");
+        &source[..end]
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn the_counter_finds_needles_that_are_really_there() {
+        // The positive control, driving the same counting the assertions use.
+        let planted = concat!("x(ui, draft, &folders, true, &mut app_ident", "ities, None, &totp_state) {");
+        assert_eq!(occurrences(planted, CREATE_ARM), 1, "planted: {planted}");
+        assert_eq!(occurrences(planted, EDIT_ARM), 0);
+        assert_eq!(occurrences("nothing here", BOTH_EDITORS), 0);
+    }
+
+    #[test]
+    fn the_edit_form_is_handed_the_selected_item_and_the_windows_one_totp_state() {
+        let production = production();
+        assert_eq!(
+            occurrences(production, BOTH_EDITORS),
+            2,
+            "expected two draft editors -- the control on the two assertions below, which \
+             each expect one arm to exist"
+        );
+        assert_eq!(
+            occurrences(production, EDIT_ARM),
+            1,
+            "expected {EDIT_ARM:?} exactly once. `None` in place of the item leaves the \
+             keystroke palette with nothing but the two boxes on the form: no `{{TOTP}}`, no \
+             `{{S:...}}`, and every custom-field reference in the preview unresolvable. \
+             `&TotpState::NoSecret` in place of the state makes the eye say this item has no \
+             one-time code, for every item, forever. Both compile, and both used to pass \
+             every test in this crate"
+        );
+        assert_eq!(
+            occurrences(production, CREATE_ARM),
+            1,
+            "expected {CREATE_ARM:?} exactly once -- the create form, which has no item yet \
+             and so is the ONE arm entitled to `None`. Two of these means the edit arm has \
+             quietly taken the create arm's arguments"
+        );
+    }
+
+    /// **The scope of the one poll.**
+    ///
+    /// The trigger and the countdown must sit ABOVE the pane `match`, not
+    /// inside its `Read` arm. They used to be inside it, and the `Edit` arm
+    /// ran neither -- so entering the editor on an item whose code had
+    /// already been fetched showed that code, frozen, for the whole edit
+    /// session: no refresh, no countdown, and no transition to
+    /// `NoCodeReported`. The keystroke preview's `{TOTP}` was a number that
+    /// had long since expired.
+    ///
+    /// This is a POSITION assertion rather than a count, because the defect
+    /// was never a missing call -- there was exactly one of each, in the
+    /// wrong scope.
+    #[test]
+    fn the_one_totp_poll_and_countdown_are_above_the_pane_match_not_inside_the_read_arm() {
+        let production = production();
+        const PANE_MATCH: &str = concat!("match &mut mo", "de {");
+        const TRIGGER: &str = concat!("} else if should_start_totp_", "poll(");
+        const COUNTDOWN: &str = concat!("let seconds_left = current_totp_seconds_", "left();");
+
+        assert_eq!(
+            occurrences(production, PANE_MATCH),
+            1,
+            "control: this test locates the poll relative to the ONE pane match"
+        );
+        assert_eq!(
+            occurrences(production, TRIGGER),
+            1,
+            "there is more than one place a TOTP poll is started. The editor reads the vault \
+             window's one `TotpState` precisely so there is one poll behind it; a second \
+             trigger is a second schedule for it"
+        );
+        assert_eq!(
+            occurrences(production, COUNTDOWN),
+            2,
+            "control: the countdown is read in exactly two places -- where a poll result \
+             lands, and where the pane is about to be drawn"
+        );
+
+        let pane_match = production.find(PANE_MATCH).expect("checked above");
+        assert!(
+            production.find(TRIGGER).expect("checked above") < pane_match,
+            "the TOTP poll is triggered inside the pane match, so it belongs to whichever \
+             arm it landed in. The Edit pane draws a `{{TOTP}}` preview and would issue no \
+             poll at all"
+        );
+        assert!(
+            production.rfind(COUNTDOWN).expect("checked above") < pane_match,
+            "the last `seconds_left` refresh is inside the pane match, so the countdown \
+             stops advancing in every arm but the one holding it -- which is what froze the \
+             editor's previewed code for the whole edit session"
+        );
     }
 }

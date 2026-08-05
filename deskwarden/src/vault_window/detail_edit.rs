@@ -5515,6 +5515,205 @@ mod sequence_builder_tests {
             "every chip landed on one row, so nothing here proves the row wraps"
         );
     }
+    // -- the wiring at the real call sites, not the pure functions ----------
+    //
+    // EVERY test above this line calls `sequence_source`, `sequence_without`
+    // or `sequence_moved` ITSELF, with arguments of its own. That leaves the
+    // calls `draw_detail_edit` really makes unexercised, which is how an
+    // argument at one of them can be swapped, constant-ified or nulled with
+    // the whole suite green. These three drive the drawn form and read what
+    // it PAINTED.
+
+    /// The one row of text painted strictly below `below`, left to right.
+    ///
+    /// Scoped deliberately. The form's own user-name and password boxes carry
+    /// the very strings the preview does and are painted ABOVE the eye, so a
+    /// read over the whole frame is satisfied by those boxes and says nothing
+    /// at all about the preview -- the first attempt at the test below was
+    /// vacuous for exactly that reason. Reading the row under the eye button
+    /// is reading the preview and nothing else.
+    fn row_below(painted: &Painted, below: Rect) -> Vec<String> {
+        let mut under: Vec<&(String, Rect)> =
+            painted.texts.iter().filter(|(_, r)| r.top() > below.bottom()).collect();
+        let top = under.iter().map(|(_, r)| r.top()).fold(f32::INFINITY, f32::min);
+        under.retain(|(_, r)| r.top() - top < 4.0);
+        under.sort_by(|(_, a), (_, b)| a.left().total_cmp(&b.left()));
+        under.into_iter().map(|(text, _)| text.clone()).collect()
+    }
+
+    /// Opens the builder AND the eye, and answers with the frame drawn with
+    /// both open.
+    fn reveal(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        item: &VaultItem,
+        totp: &detail::TotpState,
+    ) -> Painted {
+        let shut = open_builder(ctx, pane, draft, item, totp);
+        let at = shut.rect_of(APP_SEQUENCE_REVEAL).center();
+        let _ = frame(ctx, pane, draft, item, totp, &click(at));
+        assert!(draft.app.as_ref().unwrap().previewing, "the eye did not open");
+        frame(ctx, pane, draft, item, totp, &[])
+    }
+
+    /// **Which value the eye draws under which placeholder.**
+    ///
+    /// This is the whole job of the one component that has it, and it was
+    /// unpinned: swapping the two arguments at the form's own
+    /// `sequence_source(&draft.username, &draft.password, item, totp)` drew
+    /// the plaintext PASSWORD where `{USERNAME}` sits and the address where
+    /// `{PASSWORD}` sits, and the entire suite stayed green -- the other
+    /// preview tests call `sequence_source` themselves, and the only test
+    /// that reached the real call site used the fixture `"2134{TOTP}"`, which
+    /// contains neither placeholder.
+    ///
+    /// So: both placeholders, on a fixture whose user name and password are
+    /// nothing like each other, read from the paint.
+    #[test]
+    fn the_eye_draws_each_value_under_the_placeholder_that_asked_for_it() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
+        // The control on the fixture: two values that agreed would let a swap
+        // satisfy every assertion below.
+        assert_ne!(USERNAME, PASSWORD, "the fixture cannot tell a swap from a fill");
+
+        let open = reveal(&ctx, PANE, &mut draft, &item, &live_code());
+        let eye = open.rect_of(APP_SEQUENCE_HIDE);
+        assert_eq!(
+            row_below(&open, eye),
+            vec![USERNAME.to_string(), "[\u{21e5}]".to_string(), PASSWORD.to_string()],
+            "the row under the eye is not user name, tab, password: the one component whose \
+             job is saying which value goes where is saying the wrong thing"
+        );
+        // ...and both are drawn with their own glyphs, not an elision of
+        // them: `Galley::text()` answers with the SOURCE string, so the
+        // assertion above is blind to truncation on its own.
+        for label in [USERNAME, PASSWORD] {
+            let drawn: Vec<&String> = open
+                .rendered
+                .iter()
+                .filter(|(source, _, rect)| source == label && rect.top() > eye.bottom())
+                .map(|(_, drawn, _)| drawn)
+                .collect();
+            assert!(!drawn.is_empty(), "{label:?} is not painted below the eye at all");
+            for drawn in drawn {
+                assert_eq!(drawn, label, "the preview DREW {drawn:?} for {label:?}");
+            }
+        }
+    }
+
+    /// The `<`, `>` or `x` painted beside `chip`, on `chip`'s own row.
+    ///
+    /// By GEOMETRY rather than by paint order, because paint order is exactly
+    /// what a constant or an off-by-one at the binding would still get right.
+    /// The question is "which control is next to the chip the user is looking
+    /// at", and only the rects can answer it.
+    fn control_beside(painted: &Painted, chip: Rect, caption: &str) -> Pos2 {
+        let mut found: Vec<Rect> = painted
+            .rects_of(caption)
+            .into_iter()
+            .filter(|r| (r.center().y - chip.center().y).abs() < 8.0 && r.left() >= chip.right())
+            .collect();
+        found.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        assert!(!found.is_empty(), "no {caption:?} is painted beside the chip at {chip:?}");
+        found[0].center()
+    }
+
+    /// The one chip carrying `label`, found in the CHIP ROW rather than
+    /// anywhere on the form.
+    ///
+    /// Necessary, not fastidious: "Username" and "Password" are also field
+    /// labels above, and "Tab" and "Enter" are also palette buttons below, so
+    /// a bare `rect_of` finds two of everything. The chip row is the band
+    /// between the block's hint and the "Add a value" heading.
+    fn chip_rect(painted: &Painted, label: &str) -> Rect {
+        let floor = painted.rect_of(APP_SEQUENCE_HINT).bottom();
+        let ceiling = painted.rect_of("Add a value").top();
+        let found: Vec<Rect> = painted
+            .rects_of(label)
+            .into_iter()
+            .filter(|r| r.top() > floor && r.top() < ceiling)
+            .collect();
+        assert_eq!(found.len(), 1, "expected one {label:?} chip, found {}", found.len());
+        found[0]
+    }
+
+    /// **The index a chip's own control hands to the pure function.**
+    ///
+    /// `sequence_without` and `sequence_moved` are exhaustively tested as
+    /// pure functions and nothing tested the BINDING: `ChipEdit::Remove(index)`
+    /// -> `Remove(0)` deleted the first step whichever `x` was clicked, and
+    /// saved that, with every test passing. There was no chip-click test at
+    /// all -- only palette-click and eye-click ones.
+    ///
+    /// The THIRD of four steps, so it is neither first nor last: a constant
+    /// and an off-by-one in either direction are all three visible. All three
+    /// controls, because they share the shape by construction.
+    #[test]
+    fn each_chips_own_controls_act_on_that_chip_and_not_another() {
+        const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{ENTER}";
+        // Read from what the row is drawn from, so the label under test
+        // cannot drift from the chip under test.
+        let labels: Vec<String> =
+            sequence_view(SEQUENCE).tokens.iter().map(|t| t.chip_label()).collect();
+        assert_eq!(labels.len(), 4, "the fixture is not four steps long: {labels:?}");
+        let target = labels[2].clone();
+
+        for (caption, expected) in [
+            ("x", "{USERNAME}{TAB}{ENTER}"),
+            ("<", "{USERNAME}{PASSWORD}{TAB}{ENTER}"),
+            (">", "{USERNAME}{TAB}{ENTER}{PASSWORD}"),
+        ] {
+            // The control on the expectation: each of these differs from what
+            // the SAME edit applied to step 0 or to a neighbour would produce,
+            // so none of them can be satisfied by acting on the wrong step.
+            assert_ne!(expected, sequence_without(SEQUENCE, 0), "{caption}");
+            assert_ne!(expected, SEQUENCE, "{caption}");
+
+            let item = item();
+            let ctx = styled_context(PANE);
+            let mut draft = draft_for(&item, SEQUENCE);
+            let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+            let chip = chip_rect(&open, &target);
+            let at = control_beside(&open, chip, caption);
+            let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+            assert_eq!(
+                draft.app.as_ref().unwrap().sequence,
+                expected,
+                "clicking {caption:?} beside the {target:?} chip -- step 3 of 4 -- acted on a \
+                 different step"
+            );
+        }
+    }
+
+    /// **Shutting the builder shuts the eye.** Deleting `app.previewing =
+    /// false;` from the Done arm leaves a reveal armed that the user never
+    /// asked for a second time: scroll the block shut, open it again later,
+    /// and the plaintext is straight back on screen.
+    #[test]
+    fn closing_the_builder_closes_the_eye_so_reopening_reveals_nothing() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
+        let open = reveal(&ctx, PANE, &mut draft, &item, &live_code());
+        // The control: the eye really was open, and really was showing it.
+        assert!(open.strings().contains(&PASSWORD), "{:?}", open.strings());
+
+        let at = open.rect_of(APP_SEQUENCE_CLOSE).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+        let app = draft.app.as_ref().unwrap();
+        assert!(!app.sequence_open, "the builder did not close");
+        assert!(!app.previewing, "the builder closed with the eye left open");
+
+        let reopened = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        assert!(
+            !reopened.strings().contains(&PASSWORD),
+            "reopening the builder put the password back on screen without being asked: {:?}",
+            reopened.strings()
+        );
+    }
 }
 
 /// The edit form's SHAPE, on a pane too short to hold it.
