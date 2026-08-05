@@ -1501,6 +1501,89 @@ pub fn draw_detail_edit(
     ui.label(theme::bold(form_title(draft.kind, creating), 19.0).color(theme::INK));
     ui.add_space(12.0);
 
+    // A create of a kind `NewItem` cannot express has no payload at all (see
+    // `EditDraft::to_new_item`), so Save is withheld rather than left to
+    // produce nothing when clicked. Unreachable through the "+ New" menu,
+    // which offers only `CREATABLE_KINDS` -- this is the backstop, and it says
+    // why instead of doing nothing quietly. An *edit* of such an item is
+    // fine: the name and folder still save.
+    let creatable = !creating || is_creatable(draft.kind);
+
+    // The action strip is drawn BEFORE the form, as a bottom panel, and that
+    // order is the whole fix. This form was one plain `Ui` with no scroll area
+    // at any level, so on a window shorter than the form -- which commit
+    // `4b05adb`'s app block made an ordinary login on an ordinary window --
+    // Save and Cancel were laid out past the bottom of the pane, painted
+    // nowhere, and reachable by nothing. There was no way to save an edit.
+    //
+    // `Panel::bottom` rather than the alternatives, because it is the
+    // only one that measures what it holds:
+    //
+    //   * `ui.available_height() - <a button's height>` is the obvious fix and
+    //     the trap. The strip's height is not constant -- the two error labels
+    //     below are conditional, the row wraps on a narrow pane, and a third
+    //     button one day would add another line. Any constant is wrong in some
+    //     state, and wrong here means the buttons go back off-screen.
+    //   * Wrapping the whole function in a `ScrollArea` scrolls the buttons
+    //     away with everything else, which is the bug restated.
+    //   * `Layout::bottom_up` works, but the strip has to be written in
+    //     reverse -- buttons first, then the errors that belong above them --
+    //     and a later edit that appends a label in source order would silently
+    //     put it under the buttons.
+    //
+    // The panel takes its natural height off the bottom whatever that height
+    // is, and the `ScrollArea` below then gets exactly the rest. The title
+    // stays outside both, so it does not scroll away either -- see
+    // `edit_pane_layout_tests`, which pins all three facts as geometry.
+    egui::Panel::bottom("detail-edit-actions")
+        // The strip is part of the pane, not a docked tool window: the pane's
+        // own card already carries the only edge this form draws.
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                .fill(theme::CANVAS)
+                // Replaces the `ui.add_space(12.0)` that used to separate the
+                // strip from the card; the card's own bottom edge is now the
+                // scrolled content's, and this is the gap above the buttons.
+                .inner_margin(Margin { top: 12, ..Margin::ZERO }),
+        )
+        .show(ui, |ui| {
+            if !creatable {
+                ui.label(
+                    RichText::new(
+                        "Deskwarden does not know this item type and cannot create one. Create \
+                         it in the Bitwarden web vault or app.",
+                    )
+                    .size(12.0)
+                    .color(theme::ERROR),
+                );
+                ui.add_space(6.0);
+            }
+            if !draft.is_valid() {
+                ui.label(RichText::new("Name is required.").size(12.0).color(theme::ERROR));
+                ui.add_space(6.0);
+            }
+
+            ui.horizontal(|ui| {
+                let save = egui::Button::new(if draft.is_valid() {
+                    "Save"
+                } else {
+                    "Save (needs a name)"
+                });
+                if ui.add_enabled(draft.is_valid() && creatable, save).clicked() {
+                    action = EditAction::Save;
+                }
+                if theme::secondary_button(ui, "Cancel").clicked() {
+                    action = EditAction::Cancel;
+                }
+            });
+        });
+
+    // `auto_shrink([false; 2])`: the area must take the full width the pane
+    // gives it (the card inside sets its own width from `available_width`) and
+    // the full height left over, so a short form does not leave the strip
+    // floating in the middle of the pane.
+    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
@@ -1720,39 +1803,6 @@ pub fn draw_detail_edit(
                 );
             }
         });
-
-    // A create of a kind `NewItem` cannot express has no payload at all (see
-    // `EditDraft::to_new_item`), so Save is withheld rather than left to
-    // produce nothing when clicked. Unreachable through the "+ New" menu,
-    // which offers only `CREATABLE_KINDS` -- this is the backstop, and it says
-    // why instead of doing nothing quietly. An *edit* of such an item is
-    // fine: the name and folder still save.
-    let creatable = !creating || is_creatable(draft.kind);
-    if !creatable {
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new(
-                "Deskwarden does not know this item type and cannot create one. Create it in \
-                 the Bitwarden web vault or app.",
-            )
-            .size(12.0)
-            .color(theme::ERROR),
-        );
-    }
-    if !draft.is_valid() {
-        ui.add_space(6.0);
-        ui.label(RichText::new("Name is required.").size(12.0).color(theme::ERROR));
-    }
-
-    ui.add_space(12.0);
-    ui.horizontal(|ui| {
-        let save = egui::Button::new(if draft.is_valid() { "Save" } else { "Save (needs a name)" });
-        if ui.add_enabled(draft.is_valid() && creatable, save).clicked() {
-            action = EditAction::Save;
-        }
-        if theme::secondary_button(ui, "Cancel").clicked() {
-            action = EditAction::Cancel;
-        }
     });
 
     action
@@ -3846,6 +3896,295 @@ mod generator_row_tests {
         assert!(
             !theme::icon_probe::eyes(&drawn).is_empty(),
             "control: the eye probe finds no eye even when one is drawn"
+        );
+    }
+}
+
+/// The edit form's SHAPE, on a pane too short to hold it.
+///
+/// The bug these exist for: `draw_detail_edit` drew the title, the whole form
+/// and the Save/Cancel row into one plain `Ui` with no scroll area anywhere,
+/// so on a window shorter than the form the buttons were painted BELOW the
+/// pane and the user could neither reach them nor scroll to them -- an edit
+/// that could not be saved or cancelled. Commit `4b05adb`'s app block is what
+/// pushed a routine login form past a routine window's height.
+///
+/// These are geometry assertions on the rects egui really painted, not on the
+/// presence of a galley: a galley exists whether or not it is on screen, and
+/// `Galley::text()` answers with the SOURCE string, so "the button is there"
+/// is exactly the claim that stayed true all through the bug. Each test
+/// carries a positive control saying what it would look like to be blind.
+#[cfg(test)]
+mod edit_pane_layout_tests {
+    use super::*;
+    use eframe::egui::{Pos2, Rect, Vec2};
+
+    /// The narrowest the detail pane can be, derived from the three constants
+    /// that produce it (900 - 212 - 390 = 298pt) rather than written out --
+    /// same derivation, and same reason, as `detail.rs`'s `MIN_PANE`.
+    const MIN_PANE_WIDTH: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+        - crate::vault_window::SIDEBAR_WIDTH
+        - crate::vault_window::LIST_WIDTH;
+
+    /// The pane's height at the app's minimum window height. 600 is the whole
+    /// WINDOW; the detail pane gets what is left after the toolbar and the
+    /// central panel's 18pt margins, so this over-states the room the form
+    /// really has. That is the safe direction: a form that will not fit here
+    /// cannot fit in the app either.
+    const MIN_PANE_HEIGHT: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32;
+
+    /// Shorter than anything the app can be resized to, and deliberately so:
+    /// it is the case where nearly every field is off-screen, which is where a
+    /// layout that merely *shrinks* the form instead of scrolling it gets
+    /// caught.
+    const TINY_PANE_HEIGHT: f32 = 300.0;
+
+    #[derive(Default)]
+    struct Painted {
+        texts: Vec<(String, Rect)>,
+    }
+
+    impl Painted {
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn rects_of(&self, label: &str) -> Vec<Rect> {
+            self.texts.iter().filter(|(t, _)| t == label).map(|(_, r)| *r).collect()
+        }
+
+        /// The one rect painting `label`, or a failure naming everything that
+        /// was painted.
+        fn rect_of(&self, label: &str) -> Rect {
+            let found = self.rects_of(label);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} in the edit form, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+    }
+
+    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => painted.texts.push((
+                text.galley.text().to_string(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, painted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn raw_input(pane: Vec2, events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A context with `theme::apply`'s fonts live, sized to `pane`. The two
+    /// throwaway frames are this crate's standing harness: a font set
+    /// registered during a frame is only usable from the next one.
+    fn styled_context(pane: Vec2) -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(pane, &[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(pane, &[]), |_ui| {});
+        ctx
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        creating: bool,
+        events: &[egui::Event],
+    ) -> Painted {
+        let mut apps = AppIdentityCache::default();
+        let output = ctx.run_ui(raw_input(pane, events), |ui| {
+            let _ = draw_detail_edit(ui, draft, &[], creating, &mut apps);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// The tallest form the app can actually put on screen: a Login (the only
+    /// body with a generator row), being CREATED (which is when the generator
+    /// is offered), with an app binding drawn in full (commit `4b05adb`'s
+    /// block, the height that made this bug reachable), and with the name
+    /// still empty so the conditional "Name is required." error is up too.
+    /// This is the case the user hit.
+    fn tallest_draft() -> EditDraft {
+        let mut draft = EditDraft::empty();
+        draft.generator = GeneratorDraft { passphrase: false, length: 33, words: 7 };
+        draft.app = Some(AppMatchDraft::from_match(&AppMatch {
+            process: "chrome.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            // A path that exists nowhere, so the identity lookup resolves the
+            // same way on every machine and no assertion here depends on what
+            // happens to be installed.
+            path: r"C:\Deskwarden Test\Chrome\chrome.exe".to_string(),
+            args: r#"--profile-directory="Profile 2""#.to_string(),
+            trigger: TriggerMode::Prompt,
+        }));
+        assert!(!draft.is_valid(), "the tall case wants the name error showing");
+        draft
+    }
+
+    /// The label the disabled Save wears while the name is empty.
+    const SAVE: &str = "Save (needs a name)";
+
+    fn assert_inside(what: &str, rect: Rect, pane: Vec2, painted: &Painted) {
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        assert!(
+            bounds.contains_rect(rect),
+            "{what} is painted at {rect:?}, outside the {}x{} pane -- the user cannot \
+             click it. Painted: {:?}",
+            pane.x,
+            pane.y,
+            painted.strings()
+        );
+    }
+
+    /// The bug, stated as geometry: on a pane the app can really be resized
+    /// to, holding the form the user really had, Save and Cancel are on
+    /// screen.
+    ///
+    /// Positive control: the same assertion FAILS on the pre-fix layout (one
+    /// plain `Ui`, no scroll area) -- verified by running it against that
+    /// layout before the fix, where Save landed several hundred points below
+    /// the pane. It cannot pass by accident, because a form drawn top-down
+    /// with no scrolling puts its last widget at the form's full height.
+    #[test]
+    fn save_and_cancel_are_on_screen_at_the_minimum_window_size() {
+        for height in [MIN_PANE_HEIGHT, TINY_PANE_HEIGHT] {
+            let pane = egui::vec2(MIN_PANE_WIDTH, height);
+            let ctx = styled_context(pane);
+            let mut draft = tallest_draft();
+            // Two frames: a `ScrollArea` needs one to learn its content size,
+            // and the app draws this form continuously anyway.
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let painted = frame(&ctx, pane, &mut draft, true, &[]);
+
+            assert_inside("Save", painted.rect_of(SAVE), pane, &painted);
+            assert_inside("Cancel", painted.rect_of("Cancel"), pane, &painted);
+            // The error label belongs to the buttons: it is the reason Save is
+            // disabled, and it is useless where it cannot be read.
+            assert_inside("the name error", painted.rect_of("Name is required."), pane, &painted);
+
+            // On screen is not enough: the strip has to be at the BOTTOM of
+            // the pane, below the form, which is where a form's actions
+            // belong and where the user looks for them. Without this a strip
+            // pinned to the TOP -- directly under the title, above every
+            // field it acts on -- passes everything above. The slack is the
+            // button's own padding under its glyphs plus the strip's bottom
+            // edge, not room for a whole widget.
+            let save = painted.rect_of(SAVE);
+            assert!(
+                pane.y - save.bottom() <= 30.0,
+                "Save's glyphs end at y = {} on a pane {} tall -- the action strip is not \
+                 pinned to the bottom of the pane",
+                save.bottom(),
+                pane.y
+            );
+        }
+    }
+
+    /// The other half of the fix: the fields the buttons were pinned away from
+    /// are reachable. Scrolling brings the LAST thing in the form ("Folder")
+    /// on screen, and it does not drag the buttons off.
+    #[test]
+    fn the_form_scrolls_to_its_last_field_while_the_buttons_stay_put() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let before = frame(&ctx, pane, &mut draft, true, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        // Control: without this the test could pass on a pane that never
+        // needed scrolling at all, which would make the scroll below a no-op
+        // and this test blind.
+        assert!(
+            // "Not visible" is checked with `rects_of`, not `rect_of`: an
+            // unscrolled field is not merely painted out of bounds -- egui
+            // culls it and paints NOTHING, which is exactly why the user saw
+            // no Save button at all rather than a Save button off the edge.
+            !before.rects_of("Folder").iter().any(|r| bounds.contains_rect(*r)),
+            "the tall form already fits in a {}x{} pane, so this test is not \
+             exercising scrolling at all",
+            pane.x,
+            pane.y
+        );
+        let save_before = before.rect_of(SAVE);
+        let cancel_before = before.rect_of("Cancel");
+
+        // A wheel over the middle of the form. `MouseWheel` in points is what
+        // egui's scroll areas consume; the pointer has to be over the area
+        // first or the event goes nowhere.
+        let middle = Pos2::new(pane.x / 2.0, pane.y / 2.0);
+        let scroll = vec![
+            egui::Event::PointerMoved(middle),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            },
+        ];
+        let _ = frame(&ctx, pane, &mut draft, true, &scroll);
+        // egui smooths a wheel step out over several frames, so the scroll is
+        // not finished when the event frame returns; these are the frames the
+        // app would draw while the user's flick settles.
+        for _ in 0..12 {
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        }
+        let after = frame(&ctx, pane, &mut draft, true, &[]);
+
+        assert_inside("the last field's label (Folder)", after.rect_of("Folder"), pane, &after);
+        assert_eq!(
+            after.rect_of(SAVE),
+            save_before,
+            "scrolling the form moved Save -- the buttons are not pinned"
+        );
+        assert_eq!(
+            after.rect_of("Cancel"),
+            cancel_before,
+            "scrolling the form moved Cancel -- the buttons are not pinned"
+        );
+    }
+
+    /// The title is the other thing a naive "wrap the whole function in a
+    /// ScrollArea" fix loses -- and this crate has already shipped a layout
+    /// test that certified a pane whose title had been annihilated. It stays
+    /// on screen, above the form, at the minimum size.
+    #[test]
+    fn the_form_title_survives_the_short_pane() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+
+        let title = painted.rect_of(&form_title(draft.kind, true));
+        assert_inside("the form title", title, pane, &painted);
+        assert!(
+            title.bottom() < painted.rect_of(SAVE).top(),
+            "the title is not above the buttons: title {title:?}, Save {:?}",
+            painted.rect_of(SAVE)
         );
     }
 }
