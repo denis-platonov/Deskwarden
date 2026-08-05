@@ -425,6 +425,27 @@ pub enum DetailAction {
     /// this through `vault_bridge::without_app_match`, which removes the
     /// custom field rather than blanking it.
     RemoveAppMatch,
+    /// The `MATCHED APP` card's Open was clicked for the APP: start the bound
+    /// program.
+    ///
+    /// **It carries a [`LaunchPlan`] and not the [`AppMatch`] it came from,
+    /// and that is the whole point.** Every question about whether this may
+    /// run at all -- is the binding dead, is it a Store app, does
+    /// [`AppMatch::launchable_path`] accept the recorded path, is the item's
+    /// URI an `http(s)` one worth appending -- is answered ONCE, in
+    /// [`app_launch_plan`], which is a pure function a test can call. A
+    /// variant carrying the match would put those five questions in the
+    /// caller as well, and the caller is inside `vault_window::mod`'s event
+    /// loop where nothing can call them.
+    ///
+    /// So: **a `LaunchPlan` existing is the permission.** `vault_window::mod`
+    /// does not re-check and must never re-derive -- see `launch_app`, whose
+    /// doc says the same thing from the other end.
+    ///
+    /// The website half of the same control is NOT a second variant: it is
+    /// [`Self::OpenWebsite`], which already exists and already goes through
+    /// `is_safe_web_url` and `ShellExecuteW`.
+    OpenApp(LaunchPlan),
 }
 
 /// Whether this kind can be filled into an application.
@@ -1972,7 +1993,7 @@ pub fn draw_detail_read(
     let app_field_present = crate::vault_bridge::has_app_match_field(item);
     if app_card_visible(app_field_present, kind) {
         card(ui, APP_CARD_HEADING, |ui| {
-            app_match_card(ui, app_match.as_ref(), app_field_present, &mut action);
+            app_match_card(ui, app_match.as_ref(), app_field_present, website, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -2237,6 +2258,341 @@ fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
     rows
 }
 
+
+// ---------------------------------------------------------------------------
+// Open: starting the app this item is bound to.
+//
+// The user's case, in their words: "I have two browsers open - personal and
+// work... if I click Open in MS365 of work account - it launches Chrome with
+// certain profile and logins there if personal - it is another Chrome." Two
+// vault items name the same `chrome.exe` at the same `path` and differ only in
+// `AppMatch::args` -- which is what that field was added for, and this is its
+// first reader.
+//
+// Every decision below is a free function returning a value. Nothing here
+// draws, and nothing here spawns: the control reports a `DetailAction` and
+// `vault_window::mod` starts the process, for this file's standing reason --
+// a decision reachable only through an `egui` closure is a decision no test
+// can call, and a `Command::spawn` reachable from a test is a test that
+// launches a browser.
+// ---------------------------------------------------------------------------
+
+/// A program to start, in the two pieces Windows actually needs.
+///
+/// **`raw_tail` is a command line, not an argument list, and that is a
+/// decision.** Windows does not pass programs a vector of arguments; it passes
+/// one string, and each program splits it itself. `AppMatch::args` is already
+/// one such string, stored exactly as the user typed it (see that field's
+/// doc, which promises never to re-quote or split it). The obvious
+/// implementation -- split `args` into a `Vec<String>` and hand it to
+/// `Command::args` -- therefore does a round trip: split by one convention,
+/// then let `std` re-quote by another. For the motivating value,
+/// `--profile-directory="Profile 2"`, that round trip is *lossy in a way the
+/// user can see*: `CommandLineToArgvW` yields the single token
+/// `--profile-directory=Profile 2` (the quotes are consumed, they were never
+/// argument delimiters here), and `std`'s re-quoting turns that back into
+/// `"--profile-directory=Profile 2"` -- quotes around the WHOLE thing. Chrome
+/// reads that as a flag literally named `--profile-directory=Profile 2` only
+/// because it re-splits with the same convention; anything that does not
+/// (and plenty of Windows programs roll their own parser) gets a different
+/// flag than the user typed.
+///
+/// **What was rejected, and why.**
+///
+///  * *Hand-written tokenisation.* Matching `CommandLineToArgvW`'s real rules
+///    -- `2n` backslashes then a quote, `2n+1` backslashes then a quote, `""`
+///    inside a quoted run -- is notoriously error-prone, and getting it wrong
+///    is silent.
+///  * *`CommandLineToArgvW` itself*, which is in the `windows` crate already
+///    pinned here. It parses correctly, and it is still the wrong tool: it is
+///    the lossy half of the round trip above, its argv[0] rules differ from
+///    its argv[n] rules, and it would make this crate's behaviour depend on
+///    a Win32 call in a function that otherwise needs no OS at all.
+///  * Both share the same defect: they change the user's string. This field's
+///    doc promises not to.
+///
+/// **What is done instead**: `std::os::windows::process::CommandExt::raw_arg`,
+/// which appends a string to the command line *verbatim*. `args` is never
+/// split, never re-quoted, and never parsed by this crate -- it arrives at the
+/// target program byte-for-byte as the user wrote it, and the target program's
+/// own parser is the only one that ever looks at it. There is no new injection
+/// surface: no shell is involved (`Command` does not go through `cmd.exe`),
+/// so the worst a corrupted `args` can do is pass extra flags to a program
+/// whose identity [`AppMatch::launchable_path`] has already pinned -- which is
+/// exactly what an honest `args` does too.
+///
+/// The one string this crate *does* have to compose is the item's URL, which
+/// is appended after `args`; that one goes through [`quote_arg`], because it
+/// is being joined onto a command line rather than passed through one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    /// The image to run. **Always a value [`AppMatch::launchable_path`]
+    /// returned**, never `AppMatch::path` itself -- see [`app_launch_plan`],
+    /// which is the only constructor.
+    pub program: String,
+    /// Everything after the program, already in Windows command-line form,
+    /// to be handed to `raw_arg` as one piece. Empty when there is nothing to
+    /// add, in which case no `raw_arg` call is made at all.
+    pub raw_tail: String,
+}
+
+/// One argument, quoted the way `CommandLineToArgvW` will read it back.
+///
+/// Used for exactly one thing -- appending the item's URL onto a command line
+/// (see [`launch_tail`]) -- and deliberately NOT used on `AppMatch::args`,
+/// which is passed through untouched.
+///
+/// The rules, which are the documented MSVC/`CommandLineToArgvW` ones:
+///
+///  * a run of `n` backslashes followed by a `"` becomes `2n` backslashes and
+///    `\"`; the same run followed by anything else stays `n`;
+///  * a run of `n` backslashes at the very end of the argument, inside the
+///    quotes, becomes `2n`, so the closing quote is not escaped by it;
+///  * an argument with no space, tab or quote in it is returned unchanged --
+///    the overwhelmingly common case for a URL, so the tooltip that shows the
+///    command line shows something a user recognises;
+///  * the empty string becomes `""`, which is how an empty argument is spelled
+///    and is not the same as no argument at all.
+pub(crate) fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let chars: Vec<char> = arg.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let mut backslashes = 0;
+        while i < chars.len() && chars[i] == '\\' {
+            backslashes += 1;
+            i += 1;
+        }
+        if i == chars.len() {
+            // At the end: double them, so the closing quote below is not
+            // escaped by the last one.
+            for _ in 0..backslashes * 2 {
+                out.push('\\');
+            }
+        } else if chars[i] == '"' {
+            for _ in 0..backslashes * 2 + 1 {
+                out.push('\\');
+            }
+            out.push('"');
+            i += 1;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The command line after the program: the match's `args` verbatim, then the
+/// item's URL if there is one.
+///
+/// **The URL goes last**, which is where every browser this is for expects it:
+/// `chrome.exe --profile-directory="Profile 2" https://...` opens that URL in
+/// that profile, and the reverse order makes the URL a positional argument to
+/// nothing. It is the ONLY part composed by this crate, so it is the only part
+/// [`quote_arg`] touches.
+///
+/// Both ends are trimmed because leading and trailing whitespace on a command
+/// line means nothing to any parser, and a stored `args` of `"   "` would
+/// otherwise produce a tail that is nothing but a space -- which
+/// `LaunchPlan::raw_tail`'s emptiness test is supposed to catch.
+pub(crate) fn launch_tail(args: &str, url: &str) -> String {
+    let args = args.trim();
+    let url = url.trim();
+    match (args.is_empty(), url.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => args.to_string(),
+        (true, false) => quote_arg(url),
+        (false, false) => format!("{args} {}", quote_arg(url)),
+    }
+}
+
+/// The whole command line a [`LaunchPlan`] will produce, program included --
+/// what the Open control puts in its tooltip.
+///
+/// **Shown to the user on purpose.** This runs a path that came out of vault
+/// data; the one thing that makes that reviewable is being able to read what
+/// will run before clicking. It is also what a test can assert on, which is
+/// why it is a function rather than a `format!` at the call site.
+pub(crate) fn command_line(plan: &LaunchPlan) -> String {
+    if plan.raw_tail.is_empty() {
+        quote_arg(&plan.program)
+    } else {
+        format!("{} {}", quote_arg(&plan.program), plan.raw_tail)
+    }
+}
+
+/// The item's website, but only when it is something worth handing to a
+/// program or to the shell.
+///
+/// `super::is_safe_web_url` and not a second copy of the scheme test:
+/// `webbrowser_open` refuses anything else anyway, so a `javascript:` URI that
+/// got as far as an Open entry would draw a control that silently does
+/// nothing. Asked here, the entry is simply not offered.
+fn openable_url(website: &str) -> Option<&str> {
+    super::is_safe_web_url(website).then_some(website)
+}
+
+/// The program this match may start, or `None` if it may not be started at
+/// all. **The only constructor of a [`LaunchPlan`], and the only gate.**
+///
+/// Three refusals, each of which is also a sentence on the card (see
+/// [`app_open_refusal`], which is held to this function by
+/// `a_refusal_is_shown_exactly_when_there_is_no_plan`):
+///
+///  * a **dead** binding ([`app_match_is_dead`]) -- the card already says
+///    Deskwarden ignores it, and an Open beside that sentence would be this
+///    pane offering to act on a binding it has just said it never acts on;
+///  * a **hosted** (Microsoft Store / UWP) match -- there is no exe to run.
+///    A packaged app is started through the app model, not by `CreateProcess`
+///    on its image, and the image under `WindowsApps` is not launchable by
+///    path even when one was recorded. Refused explicitly rather than left to
+///    `launchable_path`, so the reason the user is shown is the true one;
+///  * anything [`AppMatch::launchable_path`] refuses -- an unrecorded path, a
+///    relative or UNC or device path, a `..`, an alternate data stream, or a
+///    file name that is not this match's own `process`. **There is no fallback
+///    branch**: the path that is run is the `&str` that function returned, not
+///    `m.path`, so there is no expression in this crate that reaches
+///    `Command::new` with a path it refused.
+fn app_launch_plan(m: &AppMatch, website: &str) -> Option<LaunchPlan> {
+    if app_match_is_dead(m) || m.hosted {
+        return None;
+    }
+    let program = m.launchable_path()?;
+    Some(LaunchPlan {
+        program: program.to_string(),
+        raw_tail: launch_tail(&m.args, openable_url(website).unwrap_or("")),
+    })
+}
+
+/// What the card says when there is a readable, live binding that still cannot
+/// be started -- the failure the user must be told about *before* they click,
+/// because there will be no click.
+///
+/// `None` for a dead binding: [`APP_MATCH_DEAD_NOTICE`] already says the whole
+/// truth about it, and a second sentence adding "also, Open is missing" is
+/// noise about a consequence.
+fn app_open_refusal(m: &AppMatch) -> Option<&'static str> {
+    if app_match_is_dead(m) {
+        return None;
+    }
+    if m.hosted {
+        return Some(APP_OPEN_HOSTED_NOTE);
+    }
+    if m.path.is_empty() {
+        return Some(APP_OPEN_NO_PATH_NOTE);
+    }
+    if m.launchable_path().is_none() {
+        return Some(APP_OPEN_REFUSED_NOTE);
+    }
+    None
+}
+
+/// Why a Microsoft Store app gets no Open. The word `hosted` stays off the
+/// screen, exactly as it does in [`APP_HOSTED_NOTE`].
+const APP_OPEN_HOSTED_NOTE: &str =
+    "Deskwarden can\u{2019}t start this one for you: Microsoft Store apps are opened through \
+     Windows rather than by running a program file. Use the Start menu.";
+
+/// Why a match saved before `path` existed gets no Open.
+const APP_OPEN_NO_PATH_NOTE: &str =
+    "Deskwarden can\u{2019}t start this app: no program file was recorded when it was matched. \
+     Use \u{201c}Add app\u{2026}\u{201d} in the Deskwarden tray menu to pick it again, and the \
+     program file will be recorded this time.";
+
+/// Why a recorded path this build will not execute gets no Open. It does not
+/// repeat the path -- the Program file row directly above is showing it, which
+/// is the whole reason that row shows `path` raw rather than through
+/// `launchable_path`.
+const APP_OPEN_REFUSED_NOTE: &str =
+    "Deskwarden won\u{2019}t start the program file above: it isn\u{2019}t a plain drive path \
+     ending in this app\u{2019}s own executable name, so it can\u{2019}t be trusted to be the \
+     program that was matched. Re-add the app from the Deskwarden tray menu to record it \
+     again.";
+
+/// One thing the card's Open control can do.
+///
+/// **Not `Option<LaunchPlan>` plus `Option<String>`**: the control's shape --
+/// a plain button or a menu -- is "how many of these are there", and a list
+/// makes that a `len()` instead of a two-`bool` match at the draw site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OpenChoice {
+    /// Start the bound program. `name` is the match's `process`, which is what
+    /// the entry is labelled with.
+    App { name: String, plan: LaunchPlan },
+    /// Open the item's first URI in the default browser.
+    Website(String),
+}
+
+/// What Open offers for this match and this website, in the order the entries
+/// are drawn.
+///
+/// **The website entry exists only alongside an app entry**, which is the
+/// user's own spec ("show dropdown exe or web if both present") and is also
+/// the honest scope: an item with a website and no launchable app already has
+/// a control that opens it -- the blue URL in the `AUTOFILL TARGETS` card,
+/// which reports the very same [`DetailAction::OpenWebsite`] this entry does.
+/// A second button for it would be a second way to do one thing, and
+/// `the_website_row_has_no_open_button` exists because that was already
+/// rejected once.
+///
+/// So the shapes are: nothing (no launchable app), one plain button (a
+/// launchable app and no web URL), or a menu of two.
+fn app_open_choices(m: &AppMatch, website: &str) -> Vec<OpenChoice> {
+    let Some(plan) = app_launch_plan(m, website) else {
+        return Vec::new();
+    };
+    let mut choices = vec![OpenChoice::App {
+        name: m.process.clone(),
+        plan,
+    }];
+    if let Some(url) = openable_url(website) {
+        choices.push(OpenChoice::Website(url.to_string()));
+    }
+    choices
+}
+
+/// The word on a menu entry -- and, when there is only one choice, on the
+/// button itself. The user asked for "Open {key}", and the key is the
+/// executable's name.
+fn open_choice_label(choice: &OpenChoice) -> String {
+    match choice {
+        OpenChoice::App { name, .. } => format!("Open {name}"),
+        OpenChoice::Website(_) => OPEN_WEBSITE_LABEL.to_string(),
+    }
+}
+
+/// The tooltip: for the app, **the exact command line that will run**; for the
+/// website, the URL and where it goes. See [`command_line`].
+fn open_choice_hover(choice: &OpenChoice) -> String {
+    match choice {
+        OpenChoice::App { plan, .. } => format!("Runs {}", command_line(plan)),
+        OpenChoice::Website(url) => format!("Opens {url} in your default browser"),
+    }
+}
+
+fn open_choice_action(choice: &OpenChoice) -> DetailAction {
+    match choice {
+        OpenChoice::App { plan, .. } => DetailAction::OpenApp(plan.clone()),
+        OpenChoice::Website(url) => DetailAction::OpenWebsite(url.clone()),
+    }
+}
+
+/// The website entry's label. A constant so the source pin and the draw site
+/// cannot drift.
+const OPEN_WEBSITE_LABEL: &str = "Open website";
+/// The menu button's own label, when there are two choices behind it.
+const OPEN_MENU_LABEL: &str = "Open";
+const OPEN_MENU_HOVER: &str = "Open this item\u{2019}s app or its website";
+
 /// The card's footer lines, under the rows: what the selected trigger means,
 /// and -- for a Store app -- why this match is keyed on a title.
 ///
@@ -2252,6 +2608,12 @@ fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
     let mut notes = vec![trigger_caption(m.trigger)];
     if m.hosted {
         notes.push(APP_HOSTED_NOTE);
+    }
+    // Last, under the caption that says what the match does, because it is
+    // about a control the user is looking for and cannot see. See
+    // [`app_open_refusal`], which is `None` exactly when there IS an Open.
+    if let Some(refusal) = app_open_refusal(m) {
+        notes.push(refusal);
     }
     notes
 }
@@ -2328,6 +2690,12 @@ fn app_match_card(
     ui: &mut egui::Ui,
     app_match: Option<&AppMatch>,
     field_present: bool,
+    // The item's website exactly as the `AUTOFILL TARGETS` card has it --
+    // empty when there is none, or when this kind does not autofill. Passed
+    // in rather than re-read off the item so that the URL this card would
+    // open and the URL that card is showing are one expression (see
+    // `draw_detail_read`, which derives it once).
+    website: &str,
     action: &mut DetailAction,
 ) {
     let m = match app_card_body(app_match, field_present) {
@@ -2421,7 +2789,7 @@ fn app_match_card(
     }
 
     theme::row_rule(ui);
-    app_card_footer(ui, &app_card_notes(m), action);
+    app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), action);
 }
 
 /// The card's footer: the notes on the left where a value goes, Remove in the
@@ -2431,7 +2799,15 @@ fn app_match_card(
 /// Shared by the bound card and by [`app_notice_with_remove`], so an
 /// unreadable field's Remove is the same control in the same place -- not a
 /// second button that happens to say the same word.
-fn app_card_footer(ui: &mut egui::Ui, notes: &[&str], action: &mut DetailAction) {
+fn app_card_footer(
+    ui: &mut egui::Ui,
+    notes: &[&str],
+    // What Open offers, from [`app_open_choices`]. Empty draws no Open at
+    // all, which is every case in which there is nothing this pane may
+    // honestly start.
+    choices: &[OpenChoice],
+    action: &mut DetailAction,
+) {
     row(
         ui,
         "",
@@ -2465,6 +2841,48 @@ fn app_card_footer(ui: &mut egui::Ui, notes: &[&str], action: &mut DetailAction)
             {
                 *action = DetailAction::RemoveAppMatch;
             }
+            // **After Remove, so it reads BEFORE it.** This control group is
+            // laid out right-to-left (see `row_body`), and Open is the
+            // ordinary action while Remove is the destructive one.
+            //
+            // Three shapes, and `choices.len()` is the whole decision -- see
+            // [`app_open_choices`], which owns it.
+            match choices {
+                // Nothing this pane may start. The reason is a sentence in
+                // the notes beside it, never a disabled button: a greyed
+                // control says "not now", and every one of these cases is
+                // "not until you change something".
+                [] => {}
+                // One thing to do, so no menu to open first. The button says
+                // which thing, because "Open" alone beside a Program file row
+                // and a website is a question.
+                [only] => {
+                    if theme::row_button(ui, &open_choice_label(only))
+                        .on_hover_text(open_choice_hover(only))
+                        .clicked()
+                    {
+                        *action = open_choice_action(only);
+                    }
+                }
+                // Both. The user's own words: "show dropdown exe or web if
+                // both present".
+                many => {
+                    let open = theme::row_button(ui, OPEN_MENU_LABEL)
+                        .on_hover_text(OPEN_MENU_HOVER);
+                    egui::Popup::menu(&open).show(|ui| {
+                        for choice in many {
+                            if ui
+                                .button(open_choice_label(choice))
+                                .on_hover_text(open_choice_hover(choice))
+                                .clicked()
+                            {
+                                *action = open_choice_action(choice);
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+            }
         },
     );
 }
@@ -2477,7 +2895,10 @@ fn app_card_footer(ui: &mut egui::Ui, notes: &[&str], action: &mut DetailAction)
 /// bound card's does -- and so the write arm in `vault_window::mod`, which
 /// clears the field by NAME through `without_app_match`, is reached by both.
 fn app_notice_with_remove(ui: &mut egui::Ui, notice: &'static str, action: &mut DetailAction) {
-    app_card_footer(ui, &[notice], action);
+    // No Open, and not because none was computed: there is no parsed match to
+    // compute one from. Remove is the only honest offer on an unreadable
+    // field, and that is the whole of this body.
+    app_card_footer(ui, &[notice], &[], action);
 }
 
 /// A pane for an item this build cannot show the contents of: it states the
@@ -8936,5 +9357,516 @@ mod tests {
              hidden rather than cleared; painted: {:?}",
             back.strings()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Open: what the card offers, and exactly what would run.
+    // -----------------------------------------------------------------
+
+    /// The user's own case, spelled the way they spelled it: two vault items
+    /// naming one `chrome.exe` at one path, told apart only by which profile
+    /// it is started with.
+    fn a_browser_match() -> AppMatch {
+        AppMatch {
+            process: "chrome.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            args: r#"--profile-directory="Profile 2""#.to_string(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    /// A login whose first URI really is an `http(s)` URL. `a_login`'s is
+    /// `app.ledgerline.com` -- schemeless, which `is_safe_web_url` refuses --
+    /// so it could never have produced a website choice, and a test written
+    /// against it would have passed for the wrong reason.
+    fn a_login_on_the_web() -> VaultItem {
+        let mut item = a_login();
+        item.login.as_mut().unwrap().uris = vec![crate::vault_bridge::UriEntry {
+            uri: Some("https://portal.ledgerline.com/sign-in".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        item
+    }
+
+    const WEB: &str = "https://portal.ledgerline.com/sign-in";
+
+    /// **The oracle for [`quote_arg`], and it is not this crate.**
+    ///
+    /// Every other assertion about quoting in this file would be this
+    /// function's own rules restated -- a control that re-derives its
+    /// expectation from the thing under test, which this crate has shipped
+    /// twice. So the expectation comes from Windows itself: build a command
+    /// line the way [`command_line`] does, hand it to `CommandLineToArgvW`
+    /// (the parser `std`, the CRT and every browser's own splitter are
+    /// modelled on), and read back what the program would actually receive.
+    ///
+    /// No process is started. `CommandLineToArgvW` is a pure string function.
+    fn argv_of(command_line: &str) -> Vec<String> {
+        let wide: Vec<u16> = command_line
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut count = 0i32;
+        // Safety: `wide` is a NUL-terminated UTF-16 buffer that outlives the
+        // call; `count` is a live `i32`. The returned block is read for
+        // `count` pointers and then freed with `LocalFree`, which is what
+        // the API documents as its deallocator.
+        unsafe {
+            let argv = windows::Win32::UI::Shell::CommandLineToArgvW(
+                windows::core::PCWSTR(wide.as_ptr()),
+                &mut count,
+            );
+            assert!(!argv.is_null(), "CommandLineToArgvW refused a command line");
+            let out = (0..count)
+                .map(|i| (*argv.offset(i as isize)).to_string().unwrap())
+                .collect();
+            let _ = windows::Win32::Foundation::LocalFree(
+                windows::Win32::Foundation::HLOCAL(argv as *mut core::ffi::c_void),
+            );
+            out
+        }
+    }
+
+    /// [`quote_arg`] round-trips through Windows' own parser, for the shapes
+    /// that break naive quoting.
+    #[test]
+    fn a_quoted_argument_comes_back_out_of_windows_own_parser_unchanged() {
+        let awkward = [
+            "https://portal.ledgerline.com/sign-in",
+            "https://x.test/a b",
+            "",
+            "   ",
+            "a\tb",
+            r#"say "hi""#,
+            r"C:\dir\",
+            r"C:\dir with space\",
+            r#"back\"slash"#,
+            r"\\\\",
+            r#"\\\""#,
+            "--profile-directory=Profile 2",
+        ];
+        for arg in awkward {
+            let line = format!("prog.exe {}", quote_arg(arg));
+            assert_eq!(
+                argv_of(&line),
+                vec!["prog.exe".to_string(), arg.to_string()],
+                "quote_arg({arg:?}) produced {line:?}, which Windows reads back as \
+                 something else"
+            );
+        }
+        // The control: the quoting is doing work. Passing these through RAW
+        // does not round-trip, so the assertions above are not satisfied by
+        // an identity function.
+        for arg in [r#"say "hi""#, "https://x.test/a b"] {
+            assert_ne!(
+                argv_of(&format!("prog.exe {arg}")),
+                vec!["prog.exe".to_string(), arg.to_string()],
+                "control: {arg:?} round-trips unquoted, so it proves nothing about quoting"
+            );
+        }
+    }
+
+    /// An argument with nothing awkward in it is returned untouched -- so the
+    /// command line in the tooltip is one a user recognises.
+    #[test]
+    fn a_plain_argument_is_not_wrapped_in_quotes_it_did_not_need() {
+        assert_eq!(quote_arg("https://x.test/a"), "https://x.test/a");
+        assert_eq!(quote_arg("--headless"), "--headless");
+        // And the two that must be quoted, spelled out rather than merely
+        // round-tripped, so a change of strategy is visible in a diff.
+        assert_eq!(quote_arg(""), r#""""#);
+        assert_eq!(quote_arg("a b"), r#""a b""#);
+    }
+
+    /// **The whole point of the feature, as one assertion.**
+    ///
+    /// `--profile-directory="Profile 2"` is passed through byte for byte, and
+    /// Windows' own parser reads the flag Chrome expects back out of the line
+    /// that would be run.
+    #[test]
+    fn the_profile_flag_reaches_the_browser_exactly_as_the_user_typed_it() {
+        let m = a_browser_match();
+        let plan = app_launch_plan(&m, "").expect("the browser match is launchable");
+        assert_eq!(
+            plan.raw_tail, r#"--profile-directory="Profile 2""#,
+            "the stored arguments were re-quoted, split or trimmed on the way to the \
+             command line"
+        );
+        assert_eq!(
+            argv_of(&command_line(&plan)),
+            vec![
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+                "--profile-directory=Profile 2".to_string(),
+            ],
+            "the command line Deskwarden would run does not deliver the profile flag"
+        );
+        // With the website too: the URL is a SECOND argument after the flag,
+        // not folded into it.
+        let with_web = app_launch_plan(&m, WEB).expect("still launchable");
+        assert_eq!(
+            argv_of(&command_line(&with_web)),
+            vec![
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+                "--profile-directory=Profile 2".to_string(),
+                WEB.to_string(),
+            ],
+            "the item's URL did not arrive as its own trailing argument"
+        );
+    }
+
+    #[test]
+    fn the_command_line_tail_is_the_arguments_verbatim_then_the_url() {
+        assert_eq!(launch_tail("", ""), "");
+        assert_eq!(launch_tail("   \t  ", ""), "", "whitespace-only arguments are no arguments");
+        assert_eq!(launch_tail("-a   -b", ""), "-a   -b", "a run of spaces INSIDE the arguments is the user's");
+        assert_eq!(launch_tail("  -a  ", ""), "-a");
+        assert_eq!(launch_tail("", WEB), WEB, "a bare URL needs no quoting");
+        assert_eq!(launch_tail("", "https://x.test/a b"), r#""https://x.test/a b""#);
+        assert_eq!(launch_tail("-a", WEB), format!("-a {WEB}"));
+        assert_eq!(
+            launch_tail(r#"--k="v w""#, WEB),
+            format!(r#"--k="v w" {WEB}"#),
+            "the URL must come AFTER the arguments"
+        );
+        // Unbalanced quotes in the stored arguments are the user's string and
+        // are passed on unchanged -- this crate does not repair them, and
+        // must not silently drop them either.
+        assert_eq!(launch_tail(r#"--k="v"#, ""), r#"--k="v"#);
+    }
+
+    #[test]
+    fn the_command_line_quotes_a_program_path_with_a_space_in_it() {
+        let plan = LaunchPlan {
+            program: r"C:\Program Files\App\App.exe".to_string(),
+            raw_tail: String::new(),
+        };
+        assert_eq!(command_line(&plan), r#""C:\Program Files\App\App.exe""#);
+        assert_eq!(argv_of(&command_line(&plan)), vec![plan.program.clone()]);
+        // No tail means no trailing space.
+        assert!(!command_line(&plan).ends_with(' '));
+    }
+
+    /// **The gate.** Nothing `AppMatch::launchable_path` refuses ever becomes
+    /// a plan, and the plan's `program` is that function's return value rather
+    /// than the field it was derived from.
+    #[test]
+    fn no_plan_is_ever_built_from_a_path_the_launch_check_refuses() {
+        let refused = [
+            (r"C:\Apps\..\Windows\System32\chrome.exe", "a .. component"),
+            (r"chrome.exe", "a relative path"),
+            (r"\\host\share\chrome.exe", "a UNC path"),
+            (r"\\?\C:\Apps\chrome.exe", "a device path"),
+            (r"C:/Apps/chrome.exe", "forward slashes"),
+            (r"C:\Apps\evil.exe:s\chrome.exe", "an alternate data stream"),
+            (r"C:\Apps\notchrome.exe", "a different file name"),
+            (r"C:\Apps\chrome.exe.", "a trailing dot"),
+            ("", "nothing recorded"),
+        ];
+        for (path, why) in refused {
+            let mut m = a_browser_match();
+            m.path = path.to_string();
+            assert!(
+                m.launchable_path().is_none(),
+                "the premise failed: launchable_path ACCEPTS {path:?} ({why})"
+            );
+            assert!(
+                app_launch_plan(&m, WEB).is_none(),
+                "a plan was built from {path:?}, which the launch check refuses ({why})"
+            );
+            assert!(
+                app_open_choices(&m, WEB).is_empty(),
+                "Open was offered for {path:?} ({why})"
+            );
+        }
+        // The control: the same match with an accepted path DOES get a plan,
+        // and the plan carries the checked value.
+        let ok = a_browser_match();
+        let plan = app_launch_plan(&ok, WEB).expect("control: this one is launchable");
+        assert_eq!(plan.program, ok.launchable_path().unwrap());
+    }
+
+    /// A Microsoft Store app is not started by running its image, and a dead
+    /// binding is not started at all.
+    #[test]
+    fn a_store_app_and_a_dead_binding_are_never_launched() {
+        let store = a_store_match();
+        assert!(
+            store.launchable_path().is_some(),
+            "the premise: this path passes the structural check, so the refusal below is \
+             about being a Store app and not about the path"
+        );
+        assert!(app_launch_plan(&store, WEB).is_none(), "a Store app was offered as a program to run");
+
+        let dead = AppMatch::for_process("ApplicationFrameHost.exe", TriggerMode::Prompt);
+        assert!(app_match_is_dead(&dead), "the premise: this binding really is dead");
+        assert!(app_launch_plan(&dead, WEB).is_none());
+    }
+
+    /// [`app_open_refusal`] says something exactly when there is nothing to
+    /// click -- and says nothing when there is.
+    #[test]
+    fn a_refusal_is_shown_exactly_when_there_is_no_plan() {
+        let mut no_path = a_browser_match();
+        no_path.path = String::new();
+        let mut bad_path = a_browser_match();
+        bad_path.path = r"C:\Apps\..\chrome.exe".to_string();
+        let dead = AppMatch::for_process("ApplicationFrameHost.exe", TriggerMode::Prompt);
+
+        let cases = [
+            (a_browser_match(), false),
+            (a_desktop_match(), false),
+            (a_store_match(), true),
+            (no_path, true),
+            (bad_path, true),
+            // Dead: refused, but the DEAD notice is what says so, and a
+            // second sentence would be noise.
+            (dead, false),
+        ];
+        for (m, expects_refusal) in cases {
+            assert_eq!(
+                app_open_refusal(&m).is_some(),
+                expects_refusal,
+                "the refusal note is wrong for {:?}",
+                m.process
+            );
+            if !app_match_is_dead(&m) {
+                assert_eq!(
+                    app_open_refusal(&m).is_some(),
+                    app_launch_plan(&m, "").is_none(),
+                    "a live binding either offers Open or explains why not, and this one \
+                     does neither or both: {m:?}"
+                );
+            }
+            // Whatever the card says, a refused match never gets a control.
+            if app_open_refusal(&m).is_some() {
+                assert!(app_open_choices(&m, WEB).is_empty());
+            }
+        }
+    }
+
+    /// The refusal reaches the card's notes, and the dead binding's does not.
+    #[test]
+    fn the_card_says_why_open_is_missing() {
+        let mut no_path = a_browser_match();
+        no_path.path = String::new();
+        let notes = app_card_notes(&no_path);
+        assert!(
+            notes.iter().any(|n| n.contains("no program file was recorded")),
+            "the card offers no Open and does not say why: {notes:?}"
+        );
+        // The trigger caption is still there: the binding still fires.
+        assert!(notes.contains(&trigger_caption(no_path.trigger)), "{notes:?}");
+
+        // A Store app gets its own reason, not the "no program file" one.
+        let store = app_card_notes(&a_store_match());
+        assert!(store.iter().any(|n| n.contains("Microsoft Store apps are opened through")), "{store:?}");
+
+        // A dead binding gets the dead notice and NOTHING else -- adding a
+        // second sentence about a missing button would be noise about a
+        // consequence.
+        let dead = app_card_notes(&AppMatch::for_process(
+            "ApplicationFrameHost.exe",
+            TriggerMode::Prompt,
+        ));
+        assert_eq!(dead, vec![APP_MATCH_DEAD_NOTICE], "{dead:?}");
+
+        // The control: a launchable match's notes say none of this.
+        let fine = app_card_notes(&a_browser_match());
+        assert!(
+            !fine.iter().any(|n| n.contains("can\u{2019}t start") || n.contains("won\u{2019}t start")),
+            "a perfectly launchable app is told it cannot be launched: {fine:?}"
+        );
+    }
+
+    /// The dropdown appears only when both are present -- the user's spec.
+    #[test]
+    fn open_offers_a_menu_only_when_there_is_an_app_and_a_website() {
+        let m = a_browser_match();
+
+        let both = app_open_choices(&m, WEB);
+        assert_eq!(both.len(), 2, "an app and a website did not produce two choices: {both:?}");
+        assert_eq!(open_choice_label(&both[0]), "Open chrome.exe");
+        assert_eq!(open_choice_label(&both[1]), "Open website");
+
+        let app_only = app_open_choices(&m, "");
+        assert_eq!(app_only.len(), 1, "{app_only:?}");
+        assert_eq!(open_choice_label(&app_only[0]), "Open chrome.exe");
+
+        // A schemeless URI is not a website this pane can open, so it does
+        // not add a choice -- and `a_login`'s own URI is exactly that shape.
+        assert_eq!(app_open_choices(&m, "app.ledgerline.com").len(), 1);
+        assert_eq!(app_open_choices(&m, "javascript:alert(1)").len(), 1);
+        // And it is not smuggled onto the app's command line either.
+        assert_eq!(
+            app_launch_plan(&m, "javascript:alert(1)").unwrap().raw_tail,
+            m.args,
+            "a URL the pane refuses to open was appended to the program's command line"
+        );
+
+        // No app: no choices at all. The website already has a control -- the
+        // blue link in AUTOFILL TARGETS.
+        let store = a_store_match();
+        assert!(app_open_choices(&store, WEB).is_empty(), "a Store app got an Open menu");
+    }
+
+    #[test]
+    fn each_choice_reports_its_own_action_and_says_what_it_will_do() {
+        let m = a_browser_match();
+        let choices = app_open_choices(&m, WEB);
+        let plan = app_launch_plan(&m, WEB).unwrap();
+
+        assert_eq!(open_choice_action(&choices[0]), DetailAction::OpenApp(plan.clone()));
+        assert_eq!(open_choice_action(&choices[1]), DetailAction::OpenWebsite(WEB.to_string()));
+        // The two arms are genuinely different -- the fallback-chain failure
+        // this crate has shipped is two branches returning one value.
+        assert_ne!(open_choice_action(&choices[0]), open_choice_action(&choices[1]));
+
+        // The app's tooltip is the command line that will run, in full.
+        let hover = open_choice_hover(&choices[0]);
+        assert!(hover.contains(&command_line(&plan)), "{hover:?}");
+        assert!(hover.contains(r#"--profile-directory="Profile 2""#), "{hover:?}");
+        assert!(hover.contains(WEB), "{hover:?}");
+        // The website's names the URL and where it goes, and is NOT the
+        // app's.
+        let web_hover = open_choice_hover(&choices[1]);
+        assert!(web_hover.contains(WEB) && web_hover.contains("default browser"), "{web_hover:?}");
+        assert_ne!(web_hover, hover);
+    }
+
+    // -----------------------------------------------------------------
+    // Open: the control on the pane.
+    // -----------------------------------------------------------------
+
+    /// One launchable app and no web URL: a plain button that names the app.
+    #[test]
+    fn a_launchable_app_with_no_website_draws_one_named_open_button() {
+        let item = bound_to(&a_login(), &a_browser_match());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            frame.painted("Open chrome.exe"),
+            "the card drew no Open control at all; it painted: {:?}",
+            frame.strings()
+        );
+        // Not a menu button: the bare word would be a question beside a
+        // Program file row.
+        assert!(!frame.painted(OPEN_MENU_LABEL), "{:?}", frame.strings());
+        assert!(!frame.painted(OPEN_WEBSITE_LABEL), "{:?}", frame.strings());
+        // And what it draws is the LABEL, not an elided stub of it.
+        assert_eq!(frame.rendered_glyphs("Open chrome.exe"), "Open chrome.exe");
+    }
+
+    /// Clicking that button reports the plan -- the same plan the pure layer
+    /// builds, so the control and the launcher cannot disagree.
+    #[test]
+    fn clicking_open_reports_the_plan_that_would_be_run() {
+        let m = a_browser_match();
+        let item = bound_to(&an_item(Some(1)), &m);
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let button = laid_out.rect_of("Open chrome.exe").center();
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, button);
+        assert_eq!(
+            clicked.action,
+            DetailAction::OpenApp(app_launch_plan(&m, "").unwrap()),
+            "clicking Open reported {:?}",
+            clicked.action
+        );
+        // The control: a click somewhere else in the same card reports
+        // something else, so the assertion above is not satisfied by a pane
+        // that returns OpenApp for every click.
+        let elsewhere = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of("App").center());
+        assert_ne!(elsewhere.action, clicked.action, "every click on this card opens the app");
+    }
+
+    /// Both present: one button saying "Open", and the two entries behind it.
+    #[test]
+    fn an_app_and_a_website_draw_one_open_menu_with_both_entries() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = Pane::new();
+
+        let closed = pane.idle(&item, &TotpState::NoSecret);
+        assert!(closed.painted(OPEN_MENU_LABEL), "{:?}", closed.strings());
+        assert!(
+            !closed.painted("Open chrome.exe"),
+            "the menu's entries are painted with the menu shut: {:?}",
+            closed.strings()
+        );
+
+        let open_button = closed.rect_of(OPEN_MENU_LABEL).center();
+        let _ = pane.click(&item, &TotpState::NoSecret, open_button);
+        // A popup only PAINTS on the frame after the click that opened it.
+        let menu = pane.idle(&item, &TotpState::NoSecret);
+        assert!(menu.painted("Open chrome.exe"), "{:?}", menu.strings());
+        assert!(menu.painted(OPEN_WEBSITE_LABEL), "{:?}", menu.strings());
+    }
+
+    /// And each entry does its own thing.
+    #[test]
+    fn the_menus_two_entries_open_the_app_and_the_website() {
+        let m = a_browser_match();
+        let item = bound_to(&a_login_on_the_web(), &m);
+
+        for (entry, expected) in [
+            ("Open chrome.exe", DetailAction::OpenApp(app_launch_plan(&m, WEB).unwrap())),
+            (OPEN_WEBSITE_LABEL, DetailAction::OpenWebsite(WEB.to_string())),
+        ] {
+            let mut pane = Pane::new();
+            let closed = pane.idle(&item, &TotpState::NoSecret);
+            let _ = pane.click(&item, &TotpState::NoSecret, closed.rect_of(OPEN_MENU_LABEL).center());
+            let menu = pane.idle(&item, &TotpState::NoSecret);
+            let row = menu.rect_of(entry).center();
+            let clicked = pane.click(&item, &TotpState::NoSecret, row);
+            assert_eq!(clicked.action, expected, "clicking {entry:?} reported the wrong action");
+        }
+    }
+
+    /// A match that may not be launched draws no control, and the pane says
+    /// why in words the user can read.
+    #[test]
+    fn a_match_that_cannot_be_launched_draws_no_open_and_explains_itself() {
+        let mut no_path = a_browser_match();
+        no_path.path = String::new();
+        let item = bound_to(&a_login_on_the_web(), &no_path);
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert!(!frame.painted(OPEN_MENU_LABEL), "{:?}", frame.strings());
+        assert!(!frame.painted("Open chrome.exe"), "{:?}", frame.strings());
+        assert!(!frame.painted(OPEN_WEBSITE_LABEL), "{:?}", frame.strings());
+        assert!(
+            frame.painted(APP_OPEN_NO_PATH_NOTE),
+            "the card silently dropped Open with no explanation: {:?}",
+            frame.strings()
+        );
+        // Remove is still there -- this did not take the card's other
+        // control with it.
+        assert!(frame.painted("Remove"), "{:?}", frame.strings());
+    }
+
+    /// An unreadable `deskwarden:app-match` field offers Remove and nothing
+    /// else: there is no parsed match to build a plan from.
+    #[test]
+    fn an_unreadable_field_is_never_offered_an_open() {
+        let mut item = a_login_on_the_web();
+        item.fields = vec![crate::vault_bridge::VaultField {
+            name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
+            value: Some("{not json".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            frame.painted(APP_MATCH_UNREADABLE_NOTICE),
+            "the premise: this item's field really is unreadable; painted {:?}",
+            frame.strings()
+        );
+        assert!(frame.painted("Remove"), "{:?}", frame.strings());
+        for label in [OPEN_MENU_LABEL, OPEN_WEBSITE_LABEL, "Open chrome.exe"] {
+            assert!(!frame.painted(label), "an unreadable field offered {label:?}");
+        }
     }
 }

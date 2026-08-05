@@ -21,13 +21,14 @@ use crate::settings::AutoLock;
 use crate::theme;
 use crate::vault_bridge::{Folder, VaultError, VaultItem};
 use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra, VaultSnapshot, VaultUnavailable};
-use detail::{draw_detail_read, DetailAction, TotpState};
+use detail::{draw_detail_read, DetailAction, LaunchPlan, TotpState};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
 use eframe::egui::{self, Margin};
 use folder_modal::{draw_folder_edit_modal, FolderEditAction, FolderEditState};
 use item_list::{draw_item_list, IconCache, ItemListAction};
 use sidebar::{draw_sidebar, OutOfVault, SidebarAction, SidebarFilter};
 use std::cell::RefCell;
+use std::os::windows::process::CommandExt;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -2388,6 +2389,25 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                 }
                                 DetailAction::OpenWebsite(url) => {
                                     webbrowser_open(&url);
+                                }
+                                // **The band, not just the log.** A program
+                                // file that has been uninstalled or moved
+                                // since it was matched is the ordinary case
+                                // here, and a click that starts nothing and
+                                // says nothing is indistinguishable from a
+                                // click that missed the button.
+                                DetailAction::OpenApp(plan) => {
+                                    if let Err(e) = launch_app(&plan) {
+                                        log::warn!(
+                                            "could not start {}: {e}",
+                                            plan.program
+                                        );
+                                        move_error = Some(app_launch_failure_message(
+                                            &item.name,
+                                            &plan.program,
+                                            &e,
+                                        ));
+                                    }
                                 }
                                 // `set_favorite` returns the written item
                                 // rather than `Ok(())` precisely so this
@@ -5100,6 +5120,121 @@ fn is_safe_web_url(url: &str) -> bool {
 /// `file:`, ...); a rejection is logged and otherwise silently ignored --
 /// this is reached from a button click, not something worth erroring the
 /// whole window over.
+/// Starts the program a [`LaunchPlan`] names.
+///
+/// **It re-checks nothing, and that is deliberate.** The plan is the
+/// permission: `detail::app_launch_plan` is the only thing that builds one, it
+/// is the only caller of `AppMatch::launchable_path`, and its `program` field
+/// is that function's return value rather than the vault's `path` string. A
+/// second check here would be a second copy of a rule (and the copy that
+/// drifts); a *fallback* here -- "launch it anyway if the check failed" --
+/// would be the whole gate undone, and there is no branch below that could
+/// become one, because this function is never handed anything but a plan.
+///
+/// Four Windows details, each of which was a bug waiting:
+///
+///  * **`raw_arg`, not `args`.** The tail is a command line, already in the
+///    form the target program will read; `args` would re-quote it. See
+///    [`LaunchPlan`], which argues this at length. The call is skipped
+///    entirely for an empty tail, so a bare launch has a bare command line
+///    rather than one with a trailing space.
+///  * **`CREATE_BREAKAWAY_FROM_JOB`.** `job_object::KillOnCloseJob` is created
+///    with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and everything in that job
+///    dies when Deskwarden's handle to it closes -- i.e. when Deskwarden
+///    exits, for any reason. Deskwarden assigns only `bw serve` to that job
+///    and never assigns *itself*, so a child spawned here does not inherit it
+///    and a plain spawn would already be safe. This flag is for the case that
+///    is not under this crate's control: Deskwarden started from inside
+///    somebody else's job (a debugger, a task-scheduler wrapper, an installer,
+///    a terminal that uses one), where a child inherits job membership by
+///    default and closing the user's browser when Deskwarden quits would be a
+///    spectacular bug. `CreateProcess` fails with `ACCESS_DENIED` when the
+///    containing job forbids breakaway, so the flag is not merely set and
+///    hoped for -- see the retry below.
+///  * **`CREATE_NO_WINDOW`**, so a console-subsystem program does not flash a
+///    console. It is the same flag `bw_path` sets for the same reason; a GUI
+///    program like a browser is unaffected by it.
+///  * **Null standard handles.** Deskwarden is a GUI process, but inheriting
+///    whatever it happens to hold would tie the child's lifetime to pipes it
+///    knows nothing about. The `Child` itself is dropped immediately, which on
+///    Windows closes Deskwarden's handle and does not touch the process.
+///
+/// The working directory is the program's own folder, not Deskwarden's: an app
+/// started by hand is started from where it lives, and a program that loads a
+/// DLL beside itself would otherwise search Deskwarden's directory first.
+fn launch_app(plan: &LaunchPlan) -> std::io::Result<()> {
+    let spawn = |breakaway: bool| {
+        let mut command = std::process::Command::new(&plan.program);
+        if !plan.raw_tail.is_empty() {
+            command.raw_arg(&plan.raw_tail);
+        }
+        if let Some(dir) = std::path::Path::new(&plan.program).parent() {
+            command.current_dir(dir);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(if breakaway {
+                crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+            } else {
+                crate::bw_path::CREATE_NO_WINDOW
+            })
+            .spawn()
+    };
+    match spawn(true) {
+        Ok(_child) => Ok(()),
+        // The containing job forbids breakaway. Falling back is right and not
+        // a hole: without the flag the child joins whatever job Deskwarden is
+        // already in, which is the same fate Deskwarden itself has -- the
+        // alternative is refusing to open the app at all in an environment
+        // this crate did not create.
+        Err(e) if e.raw_os_error() == Some(ACCESS_DENIED_ERRNO) => {
+            log::warn!("breakaway from job refused, starting {} inside it", plan.program);
+            spawn(false).map(|_child| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `ERROR_ACCESS_DENIED`, which is what `CreateProcess` returns when
+/// `CREATE_BREAKAWAY_FROM_JOB` is set and the containing job does not permit
+/// it. Named rather than spelled `5` at the match arm.
+const ACCESS_DENIED_ERRNO: i32 = 5;
+
+/// `CREATE_BREAKAWAY_FROM_JOB`, from `windows::Win32::System::Threading`.
+/// Taken as the constant's `.0` at the point of use, the same way
+/// `job_object::spawn_in_job` takes `CREATE_SUSPENDED.0`.
+const CREATE_BREAKAWAY_FROM_JOB: u32 =
+    windows::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB.0;
+
+/// What a refused app launch shows in the inline band.
+///
+/// Same shape as [`item_write_failure_message`]: a `because` clause, then the
+/// state the world is actually in -- because the question after a click that
+/// did nothing is "did it half-work?", and the answer is no. It names the
+/// program file, because "couldn't open the app" without saying *which file it
+/// tried* leaves nothing to fix; the file is already on screen in the Program
+/// file row, and this says that is the one.
+///
+/// It does **not** say anything about the vault: unlike every other message in
+/// this family, no write was attempted, so "your vault is unchanged" would be
+/// answering a question nobody asked.
+fn app_launch_failure_message(name: &str, program: &str, e: &std::io::Error) -> String {
+    let because = match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            "Windows couldn\u{2019}t find that program \u{2014} it may have been moved, renamed \
+             or uninstalled since the app was matched"
+        }
+        std::io::ErrorKind::PermissionDenied => "Windows refused to start it",
+        _ => "Windows couldn\u{2019}t start it",
+    };
+    format!(
+        "Couldn\u{2019}t open the app for \u{201c}{name}\u{201d} \u{2014} {because}. Nothing was \
+         started. ({program})"
+    )
+}
+
 fn webbrowser_open(url: &str) {
     if !is_safe_web_url(url) {
         log::warn!("refusing to open non-http(s) URL from vault data: {url}");
@@ -12317,5 +12452,160 @@ mod account_details_tests {
             "control: the slice isolated the call's arguments rather than running on into the \
              rest of the strip"
         );
+    }
+}
+
+
+/// The Open-the-app path: the sentence a refusal shows, driven directly, and a
+/// source-text guard on the arm that runs the program.
+///
+/// **Why a source guard for half of it.** The arm lives inside `run`'s update
+/// closure, which needs a real event loop and is unreachable from this suite --
+/// the same reason [`refused_write_wiring_tests`] exists, and these follow that
+/// module line for line. It is doubly true here: the thing the arm does is
+/// `CreateProcess`, and a test that exercised it would start a program on the
+/// machine running the suite.
+///
+/// **What they do not guarantee**, so the doc claims no coverage it lacks:
+/// they see spellings and counts, not behaviour. What they catch is the edit
+/// that deletes the launch, or the launch that stops reporting its failure --
+/// and, deliberately, the two Windows details a refactor would quietly drop:
+/// `raw_arg` (without which `--profile-directory="Profile 2"` is re-quoted into
+/// something else) and `CREATE_BREAKAWAY_FROM_JOB` (without which the browser
+/// can inherit a kill-on-close job and die when Deskwarden exits).
+///
+/// The DECISION about whether a launch may happen at all is not here and not
+/// in this file: it is `detail::app_launch_plan`, which `detail`'s own suite
+/// drives directly.
+#[cfg(test)]
+mod open_app_wiring_tests {
+    use super::*;
+
+    // EVERY NEEDLE IS SPLIT WITH `concat!`, for `refused_write_wiring_tests`'
+    // reason: `include_str!("mod.rs")` pulls this module in too, so a needle
+    // written as one literal always matches itself. The count assertions
+    // ENFORCE the split -- re-joining one makes it appear an extra time and
+    // fails.
+    const ARM: &str = concat!("DetailAction::OpenApp", "(plan) => {");
+    /// The call that actually starts the program. Delete it and this fails.
+    const LAUNCHES: &str = concat!("launch_app", "(&plan)");
+    /// One needle for both halves of the failure report: the assignment that
+    /// puts a sentence in the band AND the call that decides the sentence.
+    const REPORTS: &str = concat!("move_error = Some(app_launch_failure", "_message(");
+    /// The spawn itself, inside `launch_app`.
+    const SPAWNS: &str = concat!(".spawn", "()");
+    /// The verbatim command-line tail. `\u{2e}args(` here instead would
+    /// re-quote it.
+    const RAW: &str = concat!("command.raw_arg", "(&plan.raw_tail)");
+    /// The flag that keeps the launched program out of a job object this
+    /// process might be inside.
+    const BREAKS_AWAY: &str =
+        concat!("crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM", "_JOB");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn the_open_app_arm_launches_and_reports_what_it_could_not_launch() {
+        let source = source();
+        assert_eq!(occurrences(source, ARM), 1, "expected exactly one {ARM:?}");
+        assert_eq!(
+            occurrences(source, LAUNCHES),
+            1,
+            "expected {LAUNCHES:?} exactly once -- the Open control reports a plan and \
+             NOTHING starts it"
+        );
+        assert_eq!(
+            occurrences(source, REPORTS),
+            1,
+            "expected {REPORTS:?} exactly once -- a launch that fails is silent, and a click \
+             that starts nothing and says nothing is indistinguishable from a missed button"
+        );
+        // And the call is inside the arm, not merely somewhere in the file.
+        let arm_at = source.find(ARM).expect("the arm is there");
+        let arm_end = source[arm_at..]
+            .find(concat!("// `set_favorite` returns the written", " item"))
+            .expect("the arm is followed by the ToggleFavorite comment it always was");
+        let body = &source[arm_at..arm_at + arm_end];
+        assert!(occurrences(body, LAUNCHES) == 1, "the launch is not in the arm: {body}");
+        assert!(occurrences(body, REPORTS) == 1, "the report is not in the arm: {body}");
+        assert!(
+            body.len() < 1400,
+            "control: the slice isolated the arm rather than running on into the rest of \
+             the closure"
+        );
+    }
+
+    #[test]
+    fn the_launcher_spawns_the_plan_verbatim_and_out_of_any_job() {
+        let source = source();
+        assert_eq!(
+            occurrences(source, SPAWNS),
+            1,
+            "expected {SPAWNS:?} exactly once -- `launch_app` is the only thing in this file \
+             that starts a process"
+        );
+        assert_eq!(
+            occurrences(source, RAW),
+            1,
+            "expected {RAW:?} exactly once -- passing the tail through `Command::args` would \
+             re-quote --profile-directory=\"Profile 2\" into a different flag"
+        );
+        assert_eq!(
+            occurrences(source, BREAKS_AWAY),
+            1,
+            "expected {BREAKS_AWAY:?} exactly once -- without it a Deskwarden started inside \
+             somebody else's job object hands that job to the browser, which then dies when \
+             Deskwarden exits"
+        );
+    }
+
+    /// The one thing in this path that is a decision rather than plumbing:
+    /// what the band says.
+    #[test]
+    fn a_missing_program_file_is_reported_differently_from_a_refused_one() {
+        let missing = app_launch_failure_message(
+            "Ledgerline",
+            r"C:\Apps\Ledgerline\Ledgerline.exe",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let refused = app_launch_failure_message(
+            "Ledgerline",
+            r"C:\Apps\Ledgerline\Ledgerline.exe",
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert_ne!(
+            missing, refused,
+            "two different failures produce one sentence, so the band cannot tell a moved \
+             program from a refused one"
+        );
+        assert!(missing.contains("moved, renamed or uninstalled"), "{missing}");
+        assert!(refused.contains("refused to start it"), "{refused}");
+
+        for message in [&missing, &refused] {
+            // The item, so a band that outlives the selection still names
+            // what it is about; and the file, because "couldn't open the app"
+            // without saying which file it tried leaves nothing to fix.
+            assert!(message.contains("Ledgerline"), "{message}");
+            assert!(message.contains(r"C:\Apps\Ledgerline\Ledgerline.exe"), "{message}");
+            assert!(message.contains("Nothing was started"), "{message}");
+            // No write was attempted, so it must not talk about the vault.
+            assert!(!message.contains("vault"), "{message}");
+        }
+
+        // A third kind gets its own generic clause, and not one of the two
+        // specific ones -- the fallback is not a copy of a neighbour.
+        let other = app_launch_failure_message(
+            "Ledgerline",
+            r"C:\Apps\Ledgerline\Ledgerline.exe",
+            &std::io::Error::from(std::io::ErrorKind::Other),
+        );
+        assert_ne!(other, missing);
+        assert_ne!(other, refused);
     }
 }
