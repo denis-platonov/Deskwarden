@@ -1503,6 +1503,53 @@ fn app_block(
     action
 }
 
+/// The lane reserved down the right-hand edge of the scrolling form for its
+/// scroll bar, so the bar is drawn BESIDE the card rather than on top of it.
+///
+/// 10pt, which is `item_list.rs`'s `LIST_PADDING` -- the same lane width that
+/// list already ships, leaving 2pt of clear space either side of a
+/// [`theme::SCROLLBAR_WIDTH`] bar centred in it.
+///
+/// **Where it comes from is the difference from the two siblings.** In
+/// `item_list.rs` and `detail.rs` the lane REPLACES a right padding those
+/// functions own, so the content keeps the width it always had. This function
+/// owns no such padding: the edit pane's horizontal inset is the vault
+/// window's central-panel `Margin`, applied outside the `Ui` handed in here.
+/// So the lane is taken out of the form's own width instead, and the card is
+/// 10pt narrower than it was. That is a deliberate trade -- 10pt of card
+/// against a scroll bar the user can see -- and not a width that CHANGES:
+/// `AlwaysVisible` below reserves the lane whether or not a bar is painted.
+const FORM_SCROLL_GUTTER: f32 = 10.0;
+
+/// The id under which the edit form's "did it overflow last frame?" reading
+/// is kept.
+fn form_overflow_id() -> egui::Id {
+    egui::Id::new("detail-edit-form-overflow")
+}
+
+/// Whether the edit form's content was taller than its viewport the last time
+/// it was drawn -- i.e. whether the scroll bar has anything to say.
+///
+/// Read back from the last frame rather than predicted: this form's height is
+/// the sum of however many fields its kind draws, plus a conditional app
+/// block and a wrapping hint, and there is no row-count-times-pitch to
+/// compute it from the way `item_list.rs` has. The one frame of lag can only
+/// show a bar for a frame on a form that turns out to fit -- never hide one
+/// that is needed for longer than that.
+///
+/// Absent (the first frame this pane is ever drawn) answers TRUE, for the
+/// same reason as `detail.rs`'s read-side twin: a bar shown on a form that
+/// fits is gone next frame, whereas a bar hidden on a form that really does
+/// scroll tells the user there is nothing below -- which is the report.
+fn form_overflowed(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(form_overflow_id())).unwrap_or(true)
+}
+
+/// Records this frame's reading for [`form_overflowed`] to use on the next.
+fn note_form_overflow(ctx: &egui::Context, overflowed: bool) {
+    ctx.data_mut(|data| data.insert_temp(form_overflow_id(), overflowed));
+}
+
 pub fn draw_detail_edit(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
@@ -1599,7 +1646,41 @@ pub fn draw_detail_edit(
     // gives it (the card inside sets its own width from `available_width`) and
     // the full height left over, so a short form does not leave the strip
     // floating in the middle of the pane.
-    egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+    //
+    // **A `scope`, not this `ui` directly.** The two calls below configure the
+    // scroll bar by mutating the style of the `Ui` they are given, and this
+    // `Ui` belongs to the caller in `vault_window/mod.rs`. A child's style is
+    // its own clone (`Ui::spacing_mut` goes through `Arc::make_mut`), so
+    // scoping keeps the settings from outliving the form -- the property
+    // `item_list.rs` and `detail.rs` both get for free by already drawing into
+    // a child.
+    let scrolled = ui
+        .scope(|ui| {
+            // **The fix.** The area shown here was egui's default FLOATING
+            // bar with no gutter: a 1.2pt sliver at the pane's extreme right,
+            // painted ON TOP of the form card, which only widens once the
+            // pointer is already on it. Commit `68f86cb` made the form
+            // scrollable but left nothing on screen to say so, which is half
+            // of the report it answered ("cannot scroll"). Same lane, and the
+            // same reason, as `item_list.rs`'s list and `detail.rs`'s body.
+            theme::scrollbar_in_gutter(ui, FORM_SCROLL_GUTTER);
+            // ... and the bar is hidden outright when there is nothing to
+            // scroll: a full-height 6pt bar down a form that cannot move is
+            // an affordance that lies. The lane stays reserved either way --
+            // that is what `AlwaysVisible` below is for, and why the card
+            // keeps ONE width whether or not the bar is showing. `092da70`
+            // measured a real 10pt jump when that reservation was left
+            // conditional.
+            if !form_overflowed(ui.ctx()) {
+                theme::hide_scrollbar(ui);
+            }
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                // Required by `scrollbar_in_gutter`: the lane is only reserved
+                // for a bar egui is actually showing, so anything conditional
+                // here puts the width jump back.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
@@ -1819,7 +1900,10 @@ pub fn draw_detail_edit(
                 );
             }
         });
-    });
+                })
+        })
+        .inner;
+    note_form_overflow(ui.ctx(), scrolled.content_size.y > scrolled.inner_rect.height());
 
     action
 }
@@ -4198,6 +4282,21 @@ mod edit_pane_layout_tests {
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, Rect)>,
+        /// Every string the frame painted with **the characters egui really
+        /// laid glyphs for**, which is not the same list as [`texts`].
+        ///
+        /// `Galley::text()` answers with the layout job's SOURCE string, so a
+        /// run egui elided down to `"Save (needs\u{2026}"` -- or all the way
+        /// to one `"\u{2026}"` -- still reports the full label it was handed,
+        /// off a rect that is honestly small but a name that is not. Every
+        /// assertion in this module used to be blind in exactly that way,
+        /// which is the same class of defect as the header title this crate
+        /// already shipped a vacuous test for. Borrowed from `detail.rs`'s
+        /// `Frame::rendered`, which exists for that reason.
+        rendered: Vec<(String, String, Rect)>,
+        /// Every filled rectangle, so the scroll bar -- which paints no
+        /// string at all -- can be found by its geometry.
+        rects: Vec<(Rect, egui::Color32)>,
     }
 
     impl Painted {
@@ -4222,14 +4321,45 @@ mod edit_pane_layout_tests {
             );
             found[0]
         }
+
+        /// What was actually DRAWN for the run whose source text is `label`
+        /// -- glyphs, not the string the layout job was handed. See
+        /// [`Painted::rendered`].
+        fn rendered_glyphs(&self, label: &str) -> String {
+            let found: Vec<&String> = self
+                .rendered
+                .iter()
+                .filter(|(source, _, _)| source == label)
+                .map(|(_, rendered, _)| rendered)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one run laid out from {label:?}, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0].clone()
+        }
     }
 
     fn walk(shape: &egui::Shape, painted: &mut Painted) {
         match shape {
-            egui::Shape::Text(text) => painted.texts.push((
-                text.galley.text().to_string(),
-                Rect::from_min_size(text.pos, text.galley.size()),
-            )),
+            egui::Shape::Text(text) => {
+                let rect = Rect::from_min_size(text.pos, text.galley.size());
+                // One entry per glyph egui really placed, so an elided run
+                // reports the prefix it drew and the ellipsis it drew instead
+                // of the label it was asked for.
+                let rendered: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect();
+                painted.texts.push((text.galley.text().to_string(), rect));
+                painted.rendered.push((text.galley.text().to_string(), rendered, rect));
+            }
+            egui::Shape::Rect(rect) => painted.rects.push((rect.rect, rect.fill)),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -4303,7 +4433,24 @@ mod edit_pane_layout_tests {
     /// The label the disabled Save wears while the name is empty.
     const SAVE: &str = "Save (needs a name)";
 
-    fn assert_inside(what: &str, rect: Rect, pane: Vec2, painted: &Painted) {
+    /// `label` is painted inside the pane **and is still legible as itself**.
+    ///
+    /// Both halves, because either alone is satisfiable by a broken pane:
+    ///
+    /// * The rect check is `contains_rect` on BOTH axes -- deliberately
+    ///   stronger than `detail.rs`'s vertical-only `assert_visible`, because
+    ///   a control the user has to click is not reachable by being merely at
+    ///   the right height.
+    /// * The glyph check is `rendered_glyphs`, because the rect above is
+    ///   taken off a galley whose `text()` is the SOURCE string. A Save
+    ///   button squeezed down to `"Save (needs\u{2026}"` paints a small,
+    ///   entirely in-bounds box and reports the full label, so the rect half
+    ///   passes and says nothing. Equality with the label, not merely
+    ///   `!= "\u{2026}"`: these are two- and three-word button captions with
+    ///   no room to lose a word, and a check for the ellipsis alone would
+    ///   wave `"Save (needs\u{2026}"` through.
+    fn assert_inside(what: &str, label: &str, pane: Vec2, painted: &Painted) {
+        let rect = painted.rect_of(label);
         let bounds = Rect::from_min_size(Pos2::ZERO, pane);
         assert!(
             bounds.contains_rect(rect),
@@ -4312,6 +4459,13 @@ mod edit_pane_layout_tests {
             pane.x,
             pane.y,
             painted.strings()
+        );
+        let rendered = painted.rendered_glyphs(label);
+        assert_eq!(
+            rendered, label,
+            "{what} was laid out from {label:?} but DREW {rendered:?} on a {}x{} pane -- \
+             the control is on screen and unreadable",
+            pane.x, pane.y
         );
     }
 
@@ -4335,11 +4489,11 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, true, &[]);
             let painted = frame(&ctx, pane, &mut draft, true, &[]);
 
-            assert_inside("Save", painted.rect_of(SAVE), pane, &painted);
-            assert_inside("Cancel", painted.rect_of("Cancel"), pane, &painted);
+            assert_inside("Save", SAVE, pane, &painted);
+            assert_inside("Cancel", "Cancel", pane, &painted);
             // The error label belongs to the buttons: it is the reason Save is
             // disabled, and it is useless where it cannot be read.
-            assert_inside("the name error", painted.rect_of("Name is required."), pane, &painted);
+            assert_inside("the name error", "Name is required.", pane, &painted);
 
             // On screen is not enough: the strip has to be at the BOTTOM of
             // the pane, below the form, which is where a form's actions
@@ -4410,7 +4564,7 @@ mod edit_pane_layout_tests {
         }
         let after = frame(&ctx, pane, &mut draft, true, &[]);
 
-        assert_inside("the last field's label (Folder)", after.rect_of("Folder"), pane, &after);
+        assert_inside("the last field's label (Folder)", "Folder", pane, &after);
         assert_eq!(
             after.rect_of(SAVE),
             save_before,
@@ -4435,12 +4589,320 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, true, &[]);
         let painted = frame(&ctx, pane, &mut draft, true, &[]);
 
-        let title = painted.rect_of(&form_title(draft.kind, true));
-        assert_inside("the form title", title, pane, &painted);
+        let heading = form_title(draft.kind, true);
+        let title = painted.rect_of(&heading);
+        assert_inside("the form title", &heading, pane, &painted);
         assert!(
             title.bottom() < painted.rect_of(SAVE).top(),
             "the title is not above the buttons: title {title:?}, Save {:?}",
             painted.rect_of(SAVE)
+        );
+    }
+
+    /// A pane tall enough that the form has nothing to scroll.
+    const ROOMY_PANE_HEIGHT: f32 = 2000.0;
+
+    /// A pane WIDE enough that the form card is not already overflowing it
+    /// before this fix has any say -- the width at which "the bar is clear of
+    /// the card" is a question about the lane rather than about that
+    /// overflow.
+    ///
+    /// **The overflow is pre-existing and is not this fix's to answer.**
+    /// egui's `TextEdit` has a default `desired_width` of 280pt which it
+    /// treats as a MINIMUM, so the card is never narrower than 280 plus its
+    /// own 14pt margins and stroke -- about 309pt, measured identically on
+    /// `68f86cb^` and on the emptiest possible draft. At the 298pt minimum
+    /// pane the card therefore spills sideways whatever the scroll bar does,
+    /// which is why the lane calculation here does NOT assume the card fits
+    /// and why the two edge tests below are measured at a width where it
+    /// does. 420pt is comfortably past 309 and well inside the window sizes
+    /// the app actually opens at.
+    const CARD_FITS_PANE_WIDTH: f32 = 420.0;
+
+    /// The tallest form with the app binding dropped: the block draws a full
+    /// program path, and this is the fixture for tests that must not have
+    /// their measurements moved by the identity lookup's wrapped text.
+    fn tall_draft_that_fits_sideways() -> EditDraft {
+        let mut draft = tallest_draft();
+        draft.app = None;
+        draft
+    }
+
+    /// The left edge of the lane [`FORM_SCROLL_GUTTER`] reserves.
+    fn lane_left(pane: Vec2) -> f32 {
+        pane.x - FORM_SCROLL_GUTTER
+    }
+
+    /// Every coloured rectangle painted wholly inside the reserved lane and
+    /// narrow enough to be a scroll bar rather than a card spilling into it.
+    ///
+    /// The width ceiling is the LANE's width, not the bar's, on purpose: the
+    /// defect this test exists for painted a 1.2pt sliver, and a filter set
+    /// at the bar's own width would have quietly accepted it. What the sliver
+    /// fails is the assertion, not the search.
+    fn bar_rects(painted: &Painted, pane: Vec2) -> Vec<Rect> {
+        let lane = lane_left(pane);
+        painted
+            .rects
+            .iter()
+            .filter(|(rect, fill)| {
+                fill.a() > 0
+                    && rect.left() >= lane - 0.5
+                    && rect.right() <= pane.x + 0.5
+                    && rect.width() > 0.0
+                    && rect.width() <= FORM_SCROLL_GUTTER + 0.5
+                    && rect.height() > FORM_SCROLL_GUTTER
+            })
+            .map(|(rect, _)| *rect)
+            .collect()
+    }
+
+    /// The white form card: every [`theme::CARD`] fill that contains the
+    /// "Name" label, unioned. A `Frame` with a corner radius paints itself as
+    /// more than one rectangle, so the union rather than one of them.
+    fn card_rect(painted: &Painted) -> Rect {
+        let name = painted.rect_of("Name");
+        painted
+            .rects
+            .iter()
+            .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(name))
+            .map(|(rect, _)| *rect)
+            .reduce(Rect::union)
+            .unwrap_or_else(|| panic!("the form card has no white surface; painted: {:?}", painted.strings()))
+    }
+
+    /// Two frames with the pointer parked in the middle of the form, which is
+    /// what the app is doing whenever the user is looking at this pane.
+    ///
+    /// **Both halves matter.** Two frames, because `form_overflowed` decides
+    /// the second frame's bar from a reading taken on the first. Pointer
+    /// INSIDE, because egui's floating bar is fully transparent while the
+    /// pointer is away from the area -- a test that read a dormant bar would
+    /// certify the placement of something that was not drawn, which is one of
+    /// the vacuous tests this crate has already shipped.
+    fn settled(ctx: &egui::Context, pane: Vec2, draft: &mut EditDraft) -> Painted {
+        let over = [egui::Event::PointerMoved(Pos2::new(pane.x / 2.0, pane.y / 2.0))];
+        let _ = frame(ctx, pane, draft, true, &over);
+        frame(ctx, pane, draft, true, &over)
+    }
+
+    /// **Finding 1, stated as geometry.** The bar the form scrolls with is a
+    /// [`theme::SCROLLBAR_WIDTH`] bar centred in a reserved lane -- not
+    /// egui's floating default, which is a 1.2pt sliver pinned to the pane's
+    /// extreme right and only widened once the pointer is already on it.
+    ///
+    /// Commit `68f86cb` made this form scrollable and left nothing on screen
+    /// to say so; the user who reported "cannot scroll" got no affordance.
+    /// Both sibling panes (`item_list.rs`, `detail.rs`) already draw the bar
+    /// this way.
+    #[test]
+    fn the_form_scroll_bar_is_a_full_bar_centred_in_its_own_lane() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let painted = settled(&ctx, pane, &mut draft);
+
+        let bars = bar_rects(&painted, pane);
+        assert!(
+            !bars.is_empty(),
+            "a form that overflows a {}x{} pane paints nothing at all in its scroll lane, \
+             so nothing tells the user there is more below",
+            pane.x,
+            pane.y
+        );
+        let centre = lane_left(pane) + FORM_SCROLL_GUTTER / 2.0;
+        for bar in &bars {
+            assert!(
+                (bar.width() - theme::SCROLLBAR_WIDTH).abs() <= 0.5,
+                "the scroll bar is {}pt wide, not {}pt -- this is egui's floating default \
+                 painted over the card, not a bar in the reserved lane. Bars: {bars:?}",
+                bar.width(),
+                theme::SCROLLBAR_WIDTH
+            );
+            assert!(
+                (bar.center().x - centre).abs() <= 0.5,
+                "the scroll bar's centre is at x = {} but the {FORM_SCROLL_GUTTER}pt lane's \
+                 is at {centre} -- the bar is not centred in its lane. Bars: {bars:?}",
+                bar.center().x
+            );
+        }
+    }
+
+    /// The other half of Finding 1: the bar is BESIDE the card, not on it.
+    ///
+    /// Measured at [`CARD_FITS_PANE_WIDTH`], not at the 298pt minimum: at the
+    /// minimum the card overflows the pane on its own account whatever the
+    /// bar does, so the comparison there would be a statement about that
+    /// pre-existing defect instead of about the lane.
+    #[test]
+    fn the_form_scroll_bar_does_not_paint_over_the_card() {
+        let pane = egui::vec2(CARD_FITS_PANE_WIDTH, TINY_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tall_draft_that_fits_sideways();
+        let painted = settled(&ctx, pane, &mut draft);
+
+        let card = card_rect(&painted);
+        // Control: if this draft's card overflowed the pane too, the
+        // comparison below would be about the card and not about the lane.
+        assert!(
+            card.right() <= pane.x + 0.5,
+            "the fixture's card already runs off the {}pt pane at {} -- this test is \
+             measuring the horizontal overflow, not the scroll lane",
+            pane.x,
+            card.right()
+        );
+
+        let bars = bar_rects(&painted, pane);
+        assert!(!bars.is_empty(), "no scroll bar was painted, so this test is vacuous");
+        for bar in &bars {
+            assert!(
+                bar.left() >= card.right() - 0.5,
+                "the scroll bar starts at x = {} but the card runs to {} -- the bar is \
+                 painted ON TOP of the form's content",
+                bar.left(),
+                card.right()
+            );
+        }
+    }
+
+    /// No bar when there is nothing to scroll: an always-visible bar down a
+    /// form that cannot move is an affordance that lies, and it is 6pt of the
+    /// 10pt lane's clear space besides.
+    ///
+    /// The first-ever frame is checked separately and the other way round:
+    /// `form_overflowed` has no reading to go on there and answers TRUE, so
+    /// the bar is SHOWN. Ties go to showing it -- a bar on a form that turns
+    /// out to fit is gone next frame, a missing bar on a form that really
+    /// scrolls is the report.
+    #[test]
+    fn the_form_bar_is_painted_only_when_there_is_something_to_scroll() {
+        let ink_in_the_lane = |height: f32| {
+            let pane = egui::vec2(MIN_PANE_WIDTH, height);
+            let ctx = styled_context(pane);
+            let mut draft = tall_draft_that_fits_sideways();
+            let painted = settled(&ctx, pane, &mut draft);
+            bar_rects(&painted, pane).len()
+        };
+
+        assert!(
+            ink_in_the_lane(TINY_PANE_HEIGHT) > 0,
+            "a form that overflows a {TINY_PANE_HEIGHT}pt pane paints no scroll bar at all"
+        );
+        assert_eq!(
+            ink_in_the_lane(ROOMY_PANE_HEIGHT),
+            0,
+            "a form with nothing to scroll still paints a bar down its right margin"
+        );
+
+        let pane = egui::vec2(MIN_PANE_WIDTH, TINY_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tall_draft_that_fits_sideways();
+        let first = frame(
+            &ctx,
+            pane,
+            &mut draft,
+            true,
+            &[egui::Event::PointerMoved(Pos2::new(pane.x / 2.0, pane.y / 2.0))],
+        );
+        assert!(
+            !bar_rects(&first, pane).is_empty(),
+            "the very first frame this form is ever drawn paints no bar at all"
+        );
+    }
+
+    /// The lane and the hiding are configured by MUTATING a `Ui`'s style, and
+    /// the `Ui` this function is handed belongs to `vault_window/mod.rs`. So
+    /// the settings must not survive the call: the next thing that pane draws
+    /// -- today the read pane, tomorrow anything -- would otherwise inherit a
+    /// 10pt reserved gutter and, on a form that fits, six zeroed opacities
+    /// that make its OWN scroll bar invisible.
+    ///
+    /// The `scope` in `draw_detail_edit` is what buys this (a child `Ui`'s
+    /// style is its own clone), and this is the assertion that says so.
+    /// Checked in the FITS case, because that is the one that also calls
+    /// `theme::hide_scrollbar` -- the settings that would be worst to leak.
+    #[test]
+    fn the_form_leaves_the_callers_scroll_style_alone() {
+        let pane = egui::vec2(CARD_FITS_PANE_WIDTH, ROOMY_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tall_draft_that_fits_sideways();
+        let mut apps = AppIdentityCache::default();
+        // The four numbers `theme::scrollbar_in_gutter` sets and one of the
+        // six `theme::hide_scrollbar` zeroes, before and after.
+        let sample = |ui: &egui::Ui| {
+            let s = &ui.spacing().scroll;
+            (
+                s.floating_allocated_width,
+                s.bar_width,
+                s.floating_width,
+                s.bar_outer_margin,
+                s.active_handle_opacity,
+            )
+        };
+        let mut seen = None;
+        for _ in 0..2 {
+            let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
+                let before = sample(ui);
+                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps);
+                seen = Some((before, sample(ui)));
+            });
+        }
+        let (before, after) = seen.expect("the frame closure never ran");
+        // Control: a default style whose values were already the ones the
+        // helpers set would make the equality below say nothing.
+        assert_ne!(
+            before.0, FORM_SCROLL_GUTTER,
+            "the caller's style already reserves a {FORM_SCROLL_GUTTER}pt lane, so this \
+             test cannot see a leak"
+        );
+        assert_eq!(
+            before, after,
+            "drawing the edit form changed the CALLER's scroll style from {before:?} to \
+             {after:?} -- the bar's settings have escaped the form"
+        );
+    }
+
+    /// The card keeps ONE width whether or not the bar is showing.
+    ///
+    /// This is the trap `092da70` measured on the item list: under egui's
+    /// default `VisibleWhenNeeded` the lane is reserved only while the bar is
+    /// shown, so the content's right edge jumps by the lane's width as the
+    /// content crosses the overflow threshold. `AlwaysVisible` plus
+    /// `theme::scrollbar_in_gutter` makes the reservation unconditional and
+    /// `theme::hide_scrollbar` merely stops painting, so nothing moves.
+    ///
+    /// The same DRAFT on two pane heights is the comparison -- one that
+    /// overflows and one that does not. Two different drafts would have
+    /// measured the drafts.
+    #[test]
+    fn the_form_bar_does_not_change_the_card_width() {
+        let edges = |height: f32| {
+            let pane = egui::vec2(CARD_FITS_PANE_WIDTH, height);
+            let ctx = styled_context(pane);
+            let mut draft = tall_draft_that_fits_sideways();
+            let card = card_rect(&settled(&ctx, pane, &mut draft));
+            (card.left(), card.right())
+        };
+
+        let scrolls = edges(TINY_PANE_HEIGHT);
+        let fits = edges(ROOMY_PANE_HEIGHT);
+
+        // **The absolute half**: the lane is really reserved, on both. A
+        // fix that centred the bar without reserving anything would keep the
+        // two equal and still paint over the card.
+        let pane = egui::vec2(CARD_FITS_PANE_WIDTH, TINY_PANE_HEIGHT);
+        for (what, (_, right)) in [("that scrolls", scrolls), ("that fits", fits)] {
+            assert!(
+                right <= lane_left(pane) + 0.5,
+                "on a pane {what} the card runs to x = {right}, into the \
+                 {FORM_SCROLL_GUTTER}pt lane that ends at {}",
+                lane_left(pane)
+            );
+        }
+        assert_eq!(
+            scrolls, fits,
+            "the form card spans {scrolls:?} on a pane that scrolls and {fits:?} on one that \
+             does not -- the bar's lane is being reserved conditionally"
         );
     }
 }
