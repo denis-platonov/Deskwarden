@@ -3,7 +3,8 @@ use std::time::Duration;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_TAB,
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT,
+    VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
@@ -122,4 +123,126 @@ fn send(inputs: &[INPUT]) -> windows::core::Result<()> {
         return Err(windows::core::Error::from_win32());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The auto-type sequence keyboard
+// ---------------------------------------------------------------------------
+
+/// The real [`crate::injector::sequence::Keyboard`]: the one place a planned
+/// [`Step`](crate::injector::sequence::Step) becomes actual synthetic input.
+///
+/// Deliberately tiny. Every decision -- what to type, in what order, how long
+/// a burst may be, when to give up -- lives in `sequence.rs` where it is a
+/// pure function under test. What is left here is four bodies that each do one
+/// Win32 call, so the part no test can reach is also the part with nothing in
+/// it to get wrong.
+pub struct RealKeyboard;
+
+impl crate::injector::sequence::Keyboard for RealKeyboard {
+    /// **A passive check. It does not call `SetForegroundWindow`.**
+    ///
+    /// [`ensure_foreground`] above *restores* focus, which is right once, at
+    /// the start of a fill, when our own overlay has just closed and Windows
+    /// has not yet handed focus back. It is exactly wrong in the middle of a
+    /// sequence: if the user alt-tabbed away during a `{DELAY}`, yanking their
+    /// window back so we can finish typing a password into it is the opposite
+    /// of the thing this check exists to prevent. Mid-sequence the only honest
+    /// question is "is it still there", and the only honest answer to "no" is
+    /// to stop.
+    fn holds_foreground(&self, hwnd: isize) -> bool {
+        let current = unsafe { GetForegroundWindow() }.0 as isize;
+        may_type_into(hwnd, current)
+    }
+
+    fn type_text(&self, text: &str, rate: Duration) -> Result<(), String> {
+        for ch in text.encode_utf16() {
+            send_unicode_char(ch).map_err(|e| e.to_string())?;
+            std::thread::sleep(rate);
+        }
+        Ok(())
+    }
+
+    fn press_key(
+        &self,
+        key: &'static crate::key_sequence::KeyDef,
+        mods: crate::injector::sequence::ModSet,
+    ) -> Result<(), String> {
+        let Some((vk, extended)) = crate::injector::sequence::virtual_key(key.token) else {
+            // Unreachable: `plan` refuses a key with no code before any of
+            // this runs. Reported rather than ignored so that if the two ever
+            // disagree it is a failure and not a silent no-op.
+            return Err(format!("no key code for {{{}}}", key.token));
+        };
+
+        // Modifiers down, key down, key up, modifiers up -- **in one
+        // `SendInput` batch**. A stuck Ctrl is a real failure mode: it leaves
+        // the user's keyboard in a state where every subsequent keystroke is a
+        // shortcut, and they have to work out to tap Ctrl to clear it. Sending
+        // the whole chord as one batch means there is no window between the
+        // down and the up in which a failure or an early return could strand a
+        // modifier held.
+        let extended_flag =
+            if extended { KEYEVENTF_EXTENDEDKEY } else { KEYBD_EVENT_FLAGS(0) };
+        let mut inputs: Vec<INPUT> = Vec::with_capacity(8);
+        let held = modifier_keys(mods);
+        for vk in &held {
+            inputs.push(to_input(keybd_input(*vk, KEYBD_EVENT_FLAGS(0))));
+        }
+        inputs.push(to_input(keybd_input(vk, extended_flag)));
+        inputs.push(to_input(keybd_input(vk, extended_flag | KEYEVENTF_KEYUP)));
+        for vk in held.iter().rev() {
+            inputs.push(to_input(keybd_input(*vk, KEYEVENTF_KEYUP)));
+        }
+        send(&inputs).map_err(|e| e.to_string())
+    }
+
+    fn wait(&self, how_long: Duration) {
+        std::thread::sleep(how_long);
+    }
+}
+
+/// The virtual keys held for `mods`, in the order they are pressed. Released
+/// in the reverse order, which is what a real keyboard does and what
+/// applications watching for chords expect.
+fn modifier_keys(mods: crate::injector::sequence::ModSet) -> Vec<u16> {
+    let mut out = Vec::with_capacity(3);
+    if mods.ctrl {
+        out.push(VK_CONTROL.0);
+    }
+    if mods.alt {
+        out.push(VK_MENU.0);
+    }
+    if mods.shift {
+        out.push(VK_SHIFT.0);
+    }
+    out
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::*;
+    use crate::injector::sequence::ModSet;
+
+    /// The order is what makes the release order the reverse of the press
+    /// order rather than an accident of which `if` came first.
+    #[test]
+    fn a_full_chord_presses_ctrl_then_alt_then_shift() {
+        assert_eq!(
+            modifier_keys(ModSet { ctrl: true, alt: true, shift: true }),
+            vec![VK_CONTROL.0, VK_MENU.0, VK_SHIFT.0]
+        );
+    }
+
+    #[test]
+    fn no_modifiers_holds_no_keys() {
+        assert!(modifier_keys(ModSet::default()).is_empty());
+    }
+
+    #[test]
+    fn each_modifier_maps_to_its_own_key() {
+        assert_eq!(modifier_keys(ModSet { shift: true, ..Default::default() }), vec![VK_SHIFT.0]);
+        assert_eq!(modifier_keys(ModSet { ctrl: true, ..Default::default() }), vec![VK_CONTROL.0]);
+        assert_eq!(modifier_keys(ModSet { alt: true, ..Default::default() }), vec![VK_MENU.0]);
+    }
 }

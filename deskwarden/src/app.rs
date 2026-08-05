@@ -4,7 +4,9 @@
 
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::injector::ui_automation;
+use crate::injector::sequence::{self, Notifier};
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
+use crate::key_sequence;
 use crate::overlay_ui;
 use crate::vault_bridge::{extract_app_match, VaultItem};
 use crate::vault_cache::VaultCache;
@@ -139,18 +141,134 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
         });
     match item {
         Ok(item) => {
-            let (username, password) = credentials_for(&item);
-            if username.is_empty() && password.is_empty() {
-                log::warn!("vault item {item_id} has no login credentials; nothing to fill");
-                return;
-            }
-            match injector.fill(hwnd, &username, &password) {
-                Ok(()) => fill_stats.record_fill(item_id),
-                Err(e) => log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}"),
+            // The one-time code is fetched **only** when the sequence asks
+            // for one. `get_totp` is an HTTP round trip to `bw serve`, and
+            // making every fill pay for it -- including the overwhelming
+            // majority that store no sequence at all -- would put a network
+            // request on the path this app deliberately serves from the
+            // in-memory cache so that autofill works with the backend
+            // stopped.
+            let totp = if sequence_needs_a_one_time_code(&item) {
+                match cache.bridge().get_totp(item_id) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        log::warn!("could not fetch a one-time code for {item_id}: {e:?}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            match fill_action(&item, totp.as_deref()) {
+                Ok(FillAction::Default) => {
+                    let (username, password) = credentials_for(&item);
+                    if username.is_empty() && password.is_empty() {
+                        log::warn!(
+                            "vault item {item_id} has no login credentials; nothing to fill"
+                        );
+                        return;
+                    }
+                    match injector.fill(hwnd, &username, &password) {
+                        Ok(()) => fill_stats.record_fill(item_id),
+                        Err(e) => {
+                            log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}")
+                        }
+                    }
+                }
+                Ok(FillAction::Sequence(plan)) => match injector.fill_sequence(hwnd, plan) {
+                    Ok(()) => fill_stats.record_fill(item_id),
+                    Err(e) => {
+                        log::error!(
+                            "auto-type sequence failed for item {item_id} into hwnd {hwnd}: {e}"
+                        );
+                        REAL_NOTIFIER.refused(&e);
+                    }
+                },
+                Err(refusal) => {
+                    // Reaches the **user**, not only the log. A fill that
+                    // quietly does nothing is indistinguishable from a hotkey
+                    // that never registered, and the user's next move differs
+                    // completely between the two.
+                    let message = refusal.message();
+                    log::error!("refusing to fill item {item_id}: {message}");
+                    REAL_NOTIFIER.refused(&message);
+                }
             }
         }
         Err(e) => log::error!("could not read vault item {item_id} to fill it: {e:?}"),
     }
+}
+
+/// The production notifier, named here for the same reason `REAL_OVERLAY` is:
+/// so the line that *decides* to notify sits next to the decision it belongs
+/// to, while the thing that opens a window stays out of every test's way.
+const REAL_NOTIFIER: sequence::RealNotifier = sequence::RealNotifier;
+
+/// The stored auto-type sequence for `item`, or `""` if it has no app match
+/// or the match records none.
+///
+/// The sequence lives on the item's own `deskwarden:app-match` field, so this
+/// needs nothing but the item -- which is why [`fill_from_vault`] keeps its
+/// signature and why the hotkey path in `main` gets sequences without knowing
+/// they exist.
+pub fn sequence_for(item: &VaultItem) -> String {
+    extract_app_match(item).map(|m| m.sequence).unwrap_or_default()
+}
+
+/// Whether this item's sequence contains a `{TOTP}`, and so whether a fill has
+/// to go and fetch a code before it can plan.
+///
+/// Separate from [`fill_action`] because it is the one question that cannot be
+/// answered purely: the answer decides whether an HTTP request happens.
+pub fn sequence_needs_a_one_time_code(item: &VaultItem) -> bool {
+    key_sequence::parse(&sequence_for(item))
+        .iter()
+        .any(|t| matches!(t, key_sequence::Token::Field(key_sequence::FieldRef::Totp)))
+}
+
+/// What a fill will actually do.
+#[derive(Debug)]
+pub enum FillAction {
+    /// This item stores no sequence, so the fill is **exactly** what it has
+    /// always been: UI Automation's named-field fill, falling back to
+    /// username-Tab-password through `SendInput`.
+    ///
+    /// Not `Sequence(plan_of(DEFAULT_SEQUENCE))`, even though
+    /// [`key_sequence::DEFAULT_SEQUENCE`] says that is what the fallback
+    /// types. See [`crate::injector::Injector::fill_sequence`] for why the two
+    /// are different acts and collapsing them would delete the UI Automation
+    /// path for every item in every existing vault.
+    Default,
+    /// This item stores a sequence, and it planned.
+    Sequence(sequence::Plan),
+}
+
+/// **The whole of the sequence-versus-default decision, as a pure function.**
+///
+/// Takes the item and the one value that cannot be read off it (the current
+/// one-time code) and answers what to do, with no cache, no injector and no
+/// window -- so every branch is reachable from a unit test. The alternative,
+/// which this crate has been bitten by ten commits running, is a decision made
+/// inside [`fill_from_vault`], which nothing can call.
+pub fn fill_action(
+    item: &VaultItem,
+    totp: Option<&str>,
+) -> Result<FillAction, sequence::Refusal> {
+    let stored = sequence_for(item);
+    if stored.is_empty() {
+        return Ok(FillAction::Default);
+    }
+    let login = item.login.as_ref();
+    let username = login.and_then(|l| l.username.as_deref()).unwrap_or("");
+    let password = login.and_then(|l| l.password.as_deref()).map(|p| p.as_str()).unwrap_or("");
+    let values = sequence::Resolved {
+        username,
+        password,
+        totp,
+        custom: key_sequence::custom_pairs(item),
+    };
+    sequence::plan(&key_sequence::parse(&stored), &values).map(FillAction::Sequence)
 }
 
 /// Dispatches a freshly foregrounded, matched window according to its
@@ -990,5 +1108,365 @@ mod prompt_wiring_tests {
              named plainly, and a wrapper here can substitute any of the three values \
              `prompt_arm` was careful to pass through unaltered"
         );
+    }
+}
+
+/// **The wiring**: that a stored sequence actually reaches the typing path,
+/// and that an item without one still takes the fill it always took.
+///
+/// The decision itself is [`fill_action`], a pure function tested above it.
+/// These tests exist because this crate's signature defect is a correct
+/// decision that nothing consults: reviews of ten consecutive commits each
+/// found one, and one of those was a credential leak reached exactly that way.
+/// So the two calls in [`fill_from_vault`] are pinned separately -- delete
+/// either and a test here fails while every test of `fill_action` stays green.
+#[cfg(test)]
+mod fill_dispatch_tests {
+    use super::*;
+    use crate::app_match::APP_MATCH_FIELD_NAME;
+    use crate::injector::sequence::{Plan, Step};
+    use crate::vault_bridge::{LoginData, VaultBridge, VaultField};
+    use std::sync::{Arc, Mutex};
+
+    /// **The username and password disagree, and neither contains the other.**
+    /// A fixture whose two values agree cannot tell which one was typed.
+    const USER: &str = "work.account@contoso.com";
+    const PASS: &str = "Zq7-tremulous-BADGER";
+
+    fn item_with(sequence: &str) -> VaultItem {
+        let m = AppMatch {
+            sequence: sequence.to_string(),
+            ..AppMatch::for_process("msedge.exe", TriggerMode::Auto)
+        };
+        VaultItem {
+            id: "item-1".into(),
+            name: "Work Microsoft 365".into(),
+            fields: vec![
+                VaultField {
+                    name: Some(APP_MATCH_FIELD_NAME.into()),
+                    value: Some(m.to_field_value()),
+                    other: serde_json::Map::new(),
+                },
+                VaultField {
+                    name: Some("PIN".into()),
+                    value: Some("4821".into()),
+                    other: serde_json::Map::new(),
+                },
+            ],
+            login: Some(LoginData {
+                username: Some(USER.into()),
+                password: Some(PASS.to_string().into()),
+                ..LoginData::default()
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    // -- fill_action, the pure decision -------------------------------------
+
+    #[test]
+    fn an_item_with_no_sequence_takes_the_default_fill() {
+        // Not a plan of DEFAULT_SEQUENCE: UI Automation fills named fields
+        // and a sequence types at focus, and those are different acts.
+        assert!(matches!(fill_action(&item_with(""), None), Ok(FillAction::Default)));
+    }
+
+    #[test]
+    fn an_item_with_no_app_match_at_all_takes_the_default_fill() {
+        let mut item = item_with("");
+        item.fields.clear();
+        assert!(matches!(fill_action(&item, None), Ok(FillAction::Default)));
+    }
+
+    #[test]
+    fn a_stored_sequence_is_planned_from_the_items_own_values() {
+        let item = item_with("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{S:PIN}");
+        let Ok(FillAction::Sequence(plan)) = fill_action(&item, None) else {
+            panic!("a stored sequence must plan");
+        };
+        let typed: Vec<String> = plan
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        // Username first, then password and the custom field on the second
+        // screen: reading the password where the username belongs would give
+        // the same *shape* and a broken login.
+        assert_eq!(typed, vec![USER.to_string(), format!("{PASS}4821")]);
+    }
+
+    #[test]
+    fn a_sequence_whose_field_is_missing_refuses_rather_than_falling_back_to_the_default() {
+        // Silently degrading to username-Tab-password would type a password
+        // into a screen that is asking for an email address.
+        let item = item_with("{S:NOPE}");
+        assert!(matches!(fill_action(&item, None), Err(sequence::Refusal::Unresolved(_))));
+    }
+
+    #[test]
+    fn the_one_time_code_is_handed_to_the_plan() {
+        let item = item_with("{TOTP}");
+        let Ok(FillAction::Sequence(plan)) = fill_action(&item, Some("246813")) else {
+            panic!("plans with a code");
+        };
+        assert_eq!(
+            plan.steps(),
+            [Step::Text { text: "246813".into(), rate: sequence::DEFAULT_RATE }]
+        );
+        // Positive control: without the code, the same sequence refuses.
+        assert!(fill_action(&item_with("{TOTP}"), None).is_err());
+    }
+
+    #[test]
+    fn only_a_sequence_that_uses_a_one_time_code_asks_for_one() {
+        // This is what keeps an HTTP round-trip off the path that this app
+        // deliberately serves from the in-memory cache.
+        assert!(sequence_needs_a_one_time_code(&item_with("{USERNAME}{TAB}{TOTP}")));
+        assert!(!sequence_needs_a_one_time_code(&item_with("{USERNAME}{TAB}{PASSWORD}")));
+        assert!(!sequence_needs_a_one_time_code(&item_with("")));
+    }
+
+    #[test]
+    fn the_sequence_is_read_off_the_items_own_app_match_field() {
+        assert_eq!(sequence_for(&item_with("{TAB}")), "{TAB}");
+        assert_eq!(sequence_for(&item_with("")), "");
+    }
+
+    // -- fill_from_vault, the two calls -------------------------------------
+
+    #[derive(Default)]
+    struct Recorder {
+        default_fills: Mutex<Vec<(isize, String, String)>>,
+        sequences: Mutex<Vec<(isize, Vec<Step>)>>,
+    }
+
+    #[derive(Clone)]
+    struct NoUiAutomation;
+    impl UiAutomationFiller for NoUiAutomation {
+        fn fill(&self, _: isize, _: &str, _: &str) -> Result<bool, String> {
+            // Never succeeds, so the default path is observable at the
+            // fallback -- and a sequence that wrongly went down the default
+            // path would show up in `default_fills`.
+            Ok(false)
+        }
+    }
+
+    /// Records instead of typing. **There is no path from this test module to
+    /// `SendInput`** -- the same discipline as `main.rs`'s `NeverTypes`.
+    #[derive(Clone)]
+    struct RecordingFiller(Arc<Recorder>);
+    impl SendInputFiller for RecordingFiller {
+        fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {
+            self.0.default_fills.lock().unwrap().push((hwnd, user.into(), pass.into()));
+            Ok(())
+        }
+        fn fill_sequence(&self, hwnd: isize, plan: Plan) -> Result<(), String> {
+            self.0.sequences.lock().unwrap().push((hwnd, plan.steps().to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A cache holding exactly `item`.
+    ///
+    /// The mock server exists only to satisfy `populate_with`'s folder fetch
+    /// and is **dropped before the fill runs**, so a fill that reached for
+    /// the network instead of the in-memory snapshot would fail visibly
+    /// rather than quietly succeed -- which is the property
+    /// `fill_from_vault`'s doc claims and nothing else here checks.
+    fn cache_with(item: VaultItem) -> VaultCache {
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let _ = cache.populate_with(vec![item], cache.epoch()).expect("seeds");
+        assert_eq!(cache.items().len(), 1, "the cache must actually hold the item");
+        cache
+    }
+
+    fn fill(item: VaultItem) -> Arc<Recorder> {
+        let _ = sequence::take_notices();
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
+        let dir = std::env::temp_dir()
+            .join(format!("deskwarden-fill-dispatch-{:?}", std::thread::current().id()));
+        let stats = crate::fill_stats::FillStats::new(dir.join("stats.json"));
+        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
+        rec
+    }
+
+    /// **Delete `injector.fill_sequence(hwnd, plan)` from `fill_from_vault`
+    /// and this is the test that fails.**
+    #[test]
+    fn an_item_with_a_sequence_is_typed_through_the_sequence_path() {
+        let rec = fill(item_with("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}"));
+
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the sequence path was not reached");
+        assert_eq!(sequences[0].0, 4242, "the plan went to the wrong window");
+        // The plan is the item's own, not some other sequence: substituting
+        // `DEFAULT_SEQUENCE` here fails on both the shape and the values.
+        assert_eq!(
+            sequences[0].1.iter().filter(|s| matches!(s, Step::Wait(_))).count(),
+            1,
+            "the delay did not survive into the plan"
+        );
+        assert!(
+            sequences[0]
+                .1
+                .contains(&Step::Text { text: PASS.into(), rate: sequence::DEFAULT_RATE }),
+            "the item's own password is not in the plan: {:?}",
+            sequences[0].1
+        );
+        assert!(
+            rec.default_fills.lock().unwrap().is_empty(),
+            "a sequenced item also took the default fill"
+        );
+    }
+
+    /// **Delete `injector.fill(hwnd, &username, &password)` and this fails.**
+    /// The existing behaviour, unchanged, for every item in every existing
+    /// vault.
+    #[test]
+    fn an_item_without_a_sequence_still_takes_the_original_fill() {
+        let rec = fill(item_with(""));
+
+        assert_eq!(
+            *rec.default_fills.lock().unwrap(),
+            vec![(4242, USER.to_string(), PASS.to_string())]
+        );
+        assert!(
+            rec.sequences.lock().unwrap().is_empty(),
+            "an item with no sequence went down the sequence path"
+        );
+    }
+
+    /// **`fill_from_vault` really does fetch a one-time code and hand it to
+    /// the plan.** Stubbing the fetch out (`let totp = if false`) leaves
+    /// `the_one_time_code_is_handed_to_the_plan` and
+    /// `only_a_sequence_that_uses_a_one_time_code_asks_for_one` green, because
+    /// one tests `fill_action` with a code it was handed and the other tests
+    /// the predicate -- neither is the *act*. This one is: it needs the code
+    /// to come off the wire and end up in the plan, so it fails.
+    ///
+    /// The mock server is alive for the whole fill here (unlike `fill`'s),
+    /// which is the point -- the fetch is the one part of a fill that is
+    /// deliberately allowed to touch the network.
+    #[test]
+    fn a_sequence_that_uses_a_one_time_code_fetches_it_and_types_it() {
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let totp = server
+            .mock("GET", "/object/totp/item-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":"482913"}}"#)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let _ = cache
+            .populate_with(vec![item_with("{USERNAME}{TAB}{TOTP}")], cache.epoch())
+            .expect("seeds");
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
+        let stats = crate::fill_stats::FillStats::new(
+            std::env::temp_dir().join("deskwarden-fill-totp").join("stats.json"),
+        );
+        fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+
+        totp.assert();
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the sequence path was not reached");
+        assert!(
+            sequences[0].1.contains(&Step::Text {
+                text: "482913".to_string(),
+                rate: sequence::DEFAULT_RATE
+            }),
+            "the fetched code is not in the plan: {:?}",
+            sequences[0].1
+        );
+    }
+
+    /// Positive control for the test above: an item whose sequence does not
+    /// mention `{TOTP}` must not pay for the round trip at all.
+    #[test]
+    fn a_sequence_without_a_one_time_code_makes_no_totp_request() {
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let _ = cache
+            .populate_with(vec![item_with("{USERNAME}{TAB}{PASSWORD}")], cache.epoch())
+            .expect("seeds");
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
+        let stats = crate::fill_stats::FillStats::new(
+            std::env::temp_dir().join("deskwarden-fill-nototp").join("stats.json"),
+        );
+        fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+
+        assert_eq!(rec.sequences.lock().unwrap().len(), 1);
+        totp.expect(0).assert();
+    }
+
+    /// A refused sequence types **nothing at all** -- not the sequence, and
+    /// not the default fill it might have degraded to.
+    #[test]
+    fn a_refused_sequence_types_nothing_by_either_path() {
+        let rec = fill(item_with("{USERNAME}{PICKCHARS}{PASSWORD}"));
+        assert!(rec.sequences.lock().unwrap().is_empty());
+        assert!(rec.default_fills.lock().unwrap().is_empty());
+    }
+
+    /// **The refusal reaches the user, not only the log.** Deleting the
+    /// `REAL_NOTIFIER.refused(&message)` line leaves every other test in this
+    /// module green and fails only here -- which is the whole point of it
+    /// being a separate assertion.
+    #[test]
+    fn a_refused_sequence_tells_the_user_which_construct_stopped_it() {
+        let _ = fill(item_with("{USERNAME}{PICKCHARS}{PASSWORD}"));
+        let notices = sequence::take_notices();
+        assert_eq!(notices.len(), 1, "the user was not told: {notices:?}");
+        assert!(
+            notices[0].contains("{PICKCHARS}"),
+            "the notice must name the construct: {}",
+            notices[0]
+        );
+    }
+
+    /// Positive control for the test above: a fill that succeeds says nothing.
+    /// Without this, a notifier that fired on every fill would pass.
+    #[test]
+    fn a_fill_that_works_does_not_interrupt_the_user() {
+        let _ = fill(item_with("{USERNAME}{TAB}{PASSWORD}"));
+        assert!(sequence::take_notices().is_empty());
+        let _ = fill(item_with(""));
+        assert!(sequence::take_notices().is_empty());
     }
 }

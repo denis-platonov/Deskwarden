@@ -4788,7 +4788,7 @@ mod auth_in_flight_tests {
 /// were freed by `realloc` long before any of this. Fixing that means a
 /// capacity-reserving `Zeroizing<String>` and is not what these tests claim.
 #[cfg(test)]
-mod password_lifetime_tests {
+pub(crate) mod password_lifetime_tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
@@ -4797,7 +4797,7 @@ mod password_lifetime_tests {
     /// Long and distinctive: it must not occur by chance in an unrelated
     /// freed block, and it must be longer than a machine word so a partial
     /// overwrite cannot look like a wipe.
-    const PROBE: &str = "deskwarden-drop-probe-master-password";
+    pub(crate) const PROBE: &str = "deskwarden-drop-probe-master-password";
 
     thread_local! {
         static WATCHING: Cell<bool> = const { Cell::new(false) };
@@ -4850,7 +4850,7 @@ mod password_lifetime_tests {
 
     /// Runs `body` with this thread's watch armed and answers whether the probe
     /// string went past the allocator in the clear.
-    fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
+    pub(crate) fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
         SEEN.with(|seen| seen.set(false));
         WATCHING.with(|watching| watching.set(true));
         body();
