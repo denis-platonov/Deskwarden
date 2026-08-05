@@ -191,13 +191,30 @@ impl AppMatch {
     /// gaps are worth naming because the wording above could be read as
     /// covering them and it does not:
     ///
-    ///  * **The drive letter is not proof of a local disk.** `subst` and a
-    ///    mapped network drive both produce an `X:\` path whose image really is
-    ///    fetched over the network or from wherever the mapping points. The
-    ///    UNC rejection above removes one spelling of "somewhere else", not the
-    ///    possibility. Nothing structural can close this -- it takes a
-    ///    `GetDriveType`/`QueryDosDevice` call at launch time, which belongs to
-    ///    the launcher.
+    ///  * **The drive letter is not proof of a local disk, and that gap is
+    ///    ACCEPTED.** `subst` and a mapped network drive both produce an `X:\`
+    ///    path whose image really is fetched over the network or from wherever
+    ///    the mapping points. The UNC rejection above removes one spelling of
+    ///    "somewhere else", not the possibility, and nothing structural can
+    ///    close it: it would take a `GetDriveType`/`QueryDosDevice` call at
+    ///    launch time.
+    ///
+    ///    An earlier version of this doc said that call "belongs to the
+    ///    launcher", while `vault_window::launch_app` said it "re-checks
+    ///    nothing, and that is deliberate" -- two docs pointing at each other
+    ///    and nobody implementing it. It is not implemented, on purpose, for
+    ///    three reasons. `GetDriveType` on a disconnected mapped drive blocks
+    ///    on SMB timeouts measured in tens of seconds, and the launch runs on
+    ///    the UI thread, so the honest version of this check is an async
+    ///    launch path -- a real change to how Open works, not a one-line
+    ///    guard. Rejecting `DRIVE_REMOTE` would also refuse a legitimate
+    ///    install on a mapped drive, which is a normal thing in a managed
+    ///    environment. And the residual is bounded by the file-name check
+    ///    below: the ceiling is "a file called `Speedtest.exe` somewhere
+    ///    else", not an arbitrary program. That is a gap, not a hole, and it
+    ///    is smaller than the one `AppMatch::args` leaves open (see
+    ///    `vault_window::detail::LaunchPlan`), which is where the effort
+    ///    belongs first.
     ///  * **A directory component may still be an 8.3 short name**
     ///    (`C:\PROGRA~1\...`), which names a directory this check cannot expand
     ///    or verify.

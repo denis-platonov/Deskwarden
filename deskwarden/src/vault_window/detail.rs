@@ -2397,11 +2397,49 @@ fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
 /// which appends a string to the command line *verbatim*. `args` is never
 /// split, never re-quoted, and never parsed by this crate -- it arrives at the
 /// target program byte-for-byte as the user wrote it, and the target program's
-/// own parser is the only one that ever looks at it. There is no new injection
-/// surface: no shell is involved (`Command` does not go through `cmd.exe`),
-/// so the worst a corrupted `args` can do is pass extra flags to a program
-/// whose identity [`AppMatch::launchable_path`] has already pinned -- which is
-/// exactly what an honest `args` does too.
+/// own parser is the only one that ever looks at it. `args` is never split,
+/// never re-quoted, and never parsed by this crate.
+///
+/// **What `args` can do, stated accurately.** An earlier version of this doc
+/// claimed the worst a corrupted `args` could do was "pass extra flags to a
+/// program whose identity `launchable_path` has already pinned -- which is
+/// exactly what an honest `args` does too". The first half is right and the
+/// reassurance is wrong, because for the program this feature was built for,
+/// extra flags ARE arbitrary code execution:
+///
+/// ```text
+/// args = --gpu-launcher="cmd /c calc.exe"
+/// argv = ["...chrome.exe", "--gpu-launcher=cmd /c calc.exe", "https://..."]
+/// ```
+///
+/// Chrome executes that string. `--gpu-launcher`, `--renderer-cmd-prefix`,
+/// `--utility-cmd-prefix` and `--browser-subprocess-path` are all "run this
+/// command as my child process" flags, and every Chromium browser has them.
+/// So `launchable_path` pinning the *image* pins nothing about what the image
+/// is made to do.
+///
+/// **And `args` is not necessarily the user's own text.** It is unvalidated
+/// vault data, and an item can be shared into a vault by another member of an
+/// organisation. The threat model is therefore not "the user corrupted their
+/// own field" but "somebody else wrote the field, and the user clicks Open".
+///
+/// **What is genuinely inert, so this is not overstated.** Shell
+/// metacharacters do nothing: no shell is involved (`Command` does not go
+/// through `cmd.exe`), so `&`, `|`, `^` and `%` come back from
+/// `CommandLineToArgvW` as ordinary argv tokens, a newline stays inside one
+/// token, and no *second* program can be injected. The surface is exactly
+/// "arbitrary flags to the one pinned program" -- which happens to be the
+/// whole machine when that program is a browser.
+///
+/// **Nothing here validates `args`, and that is a standing decision, not an
+/// oversight.** A denylist of dangerous flags is unmaintainable (every
+/// Chromium release adds some) and gives false assurance; a confirmation
+/// prompt on every Open trains the user to click through it. The mitigation
+/// this crate actually ships is [`command_line`], which puts the exact command
+/// line in the Open control's tooltip so it can be read before clicking --
+/// weak, because it requires hovering, and with two menu entries it requires
+/// opening the menu first. Anything stronger is a product decision about what
+/// Deskwarden will refuse to run, and belongs with the person making it.
 ///
 /// The one string this crate *does* have to compose is the item's URL, which
 /// is appended after `args`; that one goes through [`quote_arg`], because it
@@ -9724,6 +9762,54 @@ mod tests {
             // Whatever the card says, a refused match never gets a control.
             if app_open_refusal(&m).is_some() {
                 assert!(app_open_choices(&m, WEB).is_empty());
+            }
+        }
+    }
+
+    /// *Which* refusal, not merely that there is one -- including the case
+    /// where two reasons are both true at once.
+    ///
+    /// **[`a_refusal_is_shown_exactly_when_there_is_no_plan`] only asks
+    /// `is_some()`**, so every arm of [`app_open_refusal`] could return every
+    /// other arm's sentence and it would still pass. The ordering of those
+    /// arms is a decision: a Store app with no recorded path is refused for
+    /// BOTH reasons, and telling that user to pick it again with "Add app..."
+    /// sends them round a loop that cannot help, because re-picking a Store
+    /// app produces another hosted match that still gets no Open. Being hosted
+    /// is the reason that stays true no matter what the user does, so it is
+    /// the one that must be said.
+    #[test]
+    fn each_refusal_gives_its_own_reason_and_hosted_outranks_a_missing_path() {
+        let mut no_path = a_browser_match();
+        no_path.path = String::new();
+        let mut bad_path = a_browser_match();
+        bad_path.path = r"C:\Apps\..\chrome.exe".to_string();
+
+        assert_eq!(app_open_refusal(&a_store_match()), Some(APP_OPEN_HOSTED_NOTE));
+        assert_eq!(app_open_refusal(&no_path), Some(APP_OPEN_NO_PATH_NOTE));
+        assert_eq!(app_open_refusal(&bad_path), Some(APP_OPEN_REFUSED_NOTE));
+
+        // The overlap, which no fixture covered: hosted AND nothing recorded.
+        let mut hosted_no_path = a_store_match();
+        hosted_no_path.path = String::new();
+        assert!(
+            hosted_no_path.hosted && hosted_no_path.path.is_empty(),
+            "the premise: this match trips both refusals at once"
+        );
+        assert_eq!(
+            app_open_refusal(&hosted_no_path),
+            Some(APP_OPEN_HOSTED_NOTE),
+            "a Store app with no recorded path is told to re-pick it from the tray menu, \
+             which cannot help: re-picking a Store app records another hosted match that \
+             still gets no Open"
+        );
+
+        // Control: the three sentences really are distinct, so the assertions
+        // above are not all satisfied by one string.
+        let all = [APP_OPEN_HOSTED_NOTE, APP_OPEN_NO_PATH_NOTE, APP_OPEN_REFUSED_NOTE];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b, "two refusals are the same sentence");
             }
         }
     }

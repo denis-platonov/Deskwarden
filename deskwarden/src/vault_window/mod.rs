@@ -5131,6 +5131,15 @@ fn is_safe_web_url(url: &str) -> bool {
 /// would be the whole gate undone, and there is no branch below that could
 /// become one, because this function is never handed anything but a plan.
 ///
+/// **In particular there is no `GetDriveType` here**, which
+/// `AppMatch::launchable_path` once said "belongs to the launcher" while this
+/// doc said it re-checks nothing -- two docs pointing at each other with
+/// nobody implementing the check. The gap is accepted rather than delegated;
+/// `launchable_path`'s doc now states the decision and the three reasons for
+/// it (a blocking SMB timeout on the UI thread, refusing legitimate installs
+/// on mapped drives, and a residual bounded by the file-name check). This
+/// sentence exists so the two docs agree.
+///
 /// Four Windows details, each of which was a bug waiting:
 ///
 ///  * **`raw_arg`, not `args`.** The tail is a command line, already in the
@@ -5163,7 +5172,7 @@ fn is_safe_web_url(url: &str) -> bool {
 /// started by hand is started from where it lives, and a program that loads a
 /// DLL beside itself would otherwise search Deskwarden's directory first.
 fn launch_app(plan: &LaunchPlan) -> std::io::Result<()> {
-    let spawn = |breakaway: bool| {
+    launch_with(&plan.program, |breakaway| {
         let mut command = std::process::Command::new(&plan.program);
         if !plan.raw_tail.is_empty() {
             command.raw_arg(&plan.raw_tail);
@@ -5175,23 +5184,61 @@ fn launch_app(plan: &LaunchPlan) -> std::io::Result<()> {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .creation_flags(if breakaway {
-                crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
-            } else {
-                crate::bw_path::CREATE_NO_WINDOW
-            })
+            .creation_flags(creation_flags_for(breakaway))
             .spawn()
-    };
+            .map(|_child| ())
+    })
+}
+
+/// The creation flags for one spawn attempt, as a value rather than as a
+/// spelling inside a closure.
+///
+/// **This exists because the flag used to be unprovable.** It was written as
+/// an `if breakaway { A | B } else { A }` expression inside `launch_app`'s
+/// spawn closure, and the only thing guarding it was a source-text count of
+/// `CREATE_BREAKAWAY_FROM_JOB`. That needle counts the *`if` arm's spelling*,
+/// not the call that selects it: changing `spawn(true)` to `spawn(false)`
+/// removed the flag from every launch in the program while the guard went on
+/// reporting it present, with the whole suite green. A `bool -> u32` function
+/// can be called by a test with both inputs and compared against the
+/// constants, which is a fact about the value that reaches `CreateProcess`
+/// rather than a fact about the characters near it.
+///
+/// See [`launch_app`]'s doc for why each flag is here.
+fn creation_flags_for(breakaway: bool) -> u32 {
+    if breakaway {
+        crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
+    } else {
+        crate::bw_path::CREATE_NO_WINDOW
+    }
+}
+
+/// The breakaway attempt-and-fallback policy, over any spawner.
+///
+/// **Generic over the spawn so that a test can be the spawn.** The three
+/// decisions here -- that the *first* attempt asks for breakaway, that
+/// `ACCESS_DENIED` and only `ACCESS_DENIED` earns a retry, and that the retry
+/// asks for it *without* -- are the entire value of the flag, and none of them
+/// is visible in a source-text needle. A fake spawner records the `bool` it
+/// was handed, so the test asserts the sequence `[true, false]` reached the
+/// caller, which no amount of moving the flag's spelling around can fake.
+/// Nothing in the test path constructs a `Command`, let alone runs one.
+///
+/// `program` is used only for the log line.
+fn launch_with(
+    program: &str,
+    mut spawn: impl FnMut(bool) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     match spawn(true) {
-        Ok(_child) => Ok(()),
+        Ok(()) => Ok(()),
         // The containing job forbids breakaway. Falling back is right and not
         // a hole: without the flag the child joins whatever job Deskwarden is
         // already in, which is the same fate Deskwarden itself has -- the
         // alternative is refusing to open the app at all in an environment
         // this crate did not create.
         Err(e) if e.raw_os_error() == Some(ACCESS_DENIED_ERRNO) => {
-            log::warn!("breakaway from job refused, starting {} inside it", plan.program);
-            spawn(false).map(|_child| ())
+            log::warn!("breakaway from job refused, starting {program} inside it");
+            spawn(false)
         }
         Err(e) => Err(e),
     }
@@ -12466,13 +12513,25 @@ mod account_details_tests {
 /// `CreateProcess`, and a test that exercised it would start a program on the
 /// machine running the suite.
 ///
-/// **What they do not guarantee**, so the doc claims no coverage it lacks:
-/// they see spellings and counts, not behaviour. What they catch is the edit
-/// that deletes the launch, or the launch that stops reporting its failure --
-/// and, deliberately, the two Windows details a refactor would quietly drop:
-/// `raw_arg` (without which `--profile-directory="Profile 2"` is re-quoted into
-/// something else) and `CREATE_BREAKAWAY_FROM_JOB` (without which the browser
-/// can inherit a kill-on-close job and die when Deskwarden exits).
+/// **What the source guards do not guarantee**, so the doc claims no coverage
+/// it lacks: they see spellings and counts, not behaviour. What they catch is
+/// the edit that deletes the launch, or the launch that stops reporting its
+/// failure -- and, deliberately, the Windows details a refactor would quietly
+/// drop: `raw_arg` (without which `--profile-directory="Profile 2"` is
+/// re-quoted into something else), the working directory, and the emptiness
+/// test that keeps a bare launch off a command line that is nothing but a
+/// space.
+///
+/// **`CREATE_BREAKAWAY_FROM_JOB` is no longer among them, and that is the
+/// point.** It used to be guarded by counting its spelling, which counted the
+/// `if` arm rather than the call that selects it -- so `spawn(true)` could
+/// become `spawn(false)`, removing the flag from every launch in the program,
+/// with the guard still reporting it present and the whole suite green. Two
+/// of the tests below are ordinary unit tests instead:
+/// [`creation_flags_for`] is called with both inputs, and [`launch_with`] is
+/// driven with a fake spawner that records the sequence of attempts. Neither
+/// constructs a `Command`; the source guard's remaining job is only to pin
+/// that the real launcher goes through them.
 ///
 /// The DECISION about whether a launch may happen at all is not here and not
 /// in this file: it is `detail::app_launch_plan`, which `detail`'s own suite
@@ -12492,15 +12551,35 @@ mod open_app_wiring_tests {
     /// One needle for both halves of the failure report: the assignment that
     /// puts a sentence in the band AND the call that decides the sentence.
     const REPORTS: &str = concat!("move_error = Some(app_launch_failure", "_message(");
+    /// What the band is told to name. The failure sentence quotes a file so
+    /// the user has something to fix; handing it the *tail* instead would name
+    /// the arguments, which the unit test cannot catch because it calls
+    /// `app_launch_failure_message` with its own literals.
+    const NAMES_THE_PROGRAM: &str = concat!("&plan.", "program,");
+    /// The other field of the plan, which must NOT appear in that call.
+    const NAMES_THE_TAIL: &str = concat!("&plan.", "raw_tail,");
     /// The spawn itself, inside `launch_app`.
     const SPAWNS: &str = concat!(".spawn", "()");
     /// The verbatim command-line tail. `\u{2e}args(` here instead would
     /// re-quote it.
     const RAW: &str = concat!("command.raw_arg", "(&plan.raw_tail)");
-    /// The flag that keeps the launched program out of a job object this
-    /// process might be inside.
-    const BREAKS_AWAY: &str =
-        concat!("crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM", "_JOB");
+    /// The working directory, which is the program's own folder and not
+    /// Deskwarden's -- see [`launch_app`]'s doc for the DLL-search-order
+    /// reason. Deleting it used to change nothing any test could see.
+    const CHDIR: &str = concat!("command.current_dir", "(dir)");
+    /// The emptiness test that keeps a bare launch from getting a command line
+    /// that is nothing but a trailing space. Deleting the `if` used to change
+    /// nothing any test could see.
+    const TAIL_GUARD: &str = concat!("if !plan.raw_tail.is_", "empty() {");
+    /// The one place the flags are computed. A test calls
+    /// [`creation_flags_for`] with both inputs; this pins that the spawn
+    /// closure asks it about the attempt it is actually making, rather than
+    /// hard-coding one answer.
+    const FLAGS_FROM_ATTEMPT: &str = concat!(".creation_flags(creation_flags_", "for(breakaway))");
+    /// The real launcher goes through the policy that
+    /// [`the_first_attempt_asks_for_breakaway_and_only_access_denied_falls_back`]
+    /// drives, rather than open-coding a second copy of it.
+    const USES_POLICY: &str = concat!("launch_with(&plan.program,", " |breakaway| {");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -12534,6 +12613,22 @@ mod open_app_wiring_tests {
         let body = &source[arm_at..arm_at + arm_end];
         assert!(occurrences(body, LAUNCHES) == 1, "the launch is not in the arm: {body}");
         assert!(occurrences(body, REPORTS) == 1, "the report is not in the arm: {body}");
+        // And it names the PROGRAM FILE, not the arguments. The unit test on
+        // `app_launch_failure_message` passes its own literals, so it is blind
+        // to which field the call site hands over.
+        assert_eq!(
+            occurrences(body, NAMES_THE_PROGRAM),
+            1,
+            "the failure band is not told the program file: it quotes a path so the user has \
+             something to fix, and any other field leaves \u{201c}couldn\u{2019}t open the \
+             app\u{201d} with nothing actionable in it: {body}"
+        );
+        assert_eq!(
+            occurrences(body, NAMES_THE_TAIL),
+            0,
+            "the failure band is being handed the command-line tail, so it names the \
+             ARGUMENTS where the program file belongs: {body}"
+        );
         assert!(
             body.len() < 1400,
             "control: the slice isolated the arm rather than running on into the rest of \
@@ -12557,11 +12652,130 @@ mod open_app_wiring_tests {
              re-quote --profile-directory=\"Profile 2\" into a different flag"
         );
         assert_eq!(
-            occurrences(source, BREAKS_AWAY),
+            occurrences(source, TAIL_GUARD),
             1,
-            "expected {BREAKS_AWAY:?} exactly once -- without it a Deskwarden started inside \
-             somebody else's job object hands that job to the browser, which then dies when \
-             Deskwarden exits"
+            "expected {TAIL_GUARD:?} exactly once -- without it a plan with nothing to add \
+             still calls `raw_arg`, and the program is started with a command line whose \
+             whole tail is a space"
+        );
+        assert_eq!(
+            occurrences(source, CHDIR),
+            1,
+            "expected {CHDIR:?} exactly once -- without it the child inherits Deskwarden's \
+             working directory, and a program that loads a DLL beside itself searches \
+             Deskwarden's folder first"
+        );
+        assert_eq!(
+            occurrences(source, FLAGS_FROM_ATTEMPT),
+            1,
+            "expected {FLAGS_FROM_ATTEMPT:?} exactly once -- the spawn must ask \
+             `creation_flags_for` about the attempt it is making; hard-coding either answer \
+             makes the retry a no-op or removes the flag from every launch"
+        );
+        assert_eq!(
+            occurrences(source, USES_POLICY),
+            1,
+            "expected {USES_POLICY:?} exactly once -- the real launcher must go through the \
+             same `launch_with` the sequence test drives, not open-code a second copy"
+        );
+    }
+
+    /// The flag, proven as a value.
+    ///
+    /// **This is the test the old source-text needle was not.** The needle
+    /// counted `CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB` as it appeared
+    /// in an `if` arm; it could not tell whether anything ever selected that
+    /// arm. Here the mapping is called.
+    #[test]
+    fn breakaway_is_a_flag_that_is_actually_set_and_dropped_by_the_bool() {
+        let with = creation_flags_for(true);
+        let without = creation_flags_for(false);
+
+        assert_ne!(
+            with, without,
+            "both attempts ask for the same flags, so the fallback retries with exactly what \
+             was just refused and can only fail again"
+        );
+        assert_eq!(
+            with,
+            crate::bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+            "the breakaway attempt does not carry CREATE_BREAKAWAY_FROM_JOB"
+        );
+        assert_eq!(
+            without,
+            crate::bw_path::CREATE_NO_WINDOW,
+            "the fallback attempt carries something other than CREATE_NO_WINDOW alone"
+        );
+        // Both keep the console suppressed: a console-subsystem program must
+        // not flash a window on either path.
+        assert_eq!(with & crate::bw_path::CREATE_NO_WINDOW, crate::bw_path::CREATE_NO_WINDOW);
+        assert_eq!(without & crate::bw_path::CREATE_NO_WINDOW, crate::bw_path::CREATE_NO_WINDOW);
+        // And the fallback really is the one WITHOUT breakaway, stated as the
+        // bit rather than as inequality with the whole value.
+        assert_eq!(with & CREATE_BREAKAWAY_FROM_JOB, CREATE_BREAKAWAY_FROM_JOB);
+        assert_eq!(without & CREATE_BREAKAWAY_FROM_JOB, 0);
+    }
+
+    /// The sequence of attempts, proven by being the spawner.
+    ///
+    /// **Nothing here constructs or runs a `Command`.** The fake records the
+    /// `bool` it was handed and returns whatever the case under test needs,
+    /// so the assertions are about the argument that reaches the flag
+    /// computation -- the exact thing three separate mutations used to be able
+    /// to change with the whole suite green.
+    #[test]
+    fn the_first_attempt_asks_for_breakaway_and_only_access_denied_falls_back() {
+        fn attempts(mut outcome: impl FnMut(usize, bool) -> std::io::Result<()>) -> Vec<bool> {
+            let mut seen = Vec::new();
+            let _ = launch_with(r"C:\Apps\Ledgerline\Ledgerline.exe", |breakaway| {
+                seen.push(breakaway);
+                outcome(seen.len() - 1, breakaway)
+            });
+            seen
+        }
+        let access_denied = || std::io::Error::from_raw_os_error(ACCESS_DENIED_ERRNO);
+
+        // A launch that works asks for breakaway, once, and stops.
+        assert_eq!(
+            attempts(|_, _| Ok(())),
+            vec![true],
+            "the successful launch does not ask for breakaway (or asks twice)"
+        );
+
+        // ACCESS_DENIED -- the containing job forbids breakaway -- retries
+        // WITHOUT it, and the retry is the last attempt.
+        assert_eq!(
+            attempts(|n, _| if n == 0 { Err(access_denied()) } else { Ok(()) }),
+            vec![true, false],
+            "a job that forbids breakaway does not produce a second attempt without the flag: \
+             either Open fails forever inside such a job, or the retry asks for the very flag \
+             that was just refused"
+        );
+
+        // Any OTHER error is the program's problem, not the job's, and must
+        // not be retried -- a missing .exe is not going to appear on a second
+        // CreateProcess, and a retry would double every failure's latency.
+        let missing = attempts(|_, _| Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+        assert_eq!(missing, vec![true], "a missing program file was retried: {missing:?}");
+
+        // Control: the fake is really being consulted -- if `launch_with`
+        // ignored the closure's result the two cases above would be identical.
+        assert_ne!(attempts(|_, _| Err(access_denied())), attempts(|_, _| Ok(())));
+
+        // And the error the caller sees is the FIRST one when there is no
+        // retry, and the RETRY's when there is.
+        let refused = launch_with("x", |b| {
+            if b {
+                Err(access_denied())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        });
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "the fallback's own failure is swallowed and the job's ACCESS_DENIED is reported \
+             instead, which points the band at the wrong cause"
         );
     }
 
