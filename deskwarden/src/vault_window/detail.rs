@@ -1556,6 +1556,13 @@ pub fn draw_detail_read(
     // re-derived per widget, so the header, the chrome, the body and the
     // metadata strip cannot disagree about what this item is.
     let kind = ItemKind::of(item);
+    // **Derived once, beside `kind`, for the same reason `kind` is.** The
+    // header measures the room its controls need and then draws them, and
+    // those two must not be able to disagree -- drift between them is what
+    // put a control off the edge of the pane once already (see
+    // `controls_width` below). It is also what `fill_hotkey_applies` asks, so
+    // the button and Ctrl+Shift+F cannot end up offering different things.
+    let offers_fill = item_offers_fill(item, kind);
     let login = item.login.as_ref();
     let username = login.and_then(|l| l.username.as_deref()).unwrap_or("");
     let password = login
@@ -1629,7 +1636,7 @@ pub fn draw_detail_read(
             // the gap before it, so the strip does not reserve space for a
             // control it will not draw.
             let controls_width = |hint: Option<&str>| {
-                let fill = if kind_offers_fill(kind) {
+                let fill = if offers_fill {
                     HEADER_GAP + theme::header_primary_button_width(ui, FILL_LABEL, hint)
                 } else {
                     0.0
@@ -1746,7 +1753,13 @@ pub fn draw_detail_read(
                 // button on a card would type two empty strings into
                 // whatever window happens to be focused. See
                 // `kind_offers_fill`.
-                if kind_offers_fill(kind)
+                //
+                // Not drawn for a DEAD binding either -- see
+                // `item_offers_fill`. The card below is printing "Deskwarden
+                // is ignoring this match, so it never fires" in this same
+                // frame; a live Fill above it would be an offer to act
+                // through it anyway.
+                if offers_fill
                     && theme::header_primary_button(ui, FILL_LABEL, layout.hint.then_some(FILL_HINT))
                         .clicked()
                 {
@@ -2230,8 +2243,45 @@ const APP_MATCH_UNREADABLE_NOTICE: &str =
 /// `a_card_calls_a_match_dead_exactly_when_the_engine_can_never_look_it_up`,
 /// which builds a `MatchEngine` from the match and asks it, rather than
 /// re-spelling the condition.
-fn app_match_is_dead(m: &AppMatch) -> bool {
+pub fn app_match_is_dead(m: &AppMatch) -> bool {
     crate::window_watch::is_host_process(&m.process) && !(m.hosted && !m.title.is_empty())
+}
+
+/// Whether *this item's* binding is one [`app_match_is_dead`] calls dead.
+///
+/// The item-level spelling of that predicate, so the two places that must act
+/// on it -- the header's Fill button here, and `vault_window::mod`'s
+/// `fill_item_into_app` -- ask one question rather than each unpacking the
+/// field for themselves. An item with no field, and an item whose field will
+/// not parse, are both `false`: there is no binding to be dead, and the fill
+/// path's own "no app is matched to this item yet" is the honest report for
+/// them.
+pub fn item_binding_is_dead(item: &VaultItem) -> bool {
+    crate::vault_bridge::extract_app_match(item).is_some_and(|m| app_match_is_dead(&m))
+}
+
+/// Whether the pane offers "Fill in app" for this item at all -- the ONE
+/// predicate behind the header button, the room the header strip reserves for
+/// it, and `vault_window::mod`'s `fill_hotkey_applies`.
+///
+/// [`kind_offers_fill`] is the first half and answers "could a fill of this
+/// item mean anything" (see its doc: a card has no username and password to
+/// type). [`item_binding_is_dead`] is the second and answers "is there an app
+/// this fill could go to". A dead binding fails the second: the card in the
+/// same frame is printing [`APP_MATCH_DEAD_NOTICE`] -- *Deskwarden is ignoring
+/// this match, so it never fires* -- and a live blue Fill beside that sentence
+/// is the pane offering to act through a binding it has just said it never
+/// acts through. Worse than the trigger pills that commit `8db47a0` removed
+/// for the same reason: the pills only changed which of three things did not
+/// happen, and this types the user's password into whatever the resolution
+/// picks.
+///
+/// **Not the only gate, and deliberately not the load-bearing one.** The
+/// refusal that actually protects the credential is in
+/// `app::find_window_for_process`, which cannot be bypassed by any caller.
+/// This one is so that the pane does not *offer* what that one will refuse.
+pub fn item_offers_fill(item: &VaultItem, kind: ItemKind) -> bool {
+    kind_offers_fill(kind) && !item_binding_is_dead(item)
 }
 
 /// Which of the card's three bodies an item asks for.
@@ -2843,17 +2893,7 @@ fn app_match_card(
             theme::row_rule(ui);
         }
         if app_row.real {
-            // A plain non-secret value, copied through `CopyValue` -- the
-            // door `DetailAction::CopyValue` reserves for values that are not
-            // `Zeroizing` in the model, which an exe name and a path are not.
-            credential_row(
-                ui,
-                app_row.label,
-                &app_row.value,
-                None,
-                action,
-                DetailAction::CopyValue(app_row.value.clone()),
-            );
+            app_value_row(ui, app_row.label, &app_row.value, action);
         } else {
             row(
                 ui,
@@ -2875,6 +2915,7 @@ fn app_match_card(
     // the setting for this binding", and the footer note says the binding has
     // no settings because it has no behaviour.
     if app_card_offers_triggers(m) {
+        let pill_width = app_card_value_width(ui);
         theme::row_rule(ui);
         // The trigger lives in the VALUE column, not the control group: it is
         // this row's value -- what the match's `trigger` currently is -- and
@@ -2883,6 +2924,15 @@ fn app_match_card(
             ui,
             "Autofill",
             |ui| {
+                // **Wrapped, and inside the column the rows above measure.**
+                // Three pills need about 200pt and the value column is 71pt
+                // at the app's minimum window size, so laid out in a plain
+                // horizontal row the third one was drawn past the pane's
+                // right edge -- the same way `Remove` was, and just as
+                // unclickable. See `app_card_value_width`.
+                ui.set_max_width(pill_width);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for mode in TRIGGER_ORDER {
                     let selected = mode == m.trigger;
@@ -2903,6 +2953,7 @@ fn app_match_card(
                         }
                     }
                 }
+                });
             },
             |_ui| {},
         );
@@ -2912,6 +2963,125 @@ fn app_match_card(
     app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), action);
 }
 
+/// The word on the card's one destructive control, in one place: the button
+/// draws it and [`app_footer_controls_width`] measures it, and a footer that
+/// reserved room for a different string than it drew would be exactly the
+/// drift that put the wide layout's controls off the pane.
+const APP_REMOVE_LABEL: &str = "Remove";
+
+/// How much room [`app_card_footer`]'s controls need to sit on the notes'
+/// line, with the gap that really separates them.
+///
+/// Measured through [`theme::row_button_width`] -- the same galley the button
+/// will lay -- rather than estimated, so the decision here and the drawing
+/// below cannot disagree about whether they fit.
+fn app_footer_controls_width(ui: &egui::Ui, choices: &[OpenChoice]) -> f32 {
+    let remove = theme::row_button_width(ui, APP_REMOVE_LABEL);
+    let open = match choices {
+        // No Open at all -- see `app_open_choices`. Remove is the whole
+        // control group, and it is never absent: every body this footer draws
+        // offers it.
+        [] => return remove,
+        [only] => theme::row_button_width(ui, &open_choice_label(only)),
+        _ => theme::row_button_width(ui, OPEN_MENU_LABEL),
+    };
+    remove + CONTROL_GAP + open
+}
+
+/// One of the card's real rows: [`credential_row`], except that the value
+/// **wraps**.
+///
+/// A plain non-secret value, copied through `CopyValue` -- the door
+/// `DetailAction::CopyValue` reserves for values that are not `Zeroizing` in
+/// the model, which an exe name and a path are not.
+///
+/// **The wrap is load-bearing, not cosmetic.** `Program file` is the only
+/// value on this pane that is a Windows path: one long token with no break
+/// egui will take, and `row_body` lays its band out in a horizontal layout,
+/// whose default wrap mode is `Extend`. So the path laid itself out at its
+/// natural ~300pt whatever the pane was; the `ScrollArea` grows its content
+/// `Ui` to fit its widest child, so the whole MATCHED APP card was then laid
+/// out 467.8pt wide inside a 298pt pane -- and the footer's controls went
+/// with it. `Remove` was culled past the clip rect and never painted at all,
+/// and `Open Ledgerline.exe` began at x = 283.7 with 14 of its 110pt on
+/// screen. Wrapping is what keeps the card inside the pane, which is what
+/// makes [`app_card_footer`]'s "do the controls fit on this line" question
+/// answerable from `ui.available_width()` at all.
+///
+/// **Scoped to this card rather than moved into [`credential_row`].** Every
+/// other value on the pane is prose, an e-mail, a user name or a masked run
+/// -- shapes that already break or already fit -- so widening the change
+/// would put every row's geometry on this pane in the blast radius of a
+/// defect reported about one card.
+fn app_value_row(ui: &mut egui::Ui, label: &str, value: &str, action: &mut DetailAction) {
+    // **Measured on the card's own `Ui`, before `copy_row` builds the row's
+    // band.** Inside the band `ui.available_width()` is derived from a
+    // `max_rect` the `ScrollArea` grew to fit LAST frame's widest child --
+    // which is this very label. Wrapping to that is a fixed point at the
+    // width the text wanted in the first place: it held the card at 467.8pt
+    // and changed nothing at all. See [`app_card_content_width`].
+    let wrap_width = app_card_value_width(ui);
+    copy_row(
+        ui,
+        label,
+        |ui| {
+            // **`break_anywhere`, not merely `wrap()`.** egui breaks a
+            // wrapped run at word boundaries, and a Windows path offers it
+            // exactly one -- its single space -- which still left a 204pt
+            // second line and a card 390.9pt wide in a 298pt pane. A path has
+            // no word boundaries worth honouring, and breaking it at the
+            // character is what makes the column's width the card's width.
+            let mut job = egui::text::LayoutJob::simple(
+                value.to_string(),
+                egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
+                theme::INK,
+                wrap_width,
+            );
+            job.wrap.break_anywhere = true;
+            // **Laid here and handed over as a `Galley`.** Given a
+            // `LayoutJob`, `Label` re-lays it and overwrites `wrap.max_width`
+            // with its own -- `f32::INFINITY` in a horizontal layout, whose
+            // wrap mode is `Extend`. So the job's width was ignored and the
+            // path drew its full 285pt anyway. A `Galley` is already laid;
+            // `Label` paints it as it is.
+            let galley = ui.painter().layout_job(job);
+            ui.label(galley);
+        },
+        |_ui| {},
+        DetailAction::CopyValue(value.to_string()),
+        None,
+        row_offers_copy(value),
+        action,
+    );
+}
+
+/// How wide the MATCHED APP card really is **on screen**: from its own left
+/// edge to the right edge of whatever is being clipped to.
+///
+/// **Not `ui.available_width()`, and the difference is the whole of this
+/// defect.** The pane's body is a `ScrollArea`, and a `ScrollArea` grows its
+/// content `Ui` to fit the widest thing drawn in it -- so one unwrapped
+/// Windows path in the `Program file` row laid the card out 467.8pt wide
+/// inside a 298pt pane, and every later question asked of `available_width`
+/// got 467.8 back and concluded there was room to spare. The clip rect is the
+/// viewport. Nothing drawn inside the card can widen it, so it is the one
+/// honest answer to "how much of this can the user see, and reach".
+fn app_card_content_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.max_rect().left()).max(0.0)
+}
+
+/// The width a card row's VALUE column really gets: [`app_card_content_width`]
+/// less the card's own padding, the fixed [`ROW_LABEL_WIDTH`] label column and
+/// the gap after it.
+///
+/// One expression, because [`app_card_footer`] asks the same question about
+/// the same column when it decides whether its controls fit beside the notes,
+/// and a footer measuring a different column than the rows above it is how
+/// the two would drift apart again.
+fn app_card_value_width(ui: &egui::Ui) -> f32 {
+    (app_card_content_width(ui) - f32::from(CARD_PAD_X) * 2.0 - ROW_LABEL_WIDTH - ROW_GAP).max(0.0)
+}
+
 /// The card's footer: the notes on the left where a value goes, Remove in the
 /// control group where every other row's control goes. An empty label keeps it
 /// on the same two columns as the rows above it.
@@ -2919,6 +3089,27 @@ fn app_match_card(
 /// Shared by the bound card and by [`app_notice_with_remove`], so an
 /// unreadable field's Remove is the same control in the same place -- not a
 /// second button that happens to say the same word.
+///
+/// **It stacks when those two columns will not hold it, and that is not a
+/// nicety.** Every other row on this pane has a short value and one small
+/// control; this one carries a paragraph and up to two buttons, and the label
+/// column is a fixed [`ROW_LABEL_WIDTH`] whatever the pane's width is. At the
+/// app's minimum window size the detail pane is 298pt, which left the value
+/// and the controls about 70pt between them: `Open Ledgerline.exe` was drawn
+/// starting at x = 283.7 on a pane 298 wide -- 14 of its 110pt on screen --
+/// and `Remove` was not painted at all, egui having culled it past the clip
+/// rect. Remove is the ONLY way to undo an app binding from this pane, and
+/// this pane refuses horizontal scrolling on purpose, so neither control
+/// could be reached by any sequence of clicks until the window was about
+/// 1200pt wide.
+///
+/// **Stacked rather than elided or abbreviated.** The labels are the only
+/// thing that says *which* app would be started and *which* binding removed;
+/// `Open Le\u{2026}` answers neither. Room was what was missing, so room is
+/// what the second line supplies.
+///
+/// Pinned by `the_matched_app_card_is_reachable_on_the_shortest_window`,
+/// whose `assert_visible` measures both axes and the glyphs really laid.
 fn app_card_footer(
     ui: &mut egui::Ui,
     notes: &[&str],
@@ -2928,21 +3119,38 @@ fn app_card_footer(
     choices: &[OpenChoice],
     action: &mut DetailAction,
 ) {
+    // The same column the rows above wrap into -- a note left to
+    // `available_width` runs off the card exactly as the `Program file` path
+    // did (`Show the overlay when this app is focused.` reached x = 394.3 on
+    // a 298pt pane).
+    let notes_width = app_card_value_width(ui);
+    let draw_notes = |ui: &mut egui::Ui| {
+        ui.vertical(|ui| {
+            ui.set_max_width(notes_width);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            for note in notes {
+                ui.label(
+                    RichText::new(*note)
+                        .size(ROW_HINT_SIZE)
+                        .color(theme::TEXT_GHOST),
+                );
+            }
+        });
+    };
+    // What is left of the row for the controls once the card's own padding
+    // and the fixed label column are taken out -- 162pt, which at the app's
+    // minimum window size is most of the pane. Through `app_card_value_width`
+    // and NOT `ui.available_width()`: see `app_card_content_width` for why
+    // the latter answers with a width this card grew for itself.
+    let room = app_card_value_width(ui);
+    if room < app_footer_controls_width(ui, choices) {
+        app_card_footer_stacked(ui, notes, draw_notes, choices, action);
+        return;
+    }
     row(
         ui,
         "",
-        |ui| {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                for note in notes {
-                    ui.label(
-                        RichText::new(*note)
-                            .size(ROW_HINT_SIZE)
-                            .color(theme::TEXT_GHOST),
-                    );
-                }
-            });
-        },
+        draw_notes,
         |ui| {
             // **One click, no arming.** `confirm_click`'s two-click gate is
             // reserved for the item Delete, which trashes the whole item;
@@ -2955,56 +3163,104 @@ fn app_card_footer(
             //
             // Hand-editing `process` and `path` is deliberately NOT offered
             // here -- see the module's own note on the card.
-            if theme::row_button(ui, "Remove")
-                .on_hover_text("Stop autofilling this item into that app")
-                .clicked()
-            {
-                *action = DetailAction::RemoveAppMatch;
-            }
+            app_card_remove_control(ui, action);
             // **After Remove, so it reads BEFORE it.** This control group is
             // laid out right-to-left (see `row_body`), and Open is the
             // ordinary action while Remove is the destructive one.
-            //
-            // Three shapes, and `choices.len()` is the whole decision -- see
-            // [`app_open_choices`], which owns it.
-            match choices {
-                // Nothing this pane may start. The reason is a sentence in
-                // the notes beside it, never a disabled button: a greyed
-                // control says "not now", and every one of these cases is
-                // "not until you change something".
-                [] => {}
-                // One thing to do, so no menu to open first. The button says
-                // which thing, because "Open" alone beside a Program file row
-                // and a website is a question.
-                [only] => {
-                    if theme::row_button(ui, &open_choice_label(only))
-                        .on_hover_text(open_choice_hover(only))
-                        .clicked()
-                    {
-                        *action = open_choice_action(only);
-                    }
-                }
-                // Both. The user's own words: "show dropdown exe or web if
-                // both present".
-                many => {
-                    let open = theme::row_button(ui, OPEN_MENU_LABEL)
-                        .on_hover_text(OPEN_MENU_HOVER);
-                    egui::Popup::menu(&open).show(|ui| {
-                        for choice in many {
-                            if ui
-                                .button(open_choice_label(choice))
-                                .on_hover_text(open_choice_hover(choice))
-                                .clicked()
-                            {
-                                *action = open_choice_action(choice);
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-            }
+            app_card_open_control(ui, choices, action);
         },
     );
+}
+
+/// [`app_card_footer`] on a pane too narrow to hold the controls beside the
+/// notes: the notes take the row's whole content width, and the controls get
+/// a line of their own beneath them.
+///
+/// The controls line starts at the card's own [`CARD_PAD_X`] -- the left edge
+/// every label above it sits on -- and reads Open, then Remove, which is what
+/// the wide layout's right-to-left group paints. Added in the opposite source
+/// order there for that reason; here the layout is left-to-right, so they are
+/// added in the order they are read. Two layouts, one control set.
+///
+/// `horizontal_wrapped` rather than a plain `horizontal`, so a longer program
+/// name or a future third control takes a second line instead of the fate
+/// this whole function exists to undo.
+fn app_card_footer_stacked(
+    ui: &mut egui::Ui,
+    notes: &[&str],
+    draw_notes: impl FnOnce(&mut egui::Ui),
+    choices: &[OpenChoice],
+    action: &mut DetailAction,
+) {
+    // Only when there is something to say: an empty notes row would be a
+    // band of padding above the controls.
+    if !notes.is_empty() {
+        row(ui, "", draw_notes, |_ui| {});
+    }
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                app_card_open_control(ui, choices, action);
+                app_card_remove_control(ui, action);
+            });
+        });
+}
+
+/// The card's one destructive control, in one place because two layouts draw
+/// it -- see [`app_card_footer_stacked`].
+fn app_card_remove_control(ui: &mut egui::Ui, action: &mut DetailAction) {
+    if theme::row_button(ui, APP_REMOVE_LABEL)
+        .on_hover_text("Stop autofilling this item into that app")
+        .clicked()
+    {
+        *action = DetailAction::RemoveAppMatch;
+    }
+}
+
+/// The Open half of the footer's controls, in one place for the same reason
+/// [`app_card_remove_control`] is.
+///
+/// Three shapes, and `choices.len()` is the whole decision -- see
+/// [`app_open_choices`], which owns it.
+fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut DetailAction) {
+    match choices {
+        // Nothing this pane may start. The reason is a sentence in the notes
+        // beside it, never a disabled button: a greyed control says "not
+        // now", and every one of these cases is "not until you change
+        // something".
+        [] => {}
+        // One thing to do, so no menu to open first. The button says which
+        // thing, because "Open" alone beside a Program file row and a website
+        // is a question.
+        [only] => {
+            if theme::row_button(ui, &open_choice_label(only))
+                .on_hover_text(open_choice_hover(only))
+                .clicked()
+            {
+                *action = open_choice_action(only);
+            }
+        }
+        // Both. The user's own words: "show dropdown exe or web if both
+        // present".
+        many => {
+            let open = theme::row_button(ui, OPEN_MENU_LABEL).on_hover_text(OPEN_MENU_HOVER);
+            egui::Popup::menu(&open).show(|ui| {
+                for choice in many {
+                    if ui
+                        .button(open_choice_label(choice))
+                        .on_hover_text(open_choice_hover(choice))
+                        .clicked()
+                    {
+                        *action = open_choice_action(choice);
+                        ui.close();
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// A card body that is one sentence and a Remove: the shape an unreadable
@@ -5956,6 +6212,82 @@ mod tests {
         assert!(any_live, "no shape in the matrix was live");
     }
 
+    /// **The frame that said both things at once.** The reviewer's exhibit
+    /// was one frame painting "...ignoring this match, so it never fires..."
+    /// and a live blue "Fill in app" above it. Asserted on the PANE, not on
+    /// the predicate: a gate correct in `item_offers_fill` and never reached
+    /// by the header is this repository's signature defect.
+    #[test]
+    fn a_dead_binding_is_not_offered_a_fill_in_the_frame_that_says_it_never_fires() {
+        let dead = bound_to(&a_login(), &a_dead_host_match());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&dead, &TotpState::NoSecret);
+
+        // The premise, read off the same frame: the card really is saying the
+        // binding is ignored. Without it this test would pass on a pane that
+        // drew no card at all.
+        assert!(
+            frame.strings().iter().any(|t| t.contains("ignoring this match")),
+            "the card is not calling this binding dead, so there is nothing to contradict: \
+             {:?}",
+            frame.strings()
+        );
+        assert!(
+            !frame.painted(FILL_LABEL),
+            "the pane offers {FILL_LABEL:?} on a binding it has just said never fires: {:?}",
+            frame.strings()
+        );
+
+        // **The positive control, and it is the whole test.** The same kind,
+        // the same pane, differing only in the binding -- so a header that
+        // had simply stopped drawing Fill altogether could not pass.
+        let mut pane = Pane::new();
+        let live = pane.idle(&bound_to(&a_login(), &a_desktop_match()), &TotpState::NoSecret);
+        assert!(
+            live.painted(FILL_LABEL),
+            "a login bound to a LIVE match lost its Fill button: {:?}",
+            live.strings()
+        );
+        let mut pane = Pane::new();
+        let unbound = pane.idle(&a_login(), &TotpState::NoSecret);
+        assert!(
+            unbound.painted(FILL_LABEL),
+            "an unbound login lost its Fill button: {:?}",
+            unbound.strings()
+        );
+    }
+
+    /// The predicate behind the frame above, over every kind and both
+    /// bindings, so the pair the header and `fill_hotkey_applies` share is
+    /// pinned in one place.
+    #[test]
+    fn only_a_fillable_kind_with_a_binding_that_can_fire_offers_a_fill() {
+        for kind in EVERY_KIND {
+            let bare = an_item(item_type_for(kind));
+            assert_eq!(
+                item_offers_fill(&bare, kind),
+                kind_offers_fill(kind),
+                "{kind:?}: an item bound to nothing should follow the kind alone"
+            );
+            let dead = bound_to(&bare, &a_dead_host_match());
+            assert!(
+                !item_offers_fill(&dead, kind),
+                "{kind:?}: a dead binding is still offered a fill"
+            );
+            let live = bound_to(&bare, &a_desktop_match());
+            assert_eq!(
+                item_offers_fill(&live, kind),
+                kind_offers_fill(kind),
+                "{kind:?}: a LIVE binding changed the answer, which is the control"
+            );
+        }
+        // The control on `item_binding_is_dead` itself: it is the binding
+        // that decides, and the three inputs really do differ.
+        assert!(item_binding_is_dead(&bound_to(&a_login(), &a_dead_host_match())));
+        assert!(!item_binding_is_dead(&bound_to(&a_login(), &a_desktop_match())));
+        assert!(!item_binding_is_dead(&a_login()));
+    }
+
     /// The card's words for a dead binding: it must say it is ignored, and it
     /// must NOT keep making the promise the trigger caption makes.
     #[test]
@@ -6110,35 +6442,81 @@ mod tests {
     /// from this pane by a sequence of clicks.
     #[test]
     fn a_corrupted_app_match_field_says_what_is_wrong_and_can_be_removed_from_this_pane() {
+        // **Both kinds, and the second one is the point.** Every pane-level
+        // case here used to be built on a Login, which `kind_offers_fill`
+        // makes the card visible for whatever its first argument says -- so
+        // substituting `app_card_visible(app_match.is_some(), kind)` for
+        // `app_card_visible(app_field_present, kind)` passed the whole suite
+        // and restored the reported bug verbatim: a SECURE NOTE whose
+        // app-match field was corrupted elsewhere got no card, and the field
+        // could not be cleared from this pane by any sequence of clicks. The
+        // non-fillable kind was asserted only as a bare unit call, which that
+        // substitution leaves untouched.
+        let subjects = [
+            ("a login", a_login()),
+            ("a secure note", an_item(item_type_for(ItemKind::SecureNote))),
+        ];
+        for (which, subject) in &subjects {
+            // The premise: the two fixtures really are different kinds, and
+            // the second really is one the pane offers no fill for.
+            if *which == "a secure note" {
+                assert_eq!(ItemKind::of(subject), ItemKind::SecureNote);
+                assert!(!kind_offers_fill(ItemKind::of(subject)));
+            }
         for value in ["{not json", r#"{"process":"a.exe","trigger":"telepathy"}"#] {
-            let item = carrying_raw_app_match_field(&a_login(), value);
+            let item = carrying_raw_app_match_field(subject, value);
             let mut pane = Pane::new();
             let frame = pane.idle(&item, &TotpState::NoSecret);
 
-            assert!(frame.painted("MATCHED APP"), "{:?}", frame.strings());
+            assert!(
+                frame.painted("MATCHED APP"),
+                "{which} with a corrupt field gets no card at all: {:?}",
+                frame.strings()
+            );
             assert!(
                 frame.strings().iter().any(|t| t.contains("cannot be read")),
-                "the pane does not say the field is unreadable for {value:?}: {:?}",
+                "the pane does not say the field is unreadable for {which} / {value:?}: {:?}",
                 frame.strings()
             );
             assert!(
                 !frame.strings().iter().any(|t| t.contains("No app is matched")),
-                "the pane still claims nothing is bound for {value:?}: {:?}",
+                "the pane still claims nothing is bound for {which} / {value:?}: {:?}",
                 frame.strings()
             );
+            // **Clickable, not merely painted.** `rect_of` panics if it was
+            // never drawn, and the click is aimed at the rect it really
+            // occupies -- so a Remove pushed off the pane, or drawn under
+            // something else, fails here rather than passing on its
+            // existence.
             let remove = frame.rect_of("Remove");
             let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
             assert_eq!(
                 clicked.action,
                 DetailAction::RemoveAppMatch,
-                "Remove on an unreadable field reported {:?}",
+                "Remove on an unreadable field on {which} reported {:?}",
                 clicked.action
             );
+        }
         }
 
         // The control: an item with NO field paints the empty notice and
         // offers no Remove, so the assertions above are about the corrupted
         // field and not about a card that now always says both.
+        //
+        // And its own control, on the kind that the substitution above turned
+        // invisible: a secure note with no field gets no card at all, so the
+        // secure-note half of the loop cannot be passing on a card that is
+        // simply always there.
+        let mut pane = Pane::new();
+        let bare_note = pane.idle(
+            &an_item(item_type_for(ItemKind::SecureNote)),
+            &TotpState::NoSecret,
+        );
+        assert!(
+            !bare_note.painted("MATCHED APP"),
+            "a secure note bound to nothing draws an app card: {:?}",
+            bare_note.strings()
+        );
         let mut pane = Pane::new();
         let bare = pane.idle(&a_login(), &TotpState::NoSecret);
         assert!(
@@ -10294,6 +10672,27 @@ mod read_pane_scroll_tests {
         )
     }
 
+
+    /// `source` is painted, wholly inside `pane` **on both axes**, and the
+    /// glyphs really laid for it are the whole of `source`.
+    ///
+    /// **Both axes, and the vertical-only version this replaces is why.**
+    /// That version passed while, on the same pane at 298pt,
+    /// `Open Ledgerline.exe` was drawn at x = 283.7..393.9 -- 14 of its 110pt
+    /// on a pane whose right edge is 298 -- and `Remove`, the only way to
+    /// undo an app binding from this pane, was culled and never painted at
+    /// all. Horizontal scrolling is refused here on purpose, so an x outside
+    /// the pane is exactly as unreachable as a y outside it. The sibling
+    /// `detail_edit.rs` suite has asserted `contains_rect` on both axes all
+    /// along; this is the same assertion, spelled out so the message can name
+    /// which axis failed.
+    ///
+    /// **And the glyphs must be the whole label, not merely non-empty.**
+    /// `rect_of` reads the galley's box, which a run elided to nothing still
+    /// has; `glyphs != "\u{2026}"` was the previous guard and it does not
+    /// catch `"Open Le\u{2026}"`, which is a control fitted into the pane by
+    /// destroying the only thing that says which app it would open. Comparing
+    /// against `source` catches every elision, including that one.
     fn assert_visible(shot: &Shot, source: &str, pane: egui::Rect) {
         let rect = shot.rect_of(source).unwrap_or_else(|| {
             panic!(
@@ -10302,33 +10701,86 @@ mod read_pane_scroll_tests {
                 shot.sources()
             )
         });
-        // **Vertically** inside the pane, which is what this fix is about
-        // and the only axis it touches.
-        //
-        // Not `contains_rect`: at 298pt the app card's `Program file` row
-        // lays a full Windows path out unwrapped, which widens the card past
-        // the pane and carries the Open button in the same row out with it.
-        // That is a HORIZONTAL defect, it is nothing to do with scrolling,
-        // and it is neither caused nor cured here --
-        // `the_bar_does_not_move_the_cards` pins that by measuring the same
-        // x on a pane that does not scroll at all. Asserting the whole rect
-        // here would tie this test to that separate bug and hide the one it
-        // is for.
         assert!(
-            rect.top() >= pane.top() && rect.bottom() <= pane.bottom(),
-            "{source:?} is painted at y = {}..{} on a pane {}pt tall -- it cannot be \
-             scrolled to",
+            pane.contains_rect(rect),
+            "{source:?} is painted at x = {}..{}, y = {}..{} on a {}x{}pt pane -- it is off \
+             the {} edge and this pane does not scroll horizontally",
+            rect.left(),
+            rect.right(),
             rect.top(),
             rect.bottom(),
-            pane.height()
+            pane.width(),
+            pane.height(),
+            if rect.left() < pane.left() || rect.right() > pane.right() {
+                "right or left"
+            } else {
+                "top or bottom"
+            }
         );
-        // `rect_of` reads the galley's box; the GLYPHS say whether anything
-        // was really drawn in it. A run elided to nothing has a rect too.
         let glyphs = shot.glyphs_of(source).unwrap_or_default();
-        assert!(
-            !glyphs.trim().is_empty() && glyphs != "\u{2026}",
-            "{source:?} occupies {rect:?} but rendered {glyphs:?} -- nothing readable is there"
+        assert_eq!(
+            glyphs, source,
+            "{source:?} occupies {rect:?} but rendered {glyphs:?} -- it was elided, so the \
+             control is on the pane and its label is not"
         );
+    }
+
+    /// **The controls on the assertion itself.** Every test in this module
+    /// leans on `assert_visible`, so a weakening of it -- back to one axis,
+    /// or back to "the glyphs are not empty" -- would quietly re-green the
+    /// very defects it exists to catch. These two feed it hand-built `Shot`s
+    /// that no layout produced and demand that it refuses them.
+    ///
+    /// `catch_unwind` because the failure IS the assertion: a helper that
+    /// accepted these would be caught by nothing else.
+    #[test]
+    fn assert_visible_refuses_a_control_that_is_off_the_right_edge() {
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(NARROW, SHORT));
+        // Vertically perfect, horizontally the exact geometry the reviewer
+        // measured: 14 of 110pt on screen.
+        let mut shot = Shot::default();
+        shot.runs.push((
+            "Open Ledgerline.exe".to_string(),
+            "Open Ledgerline.exe".to_string(),
+            egui::Rect::from_min_max(egui::pos2(283.7, 484.5), egui::pos2(393.9, 497.5)),
+        ));
+        assert!(
+            std::panic::catch_unwind(|| assert_visible(&shot, "Open Ledgerline.exe", pane))
+                .is_err(),
+            "assert_visible accepted a control 95.9pt past the right edge of the pane"
+        );
+
+        // The control on the control: move the same run inside the pane and
+        // it is accepted, so the panic above is about the x and not about the
+        // hand-built `Shot`.
+        let mut inside = Shot::default();
+        inside.runs.push((
+            "Open Ledgerline.exe".to_string(),
+            "Open Ledgerline.exe".to_string(),
+            egui::Rect::from_min_max(egui::pos2(51.0, 484.5), egui::pos2(161.2, 497.5)),
+        ));
+        assert_visible(&inside, "Open Ledgerline.exe", pane);
+    }
+
+    #[test]
+    fn assert_visible_refuses_a_label_that_was_elided_to_fit() {
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(NARROW, SHORT));
+        // Every one of these is inside the pane and none is empty, so the
+        // previous guard -- non-empty and not exactly "..." -- passed all
+        // three.
+        for elided in ["Open Le\u{2026}", "O\u{2026}", "\u{2026}"] {
+            let mut shot = Shot::default();
+            shot.runs.push((
+                "Open Ledgerline.exe".to_string(),
+                elided.to_string(),
+                egui::Rect::from_min_max(egui::pos2(51.0, 484.5), egui::pos2(101.0, 497.5)),
+            ));
+            assert!(
+                std::panic::catch_unwind(|| assert_visible(&shot, "Open Ledgerline.exe", pane))
+                    .is_err(),
+                "assert_visible accepted {elided:?} as a rendering of \"Open Ledgerline.exe\""
+            );
+        }
     }
 
     /// **The bug, and the fix, as one test.** Before scrolling the app card
@@ -10365,8 +10817,27 @@ mod read_pane_scroll_tests {
             // ... and the control commit `a33b75e` added, which was the
             // single least reachable thing on the pane.
             "Open Ledgerline.exe",
+            // **The only way to undo an app binding from this pane**, and the
+            // one this list did not name: it was not painted at all below
+            // about 600pt of pane, and the vertical-only `assert_visible`
+            // could not have said so if it had been named.
+            "Remove",
+            // Every trigger pill, for the same reason: the third was drawn
+            // past the pane's right edge.
+            "Auto",
+            "Hotkey",
+            "Prompt",
             "App",
             "Program file",
+            // **The VALUES, not only the labels.** Every label on this card
+            // sits at x = 41 whatever the pane is, so a list of labels alone
+            // is satisfied by a card laid out at any width at all: with the
+            // `Program file` path drawn unwrapped the card measured 467.8pt
+            // inside a 298pt pane and every label above still passed. The
+            // path is the widest thing this pane can be asked to draw, and
+            // it is the one that inflated the card.
+            "Ledgerline.exe",
+            r"C:\Deskwarden Test\Ledgerline\Ledgerline.exe",
         ] {
             assert_visible(&after, source, bounds);
         }

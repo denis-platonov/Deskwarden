@@ -402,10 +402,36 @@ pub fn window_label<'a>(exe_name: &'a str, title: &'a str) -> &'a str {
 /// "Fill in app" (the vault window's detail pane), which has no
 /// window-watch context of its own and needs to resolve a target hwnd from
 /// just an item's `deskwarden:app-match` process name.
+///
+/// **A host process resolves to nothing, and that refusal is here rather than
+/// at either caller.** `window_list` gives an unattributable Microsoft Store
+/// frame the name of its host (`ApplicationFrameHost.exe`, see
+/// `Attribution::UnresolvedHost`), and that one name is worn by the frame of
+/// *every* Store app that happens to be open. So an exe-name compare against
+/// it does not resolve "the app this item is bound to" -- it resolves
+/// whichever Store app is first in the enumeration, and the caller then types
+/// the user's credentials into it. There is no honest caller for that answer:
+/// the name identifies no application, which is the same reason
+/// `MatchEngine::rebuild` keeps such a match out of `by_process` and the
+/// detail pane's `app_match_is_dead` calls the binding dead.
+///
+/// The presentation layer already said so (the card prints
+/// `APP_MATCH_DEAD_NOTICE` and drops its trigger pills) and `app_launch_plan`
+/// already refuses to start one. This is the same predicate asked at the
+/// point that *acts*, so no future caller can reach a host frame by not
+/// knowing to ask -- which is exactly how the fill path got there.
+///
+/// Nothing real is lost. A Store app the picker could attribute is listed
+/// under its OWN exe name (`Attribution::Attributed`), so a match the picker
+/// saved for it still resolves here; only the shape the picker refuses to
+/// save, and that `MatchEngine` refuses to arm, is refused.
 pub fn find_window_for_process<'a>(
     windows: &'a [crate::window_list::WindowInfo],
     process: &str,
 ) -> Option<&'a crate::window_list::WindowInfo> {
+    if crate::window_watch::is_host_process(process) {
+        return None;
+    }
     windows.iter().find(|w| w.exe_name.eq_ignore_ascii_case(process))
 }
 
@@ -525,6 +551,75 @@ mod tests {
         let found = find_window_for_process(&windows, "epicgameslauncher.exe").unwrap();
         assert_eq!(found.hwnd, 1);
         assert!(find_window_for_process(&windows, "steam.exe").is_none());
+    }
+
+    /// **The credential the pane said it would not type.** `window_list`
+    /// gives an unattributable Microsoft Store frame the name of its host, so
+    /// that one name is worn by the frame of every Store app that happens to
+    /// be open. An exe-name compare against it therefore resolves whichever
+    /// Store app is first in the enumeration -- and "Fill in app" then typed
+    /// the user's user name and password into it, in the very frame in which
+    /// the MATCHED APP card was saying Deskwarden ignores that binding.
+    ///
+    /// Asked HERE and not at either caller: this is the function that turns a
+    /// process name into an hwnd, and a check that lived at the callers is
+    /// what the defect was -- `app_match_is_dead` existed, was correct and
+    /// was consulted only where it rendered text.
+    #[test]
+    fn a_host_process_resolves_to_no_window_however_many_store_frames_are_open() {
+        let windows = vec![
+            crate::window_list::WindowInfo {
+                hwnd: 7,
+                pid: 12472,
+                exe_path: r"C:\Windows\System32\ApplicationFrameHost.exe".into(),
+                exe_name: HOST.into(),
+                title: "Some Other Store App".into(),
+                hosted: false,
+            },
+            crate::window_list::WindowInfo {
+                hwnd: 8,
+                pid: 12472,
+                exe_path: r"C:\Windows\System32\ApplicationFrameHost.exe".into(),
+                exe_name: HOST.into(),
+                title: "Speedtest".into(),
+                hosted: false,
+            },
+        ];
+        // The premise: a plain name lookup really would find one of these, so
+        // the refusal below is doing the work and not a lookup that misses.
+        assert!(
+            windows
+                .iter()
+                .any(|w| w.exe_name.eq_ignore_ascii_case(HOST)),
+            "the fixture has no host frame in it, so nothing here is being refused"
+        );
+        assert!(
+            find_window_for_process(&windows, HOST).is_none(),
+            "a dead binding resolved a window -- whichever Store app happened to be listed \
+             first -- and the fill would have gone into it"
+        );
+        // Case-insensitively, the same way the match itself is compared.
+        assert!(find_window_for_process(&windows, "applicationframehost.exe").is_none());
+    }
+
+    /// The control on the test above: a Store app the picker COULD attribute
+    /// is listed under its own executable name, and a match saved for it
+    /// still resolves. The refusal is about the host's name, not about Store
+    /// apps.
+    #[test]
+    fn an_attributed_store_app_still_resolves_under_its_own_name() {
+        let windows = vec![crate::window_list::WindowInfo {
+            hwnd: 9,
+            pid: 3300,
+            exe_path: r"C:\Program Files\WindowsApps\Ledgerline\Ledgerline.exe".into(),
+            exe_name: "Ledgerline.exe".into(),
+            title: "Ledgerline".into(),
+            hosted: true,
+        }];
+        assert_eq!(
+            find_window_for_process(&windows, "Ledgerline.exe").map(|w| w.hwnd),
+            Some(9)
+        );
     }
 
     const HOST: &str = "ApplicationFrameHost.exe";

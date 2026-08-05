@@ -1096,9 +1096,9 @@ pub fn header_primary_button_width(ui: &Ui, label: &str, shortcut: Option<&str>)
 /// unlike the 600 it sets explicitly on the header pair.
 pub fn row_button(ui: &mut Ui, label: &str) -> Response {
     ui.scope(|ui| {
-        ui.spacing_mut().button_padding = Vec2::new(10.0, 4.0);
+        ui.spacing_mut().button_padding = ROW_BUTTON_PADDING;
         ui.add(
-            egui::Button::new(RichText::new(label).size(12.0).color(INK))
+            egui::Button::new(RichText::new(label).size(ROW_BUTTON_TEXT_SIZE).color(INK))
                 .fill(CARD)
                 .stroke(Stroke::new(1.0, BORDER_STRONG))
                 .corner_radius(CornerRadius::same(7))
@@ -1106,6 +1106,29 @@ pub fn row_button(ui: &mut Ui, label: &str) -> Response {
         )
     })
     .inner
+}
+
+/// [`row_button`]'s own `padding: 0 10px` and `font-size: 12px`, named rather
+/// than written twice, so [`row_button_width`] measures the button that will
+/// really be drawn instead of a second copy of its numbers.
+const ROW_BUTTON_PADDING: Vec2 = Vec2::new(10.0, 4.0);
+const ROW_BUTTON_TEXT_SIZE: f32 = 12.0;
+
+/// How wide [`row_button`] will be for `label`, without drawing it.
+///
+/// For a caller that has to choose a LAYOUT before it draws -- the detail
+/// pane's MATCHED APP footer, which puts its controls beside the notes when
+/// they fit on that line and on a line of their own when they do not. Laying
+/// the same galley the button will lay is the whole point: a caller that
+/// estimated would reserve room the button then overflows, which is the drift
+/// `header_primary_button_width` exists to prevent in the header strip.
+pub fn row_button_width(ui: &Ui, label: &str) -> f32 {
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::new(ROW_BUTTON_TEXT_SIZE, FontFamily::Proportional),
+        INK,
+    );
+    galley.size().x + ROW_BUTTON_PADDING.x * 2.0
 }
 
 /// A URL drawn as the link it is: the value text itself in [`BLUE`], with the

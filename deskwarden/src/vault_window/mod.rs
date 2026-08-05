@@ -3000,34 +3000,96 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 /// (nothing matched yet, matched but not running) are only ever reported in
 /// the log, and a second copy of that reporting is a second place for it to
 /// go quietly missing.
+/// Why "Fill in app" did nothing, when it did nothing.
+///
+/// Three refusals rather than two, because the third used to be reported as
+/// the second: a dead binding fell through to "isn't currently open", which
+/// is false and reads as "try again once it is running" about a binding that
+/// will never fire however many apps are running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FillRefusal {
+    /// The item carries no readable `deskwarden:app-match` field.
+    NotBound,
+    /// It carries one that [`detail::app_match_is_dead`] calls dead -- see
+    /// [`fill_target`].
+    BindingIsDead,
+    /// A live binding whose app is not among the open windows.
+    NotOpen,
+}
+
+/// Which open window "Fill in app" should fill `item` into, or why none.
+///
+/// **The whole decision, as a pure function over a window list.**
+/// [`fill_item_into_app`] is untestable -- it enumerates the real desktop and
+/// drives a real injector -- and a decision that only exists inside it is a
+/// decision nothing can pin. That is not a hypothetical here: the check that
+/// a dead binding must not be filled through existed, was correct, was
+/// covered, and was consulted at exactly two sites that render TEXT.
+///
+/// **`find_window_for_process` is still the gate that protects the
+/// credential**, and it refuses a host process itself; this function cannot
+/// be routed around either, because it is the only place `fill_item_into_app`
+/// gets an hwnd from. The dead arm is here so the refusal has a NAME to
+/// report, and so `a_dead_binding_resolves_no_window_to_fill` can assert it
+/// without a desktop.
+fn fill_target<'a>(
+    item: &VaultItem,
+    windows: &'a [crate::window_list::WindowInfo],
+) -> Result<&'a crate::window_list::WindowInfo, FillRefusal> {
+    if detail::item_binding_is_dead(item) {
+        return Err(FillRefusal::BindingIsDead);
+    }
+    let app_match =
+        crate::vault_bridge::extract_app_match(item).ok_or(FillRefusal::NotBound)?;
+    crate::app::find_window_for_process(windows, &app_match.process)
+        .ok_or(FillRefusal::NotOpen)
+}
+
+/// What the log says about each refusal, off the item it is about.
+///
+/// Separate from [`fill_target`] so the decision can be asserted without the
+/// wording and the wording without the decision -- and in one place, because
+/// both of `fill_item_into_app`'s callers reach it and a second copy is a
+/// second place for a sentence to go quietly missing.
+fn fill_refusal_note(item: &VaultItem, why: FillRefusal) -> String {
+    let name = &item.name;
+    match why {
+        FillRefusal::NotBound => {
+            format!("\"Fill in app\" for {name}: no app is matched to this item yet")
+        }
+        FillRefusal::BindingIsDead => format!(
+            "\"Fill in app\" for {name}: the app match on this item names the process that \
+             owns the window for every Microsoft Store app, and recorded no window title to \
+             tell those apps apart, so Deskwarden ignores it -- there is no one app to fill. \
+             Use \u{201c}Add app\u{2026}\u{201d} in the tray menu to pick the app again, or \
+             Remove on the item's MATCHED APP card to clear it"
+        ),
+        FillRefusal::NotOpen => {
+            let process = crate::vault_bridge::extract_app_match(item)
+                .map(|m| m.process)
+                .unwrap_or_default();
+            format!("\"Fill in app\" for {name}: {process} isn't currently open")
+        }
+    }
+}
+
 fn fill_item_into_app<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
     item: &VaultItem,
     cache: &VaultCache,
     injector: &Injector<A, B>,
     fill_stats: &FillStats,
 ) {
-    match crate::vault_bridge::extract_app_match(item) {
-        Some(app_match) => {
-            let windows = crate::window_list::list_windows(std::process::id());
-            match crate::app::find_window_for_process(&windows, &app_match.process) {
-                // fill_from_vault does its own credential lookup (from the
-                // cache, not `bw serve` -- see its doc comment) and the fill
-                // in one call -- nothing else here needs to touch `injector`
-                // directly.
-                Some(target) => {
-                    crate::app::fill_from_vault(cache, injector, fill_stats, &item.id, target.hwnd)
-                }
-                None => log::info!(
-                    "\"Fill in app\" for {}: {} isn't currently open",
-                    item.name,
-                    app_match.process
-                ),
-            }
+    // Enumerated once, whatever the outcome: `fill_target` owns the decision
+    // and this function owns the two effects it can have.
+    let windows = crate::window_list::list_windows(std::process::id());
+    match fill_target(item, &windows) {
+        // fill_from_vault does its own credential lookup (from the cache, not
+        // `bw serve` -- see its doc comment) and the fill in one call --
+        // nothing else here needs to touch `injector` directly.
+        Ok(target) => {
+            crate::app::fill_from_vault(cache, injector, fill_stats, &item.id, target.hwnd)
         }
-        None => log::info!(
-            "\"Fill in app\" for {}: no app is matched to this item yet",
-            item.name
-        ),
+        Err(why) => log::info!("{}", fill_refusal_note(item, why)),
     }
 }
 
@@ -3902,7 +3964,7 @@ fn draw_read_arm(
     // on the item's kind by the same predicate the button is; see
     // `fill_hotkey_applies`.
     if fill_hotkey_applies(
-        crate::vault_bridge::ItemKind::of(item),
+        item,
         ui.ctx()
             .input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)),
     ) {
@@ -3914,7 +3976,7 @@ fn draw_read_arm(
 /// Whether Ctrl+Shift+F should fill the currently selected item.
 ///
 /// Gated on exactly the predicate the "Fill in app" button is
-/// (`detail::kind_offers_fill`), not on a second copy of the rule: the
+/// (`detail::item_offers_fill`), not on a second copy of the rule: the
 /// shortcut is that button's keyboard equivalent, so hiding the button for a
 /// card while leaving the shortcut live would keep the very door open that
 /// hiding it was meant to close -- two empty strings typed into whatever
@@ -3925,8 +3987,13 @@ fn draw_read_arm(
 /// a block inside `run`'s closure, so `draw_read_arm_tests` can prove the
 /// wiring as well as the rule -- reverting the call site to a bare
 /// `ui.ctx().input(..)` check used to leave every test here green.
-fn fill_hotkey_applies(kind: crate::vault_bridge::ItemKind, pressed: bool) -> bool {
-    pressed && detail::kind_offers_fill(kind)
+/// Takes the ITEM, not just its kind, because the button's predicate does:
+/// `detail::item_offers_fill` is the kind AND the item's binding not being
+/// dead, and a chord that stayed on the kind alone would be the door left
+/// open beside a hidden button -- the exact failure this doc's own second
+/// paragraph describes, one field further down.
+fn fill_hotkey_applies(item: &VaultItem, pressed: bool) -> bool {
+    pressed && detail::item_offers_fill(item, crate::vault_bridge::ItemKind::of(item))
 }
 
 /// Whether `run`'s per-frame TOTP block should spawn a new background poll
@@ -10015,9 +10082,197 @@ mod entered_no_code_reported_tests {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod fill_target_tests {
+    //! The whole of "Fill in app"'s decision, over a window list a test
+    //! writes -- no desktop, no process, no injector.
+
+    use super::{fill_refusal_note, fill_target, FillRefusal};
+    use crate::app_match::{AppMatch, TriggerMode};
+    use crate::vault_bridge::VaultItem;
+    use crate::window_list::WindowInfo;
+
+    const HOST: &str = "ApplicationFrameHost.exe";
+
+    fn login(id: &str) -> VaultItem {
+        serde_json::from_str(&format!(
+            r#"{{"id":"{id}","name":"Ledgerline","fields":[],"type":1,               "login":{{"username":"a.novak","password":"hunter2"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn bound(process: &str, hosted: bool, title: &str) -> VaultItem {
+        crate::vault_bridge::with_app_match(
+            &login("id-1"),
+            &AppMatch {
+                process: process.to_string(),
+                title: title.to_string(),
+                hosted,
+                path: String::new(),
+                args: String::new(),
+                trigger: TriggerMode::Auto,
+            },
+        )
+    }
+
+    fn window(hwnd: isize, exe_name: &str, title: &str) -> WindowInfo {
+        WindowInfo {
+            hwnd,
+            pid: 12472,
+            exe_path: format!(r"C:\\Windows\\{exe_name}"),
+            exe_name: exe_name.to_string(),
+            title: title.to_string(),
+            hosted: false,
+        }
+    }
+
+    /// **The reviewer's exhibit, as an assertion.** Two Microsoft Store apps
+    /// are open, so the unattributable host frame is in the window list; the
+    /// item is bound to that host frame. Before the fix `find_window_for_
+    /// process` handed back the FIRST of them and `fill_from_vault` typed the
+    /// user's user name and password into whichever Store app happened to own
+    /// it -- in the same frame in which the MATCHED APP card was saying
+    /// Deskwarden ignores that binding.
+    #[test]
+    fn a_dead_binding_resolves_no_window_to_fill_however_many_store_apps_are_open() {
+        let windows = [
+            window(7, HOST, "Some Other Store App"),
+            window(8, HOST, "Speedtest"),
+        ];
+        let item = bound(HOST, false, "");
+        // The premise: a plain name compare really would have found one.
+        assert!(
+            windows.iter().any(|w| w.exe_name.eq_ignore_ascii_case(HOST)),
+            "the fixture holds no host frame, so nothing here is being refused"
+        );
+        assert_eq!(
+            fill_target(&item, &windows).map(|w| w.hwnd),
+            Err(FillRefusal::BindingIsDead),
+            "the fill resolved a window for a binding the pane says never fires"
+        );
+        // And it is reported as what it is, not as "isn't currently open" --
+        // which would tell the user to launch something that is running.
+        let note = fill_refusal_note(&item, FillRefusal::BindingIsDead);
+        assert!(note.contains("ignores it"), "{note}");
+        assert!(!note.contains("currently open"), "{note}");
+    }
+
+    /// The positive control on the test above: the same two open windows, and
+    /// a binding to a real executable that is among them, still fills.
+    /// Without this a `fill_target` that had simply stopped resolving
+    /// anything would pass.
+    #[test]
+    fn a_live_binding_still_resolves_the_window_it_names() {
+        let windows = [
+            window(7, HOST, "Some Other Store App"),
+            window(11, "Ledgerline.exe", "Ledgerline -- Invoices"),
+        ];
+        assert_eq!(
+            fill_target(&bound("Ledgerline.exe", false, ""), &windows).map(|w| w.hwnd),
+            Ok(11)
+        );
+        // Case-insensitively, the way every exe-name compare in this crate is.
+        assert_eq!(
+            fill_target(&bound("ledgerline.EXE", false, ""), &windows).map(|w| w.hwnd),
+            Ok(11)
+        );
+    }
+
+    /// The other two refusals, so the three are told apart and the messages
+    /// cannot collapse into one.
+    #[test]
+    fn an_unbound_item_and_a_closed_app_are_refused_as_themselves() {
+        let windows = [window(11, "Ledgerline.exe", "Ledgerline")];
+        let unbound = login("id-2");
+        assert_eq!(
+            fill_target(&unbound, &windows).map(|w| w.hwnd),
+            Err(FillRefusal::NotBound)
+        );
+        let elsewhere = bound("Mabl.exe", false, "");
+        assert_eq!(
+            fill_target(&elsewhere, &windows).map(|w| w.hwnd),
+            Err(FillRefusal::NotOpen)
+        );
+
+        let notes = [
+            fill_refusal_note(&unbound, FillRefusal::NotBound),
+            fill_refusal_note(&elsewhere, FillRefusal::NotOpen),
+            fill_refusal_note(&bound(HOST, false, ""), FillRefusal::BindingIsDead),
+        ];
+        for (i, a) in notes.iter().enumerate() {
+            for b in &notes[i + 1..] {
+                assert_ne!(a, b, "two refusals report the same sentence");
+            }
+        }
+        // The closed-app note names the app, which is the whole reason that
+        // arm reads the match again.
+        assert!(notes[1].contains("Mabl.exe"), "{}", notes[1]);
+    }
+
+    /// A hosted match the picker really can save -- an attributed Store app,
+    /// listed under its OWN executable name -- is not dead and still fills.
+    /// The refusal is about the HOST's name, not about Store apps, and a fix
+    /// that had refused every `hosted` match would fail here.
+    #[test]
+    fn an_attributed_store_app_is_not_collateral_damage() {
+        let windows = [window(21, "Ledgerline.exe", "Ledgerline")];
+        let item = bound("Ledgerline.exe", true, "Ledgerline");
+        assert!(
+            !crate::vault_window::detail::item_binding_is_dead(&item),
+            "the premise: a match with a real exe name is not dead"
+        );
+        assert_eq!(fill_target(&item, &windows).map(|w| w.hwnd), Ok(21));
+    }
+}
+
+#[cfg(test)]
 mod fill_hotkey_applies_tests {
     use super::fill_hotkey_applies;
-    use crate::vault_bridge::ItemKind;
+    use crate::app_match::{AppMatch, TriggerMode};
+    use crate::vault_bridge::{ItemKind, VaultItem};
+
+    /// An item of `kind`, carrying no `deskwarden:app-match` field at all.
+    fn item_of_kind(kind: ItemKind) -> VaultItem {
+        let item_type = match kind {
+            ItemKind::Login => 1,
+            ItemKind::SecureNote => 2,
+            ItemKind::Card => 3,
+            ItemKind::Identity => 4,
+            ItemKind::SshKey => 5,
+            ItemKind::Unknown(other) => other,
+        };
+        let item: VaultItem = serde_json::from_str(&format!(
+            r#"{{"id":"id-1","name":"Ledgerline","fields":[],"type":{item_type}}}"#
+        ))
+        .unwrap();
+        // The premise of every case below: the fixture really is the kind it
+        // is named for, so a builder that silently produced a Login for
+        // everything could not make these assertions vacuous.
+        assert_eq!(ItemKind::of(&item), kind, "the fixture is not the kind it claims");
+        item
+    }
+
+    /// A login bound to a match `MatchEngine` can never look up: the host
+    /// process that owns the top-level window for every Microsoft Store app,
+    /// with no title recorded to tell those apps apart.
+    fn login_with_a_dead_binding() -> VaultItem {
+        let item = crate::vault_bridge::with_app_match(
+            &item_of_kind(ItemKind::Login),
+            &AppMatch {
+                process: "ApplicationFrameHost.exe".to_string(),
+                title: String::new(),
+                hosted: false,
+                path: String::new(),
+                args: String::new(),
+                trigger: TriggerMode::Auto,
+            },
+        );
+        assert!(
+            crate::vault_window::detail::item_binding_is_dead(&item),
+            "the premise: this binding really is dead"
+        );
+        item
+    }
 
     /// Ctrl+Shift+F is the keyboard equivalent of the "Fill in app" button,
     /// so it has to be gated by the same predicate. Gating only the button
@@ -10035,17 +10290,35 @@ mod fill_hotkey_applies_tests {
             ItemKind::SshKey,
             ItemKind::Unknown(9),
         ] {
+            let item = item_of_kind(kind);
             assert_eq!(
-                fill_hotkey_applies(kind, true),
-                crate::vault_window::detail::kind_offers_fill(kind),
+                fill_hotkey_applies(&item, true),
+                crate::vault_window::detail::item_offers_fill(&item, kind),
                 "{kind:?}: the hotkey and the button disagree"
             );
         }
     }
 
+    /// **The door beside the hidden button.** The header stops drawing Fill
+    /// for a dead binding; a chord still gated on the KIND alone would reach
+    /// `fill_item_into_app` for the very item the pane just said Deskwarden
+    /// ignores. The pair below is the whole assertion: the same kind, the
+    /// same press, differing only in the binding.
+    #[test]
+    fn the_fill_hotkey_is_refused_on_a_login_whose_binding_is_dead() {
+        assert!(
+            fill_hotkey_applies(&item_of_kind(ItemKind::Login), true),
+            "the control: an unbound login is exactly what the hotkey is for"
+        );
+        assert!(
+            !fill_hotkey_applies(&login_with_a_dead_binding(), true),
+            "Ctrl+Shift+F fired on a binding the pane says never fires"
+        );
+    }
+
     #[test]
     fn an_unpressed_hotkey_fills_nothing_even_on_a_login() {
-        assert!(!fill_hotkey_applies(ItemKind::Login, false));
+        assert!(!fill_hotkey_applies(&item_of_kind(ItemKind::Login), false));
     }
 }
 
