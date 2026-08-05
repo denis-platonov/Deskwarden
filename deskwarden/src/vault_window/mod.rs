@@ -716,6 +716,12 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
     let mut folder_edit: Option<FolderEditState> = None;
+    // The app launch that has been asked for and has not happened yet. See
+    // [`PendingLaunch`]: the Open arm records the request and NOTHING there
+    // starts a program, so every launch in this window goes through the one
+    // block that drains this -- and a plan carrying vault-supplied arguments
+    // only gets there once the user has been shown the command line.
+    let mut pending_launch: Option<PendingLaunch> = None;
     // The inline "that write did not happen" message, shown under the item
     // list's toolbar. Set by a drag-to-folder that the sidebar refused (the
     // virtual "No Folder" bucket, or the folder the item is already in) or
@@ -2396,18 +2402,21 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                 // here, and a click that starts nothing and
                                 // says nothing is indistinguishable from a
                                 // click that missed the button.
+                                //
+                                // **This arm no longer starts anything.** It
+                                // records the request; the block after the
+                                // panels is the one caller of `launch_app` in
+                                // the program, and it is reachable only
+                                // through a `LaunchConfirmAction::Launch`.
+                                // For a plan with vault-supplied arguments
+                                // that action can come from nowhere but the
+                                // dialog, which is what makes "no launch
+                                // without the command line on screen" a
+                                // property of the shape rather than of a
+                                // remembered `if`. See `PendingLaunch`.
                                 DetailAction::OpenApp(plan) => {
-                                    if let Err(e) = launch_app(&plan) {
-                                        log::warn!(
-                                            "could not start {}: {e}",
-                                            plan.program
-                                        );
-                                        move_error = Some(app_launch_failure_message(
-                                            &item.name,
-                                            &plan.program,
-                                            &e,
-                                        ));
-                                    }
+                                    pending_launch =
+                                        Some(PendingLaunch::new(item.name.clone(), plan));
                                 }
                                 // `set_favorite` returns the written item
                                 // rather than `Ok(())` precisely so this
@@ -2592,10 +2601,25 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                 DetailAction::None => {}
                             }
                         } else {
+                            // Nothing is selected, so there is nothing a copy
+                            // confirmation could belong to. Dropped rather
+                            // than left ticking: without this, deselecting an
+                            // item and reselecting it inside the five seconds
+                            // brought the confirmation back, because
+                            // `forget_copy_toast_on_item_change` sees the same
+                            // id it recorded and leaves the toast alone. See
+                            // `detail::forget_copy_toast`.
+                            detail::forget_copy_toast(ui.ctx());
                             ui.label("Select an item.");
                         }
                     }
+                    // The editors clear it for the same reason, by the same
+                    // one call: copy a password, click Edit, cancel back
+                    // inside the five seconds, and the read pane used to
+                    // resume with the confirmation still up for a copy the
+                    // user had looked away from.
                     DetailMode::Edit(draft) => {
+                        detail::forget_copy_toast(ui.ctx());
                         match draw_detail_edit(ui, draft, &folders, false, &mut app_identities) {
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
@@ -2690,6 +2714,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                         }
                     }
                     DetailMode::Create(draft) => {
+                        detail::forget_copy_toast(ui.ctx());
                         match draw_detail_edit(ui, draft, &folders, true, &mut app_identities) {
                             // `to_new_item` is fallible because `NewItem` has no
                             // variant for `ItemKind::Unknown(_)`: a future Bitwarden
@@ -2855,6 +2880,47 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                 },
                 FolderEditAction::Cancel => folder_edit = None,
                 FolderEditAction::None => {}
+            }
+        }
+
+        // **The only place in this program that starts an app match.** Drawn
+        // here for `folder_edit`'s reason -- last, so the dialog is over the
+        // three panels -- and drained with `take`, so a launch happens once
+        // and the request is gone whichever way it ended.
+        //
+        // A plan with no vault-supplied arguments is approved on arrival and
+        // never draws a dialog: it launches on this same frame, exactly as
+        // every launch did before, with no extra click.
+        if let Some(pending) = pending_launch.take() {
+            let decision = if pending.needs_confirmation {
+                draw_launch_confirm_modal(ui.ctx(), &pending)
+            } else {
+                LaunchConfirmAction::Launch
+            };
+            match decision {
+                // **The band, not just the log.** A program file that has
+                // been uninstalled or moved since it was matched is the
+                // ordinary case here, and a click that starts nothing and
+                // says nothing is indistinguishable from a click that missed
+                // the button.
+                LaunchConfirmAction::Launch => {
+                    if let Err(e) = launch_app(&pending.plan) {
+                        log::warn!("could not start {}: {e}", pending.plan.program);
+                        move_error = Some(app_launch_failure_message(
+                            &pending.item_name,
+                            &pending.plan.program,
+                            &e,
+                        ));
+                    }
+                }
+                // Dropped: `take` already removed it, so the dialog is gone
+                // and nothing ran.
+                LaunchConfirmAction::Cancel => {}
+                // Still up. Put back exactly as it was -- in particular
+                // `needs_confirmation` is not cleared here, because a
+                // confirmation that disarmed itself while still on screen
+                // would launch on whatever the next frame decided.
+                LaunchConfirmAction::None => pending_launch = Some(pending),
             }
         }
 
@@ -5347,6 +5413,190 @@ fn app_launch_failure_message(name: &str, program: &str, e: &std::io::Error) -> 
         "Couldn\u{2019}t open the app for \u{201c}{name}\u{201d} \u{2014} {because}. Nothing was \
          started. ({program})"
     )
+}
+
+/// A launch the user has asked for, waiting to happen.
+///
+/// **Every Open on an app match becomes one of these, and the launcher is
+/// reached from exactly one place**: the `DetailAction::OpenApp` arm no longer
+/// starts anything, it records the request, and the block that drains this is
+/// the only caller of [`launch_app`] in the program. That shape is the gate --
+/// a launch that skipped the confirmation would have to be a second call to
+/// `launch_app`, and `open_app_wiring_tests` counts them.
+///
+/// It outlives the frame it was created on, because a confirmed launch takes
+/// at least two: the frame the Open was clicked on puts the dialog up, and the
+/// frame the dialog's Open is clicked on starts the program.
+pub(crate) struct PendingLaunch {
+    /// The item the Open was clicked on. Carried because the failure band
+    /// names it, and by the time the launch happens the selection may be a
+    /// frame or several old.
+    item_name: String,
+    /// **The plan that is shown and the plan that runs.** One value: the
+    /// dialog renders [`detail::command_line`] of this field and the launcher
+    /// spawns this field, so there is no pair to drift.
+    plan: LaunchPlan,
+    /// Whether the user still has to approve it. Set once, from
+    /// [`launch_needs_confirmation`], when the request is recorded.
+    needs_confirmation: bool,
+}
+
+impl PendingLaunch {
+    fn new(item_name: String, plan: LaunchPlan) -> Self {
+        Self {
+            needs_confirmation: launch_needs_confirmation(&plan),
+            item_name,
+            plan,
+        }
+    }
+}
+
+/// Whether a plan may go straight to the launcher, or must be shown to the
+/// user first.
+///
+/// **`has_raw_args`, and nothing else.** `AppMatch::args` reaches the program
+/// verbatim -- that is what makes `--profile-directory="Profile 2"` survive
+/// intact, and it is equally what makes `--gpu-launcher="cmd /c calc.exe"` run
+/// `calc.exe`: `--gpu-launcher`, `--renderer-cmd-prefix`,
+/// `--utility-cmd-prefix` and `--browser-subprocess-path` all make Chrome
+/// execute the string they are given. `args` is unvalidated vault data, and a
+/// vault item can be shared in by another member of an organisation, so the
+/// string is not necessarily one the user ever typed.
+///
+/// Shell metacharacters are inert here (no shell is involved; `&`, `|`, `^`
+/// and `%` arrive as ordinary argv tokens and no second program can be
+/// injected), so the surface is exactly "arbitrary flags to the one pinned
+/// program" -- which for a browser is the whole machine. Consent on the exact
+/// command line is the mitigation; see [`LaunchPlan`]'s doc for the two
+/// stronger options and why neither is here.
+///
+/// A plan with no stored arguments is **not** confirmed. Its whole command
+/// line is a program the launcher already vetted plus, at most, the item's own
+/// URL through `quote_arg`; prompting for that would put a click in front of
+/// the ordinary case and teach the user to dismiss the dialog without reading
+/// it, which is the failure mode a confirmation has.
+fn launch_needs_confirmation(plan: &LaunchPlan) -> bool {
+    plan.has_raw_args
+}
+
+/// What the launch confirmation reports back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchConfirmAction {
+    /// Still up. **The default**, so a frame in which nothing was clicked
+    /// cannot be mistaken for approval.
+    None,
+    Launch,
+    Cancel,
+}
+
+/// The heading the confirmation shows.
+const LAUNCH_CONFIRM_TITLE: &str = "Open this app?";
+
+/// The sentence above the command line.
+///
+/// It says where the arguments came from, because that is the fact the user
+/// needs in order to judge the string underneath: they may never have typed
+/// it, and on an item shared into their vault they certainly did not.
+const LAUNCH_CONFIRM_BODY: &str =
+    "This app match stores extra command-line arguments, which are passed to the program \
+     exactly as they are written in the vault. Deskwarden will run:";
+
+/// The button that starts the program. Not "OK": the label says what happens.
+const LAUNCH_CONFIRM_GO: &str = "Open";
+
+/// Draws the launch confirmation as a centered card over a dimmed scrim,
+/// exactly as [`draw_folder_edit_modal`] does, and reports what was clicked.
+///
+/// **A dialog, not `confirm_click`.** The two-click confirm is deliberately
+/// reserved for the item Delete (see its doc), and it is the wrong instrument
+/// here for a reason that is not taste: `confirm_click` confirms *that* the
+/// user meant it, by making them click twice. What has to be confirmed here is
+/// *what will run* -- an arbitrary string out of the vault, possibly hundreds
+/// of characters of it -- and a button that relabels itself cannot show that.
+/// The tooltip already tried the "put it somewhere it can be read" approach
+/// and requires hovering.
+///
+/// **It shows the command line in full.** `ui.set_width` plus a wrapping
+/// monospace label, never a truncation or an ellipsis: a control that elides
+/// the dangerous half of the string is worse than no control, because it looks
+/// like one. The card is also allowed to grow and scroll rather than clip.
+///
+/// **It defaults to not launching.** `None` unless something was clicked, Esc
+/// cancels, and the scrim eats clicks aimed at whatever is behind it.
+///
+/// Pure view: it starts nothing. The caller launches, which is what lets this
+/// be driven from a test at all.
+fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> LaunchConfirmAction {
+    use eframe::egui::{CornerRadius, Margin, RichText, Stroke};
+
+    let mut action = LaunchConfirmAction::None;
+
+    egui::Area::new(egui::Id::new("launch-confirm-scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let screen = ctx.content_rect();
+            ui.allocate_response(screen.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
+        });
+
+    egui::Area::new(egui::Id::new("launch-confirm-modal"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .inner_margin(Margin::same(20))
+                .show(ui, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(theme::bold(LAUNCH_CONFIRM_TITLE, 15.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(&pending.item_name)
+                            .size(12.0)
+                            .color(theme::TEXT_GHOST),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(LAUNCH_CONFIRM_BODY).size(12.0).color(theme::INK));
+                    ui.add_space(10.0);
+                    // The string itself. Monospace because it is a command
+                    // line, and `wrap()` because the alternative at this width
+                    // is an ellipsis over the part that matters.
+                    egui::Frame::new()
+                        .fill(theme::CARD_TINT)
+                        .corner_radius(CornerRadius::same(7))
+                        .inner_margin(Margin::same(10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(
+                                RichText::new(detail::command_line(&pending.plan))
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(theme::INK),
+                            );
+                        });
+                    ui.add_space(18.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::primary_button(ui, LAUNCH_CONFIRM_GO, None).clicked() {
+                            action = LaunchConfirmAction::Launch;
+                        }
+                        ui.add_space(8.0);
+                        if theme::secondary_button(ui, "Cancel").clicked() {
+                            action = LaunchConfirmAction::Cancel;
+                        }
+                    });
+                });
+        });
+
+    // Esc cancels, same as every other transient overlay in this app.
+    if action == LaunchConfirmAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        action = LaunchConfirmAction::Cancel;
+    }
+
+    action
 }
 
 fn webbrowser_open(url: &str) {
@@ -12819,8 +13069,21 @@ mod open_app_wiring_tests {
     // ENFORCE the split -- re-joining one makes it appear an extra time and
     // fails.
     const ARM: &str = concat!("DetailAction::OpenApp", "(plan) => {");
+    /// What the arm does instead of launching: it records the request.
+    const RECORDS: &str = concat!("PendingLaunch::", "new(item.name.clone(), plan)");
+    /// The drain block, which is where every launch in this program happens.
+    const DRAIN: &str = concat!("if let Some(pending) = pending_launch.", "take() {");
+    /// The gate. A plan that has not been approved does not reach the
+    /// launcher; making this `false` launches everything on the click.
+    const GATE: &str = concat!("if pending.", "needs_confirmation {");
+    /// The dialog, handed **the pending launch itself** -- the same value the
+    /// launcher below reads its plan out of, so the string on screen and the
+    /// string that runs cannot be two different plans.
+    const CONFIRMS: &str = concat!("draw_launch_confirm_modal(ui.ctx(), ", "&pending)");
+    /// The only outcome that reaches the launcher.
+    const APPROVED: &str = concat!("LaunchConfirmAction::", "Launch => {");
     /// The call that actually starts the program. Delete it and this fails.
-    const LAUNCHES: &str = concat!("launch_app", "(&plan)");
+    const LAUNCHES: &str = concat!("launch_app", "(&pending.plan)");
     /// One needle for both halves of the failure report: the assignment that
     /// puts a sentence in the band AND the call that decides the sentence.
     const REPORTS: &str = concat!("move_error = Some(app_launch_failure", "_message(");
@@ -12828,9 +13091,9 @@ mod open_app_wiring_tests {
     /// the user has something to fix; handing it the *tail* instead would name
     /// the arguments, which the unit test cannot catch because it calls
     /// `app_launch_failure_message` with its own literals.
-    const NAMES_THE_PROGRAM: &str = concat!("&plan.", "program,");
+    const NAMES_THE_PROGRAM: &str = concat!("&pending.plan.", "program,");
     /// The other field of the plan, which must NOT appear in that call.
-    const NAMES_THE_TAIL: &str = concat!("&plan.", "raw_tail,");
+    const NAMES_THE_TAIL: &str = concat!("&pending.plan.", "raw_tail,");
     /// The spawn itself, inside `launch_app`.
     const SPAWNS: &str = concat!(".spawn", "()");
     /// The verbatim command-line tail. `\u{2e}args(` here instead would
@@ -12862,15 +13125,76 @@ mod open_app_wiring_tests {
         haystack.match_indices(needle).count()
     }
 
+    /// The drain block: from the `take` to the comment that has always
+    /// followed the frame closure's tail.
+    fn drain_body(source: &'static str) -> &'static str {
+        let at = source.find(DRAIN).expect("the drain block is there");
+        let end = source[at..]
+            .find(concat!("// NOTHING SCHEDULES THE NEXT", " FRAME HERE ANY MORE."))
+            .expect("the drain block is followed by the repaint comment it always was");
+        &source[at..at + end]
+    }
+
+    /// The `DetailAction::OpenApp` arm, up to the comment that has always
+    /// followed it.
+    fn arm_body(source: &'static str) -> &'static str {
+        let at = source.find(ARM).expect("the arm is there");
+        let end = source[at..]
+            .find(concat!("// `set_favorite` returns the written", " item"))
+            .expect("the arm is followed by the ToggleFavorite comment it always was");
+        &source[at..at + end]
+    }
+
+    /// **The arm does not launch, it asks.**
+    ///
+    /// This used to be `the_open_app_arm_launches_and_reports_what_it_could_
+    /// not_launch`, and it pinned the launch and the failure report *inside*
+    /// the arm. They have moved, together, into the one block that drains
+    /// `pending_launch` -- and that move is the security control, not a
+    /// tidy-up: with exactly one `launch_app` in the program, reachable only
+    /// from a `LaunchConfirmAction::Launch`, a launch that skipped the
+    /// confirmation would have to be a *second* call, which the count below
+    /// refuses. The assertions this test used to make are all still here, on
+    /// the drain block; the ones about the arm are new and are the strict
+    /// half: the arm must contain no launch and no report at all.
     #[test]
-    fn the_open_app_arm_launches_and_reports_what_it_could_not_launch() {
+    fn the_open_app_arm_records_the_request_and_starts_nothing_itself() {
         let source = source();
         assert_eq!(occurrences(source, ARM), 1, "expected exactly one {ARM:?}");
+        let arm = arm_body(source);
+        assert_eq!(
+            occurrences(arm, RECORDS),
+            1,
+            "the Open arm does not record the request through {RECORDS:?}, so whatever it \
+             does instead has not been through `launch_needs_confirmation`: {arm}"
+        );
+        assert_eq!(
+            occurrences(arm, LAUNCHES),
+            0,
+            "the Open arm starts a program itself, which is a launch that never passes the \
+             confirmation: {arm}"
+        );
+        assert_eq!(
+            occurrences(arm, concat!("launch_", "app(")),
+            0,
+            "the Open arm calls the launcher under some other spelling: {arm}"
+        );
+        assert!(
+            arm.len() < 1400,
+            "control: the slice isolated the arm rather than running on into the rest of \
+             the closure"
+        );
+    }
+
+    /// **The one launch, and what it is gated on.**
+    #[test]
+    fn the_only_launch_in_the_program_is_the_one_the_user_approved() {
+        let source = source();
         assert_eq!(
             occurrences(source, LAUNCHES),
             1,
-            "expected {LAUNCHES:?} exactly once -- the Open control reports a plan and \
-             NOTHING starts it"
+            "expected {LAUNCHES:?} exactly once -- a second call to the launcher anywhere in \
+             this file is a launch that does not go past the confirmation"
         );
         assert_eq!(
             occurrences(source, REPORTS),
@@ -12878,14 +13202,36 @@ mod open_app_wiring_tests {
             "expected {REPORTS:?} exactly once -- a launch that fails is silent, and a click \
              that starts nothing and says nothing is indistinguishable from a missed button"
         );
-        // And the call is inside the arm, not merely somewhere in the file.
-        let arm_at = source.find(ARM).expect("the arm is there");
-        let arm_end = source[arm_at..]
-            .find(concat!("// `set_favorite` returns the written", " item"))
-            .expect("the arm is followed by the ToggleFavorite comment it always was");
-        let body = &source[arm_at..arm_at + arm_end];
-        assert!(occurrences(body, LAUNCHES) == 1, "the launch is not in the arm: {body}");
-        assert!(occurrences(body, REPORTS) == 1, "the report is not in the arm: {body}");
+        let body = drain_body(source);
+        assert_eq!(
+            occurrences(body, GATE),
+            1,
+            "the drain block does not ask whether this plan still needs confirming, so it \
+             either confirms every launch or none: {body}"
+        );
+        assert_eq!(
+            occurrences(body, CONFIRMS),
+            1,
+            "the dialog is not drawn from the pending launch itself, so the command line on \
+             screen and the command line that runs can be two different plans: {body}"
+        );
+        assert_eq!(
+            occurrences(body, APPROVED),
+            1,
+            "expected exactly one {APPROVED:?} -- the launcher must hang off the approving \
+             arm and nothing else: {body}"
+        );
+        // The launch is inside the approving arm, not merely inside the block.
+        let approved_at = body.find(APPROVED).expect("the approving arm is there");
+        let approved = &body[approved_at..];
+        assert_eq!(
+            occurrences(approved, LAUNCHES),
+            1,
+            "the launch is not under `LaunchConfirmAction::Launch`, so it runs whatever the \
+             dialog answered: {body}"
+        );
+        assert_eq!(occurrences(body, LAUNCHES), 1, "the launch is not in the drain block: {body}");
+        assert_eq!(occurrences(body, REPORTS), 1, "the report is not in the drain block: {body}");
         // And it names the PROGRAM FILE, not the arguments. The unit test on
         // `app_launch_failure_message` passes its own literals, so it is blind
         // to which field the call site hands over.
@@ -12903,9 +13249,9 @@ mod open_app_wiring_tests {
              ARGUMENTS where the program file belongs: {body}"
         );
         assert!(
-            body.len() < 1400,
-            "control: the slice isolated the arm rather than running on into the rest of \
-             the closure"
+            body.len() < 2600,
+            "control: the slice isolated the drain block rather than running on into the \
+             rest of the closure"
         );
     }
 
@@ -13094,5 +13440,435 @@ mod open_app_wiring_tests {
         );
         assert_ne!(other, missing);
         assert_ne!(other, refused);
+    }
+}
+
+/// **The confirmation is a security control, so it is tested as one.**
+///
+/// The whole feature is one claim: a launch whose command line carries vault
+/// data does not happen until the user has seen that command line, in full,
+/// and clicked through it. [`open_app_wiring_tests`] holds the half that lives
+/// inside `run`'s update closure -- there is exactly one `launch_app`, and it
+/// hangs off `LaunchConfirmAction::Launch`. This module holds the half that
+/// can be run: which plans are gated, and what the dialog does.
+///
+/// Placed at the END of the file, after every other test module: the
+/// `production()` slices in this file cut at the FIRST `#[cfg(test)]`, so a
+/// module inserted higher up would silently empty every one of them and leave
+/// the suite green with the source guards vacated.
+#[cfg(test)]
+mod launch_confirm_tests {
+    use super::*;
+
+    /// The payload the security review found, spelled as it was spelled. It
+    /// has a space and a pair of quotes in it, which is what makes it worth
+    /// testing that it survives to the screen intact.
+    const HOSTILE: &str = r#"--gpu-launcher="cmd /c calc.exe""#;
+    const PROGRAM: &str = r"C:\Apps\Chrome\chrome.exe";
+    const URL: &str = "https://app.ledgerline.com/";
+
+    fn hostile_plan() -> LaunchPlan {
+        LaunchPlan {
+            program: PROGRAM.to_string(),
+            raw_tail: detail::launch_tail(HOSTILE, URL),
+            has_raw_args: true,
+        }
+    }
+
+    fn bare_plan() -> LaunchPlan {
+        LaunchPlan {
+            program: PROGRAM.to_string(),
+            raw_tail: detail::launch_tail("", URL),
+            has_raw_args: false,
+        }
+    }
+
+    // --------------------------------------------------------------
+    // The gate.
+    // --------------------------------------------------------------
+
+    #[test]
+    fn a_plan_carrying_vault_arguments_is_confirmed_and_a_bare_one_is_not() {
+        assert!(
+            launch_needs_confirmation(&hostile_plan()),
+            "a command line carrying --gpu-launcher out of the vault launches on the click"
+        );
+        assert!(
+            !launch_needs_confirmation(&bare_plan()),
+            "a launch with no stored arguments asks for a click it never used to need, and \
+             the ordinary case is exactly where a confirmation becomes something to dismiss \
+             unread"
+        );
+        // The tail alone cannot decide this: both of these have one.
+        assert!(!bare_plan().raw_tail.is_empty());
+        assert!(!hostile_plan().raw_tail.is_empty());
+    }
+
+    #[test]
+    fn a_pending_launch_takes_its_verdict_from_the_gate_rather_than_a_second_rule() {
+        for plan in [hostile_plan(), bare_plan()] {
+            let expected = launch_needs_confirmation(&plan);
+            let pending = PendingLaunch::new("Ledgerline".to_string(), plan.clone());
+            assert_eq!(
+                pending.needs_confirmation, expected,
+                "the recorded request disagrees with `launch_needs_confirmation` about \
+                 {plan:?}, so the gate the drain block reads is a second copy of the rule"
+            );
+            assert_eq!(
+                pending.plan, plan,
+                "the recorded request is not the plan the Open control reported"
+            );
+        }
+    }
+
+    // --------------------------------------------------------------
+    // The dialog.
+    // --------------------------------------------------------------
+
+    const SCREEN: f32 = 900.0;
+
+    struct Shot {
+        action: LaunchConfirmAction,
+        /// Source string, the characters really laid out, and the rect.
+        ///
+        /// The middle one is the point: `Galley::text()` returns the layout
+        /// job's SOURCE, so a command line elided to `--gpu-lau\u{2026}` still
+        /// reports itself in full. A security control that shows half the
+        /// string is worse than none, so the glyphs are what is asserted on.
+        texts: Vec<(String, String, egui::Rect)>,
+    }
+
+    impl Shot {
+        fn sources(&self) -> Vec<&str> {
+            self.texts.iter().map(|(s, _, _)| s.as_str()).collect()
+        }
+
+        fn find(&self, source: &str) -> Option<&(String, String, egui::Rect)> {
+            self.texts.iter().find(|(s, _, _)| s == source)
+        }
+
+        fn painted(&self, source: &str) -> bool {
+            self.find(source).is_some()
+        }
+
+        fn rect_of(&self, source: &str) -> egui::Rect {
+            self.find(source)
+                .unwrap_or_else(|| {
+                    panic!("{source:?} was not painted; painted: {:?}", self.sources())
+                })
+                .2
+        }
+    }
+
+    struct Dialog {
+        ctx: egui::Context,
+    }
+
+    impl Dialog {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            // The same two throwaway frames every harness in this crate runs:
+            // a font set registered during a frame is only usable from the
+            // start of the next one.
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Self { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::Vec2::splat(SCREEN),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn frame(&mut self, pending: &PendingLaunch, events: Vec<egui::Event>) -> Shot {
+            let mut action = LaunchConfirmAction::None;
+            let ctx = self.ctx.clone();
+            let output = self.ctx.run_ui(Self::input(events), |_ui| {
+                action = draw_launch_confirm_modal(&ctx, pending);
+            });
+            let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+            let mut texts = Vec::new();
+            collect(&all, &mut texts);
+            Shot { action, texts }
+        }
+
+        fn idle(&mut self, pending: &PendingLaunch) -> Shot {
+            self.frame(pending, Vec::new())
+        }
+
+        /// The dialog, up and painted.
+        ///
+        /// **Two frames, and the first one is not optional.** An anchored
+        /// `egui::Area` does not know its own size until it has been laid out
+        /// once, so its very first frame paints nothing at all -- `shapes` is
+        /// three `Noop`s. The same reason `Switcher::open` above lets the
+        /// popup paint on a frame after the click. A test that read the first
+        /// frame would find no command line and no buttons and would be
+        /// asserting about an empty screen.
+        fn up(&mut self, pending: &PendingLaunch) -> Shot {
+            let blank = self.idle(pending);
+            assert!(
+                blank.texts.is_empty(),
+                "the first frame already painted, so this warm-up is hiding something: {:?}",
+                blank.sources()
+            );
+            self.idle(pending)
+        }
+
+        fn click(&mut self, pending: &PendingLaunch, pos: egui::Pos2) -> Shot {
+            self.frame(
+                pending,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            )
+        }
+    }
+
+    fn collect(shape: &egui::Shape, out: &mut Vec<(String, String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                text.galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+            _ => {}
+        }
+    }
+
+    /// The screen the dialog is drawn on.
+    fn screen() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(SCREEN))
+    }
+
+    fn a_pending(plan: LaunchPlan) -> PendingLaunch {
+        PendingLaunch::new("Ledgerline".to_string(), plan)
+    }
+
+    /// **The control the whole feature is.**
+    ///
+    /// Not "a command line is painted somewhere": the *exact* string that will
+    /// be handed to `raw_arg`, every character of it, inside the window, and
+    /// laid out rather than elided. This crate has shipped controls that
+    /// silently elided the only part that mattered, and `Galley::text()` is
+    /// blind to exactly that -- so the assertion is on the glyphs.
+    #[test]
+    fn the_dialog_shows_the_whole_command_line_that_will_run() {
+        let pending = a_pending(hostile_plan());
+        let expected = detail::command_line(&pending.plan);
+        let shot = Dialog::new().up(&pending);
+
+        let (_, glyphs, rect) = shot.find(&expected).unwrap_or_else(|| {
+            panic!(
+                "the dialog does not show the command line that will run.\nexpected: \
+                 {expected}\npainted: {:?}",
+                shot.sources()
+            )
+        });
+        assert!(
+            screen().contains_rect(*rect),
+            "the command line is painted at {rect:?} on a {SCREEN}x{SCREEN}pt screen -- it is \
+             off the edge, so the control is up and the string is not"
+        );
+        // Wrapping is allowed and elision is not, so the comparison drops
+        // whitespace: every non-space character of the command line must have
+        // been laid out.
+        let laid: String = glyphs.chars().filter(|c| !c.is_whitespace()).collect();
+        let want: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            laid, want,
+            "the command line was elided: {glyphs:?} was drawn for {expected:?}, and a \
+             control that hides the dangerous half of the string is worse than no control"
+        );
+        assert!(
+            !glyphs.contains('\u{2026}'),
+            "the command line was drawn with an ellipsis in it: {glyphs:?}"
+        );
+        // And the payload itself, named, so a future change that reformats the
+        // command line cannot quietly drop it.
+        assert!(
+            expected.contains(HOSTILE),
+            "the string the dialog shows has lost the arguments that make this dangerous: \
+             {expected}"
+        );
+        // The item is named too -- the user has to know which Open this is.
+        assert!(shot.painted("Ledgerline"), "painted: {:?}", shot.sources());
+        assert!(shot.painted(LAUNCH_CONFIRM_TITLE), "painted: {:?}", shot.sources());
+    }
+
+    /// **Default deny.** A frame in which nothing happened is not approval.
+    #[test]
+    fn a_dialog_nobody_touched_does_not_approve_the_launch() {
+        let pending = a_pending(hostile_plan());
+        let mut dialog = Dialog::new();
+        for _ in 0..3 {
+            assert_eq!(
+                dialog.idle(&pending).action,
+                LaunchConfirmAction::None,
+                "the dialog approved a launch on a frame in which nothing was clicked"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dialog_is_dismissible_without_launching() {
+        let pending = a_pending(hostile_plan());
+
+        let mut by_button = Dialog::new();
+        let up = by_button.up(&pending);
+        let cancel = up.rect_of("Cancel").center();
+        assert_eq!(
+            by_button.click(&pending, cancel).action,
+            LaunchConfirmAction::Cancel,
+            "Cancel did not dismiss the dialog"
+        );
+
+        let mut by_esc = Dialog::new();
+        let _ = by_esc.up(&pending);
+        let escaped = by_esc.frame(
+            &pending,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            escaped.action,
+            LaunchConfirmAction::Cancel,
+            "Escape did not dismiss the dialog, so the only way out is a button"
+        );
+    }
+
+    /// The other direction: the dialog can be obeyed. A control that could
+    /// never say yes would pass every test above and ship an Open that does
+    /// nothing.
+    #[test]
+    fn the_confirming_button_approves_the_launch() {
+        let pending = a_pending(hostile_plan());
+        let mut dialog = Dialog::new();
+        let up = dialog.up(&pending);
+        let go = up.rect_of(LAUNCH_CONFIRM_GO).center();
+        assert_eq!(
+            dialog.click(&pending, go).action,
+            LaunchConfirmAction::Launch,
+            "the dialog's {LAUNCH_CONFIRM_GO:?} button does not approve the launch"
+        );
+        // And the two buttons are not the same button.
+        assert_ne!(
+            up.rect_of(LAUNCH_CONFIRM_GO),
+            up.rect_of("Cancel"),
+            "the confirm and the cancel are one control"
+        );
+    }
+}
+
+/// **Every door out of the read pane drops the copy confirmation.**
+///
+/// `detail::forget_copy_toast_on_item_change` is called from
+/// `draw_detail_read` and fires on a DIFFERENT item, so it covers exactly one
+/// door. The editors and the empty selection are two more, and neither
+/// changes the item: copy a password, click Edit, cancel back inside the five
+/// seconds, and the confirmation was still there for a copy the user had
+/// looked away from. Same for deselecting and reselecting.
+///
+/// `detail`'s own suite drives the primitive on a real pane
+/// (`a_confirmation_does_not_survive_the_pane_being_looked_away_from`); what
+/// cannot be run is the wiring, because these three branches live inside
+/// `run`'s update closure -- see [`open_app_wiring_tests`] for that
+/// limitation and why a source guard is the answer to it here.
+///
+/// At the END of the file for the reason [`launch_confirm_tests`] states.
+#[cfg(test)]
+mod copy_toast_wiring_tests {
+    // No `use super::*`: this module reads the file's TEXT and calls nothing.
+
+    // `concat!`-split for `open_app_wiring_tests`' reason: `include_str!`
+    // pulls this module in too.
+    const CLEARS: &str = concat!("detail::forget_copy_toast", "(ui.ctx());");
+    const EDIT: &str = concat!("DetailMode::Edit", "(draft) => {");
+    const CREATE: &str = concat!("DetailMode::Create", "(draft) => {");
+    const NOTHING_SELECTED: &str = concat!("ui.label(\"Select an", " item.\");");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    /// `before` bytes on one side of `marker` and `after` on the other, cut
+    /// back to char boundaries. Wide enough to hold the branch's own comment
+    /// and its statements, nothing like wide enough to reach the next branch
+    /// -- the length control on each assertion below says so.
+    fn window(source: &'static str, marker: &str, before: usize, after: usize) -> &'static str {
+        let at = source.find(marker).unwrap_or_else(|| panic!("no {marker:?} in this file"));
+        let mut start = at.saturating_sub(before);
+        while !source.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = (at + marker.len() + after).min(source.len());
+        while !source.is_char_boundary(end) {
+            end -= 1;
+        }
+        &source[start..end]
+    }
+
+    #[test]
+    fn the_editors_and_the_empty_selection_drop_a_live_copy_confirmation() {
+        let source = source();
+        assert_eq!(
+            occurrences(source, CLEARS),
+            3,
+            "expected {CLEARS:?} exactly three times -- the edit pane, the create pane and \
+             the no-selection branch. Fewer means one of the three routes back into the read \
+             pane still resurrects a confirmation the user has looked away from"
+        );
+        // The clear is the statement immediately after the branch opens, for
+        // the two editors; for the empty selection it is immediately before
+        // the label, which is what opens that branch's body. Hence the two
+        // directions -- the window is around the marker, not after it.
+        for (marker, what, before, after) in [
+            (EDIT, "the edit pane", 0usize, 120usize),
+            (CREATE, "the create pane", 0, 120),
+            (NOTHING_SELECTED, "the no-selection branch", 120, 0),
+        ] {
+            assert_eq!(occurrences(source, marker), 1, "expected exactly one {marker:?}");
+            let branch = window(source, marker, before, after);
+            assert_eq!(
+                occurrences(branch, CLEARS),
+                1,
+                "{what} does not clear the copy confirmation -- a round trip through it \
+                 brings back a confirmation for a copy the user has looked away from: \
+                 {branch}"
+            );
+        }
     }
 }

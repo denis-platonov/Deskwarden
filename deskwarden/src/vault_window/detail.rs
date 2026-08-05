@@ -1089,10 +1089,55 @@ fn copy_toast_item_id() -> egui::Id {
 fn forget_copy_toast_on_item_change(ctx: &egui::Context, item: &str) {
     ctx.data_mut(|data| {
         if data.get_temp::<String>(copy_toast_item_id()).as_deref() != Some(item) {
-            data.remove::<CopyToast>(copy_toast_id());
+            forget_copy_toast_in(data);
             data.insert_temp(copy_toast_item_id(), item.to_string());
         }
     });
+}
+
+/// Drops any live confirmation **and** the record of which item it belonged
+/// to, unconditionally.
+///
+/// The other route out of a confirmation. [`forget_copy_toast_on_item_change`]
+/// covers the pane being handed a different item, which is the only look-away
+/// the read pane itself can see -- and for a long time it was the only one
+/// wired up at all, which left two routes that the same reasoning covers wide
+/// open:
+///
+///  * copy a password, click **Edit**, cancel back inside the five seconds --
+///    `draw_detail_edit` never called this, so the read pane resumed with the
+///    recorded id still equal to the item's and the toast still in the map,
+///    and the confirmation came back;
+///  * deselect the item and reselect it, same window, same result.
+///
+/// Neither crosses items, so neither breaks the "the toast belongs to the
+/// item" rule that [`forget_copy_toast_on_item_change`]'s doc states -- but
+/// both are exactly the RESURRECTION that doc sets out to make impossible,
+/// reached by a door it does not watch.
+///
+/// **Clear, rather than merely decline to resurrect.** "Don't resurrect" means
+/// leaving the toast in the map and suppressing it, which is the "hidden
+/// rather than cleared" state the cross-item test already refuses -- it makes
+/// a live toast's visibility depend on where the user has been rather than on
+/// what is on screen, and every new door then needs its own suppression. One
+/// primitive that destroys the toast makes "you left the item", "you opened
+/// the editor", "you deselected it" and "it expired" the same end state, and
+/// that is the whole rule.
+///
+/// The item-id record goes too, and not just the toast: leaving a stale id
+/// behind would make the next `forget_copy_toast_on_item_change` for that same
+/// item a no-op, which is harmless today only because there is nothing left to
+/// drop. Removing both leaves no state at all, which is the state a fresh
+/// context is in.
+pub(crate) fn forget_copy_toast(ctx: &egui::Context) {
+    ctx.data_mut(forget_copy_toast_in);
+}
+
+/// The one place a confirmation is destroyed, so the two callers above cannot
+/// drift into forgetting different halves of it.
+fn forget_copy_toast_in(data: &mut egui::util::IdTypeMap) {
+    data.remove::<CopyToast>(copy_toast_id());
+    data.remove::<String>(copy_toast_item_id());
 }
 
 
@@ -2483,13 +2528,21 @@ fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
 ///
 /// **Nothing here validates `args`, and that is a standing decision, not an
 /// oversight.** A denylist of dangerous flags is unmaintainable (every
-/// Chromium release adds some) and gives false assurance; a confirmation
-/// prompt on every Open trains the user to click through it. The mitigation
-/// this crate actually ships is [`command_line`], which puts the exact command
-/// line in the Open control's tooltip so it can be read before clicking --
-/// weak, because it requires hovering, and with two menu entries it requires
-/// opening the menu first. Anything stronger is a product decision about what
-/// Deskwarden will refuse to run, and belongs with the person making it.
+/// Chromium release adds some) and gives false assurance. What this crate
+/// ships instead is consent on the exact string: [`command_line`] renders the
+/// whole command line, the Open control puts it in its tooltip, and --
+/// **because a tooltip requires hovering, and with two menu entries it
+/// requires opening the menu first** -- `vault_window::mod` also refuses to
+/// start a plan whose [`has_raw_args`](LaunchPlan::has_raw_args) is set until
+/// the user has been shown that same string and clicked through it. A plan
+/// with no stored arguments is not confirmed, so the prompt appears on the
+/// launches that carry vault data onto a command line and on no others, which
+/// is what keeps it from becoming a thing to click past.
+///
+/// Anything stronger -- refusing arguments outright on items shared into the
+/// vault by an organisation, which is the actual vector -- is a product
+/// decision about what Deskwarden will refuse to run, and needs
+/// item-ownership data this crate does not carry to the launch site.
 ///
 /// The one string this crate *does* have to compose is the item's URL, which
 /// is appended after `args`; that one goes through [`quote_arg`], because it
@@ -2504,6 +2557,25 @@ pub struct LaunchPlan {
     /// to be handed to `raw_arg` as one piece. Empty when there is nothing to
     /// add, in which case no `raw_arg` call is made at all.
     pub raw_tail: String,
+    /// Whether any part of `raw_tail` is `AppMatch::args` -- vault data on a
+    /// command line, verbatim.
+    ///
+    /// **Not `!raw_tail.is_empty()`, and the difference is the whole point.**
+    /// A tail can be non-empty with no stored arguments at all: an ordinary
+    /// login with a website and a bare app binding produces a tail that is
+    /// only the item's URL, and that URL went through [`quote_arg`] on its way
+    /// there, so it is one positional argument and cannot become a flag. The
+    /// dangerous half is `args`, which is passed through untouched (see this
+    /// struct's doc) and can therefore be `--gpu-launcher=...`.
+    ///
+    /// `vault_window::mod` is what reads this: a plan with it set is confirmed
+    /// against its own command line before anything is started, and a plan
+    /// without it launches on the click, as every launch did before. Recorded
+    /// here rather than re-derived from `raw_tail` at the launch site because
+    /// the tail is already joined by then and no longer says which half is
+    /// which -- and a launch gate that guessed would be a second, weaker copy
+    /// of [`launch_tail`]'s rule.
+    pub has_raw_args: bool,
 }
 
 /// One argument, quoted the way `CommandLineToArgvW` will read it back.
@@ -2640,6 +2712,12 @@ fn app_launch_plan(m: &AppMatch, website: &str) -> Option<LaunchPlan> {
     Some(LaunchPlan {
         program: program.to_string(),
         raw_tail: launch_tail(&m.args, openable_url(website).unwrap_or("")),
+        // `trim`, and the SAME trim `launch_tail` applies: a stored `args` of
+        // "   " contributes nothing to the tail, so calling it "this command
+        // line carries vault arguments" would put a confirmation in front of a
+        // launch whose command line is the program and the URL and nothing
+        // else.
+        has_raw_args: !m.args.trim().is_empty(),
     })
 }
 
@@ -9805,8 +9883,23 @@ mod tests {
         let item = a_login();
         let mut other = an_item(Some(2));
         other.id = "id-2".to_string();
-        other.name = "Other".to_string();
+        // **The same NAME, deliberately.** Two `Gmail` logins is an ordinary
+        // vault, and while these two fixtures differed in name as well as id
+        // this test could not say which of the two the toast was keyed on:
+        // substituting `&item.name` for `&item.id` at
+        // `forget_copy_toast_on_item_change`'s call site passed the whole
+        // suite. Under that mutant these two items are one item, the
+        // confirmation follows the pane across the selection change, and
+        // renaming an item mid-toast clears a live one. The id is the only
+        // thing that differs here, so only the id can be what carries the
+        // assertions below.
+        other.name = item.name.clone();
         assert_ne!(item.id, other.id, "the two fixtures are the same item");
+        assert_eq!(
+            item.name, other.name,
+            "the two fixtures differ by name as well as id, so this test cannot tell a \
+             toast keyed on the id from one keyed on the name"
+        );
 
         let mut pane = Pane::new();
         let laid_out = pane.idle(&item, &TotpState::NoSecret);
@@ -9854,6 +9947,71 @@ mod tests {
             "the confirmation came back when the item was reselected -- it was \
              hidden rather than cleared; painted: {:?}",
             back.strings()
+        );
+    }
+
+    /// The other door out of an item, which the read pane cannot see.
+    ///
+    /// `forget_copy_toast_on_item_change` fires on a *different* item. Opening
+    /// the editor and cancelling back, or deselecting and reselecting, never
+    /// changes the item -- so nothing fired, the toast was still in the map,
+    /// the recorded id still matched, and the confirmation came back for a
+    /// copy the user had looked away from five seconds ago. That is the
+    /// resurrection `forget_copy_toast_on_item_change`'s doc sets out to make
+    /// impossible, reached by a route it does not watch.
+    ///
+    /// `vault_window::mod` is what calls this on those routes (its own suite
+    /// pins the three call sites); here is the primitive doing what it claims,
+    /// on a real pane, with a real toast up.
+    #[test]
+    fn a_confirmation_does_not_survive_the_pane_being_looked_away_from() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let row = laid_out.rect_of("Password");
+        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert!(
+            copied.painted("Password copied"),
+            "nothing was confirmed, so the assertions below are about a toast that never \
+             existed -- painted: {:?}",
+            copied.strings()
+        );
+        // Control: the SAME item redrawn keeps it, so what the clear below
+        // does is not something a redraw was going to do anyway.
+        assert!(
+            pane.idle(&item, &TotpState::NoSecret).painted("Password copied"),
+            "a plain redraw already lost the confirmation, so this test cannot show that \
+             the clear is what removed it"
+        );
+
+        // The user leaves the read pane: the editor opens, or the selection
+        // is dropped. No item change -- the item is the same one.
+        forget_copy_toast(&pane.ctx);
+        // The record went with the toast, so the item-change check starts
+        // from nothing rather than from a stale id that would make it a
+        // no-op. Asserted HERE, before the pane redraws: the next
+        // `draw_detail_read` records the item again, which is correct and
+        // would hide a clear that had left it behind.
+        assert_eq!(
+            pane.ctx.data(|data| data.get_temp::<String>(copy_toast_item_id())),
+            None,
+            "the toast is gone but the item it belonged to is still recorded"
+        );
+
+        let back = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !back.painted("Password copied"),
+            "the confirmation came back on the SAME item after the user looked away -- a \
+             round trip through the edit pane, or a deselect and reselect, resurrects it; \
+             painted: {:?}",
+            back.strings()
+        );
+        // And it stays gone, rather than being suppressed for one frame.
+        let again = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !again.painted("Password copied"),
+            "the confirmation was hidden for a frame rather than cleared; painted: {:?}",
+            again.strings()
         );
     }
 
@@ -10034,11 +10192,71 @@ mod tests {
         assert_eq!(launch_tail(r#"--k="v"#, ""), r#"--k="v"#);
     }
 
+    /// **What the launch gate reads, and what it must not read.**
+    ///
+    /// `vault_window::mod`'s `launch_needs_confirmation` asks the plan whether
+    /// any of its command line is `AppMatch::args` -- vault data passed
+    /// through untouched. The tempting substitute at the launch site is
+    /// `!raw_tail.is_empty()`, and it is wrong in the common direction: an
+    /// ordinary login with a website and a bare app binding has a non-empty
+    /// tail made of nothing but its own quoted URL, and confirming *that*
+    /// would put a dialog in front of the launch every user makes every day.
+    /// The two cases are pinned apart here because the mod-side gate is one
+    /// field read and cannot tell them apart on its own.
+    #[test]
+    fn only_stored_arguments_mark_a_plan_as_carrying_vault_data() {
+        const WEB: &str = "https://app.ledgerline.com/";
+
+        let bare = app_launch_plan(&a_desktop_match(), "").expect("a live desktop match");
+        assert_eq!(bare.raw_tail, "");
+        assert!(!bare.has_raw_args, "a match with no stored arguments carries none");
+
+        // A tail that is ONLY the item's URL. Non-empty, and still nothing to
+        // confirm: it went through `quote_arg`, so it is one positional
+        // argument and cannot become a flag.
+        let url_only = app_launch_plan(&a_desktop_match(), WEB).expect("a live desktop match");
+        assert!(!url_only.raw_tail.is_empty(), "the URL is on the command line");
+        assert!(
+            !url_only.has_raw_args,
+            "a plan whose whole tail is the item's own quoted URL claims to carry vault \
+             arguments, so every ordinary Open would be confirmed and the dialog becomes \
+             something to click past"
+        );
+
+        // Whitespace-only `args` contributes nothing to the tail -- the same
+        // `trim` `launch_tail` applies -- so it is not "arguments" either.
+        let blank = AppMatch { args: "   ".to_string(), ..a_desktop_match() };
+        let blank = app_launch_plan(&blank, "").expect("a live desktop match");
+        assert_eq!(blank.raw_tail, "");
+        assert!(
+            !blank.has_raw_args,
+            "a stored `args` of whitespace produces an empty tail but claims to carry \
+             arguments, so the confirmation would show a command line with nothing extra in it"
+        );
+
+        // And the real thing: the payload the review found.
+        let hostile = AppMatch {
+            args: r#"--gpu-launcher="cmd /c calc.exe""#.to_string(),
+            ..a_desktop_match()
+        };
+        let hostile = app_launch_plan(&hostile, WEB).expect("a live desktop match");
+        assert!(
+            hostile.has_raw_args,
+            "a plan carrying --gpu-launcher out of the vault does not ask to be confirmed"
+        );
+        assert!(
+            command_line(&hostile).contains(r#"--gpu-launcher="cmd /c calc.exe""#),
+            "the string the confirmation would show does not contain the payload that runs: {}",
+            command_line(&hostile)
+        );
+    }
+
     #[test]
     fn the_command_line_quotes_a_program_path_with_a_space_in_it() {
         let plan = LaunchPlan {
             program: r"C:\Program Files\App\App.exe".to_string(),
             raw_tail: String::new(),
+            has_raw_args: false,
         };
         assert_eq!(command_line(&plan), r#""C:\Program Files\App\App.exe""#);
         assert_eq!(argv_of(&command_line(&plan)), vec![plan.program.clone()]);
