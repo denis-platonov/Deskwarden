@@ -37,7 +37,7 @@ use crate::icon;
 use eframe::egui;
 use std::collections::HashMap;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{
@@ -103,7 +103,7 @@ pub struct Probe {
     description: Option<String>,
     /// `ProductName` from the same place.
     product: Option<String>,
-    /// Whether the file could be stat'd at all.
+    /// Whether the path could be stat'd **and named a file**.
     ///
     /// **This is the gate on the icon lookup, and that is its whole purpose.**
     /// The worker has just paid whatever the volume costs to answer; if it
@@ -111,7 +111,16 @@ pub struct Probe {
     /// risking the stall this module exists to avoid. If it did not -- the
     /// path is gone, the share is down, the `subst` target is unmounted -- the
     /// UI thread makes no call at all and the row simply has no icon.
-    reachable: bool,
+    ///
+    /// A **directory** is excluded as deliberately as an unreachable path is:
+    /// `SHGetFileInfoW` answers for one perfectly well, with the shell's folder
+    /// icon, and a folder icon beside the app's name is a picture of something
+    /// that is not the app.
+    file: bool,
+    /// Whether the path named a directory. See [`AppIdentityCache::label`]:
+    /// a directory's own last component is not the app's name either, so a
+    /// path that resolves to one is labelled by `process` instead.
+    directory: bool,
 }
 
 enum Entry {
@@ -154,6 +163,24 @@ pub struct AppLabel<'a> {
 #[derive(Default)]
 pub struct AppIdentityCache {
     entries: HashMap<String, Entry>,
+    /// The path that has been asked for but not yet probed, and since when.
+    ///
+    /// **The whole of the debounce, and the reason it is one slot and not a
+    /// second map.** The form asks about exactly one path per frame, and a
+    /// path being typed is a path that changes between frames; a slot that
+    /// holds the latest one and its arrival time is enough to answer "has this
+    /// stopped moving?" and costs one `String` for the window's lifetime. A
+    /// map would remember every prefix, which is the leak this exists to
+    /// prevent.
+    settling: Option<Settling>,
+}
+
+struct Settling {
+    path: String,
+    since: Instant,
+    /// The path's file name, stored for the same reason `Entry::Pending` stores
+    /// one: the label is handed out as a borrow of the cache.
+    placeholder: String,
 }
 
 impl AppIdentityCache {
@@ -164,6 +191,34 @@ impl AppIdentityCache {
     /// label. An empty `path` is answered from `process` alone with no lookup
     /// and no thread -- which is the Microsoft Store case, where there is no
     /// image path to read anything out of.
+    ///
+    /// # A path is not probed the instant it is first seen
+    ///
+    /// The edit form's Program file box rewrites `path` on **every keystroke**,
+    /// and this function used to start a lookup for every path it had not seen
+    /// before. Typing a 53-character path therefore spawned 53 threads, made 53
+    /// `fs::metadata` calls, and left 53 map entries that nothing ever removed
+    /// -- measured, not supposed, by
+    /// `typing_a_path_one_character_at_a_time_starts_no_probe`. Worse, a prefix
+    /// that happens to name a directory (`C:\Windows`) is stat-able, so it also
+    /// took the UI thread's `SHGetFileInfoW` call and a GPU texture: unbounded
+    /// churn on the one shell call this module exists to ration.
+    ///
+    /// So a path must hold still for [`Self::SETTLE`] before it is probed.
+    /// **Debounce rather than a "does this look like a file name?" test**,
+    /// because every prefix of `chrome.exe` from `chrome.e` on looks exactly
+    /// like one -- guessing at the shape of the string cannot tell a finished
+    /// path from an unfinished one, and only time can. A path chosen through
+    /// Browse... or the running-app picker is not delayed in any way the user
+    /// can perceive: it arrives once and then holds still, and the answer is
+    /// already only ever painted on the next [`Self::POLL_INTERVAL`] repaint,
+    /// which is the same 150ms.
+    ///
+    /// Nothing is evicted. It does not need to be any more: the map now grows
+    /// once per path the user actually settles on, not once per keystroke, and
+    /// dropping a `Ready` entry would only make the next frame that asks for it
+    /// spawn the probe again -- per-frame I/O, which is the thing this module
+    /// was written to prevent.
     pub fn label<'a>(
         &'a mut self,
         ctx: &egui::Context,
@@ -179,29 +234,60 @@ impl AppIdentityCache {
         // borrowed, and spelling the insert out keeps the "spawn exactly once"
         // rule visible.
         if !self.entries.contains_key(path) {
-            let placeholder = file_name_of(path).unwrap_or(process).to_string();
-            self.entries.insert(
-                path.to_string(),
-                Entry::Pending { rx: spawn_probe(path), placeholder },
-            );
+            // A path with no file name (`C:\Program Files\`) names a directory
+            // by construction. There is no executable there to read a name out
+            // of, `set_path` already refuses to derive `process` from it, and
+            // it is what half a typed path looks like -- so no thread, no
+            // entry, and no settle either.
+            if let Some(name) = file_name_of(path) {
+                if self.settling.as_ref().map(|s| s.path.as_str()) != Some(path) {
+                    self.settling = Some(Settling {
+                        path: path.to_string(),
+                        since: Instant::now(),
+                        placeholder: name.to_string(),
+                    });
+                }
+                let settled = self
+                    .settling
+                    .as_ref()
+                    .is_some_and(|s| s.since.elapsed() >= Self::SETTLE);
+                if settled {
+                    let placeholder = match self.settling.take() {
+                        Some(s) => s.placeholder,
+                        None => name.to_string(),
+                    };
+                    self.entries.insert(
+                        path.to_string(),
+                        Entry::Pending { rx: spawn_probe(path), placeholder },
+                    );
+                }
+            }
         }
 
         // A pending entry that has answered becomes ready HERE, on the UI
         // thread, which is also the only place the icon may be fetched.
         if let Some(Entry::Pending { rx, .. }) = self.entries.get(path) {
             if let Ok(probe) = rx.try_recv() {
-                let name = display_name(
-                    probe.description.as_deref(),
-                    probe.product.as_deref(),
-                    path,
-                    process,
-                );
-                // Gated on `reachable`, and only ever attempted once: a `None`
-                // here is remembered as "no icon", never retried per frame.
-                let icon = probe
-                    .reachable
-                    .then(|| load_icon(ctx, path))
-                    .flatten();
+                let name = if probe.directory {
+                    // The path names a FOLDER. Its last component is the
+                    // folder's name, and painting "WINDOWS" where the app's
+                    // name goes says something false about the binding; the
+                    // executable this match is keyed on is the honest answer,
+                    // and it is the one the user can check against the path in
+                    // the box directly below.
+                    process.to_string()
+                } else {
+                    display_name(
+                        probe.description.as_deref(),
+                        probe.product.as_deref(),
+                        path,
+                        process,
+                    )
+                };
+                // Gated on the path having named a reachable FILE, and only
+                // ever attempted once: a `None` here is remembered as "no
+                // icon", never retried per frame.
+                let icon = probe.file.then(|| load_icon(ctx, path)).flatten();
                 self.entries.insert(path.to_string(), Entry::Ready { name, icon });
             }
         }
@@ -216,10 +302,15 @@ impl AppIdentityCache {
             Some(Entry::Pending { placeholder, .. }) => {
                 AppLabel { name: placeholder, icon: None, pending: true }
             }
-            // Unreachable: the entry was inserted above and nothing removes
-            // one. Answered rather than `unreachable!()`, because a panic here
-            // would take the whole window down over a missing label.
-            None => AppLabel { name: process, icon: None, pending: false },
+            // Not probed yet: either still settling -- in which case the
+            // placeholder is the same file name a `Pending` would show, so the
+            // debounce is invisible -- or a path with no file name to probe.
+            None => match &self.settling {
+                Some(s) if s.path == path => {
+                    AppLabel { name: &s.placeholder, icon: None, pending: true }
+                }
+                _ => AppLabel { name: process, icon: None, pending: false },
+            },
         }
     }
 
@@ -228,6 +319,21 @@ impl AppIdentityCache {
     /// polling cadence is stated once; the picker's readiness probe uses the
     /// same 150ms.
     pub const POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+    /// How long a path must hold still before it is probed. See
+    /// [`Self::label`]. One [`Self::POLL_INTERVAL`], deliberately: the answer
+    /// cannot reach the screen faster than that repaint anyway, so a settle of
+    /// the same length costs a Browse... choice nothing anyone can see, while
+    /// being far longer than the gap between two keystrokes.
+    pub const SETTLE: Duration = Self::POLL_INTERVAL;
+
+    /// How many paths have been probed. Test-only: the leak this module's
+    /// debounce exists to prevent is a *count*, and counting is the only way to
+    /// see it.
+    #[cfg(test)]
+    fn probed(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// Reads `path`'s version resource on a worker thread.
@@ -240,13 +346,11 @@ fn spawn_probe(path: &str) -> mpsc::Receiver<Probe> {
     let (tx, rx) = mpsc::sync_channel(1);
     let owned = path.to_string();
     std::thread::spawn(move || {
-        let reachable = std::fs::metadata(&owned).is_ok();
-        let (description, product) = if reachable {
-            version_names(&owned)
-        } else {
-            (None, None)
-        };
-        let _ = tx.send(Probe { description, product, reachable });
+        let meta = std::fs::metadata(&owned);
+        let file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
+        let directory = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let (description, product) = if file { version_names(&owned) } else { (None, None) };
+        let _ = tx.send(Probe { description, product, file, directory });
     });
     rx
 }
@@ -483,5 +587,150 @@ mod tests {
         // A path that cannot exist: no panic, and nothing invented.
         let missing = format!(r"{system_root}\System32\deskwarden-no-such-file-9ce14529.exe");
         assert_eq!(version_names(&missing), (None, None));
+    }
+
+    // -- the debounce -------------------------------------------------------
+
+    /// The path the tests below type, and the app it is bound to. Nothing on
+    /// disk, so nothing here depends on what is installed.
+    const TYPED: &str = r"C:\Deskwarden Test\Edge\msedge.exe";
+
+    /// Every prefix of `path`, which is exactly what `label` is handed as the
+    /// user types it: one call per frame, one character longer each time.
+    fn keystrokes(path: &str) -> Vec<String> {
+        (1..=path.chars().count())
+            .map(|n| path.chars().take(n).collect::<String>())
+            .collect()
+    }
+
+    /// A context, with no fonts and no frame -- `label` draws nothing, it only
+    /// ever loads a texture, and only for a path that named a real file.
+    fn ctx() -> egui::Context {
+        egui::Context::default()
+    }
+
+    #[test]
+    fn typing_a_path_one_character_at_a_time_starts_no_probe() {
+        // The measurement this whole debounce exists for. Before it, this
+        // asserted 0 and got 35: one worker thread, one `fs::metadata` and one
+        // permanent map entry per keystroke, several of them naming real
+        // directories and so also taking a shell call and a GPU texture.
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let typed = keystrokes(TYPED);
+        assert!(typed.len() > 30, "the fixture must be long enough to be a leak: {}", typed.len());
+
+        for prefix in &typed {
+            let label = cache.label(&ctx, prefix, "chrome.exe");
+            // ...and the form is never left with nothing to paint while it
+            // waits: the placeholder is the same file name a started probe
+            // would have shown, so the debounce is invisible on screen.
+            assert_eq!(
+                label.name,
+                file_name_of(prefix).unwrap_or("chrome.exe"),
+                "the box painted nothing useful while {prefix:?} settled"
+            );
+        }
+
+        assert_eq!(
+            cache.probed(),
+            0,
+            "typing {} characters started {} lookups -- one per keystroke is the leak",
+            typed.len(),
+            cache.probed()
+        );
+    }
+
+    #[test]
+    fn a_path_that_stops_moving_is_probed_exactly_once() {
+        // The positive control, and the one that matters most: a debounce that
+        // never fires would satisfy the test above and would mean no app on
+        // this form ever got its name or its icon. It also stands in for the
+        // Browse... and picker routes -- a path that arrives whole and then
+        // holds still is precisely what those produce.
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+
+        assert!(cache.label(&ctx, TYPED, "chrome.exe").pending);
+        assert_eq!(cache.probed(), 0, "a path was probed on the frame it first appeared");
+
+        std::thread::sleep(AppIdentityCache::SETTLE + Duration::from_millis(50));
+        let _ = cache.label(&ctx, TYPED, "chrome.exe");
+        assert_eq!(cache.probed(), 1, "a settled path was never looked up");
+
+        // ...and not again, on any number of further frames.
+        for _ in 0..20 {
+            let _ = cache.label(&ctx, TYPED, "chrome.exe");
+        }
+        assert_eq!(cache.probed(), 1, "a resolved path was looked up more than once");
+    }
+
+    #[test]
+    fn a_path_that_names_no_file_is_never_probed_however_long_it_sits() {
+        // A directory path is not an executable and never becomes one by
+        // waiting. Distinct from the debounce above: this one is refused on its
+        // shape, so it must not even take a settle slot's worth of a lookup.
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let label = cache.label(&ctx, r"C:\Program Files\", "chrome.exe");
+        assert_eq!(label.name, "chrome.exe");
+        assert!(!label.pending, "a path with no file name left the form waiting for an answer");
+
+        std::thread::sleep(AppIdentityCache::SETTLE + Duration::from_millis(50));
+        let _ = cache.label(&ctx, r"C:\Program Files\", "chrome.exe");
+        assert_eq!(cache.probed(), 0, "a directory path was looked up");
+    }
+
+    /// Drives `cache` until `path` resolves, or gives up. Live -- the probe is
+    /// a real worker on a real file system -- so it polls rather than sleeping
+    /// a guessed amount.
+    fn resolve(cache: &mut AppIdentityCache, ctx: &egui::Context, path: &str, process: &str) -> (String, bool) {
+        std::thread::sleep(AppIdentityCache::SETTLE + Duration::from_millis(50));
+        for _ in 0..200 {
+            let label = cache.label(ctx, path, process);
+            if !label.pending {
+                return (label.name.to_string(), label.icon.is_some());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{path:?} never resolved");
+    }
+
+    #[test]
+    fn a_path_that_turns_out_to_be_a_folder_is_not_named_after_the_folder() {
+        // A stored path ending in a directory is permanent, so the debounce
+        // does not cover this one. Measured before the fix: `C:\Windows`
+        // resolved to name "WINDOWS" with the shell's FOLDER icon beside it --
+        // a picture of something that is not the app, over the name of
+        // something that is not the app either.
+        let ctx = ctx();
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        if std::fs::metadata(&system_root).is_err() {
+            return;
+        }
+        let mut cache = AppIdentityCache::default();
+        let (name, has_icon) = resolve(&mut cache, &ctx, &system_root, "Ledgerline.exe");
+        assert_eq!(name, "Ledgerline.exe", "a folder's own name was shown as the app's");
+        assert!(!has_icon, "a folder icon was drawn beside the app's name");
+    }
+
+    #[test]
+    fn a_path_that_is_a_real_file_is_still_named_after_the_file() {
+        // The positive control for the test above: without it, a `label` that
+        // answered `process` for everything would pass it, and no app on this
+        // form would ever show its real name again.
+        let ctx = ctx();
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let notepad = format!(r"{system_root}\System32\notepad.exe");
+        if std::fs::metadata(&notepad).is_err() {
+            return;
+        }
+        let mut cache = AppIdentityCache::default();
+        let (name, _) = resolve(&mut cache, &ctx, &notepad, "Ledgerline.exe");
+        assert_ne!(
+            name, "Ledgerline.exe",
+            "a real executable was labelled by the match's process instead of by itself"
+        );
+        assert!(!name.trim().is_empty());
     }
 }

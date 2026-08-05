@@ -218,7 +218,9 @@ impl AppMatchDraft {
     /// `args` is passed straight through -- **not trimmed, not re-quoted, not
     /// split**. See [`AppMatch::args`]: the string is the user's, and this app
     /// has no tokenisation of a Windows command line that it could apply
-    /// without guessing.
+    /// without guessing. The one thing done to it is the same thing done to
+    /// `title`, in the mirror-image case: it is **dropped when it can no longer
+    /// apply**.
     pub fn to_match(&self) -> AppMatch {
         AppMatch {
             process: self.process.clone(),
@@ -230,7 +232,18 @@ impl AppMatchDraft {
             title: if self.hosted { self.title.clone() } else { String::new() },
             hosted: self.hosted,
             path: self.path.clone(),
-            args: self.args.clone(),
+            // ...and the same for the arguments, for the same reason and in
+            // the other direction. A Store app is not started by path, so
+            // there is no command line to give it: the form draws the args row
+            // for a hosted binding as a DISABLED box saying so, which means an
+            // `args` string already in the draft -- from a binding that was
+            // unhosted when the user typed one, and then re-pointed at a Store
+            // app -- becomes invisible and unclearable while still being
+            // written on every save. Zeroed here rather than in
+            // `choose_window`, so that a hosted binding written by an older
+            // build is cleaned up too, and so that Cancel still puts the old
+            // arguments back if the user re-points at a real executable.
+            args: if self.hosted { String::new() } else { self.args.clone() },
             trigger: self.trigger,
         }
     }
@@ -276,8 +289,11 @@ impl AppMatchDraft {
     /// Byte-for-byte the rule `picker_ui::app_match_for` follows, and for its
     /// reasons: all four values come from the SAME row, so the path really is
     /// the image of the process being named, and **the title is recorded only
-    /// for a hosted row**. `trigger` and `args` survive, because they are the
-    /// user's settings for this item and not facts about the window.
+    /// for a hosted row**. `trigger` and `args` survive here, because they are
+    /// the user's settings for this item and not facts about the window -- and
+    /// because a Cancel must be able to put them back. Whether the arguments
+    /// are ever *saved* is [`Self::to_match`]'s decision, and for a hosted row
+    /// they are not.
     pub fn choose_window(&mut self, row: &AppWindowRow) {
         self.process = row.exe_name.clone();
         self.hosted = row.hosted;
@@ -1930,6 +1946,32 @@ mod tests {
         // Positive control: a hosted one keeps it, so the assertion above is not
         // satisfied by a `to_match` that drops every title.
         assert_eq!(AppMatchDraft::from_match(&store_match()).to_match().title, "Speedtest");
+    }
+
+    #[test]
+    fn a_draft_never_carries_arguments_onto_a_store_match() {
+        // The mirror of the rule above, and the same defect: the form draws the
+        // arguments row for a hosted binding as a DISABLED box saying "not
+        // applicable", so an `args` string in the draft -- typed while the
+        // binding pointed at a real executable, then left behind by a re-point
+        // at a Store app, or written by an older build -- is invisible,
+        // unclearable, and written on every save.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.choose_window(&window_row("Speedtest.exe", true));
+        assert_eq!(
+            app.args,
+            r#"--profile-directory="Profile 2""#,
+            "the draft keeps them, so a Cancel -- or a re-point at a real .exe -- puts them back"
+        );
+        assert_eq!(app.to_match().args, "", "but a Store binding must not SAVE them");
+
+        // Positive control: the arguments of an unhosted binding are the user's
+        // and are saved verbatim, so the assertion above is not satisfied by a
+        // `to_match` that drops every argument string.
+        assert_eq!(
+            AppMatchDraft::from_match(&chrome_match()).to_match().args,
+            r#"--profile-directory="Profile 2""#
+        );
     }
 
     #[test]
@@ -3600,7 +3642,17 @@ mod generator_row_tests {
             // Deliberately a path that does not exist, so the identity lookup
             // resolves the same way on every machine (to the file name) and no
             // assertion here depends on what is installed.
-            path: r"C:\Deskwarden Test\Chrome\chrome.exe".to_string(),
+            //
+            // And deliberately a file name that is NOT `process`. Chrome really
+            // does ship a `chrome_proxy.exe` beside `chrome.exe`, so this is a
+            // real shape rather than a contrivance -- but the reason it is here
+            // is that the two inputs to `AppIdentityCache::label` are a path and
+            // a process name, and a fixture where those agree cannot tell which
+            // one the form passed. Measured: with both reading `chrome.exe`,
+            // `label(ctx, &app.process, &app.process)` -- which probes a bare
+            // relative name, so no description ever resolves and there is never
+            // an icon -- passed every test in this file.
+            path: r"C:\Deskwarden Test\Chrome\chrome_proxy.exe".to_string(),
             args: "--profile-directory=WorkProfile".to_string(),
             trigger: TriggerMode::Prompt,
         }
@@ -3609,10 +3661,17 @@ mod generator_row_tests {
     fn store() -> AppMatch {
         AppMatch {
             process: "Speedtest.exe".to_string(),
-            title: "Speedtest".to_string(),
+            // Not "Speedtest": the block paints a name and a title, and a title
+            // that is a prefix of the process name is a title that cannot say
+            // which of the two was drawn. Real Store frames are titled like
+            // this anyway.
+            title: "Speedtest by Ookla".to_string(),
             hosted: true,
             path: String::new(),
-            args: String::new(),
+            // A Store binding that carries arguments: they are unreachable in
+            // the form (the row is disabled and says so) and they must not be
+            // saved. See `to_match`.
+            args: "--headless".to_string(),
             trigger: TriggerMode::Hotkey,
         }
     }
@@ -3649,7 +3708,23 @@ mod generator_row_tests {
         // lookup has not answered yet on the frame after the first, so this is
         // the file name -- which is what `app_identity` promises as its
         // placeholder and its last fallback both.
-        assert!(strings.contains(&"chrome.exe"), "no app name painted: {strings:?}");
+        //
+        // **The PATH's file name, and that is the assertion.** The mutation this
+        // catches is `apps.label(ui.ctx(), &app.process, &app.process)`: the
+        // identity lookup fed the match's process name where the image path
+        // belongs. It probes a bare relative name, so `FileDescription` never
+        // resolves and `SHGetFileInfoW` never finds an icon -- the block shows
+        // `chrome.exe` for ever and is never able to say "Google Chrome". Every
+        // test in this file passed under it while the fixture's path and
+        // process agreed.
+        assert!(
+            strings.contains(&"chrome_proxy.exe"),
+            "the app block is not named after the program file it is bound to: {strings:?}"
+        );
+        assert!(
+            !strings.contains(&"chrome.exe"),
+            "the app block is named after `process`, not after the path: {strings:?}"
+        );
     }
 
     #[test]
@@ -3709,6 +3784,65 @@ mod generator_row_tests {
             app.args,
             chrome().args,
             "typing in the path box moved the command-line arguments"
+        );
+    }
+
+    /// **Hand-typing a new program file re-points the match.**
+    ///
+    /// The mutation this catches is the whole of the path row's body reduced to
+    /// `app.path = typed`, and it survived every test in this file: the pure
+    /// test calls `set_path` directly, the browse test goes through
+    /// `EditDraft::set_app_path`, and `typing_in_the_path_box_edits_the_path`
+    /// looks only at `path` and `args`. Nothing looked at `process`.
+    ///
+    /// What that costs the user: they retype Program file from Chrome's
+    /// executable to Edge's, Save, and the binding still keys on `chrome.exe`.
+    /// The item goes on filling Chrome, and Open refuses -- `launchable_path`
+    /// requires the path's file name to BE `process`, and it no longer is.
+    ///
+    /// So this drives the box far enough that the typed file name really
+    /// differs from the process it started on, and asserts the derivation
+    /// followed.
+    #[test]
+    fn typing_a_new_program_file_re_points_the_match() {
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        assert_eq!(draft.app.as_ref().unwrap().process, "chrome.exe");
+
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let box_rect = painted.rect_of(chrome().path.as_str());
+
+        // Click in, select the whole path, and type a different one over it --
+        // a different DIRECTORY and a different file name, which is what
+        // re-pointing an item at another browser looks like.
+        let _ = frame(&ctx, &mut draft, &click(box_rect.center()));
+        let typed = r"C:\Deskwarden Test\Edge\msedge.exe";
+        let _ = frame(
+            &ctx,
+            &mut draft,
+            &[
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(typed.to_string()),
+            ],
+        );
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.path, typed, "the box did not take the typed path");
+        assert_eq!(
+            app.process, "msedge.exe",
+            "the typed path did not re-derive `process`: this item still fills chrome.exe and \
+             cannot open the program it now names"
+        );
+        assert!(
+            app.to_match().launchable_path().is_some(),
+            "a hand-typed path must be one the launcher would accept, which is the whole reason \
+             `process` is derived rather than checked"
         );
     }
 
@@ -3794,7 +3928,26 @@ mod generator_row_tests {
             strings.contains(&APP_PATH_STORE_APP),
             "a Store binding does not say why it has no path: {strings:?}"
         );
-        assert!(strings.contains(&"Speedtest"), "the window title is not shown: {strings:?}");
+        assert!(
+            strings.contains(&"Speedtest by Ookla"),
+            "the window title is not shown: {strings:?}"
+        );
+        // The arguments row is drawn, says why it is disabled, and does NOT
+        // show the string the draft is still carrying -- which is exactly why
+        // that string must not be saved. See the `to_match` assertion below.
+        assert!(
+            strings.contains(&APP_ARGS_STORE_APP),
+            "a Store binding does not say why it has no arguments: {strings:?}"
+        );
+        assert!(
+            !strings.contains(&"--headless"),
+            "arguments that cannot be edited were nonetheless shown: {strings:?}"
+        );
+        assert_eq!(
+            draft.app.as_ref().unwrap().to_match().args,
+            "",
+            "a Store binding saved arguments the user could neither see nor clear"
+        );
         assert!(strings.contains(&"Remove app match"), "Remove is gone: {strings:?}");
         // The word the user must never see.
         assert!(
@@ -3845,6 +3998,109 @@ mod generator_row_tests {
         let (_, after) = frame(&ctx, &mut draft, &[]);
         let _ = frame(&ctx, &mut draft, &click(after.rect_of("Close list").center()));
         assert!(!draft.app.as_ref().unwrap().picking, "the picker did not close");
+    }
+
+    /// A row for the running-app picker, injected rather than enumerated.
+    ///
+    /// The enumeration is the real desktop's, which is why the picker's click
+    /// wiring had no test at all -- there was no row anyone could be sure of
+    /// clicking. But the list the picker draws is `AppMatchDraft::windows`, a
+    /// plain `pub Vec` filled on the button click and read on every frame after
+    /// it, so a test can simply put a row there and open the list. Nothing in
+    /// production is bent to allow it: this is the same field the button writes.
+    fn picker_row(title: &str, exe: &str) -> AppWindowRow {
+        AppWindowRow {
+            title: title.to_string(),
+            exe_name: exe.to_string(),
+            // A directory that is NOT the exe name and NOT the fixture's, so
+            // "the path came from this row" cannot be satisfied by any other
+            // string in the form.
+            exe_path: format!(r"C:\Deskwarden Test\Picked\{exe}"),
+            hosted: false,
+            pid: 4242,
+            hwnd: 909,
+        }
+    }
+
+    /// The label `app_window_picker` paints for a row, spelled here in the
+    /// pieces the test supplies rather than by calling the production
+    /// formatter, so a row that stops being drawn cannot be found by this test
+    /// agreeing with itself.
+    fn row_label(title: &str, exe: &str) -> String {
+        format!("{title}  \u{b7}  {exe}")
+    }
+
+    #[test]
+    fn clicking_a_row_in_the_running_app_picker_binds_the_item_to_that_row() {
+        // Mutation this catches: dropping the `app.choose_window(&row)` after
+        // the loop (or the `chosen = Some(index)` inside it). The list still
+        // opens, the rows still draw, every click is a silent no-op, and
+        // `choose_window`'s own pure test keeps passing.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.picking = true;
+            app.windows = vec![picker_row("Ledgerline - Invoices", "Ledgerline.exe")];
+        }
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let row = listed.rect_of(row_label("Ledgerline - Invoices", "Ledgerline.exe").as_str());
+        let _ = frame(&ctx, &mut draft, &click(row.center()));
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.process, "Ledgerline.exe", "clicking a row bound nothing");
+        assert_eq!(app.path, r"C:\Deskwarden Test\Picked\Ledgerline.exe");
+        assert_eq!(app.args, chrome().args, "choosing an app threw away the user's arguments");
+        assert!(!app.picking, "choosing a row left the list open");
+    }
+
+    #[test]
+    fn a_click_that_misses_every_row_binds_nothing() {
+        // The positive control: without it, a `choose_window` called
+        // unconditionally at the end of the picker -- on whatever row happened
+        // to be first -- would satisfy the test above.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.picking = true;
+            app.windows = vec![picker_row("Ledgerline - Invoices", "Ledgerline.exe")];
+        }
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let row = listed.rect_of(row_label("Ledgerline - Invoices", "Ledgerline.exe").as_str());
+        let miss = Pos2::new(row.center().x, row.top() - 200.0);
+        let _ = frame(&ctx, &mut draft, &click(miss));
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.process, "chrome.exe", "a click that hit no row re-pointed the item");
+        assert!(app.picking, "a click that hit no row closed the list");
+    }
+
+    #[test]
+    fn a_row_that_names_the_window_host_cannot_be_clicked() {
+        // The refusal has a pure test; what only this can see is whether the
+        // form honours it. Mutation this catches: `ui.add_enabled(true, ..)`.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        {
+            let app = draft.app.as_mut().unwrap();
+            app.picking = true;
+            app.windows = vec![picker_row("Speedtest by Ookla", "ApplicationFrameHost.exe")];
+        }
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let row =
+            listed.rect_of(row_label("Speedtest by Ookla", "ApplicationFrameHost.exe").as_str());
+        let _ = frame(&ctx, &mut draft, &click(row.center()));
+
+        assert_eq!(
+            draft.app.as_ref().unwrap().process,
+            "chrome.exe",
+            "a row Windows could not attribute bound this item to the frame host, which would \
+             fill it into every Store app on the machine"
+        );
     }
 
     /// **The `icon_probe` tripwire, answered.**
