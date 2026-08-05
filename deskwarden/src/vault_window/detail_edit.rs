@@ -5,6 +5,7 @@
 
 use crate::app_identity::{self, AppIdentityCache};
 use crate::app_match::{AppMatch, TriggerMode};
+use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
 use crate::theme;
 use crate::vault_bridge::{
     CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
@@ -195,6 +196,49 @@ pub struct AppMatchDraft {
     /// per-frame I/O this feature is otherwise careful to avoid.
     pub windows: Vec<AppWindowRow>,
     pub window_filter: String,
+    /// The keystroke sequence, **as the stored string** rather than as a
+    /// parsed value.
+    ///
+    /// This is what makes the byte-for-byte promise in
+    /// [`AppMatch::sequence`]'s doc true rather than aspirational: a sequence
+    /// this build does not fully understand -- one KeePass wrote, one a later
+    /// version wrote -- is carried through an edit of the item's *name*
+    /// without ever passing through this build's renderer, so there is no
+    /// spelling it could be changed into. The chips are a VIEW of this string
+    /// (`key_sequence::parse`), and every edit is a whole-string replacement
+    /// (`key_sequence::render`) applied only when the user actually clicks
+    /// something.
+    pub sequence: String,
+    /// Whether the eye is open, i.e. whether the sequence is being previewed
+    /// resolved against the item.
+    ///
+    /// **A `bool`, and it is important that it is only a `bool`.** The resolved
+    /// preview is built and dropped inside the frame that paints it (see
+    /// [`key_sequence::PreviewPart`]); nothing about it is kept here, so
+    /// closing the pane, cancelling the edit or simply moving on leaves no
+    /// copy of a password or a one-time code behind on the draft. The same
+    /// care [`detail::DetailAction`]'s secret variants take, for the same
+    /// reason.
+    pub previewing: bool,
+    /// The literal-text box, holding what the user is about to add. Not part
+    /// of the sequence until Add is clicked, so a half-typed word is not a
+    /// chip.
+    pub literal_draft: String,
+    /// The wait box, **in seconds** -- the unit the user asked in ("Wait N
+    /// sec"). Converted to the format's milliseconds by
+    /// [`key_sequence::wait_ms_from_seconds`] at the moment Add is clicked.
+    pub wait_draft: String,
+    /// Whether the keystroke builder is open.
+    ///
+    /// **Shut by default, and the pane's width is the reason.** The detail
+    /// pane is 298pt at the app's minimum size and the edit form's card is
+    /// already wider than that (`aae9429`); a palette of every field, every
+    /// key, a text box and a wait box is several hundred points of height that
+    /// would push Save, Cancel and Remove down the scroll on a form the user
+    /// opened to rename something. Closed, the block is a heading, a
+    /// one-line summary of what would be typed, and the button that opens it
+    /// -- so the sequence is still *visible* without being in the way.
+    pub sequence_open: bool,
 }
 
 impl AppMatchDraft {
@@ -210,6 +254,15 @@ impl AppMatchDraft {
             picking: false,
             windows: Vec::new(),
             window_filter: String::new(),
+            // Verbatim. See the field's doc: this is the only copy, and it is
+            // the one written back.
+            sequence: m.sequence.clone(),
+            // Closed. The eye is a reveal, and a reveal that is on by default
+            // is not a reveal.
+            previewing: false,
+            literal_draft: String::new(),
+            wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
+            sequence_open: false,
         }
     }
 
@@ -244,6 +297,12 @@ impl AppMatchDraft {
             // build is cleaned up too, and so that Cancel still puts the old
             // arguments back if the user re-points at a real executable.
             args: if self.hosted { String::new() } else { self.args.clone() },
+            // Passed through untouched, and NOT dropped for a hosted binding
+            // the way `args` above is. The two look alike and are not: a
+            // command line is meaningless for a Store app because nothing is
+            // started by path, whereas a Store app is typed into exactly like
+            // any other window -- so its sequence is as applicable as any.
+            sequence: self.sequence.clone(),
             trigger: self.trigger,
         }
     }
@@ -1262,6 +1321,235 @@ const APP_REMOVED_NOTICE: &str =
     "This app will stop filling from this item when you save. Undo, or Cancel the edit, to keep \
      it.";
 
+// ---------------------------------------------------------------------------
+// The keystroke sequence builder.
+//
+// The user's ask, in their words: "for auto-keystrokes we should show all vars
+// available and also keys (Enter, tab...) and Wait N sec - so users can click
+// the sequence not google everytime and wonder why not working because of
+// typo". So: nothing here is typed from memory. Every field the item really
+// has, every key, and a wait are buttons, and what they build is the portable
+// string `key_sequence` defines.
+//
+// EVERY EDIT IS A PURE FUNCTION on `(&str, what was clicked) -> String`, tested
+// directly. The drawing below only decides which button was pressed; a decision
+// reachable only through an egui closure is a decision no test can call, which
+// is this file's standing rule.
+// ---------------------------------------------------------------------------
+
+const APP_SEQUENCE_LABEL: &str = "Keystrokes";
+
+/// Why this exists, in the terms of the case that motivates it. Multi-screen
+/// sign-ins are named because they are what a plain user-name-Tab-password
+/// fill cannot do, and "nothing happens" on such a page is exactly the symptom
+/// a user would otherwise be left to guess at.
+const APP_SEQUENCE_HINT: &str =
+    "What Deskwarden types into this app. Add a wait and an Enter for sign-ins that ask for \
+     the address on one screen and the password on the next.";
+
+/// What the block says when the item stores no sequence. **It names the
+/// default rather than showing an empty row**: the chips below it are real,
+/// they are what would be typed, and a blank space where they sit would read
+/// as "nothing will be typed", which is the one thing an empty sequence does
+/// not mean (see [`key_sequence::DEFAULT_SEQUENCE`]).
+const APP_SEQUENCE_DEFAULT_NOTICE: &str =
+    "Default \u{2014} username, Tab, password. Add or remove a step to change it.";
+
+/// The builder's two captions.
+const APP_SEQUENCE_OPEN: &str = "Change what it types\u{2026}";
+const APP_SEQUENCE_CLOSE: &str = "Done";
+
+/// The shut block's one line: the steps, in words, in order.
+///
+/// **Named, never elided.** The pane is narrow and the honest way to fit a
+/// long sequence into it is to let the label wrap; cutting it off with an
+/// ellipsis would hide exactly the step a user came to check (`aae9429`'s
+/// lesson, and the reason `assert_visible` compares glyphs with the source).
+pub fn sequence_summary(sequence: &str) -> String {
+    let view = sequence_view(sequence);
+    let steps: Vec<String> = view.tokens.iter().map(|t| t.chip_label()).collect();
+    let joined = steps.join(" \u{b7} ");
+    if view.is_default {
+        format!("{joined}  (default)")
+    } else {
+        joined
+    }
+}
+
+/// The eye's two captions. The word says what the click does next, not what
+/// the pane is doing now.
+const APP_SEQUENCE_REVEAL: &str = "Show what it types";
+const APP_SEQUENCE_HIDE: &str = "Hide what it types";
+
+/// The wait box's starting value, in seconds. One second is the shortest wait
+/// that is any use against a page navigation and the most common thing typed,
+/// so the button works without touching the box at all.
+const DEFAULT_WAIT_SECONDS: &str = "1";
+
+/// What the eye shows about the item when the eye is shut. Deliberately not a
+/// count of characters or a masked run of dots -- neither is information, and
+/// a dotted run invites the reading that the dots are the password's length.
+const APP_SEQUENCE_HIDDEN_NOTE: &str = "Values are hidden.";
+
+/// The chips a sequence is drawn as, and whether they are the item's own or
+/// the default standing in for a stored value it does not have.
+///
+/// One type rather than two returns, because the two facts must not be able to
+/// disagree: the notice is shown exactly when the tokens came from the
+/// default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceView {
+    pub tokens: Vec<key_sequence::Token>,
+    /// The item stores no sequence, so these are [`key_sequence::DEFAULT_SEQUENCE`]'s.
+    pub is_default: bool,
+}
+
+/// See [`SequenceView`].
+pub fn sequence_view(sequence: &str) -> SequenceView {
+    SequenceView {
+        tokens: key_sequence::effective_tokens(sequence),
+        is_default: sequence.is_empty(),
+    }
+}
+
+/// The stored string after `tokens` replace whatever was there.
+///
+/// **An empty token list stores the empty string, which means the default
+/// again -- not "type nothing".** That is the whole of the reason: this app has
+/// no spelling for "type nothing", because that is not a fill anyone wants and
+/// because the empty string is already spoken for by every item in every
+/// existing vault. So a user who deletes every chip is put back where they
+/// started, with the notice saying so, rather than silently given an item that
+/// stops filling.
+fn store(tokens: &[key_sequence::Token]) -> String {
+    if tokens.is_empty() {
+        String::new()
+    } else {
+        key_sequence::render(tokens)
+    }
+}
+
+/// `sequence` with `token` added on the end.
+///
+/// Adding to an item that stores nothing **materialises the default first**,
+/// so clicking `{TOTP}` on a fresh item gives username-Tab-password-code
+/// rather than a sequence that types only the code. The alternative -- start
+/// from nothing -- silently deletes the fill the item already had, on a click
+/// whose caption said "add".
+pub fn sequence_with(sequence: &str, token: key_sequence::Token) -> String {
+    let mut tokens = key_sequence::effective_tokens(sequence);
+    tokens.push(token);
+    store(&tokens)
+}
+
+/// `sequence` with the chip at `index` gone. Out of range changes nothing.
+pub fn sequence_without(sequence: &str, index: usize) -> String {
+    let mut tokens = key_sequence::effective_tokens(sequence);
+    if index >= tokens.len() {
+        return sequence.to_string();
+    }
+    tokens.remove(index);
+    store(&tokens)
+}
+
+/// `sequence` with the chip at `index` swapped with its neighbour.
+///
+/// A no-op at the ends, and it returns the input **unchanged** there rather
+/// than a re-rendered copy of it: a click on a disabled arrow must not be able
+/// to rewrite the spelling of a sequence this build merely carries.
+pub fn sequence_moved(sequence: &str, index: usize, back: bool) -> String {
+    let mut tokens = key_sequence::effective_tokens(sequence);
+    let other = if back { index.checked_sub(1) } else { index.checked_add(1) };
+    let Some(other) = other else { return sequence.to_string() };
+    if index >= tokens.len() || other >= tokens.len() {
+        return sequence.to_string();
+    }
+    tokens.swap(index, other);
+    store(&tokens)
+}
+
+/// `sequence` with `text` added as literal characters, escaped so it is typed
+/// as itself.
+///
+/// `None` when there is nothing to add, so the caller does not have to decide
+/// whether an empty box is an edit -- and so a click on Add with an empty box
+/// leaves the stored string byte-identical instead of re-rendering it.
+pub fn sequence_with_literal(sequence: &str, text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    Some(sequence_with(sequence, key_sequence::Token::Literal(text.to_string())))
+}
+
+/// `sequence` with a wait added, from the **seconds** the user typed.
+///
+/// `None` for anything [`key_sequence::wait_ms_from_seconds`] refuses, which
+/// is what lets the button be disabled with the box saying why rather than a
+/// click that appears to work and adds nothing.
+pub fn sequence_with_wait(sequence: &str, seconds: &str) -> Option<String> {
+    let ms = key_sequence::wait_ms_from_seconds(seconds)?;
+    Some(sequence_with(sequence, key_sequence::Token::Delay(ms)))
+}
+
+/// The field buttons this form offers, for the item **as it is being edited**.
+///
+/// The user name and the password come from the DRAFT rather than the item,
+/// and that is the point: typing a user name into the form above and then
+/// looking for a `{USERNAME}` button should find one, and an item whose
+/// password is being cleared should stop offering to type it. The one-time
+/// code and the custom fields come from the item, because this form does not
+/// edit either -- so the item is the only thing that knows about them, and
+/// `{S:PIN}` is discoverable exactly when a field called `PIN` really exists.
+///
+/// `None` for a create: there is no item yet, so there are no custom fields
+/// and no TOTP secret to name, and the two boxes on this very form are the
+/// whole of what can be referenced.
+pub fn sequence_palette(draft: &EditDraft, item: Option<&VaultItem>) -> Vec<FieldRef> {
+    let mut out = Vec::new();
+    if !draft.username.is_empty() {
+        out.push(FieldRef::Username);
+    }
+    if !draft.password.is_empty() {
+        out.push(FieldRef::Password);
+    }
+    if let Some(item) = item {
+        for field in key_sequence::field_palette(item) {
+            match field {
+                // The draft has already answered for these two, and it is the
+                // more current answer.
+                FieldRef::Username | FieldRef::Password => {}
+                other if !out.contains(&other) => out.push(other),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// What the preview resolves against: the draft's own boxes for the two values
+/// this form edits, the item for everything else, and the vault window's one
+/// [`detail::TotpState`] for the code.
+///
+/// **Borrowed, for the length of one frame.** Nothing here is copied and
+/// nothing is stored; see [`PreviewPart`].
+/// The two draft strings are passed separately rather than as `&EditDraft`
+/// **so the borrow checker can split them from `draft.app`**, which the block
+/// that draws the sequence holds mutably at the same moment. A whole-struct
+/// borrow here would make the preview and the builder mutually exclusive.
+pub fn sequence_source<'a>(
+    username: &'a str,
+    password: &'a str,
+    item: Option<&'a VaultItem>,
+    totp: &'a detail::TotpState,
+) -> ResolveSource<'a> {
+    ResolveSource {
+        username,
+        password,
+        custom: item.map(key_sequence::custom_pairs).unwrap_or_default(),
+        totp,
+    }
+}
+
 /// The three trigger pills, bound to the draft rather than reporting a click.
 ///
 /// The order, the words and the caption are `detail`'s -- the read pane's card
@@ -1364,12 +1652,253 @@ fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
     }
 }
 
+/// One chip: the step, and the three controls that move and remove it.
+///
+/// **In a wrapped row, never a scrolled one.** The pane refuses horizontal
+/// scrolling (see `assert_inside`), so a chip row that ran off the right edge
+/// would put steps somewhere the user cannot click -- the very defect
+/// `aae9429` fixed for the app card. `horizontal_wrapped` is the whole
+/// mechanism, and the minimum-size test below is what holds it.
+///
+/// Returns the edit the click asked for, applied by the caller after the loop
+/// so the borrow of the token list is over first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipEdit {
+    Back(usize),
+    Forward(usize),
+    Remove(usize),
+}
+
+/// The wrapped chip row. Returns the one edit clicked, if any.
+fn sequence_chips(ui: &mut egui::Ui, tokens: &[Token]) -> Option<ChipEdit> {
+    let mut edit = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 4.0);
+        for (index, token) in tokens.iter().enumerate() {
+            // An unknown step is drawn in the faint ink and says so on hover:
+            // it is carried, not acted on, and a user looking at an imported
+            // sequence should be able to see which is which.
+            let understood = token.is_understood();
+            let chip = egui::Button::new(
+                theme::semibold(token.chip_label(), 12.0)
+                    .color(if understood { theme::INK } else { theme::TEXT_FAINT }),
+            )
+            .fill(if understood { theme::BLUE_WASH } else { theme::CARD_TINT })
+            .stroke(Stroke::new(1.0, if understood { theme::BLUE_EDGE } else { theme::BORDER }))
+            .corner_radius(CornerRadius::same(7))
+            .wrap();
+            let response = ui.add(chip);
+            if !understood {
+                response.on_hover_text(SEQUENCE_UNKNOWN_TIP);
+            }
+            if ui.add_enabled(index > 0, small_chip_button("<")).clicked() {
+                edit = Some(ChipEdit::Back(index));
+            }
+            if ui.add_enabled(index + 1 < tokens.len(), small_chip_button(">")).clicked() {
+                edit = Some(ChipEdit::Forward(index));
+            }
+            if ui.add(small_chip_button("x")).clicked() {
+                edit = Some(ChipEdit::Remove(index));
+            }
+        }
+    });
+    edit
+}
+
+/// The tip on a step this build carries but does not understand.
+const SEQUENCE_UNKNOWN_TIP: &str =
+    "Deskwarden does not know this step. It is kept exactly as it is so another password \
+     manager can still read it.";
+
+/// The move/remove controls. ASCII captions on purpose: the app's own font is
+/// a Latin text face, and an arrow glyph it has no coverage for is a control
+/// that draws as a box.
+fn small_chip_button(caption: &str) -> egui::Button<'static> {
+    egui::Button::new(theme::semibold(caption.to_string(), 11.0).color(theme::TEXT_FAINT))
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.0, theme::BORDER))
+        .corner_radius(CornerRadius::same(5))
+}
+
+/// The resolved preview. Draws and drops -- see [`PreviewPart`].
+fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(2.0, 3.0);
+        for part in parts {
+            let (text, color) = match part {
+                PreviewPart::Text(t) => (t.clone(), theme::INK),
+                PreviewPart::Value(v) => (v.clone(), theme::BLUE),
+                // In brackets, so a key cannot be misread as the characters
+                // of its own name sitting in the typed text.
+                PreviewPart::Key(symbol) => (format!("[{symbol}]"), theme::TEXT_FAINT),
+                PreviewPart::Wait(label) => (format!("[{label}]"), theme::TEXT_FAINT),
+                PreviewPart::Unresolved(why) => (why.clone(), theme::ERROR),
+                PreviewPart::Pending => ("[fetching code]".to_string(), theme::TEXT_FAINT),
+                PreviewPart::Opaque(raw) => (raw.clone(), theme::TEXT_FAINT),
+            };
+            ui.label(RichText::new(text).size(12.0).color(color));
+        }
+    });
+}
+
+/// The keystroke builder: the chips, the palette, and the eye.
+///
+/// Every branch here is a call to one of the pure functions above. What is
+/// left in this function is which button was pressed.
+fn app_sequence_block(
+    ui: &mut egui::Ui,
+    app: &mut AppMatchDraft,
+    palette: &[FieldRef],
+    source: &ResolveSource<'_>,
+) {
+    theme::field_label(ui, APP_SEQUENCE_LABEL);
+    let view = sequence_view(&app.sequence);
+
+    // Shut, this is three lines: what would be typed, said in words, and the
+    // way in. See `AppMatchDraft::sequence_open`.
+    if !app.sequence_open {
+        ui.label(
+            RichText::new(sequence_summary(&app.sequence)).size(11.0).color(theme::TEXT_FAINT),
+        );
+        ui.add_space(4.0);
+        if theme::secondary_button(ui, APP_SEQUENCE_OPEN).clicked() {
+            app.sequence_open = true;
+        }
+        ui.add_space(10.0);
+        return;
+    }
+
+    ui.label(RichText::new(APP_SEQUENCE_HINT).size(11.0).color(theme::TEXT_FAINT));
+    ui.add_space(6.0);
+
+    if view.is_default {
+        ui.label(
+            RichText::new(APP_SEQUENCE_DEFAULT_NOTICE).size(11.0).color(theme::TEXT_FAINT),
+        );
+        ui.add_space(4.0);
+    }
+
+    if let Some(edit) = sequence_chips(ui, &view.tokens) {
+        app.sequence = match edit {
+            ChipEdit::Back(i) => sequence_moved(&app.sequence, i, true),
+            ChipEdit::Forward(i) => sequence_moved(&app.sequence, i, false),
+            ChipEdit::Remove(i) => sequence_without(&app.sequence, i),
+        };
+    }
+    ui.add_space(8.0);
+
+    // -- the palette: nothing here is typed from memory --------------------
+    ui.label(RichText::new("Add a value").size(11.0).color(theme::TEXT_FAINT));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for field in palette {
+            if ui.add(palette_button(&field.label())).clicked() {
+                app.sequence = sequence_with(&app.sequence, Token::Field(field.clone()));
+            }
+        }
+        if palette.is_empty() {
+            ui.label(
+                RichText::new("This item has no fields to reference yet.")
+                    .size(11.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+    });
+    ui.add_space(6.0);
+
+    ui.label(RichText::new("Add a key").size(11.0).color(theme::TEXT_FAINT));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
+            if ui.add(palette_button(key.label)).clicked() {
+                app.sequence = sequence_with(&app.sequence, Token::Key(key));
+            }
+        }
+    });
+    ui.add_space(6.0);
+
+    // -- literal text: `2134{TOTP}` is why this box exists ------------------
+    ui.label(RichText::new("Add text").size(11.0).color(theme::TEXT_FAINT));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.add(egui::TextEdit::singleline(&mut app.literal_draft).desired_width(120.0));
+        let add = theme::secondary_button(ui, "Add text");
+        if add.clicked() {
+            // Escaping is this app's job, not the user's: they typed a `+`,
+            // they get a `+`. See `key_sequence::escape_literal`.
+            if let Some(next) = sequence_with_literal(&app.sequence, &app.literal_draft) {
+                app.sequence = next;
+                app.literal_draft.clear();
+            }
+        }
+    });
+    ui.add_space(6.0);
+
+    // -- the wait, in the seconds the user asked for -----------------------
+    ui.label(RichText::new("Add a wait").size(11.0).color(theme::TEXT_FAINT));
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.add(egui::TextEdit::singleline(&mut app.wait_draft).desired_width(48.0));
+        ui.label(RichText::new("seconds").size(11.0).color(theme::TEXT_FAINT));
+        let addable = key_sequence::wait_ms_from_seconds(&app.wait_draft).is_some();
+        if ui.add_enabled(addable, egui::Button::new("Add wait")).clicked() {
+            if let Some(next) = sequence_with_wait(&app.sequence, &app.wait_draft) {
+                app.sequence = next;
+            }
+        }
+        if !addable {
+            ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+        }
+    });
+    ui.add_space(8.0);
+
+    // -- the eye ------------------------------------------------------------
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        let caption = if app.previewing { APP_SEQUENCE_HIDE } else { APP_SEQUENCE_REVEAL };
+        if theme::secondary_button(ui, caption).clicked() {
+            app.previewing = !app.previewing;
+        }
+        if !view.is_default && theme::secondary_button(ui, "Use the default").clicked() {
+            // The empty string, not the default's own spelling: see `store`.
+            app.sequence = String::new();
+        }
+        if theme::secondary_button(ui, APP_SEQUENCE_CLOSE).clicked() {
+            app.sequence_open = false;
+            // Shutting the builder shuts the eye with it. A reveal that
+            // survived being scrolled past and came back open later would be
+            // a reveal the user did not ask for the second time.
+            app.previewing = false;
+        }
+    });
+    ui.add_space(4.0);
+    if app.previewing {
+        sequence_preview(ui, &key_sequence::resolve_preview(&view.tokens, source));
+    } else {
+        ui.label(RichText::new(APP_SEQUENCE_HIDDEN_NOTE).size(11.0).color(theme::TEXT_FAINT));
+    }
+    ui.add_space(10.0);
+}
+
+/// The refusal under the wait box, said as the rule rather than as "invalid".
+const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
+
+fn palette_button(label: &str) -> egui::Button<'static> {
+    egui::Button::new(theme::semibold(label.to_string(), 12.0).color(theme::INK))
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.0, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(7))
+        .wrap()
+}
+
 /// The whole app block. Returns an [`EditAction`] when it needs the caller to
 /// do something the form cannot (open the file dialog).
 fn app_block(
     ui: &mut egui::Ui,
     app: &mut AppMatchDraft,
     apps: &mut AppIdentityCache,
+    palette: &[FieldRef],
+    source: &ResolveSource<'_>,
 ) -> Option<EditAction> {
     let mut action = None;
     theme::hairline(ui);
@@ -1489,6 +2018,10 @@ fn app_block(
     );
     ui.add_space(10.0);
 
+    // After the trigger, because it answers the next question: *when* this
+    // item fills, and then *what it types*.
+    app_sequence_block(ui, app, palette, source);
+
     // Staged, not immediate: unlike the read pane's card -- which writes
     // straight through because there is no Save to wait for -- this is one
     // change among several on a form the user can still Cancel. Nothing is
@@ -1556,6 +2089,16 @@ pub fn draw_detail_edit(
     folders: &[Folder],
     creating: bool,
     apps: &mut AppIdentityCache,
+    // `item` is the item being edited, or `None` while one is being created.
+    // It is read for exactly two things -- the custom fields the keystroke
+    // palette offers, and the ones its preview resolves -- because this form
+    // does not edit either and the item is the only thing that knows them.
+    // Everything else on screen still comes from the draft.
+    item: Option<&VaultItem>,
+    // The vault window's ONE `detail::TotpState`, so the keystroke preview can
+    // show what `{TOTP}` would type. Not a second poll: this form cannot fetch
+    // a code and does not try.
+    totp: &detail::TotpState,
 ) -> EditAction {
     let mut action = EditAction::None;
     // Read before the closure borrows `draft` mutably.
@@ -1846,8 +2389,15 @@ pub fn draw_detail_edit(
             //
             // Drawn only for an item that HAS a binding -- see `EditDraft::app`
             // and `AppMatchDraft`.
+            // Built here, immediately before the block that reads them, and
+            // dropped immediately after: `source` borrows the draft's own
+            // user-name and password boxes (never a copy of either), and
+            // splitting them from `draft.app` is only possible field by field
+            // like this. See `sequence_source`.
+            let palette = sequence_palette(draft, item);
+            let source = sequence_source(&draft.username, &draft.password, item, totp);
             if let Some(app) = draft.app.as_mut() {
-                if let Some(requested) = app_block(ui, app, apps) {
+                if let Some(requested) = app_block(ui, app, apps, &palette, &source) {
                     action = requested;
                 }
                 ui.add_space(4.0);
@@ -1955,6 +2505,7 @@ mod tests {
             hosted: false,
             path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
             args: r#"--profile-directory="Profile 2""#.to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -1967,6 +2518,7 @@ mod tests {
             hosted: true,
             path: String::new(),
             args: String::new(),
+            sequence: String::new(),
             trigger: TriggerMode::Hotkey,
         }
     }
@@ -3355,7 +3907,15 @@ mod generator_row_tests {
 
     /// Wide enough that the generator row is not wrapped and tall enough that
     /// the combo's popup opens *downward*, which `popup_entry` relies on.
-    const BODY: egui::Vec2 = egui::vec2(560.0, 900.0);
+    ///
+    /// **The height is a harness size, not a claim about the app.** These
+    /// tests ask what the form *says*; the form scrolls, so a control below
+    /// the fold is painted only if the harness pane is tall enough to hold the
+    /// whole form. Raised from 900 when the app block gained the keystroke
+    /// summary. What the app can really be resized to is asserted separately
+    /// and deliberately, against `MIN_PANE_WIDTH`/`MIN_PANE_HEIGHT` in
+    /// `min_size_tests` -- those are the geometry pins and this is not one.
+    const BODY: egui::Vec2 = egui::vec2(560.0, 1100.0);
 
     #[derive(Default)]
     struct Painted {
@@ -3461,7 +4021,7 @@ mod generator_row_tests {
         let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false, &mut apps);
+            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, &detail::TotpState::NoSecret);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -3738,6 +4298,7 @@ mod generator_row_tests {
             // an icon -- passed every test in this file.
             path: r"C:\Deskwarden Test\Chrome\chrome_proxy.exe".to_string(),
             args: "--profile-directory=WorkProfile".to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -3756,6 +4317,7 @@ mod generator_row_tests {
             // the form (the row is disabled and says so) and they must not be
             // saved. See `to_match`.
             args: "--headless".to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Hotkey,
         }
     }
@@ -4240,6 +4802,721 @@ mod generator_row_tests {
     }
 }
 
+/// The keystroke builder: its decisions, its wiring, and its geometry.
+///
+/// Every decision the block makes is one of the pure functions above, and each
+/// is called here directly rather than through a frame. The three tests that
+/// DO run a frame are the wiring pins -- they exist to fail when the call that
+/// draws the block, or the assignment that saves it, is deleted.
+#[cfg(test)]
+mod sequence_builder_tests {
+    use super::*;
+    use eframe::egui::{Pos2, Rect, Vec2};
+
+    // -- fixtures ----------------------------------------------------------
+    //
+    // Every value differs from every other one, deliberately: a fixture whose
+    // password equalled its user name would let a `{PASSWORD}` that resolved
+    // the user name pass every assertion below.
+
+    const USERNAME: &str = "ada@contoso.test";
+    const PASSWORD: &str = "correct-horse-battery";
+    const PIN: &str = "8421";
+    const TOTP_CODE: &str = "776699";
+
+    fn vault_field(name: &str, value: &str) -> crate::vault_bridge::VaultField {
+        crate::vault_bridge::VaultField {
+            name: Some(name.to_string()),
+            value: Some(value.to_string()),
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// The user's own case: a Microsoft-365-shaped login with a PIN field, so
+    /// `{S:PIN}` is discoverable and resolvable.
+    fn item() -> VaultItem {
+        VaultItem {
+            id: "item-1".to_string(),
+            name: "Contoso 365".to_string(),
+            fields: vec![vault_field("PIN", PIN)],
+            login: Some(LoginData {
+                username: Some(USERNAME.to_string()),
+                password: Some(PASSWORD.to_string().into()),
+                totp: Some("JBSWY3DPEHPK3PXP".to_string().into()),
+                uris: Vec::new(),
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn draft_for(item: &VaultItem, sequence: &str) -> EditDraft {
+        let mut draft = EditDraft::from_item(item);
+        draft.app = Some(AppMatchDraft::from_match(&AppMatch {
+            process: "msedge.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Deskwarden Test\Edge\msedge.exe".to_string(),
+            args: String::new(),
+            sequence: sequence.to_string(),
+            trigger: TriggerMode::Prompt,
+        }));
+        draft
+    }
+
+    fn live_code() -> detail::TotpState {
+        detail::TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 21 }
+    }
+
+    // -- the view and the default ------------------------------------------
+
+    #[test]
+    fn an_item_with_no_sequence_shows_the_default_and_says_so() {
+        let view = sequence_view("");
+        assert!(view.is_default);
+        assert_eq!(
+            view.tokens,
+            key_sequence::parse(key_sequence::DEFAULT_SEQUENCE),
+            "an empty sequence must show what would really be typed, not nothing"
+        );
+        assert_eq!(sequence_summary(""), "Username \u{b7} Tab \u{b7} Password  (default)");
+    }
+
+    #[test]
+    fn an_item_with_a_sequence_shows_its_own_and_is_not_marked_default() {
+        let view = sequence_view("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}");
+        assert!(!view.is_default);
+        assert_eq!(
+            sequence_summary("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}"),
+            "Username \u{b7} Enter \u{b7} Wait 2s \u{b7} Password"
+        );
+    }
+
+    // -- the edits ---------------------------------------------------------
+
+    #[test]
+    fn adding_to_an_item_that_stores_nothing_keeps_the_fill_it_already_had() {
+        // The trap this closes: starting from an empty token list would make
+        // one click on `{TOTP}` silently delete the user name and password
+        // this item has always typed.
+        let next = sequence_with(&String::new(), Token::Field(FieldRef::Totp));
+        assert_eq!(next, "{USERNAME}{TAB}{PASSWORD}{TOTP}");
+    }
+
+    #[test]
+    fn adding_appends_to_a_sequence_the_item_already_stores() {
+        assert_eq!(
+            sequence_with("{USERNAME}", Token::Key(key_sequence::key_named("ENTER").unwrap())),
+            "{USERNAME}{ENTER}"
+        );
+    }
+
+    #[test]
+    fn removing_a_step_removes_that_step_and_no_other() {
+        let stored = "{USERNAME}{TAB}{PASSWORD}{ENTER}";
+        assert_eq!(sequence_without(stored, 1), "{USERNAME}{PASSWORD}{ENTER}");
+        assert_eq!(sequence_without(stored, 0), "{TAB}{PASSWORD}{ENTER}");
+        assert_eq!(sequence_without(stored, 3), "{USERNAME}{TAB}{PASSWORD}");
+        // Out of range changes nothing, byte for byte.
+        assert_eq!(sequence_without(stored, 4), stored);
+    }
+
+    #[test]
+    fn removing_every_step_gives_the_default_back_rather_than_an_item_that_types_nothing() {
+        let mut sequence = "{TAB}{ENTER}".to_string();
+        sequence = sequence_without(&sequence, 0);
+        sequence = sequence_without(&sequence, 0);
+        assert_eq!(sequence, "", "an emptied sequence must store the empty string");
+        let view = sequence_view(&sequence);
+        assert!(view.is_default);
+        assert!(
+            !view.tokens.is_empty(),
+            "emptying the builder left an item that would type nothing"
+        );
+    }
+
+    #[test]
+    fn moving_a_step_swaps_it_with_its_neighbour() {
+        let stored = "{USERNAME}{TAB}{PASSWORD}";
+        assert_eq!(sequence_moved(stored, 2, true), "{USERNAME}{PASSWORD}{TAB}");
+        assert_eq!(sequence_moved(stored, 0, false), "{TAB}{USERNAME}{PASSWORD}");
+    }
+
+    /// **A click that does nothing must change nothing, byte for byte.**
+    ///
+    /// The fixtures are chosen so the assertion can actually fail. A sequence
+    /// that happens to round-trip through this build's own renderer cannot
+    /// tell "returned the input" from "re-rendered the input" -- the first
+    /// version of this test used `{PICKCHARS}{tab}{DELAY  9}`, which
+    /// round-trips exactly, and a mutant that re-rendered on every disabled
+    /// arrow SURVIVED it. These three do not round-trip to themselves:
+    ///
+    ///  * the empty string, which re-renders as the whole default -- so a
+    ///    disabled arrow would silently write a sequence onto an item that
+    ///    stored none;
+    ///  * an unterminated brace, which re-renders escaped;
+    ///  * a lower-case key beside them, so the value is one this build only
+    ///    carries.
+    #[test]
+    fn a_move_that_does_nothing_leaves_the_stored_bytes_exactly_as_they_were() {
+        for stored in ["", "{USERNAME", "{tab}{PICKCHARS"] {
+            for (index, back) in [(0, true), (0, false), (9, true), (9, false)] {
+                // Only the no-op directions: index 0 forward on a one-token
+                // sequence is a no-op too, and index 9 is past the end of all
+                // three.
+                if index == 0 && !back && key_sequence::effective_tokens(stored).len() > 1 {
+                    continue;
+                }
+                assert_eq!(
+                    sequence_moved(stored, index, back),
+                    stored,
+                    "moving {index} (back = {back}) rewrote {stored:?}"
+                );
+            }
+            assert_eq!(
+                sequence_without(stored, 9),
+                stored,
+                "removing a step that is not there rewrote {stored:?}"
+            );
+        }
+        // The control: these fixtures really would change if re-rendered, so
+        // the assertions above are not satisfied by a value that is its own
+        // rendering.
+        for stored in ["", "{USERNAME", "{tab}{PICKCHARS"] {
+            assert_ne!(
+                key_sequence::render(&key_sequence::effective_tokens(stored)),
+                stored,
+                "{stored:?} is its own rendering, so this test cannot tell a no-op from a rewrite"
+            );
+        }
+        // ...and a move that IS a move still moves.
+        assert_eq!(sequence_moved("{TAB}{ENTER}", 1, true), "{ENTER}{TAB}");
+    }
+
+    #[test]
+    fn text_the_user_types_is_escaped_for_them() {
+        // "user can decide whether they want ... to put literals" -- and the
+        // user is not expected to know that `+` and `{` are special.
+        let stored = sequence_with_literal("", "100%+{x}").unwrap();
+        assert_eq!(stored, "{USERNAME}{TAB}{PASSWORD}100{%}{+}{{}x{}}");
+        // ...and it comes back as the very characters they typed.
+        let tokens = key_sequence::parse(&stored);
+        assert_eq!(tokens.last(), Some(&Token::Literal("100%+{x}".to_string())));
+    }
+
+    #[test]
+    fn an_empty_text_box_is_not_an_edit() {
+        assert_eq!(sequence_with_literal("{TAB}", ""), None);
+    }
+
+    #[test]
+    fn the_users_own_example_is_expressible_by_clicking() {
+        // "2134{TOTP} - which will return as 2134776699"
+        let mut sequence = String::new();
+        // Start from the default, strip it back, then build the literal.
+        sequence = sequence_without(&sequence, 0);
+        sequence = sequence_without(&sequence, 0);
+        sequence = sequence_without(&sequence, 0);
+        sequence = sequence_with_literal(&sequence, "2134").unwrap();
+        // The default came back when the list emptied, so drop it again and
+        // keep only what was typed.
+        let index_of_literal = key_sequence::parse(&sequence)
+            .iter()
+            .position(|t| matches!(t, Token::Literal(text) if text == "2134"))
+            .expect("the literal was added");
+        for _ in 0..index_of_literal {
+            sequence = sequence_without(&sequence, 0);
+        }
+        sequence = sequence_with(&sequence, Token::Field(FieldRef::Totp));
+        assert_eq!(sequence, "2134{TOTP}");
+
+        let item = item();
+        let totp = live_code();
+        let draft = draft_for(&item, &sequence);
+        let source = sequence_source(&draft.username, &draft.password, Some(&item), &totp);
+        let parts = key_sequence::resolve_preview(&key_sequence::parse(&sequence), &source);
+        assert_eq!(
+            parts,
+            vec![
+                PreviewPart::Text("2134".to_string()),
+                PreviewPart::Value(TOTP_CODE.to_string()),
+            ],
+            "the user's own example does not resolve to 2134{TOTP_CODE}"
+        );
+    }
+
+    #[test]
+    fn a_wait_is_added_in_seconds_and_stored_in_milliseconds() {
+        assert_eq!(sequence_with_wait("{TAB}", "1.5"), Some("{TAB}{DELAY 1500}".to_string()));
+        assert_eq!(sequence_with_wait("{TAB}", "2"), Some("{TAB}{DELAY 2000}".to_string()));
+        // Refused rather than added as nothing, which is what lets the button
+        // be disabled with the rule shown beside it.
+        for typed in ["", "soon", "-1", "9999"] {
+            assert_eq!(sequence_with_wait("{TAB}", typed), None, "{typed:?}");
+        }
+    }
+
+    // -- the palette -------------------------------------------------------
+
+    #[test]
+    fn the_palette_lists_this_items_own_fields_and_not_a_fixed_list() {
+        let item = item();
+        let draft = draft_for(&item, "");
+        assert_eq!(
+            sequence_palette(&draft, Some(&item)),
+            vec![
+                FieldRef::Username,
+                FieldRef::Password,
+                FieldRef::Totp,
+                FieldRef::Custom("PIN".to_string()),
+            ],
+            "`{{S:PIN}}` is discoverable only if the palette comes from the item"
+        );
+        // The control: a different item offers different buttons.
+        let mut other = item.clone();
+        other.fields = vec![vault_field("Security answer", "Fido")];
+        other.login.as_mut().unwrap().totp = None;
+        let other_draft = draft_for(&other, "");
+        let palette = sequence_palette(&other_draft, Some(&other));
+        assert!(!palette.contains(&FieldRef::Totp), "{palette:?}");
+        assert!(palette.contains(&FieldRef::Custom("Security answer".to_string())), "{palette:?}");
+        assert!(!palette.contains(&FieldRef::Custom("PIN".to_string())), "{palette:?}");
+    }
+
+    #[test]
+    fn the_palette_follows_the_boxes_on_this_very_form() {
+        let item = item();
+        let mut draft = draft_for(&item, "");
+        draft.username.clear();
+        let palette = sequence_palette(&draft, Some(&item));
+        assert!(
+            !palette.contains(&FieldRef::Username),
+            "a user name cleared on the form is still offered: {palette:?}"
+        );
+        assert!(palette.contains(&FieldRef::Password), "{palette:?}");
+    }
+
+    #[test]
+    fn a_create_offers_only_the_two_boxes_it_has() {
+        let mut draft = EditDraft::empty();
+        draft.username = "someone@example.test".to_string();
+        assert_eq!(sequence_palette(&draft, None), vec![FieldRef::Username]);
+    }
+
+    // -- the preview -------------------------------------------------------
+
+    #[test]
+    fn the_preview_resolves_against_the_boxes_on_the_form_not_the_saved_item() {
+        let item = item();
+        let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
+        draft.password = "just-typed-this".to_string();
+        let totp = live_code();
+        let source = sequence_source(&draft.username, &draft.password, Some(&item), &totp);
+        let parts =
+            key_sequence::resolve_preview(&key_sequence::parse(&draft.app.as_ref().unwrap().sequence), &source);
+        assert_eq!(
+            parts,
+            vec![
+                PreviewPart::Value(USERNAME.to_string()),
+                PreviewPart::Key("\u{21e5}"),
+                PreviewPart::Value("just-typed-this".to_string()),
+            ]
+        );
+        assert_ne!("just-typed-this", PASSWORD, "the fixture's two passwords must differ");
+    }
+
+    #[test]
+    fn a_reference_to_a_field_that_is_not_there_is_shown_as_unresolved() {
+        let item = item();
+        let draft = draft_for(&item, "{S:Missing}");
+        let totp = live_code();
+        let source = sequence_source(&draft.username, &draft.password, Some(&item), &totp);
+        let parts = key_sequence::resolve_preview(&key_sequence::parse("{S:Missing}"), &source);
+        assert!(
+            matches!(parts.as_slice(), [PreviewPart::Unresolved(_)]),
+            "{parts:?}"
+        );
+    }
+
+    // -- the draft carries it, verbatim, in both directions -----------------
+
+    #[test]
+    fn the_draft_carries_the_stored_sequence_verbatim_in_both_directions() {
+        for sequence in [
+            "",
+            "{USERNAME}{TAB}{PASSWORD}",
+            "{PICKCHARS}{tab}{DELAY  9}",
+            "2134{TOTP}",
+        ] {
+            let m = AppMatch {
+                sequence: sequence.to_string(),
+                ..AppMatch::for_process("a.exe", TriggerMode::Auto)
+            };
+            let draft = AppMatchDraft::from_match(&m);
+            assert_eq!(draft.sequence, sequence, "into the draft: {sequence:?}");
+            assert_eq!(draft.to_match().sequence, sequence, "out of it: {sequence:?}");
+            assert_eq!(draft.to_match(), m, "{sequence:?}");
+        }
+    }
+
+    /// Unlike the arguments beside it, the sequence is **kept** for a Store
+    /// app: nothing is started by path, but a Store window is typed into like
+    /// any other. Making `to_match` zero it the way it zeroes `args` fails
+    /// here.
+    #[test]
+    fn a_store_binding_keeps_its_sequence() {
+        let m = AppMatch {
+            process: "Speedtest.exe".to_string(),
+            title: "Speedtest by Ookla".to_string(),
+            hosted: true,
+            path: String::new(),
+            args: "--headless".to_string(),
+            sequence: "{USERNAME}{ENTER}".to_string(),
+            trigger: TriggerMode::Hotkey,
+        };
+        let round = AppMatchDraft::from_match(&m).to_match();
+        assert_eq!(round.sequence, "{USERNAME}{ENTER}");
+        // The control: the arguments beside it really are dropped, so the
+        // assertion above is about the sequence and not about a `to_match`
+        // that drops nothing.
+        assert_eq!(round.args, "");
+    }
+
+    /// **The byte-identity promise, end to end.** An edit that does not touch
+    /// the sequence must not rewrite it -- not even into a spelling this build
+    /// finds tidier. `{tab}` and `{DELAY  9}` are exactly the constructs this
+    /// build would re-spell if it ever round-tripped the string through its
+    /// own renderer.
+    #[test]
+    fn an_edit_that_does_not_touch_the_sequence_writes_nothing_at_all() {
+        let stored = "{USERNAME}{tab}{DELAY  9}{PICKCHARS}{PASSWORD}";
+        let existing =
+            AppMatch { sequence: stored.to_string(), ..AppMatch::for_process("a.exe", TriggerMode::Auto) };
+        let draft = AppMatchDraft::from_match(&existing);
+        assert_eq!(
+            app_match_edit(Some(&existing), Some(&draft)),
+            AppMatchEdit::Leave,
+            "renaming an item rewrote a keystroke sequence this build merely carries"
+        );
+        // The control: an edit that DOES touch it is written.
+        let mut edited = draft.clone();
+        edited.sequence = sequence_with(&edited.sequence, Token::Field(FieldRef::Totp));
+        assert!(matches!(
+            app_match_edit(Some(&existing), Some(&edited)),
+            AppMatchEdit::Write(m) if m.sequence.starts_with(stored)
+        ));
+    }
+
+    // -- the wiring, pinned separately from the decisions --------------------
+
+    /// Tall enough to hold the whole form with the builder OPEN, so a control
+    /// below the fold is painted and can be asserted about. A harness size,
+    /// not a claim about the app: the form scrolls, and what the app can
+    /// really be resized to is asserted against `MIN_PANE_WIDTH` below and in
+    /// `edit_pane_layout_tests`.
+    const PANE: Vec2 = egui::vec2(560.0, 1700.0);
+
+    /// The narrowest the detail pane can be -- the same derivation, and the
+    /// same reason, as `edit_pane_layout_tests`'s.
+    const MIN_PANE_WIDTH: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+        - crate::vault_window::SIDEBAR_WIDTH
+        - crate::vault_window::LIST_WIDTH;
+
+    #[derive(Default)]
+    struct Painted {
+        texts: Vec<(String, Rect)>,
+        rendered: Vec<(String, String, Rect)>,
+    }
+
+    impl Painted {
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn rects_of(&self, label: &str) -> Vec<Rect> {
+            self.texts.iter().filter(|(t, _)| t == label).map(|(_, r)| *r).collect()
+        }
+
+        fn rect_of(&self, label: &str) -> Rect {
+            let found = self.rects_of(label);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?}, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+    }
+
+    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rect = Rect::from_min_size(text.pos, text.galley.size());
+                let rendered: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect();
+                painted.texts.push((text.galley.text().to_string(), rect));
+                painted.rendered.push((text.galley.text().to_string(), rendered, rect));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, painted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn raw_input(pane: Vec2, events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn styled_context(pane: Vec2) -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(pane, &[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(pane, &[]), |_ui| {});
+        ctx
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        item: &VaultItem,
+        totp: &detail::TotpState,
+        events: &[egui::Event],
+    ) -> Painted {
+        let mut apps = AppIdentityCache::default();
+        let output = ctx.run_ui(raw_input(pane, events), |ui| {
+            let _ = draw_detail_edit(ui, draft, &[], false, &mut apps, Some(item), totp);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// Opens the builder, and answers with the frame drawn after it opened.
+    fn open_builder(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        item: &VaultItem,
+        totp: &detail::TotpState,
+    ) -> Painted {
+        let shut = frame(ctx, pane, draft, item, totp, &[]);
+        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let _ = frame(ctx, pane, draft, item, totp, &click(at));
+        assert!(draft.app.as_ref().unwrap().sequence_open, "the builder did not open");
+        frame(ctx, pane, draft, item, totp, &[])
+    }
+
+    /// **The wiring pin for the drawing.** Deleting the
+    /// `app_sequence_block(...)` call inside `app_block` fails here: the form
+    /// stops saying anything about keystrokes at all.
+    #[test]
+    fn the_form_draws_the_keystroke_block_for_a_bound_item() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "");
+        let painted = frame(&ctx, PANE, &mut draft, &item, &detail::TotpState::NoSecret, &[]);
+        let strings = painted.strings();
+        assert!(strings.contains(&APP_SEQUENCE_LABEL), "{strings:?}");
+        assert!(
+            strings.iter().any(|s| *s == sequence_summary("")),
+            "the block does not say what would be typed: {strings:?}"
+        );
+        assert!(strings.contains(&APP_SEQUENCE_OPEN), "there is no way in: {strings:?}");
+    }
+
+    /// The palette really is on screen and really is the item's own: every
+    /// field button, every key button, and the two boxes.
+    #[test]
+    fn opening_the_builder_shows_every_field_key_and_wait_the_user_can_click() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "");
+        let painted = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let strings = painted.strings();
+        for field in sequence_palette(&draft, Some(&item)) {
+            assert!(
+                strings.contains(&field.label().as_str()),
+                "{:?} is not a button: {strings:?}",
+                field.label()
+            );
+        }
+        for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
+            assert!(strings.contains(&key.label), "{} is not a button: {strings:?}", key.label);
+        }
+        assert!(strings.contains(&"Add text"), "{strings:?}");
+        assert!(strings.contains(&"Add wait"), "{strings:?}");
+        assert!(strings.contains(&APP_SEQUENCE_REVEAL), "the eye is missing: {strings:?}");
+    }
+
+    /// **The wiring pin for the write.** A click on a palette button reaches
+    /// the draft, and the draft reaches the saved item. Deleting
+    /// `sequence: self.sequence.clone()` from `AppMatchDraft::to_match` fails
+    /// on the second half.
+    #[test]
+    fn clicking_a_field_adds_it_to_the_sequence_and_the_save_carries_it() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "");
+        let painted = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let at = painted.rect_of(&FieldRef::Totp.label()).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+        assert_eq!(
+            draft.app.as_ref().unwrap().sequence,
+            "{USERNAME}{TAB}{PASSWORD}{TOTP}",
+            "the click did not reach the draft"
+        );
+        let saved = draft.apply_to(&item);
+        let stored = crate::vault_bridge::extract_app_match(&saved).expect("the binding is saved");
+        assert_eq!(
+            stored.sequence, "{USERNAME}{TAB}{PASSWORD}{TOTP}",
+            "the sequence the user built was not written to the item"
+        );
+    }
+
+    /// The eye is what makes this parser have a reader. Shut, the values are
+    /// not on screen; open, they are.
+    #[test]
+    fn the_eye_reveals_what_the_sequence_would_actually_type() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "2134{TOTP}");
+        let shut = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        assert!(
+            !shut.strings().iter().any(|s| s.contains(TOTP_CODE)),
+            "the code is on screen with the eye shut: {:?}",
+            shut.strings()
+        );
+        let at = shut.rect_of(APP_SEQUENCE_REVEAL).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+        let open = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let strings = open.strings();
+        assert!(
+            strings.contains(&TOTP_CODE),
+            "the eye is open and the code is not shown: {strings:?}"
+        );
+        assert!(strings.contains(&"2134"), "the literal is not shown: {strings:?}");
+    }
+
+    /// Every chip, and every palette button, is inside the pane at the app's
+    /// MINIMUM width -- and drawn with the glyphs of its own label, not an
+    /// elision of it.
+    ///
+    /// This is `aae9429`'s defect stated for a new row: the edit form's card
+    /// is already 309.3pt wide on a 298pt pane, and a chip row that ran off
+    /// the right edge would put steps somewhere with no horizontal scroll to
+    /// reach them. `horizontal_wrapped` is what holds it.
+    #[test]
+    fn every_chip_and_button_is_reachable_at_the_apps_minimum_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, 2200.0);
+        let item = item();
+        let ctx = styled_context(pane);
+        // A deliberately long sequence: more steps than fit on one row, so
+        // the wrap is really exercised rather than merely available.
+        let mut draft =
+            draft_for(&item, "{USERNAME}{TAB}{PASSWORD}{ENTER}{DELAY 2000}{S:PIN}{TAB}{TOTP}{ENTER}");
+        let painted = open_builder(&ctx, pane, &mut draft, &item, &live_code());
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+
+        let mut checked = 0;
+        for token in sequence_view(&draft.app.as_ref().unwrap().sequence).tokens {
+            let label = token.chip_label();
+            for rect in painted.rects_of(&label) {
+                assert!(
+                    bounds.contains_rect(rect),
+                    "the chip {label:?} is painted at {rect:?}, off a {}x{}pt pane -- this pane \
+                     does not scroll horizontally",
+                    pane.x,
+                    pane.y
+                );
+                checked += 1;
+            }
+            // ...and the label is the whole label, not an elision of it.
+            let rendered: Vec<&String> = painted
+                .rendered
+                .iter()
+                .filter(|(source, _, _)| *source == label)
+                .map(|(_, drawn, _)| drawn)
+                .collect();
+            assert!(!rendered.is_empty(), "the chip {label:?} was not painted at all");
+            for drawn in rendered {
+                assert_eq!(
+                    *drawn, label,
+                    "the chip {label:?} DREW {drawn:?} -- it is on the pane and unreadable"
+                );
+            }
+        }
+        assert!(checked >= 8, "only {checked} chips were checked; the row was not drawn");
+
+        // The palette buttons too: a key the user cannot reach is a key the
+        // user has to type from memory, which is the whole thing they asked
+        // not to have to do.
+        for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
+            for rect in painted.rects_of(key.label) {
+                assert!(
+                    bounds.contains_rect(rect),
+                    "the {} button is painted at {rect:?}, off a {}pt-wide pane",
+                    key.label,
+                    pane.x
+                );
+            }
+        }
+
+        // The control on this assertion: it is not vacuous because the chips
+        // really did need more than one row.
+        let rows: std::collections::BTreeSet<i64> = sequence_view(&draft.app.as_ref().unwrap().sequence)
+            .tokens
+            .iter()
+            .flat_map(|t| painted.rects_of(&t.chip_label()))
+            .map(|r| r.top() as i64)
+            .collect();
+        assert!(
+            rows.len() > 1,
+            "every chip landed on one row, so nothing here proves the row wraps"
+        );
+    }
+}
+
 /// The edit form's SHAPE, on a pane too short to hold it.
 ///
 /// The bug these exist for: `draw_detail_edit` drew the title, the whole form
@@ -4395,9 +5672,24 @@ mod edit_pane_layout_tests {
         creating: bool,
         events: &[egui::Event],
     ) -> Painted {
+        frame_for(ctx, pane, draft, creating, events, None, &detail::TotpState::NoSecret)
+    }
+
+    /// [`frame`], against a real item and a real TOTP state -- what the
+    /// keystroke palette and its preview need and nothing else on this form
+    /// reads.
+    fn frame_for(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        creating: bool,
+        events: &[egui::Event],
+        item: Option<&VaultItem>,
+        totp: &detail::TotpState,
+    ) -> Painted {
         let mut apps = AppIdentityCache::default();
         let output = ctx.run_ui(raw_input(pane, events), |ui| {
-            let _ = draw_detail_edit(ui, draft, &[], creating, &mut apps);
+            let _ = draw_detail_edit(ui, draft, &[], creating, &mut apps, item, totp);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -4424,6 +5716,7 @@ mod edit_pane_layout_tests {
             // happens to be installed.
             path: r"C:\Deskwarden Test\Chrome\chrome.exe".to_string(),
             args: r#"--profile-directory="Profile 2""#.to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }));
         assert!(!draft.is_valid(), "the tall case wants the name error showing");
@@ -4843,7 +6136,7 @@ mod edit_pane_layout_tests {
         for _ in 0..2 {
             let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
                 let before = sample(ui);
-                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps);
+                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps, None, &detail::TotpState::NoSecret);
                 seen = Some((before, sample(ui)));
             });
         }

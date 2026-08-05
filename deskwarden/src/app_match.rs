@@ -113,6 +113,40 @@ pub struct AppMatch {
     /// in a user's vault still parses.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub args: String,
+    /// The auto-type keystroke sequence, in KeePass's notation --
+    /// `{USERNAME}{TAB}{PASSWORD}{ENTER}` and its relatives. See
+    /// [`crate::key_sequence`] for the grammar and
+    /// [`crate::key_sequence::DEFAULT_SEQUENCE`] for what the empty string
+    /// means.
+    ///
+    /// **Stored verbatim, exactly like [`Self::args`], and for a stronger
+    /// reason.** This notation is not this app's -- it is KeePass's, which is
+    /// the whole point of using it ("so it is portable"): the same field can
+    /// have been written by KeePass, by KeePassXC, or by a later build of this
+    /// app that knows constructs this one does not. So the string is kept as
+    /// the user's bytes and never re-spelled: `key_sequence::parse` is total
+    /// and carries anything it does not model through
+    /// `key_sequence::Token::Unknown`, and the edit form holds this string
+    /// rather than a parsed value, so an edit that does not touch the sequence
+    /// writes back the very bytes that arrived.
+    ///
+    /// **Why it lives on the binding rather than beside it.** A sequence is
+    /// how to fill *this app*, not a fact about the credential: two vault
+    /// items naming the same browser under different profiles (see
+    /// [`Self::args`]) can want different sequences, and a login filled into
+    /// two different programs would want two. Putting it on the binding also
+    /// keeps it in the one custom field this app already owns, rather than
+    /// adding a second `deskwarden:` field to every user's items. The cost is
+    /// stated plainly: an item with no binding has nowhere to put a sequence,
+    /// which is fine today because there is nothing to fill without a binding
+    /// -- ambient web matching does not exist yet. The Microsoft 365 case the
+    /// user raised is reached the way this app already reaches the web, by
+    /// binding the browser.
+    ///
+    /// Skipped when empty, so every match already in a vault serializes to
+    /// exactly the bytes it has now.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sequence: String,
     pub trigger: TriggerMode,
 }
 
@@ -127,6 +161,7 @@ impl AppMatch {
             hosted: false,
             path: String::new(),
             args: String::new(),
+            sequence: String::new(),
             trigger,
         }
     }
@@ -291,6 +326,7 @@ mod tests {
             // arguments have their own fixture (`with_args`) and their own
             // tests.
             args: String::new(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -304,6 +340,7 @@ mod tests {
             hosted: false,
             path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
             args: r#"--profile-directory="Profile 2""#.to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -476,6 +513,83 @@ mod tests {
         // so the two assertions above are not satisfied by a field that is
         // never serialized at all.
         assert!(with_args().to_field_value().contains(r#""args":"#));
+    }
+
+    /// **The keystroke sequence reaches the wire under its own key**, as the
+    /// literal bytes rather than as a comparison against the serializer's own
+    /// output. Renaming the key, or folding the sequence into another field,
+    /// fails here with a string diff.
+    #[test]
+    fn the_sequence_serializes_under_its_own_key() {
+        let m = AppMatch {
+            sequence: "{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{ENTER}".to_string(),
+            ..with_args()
+        };
+        assert_eq!(
+            m.to_field_value(),
+            r#"{"process":"chrome.exe","path":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe","args":"--profile-directory=\"Profile 2\"","sequence":"{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{ENTER}","trigger":"prompt"}"#
+        );
+    }
+
+    /// The whole point of the field: the string comes back **byte for byte**.
+    /// A serializer that normalised the notation -- upper-cased a key name,
+    /// re-spelled a delay, dropped a construct it did not recognise -- fails
+    /// here rather than in someone else's password manager.
+    #[test]
+    fn the_sequence_round_trips_verbatim() {
+        for sequence in [
+            "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+            "{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{ENTER}",
+            "2134{TOTP}",
+            "{S:PIN}{TAB}{TOTP}",
+            "{PICKCHARS}{APPACTIVATE Notepad}",
+            "{tab}{BKSP}",
+            "{{}literal{}}",
+            "^v+{TAB}%{F4}",
+            "  leading and trailing  ",
+        ] {
+            let m = AppMatch { sequence: sequence.to_string(), ..with_args() };
+            let parsed = AppMatch::from_field_value(&m.to_field_value()).unwrap();
+            assert_eq!(parsed.sequence, sequence, "sequence: {sequence:?}");
+            assert_eq!(parsed, m, "sequence: {sequence:?}");
+        }
+    }
+
+    /// **Backward compatibility, as the literal bytes now sitting in real
+    /// vaults.** Dropping `#[serde(default)]` from `sequence` fails here with
+    ///     called `Result::unwrap()` on an `Err` value: Error("missing field `sequence`", ...)
+    #[test]
+    fn a_match_saved_before_the_sequence_existed_still_parses_and_carries_none() {
+        for stored in [
+            r#"{"process":"RockstarGamesLauncher.exe","trigger":"hotkey"}"#,
+            r#"{"process":"Speedtest.exe","title":"Speedtest","hosted":true,"path":"C:\\Program Files\\WindowsApps\\Speedtest\\Speedtest.exe","trigger":"prompt"}"#,
+            r#"{"process":"chrome.exe","path":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe","args":"--profile-directory=\"Profile 2\"","trigger":"prompt"}"#,
+        ] {
+            let parsed =
+                AppMatch::from_field_value(stored).expect("a shipped field value must parse");
+            assert_eq!(parsed.sequence, "", "an old value records no sequence: {stored}");
+            // ...and re-saving it writes the user's field back UNCHANGED,
+            // byte for byte. Deleting `sequence`'s `skip_serializing_if`
+            // gives `...,"sequence":"","trigger":...` and fails here.
+            assert_eq!(
+                parsed.to_field_value(),
+                stored,
+                "a re-save rewrote a field that had not been edited"
+            );
+        }
+        // Positive control: a match that DOES carry a sequence writes the key,
+        // so the assertions above are not satisfied by a field that is never
+        // serialized at all.
+        assert!(
+            AppMatch { sequence: "{TAB}".to_string(), ..with_args() }
+                .to_field_value()
+                .contains(r#""sequence":"{TAB}""#)
+        );
+    }
+
+    #[test]
+    fn for_process_records_no_sequence() {
+        assert_eq!(AppMatch::for_process("a.exe", TriggerMode::Prompt).sequence, "");
     }
 
     /// The arguments are **not** part of what makes a path launchable, in

@@ -730,7 +730,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 31] = [
+        const OPENS_NO_WINDOW: [&str; 32] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -760,6 +760,7 @@ mod tests {
             "icon",
             "injector",
             "job_object",
+            "key_sequence",
             "logging",
             "match_engine",
             "password_strength",

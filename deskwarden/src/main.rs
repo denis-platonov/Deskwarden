@@ -12092,6 +12092,7 @@ mod tests {
                 hosted: true,
                 path: String::new(),
                 args: String::new(),
+                sequence: String::new(),
                 trigger,
             }
         }

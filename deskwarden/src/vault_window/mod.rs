@@ -2620,7 +2620,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                     // user had looked away from.
                     DetailMode::Edit(draft) => {
                         detail::forget_copy_toast(ui.ctx());
-                        match draw_detail_edit(ui, draft, &folders, false, &mut app_identities) {
+                        match draw_detail_edit(ui, draft, &folders, false, &mut app_identities, selected_item.as_ref(), &totp_state) {
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
@@ -2715,7 +2715,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                     }
                     DetailMode::Create(draft) => {
                         detail::forget_copy_toast(ui.ctx());
-                        match draw_detail_edit(ui, draft, &folders, true, &mut app_identities) {
+                        match draw_detail_edit(ui, draft, &folders, true, &mut app_identities, None, &totp_state) {
                             // `to_new_item` is fallible because `NewItem` has no
                             // variant for `ItemKind::Unknown(_)`: a future Bitwarden
                             // type has no create payload, and every total
@@ -7609,7 +7609,7 @@ mod app_block_wiring_tests {
     /// once a frame -- it has to be the SAME one across frames, so it is
     /// passed in from `run`'s own state. Twice: the edit form and the create
     /// form both take it.
-    const PASSES_THE_CACHE: &str = concat!("&mut app_", "identities)");
+    const PASSES_THE_CACHE: &str = concat!("&mut app_", "identities,");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -10360,6 +10360,7 @@ mod fill_target_tests {
                 hosted,
                 path: String::new(),
                 args: String::new(),
+                sequence: String::new(),
                 trigger: TriggerMode::Auto,
             },
         )
@@ -10514,6 +10515,7 @@ mod fill_hotkey_applies_tests {
                 hosted: false,
                 path: String::new(),
                 args: String::new(),
+                sequence: String::new(),
                 trigger: TriggerMode::Auto,
             },
         );

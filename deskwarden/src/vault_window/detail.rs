@@ -5887,6 +5887,7 @@ mod tests {
             hosted: false,
             path: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
             args: String::new(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -5900,6 +5901,7 @@ mod tests {
             hosted: true,
             path: r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe".to_string(),
             args: String::new(),
+            sequence: String::new(),
             trigger: TriggerMode::Hotkey,
         }
     }
@@ -6216,6 +6218,7 @@ mod tests {
             hosted: false,
             path: String::new(),
             args: String::new(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -6246,6 +6249,7 @@ mod tests {
                         hosted,
                         path: String::new(),
                         args: String::new(),
+                        sequence: String::new(),
                         trigger: TriggerMode::Prompt,
                     };
                     let mut engine = MatchEngine::new();
@@ -10029,6 +10033,7 @@ mod tests {
             hosted: false,
             path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
             args: r#"--profile-directory="Profile 2""#.to_string(),
+            sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -10885,6 +10890,7 @@ mod read_pane_scroll_tests {
                 // what happens to be installed on the machine running it.
                 path: "C:\\Deskwarden Test\\Ledgerline\\Ledgerline.exe".to_string(),
                 args: String::new(),
+                sequence: String::new(),
                 trigger: TriggerMode::Prompt,
             },
         )

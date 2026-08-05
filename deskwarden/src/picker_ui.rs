@@ -867,6 +867,7 @@ fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
         // replay). The edit form is where arguments are typed -- see
         // `vault_window::detail_edit`.
         args: String::new(),
+        sequence: String::new(),
         trigger,
     }
 }

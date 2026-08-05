@@ -226,6 +226,7 @@ mod tests {
                 path: format!(r"C:\Apps\{process}"),
                 hosted: true,
                 args: String::new(),
+                sequence: String::new(),
                 trigger: TriggerMode::Prompt,
             },
         )

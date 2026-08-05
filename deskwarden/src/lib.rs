@@ -28,6 +28,7 @@ pub mod http_agent;
 pub mod icon;
 pub mod injector;
 pub mod job_object;
+pub mod key_sequence;
 pub mod loading_ui;
 pub mod logging;
 pub mod login_ui;
