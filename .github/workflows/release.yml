@@ -24,7 +24,7 @@ jobs:
   build-and-release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # deskwarden.iss's AppVersion/OutputBaseFilename and updater.rs's
       # release-asset parsing (`tag.strip_prefix('v')`, then
@@ -103,7 +103,7 @@ jobs:
           echo "TODO: wire SignPath signing once the account is approved. This installer is UNSIGNED."
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             deskwarden/target/release/deskwarden.exe
