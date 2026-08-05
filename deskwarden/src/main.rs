@@ -5567,9 +5567,24 @@ mod tests {
     /// and `stop_backend_if_idle` against an actual `Child` without needing a
     /// real `bw serve` -- neither function cares what the process is, only
     /// whether it's alive.
+    ///
+    /// **`ping` is spawned directly, not as `cmd /c ping`.** Through `cmd` the
+    /// `Child` is the shell and `ping` is a GRANDCHILD, so every `kill()` in
+    /// these tests stopped the shell and left the `ping` running: one leaked
+    /// process per use, and these tests spawn one per assertion. Measured on
+    /// the test machine mid-run: 7812 live `PING` processes out of 9037
+    /// processes total.
+    ///
+    /// That debris is what made `tasklist` cost seconds -- it enumerates the
+    /// process table, and the table was the leak. `ProcessWatch` already means
+    /// no test has to ask `tasklist` anything, so this no longer decides
+    /// whether the suite is fast; it decides whether running the suite quietly
+    /// degrades the machine it runs on. Spawning `ping` itself makes the
+    /// `Child` the process under test, so `kill()` stops it and `wait()` reaps
+    /// it, and the suite leaves nothing behind.
     fn long_lived_command() -> std::process::Command {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/c", "ping", "-n", "20", "127.0.0.1"])
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "20", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         cmd
