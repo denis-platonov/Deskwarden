@@ -5646,9 +5646,66 @@ mod write_arms_adopt_the_backends_copy_tests {
     /// The calls that make each arm a write at all.
     const UNMATCH_CALL: &str = concat!("crate::vault_bridge::without_app", "_match(item)");
     const TRIGGER_CALL: &str = concat!("detail::app_match_with", "_trigger(&current, to)");
+    /// **Which row the returned item is written ONTO** -- the half of "adopt
+    /// the backend's copy" this suite did not pin (review 20's Minor 3).
+    /// Replacing this selector with `position(|_i| true)` writes the server's
+    /// copy of the edited item over row 0 of the list, and the whole suite
+    /// stayed green: every `items[pos] = ...;` needle above still matched, and
+    /// nothing else reads the list's ordering.
+    const ROW_SELECTOR: &str = concat!("items.iter().position(|i| i.id == ", "item.id)");
+    /// The favourite arm names its own returned item rather than `item`, so
+    /// it has its own spelling of the same rule.
+    const STAR_ROW_SELECTOR: &str = concat!("items.iter().position(|i| i.id == ", "starred.id)");
+    /// The head of every one of these adoptions, and the boundary between one
+    /// arm and the next -- see [`arm_pins_its_row`]. Split for this module's
+    /// standing reason, and note that it is also the tail of every `*_ARM`
+    /// const above, so nothing counts occurrences of it.
+    const ASSIGNMENT_HEAD: &str = concat!("items[pos]", " = ");
+    /// The bare call, whatever predicate it was given. The anchor
+    /// [`arm_pins_its_row`] searches back to, so a MUTATED predicate is what
+    /// the assertion reads rather than a correct one further up the file.
+    const ANY_ROW_SELECTOR: &str = concat!("items.iter().", "position(");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
+    }
+
+    /// Asserts that the arm whose adoption reads `assignment` picks its row
+    /// with `selector`.
+    ///
+    /// **Bounded by the code itself, not by a byte count.** The slice runs
+    /// from the LAST [`ANY_ROW_SELECTOR`] before the assignment -- so a
+    /// mutated predicate is the one this reads, rather than a correct one
+    /// further up the file -- and it is rejected outright if another arm's
+    /// [`ASSIGNMENT_HEAD`] sits in between, which is what it would mean for
+    /// the selector found to belong to a different arm. A fixed byte window
+    /// was tried first and is what those two facts replace: the widest of
+    /// these arms carries 600 bytes of comment between its selector and its
+    /// assignment, and a window wide enough for that reaches its neighbour.
+    ///
+    /// A slice rather than a whole-file count for the same reason: a count
+    /// says "the right selector appears N times somewhere", which a mutation
+    /// in ONE arm leaves true of the others.
+    fn arm_pins_its_row(assignment: &str, selector: &str, what: &str) {
+        let source = source();
+        let at = source.find(assignment).unwrap_or_else(|| {
+            panic!(
+                "no {assignment:?} in this file -- {what} was renamed or deleted, and this                  guard is now aimed at nothing"
+            )
+        });
+        let selector_at = source[..at].rfind(ANY_ROW_SELECTOR).unwrap_or_else(|| {
+            panic!("{what} reaches {assignment:?} without resolving a row at all")
+        });
+        assert!(
+            !source[selector_at..at].contains(ASSIGNMENT_HEAD),
+            "{what} has no row lookup of its own -- the nearest one above it belongs to              another arm, which this guard must not accept as proof. Between them: {:?}",
+            &source[selector_at..at]
+        );
+        assert!(
+            source[selector_at..].starts_with(selector),
+            "{what} adopts the backend's copy but does not pin WHICH ROW it lands on: it              resolves the row with {:?} rather than {selector:?}, so the server's copy of              the edited item is written over some other item's row",
+            &source[selector_at..at]
+        );
     }
 
     #[test]
@@ -5738,12 +5795,72 @@ mod write_arms_adopt_the_backends_copy_tests {
              `vault_bridge::without_app_match` exactly once (needle {UNMATCH_CALL:?}); \
              without it, Remove reports and writes nothing"
         );
+        // **And each arm SENDS the value it built.** Passing the bare
+        // `item` to the cache instead of the rebuilt/cleared copy writes the
+        // UNCHANGED item -- the trigger change never reaches the vault -- and
+        // the whole suite stays green; only `unused variable` catches it,
+        // i.e. the compiler and not a test.
+        for (needle, what) in [
+            (concat!("cache.update_item(&", "rebound)"), "the trigger arm"),
+            (concat!("cache.update_item(&", "unbound)"), "the Remove arm"),
+        ] {
+            assert_eq!(
+                source().matches(needle).count(),
+                1,
+                "{what} does not PUT the item it built exactly once (needle {needle:?}); \
+                 sending `item` instead writes the unchanged item and the edit is lost"
+            );
+        }
         assert_eq!(
             source().matches(TRIGGER_CALL).count(),
             1,
             "the trigger arm does not go through `detail::app_match_with_trigger` exactly \
              once (needle {TRIGGER_CALL:?}); rebuilding the match here would make this a \
              second producer of the four fields the picker captured off a live window"
+        );
+    }
+
+    /// **Onto the RIGHT ROW.** "Adopt the returned item" was pinned above and
+    /// "put it back where it came from" was not, so `position(|i| i.id ==
+    /// item.id)` could become `position(|_i| true)` in either MATCHED APP arm
+    /// with 1309/1309 green and no warning -- the edited item's server copy
+    /// landing on row 0 of the list, which is a different item every time the
+    /// user's sort or filter changes.
+    ///
+    /// The two pre-existing arms are here as well: they share the shape, the
+    /// mutation survives in them identically, and covering them costs one
+    /// line each.
+    #[test]
+    fn every_write_arm_puts_the_returned_item_back_on_its_own_row() {
+        for (assignment, what) in [
+            (TRIGGER_ARM, "the MATCHED APP card's trigger arm"),
+            (UNMATCH_ARM, "the MATCHED APP card's Remove arm"),
+            (MOVE_ARM, "the row menu's move arm"),
+            (SAVE_ARM, "the edit pane's save arm"),
+        ] {
+            arm_pins_its_row(assignment, ROW_SELECTOR, what);
+        }
+        // The star's arm resolves its row off the item the cache handed back
+        // rather than off `item`, so it has its own selector.
+        arm_pins_its_row(FAVOURITE_ARM, STAR_ROW_SELECTOR, "the star's arm");
+        // POSITIVE CONTROL, in two parts: the helper must be capable of
+        // failing, or none of the assertions above can.
+        //
+        // 1. The mutation this test exists to catch appears nowhere.
+        assert_eq!(
+            source().matches(concat!("items.iter().position(|_i| ", "true)")).count(),
+            0,
+            "the mutation this test exists to catch is live somewhere in this file"
+        );
+        // 2. The star's arm really does use a DIFFERENT selector, so the
+        //    per-arm slicing is doing work: asked for the ordinary one, the
+        //    helper must reject it.
+        let mismatched = std::panic::catch_unwind(|| {
+            arm_pins_its_row(FAVOURITE_ARM, ROW_SELECTOR, "a deliberately wrong pairing")
+        });
+        assert!(
+            mismatched.is_err(),
+            "arm_pins_its_row accepts a selector the arm does not use, so an arm that              resolved the wrong row would pass"
         );
     }
 

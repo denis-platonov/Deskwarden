@@ -1259,9 +1259,22 @@ fn copy_shortcut_action(
         // `CopyTotp` out of this same state, so every other variant --
         // `NoSecret`, `Fetching`, `Unavailable`, `NoCodeReported` -- would
         // have it copy nothing, or an empty string, without this gate.
-        CopyShortcut::Totp => {
-            matches!(totp, TotpState::Code { .. }).then_some(DetailAction::CopyTotp)
-        }
+        //
+        // **And `row_offers_copy` on the code itself**, not `Code { .. }`
+        // alone (review 20's Minor 4). `Code { code: String::new() }` is a
+        // shape this pane cannot rule out -- `totp_code_row` passes
+        // `row_offers_copy(code)` for exactly that reason, and the note on
+        // `TotpRow` refuses to assume otherwise -- and the bare variant test
+        // left CTRL+T copying an empty string and raising "One-time code
+        // copied" over it, which is the defect `bc161b2` fixed on the click
+        // path and only on the click path. Asking `row_offers_copy` is what
+        // makes the two paths one rule rather than two that agree today.
+        CopyShortcut::Totp => match totp {
+            TotpState::Code { code, .. } => {
+                row_offers_copy(code).then_some(DetailAction::CopyTotp)
+            }
+            _ => None,
+        },
     }
 }
 
@@ -1884,9 +1897,15 @@ pub fn draw_detail_read(
     // the cards above are the item's own contents, and this one is about what
     // Deskwarden does with them.
     let app_match = crate::vault_bridge::extract_app_match(item);
-    if app_card_visible(app_match.is_some(), kind) {
+    // **The FIELD, not the parsed match.** A field that will not parse is a
+    // binding the user can see in every other Bitwarden client and must be
+    // able to clear from here; asking `app_match.is_some()` filed it as "no
+    // field at all" and hid the card outright on a non-fillable kind. See
+    // `app_card_body`.
+    let app_field_present = crate::vault_bridge::has_app_match_field(item);
+    if app_card_visible(app_field_present, kind) {
         card(ui, APP_CARD_HEADING, |ui| {
-            app_match_card(ui, app_match.as_ref(), &mut action);
+            app_match_card(ui, app_match.as_ref(), app_field_present, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -1983,18 +2002,110 @@ const APP_MATCH_EMPTY_NOTICE: &str =
 const APP_HOSTED_NOTE: &str =
     "Matched by its window title, because this is a Microsoft Store app.";
 
+/// What the card says under the rows when the match exists but the engine
+/// will never act on it -- see [`app_match_is_dead`].
+///
+/// **It replaces [`trigger_caption`], it does not join it.** The caption is a
+/// promise about what happens when the app is focused, and on a dead binding
+/// every one of the three is false; printing "Show the overlay when this app
+/// is focused." next to "this never fires" is the same lie with a disclaimer
+/// stapled on.
+///
+/// The wording is `picker_ui::existing_host_match_notice`'s, said about the
+/// binding rather than about the picker's target, and it names the same two
+/// ways out the picker names: re-add through the tray, or clear it. Unlike
+/// every other note on this card, the process name it is about is already in
+/// the App row directly above, so this sentence does not repeat it.
+const APP_MATCH_DEAD_NOTICE: &str =
+    "Deskwarden is ignoring this match, so it never fires: that process owns the window for \
+     every Microsoft Store app, and no window title was recorded to tell those apps apart. \
+     Nothing in your vault has been changed. Use \u{201c}Add app\u{2026}\u{201d} in the \
+     Deskwarden tray menu to pick the app again, or Remove to clear it.";
+
+/// What the card says when the item carries a `deskwarden:app-match` field
+/// whose value this build cannot read -- see
+/// [`crate::vault_bridge::has_app_match_field`].
+///
+/// **It says the field is there and unreadable, not that nothing is bound.**
+/// The field is visible and hand-editable in every other Bitwarden client, so
+/// a user who broke it there is looking at a row this pane used to claim did
+/// not exist. It names Remove because Remove is the only thing this pane can
+/// honestly do with it: the value cannot be repaired from a shape nothing can
+/// parse, and `without_app_match` clears it on the field's NAME and so works
+/// perfectly on exactly this case.
+const APP_MATCH_UNREADABLE_NOTICE: &str =
+    "This item has a Deskwarden app match that cannot be read \u{2014} the \
+     \u{201c}deskwarden:app-match\u{201d} custom field is there, but its contents are not \
+     something this version understands, which usually means it was edited by hand in \
+     another Bitwarden client. Autofill ignores it. Remove clears the field, and \
+     \u{201c}Add app\u{2026}\u{201d} in the Deskwarden tray menu can bind this item again.";
+
+/// Whether [`MatchEngine`](crate::match_engine::MatchEngine) has dropped this
+/// match -- i.e. whether the binding the card is about **can never fire**.
+///
+/// **Derived from the engine's own gate, not restated.** `rebuild` keeps a
+/// match out of `by_process` when `is_host_process(&m.process)`, and admits it
+/// to `by_title` only when `m.hosted && !m.title.is_empty()`; a match in
+/// neither table is unreachable from any foreground window at all. That is one
+/// call to [`crate::window_watch::is_host_process`] off the same field, which
+/// is what `picker_ui`'s `host_process_refusal` already does for the same
+/// purpose -- so this is not a second copy of the rule, it is the same
+/// predicate asked from a second place.
+///
+/// `match_engine`'s own doc says telling the user "needs a channel out of
+/// `main`'s loop". That is true of telling them *at the moment it goes quiet*.
+/// It is not true here: the card is holding the match in its hand.
+///
+/// Pinned against the engine's real behaviour by
+/// `a_card_calls_a_match_dead_exactly_when_the_engine_can_never_look_it_up`,
+/// which builds a `MatchEngine` from the match and asks it, rather than
+/// re-spelling the condition.
+fn app_match_is_dead(m: &AppMatch) -> bool {
+    crate::window_watch::is_host_process(&m.process) && !(m.hosted && !m.title.is_empty())
+}
+
+/// Which of the card's three bodies an item asks for.
+///
+/// The pair of answers -- "does the field exist" and "did it parse" -- is
+/// three states, and the card used to collapse them into two by asking only
+/// the second (review 20's Important 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppCardBody<'a> {
+    /// A match this build understands. It may still be dead: see
+    /// [`app_match_is_dead`].
+    Bound(&'a AppMatch),
+    /// The field is there and its value will not parse. Nothing to draw rows
+    /// from, and Remove is the only honest offer.
+    Unreadable,
+    /// No `deskwarden:app-match` field on the item at all.
+    Unbound,
+}
+
+fn app_card_body(app_match: Option<&AppMatch>, field_present: bool) -> AppCardBody<'_> {
+    match app_match {
+        Some(m) => AppCardBody::Bound(m),
+        None if field_present => AppCardBody::Unreadable,
+        None => AppCardBody::Unbound,
+    }
+}
+
 /// Whether the pane draws a [`APP_CARD_HEADING`] card at all.
 ///
-/// **Two reasons, and the first outranks the second.** An item that HAS a
-/// match always gets the card, whatever kind it is: a binding the pane refuses
-/// to draw is the defect being fixed, and an app match sitting on a secure
-/// note is exactly the case a user would most need to see in order to remove
-/// it. An item with no match gets the card only where a match would do
+/// **Two reasons, and the first outranks the second.** An item that CARRIES
+/// the field always gets the card, whatever kind it is: a binding the pane
+/// refuses to draw is the defect being fixed, and an app match sitting on a
+/// secure note is exactly the case a user would most need to see in order to
+/// remove it. An item with no field gets the card only where a match would do
 /// something -- `kind_offers_fill`, the same predicate that gates the Fill
 /// button and the `AUTOFILL TARGETS` card, so a card, a note and a button
 /// cannot end up disagreeing about which kinds autofill.
-fn app_card_visible(has_match: bool, kind: ItemKind) -> bool {
-    has_match || kind_offers_fill(kind)
+///
+/// **`has_field`, not "has a match this build could parse".** A secure note
+/// whose app-match field was corrupted by hand elsewhere had the whole card
+/// suppressed, which is the same invisibility one paragraph up, reached by a
+/// different route.
+fn app_card_visible(has_field: bool, kind: ItemKind) -> bool {
+    has_field || kind_offers_fill(kind)
 }
 
 /// One row of the card: its label, the text in its value column, and whether
@@ -2061,12 +2172,33 @@ fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
 
 /// The card's footer lines, under the rows: what the selected trigger means,
 /// and -- for a Store app -- why this match is keyed on a title.
+///
+/// **A dead match gets [`APP_MATCH_DEAD_NOTICE`] and NOTHING else.** See that
+/// constant: the trigger caption is a claim about what focusing the app does,
+/// and there is no trigger on this binding that does anything at all. The
+/// hosted note goes with it, because "matched by its window title" is exactly
+/// what a dead match failed to be.
 fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
+    if app_match_is_dead(m) {
+        return vec![APP_MATCH_DEAD_NOTICE];
+    }
     let mut notes = vec![trigger_caption(m.trigger)];
     if m.hosted {
         notes.push(APP_HOSTED_NOTE);
     }
     notes
+}
+
+/// Whether the three trigger pills are drawn for `m`.
+///
+/// **Not on a dead binding.** A pill is a control whose entire meaning is
+/// "when this match fires, do THIS"; offering three of them on a match that
+/// cannot fire invites a vault write (`SetAppTrigger` PUTs the item and
+/// supersedes its `revisionDate`) whose only possible effect is to change
+/// which of three things does not happen. Remove stays -- clearing the field
+/// is the one action on this binding that does what it says.
+fn app_card_offers_triggers(m: &AppMatch) -> bool {
+    !app_match_is_dead(m)
 }
 
 /// The three trigger pills, in the order they are drawn.
@@ -2125,15 +2257,31 @@ pub fn app_match_with_trigger(m: &AppMatch, to: TriggerMode) -> AppMatch {
 
 /// The card's body: the rows, the trigger pills, the notes and Remove -- or,
 /// for an item bound to nothing, one sentence saying so.
-fn app_match_card(ui: &mut egui::Ui, app_match: Option<&AppMatch>, action: &mut DetailAction) {
-    let Some(m) = app_match else {
-        card_text(
-            ui,
-            RichText::new(APP_MATCH_EMPTY_NOTICE)
-                .size(ROW_LABEL_SIZE)
-                .color(theme::TEXT_FAINT),
-        );
-        return;
+fn app_match_card(
+    ui: &mut egui::Ui,
+    app_match: Option<&AppMatch>,
+    field_present: bool,
+    action: &mut DetailAction,
+) {
+    let m = match app_card_body(app_match, field_present) {
+        AppCardBody::Bound(m) => m,
+        AppCardBody::Unbound => {
+            card_text(
+                ui,
+                RichText::new(APP_MATCH_EMPTY_NOTICE)
+                    .size(ROW_LABEL_SIZE)
+                    .color(theme::TEXT_FAINT),
+            );
+            return;
+        }
+        // No rows: there is no parsed match to draw any from, and inventing
+        // an "App: (unreadable)" row would be this pane fabricating a field
+        // value. The notice says what is wrong, and Remove -- the same
+        // control, in the same column, as the bound card's -- clears it.
+        AppCardBody::Unreadable => {
+            app_notice_with_remove(ui, APP_MATCH_UNREADABLE_NOTICE, action);
+            return;
+        }
     };
     for (index, app_row) in app_match_rows(m).iter().enumerate() {
         if index > 0 {
@@ -2167,50 +2315,65 @@ fn app_match_card(ui: &mut egui::Ui, app_match: Option<&AppMatch>, action: &mut 
         }
     }
 
-    theme::row_rule(ui);
-    // The trigger lives in the VALUE column, not the control group: it is
-    // this row's value -- what the match's `trigger` currently is -- and not
-    // an action performed on a value shown elsewhere.
-    row(
-        ui,
-        "Autofill",
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            for mode in TRIGGER_ORDER {
-                let selected = mode == m.trigger;
-                let button = egui::Button::new(theme::semibold(trigger_label(mode), 12.0).color(
-                    if selected { egui::Color32::WHITE } else { theme::INK },
-                ))
-                .fill(if selected { theme::BLUE } else { theme::CARD })
-                .stroke(if selected {
-                    Stroke::NONE
-                } else {
-                    Stroke::new(1.0, theme::BORDER_STRONG)
-                })
-                .corner_radius(CornerRadius::same(7));
-                if ui.add(button).clicked() {
-                    if let Some(chosen) = app_trigger_click(m.trigger, mode) {
-                        *action = chosen;
+    // Skipped entirely on a dead binding -- see `app_card_offers_triggers`.
+    // The row is not merely disabled: a greyed control still says "this is
+    // the setting for this binding", and the footer note says the binding has
+    // no settings because it has no behaviour.
+    if app_card_offers_triggers(m) {
+        theme::row_rule(ui);
+        // The trigger lives in the VALUE column, not the control group: it is
+        // this row's value -- what the match's `trigger` currently is -- and
+        // not an action performed on a value shown elsewhere.
+        row(
+            ui,
+            "Autofill",
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for mode in TRIGGER_ORDER {
+                    let selected = mode == m.trigger;
+                    let button =
+                        egui::Button::new(theme::semibold(trigger_label(mode), 12.0).color(
+                            if selected { egui::Color32::WHITE } else { theme::INK },
+                        ))
+                        .fill(if selected { theme::BLUE } else { theme::CARD })
+                        .stroke(if selected {
+                            Stroke::NONE
+                        } else {
+                            Stroke::new(1.0, theme::BORDER_STRONG)
+                        })
+                        .corner_radius(CornerRadius::same(7));
+                    if ui.add(button).clicked() {
+                        if let Some(chosen) = app_trigger_click(m.trigger, mode) {
+                            *action = chosen;
+                        }
                     }
                 }
-            }
-        },
-        |_ui| {},
-    );
+            },
+            |_ui| {},
+        );
+    }
 
     theme::row_rule(ui);
-    // The footer: the notes on the left where a value goes, Remove in the
-    // control group where every other row's control goes. An empty label
-    // keeps it on the same two columns as the rows above it.
+    app_card_footer(ui, &app_card_notes(m), action);
+}
+
+/// The card's footer: the notes on the left where a value goes, Remove in the
+/// control group where every other row's control goes. An empty label keeps it
+/// on the same two columns as the rows above it.
+///
+/// Shared by the bound card and by [`app_notice_with_remove`], so an
+/// unreadable field's Remove is the same control in the same place -- not a
+/// second button that happens to say the same word.
+fn app_card_footer(ui: &mut egui::Ui, notes: &[&str], action: &mut DetailAction) {
     row(
         ui,
         "",
         |ui| {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
-                for note in app_card_notes(m) {
+                for note in notes {
                     ui.label(
-                        RichText::new(note)
+                        RichText::new(*note)
                             .size(ROW_HINT_SIZE)
                             .color(theme::TEXT_GHOST),
                     );
@@ -2237,6 +2400,17 @@ fn app_match_card(ui: &mut egui::Ui, app_match: Option<&AppMatch>, action: &mut 
             }
         },
     );
+}
+
+/// A card body that is one sentence and a Remove: the shape an unreadable
+/// `deskwarden:app-match` field gets (see [`APP_MATCH_UNREADABLE_NOTICE`]).
+///
+/// It goes through [`app_card_footer`] rather than drawing its own button so
+/// that the control reports the same [`DetailAction::RemoveAppMatch`] the
+/// bound card's does -- and so the write arm in `vault_window::mod`, which
+/// clears the field by NAME through `without_app_match`, is reached by both.
+fn app_notice_with_remove(ui: &mut egui::Ui, notice: &'static str, action: &mut DetailAction) {
+    app_card_footer(ui, &[notice], action);
 }
 
 /// A pane for an item this build cannot show the contents of: it states the
@@ -5065,6 +5239,305 @@ mod tests {
         );
     }
 
+    // --- review 20's Important 1: a binding the engine has dropped ---
+
+    /// A match in the shape the reported bug produced: the host's own name,
+    /// no title, not hosted. `MatchEngine::rebuild` drops it from both
+    /// tables, and the card used to draw it as `App: ApplicationFrameHost.exe`
+    /// under "Show the overlay when this app is focused."
+    fn a_dead_host_match() -> AppMatch {
+        AppMatch {
+            process: "ApplicationFrameHost.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: String::new(),
+            args: String::new(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    /// **The predicate is checked against `MatchEngine` itself, not against a
+    /// second spelling of its filter.** An engine is built from the one match
+    /// and asked every foreground window that could plausibly reach it; the
+    /// card is "right" only when it says dead exactly on the matches no such
+    /// window can look up.
+    ///
+    /// The candidate windows are a cross product, not the one event the match
+    /// was captured off: a match is dead only if NOTHING can find it, and
+    /// probing a single event would call a title-keyed match dead merely
+    /// because the process-keyed event misses it.
+    #[test]
+    fn a_card_calls_a_match_dead_exactly_when_the_engine_can_never_look_it_up() {
+        use crate::match_engine::MatchEngine;
+        use crate::window_watch::ForegroundEvent;
+
+        let mut any_dead = false;
+        let mut any_live = false;
+        for process in ["Ledgerline.exe", "ApplicationFrameHost.exe"] {
+            for title in ["", "Speedtest"] {
+                for hosted in [false, true] {
+                    let m = AppMatch {
+                        process: process.to_string(),
+                        title: title.to_string(),
+                        hosted,
+                        path: String::new(),
+                        args: String::new(),
+                        trigger: TriggerMode::Prompt,
+                    };
+                    let mut engine = MatchEngine::new();
+                    engine.rebuild(&[("item-1".to_string(), m.clone())]);
+
+                    // Every window that could conceivably reach this entry:
+                    // its own process and its own title, the host frame, and
+                    // a stranger's name and title as the control.
+                    let mut reachable = false;
+                    for exe_name in [process, "ApplicationFrameHost.exe", "Stranger.exe"] {
+                        for window_title in [title, "", "Some Other Window"] {
+                            let event = ForegroundEvent {
+                                hwnd: 1,
+                                pid: 2,
+                                exe_name: exe_name.to_string(),
+                                title: window_title.to_string(),
+                            };
+                            if engine.lookup(&event).is_some() {
+                                reachable = true;
+                            }
+                        }
+                    }
+
+                    assert_eq!(
+                        app_match_is_dead(&m),
+                        !reachable,
+                        "the card and the match engine disagree about {m:?}: the card says \
+                         dead={}, the engine says it is reachable={reachable}",
+                        app_match_is_dead(&m)
+                    );
+                    if reachable {
+                        any_live = true;
+                    } else {
+                        any_dead = true;
+                    }
+                }
+            }
+        }
+        // The control: the loop really exercised both answers, so the
+        // assertion above is not satisfied by a constant on either side.
+        assert!(any_dead, "no shape in the matrix was dead");
+        assert!(any_live, "no shape in the matrix was live");
+    }
+
+    /// The card's words for a dead binding: it must say it is ignored, and it
+    /// must NOT keep making the promise the trigger caption makes.
+    #[test]
+    fn a_dead_matchs_notes_say_it_is_ignored_and_drop_the_trigger_promise() {
+        let dead = a_dead_host_match();
+        assert!(app_match_is_dead(&dead), "the premise: this match really is dead");
+        let notes = app_card_notes(&dead);
+        assert!(
+            notes.iter().any(|n| n.contains("ignoring")),
+            "a dead binding's card does not say it is ignored: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("Add app")),
+            "a dead binding's card does not say how to replace it: {notes:?}"
+        );
+        for mode in TRIGGER_ORDER {
+            assert!(
+                !notes.contains(&trigger_caption(mode)),
+                "a dead binding still promises {:?}: {notes:?}",
+                trigger_caption(mode)
+            );
+        }
+        assert!(
+            !app_card_offers_triggers(&dead),
+            "a binding that cannot fire still offers three settings for how it fires"
+        );
+        // The controls, on a LIVE match: the caption is there and the dead
+        // notice is not, so neither assertion above is satisfied by a
+        // constant.
+        let live = app_card_notes(&a_store_match());
+        assert!(live.contains(&trigger_caption(TriggerMode::Hotkey)), "{live:?}");
+        assert!(!live.iter().any(|n| n.contains("ignoring")), "{live:?}");
+        assert!(app_card_offers_triggers(&a_store_match()));
+        assert!(app_card_offers_triggers(&a_desktop_match()));
+    }
+
+    /// **The wiring.** The reviewer's demonstration was that the pane painted
+    /// the process name and the trigger caption in one frame while the engine
+    /// answered `None` -- and that no painted string contained "ignor". This
+    /// asserts the pane's real output on that same item.
+    #[test]
+    fn the_pane_tells_the_user_a_dead_binding_is_dead_and_offers_no_trigger_pills() {
+        let item = bound_to(&a_login(), &a_dead_host_match());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert!(
+            frame.painted("MATCHED APP"),
+            "the card is not on screen at all: {:?}",
+            frame.strings()
+        );
+        assert!(
+            frame.strings().iter().any(|t| t.contains("ignoring")),
+            "the pane paints a dead binding with nothing saying it is ignored: {:?}",
+            frame.strings()
+        );
+        for mode in TRIGGER_ORDER {
+            assert!(
+                !frame.painted(trigger_caption(mode)),
+                "the pane still promises {:?} on a binding that cannot fire: {:?}",
+                trigger_caption(mode),
+                frame.strings()
+            );
+            assert!(
+                !frame.painted(trigger_label(mode)),
+                "the pane still offers the {mode:?} pill on a binding that cannot fire"
+            );
+        }
+        // Remove stays: clearing the field is the one thing that works.
+        assert!(frame.painted("Remove"), "{:?}", frame.strings());
+        let remove = frame.rect_of("Remove");
+        let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
+        assert_eq!(clicked.action, DetailAction::RemoveAppMatch);
+
+        // The control: the SAME pane on a LIVE match paints all three pills
+        // and the selected caption, so the absences above are about this
+        // binding and not about a card that stopped drawing anything.
+        let live = bound_to(&a_login(), &a_store_match());
+        let live_frame = pane.idle(&live, &TotpState::NoSecret);
+        for mode in TRIGGER_ORDER {
+            assert!(live_frame.painted(trigger_label(mode)), "{:?}", live_frame.strings());
+        }
+        assert!(live_frame.painted(trigger_caption(TriggerMode::Hotkey)));
+        assert!(
+            !live_frame.strings().iter().any(|t| t.contains("ignoring")),
+            "a live binding is being called ignored: {:?}",
+            live_frame.strings()
+        );
+    }
+
+    // --- review 20's Important 2: a field that will not parse ---
+
+    /// `item` carrying a `deskwarden:app-match` field whose value is `value`
+    /// -- built at the field level on purpose, because `with_app_match` can
+    /// only produce values that parse and the whole case is a value that does
+    /// not. This is the shape a user reaches by editing the custom field in
+    /// any other Bitwarden client.
+    fn carrying_raw_app_match_field(item: &VaultItem, value: &str) -> VaultItem {
+        let mut updated = item.clone();
+        updated.fields.push(crate::vault_bridge::VaultField {
+            name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
+            value: Some(value.to_string()),
+            other: serde_json::Map::new(),
+        });
+        updated
+    }
+
+    /// The three states the card must tell apart, decided by the PAIR of
+    /// answers rather than by `extract_app_match` alone.
+    #[test]
+    fn a_field_that_will_not_parse_is_not_the_same_as_no_field_at_all() {
+        let bound = bound_to(&a_login(), &a_desktop_match());
+        let corrupt = carrying_raw_app_match_field(&a_login(), "{not json");
+        let unknown_trigger = carrying_raw_app_match_field(
+            &a_login(),
+            r#"{"process":"Ledgerline.exe","trigger":"telepathy"}"#,
+        );
+        let unbound = a_login();
+
+        // The premise: both broken shapes really do carry the field and
+        // really do fail to parse.
+        for broken in [&corrupt, &unknown_trigger] {
+            assert!(crate::vault_bridge::has_app_match_field(broken));
+            assert!(crate::vault_bridge::extract_app_match(broken).is_none());
+            assert_eq!(
+                app_card_body(None, crate::vault_bridge::has_app_match_field(broken)),
+                AppCardBody::Unreadable
+            );
+        }
+        assert!(!crate::vault_bridge::has_app_match_field(&unbound));
+        assert_eq!(app_card_body(None, false), AppCardBody::Unbound);
+        let parsed = crate::vault_bridge::extract_app_match(&bound).unwrap();
+        assert_eq!(
+            app_card_body(Some(&parsed), true),
+            AppCardBody::Bound(&parsed)
+        );
+
+        // And the card is drawn for a broken field on a kind that offers no
+        // fill at all -- the case that used to suppress it entirely and so
+        // left the field unclearable from this pane.
+        assert!(
+            app_card_visible(true, ItemKind::SecureNote),
+            "a secure note whose app-match field is corrupt cannot see it"
+        );
+        assert!(
+            !app_card_visible(false, ItemKind::SecureNote),
+            "the control: a secure note with NO field still gets no card"
+        );
+    }
+
+    /// **The wiring, and the fix's whole point:** the field can be removed
+    /// from this pane by a sequence of clicks.
+    #[test]
+    fn a_corrupted_app_match_field_says_what_is_wrong_and_can_be_removed_from_this_pane() {
+        for value in ["{not json", r#"{"process":"a.exe","trigger":"telepathy"}"#] {
+            let item = carrying_raw_app_match_field(&a_login(), value);
+            let mut pane = Pane::new();
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+
+            assert!(frame.painted("MATCHED APP"), "{:?}", frame.strings());
+            assert!(
+                frame.strings().iter().any(|t| t.contains("cannot be read")),
+                "the pane does not say the field is unreadable for {value:?}: {:?}",
+                frame.strings()
+            );
+            assert!(
+                !frame.strings().iter().any(|t| t.contains("No app is matched")),
+                "the pane still claims nothing is bound for {value:?}: {:?}",
+                frame.strings()
+            );
+            let remove = frame.rect_of("Remove");
+            let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
+            assert_eq!(
+                clicked.action,
+                DetailAction::RemoveAppMatch,
+                "Remove on an unreadable field reported {:?}",
+                clicked.action
+            );
+        }
+
+        // The control: an item with NO field paints the empty notice and
+        // offers no Remove, so the assertions above are about the corrupted
+        // field and not about a card that now always says both.
+        let mut pane = Pane::new();
+        let bare = pane.idle(&a_login(), &TotpState::NoSecret);
+        assert!(
+            bare.strings().iter().any(|t| t.contains("No app is matched")),
+            "{:?}",
+            bare.strings()
+        );
+        assert!(!bare.painted("Remove"), "{:?}", bare.strings());
+        assert!(
+            !bare.strings().iter().any(|t| t.contains("cannot be read")),
+            "{:?}",
+            bare.strings()
+        );
+    }
+
+    /// A corrupted field is cleared by the arm the card reports into --
+    /// `without_app_match`, which filters on the field's NAME and so does not
+    /// care that the value never parsed.
+    #[test]
+    fn the_remove_the_card_reports_really_does_clear_an_unparseable_field() {
+        let item = carrying_raw_app_match_field(&a_login(), "{not json");
+        assert!(crate::vault_bridge::has_app_match_field(&item), "the premise");
+        let cleared = crate::vault_bridge::without_app_match(&item);
+        assert!(
+            !crate::vault_bridge::has_app_match_field(&cleared),
+            "Remove leaves the unreadable field in place, so the card's offer is empty"
+        );
+    }
+
     /// The card's rows are the pane's ordinary copy rows, and the placeholder
     /// is not -- Task 1's rule, reaching this card.
     #[test]
@@ -5142,6 +5615,32 @@ mod tests {
                 chord_takes_password,
                 "the click path and CTRL+B disagree about {value:?}"
             );
+            // **TOTP, which this test used to leave out** (review 20's Minor
+            // 4). `totp_code_row` passes `row_offers_copy(code)`, so the
+            // click path already refused `Code { code: "" }`; the chord
+            // gated on the VARIANT alone and never read the code, so CTRL+T
+            // copied an empty string and raised "One-time code copied" over
+            // it. Asked here through the same live-code state the pane
+            // draws, so a variant test cannot satisfy it.
+            let live = TotpState::Code { code: value.to_string(), seconds_left: 17 };
+            let chord_takes_totp =
+                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &live, "").is_some();
+            assert_eq!(
+                row_offers_copy(value),
+                chord_takes_totp,
+                "the click path and CTRL+T disagree about {value:?}"
+            );
+            // The URL binding, for completeness: the fourth chord, and the
+            // one whose row already states the rule through the same
+            // predicate.
+            let chord_takes_url =
+                copy_shortcut_action(CopyShortcut::Url, "x", "x", &TotpState::NoSecret, value)
+                    .is_some();
+            assert_eq!(
+                row_offers_copy(value),
+                chord_takes_url,
+                "the click path and CTRL+SHIFT+U disagree about {value:?}"
+            );
         }
         // The control that keeps the loop above from passing against a
         // `row_offers_copy` that is always false AND a `copy_shortcut_action`
@@ -5149,6 +5648,27 @@ mod tests {
         // value and NO for the empty string.
         assert!(row_offers_copy("hunter2"));
         assert!(!row_offers_copy(""));
+        // And TOTP's non-`Code` states are still refused whatever the loop
+        // above proved -- the gate the variant test was right about, which
+        // reading the code must not have thrown away.
+        for state in [TotpState::NoSecret, TotpState::Fetching] {
+            assert_eq!(
+                copy_shortcut_action(CopyShortcut::Totp, "x", "x", &state, ""),
+                None,
+                "CTRL+T reported a copy in {state:?}"
+            );
+        }
+        assert_eq!(
+            copy_shortcut_action(
+                CopyShortcut::Totp,
+                "x",
+                "x",
+                &TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+                ""
+            ),
+            Some(DetailAction::CopyTotp),
+            "CTRL+T refuses a code that really is on screen"
+        );
     }
 
     /// The bug, at the pane: a click on an empty Password row reported a copy

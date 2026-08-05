@@ -724,6 +724,29 @@ pub fn echoing_item_put(
         })
 }
 
+/// Whether `item` carries a `deskwarden:app-match` custom field **at all**,
+/// answered on the field's NAME alone and therefore independently of whether
+/// its value parses.
+///
+/// [`extract_app_match`] cannot answer this: it ends in `.ok()`, so a field
+/// whose JSON is malformed, or whose `trigger` is a string this build does not
+/// know, is indistinguishable from no field at all. That field is a visible
+/// custom field in every Bitwarden client and is hand-editable in all of them,
+/// so the corrupted shape is reachable without this app ever being involved --
+/// and the detail pane's `MATCHED APP` card used to answer it with "No app is
+/// matched to this item yet" and no Remove, which left the field unclearable
+/// from that pane by any sequence of clicks.
+///
+/// The card asks this and [`extract_app_match`] both, and the pair of answers
+/// is what separates "unbound" from "bound to something unreadable". The
+/// clear-up path is [`without_app_match`], which already filters on the same
+/// name and so removes the field whether or not it parses.
+pub fn has_app_match_field(item: &VaultItem) -> bool {
+    item.fields
+        .iter()
+        .any(|f| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME))
+}
+
 pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
     item.fields
         .iter()
@@ -2284,6 +2307,77 @@ mod tests {
             other: serde_json::Map::new(),
         };
         assert!(extract_app_match(&item).is_none());
+        // The pair of answers the detail pane's card needs: the field IS
+        // there, it just will not parse. `extract_app_match` alone cannot
+        // tell this from the item above, which carries no such field at all.
+        assert!(
+            has_app_match_field(&item),
+            "a field that fails to parse is reported as no field at all"
+        );
+    }
+
+    /// [`has_app_match_field`] answers on the NAME, so it must say yes for
+    /// every value -- including ones nothing can parse -- and no when the
+    /// field is genuinely absent.
+    #[test]
+    fn has_app_match_field_reports_presence_and_not_parseability() {
+        let bare = VaultItem {
+            id: "1".into(),
+            name: "Bare".into(),
+            fields: vec![VaultField {
+                name: Some("Some other field".into()),
+                value: Some("x".into()),
+                other: serde_json::Map::new(),
+            }],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        assert!(!has_app_match_field(&bare), "a field with another name counted");
+
+        for value in [
+            // A real saved match.
+            r#"{"process":"a.exe","trigger":"prompt"}"#,
+            // Malformed JSON.
+            "{not json",
+            // Well-formed JSON, unknown `trigger` -- the hand-edit that is
+            // easiest to make in another client's UI.
+            r#"{"process":"a.exe","trigger":"telepathy"}"#,
+            // Emptied by hand.
+            "",
+        ] {
+            let mut item = bare.clone();
+            item.fields.push(VaultField {
+                name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
+                value: Some(value.to_string()),
+                other: serde_json::Map::new(),
+            });
+            assert!(
+                has_app_match_field(&item),
+                "the field is present but unreported for value {value:?}"
+            );
+            // And `without_app_match` really clears each of them -- the
+            // card's Remove is only an offer if this holds.
+            assert!(
+                !has_app_match_field(&without_app_match(&item)),
+                "Remove would leave the field behind for value {value:?}"
+            );
+        }
+        // The control: at least one of those values genuinely does NOT parse,
+        // so the loop is not four copies of the happy case.
+        let mut broken = bare.clone();
+        broken.fields.push(VaultField {
+            name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
+            value: Some("{not json".into()),
+            other: serde_json::Map::new(),
+        });
+        assert!(has_app_match_field(&broken) && extract_app_match(&broken).is_none());
     }
 
     #[test]
