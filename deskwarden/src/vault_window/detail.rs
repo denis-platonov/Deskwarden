@@ -1169,6 +1169,30 @@ fn note_copied(ctx: &egui::Context, label: &str) {
 /// floats over the pane's cards without stealing a click from the row
 /// underneath -- the same treatment `login_ui`'s resize handles and
 /// `folder_modal`'s scrim already use.
+/// The id under which the read body's "did it overflow last frame?" reading
+/// is kept.
+fn body_overflow_id() -> egui::Id {
+    egui::Id::new("detail-read-body-overflow")
+}
+
+/// Whether the read body's content was taller than its viewport the last time
+/// it was drawn -- i.e. whether the scroll bar has anything to say.
+///
+/// Absent (the first frame this pane is ever drawn, or the first after a
+/// context is rebuilt) answers TRUE: a bar shown on a body that turns out to
+/// fit disappears on the next frame, whereas a bar hidden on a body that
+/// really does scroll would tell the reader there is nothing below when there
+/// is. Ties go to showing it.
+fn body_overflowed(ctx: &egui::Context) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(body_overflow_id()))
+        .unwrap_or(true)
+}
+
+/// Records this frame's reading for [`body_overflowed`] to use on the next.
+fn note_body_overflow(ctx: &egui::Context, overflowed: bool) {
+    ctx.data_mut(|data| data.insert_temp(body_overflow_id(), overflowed));
+}
+
 fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
     let now = ui.input(|i| i.time);
     let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
@@ -1830,18 +1854,70 @@ pub fn draw_detail_read(
     // The body's `padding: 18px 24px`, applied by placing the rest of the pane
     // in a child over the padded remainder rather than by a `Frame`, so
     // everything below keeps laying itself out exactly where it did.
+    //
+    // The RIGHT padding is 0 here because the scroll bar below is given that
+    // lane instead -- `theme::scrollbar_in_gutter` reserves exactly
+    // `BODY_PAD_X` for itself, so the cards still end at
+    // `pane.right() - BODY_PAD_X` as they always did, and the bar is centred
+    // in the padding rather than drawn hard against them. Same arrangement,
+    // and the same reason, as `item_list.rs`'s list.
     let body = egui::Rect::from_min_max(
         egui::pos2(
             pane.left() + f32::from(BODY_PAD_X),
             ui.cursor().top() + f32::from(BODY_PAD_Y),
         ),
-        egui::pos2(
-            pane.right() - f32::from(BODY_PAD_X),
-            pane.bottom() - f32::from(BODY_PAD_Y),
-        ),
+        egui::pos2(pane.right(), pane.bottom() - f32::from(BODY_PAD_Y)),
     );
     let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
-    let ui = &mut body_ui;
+    // **The fix.** This body was one plain `Ui` with no scroll area at any
+    // level, so on a pane shorter than the item -- a full identity with notes
+    // and previous passwords paints to y = 1967 on a pane the app can be
+    // resized down to 600 -- egui laid the lower cards out past the bottom
+    // and culled them: not painted, not scrollable to, not reachable by
+    // anything. The whole `MATCHED APP` card, including the Autofill row and
+    // the Open button, was among them. This is the read-side half of the
+    // defect commit `68f86cb` fixed on the edit form.
+    //
+    // What is pinned and what scrolls: the HEADER STRIP stays outside this
+    // area, and only it. It carries the item's name, the folder subtitle and
+    // the star / kebab / Fill controls -- a title that scrolls away leaves
+    // the reader with no answer to "which item is this?", and the controls
+    // there act on the item as a whole rather than on any row below. The edit
+    // pane additionally pinned an action strip to the BOTTOM; there is no
+    // counterpart here, because the read pane has no Save or Cancel and no
+    // other control that must be reachable without reading what it applies
+    // to. Nothing else is held back: pinning, say, the metadata line as well
+    // would spend a second slice of a 600pt pane on chrome.
+    //
+    // Horizontal scrolling is not offered, deliberately -- the rows already
+    // elide long values (see `value_text`), and a horizontal bar would be the
+    // regression rather than the fix.
+    theme::scrollbar_in_gutter(&mut body_ui, f32::from(BODY_PAD_X));
+    // ... and the bar is hidden outright when there is nothing to scroll.
+    // The lane stays reserved either way -- that is what `AlwaysVisible`
+    // below is for, and why the cards keep ONE width whether or not the bar
+    // is showing, which is the 10pt jump `092da70` measured on the item list.
+    //
+    // Read back from the last frame rather than predicted: unlike the item
+    // list, whose content height is a row count times a pitch, this body's
+    // height is the sum of however many cards this kind of item draws, each
+    // with wrapped text of its own. The one frame of lag can only show a bar
+    // for a frame on an item that does not need one -- never hide one that
+    // is needed for longer than that -- and a first-ever frame, which has no
+    // reading, shows it. That is the safe direction.
+    if !body_overflowed(ui.ctx()) {
+        theme::hide_scrollbar(&mut body_ui);
+    }
+    let scrolled = egui::ScrollArea::vertical()
+        // The area takes the full width and height of the body rect: the
+        // cards inside set their own width from `available_width`, which the
+        // reserved lane has already narrowed back to what it was.
+        .auto_shrink([false; 2])
+        // Required by `scrollbar_in_gutter`: the lane is only reserved for a
+        // bar egui is actually showing, so anything conditional here puts the
+        // width jump back.
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(&mut body_ui, |ui| {
     ui.spacing_mut().item_spacing = card_spacing;
 
     // Which body this item gets is decided by `detail_body_for` and nowhere
@@ -2020,6 +2096,12 @@ pub fn draw_detail_read(
                     .color(theme::TEXT_FAINT),
             );
         });
+        });
+    note_body_overflow(
+        body_ui.ctx(),
+        scrolled.content_size.y > scrolled.inner_rect.height(),
+    );
+    let ui = &mut body_ui;
 
     if matches!(action, DetailAction::None) {
         if let Some(which) = shortcut {
@@ -9868,5 +9950,666 @@ mod tests {
         for label in [OPEN_MENU_LABEL, OPEN_WEBSITE_LABEL, "Open chrome.exe"] {
             assert!(!frame.painted(label), "an unreadable field offered {label:?}");
         }
+    }
+}
+
+/// The read pane's SHAPE, on a pane too short to hold the item in it.
+///
+/// The bug these exist for: `draw_detail_read` drew the header strip and
+/// every body card into one plain `Ui` with no scroll area at any level. On
+/// the tallest realistic item -- a full identity with notes, five previous
+/// passwords and a bound app -- the body painted down to y = 1967 on a pane
+/// the app can be resized to 600. Everything past the fold was not merely
+/// off-screen: egui culled it, so it was not painted, not clickable and not
+/// scrollable to. The `MATCHED APP` card, its Autofill triggers and its Open
+/// button -- the whole feature of commits `4b05adb` and `a33b75e` -- were
+/// among the unreachable, which is very likely why the user went looking in
+/// the Edit pane at all. This is the read-side half of `68f86cb`.
+///
+/// Everything here is a geometry assertion on rects egui really painted, and
+/// the card assertions read the GLYPHS rather than `Galley::text()`, which
+/// answers with the layout job's source string and is therefore blind to a
+/// run that was elided to nothing. Each test carries the control that says
+/// what it would look like to be blind.
+#[cfg(test)]
+mod read_pane_scroll_tests {
+    use super::*;
+
+    /// The narrowest the detail pane can be: 900 - 212 - 390 = 298pt,
+    /// derived rather than written out for the same reason `MIN_PANE` above
+    /// is.
+    const NARROW: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+        - crate::vault_window::SIDEBAR_WIDTH
+        - crate::vault_window::LIST_WIDTH;
+
+    /// The app's minimum window HEIGHT. 600 is the whole window and the pane
+    /// really gets less, so this over-states the room -- the safe direction:
+    /// an item that will not fit here cannot fit in the app either.
+    const SHORT: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32;
+
+    /// A pane with room to spare for the same item -- taller than the 1967pt
+    /// the tallest body measures, so nothing scrolls and the bar has nothing
+    /// to say. Not a value to guess at: `a_roomy_pane_really_does_fit_the_
+    /// item` checks that this height really is roomy, because every test
+    /// below that contrasts "scrolls" with "fits" is vacuous if it is not.
+    const ROOMY: f32 = 2400.0;
+
+    /// Every string the frame painted, as (source, glyphs, rect), plus every
+    /// filled rectangle.
+    #[derive(Default)]
+    struct Shot {
+        runs: Vec<(String, String, egui::Rect)>,
+        rects: Vec<(egui::Rect, egui::Color32)>,
+    }
+
+    impl Shot {
+        /// The rect of the one run laid out from `source`, or `None` if the
+        /// pane painted nothing from it -- which is what a culled card looks
+        /// like, and so is the answer this suite is mostly about.
+        fn rect_of(&self, source: &str) -> Option<egui::Rect> {
+            let hits: Vec<&(String, String, egui::Rect)> =
+                self.runs.iter().filter(|(s, _, _)| s == source).collect();
+            assert!(
+                hits.len() <= 1,
+                "{source:?} was painted {} times, so an assertion naming it is ambiguous",
+                hits.len()
+            );
+            hits.first().map(|(_, _, r)| *r)
+        }
+
+        /// The glyphs actually laid out for `source`. `None` when it was not
+        /// painted at all.
+        fn glyphs_of(&self, source: &str) -> Option<String> {
+            self.runs
+                .iter()
+                .find(|(s, _, _)| s == source)
+                .map(|(_, g, _)| g.clone())
+        }
+
+        fn sources(&self) -> Vec<&str> {
+            self.runs.iter().map(|(s, _, _)| s.as_str()).collect()
+        }
+    }
+
+    fn walk(shape: &egui::Shape, shot: &mut Shot) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let glyphs: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|g| g.chr))
+                    .collect();
+                shot.runs.push((
+                    text.galley.text().to_string(),
+                    glyphs,
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+            egui::Shape::Rect(rect) => shot.rects.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, shot);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A pane of a chosen SIZE -- which the `Pane` harness above cannot do,
+    /// being fixed at `PANE` tall, and the height is the entire subject here.
+    struct ShortPane {
+        ctx: egui::Context,
+        size: egui::Vec2,
+        reveal: RevealState,
+    }
+
+    impl ShortPane {
+        fn new(size: egui::Vec2) -> Self {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            // The crate's standing two throwaway frames: a font set
+            // registered during a frame is only usable from the next one.
+            let _ = ctx.run_ui(input.clone(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input, |_ui| {});
+            Self {
+                ctx,
+                size,
+                reveal: RevealState::default(),
+            }
+        }
+
+        fn bounds(&self) -> egui::Rect {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)
+        }
+
+        fn frame(&mut self, item: &VaultItem, events: Vec<egui::Event>) -> Shot {
+            let output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(self.bounds()),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let _ = draw_detail_read(
+                        ui,
+                        item,
+                        None,
+                        3,
+                        &TotpState::NoSecret,
+                        false,
+                        &mut self.reveal,
+                        None,
+                    );
+                },
+            );
+            let mut shot = Shot::default();
+            let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+            walk(&all, &mut shot);
+            shot
+        }
+
+        fn idle(&mut self, item: &VaultItem) -> Shot {
+            self.frame(item, Vec::new())
+        }
+
+        /// Scrolls the body to its bottom: the pointer parked in the middle
+        /// of the pane (a wheel goes to the area under the pointer, and with
+        /// no pointer there is no area) and a wheel delta far larger than the
+        /// content, which a `ScrollArea` clamps to its own end. Several
+        /// frames because that clamp is against LAST frame's content size.
+        fn scroll_to_bottom(&mut self, item: &VaultItem) -> Shot {
+            let mut shot = self.idle(item);
+            for _ in 0..4 {
+                shot = self.frame(
+                    item,
+                    vec![
+                        egui::Event::PointerMoved(self.bounds().center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -4000.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+            }
+            shot
+        }
+    }
+
+    /// The tallest item this app can really be asked to draw: an identity
+    /// with EVERY field filled (four groups, eighteen rows), a note, five
+    /// previous passwords, and a bound desktop app -- which an identity does
+    /// show (see `app_card_visible`: a binding is never hidden, whatever the
+    /// kind). This is the item whose body measured 1967pt.
+    fn the_tallest_item() -> VaultItem {
+        let some = |s: &str| Some(s.to_string());
+        let mut item = VaultItem {
+            id: "id-tall".to_string(),
+            name: "Ada Lovelace".to_string(),
+            fields: Vec::new(),
+            login: None,
+            card: None,
+            identity: Some(crate::vault_bridge::IdentityData {
+                title: some("Ms"),
+                first_name: some("Ada"),
+                middle_name: some("Augusta"),
+                last_name: some("Lovelace"),
+                address1: some("12 Analytical Way"),
+                address2: some("Flat 4"),
+                address3: some("Difference Court"),
+                city: some("London"),
+                state: some("Greater London"),
+                postal_code: some("EC1A 1BB"),
+                country: some("United Kingdom"),
+                company: some("Ledgerline"),
+                email: some("ada@example.com"),
+                phone: some("+44 20 7946 0000"),
+                ssn: some("123-45-6789"),
+                username: some("ada"),
+                passport_number: some("P123456"),
+                license_number: some("L987654"),
+                other: serde_json::Map::new(),
+            }),
+            ssh_key: None,
+            notes: Some("Recovery codes are in the safe.".to_string().into()),
+            item_type: Some(4),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        let history: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "password": format!("old-secret-{i}"),
+                })
+            })
+            .collect();
+        item.other
+            .insert("passwordHistory".to_string(), serde_json::Value::Array(history));
+        crate::vault_bridge::with_app_match(
+            &item,
+            &AppMatch {
+                process: "Ledgerline.exe".to_string(),
+                title: String::new(),
+                hosted: false,
+                // A path that exists nowhere, so nothing here depends on
+                // what happens to be installed on the machine running it.
+                path: "C:\\Deskwarden Test\\Ledgerline\\Ledgerline.exe".to_string(),
+                args: String::new(),
+                trigger: TriggerMode::Prompt,
+            },
+        )
+    }
+
+    fn assert_visible(shot: &Shot, source: &str, pane: egui::Rect) {
+        let rect = shot.rect_of(source).unwrap_or_else(|| {
+            panic!(
+                "{source:?} was not painted at all -- egui culled it, which is the bug. \
+                 Painted: {:?}",
+                shot.sources()
+            )
+        });
+        // **Vertically** inside the pane, which is what this fix is about
+        // and the only axis it touches.
+        //
+        // Not `contains_rect`: at 298pt the app card's `Program file` row
+        // lays a full Windows path out unwrapped, which widens the card past
+        // the pane and carries the Open button in the same row out with it.
+        // That is a HORIZONTAL defect, it is nothing to do with scrolling,
+        // and it is neither caused nor cured here --
+        // `the_bar_does_not_move_the_cards` pins that by measuring the same
+        // x on a pane that does not scroll at all. Asserting the whole rect
+        // here would tie this test to that separate bug and hide the one it
+        // is for.
+        assert!(
+            rect.top() >= pane.top() && rect.bottom() <= pane.bottom(),
+            "{source:?} is painted at y = {}..{} on a pane {}pt tall -- it cannot be \
+             scrolled to",
+            rect.top(),
+            rect.bottom(),
+            pane.height()
+        );
+        // `rect_of` reads the galley's box; the GLYPHS say whether anything
+        // was really drawn in it. A run elided to nothing has a rect too.
+        let glyphs = shot.glyphs_of(source).unwrap_or_default();
+        assert!(
+            !glyphs.trim().is_empty() && glyphs != "\u{2026}",
+            "{source:?} occupies {rect:?} but rendered {glyphs:?} -- nothing readable is there"
+        );
+    }
+
+    /// **The bug, and the fix, as one test.** Before scrolling the app card
+    /// is not on the pane at all; after scrolling every part of it is.
+    ///
+    /// Positive control: the first half is it. On the pre-fix layout -- one
+    /// plain `Ui`, no scroll area -- the wheel does nothing at all, so the
+    /// second half fails with the card still unpainted. Verified by running
+    /// this against that layout, not assumed.
+    #[test]
+    fn the_matched_app_card_is_reachable_on_the_shortest_window() {
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let item = the_tallest_item();
+        let bounds = pane.bounds();
+
+        let before = pane.idle(&item);
+        // The premise. Without it this test would pass on a pane the item
+        // already fits in, where the scroll below is a no-op and the whole
+        // thing is blind.
+        assert!(
+            before.rect_of(APP_CARD_HEADING).is_none(),
+            "the tallest item already fits in a {NARROW}x{SHORT} pane, so this test is \
+             not exercising scrolling at all"
+        );
+        // ... and the control on the control: the pane IS drawing something,
+        // so "nothing is painted" cannot be what satisfies the line above.
+        assert_visible(&before, "IDENTITY", bounds);
+
+        let after = pane.scroll_to_bottom(&item);
+        for source in [
+            APP_CARD_HEADING,
+            // The row the binding's behaviour is set on ...
+            "Autofill",
+            // ... and the control commit `a33b75e` added, which was the
+            // single least reachable thing on the pane.
+            "Open Ledgerline.exe",
+            "App",
+            "Program file",
+        ] {
+            assert_visible(&after, source, bounds);
+        }
+    }
+
+    /// The header stays where it is. It is the only thing held out of the
+    /// scroll area, and the reason is that a scrolled-away title leaves no
+    /// answer to "which item am I looking at?" -- so it has to be pinned in
+    /// fact and not just in intent.
+    #[test]
+    fn the_header_does_not_move_when_the_body_scrolls() {
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let item = the_tallest_item();
+        let bounds = pane.bounds();
+
+        let before = pane.idle(&item);
+        let title_before = before
+            .rect_of(&item.name)
+            .expect("the header painted no title");
+        assert_visible(&before, &item.name, bounds);
+
+        let after = pane.scroll_to_bottom(&item);
+        let title_after = after.rect_of(&item.name).expect("the title scrolled away");
+        assert_eq!(
+            title_before, title_after,
+            "the header title moved from {title_before:?} to {title_after:?} when the body \
+             scrolled -- it is inside the scroll area"
+        );
+        // The control on that: the BODY did move, so an equality that held
+        // because nothing scrolled at all would not pass here.
+        assert!(
+            after.rect_of(APP_CARD_HEADING).is_some(),
+            "nothing scrolled, so the title standing still proves nothing"
+        );
+    }
+
+    /// The copy confirmation is drawn on a foreground layer against the PANE,
+    /// not against the scrolled content, so it keeps the corner
+    /// `copy_toast_tests` pins it to -- 20pt in from the pane's bottom-right
+    /// -- however far the body has been scrolled, and the scroll area does
+    /// not clip it.
+    #[test]
+    fn the_copy_toast_keeps_its_corner_while_the_body_is_scrolled() {
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let item = the_tallest_item();
+        let bounds = pane.bounds();
+
+        let _ = pane.scroll_to_bottom(&item);
+        note_copied(&pane.ctx, "Password");
+        let shot = pane.idle(&item);
+
+        let text = copy_toast_text("Password");
+        let glyphs = shot.rect_of(&text).unwrap_or_else(|| {
+            panic!(
+                "the confirmation was not painted; the pane painted {:?}",
+                shot.sources()
+            )
+        });
+        // The BOX, not the glyphs: the assertions in `copy_toast_tests` are
+        // about the box's own edges, and a box is what a scroll area would
+        // have clipped.
+        let boxes: Vec<egui::Rect> = shot
+            .rects
+            .iter()
+            .filter(|(rect, fill)| *fill == theme::INK && rect.contains_rect(glyphs))
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert_eq!(
+            boxes.len(),
+            1,
+            "expected one confirmation box around {glyphs:?}, found {boxes:?}"
+        );
+        let toast = boxes[0];
+        assert_eq!(toast.right(), bounds.right() - COPY_TOAST_INSET);
+        assert_eq!(toast.bottom(), bounds.bottom() - COPY_TOAST_INSET);
+    }
+
+    /// No horizontal scrolling: the wheel moves the body up and down and
+    /// NOTHING sideways. The rows already elide what they can, and a
+    /// horizontal bar under them would be the regression rather than the fix.
+    ///
+    /// Stated as "every run that is painted both before and after the scroll
+    /// keeps its x", which is what a horizontal offset would break and what a
+    /// bar appearing mid-scroll would break too.
+    #[test]
+    fn the_body_never_scrolls_sideways() {
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let item = the_tallest_item();
+        let before = pane.idle(&item);
+        let mut after = pane.scroll_to_bottom(&item);
+        assert!(
+            after.rect_of(APP_CARD_HEADING).is_some(),
+            "nothing scrolled, so an x that did not move proves nothing"
+        );
+        // And then asked, in as many words, to scroll sideways. Without this
+        // the sweep below only says a VERTICAL wheel has no sideways
+        // component -- `ScrollArea::both` in place of `::vertical` would pass
+        // it while giving the pane a horizontal bar and a horizontal offset.
+        for _ in 0..4 {
+            after = pane.frame(
+                &item,
+                vec![
+                    egui::Event::PointerMoved(pane.bounds().center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(-4000.0, 0.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ],
+            );
+        }
+
+        let mut compared = 0;
+        let once = |shot: &Shot, source: &str| {
+            let hits: Vec<egui::Rect> = shot
+                .runs
+                .iter()
+                .filter(|(s, _, _)| s == source)
+                .map(|(_, _, r)| *r)
+                .collect();
+            // Exactly one, or this comparison cannot say WHICH run moved --
+            // the five "6 days ago" stamps in the previous-passwords card
+            // are five different rows with one string between them.
+            (hits.len() == 1).then(|| hits[0])
+        };
+        for (source, _, rect) in &before.runs {
+            let (Some(_), Some(moved)) = (once(&before, source), once(&after, source)) else {
+                continue;
+            };
+            assert_eq!(
+                (rect.left(), rect.right()),
+                (moved.left(), moved.right()),
+                "{source:?} moved sideways from x = {}..{} to {}..{} when the body was                  scrolled",
+                rect.left(),
+                rect.right(),
+                moved.left(),
+                moved.right()
+            );
+            compared += 1;
+        }
+        // The sweep has to have swept something: an empty loop asserts
+        // nothing, and the identity rows above the fold are painted in both
+        // frames, so there is no honest way for this to be zero.
+        assert!(compared >= 5, "only {compared} runs were common to both frames");
+    }
+
+    /// The premise every "scrolls versus fits" contrast below rests on:
+    /// [`ROOMY`] really is tall enough for the whole body, and [`SHORT`]
+    /// really is not. Without this, two panes that both overflow would
+    /// satisfy those tests while comparing nothing.
+    #[test]
+    fn a_roomy_pane_really_does_fit_the_item() {
+        let mut item = the_tallest_item();
+        item.fields.clear();
+        // The last card of the body proper, and so the one that is only
+        // painted when everything above it fitted.
+        let last = "PREVIOUS PASSWORDS";
+
+        let mut roomy = ShortPane::new(egui::vec2(NARROW, ROOMY));
+        let _ = roomy.idle(&item);
+        let shot = roomy.idle(&item);
+        let rect = shot
+            .rect_of(last)
+            .unwrap_or_else(|| panic!("{last:?} is not on a {ROOMY}pt pane either"));
+        assert!(
+            rect.bottom() <= ROOMY,
+            "{last:?} ends at y = {} on a {ROOMY}pt pane, so ROOMY is not roomy",
+            rect.bottom()
+        );
+
+        let mut short = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let _ = short.idle(&item);
+        let shot = short.idle(&item);
+        assert!(
+            shot.rect_of(last).is_none(),
+            "{last:?} already fits a {SHORT}pt pane unscrolled, so SHORT does not overflow"
+        );
+    }
+
+    /// The bar is PAINTED when there is something to scroll and not painted
+    /// when there is not.
+    ///
+    /// Hiding it is not cosmetic tidying: `AlwaysVisible` above is what keeps
+    /// the cards one width, and it also means egui would otherwise draw a
+    /// full-height bar down a body that cannot move. That is exactly the
+    /// report `092da70` fixed on the item list -- a bar in the margin reads
+    /// as the padding having shrunk. Nothing about the LAYOUT changes either
+    /// way, which is what `the_bar_does_not_move_the_cards` pins; this is
+    /// only about whether ink lands in the lane.
+    #[test]
+    fn the_bar_is_painted_only_when_there_is_something_to_scroll() {
+        let mut item = the_tallest_item();
+        // The binding dropped for the same reason as in the test below: its
+        // path row widens the body sideways and would paint into the lane on
+        // its own account.
+        item.fields.clear();
+
+        let ink_in_the_lane = |height: f32| {
+            let mut pane = ShortPane::new(egui::vec2(NARROW, height));
+            // Two frames: the first is the reading the second decides on.
+            // The pointer is IN the area on both, because egui's floating bar
+            // is dormant -- fully transparent -- while the pointer is away,
+            // and a test that read a dormant bar would certify the placement
+            // of something not drawn. That is one of the vacuous tests this
+            // crate has already shipped.
+            let over = vec![egui::Event::PointerMoved(pane.bounds().center())];
+            let _ = pane.frame(&item, over.clone());
+            let shot = pane.frame(&item, over);
+            let lane = NARROW - f32::from(BODY_PAD_X);
+            shot.rects
+                .iter()
+                .filter(|(rect, fill)| {
+                    // Anything with colour in it, in the reserved lane and
+                    // no wider than the bar. The width is part of the filter
+                    // because at 298pt the cards themselves spill sideways
+                    // into the lane (the horizontal defect noted in
+                    // `assert_visible`) -- a card is hundreds of points wide
+                    // and the bar is `SCROLLBAR_WIDTH`.
+                    fill.a() > 0
+                        && rect.left() >= lane - 0.5
+                        && rect.width() > 0.0
+                        && rect.width() <= theme::SCROLLBAR_WIDTH + 0.5
+                })
+                .count()
+        };
+
+        // The FIRST frame a context ever draws has no reading to go on, and
+        // `body_overflowed` answers TRUE there so the bar is shown rather
+        // than missing. Ties go to showing it: a bar on a body that turns
+        // out to fit is gone next frame, a missing bar on a body that really
+        // scrolls says there is nothing below.
+        let mut first = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let shot = first.frame(&item, vec![egui::Event::PointerMoved(egui::pos2(150.0, 300.0))]);
+        let lane = NARROW - f32::from(BODY_PAD_X);
+        assert!(
+            shot.rects.iter().any(|(rect, fill)| fill.a() > 0
+                && rect.left() >= lane - 0.5
+                && rect.width() > 0.0
+                && rect.width() <= theme::SCROLLBAR_WIDTH + 0.5),
+            "the very first frame paints no bar at all"
+        );
+
+        assert!(
+            ink_in_the_lane(SHORT) > 0,
+            "a body that overflows a {SHORT}pt pane paints no scroll bar at all, so              nothing tells the reader there is more below"
+        );
+        assert_eq!(
+            ink_in_the_lane(ROOMY),
+            0,
+            "a body with nothing to scroll still paints a bar down its right margin"
+        );
+    }
+
+    /// The cards keep ONE width whether or not the scroll bar is showing.
+    ///
+    /// This is the trap `092da70` measured on the item list: under egui's
+    /// default `VisibleWhenNeeded` the bar reserves its lane only while it is
+    /// shown, so the content's right edge jumps by the lane's width as the
+    /// content crosses the overflow threshold -- a 10pt jump the user
+    /// noticed. Here `AlwaysVisible` plus `theme::scrollbar_in_gutter` makes
+    /// the reservation unconditional and `theme::hide_scrollbar` merely stops
+    /// painting the bar, so nothing moves.
+    ///
+    /// The same ITEM on two pane HEIGHTS is the comparison: one short enough
+    /// to overflow and one tall enough not to. Comparing two different items
+    /// instead would have measured the items, not the bar -- the app card is
+    /// wider than a 298pt pane whatever the height, which is the separate
+    /// horizontal defect noted in `assert_visible`, and this test's equality
+    /// across heights is also what shows that defect is not this fix's doing.
+    #[test]
+    fn the_bar_does_not_move_the_cards() {
+        let edges = |item: &VaultItem, height: f32| {
+            let mut pane = ShortPane::new(egui::vec2(NARROW, height));
+            // Two frames: the second is the one whose bar state was decided
+            // by a real reading of the first, which is when a conditional
+            // lane would appear or vanish.
+            let _ = pane.idle(item);
+            let shot = pane.idle(item);
+            let heading = shot
+                .rect_of("IDENTITY")
+                .expect("the identity card lost its heading");
+            let card = shot
+                .rects
+                .iter()
+                .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(heading))
+                .map(|(rect, _)| *rect)
+                .reduce(egui::Rect::union)
+                .expect("the identity card has no white surface");
+            (card.left(), card.right())
+        };
+
+        // **The absolute half**, on an item with nothing in it long enough to
+        // widen a card: the lane REPLACES the body's right padding, so a lane
+        // that is never reserved leaves the cards running to the pane's very
+        // edge. Measured here rather than on the tall item because at 298pt
+        // ordinary identity values already overflow their card sideways --
+        // the separate horizontal defect noted in `assert_visible`.
+        let mut small = the_tallest_item();
+        small.identity = Some(crate::vault_bridge::IdentityData {
+            first_name: Some("Ada".to_string()),
+            ..Default::default()
+        });
+        small.notes = None;
+        small.other.remove("passwordHistory");
+        small.fields.clear();
+        assert_eq!(
+            edges(&small, SHORT),
+            (f32::from(BODY_PAD_X), NARROW - f32::from(BODY_PAD_X)),
+            "a card does not span the body's own {BODY_PAD_X}pt padding on a {NARROW}pt pane"
+        );
+
+        // **The consistency half**: the same item on two heights, one that
+        // overflows and one that does not, so the bar is really showing in
+        // one and hidden in the other. The binding is dropped for the reason
+        // above; without it the body is still ~1000pt on a 600pt pane, which
+        // is all this needs.
+        let mut tall = the_tallest_item();
+        tall.fields.clear();
+        let scrolls = edges(&tall, SHORT);
+        let fits = edges(&tall, ROOMY);
+        assert_ne!(
+            scrolls,
+            (0.0, 0.0),
+            "the card was not found at all, so the equality below is vacuous"
+        );
+        assert_eq!(
+            scrolls, fits,
+            "the identity card spans {scrolls:?} on a pane that scrolls and {fits:?} on one              that does not -- the bar's lane is being reserved conditionally"
+        );
     }
 }
