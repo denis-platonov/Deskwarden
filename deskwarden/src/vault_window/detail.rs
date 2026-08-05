@@ -1035,6 +1035,46 @@ fn copy_toast_id() -> egui::Id {
     egui::Id::new("detail-copy-toast")
 }
 
+/// Where the id of the item the pane drew LAST lives.
+///
+/// Companion to [`copy_toast_id`], and deliberately a second entry rather than
+/// a field on [`CopyToast`]: the toast is written by [`copy_row`], a widget
+/// several helpers deep inside the body, and the item id is not reachable from
+/// there without the new out-param on every row helper that `CopyToast` exists
+/// to avoid (see its doc). The pane's one entry point knows the item; this is
+/// where it says so.
+fn copy_toast_item_id() -> egui::Id {
+    egui::Id::new("detail-copy-toast-item")
+}
+
+/// Drops any live confirmation when the pane starts drawing a **different**
+/// item, and records the item now being drawn.
+///
+/// The confirmation is context-global, so without this it followed the pane:
+/// copy the password on a login, click any other item inside the five seconds,
+/// and the new item painted "Password copied" -- on an item that may have no
+/// Password row at all. That is this feature's own central claim (the toast
+/// names the row it belongs to) failing across a selection change.
+///
+/// **Cleared, not merely filtered.** Hiding a mismatched toast would leave it
+/// in the map, so copying on A, glancing at B and coming back to A inside the
+/// five seconds would RESURRECT a confirmation for a copy the user has since
+/// looked away from -- almost as wrong as the followed one. Removing it makes
+/// "you left the item" and "it expired" the same end state.
+///
+/// **Keyed on the item, not on the redraw.** A vault refresh, a write landing
+/// or any other reason the pane redraws the SAME item leaves the id equal and
+/// the toast alone: the confirmation belongs to the item, not to the frame.
+fn forget_copy_toast_on_item_change(ctx: &egui::Context, item: &str) {
+    ctx.data_mut(|data| {
+        if data.get_temp::<String>(copy_toast_item_id()).as_deref() != Some(item) {
+            data.remove::<CopyToast>(copy_toast_id());
+            data.insert_temp(copy_toast_item_id(), item.to_string());
+        }
+    });
+}
+
+
 /// The sentence a confirmation shows for a row labelled `label`.
 ///
 /// **The label and nothing else.** The whole point of the confirmation is to
@@ -1112,6 +1152,18 @@ fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
     let now = ui.input(|i| i.time);
     let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
     let Some((text, left)) = copy_toast_now(toast.as_ref(), now) else {
+        // **Expired means gone, not merely unpainted.** Left in place, a dead
+        // `CopyToast` sat in the context's temp map for the rest of the
+        // session. Nothing sensitive is in it (the label is one of a fixed
+        // set of literals -- see `copy_toast_text`) and the next copy
+        // overwrites it, so this is tidiness rather than a leak; it is here
+        // because it leaves the map in the same state
+        // `forget_copy_toast_on_item_change` does, so "a toast is recorded"
+        // and "a toast is live" cannot become two different answers.
+        if toast.is_some() {
+            ui.ctx()
+                .data_mut(|data| data.remove::<CopyToast>(copy_toast_id()));
+        }
         return;
     };
     // The deadline, handed to egui. Without this the toast expires only when
@@ -1136,6 +1188,16 @@ fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
     let size = galley.size() + pad * 2.0;
     // `max` on the near edges so a pane narrower than the message keeps the
     // START of the sentence on screen rather than the end of it.
+    //
+    // **Unreachable today, and kept anyway.** The widest message boxes at
+    // about 127pt, and `MIN_VAULT_WINDOW_SIZE` puts the narrowest pane this
+    // window can be resized to at `MIN_PANE` (298), so the clamp needs a pane
+    // under roughly 167pt that the app cannot produce -- deleting it changes
+    // nothing visible, which is exactly why it would be deleted by mistake.
+    // It is not dead code but a bound on arithmetic that would otherwise
+    // place the box off the left of the pane the moment any of those three
+    // numbers moves, so its unreachability is written down here rather than
+    // rediscovered.
     let pos = egui::pos2(
         (pane.right() - COPY_TOAST_INSET - size.x).max(pane.left() + COPY_TOAST_INSET),
         (pane.bottom() - COPY_TOAST_INSET - size.y).max(pane.top() + COPY_TOAST_INSET),
@@ -1440,6 +1502,11 @@ pub fn draw_detail_read(
     icon: Option<&egui::TextureHandle>,
 ) -> DetailAction {
     let mut action = DetailAction::None;
+    // **First, before anything is drawn or any chord is resolved.** A copy
+    // made later in THIS frame belongs to the item being drawn now, so it
+    // must outlive this clear; a copy made on the item that was on screen
+    // before it must not. See `forget_copy_toast_on_item_change`.
+    forget_copy_toast_on_item_change(ui.ctx(), &item.id);
     // Derived once, here, and passed to the pure decisions below -- not
     // re-derived per widget, so the header, the chrome, the body and the
     // metadata strip cannot disagree about what this item is.
@@ -3859,6 +3926,28 @@ mod tests {
                 .map(|(rect, _)| *rect)
                 .reduce(egui::Rect::union);
             tile.expect("the header painted no 44px avatar tile")
+        }
+
+        /// The one filled `colour` rectangle that encloses `inner` -- the
+        /// surface a run of text is painted ON, which paints no string of its
+        /// own and so cannot be found by name.
+        ///
+        /// The enclosure is what makes this specific: the pane is full of
+        /// filled rects, and only the confirmation's own box contains the
+        /// confirmation's own glyphs.
+        fn filled_box_around(&self, inner: egui::Rect, colour: egui::Color32) -> egui::Rect {
+            let found: Vec<egui::Rect> = self
+                .rects
+                .iter()
+                .filter(|(rect, fill)| *fill == colour && rect.contains_rect(inner))
+                .map(|(rect, _)| *rect)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {colour:?} box around {inner:?}, found {found:?}"
+            );
+            found[0]
         }
 
         /// Every reveal eye, top-down -- the order the rows are drawn in, so
@@ -8567,8 +8656,15 @@ mod tests {
         let header = laid_out.header_strip();
         let row = laid_out.rect_of("Password");
         let _ = pane.click(&item, &TotpState::NoSecret, row.center());
-        // One more frame: an `Area` only knows its own size once it has been
-        // laid out, so its placement settles on the frame after it appears.
+        // One more frame, on a QUIET pane. Not because the placement needs
+        // to settle -- it does not, and that is the point: `draw_copy_toast`
+        // measures the galley itself and paints through a layer painter
+        // precisely so the toast is in its final position on the very frame
+        // the copy happened. The `Area` that had to be laid out before it
+        // knew its own size is the design this feature REJECTED, for that
+        // exact reason. This frame is read instead of the click's so the
+        // geometry is not taken off a frame that also carries a pointer
+        // press, a hover tint and the row's own click response.
         let settled = pane.idle(&item, &TotpState::NoSecret);
         let toast = settled.rect_of("Password copied");
         assert_eq!(
@@ -8584,6 +8680,26 @@ mod tests {
         assert!(
             toast.right() <= 900.0 && toast.bottom() <= 900.0,
             "the confirmation runs off the bottom-right of a 900x900 pane: {toast:?}"
+        );
+
+        // **The BOX, to the point, not the quadrant.** Everything above is
+        // satisfied by a toast placed anywhere in a 450pt square, which is
+        // how a 24pt/18pt shift (drawing it against the padded body instead
+        // of the whole pane) passed the whole suite. The dark box is also the
+        // thing the user sees meet the window edge -- the galley sits a
+        // padding in from it, so the text's rect can never say where the
+        // toast IS. 880 is 900 less the documented 20pt inset, written
+        // absolutely rather than derived from `COPY_TOAST_INSET`.
+        let box_rect = settled.filled_box_around(toast, theme::INK);
+        assert!(
+            (box_rect.right() - 880.0).abs() < 0.5,
+            "the confirmation's box is at {box_rect:?}: its right edge is not 20pt \
+             in from a 900pt pane"
+        );
+        assert!(
+            (box_rect.bottom() - 880.0).abs() < 0.5,
+            "the confirmation's box is at {box_rect:?}: its bottom edge is not 20pt \
+             up from a 900pt pane"
         );
         assert!(
             !toast.intersects(row),
@@ -8612,6 +8728,213 @@ mod tests {
             narrow_toast.left() >= 0.0 && narrow_toast.right() <= MIN_PANE,
             "at the minimum window size the confirmation ({narrow_toast:?}) runs \
              outside the {MIN_PANE}pt pane"
+        );
+    }
+
+    /// **A chord that copies nothing says nothing.** The one thing standing
+    /// between the user and "One-time code copied" on an item with no TOTP.
+    ///
+    /// Live behaviour is already correct, and that is the problem this pins:
+    /// hoisting `note_copied` OUT of the `if let Some(copy)` guard -- so
+    /// every chord confirms whether or not it copied -- passed the entire
+    /// suite. The same guard has already failed one variant over: CTRL+T on
+    /// `Code { code: "" }` copied an empty string and confirmed it (fixed in
+    /// `8db47a0`), which is what a silent-path assertion would have caught
+    /// and no positive-path test could.
+    ///
+    /// Every chord, and every state that has nothing for it: an item with a
+    /// login object whose fields are all empty, and one with no login object
+    /// at all -- crossed with each TOTP state that carries no code, the
+    /// empty-string `Code` included.
+    #[test]
+    fn a_chord_with_nothing_to_copy_raises_no_confirmation() {
+        let shift_ctrl = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
+        let chords = [
+            (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
+            (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "One-time code copied"),
+            (shift_ctrl, egui::Key::U, "Website copied"),
+        ];
+
+        // **The positive control, and it is not the negative one rephrased.**
+        // "No confirmation appeared" is also true of a harness that cannot
+        // deliver a key event, of a pane that draws no toast at all, and of
+        // four chord literals that match nothing painted. This drives the
+        // SAME four chords through the SAME harness on an item that has all
+        // four fields, and requires each to produce its own message.
+        let mut stocked = a_login();
+        stocked.login.as_mut().expect("a_login has login data").totp =
+            Some("seed".to_string().into());
+        let live = TotpState::Code {
+            code: "123456".to_string(),
+            seconds_left: 21,
+        };
+        for (modifiers, key, want) in chords {
+            let mut pane = Pane::new();
+            let _ = pane.idle(&stocked, &live);
+            let pressed = pane.frame(
+                &stocked,
+                &live,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+            );
+            assert!(
+                pressed.painted(want),
+                "the control failed: this chord does not raise {want:?} even on an \
+                 item that has the field, so finding it absent below proves nothing \
+                 -- the frame painted: {:?}",
+                pressed.strings()
+            );
+        }
+
+        // A login object with every field empty, and an item with no login
+        // object whatsoever (a secure note). Neither has a URI, so
+        // CTRL+SHIFT+U has nothing either.
+        let mut bare_login = a_login();
+        {
+            let login = bare_login.login.as_mut().expect("a_login has login data");
+            login.username = Some(String::new());
+            login.password = Some(String::new().into());
+            login.totp = None;
+            login.uris = Vec::new();
+        }
+        let note = an_item(Some(2));
+
+        for item in [&bare_login, &note] {
+            for totp in [
+                TotpState::NoSecret,
+                TotpState::Fetching,
+                TotpState::Unavailable,
+                TotpState::NoCodeReported,
+                // The drift `8db47a0` fixed: a live-code variant carrying no
+                // code. The chord must read the code, not the variant.
+                TotpState::Code {
+                    code: String::new(),
+                    seconds_left: 9,
+                },
+            ] {
+                for (modifiers, key, message) in chords {
+                    let mut pane = Pane::new();
+                    let _ = pane.idle(item, &totp);
+                    let pressed = pane.frame(
+                        item,
+                        &totp,
+                        vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers,
+                        }],
+                    );
+                    // The copy really did not happen -- so the silence below
+                    // is a chord that confirmed nothing, not a chord that
+                    // copied and confirmed correctly.
+                    assert!(
+                        matches!(pressed.action, DetailAction::None),
+                        "{message:?}: the chord reported {:?} on an item with nothing \
+                         to copy (TOTP {totp:?})",
+                        pressed.action
+                    );
+                    assert!(
+                        !pressed.painted(message),
+                        "{message:?} was shown for a chord that copied NOTHING \
+                         (TOTP {totp:?}); the frame painted: {:?}",
+                        pressed.strings()
+                    );
+                    // And no OTHER confirmation either: a chord that named the
+                    // wrong field would slip past the assertion above.
+                    let claims: Vec<&str> = pressed
+                        .strings()
+                        .into_iter()
+                        .filter(|painted| painted.ends_with(" copied"))
+                        .collect();
+                    assert!(
+                        claims.is_empty(),
+                        "a chord that copied nothing claimed {claims:?} (TOTP {totp:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The confirmation belongs to the item it was copied on.**
+    ///
+    /// The toast lives in the context, which is shared by every item the pane
+    /// ever draws: copy the password on a login, click any other item inside
+    /// the five seconds, and the new item painted "Password copied" -- on a
+    /// secure note, which has no Password row at all. That is this feature's
+    /// own claim (the toast names the row it belongs to) failing the moment
+    /// the selection changes.
+    ///
+    /// Three things in one test, because two of them are each other's
+    /// control:
+    ///   * a redraw of the SAME item keeps it -- a vault refresh or a write
+    ///     landing is not the user walking away, and a "clear on every frame"
+    ///     fix would pass the other two assertions while making the toast
+    ///     invisible in the app;
+    ///   * a different item does not get it;
+    ///   * and coming BACK does not resurrect it, which is what separates
+    ///     clearing the value from merely hiding it.
+    #[test]
+    fn the_confirmation_does_not_follow_the_pane_onto_another_item() {
+        let item = a_login();
+        let mut other = an_item(Some(2));
+        other.id = "id-2".to_string();
+        other.name = "Other".to_string();
+        assert_ne!(item.id, other.id, "the two fixtures are the same item");
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let row = laid_out.rect_of("Password");
+        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
+        assert!(
+            copied.painted("Password copied"),
+            "nothing was confirmed on the item that was copied, so the assertions \
+             below are about a toast that never existed -- painted: {:?}",
+            copied.strings()
+        );
+
+        // Redrawn for a reason that is not a selection change.
+        let refreshed = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            refreshed.painted("Password copied"),
+            "a redraw of the SAME item lost the confirmation -- a vault refresh or a \
+             write landing must not cancel it; painted: {:?}",
+            refreshed.strings()
+        );
+
+        // The user clicks another item, well inside the five seconds.
+        let switched = pane.idle(&other, &TotpState::NoSecret);
+        assert!(
+            !switched.painted("Password copied"),
+            "the confirmation followed the pane onto another item, which has no \
+             Password row at all; it painted: {:?}",
+            switched.strings()
+        );
+        let claims: Vec<&str> = switched
+            .strings()
+            .into_iter()
+            .filter(|painted| painted.ends_with(" copied"))
+            .collect();
+        assert!(
+            claims.is_empty(),
+            "the newly selected item claimed {claims:?} about a copy made on a \
+             different item"
+        );
+
+        // And back again, still inside the five seconds: nothing returns.
+        let back = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !back.painted("Password copied"),
+            "the confirmation came back when the item was reselected -- it was \
+             hidden rather than cleared; painted: {:?}",
+            back.strings()
         );
     }
 }
