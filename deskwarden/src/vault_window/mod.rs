@@ -633,6 +633,13 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     // so a revealed card number cannot follow the user onto the next item.
     let mut reveal = detail::RevealState::default();
     let mut icons = IconCache::default();
+    // The edit form's app block resolves a matched executable's real name (and
+    // icon) off the UI thread and caches it per path -- see `app_identity`. It
+    // lives HERE, beside `icons`, for the same two reasons: it must survive
+    // across frames (a per-frame cache is a lookup per frame, which is what
+    // this module exists to avoid), and it holds a GPU texture and a channel,
+    // neither of which belongs on a `Clone` draft.
+    let mut app_identities = crate::app_identity::AppIdentityCache::default();
     // Ids of the item rows `draw_item_list` actually rendered this frame --
     // populated by that call each frame, then used right after to trigger
     // favicon loads for whatever's currently scrolled into view (see
@@ -2569,7 +2576,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                         }
                     }
                     DetailMode::Edit(draft) => {
-                        match draw_detail_edit(ui, draft, &folders, false) {
+                        match draw_detail_edit(ui, draft, &folders, false, &mut app_identities) {
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
@@ -2646,12 +2653,24 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                     }
                                 }
                             }
+                            // Opened HERE rather than inside the form's own
+                            // closure, exactly as the generate above is: the
+                            // shell's file dialog is modal and pumps its own
+                            // message loop, so calling it mid-frame would
+                            // re-enter egui's. A cancelled dialog answers
+                            // `None` and nothing changes -- there is no failure
+                            // to report, so this arm has no error band.
+                            EditAction::PickAppFile => {
+                                if let Some(path) = crate::file_picker::pick_executable() {
+                                    draft.set_app_path(&path);
+                                }
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
                     }
                     DetailMode::Create(draft) => {
-                        match draw_detail_edit(ui, draft, &folders, true) {
+                        match draw_detail_edit(ui, draft, &folders, true, &mut app_identities) {
                             // `to_new_item` is fallible because `NewItem` has no
                             // variant for `ItemKind::Unknown(_)`: a future Bitwarden
                             // type has no create payload, and every total
@@ -2725,6 +2744,17 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                     }
                                 }
                             }
+                            // Unreachable, and spelled out rather than caught
+                            // by a `_ =>`: the create form draws no app block
+                            // (a draft with no item behind it carries no
+                            // binding -- see `EditDraft::app`), so there is no
+                            // Browse button here to click. `EditAction` is
+                            // matched exhaustively so that a control added to
+                            // one of the two forms cannot be silently ignored
+                            // by the other.
+                            EditAction::PickAppFile => log::warn!(
+                                "the create form asked for a file picker it does not draw"
+                            ),
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -6930,6 +6960,94 @@ mod generate_failure_wiring_tests {
             "the {GUARDED_BY:?} block no longer clears the generate error. It is the only \
              thing that condition is for, and the clear must be INSIDE the block: moved \
              out below it, it runs every frame.\n{body}"
+        );
+    }
+}
+
+/// Source-text guards on the edit form's app block, for the one piece of it
+/// no test in this crate can drive: the Browse button's other half.
+///
+/// `EditAction::PickAppFile` is reported by the form and asserted directly
+/// (`detail_edit::generator_row_tests::clicking_browse_asks_the_caller_to_open_
+/// the_file_dialog`). What happens next lives in `run`'s update closure, which
+/// needs a real event loop, and it ends in `IFileOpenDialog::Show` -- a modal
+/// dialog that would sit there waiting for a person. So the arm is pinned by
+/// source position, exactly as `refused_write_wiring_tests` pins the arms it
+/// cannot run.
+///
+/// **What this cannot see:** that the dialog's answer is any good, or that the
+/// arm runs at the right moment. What it catches is the arm being deleted or
+/// gutted -- which would leave a Browse button that reports an action nobody
+/// acts on, i.e. a button that does nothing, with the whole suite green.
+#[cfg(test)]
+mod app_block_wiring_tests {
+    // EVERY NEEDLE IS SPLIT WITH `concat!` and is a single line with no line
+    // ending, for `refused_write_wiring_tests`' reasons: `include_str!("mod.rs")`
+    // pulls this module in too, so an unsplit needle matches its own
+    // declaration, and a needle carrying a newline passes on one checkout's
+    // line endings and fails on the other's.
+    const PICK_ARM: &str = concat!("EditAction::PickApp", "File => {");
+    const OPENS_THE_DIALOG: &str = concat!("file_picker::pick_", "executable()");
+    const HANDS_IT_BACK: &str = concat!("draft.set_app_", "path(&path)");
+    /// The cache that makes the name-and-icon lookup happen once rather than
+    /// once a frame -- it has to be the SAME one across frames, so it is
+    /// passed in from `run`'s own state. Twice: the edit form and the create
+    /// form both take it.
+    const PASSES_THE_CACHE: &str = concat!("&mut app_", "identities)");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn the_counter_finds_needles_that_are_really_there() {
+        // The positive control, driving the same counting the assertions use
+        // rather than a re-implementation of it.
+        let planted = concat!("match x { EditAction::PickApp", "File => { pick(); } }");
+        assert_eq!(occurrences(planted, PICK_ARM), 1, "planted: {planted}");
+        assert_eq!(occurrences("nothing here", PICK_ARM), 0);
+        assert_eq!(occurrences("nothing here", OPENS_THE_DIALOG), 0);
+        assert_eq!(occurrences("nothing here", HANDS_IT_BACK), 0);
+    }
+
+    #[test]
+    fn browse_opens_the_file_dialog_and_the_answer_reaches_the_draft() {
+        assert_eq!(
+            occurrences(source(), PICK_ARM),
+            1,
+            "expected {PICK_ARM:?} exactly once -- the edit form's Browse arm. Zero means the \
+             form still reports the action and nobody acts on it: the button opens nothing, \
+             and every test of the button keeps passing because the button really does report"
+        );
+        assert_eq!(
+            occurrences(source(), OPENS_THE_DIALOG),
+            1,
+            "expected {OPENS_THE_DIALOG:?} exactly once -- nothing else in this app opens a \
+             file dialog, and an arm that does not open one is a dead Browse button"
+        );
+        assert_eq!(
+            occurrences(source(), HANDS_IT_BACK),
+            1,
+            "expected {HANDS_IT_BACK:?} exactly once -- the chosen path must reach the draft \
+             through `set_app_path`, which is what derives `process` from it and so keeps \
+             `AppMatch::launchable_path`'s file-name tie-back satisfiable. An arm that \
+             assigned `draft.app.path` directly would store a path the launcher refuses"
+        );
+    }
+
+    #[test]
+    fn both_editors_are_handed_the_one_identity_cache() {
+        assert_eq!(
+            occurrences(source(), PASSES_THE_CACHE),
+            2,
+            "expected {PASSES_THE_CACHE:?} exactly twice -- once per draft editor. Constructing \
+             a cache inside the frame closure instead would resolve the matched app's name and \
+             re-upload its icon on EVERY repaint, which is the per-frame I/O `app_identity` \
+             exists to prevent"
         );
     }
 }

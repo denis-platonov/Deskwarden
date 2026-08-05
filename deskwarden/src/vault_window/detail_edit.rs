@@ -3,6 +3,8 @@
 //! with no item id yet). See `detail.rs` for why this is a separate file
 //! from read mode.
 
+use crate::app_identity::{self, AppIdentityCache};
+use crate::app_match::{AppMatch, TriggerMode};
 use crate::theme;
 use crate::vault_bridge::{
     CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
@@ -10,7 +12,7 @@ use crate::vault_bridge::{
 };
 #[cfg(test)]
 use crate::vault_bridge::{LoginData, UriEntry};
-use crate::vault_window::sidebar;
+use crate::vault_window::{detail, sidebar};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use zeroize::Zeroizing;
 
@@ -93,6 +95,296 @@ pub struct SshKeyDraft {
     pub reveal_private_key: bool,
 }
 
+/// One running window, as the edit form's process picker shows it.
+///
+/// A plain, owned, `Clone` copy of the fields of
+/// [`crate::window_list::WindowInfo`] this form uses -- not the type itself,
+/// which is built by a Win32 callback and is neither `Clone` nor `Debug`, and
+/// which the draft has to be both of. **The enumeration itself is not
+/// re-implemented**: [`running_app_rows`] is a thin map over
+/// `window_list::list_windows`, which stays the one place that decides what
+/// counts as a window a user could point at (visible, titled, not cloaked, not
+/// a tool window, attributed through the frame host rather than named after
+/// it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppWindowRow {
+    pub title: String,
+    pub exe_name: String,
+    pub exe_path: String,
+    /// See [`crate::window_list::WindowInfo::hosted`]. Carried through
+    /// verbatim because it cannot be re-derived later, and because it is the
+    /// single thing that decides whether this row's title may ever be matched
+    /// on.
+    pub hosted: bool,
+    pub pid: u32,
+    /// The window handle, which is this row's identity. NOT the pid: every
+    /// unattributable Microsoft Store frame on a machine shares the host's
+    /// pid, so two different rows can carry the same one -- the same reason
+    /// `picker_ui::selected_window` keys on the handle.
+    pub hwnd: isize,
+}
+
+/// The windows the process picker offers.
+///
+/// Excludes this process, so the form cannot offer to match Deskwarden to
+/// itself -- the same argument `picker_ui::run_picker` passes.
+pub fn running_app_rows() -> Vec<AppWindowRow> {
+    crate::window_list::list_windows(std::process::id())
+        .into_iter()
+        .map(|w| AppWindowRow {
+            title: w.title,
+            exe_name: w.exe_name,
+            exe_path: w.exe_path,
+            hosted: w.hosted,
+            pid: w.pid,
+            hwnd: w.hwnd,
+        })
+        .collect()
+}
+
+/// Why a row must not be chosen, or `None` when it may be.
+///
+/// The one refusal, and it is the same one `picker_ui::host_process_refusal`
+/// makes for the same reason: a row still showing `ApplicationFrameHost.exe`
+/// is a Microsoft Store frame whose app could not be identified, and matching
+/// the host would fill this item into **every** Store app. Shorter wording
+/// than the tray picker's because this row is one of a list rather than the
+/// single thing the window is about, and it is shown on the row itself.
+///
+/// `Option<&'static str>` rather than a `bool` so the refusal and its reason
+/// cannot drift apart -- a disabled row with no explanation is the silent
+/// no-op this crate keeps being patched for.
+pub fn window_row_refusal(row: &AppWindowRow) -> Option<&'static str> {
+    crate::window_watch::is_host_process(&row.exe_name).then_some(
+        "Windows is not saying which app is inside this window. Restore it from the taskbar \
+         and refresh.",
+    )
+}
+
+/// The app-binding half of a draft: the `deskwarden:app-match` custom field,
+/// broken out into the boxes the form edits.
+///
+/// **`None` on [`EditDraft`] means the item carries no binding**, and the form
+/// draws no app block at all. Creating a binding is still the tray's "Add
+/// app..." flow: this form edits one that exists, which is exactly what was
+/// asked for ("when clicked Edit on a login **if app present**"). Offering a
+/// create here as well would put a second producer of a first binding in a
+/// second file, and the two would have to agree forever about a capture that
+/// only makes sense against a live window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppMatchDraft {
+    /// Cleared by Remove. The binding's fields are deliberately **kept** when
+    /// it is cleared, so the block can say what is about to be removed, and so
+    /// that a Remove followed by Cancel loses nothing.
+    pub bound: bool,
+    pub process: String,
+    pub title: String,
+    pub hosted: bool,
+    pub path: String,
+    pub args: String,
+    pub trigger: TriggerMode,
+    /// Whether the running-window list is open.
+    pub picking: bool,
+    /// The rows that list is showing.
+    ///
+    /// Captured when the list is opened and when Refresh is clicked -- **never
+    /// per frame**. Enumerating every top-level window on the desktop is an
+    /// `EnumWindows` walk with a `DwmGetWindowAttribute`, a
+    /// `GetWindowThreadProcessId`, a process-name lookup and an image-path
+    /// lookup per window; doing that on every repaint of an open form is the
+    /// per-frame I/O this feature is otherwise careful to avoid.
+    pub windows: Vec<AppWindowRow>,
+    pub window_filter: String,
+}
+
+impl AppMatchDraft {
+    pub fn from_match(m: &AppMatch) -> Self {
+        Self {
+            bound: true,
+            process: m.process.clone(),
+            title: m.title.clone(),
+            hosted: m.hosted,
+            path: m.path.clone(),
+            args: m.args.clone(),
+            trigger: m.trigger,
+            picking: false,
+            windows: Vec::new(),
+            window_filter: String::new(),
+        }
+    }
+
+    /// The binding this draft would save.
+    ///
+    /// `args` is passed straight through -- **not trimmed, not re-quoted, not
+    /// split**. See [`AppMatch::args`]: the string is the user's, and this app
+    /// has no tokenisation of a Windows command line that it could apply
+    /// without guessing.
+    pub fn to_match(&self) -> AppMatch {
+        AppMatch {
+            process: self.process.clone(),
+            // A title only ever rides a HOSTED match. Review 31's Important 1
+            // as an invariant of this type rather than of one call site: an
+            // unhosted title is inert, and an inert title in a saved field is
+            // indistinguishable from the batch of them one shipped commit
+            // wrote, which is why `MatchEngine::rebuild` refuses all of them.
+            title: if self.hosted { self.title.clone() } else { String::new() },
+            hosted: self.hosted,
+            path: self.path.clone(),
+            args: self.args.clone(),
+            trigger: self.trigger,
+        }
+    }
+
+    /// Points this binding at `path`, **deriving `process` from it**.
+    ///
+    /// This is the answer to the question a hand-typed or browsed-for path
+    /// raises: `AppMatch::launchable_path` requires the path's file name to be
+    /// the very `process` the match is keyed on, and a user editing one of the
+    /// two boxes would otherwise be able to break that tie-back and store
+    /// something the launcher will silently refuse.
+    ///
+    /// Three options were on the table -- refuse the save, warn and store it
+    /// anyway, or derive. **Derive**, because it is the only one that matches
+    /// what the user is doing: pointing at `chrome.exe` and then at
+    /// `msedge.exe` means "this item is for Edge now", and asking them to
+    /// retype the executable name in a second box to confirm it is asking them
+    /// to restate what they just said. Refusing the save would also make an
+    /// unrelated field (the arguments, the trigger) un-editable on any item
+    /// whose stored path is already odd, which is the class of item most in
+    /// need of editing.
+    ///
+    /// **A path with no file name changes nothing.** `C:\Program Files\` names
+    /// a directory; taking an empty `process` off it would produce a match that
+    /// can never fire and can never be launched.
+    ///
+    /// It also clears `hosted`/`title`: a match with an image path chosen off
+    /// the file system is not a Microsoft Store app presenting inside a frame,
+    /// and leaving the flag set would leave a title that is matched on but no
+    /// longer describes anything.
+    pub fn set_path(&mut self, path: &str) {
+        self.path = path.to_string();
+        if let Some(name) = app_identity::file_name_of(path) {
+            self.process = name.to_string();
+            self.hosted = false;
+            self.title = String::new();
+        }
+    }
+
+    /// Points this binding at a running window, copying everything off that one
+    /// row.
+    ///
+    /// Byte-for-byte the rule `picker_ui::app_match_for` follows, and for its
+    /// reasons: all four values come from the SAME row, so the path really is
+    /// the image of the process being named, and **the title is recorded only
+    /// for a hosted row**. `trigger` and `args` survive, because they are the
+    /// user's settings for this item and not facts about the window.
+    pub fn choose_window(&mut self, row: &AppWindowRow) {
+        self.process = row.exe_name.clone();
+        self.hosted = row.hosted;
+        self.title = if row.hosted { row.title.clone() } else { String::new() };
+        self.path = row.exe_path.clone();
+        self.bound = true;
+        self.picking = false;
+    }
+}
+
+/// What the edit form's Program file row shows, and whether it may be edited.
+///
+/// A Microsoft Store app has **no image path and no icon**: it presents inside
+/// an `ApplicationFrameHost.exe` frame and is matched by its window title (see
+/// [`AppMatch::hosted`]). Showing it an empty, editable path box would invite
+/// the user to type one in, and a path typed there could never be right.
+///
+/// **The word "hosted" does not appear**, here or on screen: it is the
+/// mechanism. What the user needs is the fact -- this is a Store app -- and
+/// that is what the row says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppPathRow {
+    /// An editable box holding the path.
+    Editable,
+    /// A disabled box holding this text, and a disabled Browse button.
+    NotApplicable(&'static str),
+}
+
+pub const APP_PATH_STORE_APP: &str = "Not applicable \u{2014} Store app";
+
+/// See [`AppPathRow`].
+pub fn app_path_row(hosted: bool) -> AppPathRow {
+    if hosted {
+        AppPathRow::NotApplicable(APP_PATH_STORE_APP)
+    } else {
+        AppPathRow::Editable
+    }
+}
+
+/// The warning under the Program file box, or `None` when there is nothing to
+/// warn about.
+///
+/// **A warning, not a refusal.** A path this app would decline to launch is
+/// still a perfectly good *match*: matching is done on `process`, which is a
+/// name, and it keeps working. Withholding Save would make the trigger and the
+/// arguments un-editable on exactly the items whose path most needs correcting,
+/// and would do it over a decision the user can see and fix in the box directly
+/// above the message. What is NOT acceptable is storing it silently -- so the
+/// message says precisely which rule the path fails to meet.
+///
+/// Nothing to say when the match is a Store app (there is no path to have an
+/// opinion about) or when the path is empty (every match saved before the field
+/// existed).
+pub fn app_path_warning(m: &AppMatch) -> Option<&'static str> {
+    if m.hosted || m.path.is_empty() || m.launchable_path().is_some() {
+        return None;
+    }
+    Some(
+        "Deskwarden will still fill this app, but it will not be able to open it: the program \
+         file has to be a full path on a drive letter, with no \u{201c}..\u{201d} in it \
+         \u{2014} like C:\\Program Files\\App\\App.exe",
+    )
+}
+
+/// What saving this draft should do to the item's `deskwarden:app-match` field.
+///
+/// **`Leave` is the important variant.** `EditDraft::apply_to`'s contract is
+/// that an edit that changes nothing produces a byte-identical item, and a
+/// binding is JSON in a custom field: rewriting it on every save would rewrite
+/// the *serializer's* spelling of it over whatever spelling is in the vault --
+/// key order, whitespace, and any future key this build does not model. So the
+/// field is written only when the value actually differs from what the item
+/// already carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppMatchEdit {
+    Leave,
+    Write(AppMatch),
+    Remove,
+}
+
+/// See [`AppMatchEdit`].
+///
+/// `draft` is `None` for every item this form drew no app block for, and that
+/// must mean *leave the field alone* rather than *remove it*: an item can carry
+/// a binding whose block the form declined to draw, and a save of its name
+/// would otherwise silently unbind it.
+pub fn app_match_edit(existing: Option<&AppMatch>, draft: Option<&AppMatchDraft>) -> AppMatchEdit {
+    let Some(draft) = draft else {
+        return AppMatchEdit::Leave;
+    };
+    if !draft.bound {
+        // A Remove against an item that has nothing to remove is `Leave`, not
+        // `Remove`: `without_app_match` would be a no-op, but going through it
+        // would still count as a change and cost a PUT.
+        return match existing {
+            Some(_) => AppMatchEdit::Remove,
+            None => AppMatchEdit::Leave,
+        };
+    }
+    let wanted = draft.to_match();
+    if existing == Some(&wanted) {
+        AppMatchEdit::Leave
+    } else {
+        AppMatchEdit::Write(wanted)
+    }
+}
+
 /// The edit form's state, for **one kind of item**.
 ///
 /// [`Self::kind`] is what makes this safe. Before it existed, `apply_to`
@@ -147,6 +439,17 @@ pub struct EditDraft {
     /// What the Generate control beside the password box will ask
     /// `bw serve` for. See [`GeneratorDraft`].
     pub generator: GeneratorDraft,
+    /// The item's app binding, or `None` when it carries none.
+    ///
+    /// **Item-level, like `name` and `folder_id`, and not one of the
+    /// kind-specific halves.** A `deskwarden:app-match` is a custom field and
+    /// can sit on an item of any type, so it does not belong to
+    /// [`Self::kind`] and is not cleared by [`Self::set_kind`].
+    ///
+    /// `None` is load-bearing on the way out as well as in: it is what tells
+    /// [`app_match_edit`] to leave the field alone entirely. See
+    /// [`AppMatchDraft`].
+    pub app: Option<AppMatchDraft>,
 }
 
 /// The generator's own form state: which kind of secret to make, and how big.
@@ -213,6 +516,7 @@ impl Default for EditDraft {
             ssh_key: SshKeyDraft::default(),
             note_body: String::new(),
             generator: GeneratorDraft::default(),
+            app: None,
         }
     }
 }
@@ -359,6 +663,11 @@ impl EditDraft {
             ssh_key: SshKeyDraft::default(),
             note_body: drafted(item.notes.as_deref().map(|n| n.as_str())),
             generator: GeneratorDraft::default(),
+            // Read through the SAME reader the detail pane's read-only card
+            // uses, so the two panes can never disagree about whether an item
+            // is bound or to what.
+            app: crate::vault_bridge::extract_app_match(item)
+                .map(|m| AppMatchDraft::from_match(&m)),
         }
     }
 
@@ -418,6 +727,12 @@ impl EditDraft {
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
         self.note_body = String::new();
+        // `app` is deliberately NOT cleared either, and for a different
+        // reason from `generator`'s: it is not kind-specific data at all. A
+        // `deskwarden:app-match` is a custom field on the ITEM, exactly as
+        // `name` and `folder_id` are item-level, and clearing it here would
+        // make switching the type menu silently unbind an app.
+        //
         // `generator` is deliberately NOT cleared. Everything above is the
         // abandoned kind's *data*, and the argument for wiping it is that
         // carrying it forward puts one kind's contents on the wire under
@@ -594,7 +909,51 @@ impl EditDraft {
             // to it.
             ItemKind::SshKey | ItemKind::Unknown(_) => {}
         }
-        updated
+        self.apply_app_match_to(item, updated)
+    }
+
+    /// The app-binding half of [`Self::apply_to`], split out so the decision
+    /// ([`app_match_edit`]) and the write can be pinned separately -- deleting
+    /// this call is a mutation `EditDraft`'s own tests catch, and deleting the
+    /// call to `app_match_edit` inside it is one `app_match_edit`'s tests
+    /// cannot.
+    ///
+    /// **Applied for every kind**, after the kind's own object and outside the
+    /// `self.kind != ItemKind::of(item)` early return above: a binding is a
+    /// custom field, not a type object, and an item whose type the draft
+    /// disagrees about is still an item whose binding the user just edited.
+    ///
+    /// Both writes go through `vault_bridge`, which is the one producer and the
+    /// one remover of that field -- a hand-rolled `fields.push` here would be a
+    /// second one, and would drop the server's extra keys on the field the way
+    /// `with_app_match`'s own doc describes.
+    fn apply_app_match_to(&self, item: &VaultItem, updated: VaultItem) -> VaultItem {
+        match app_match_edit(
+            crate::vault_bridge::extract_app_match(item).as_ref(),
+            self.app.as_ref(),
+        ) {
+            AppMatchEdit::Leave => updated,
+            AppMatchEdit::Write(m) => crate::vault_bridge::with_app_match(&updated, &m),
+            AppMatchEdit::Remove => crate::vault_bridge::without_app_match(&updated),
+        }
+    }
+
+    /// Puts a browsed-for path into the app block.
+    ///
+    /// A named method rather than `draft.app.as_mut().unwrap().set_path(..)` at
+    /// the call site, for the reason [`Self::set_generated_password`] exists:
+    /// the call site is `vault_window/mod.rs`, and the rule about what choosing
+    /// a file changes (the path, and `process` derived from it -- see
+    /// [`AppMatchDraft::set_path`]) belongs here.
+    ///
+    /// A no-op when there is no app block, which is the only honest answer: the
+    /// dialog cannot have been opened from a form that was not drawing one, and
+    /// inventing a binding out of a file choice would create a match the user
+    /// never asked for.
+    pub fn set_app_path(&mut self, path: &str) {
+        if let Some(app) = self.app.as_mut() {
+            app.set_path(path);
+        }
     }
 
     /// This draft's card fields as a [`CardData`], built on top of `base`
@@ -806,6 +1165,18 @@ pub enum EditAction {
     /// reported: the box is unchanged on failure, so a silently swallowed
     /// error looks exactly like a button that does nothing.
     GeneratePassword,
+    /// The app block's "Browse..." was clicked.
+    ///
+    /// Carries nothing, exactly as [`Self::GeneratePassword`] does and for the
+    /// same reason: the form cannot open the dialog itself. `IFileOpenDialog`
+    /// is modal and runs its own message loop, so calling it from inside the
+    /// frame closure would re-enter egui's; the caller runs
+    /// [`crate::file_picker::pick_executable`] between frames and hands the
+    /// answer back through [`EditDraft::set_app_path`].
+    ///
+    /// A cancelled dialog is `None` and nothing changes -- there is no failure
+    /// to report, unlike a failed generate.
+    PickAppFile,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -837,11 +1208,291 @@ pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
     folders.iter().filter(|folder| !sidebar::is_virtual_folder(folder)).collect()
 }
 
+// ---------------------------------------------------------------------------
+// The edit form's app block.
+//
+// The read pane's `MATCHED APP` card can only *show* a binding and remove it;
+// this is where one is changed. Every decision it makes is a pure function
+// above (`app_path_row`, `app_path_warning`, `window_row_refusal`,
+// `AppMatchDraft::set_path`/`choose_window`, `app_match_edit`) and the drawing
+// below does nothing but obey them -- this file's standing reason, stated in
+// `detail.rs`: a decision reachable only through an egui closure is a decision
+// no test can call.
+// ---------------------------------------------------------------------------
+
+/// The block's heading. Sentence case, matching every other `field_label` on
+/// this form rather than the read pane's uppercase card headings -- this is a
+/// group of fields in a form, not a card.
+pub const APP_BLOCK_HEADING: &str = "Matched app";
+
+const APP_PATH_LABEL: &str = "Program file";
+const APP_ARGS_LABEL: &str = "Command-line arguments";
+
+/// What the arguments box is for, said in the terms the user asked in.
+///
+/// Naming the browser-profile case explicitly because it is the case: the
+/// same executable, twice, told apart only by this string.
+const APP_ARGS_HINT: &str = "Passed to the program when Deskwarden opens it \u{2014} for example \
+                             --profile-directory=\"Profile 2\" to pick a browser profile. Saved \
+                             exactly as you type it.";
+
+/// The arguments row for a Microsoft Store app. There is no command line to
+/// pass: nothing is started by path (see [`AppPathRow`]).
+const APP_ARGS_STORE_APP: &str = APP_PATH_STORE_APP;
+
+const APP_WINDOW_LABEL: &str = "Window title";
+
+const APP_REMOVED_NOTICE: &str =
+    "This app will stop filling from this item when you save. Undo, or Cancel the edit, to keep \
+     it.";
+
+/// The three trigger pills, bound to the draft rather than reporting a click.
+///
+/// The order, the words and the caption are `detail`'s -- the read pane's card
+/// and this block must offer the user the same three choices under the same
+/// three names, and a second copy of the vocabulary here is how they would
+/// drift.
+fn app_trigger_pills(ui: &mut egui::Ui, current: &mut TriggerMode) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        for mode in detail::TRIGGER_ORDER {
+            let selected = mode == *current;
+            let button = egui::Button::new(
+                theme::semibold(detail::trigger_label(mode), 12.0).color(if selected {
+                    egui::Color32::WHITE
+                } else {
+                    theme::INK
+                }),
+            )
+            .fill(if selected { theme::BLUE } else { theme::CARD })
+            .stroke(if selected {
+                Stroke::NONE
+            } else {
+                Stroke::new(1.0, theme::BORDER_STRONG)
+            })
+            .corner_radius(CornerRadius::same(7));
+            if ui.add(button).clicked() {
+                *current = mode;
+            }
+        }
+    });
+}
+
+/// The running-window list, shown under the buttons while `picking`.
+///
+/// **In the form, not a second window.** The tray's `picker_ui::run_picker`
+/// opens its own `eframe` loop on `main`'s thread, and the vault window is a
+/// blocking call on that same thread -- which is exactly why the read pane's
+/// card only *names* the tray flow instead of routing to it. eframe cannot nest
+/// event loops, so raising the tray picker from here would deadlock. What is
+/// reusable is the part that matters: `window_list::list_windows`, the one
+/// enumeration, reached through [`running_app_rows`]. The list is drawn with
+/// this form's own widgets, which costs a scroll area and buys a picker that
+/// cannot hang the window.
+fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
+    ui.horizontal(|ui| {
+        if theme::secondary_button(ui, "Refresh").clicked() {
+            app.windows = running_app_rows();
+        }
+        if theme::secondary_button(ui, "Close list").clicked() {
+            app.picking = false;
+        }
+    });
+    ui.add_space(6.0);
+    theme::text_field(ui, &mut app.window_filter, false);
+    ui.add_space(4.0);
+
+    let filter = app.window_filter.to_lowercase();
+    let mut chosen: Option<usize> = None;
+    egui::ScrollArea::vertical()
+        .id_salt("edit-app-window-picker")
+        .max_height(180.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Matches the window title as well as the executable name, the same
+            // way the tray picker's search does -- "chrome" and "Google Chrome"
+            // should find the same row.
+            for index in 0..app.windows.len() {
+                let row = &app.windows[index];
+                if !filter.is_empty()
+                    && !row.title.to_lowercase().contains(&filter)
+                    && !row.exe_name.to_lowercase().contains(&filter)
+                {
+                    continue;
+                }
+                let refusal = window_row_refusal(row);
+                let label = format!("{}  \u{b7}  {}", row.title, row.exe_name);
+                let response =
+                    ui.add_enabled(refusal.is_none(), egui::Button::new(label).wrap());
+                if let Some(why) = refusal {
+                    // On the row itself, not only in a tooltip: a disabled row
+                    // with no visible reason is the silent no-op again.
+                    ui.label(RichText::new(why).size(11.0).color(theme::TEXT_FAINT));
+                } else if response.clicked() {
+                    chosen = Some(index);
+                }
+            }
+            if app.windows.is_empty() {
+                ui.label(
+                    RichText::new("No open windows to choose from.")
+                        .size(12.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        });
+    // Applied after the loop, so the immutable borrow of `app.windows` above is
+    // over before the row is copied into the draft.
+    if let Some(index) = chosen {
+        let row = app.windows[index].clone();
+        app.choose_window(&row);
+    }
+}
+
+/// The whole app block. Returns an [`EditAction`] when it needs the caller to
+/// do something the form cannot (open the file dialog).
+fn app_block(
+    ui: &mut egui::Ui,
+    app: &mut AppMatchDraft,
+    apps: &mut AppIdentityCache,
+) -> Option<EditAction> {
+    let mut action = None;
+    theme::hairline(ui);
+    ui.add_space(10.0);
+    theme::field_label(ui, APP_BLOCK_HEADING);
+
+    if !app.bound {
+        ui.label(RichText::new(APP_REMOVED_NOTICE).size(12.0).color(theme::TEXT_FAINT));
+        ui.add_space(6.0);
+        if theme::secondary_button(ui, "Undo remove").clicked() {
+            app.bound = true;
+        }
+        ui.add_space(10.0);
+        return action;
+    }
+
+    // Resolved ONCE per path by the cache, off this thread, and copied out
+    // here so the borrow of `apps` (and of `app.process`) ends before the
+    // boxes below take `app` mutably.
+    let (name, icon, pending) = {
+        let label = apps.label(ui.ctx(), &app.path, &app.process);
+        (label.name.to_string(), label.icon.cloned(), label.pending)
+    };
+    if pending {
+        // A channel is not input, and egui does not repaint for one.
+        ui.ctx().request_repaint_after(AppIdentityCache::POLL_INTERVAL);
+    }
+    ui.horizontal(|ui| {
+        if let Some(texture) = &icon {
+            ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(18.0, 18.0)));
+        }
+        // The APP's name -- "Google Chrome", not "chrome.exe". See
+        // `app_identity`.
+        ui.label(theme::semibold(name, 14.0).color(theme::INK));
+    });
+    ui.add_space(8.0);
+
+    if app.hosted && !app.title.is_empty() {
+        // Read-only, because it is not a setting: it is what the frame was
+        // called when the app was captured, and it is the only thing that can
+        // identify a suspended Store app. Typing over it would be typing a new
+        // identity for something that is not there to check it against.
+        theme::disabled_field_label(ui, APP_WINDOW_LABEL);
+        theme::disabled_text_field(ui, &app.title);
+        ui.add_space(10.0);
+    }
+
+    theme::field_label(ui, APP_PATH_LABEL);
+    let path_row = app_path_row(app.hosted);
+    match path_row {
+        AppPathRow::Editable => {
+            if theme::text_field(ui, &mut app.path, false).changed() {
+                // `process` is re-derived on every keystroke, which is what
+                // keeps `launchable_path`'s file-name tie-back satisfiable --
+                // see `AppMatchDraft::set_path`.
+                let typed = app.path.clone();
+                app.set_path(&typed);
+            }
+        }
+        AppPathRow::NotApplicable(text) => {
+            theme::disabled_text_field(ui, text);
+        }
+    }
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        if theme::secondary_button(ui, "Choose a running app\u{2026}").clicked() {
+            app.picking = !app.picking;
+            if app.picking {
+                // Enumerated on OPEN, never per frame.
+                app.windows = running_app_rows();
+            }
+        }
+        let browse = egui::Button::new("Browse\u{2026}");
+        if ui
+            .add_enabled(matches!(path_row, AppPathRow::Editable), browse)
+            .clicked()
+        {
+            action = Some(EditAction::PickAppFile);
+        }
+    });
+
+    if app.picking {
+        ui.add_space(6.0);
+        app_window_picker(ui, app);
+    }
+
+    if let Some(warning) = app_path_warning(&app.to_match()) {
+        ui.add_space(4.0);
+        ui.label(RichText::new(warning).size(11.0).color(theme::TEXT_FAINT));
+    }
+    ui.add_space(10.0);
+
+    theme::field_label(ui, APP_ARGS_LABEL);
+    match path_row {
+        AppPathRow::Editable => {
+            theme::text_field(ui, &mut app.args, false);
+        }
+        // A Store app is not started by path, so there is no command line to
+        // give it. Disabled for the same reason the path box is, and saying so
+        // in the same words.
+        AppPathRow::NotApplicable(_) => {
+            theme::disabled_text_field(ui, APP_ARGS_STORE_APP);
+        }
+    }
+    ui.add_space(4.0);
+    ui.label(RichText::new(APP_ARGS_HINT).size(11.0).color(theme::TEXT_FAINT));
+    ui.add_space(10.0);
+
+    theme::field_label(ui, "Autofill");
+    app_trigger_pills(ui, &mut app.trigger);
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(detail::trigger_caption(app.trigger))
+            .size(11.0)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(10.0);
+
+    // Staged, not immediate: unlike the read pane's card -- which writes
+    // straight through because there is no Save to wait for -- this is one
+    // change among several on a form the user can still Cancel. Nothing is
+    // written until Save, and `AppMatchDraft::bound` keeps the fields so the
+    // block can still say what is going.
+    if theme::secondary_button(ui, "Remove app match").clicked() {
+        app.bound = false;
+        app.picking = false;
+    }
+    ui.add_space(10.0);
+
+    action
+}
+
 pub fn draw_detail_edit(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
     folders: &[Folder],
     creating: bool,
+    apps: &mut AppIdentityCache,
 ) -> EditAction {
     let mut action = EditAction::None;
     // Read before the closure borrows `draft` mutably.
@@ -1008,6 +1659,20 @@ pub fn draw_detail_edit(
                 }
             }
 
+            // Between the kind's own fields and the folder, because a
+            // binding is neither: it is about what Deskwarden does with this
+            // item, which is the same argument that puts the read pane's
+            // `MATCHED APP` card last among the body cards.
+            //
+            // Drawn only for an item that HAS a binding -- see `EditDraft::app`
+            // and `AppMatchDraft`.
+            if let Some(app) = draft.app.as_mut() {
+                if let Some(requested) = app_block(ui, app, apps) {
+                    action = requested;
+                }
+                ui.add_space(4.0);
+            }
+
             theme::field_label(ui, "Folder");
             // Both the label and the rows read the *assignable* list, not the
             // raw one, and the label matters as much as the rows: resolving a
@@ -1124,6 +1789,353 @@ mod tests {
             favorite: true,
             other: item_other,
         }
+    }
+
+    // -- the app block ------------------------------------------------------
+    //
+    // The decisions first, then `apply_to` end to end. `app_block_ui_tests`
+    // (below, its own module) drives the widgets.
+
+    /// The binding on the user's motivating item: a browser, plus the switch
+    /// that says which profile.
+    fn chrome_match() -> AppMatch {
+        AppMatch {
+            process: "chrome.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            args: r#"--profile-directory="Profile 2""#.to_string(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    /// A Microsoft Store binding: a title, no path, and nothing to launch.
+    fn store_match() -> AppMatch {
+        AppMatch {
+            process: "Speedtest.exe".to_string(),
+            title: "Speedtest".to_string(),
+            hosted: true,
+            path: String::new(),
+            args: String::new(),
+            trigger: TriggerMode::Hotkey,
+        }
+    }
+
+    fn bound_item(m: &AppMatch) -> VaultItem {
+        crate::vault_bridge::with_app_match(&item(), m)
+    }
+
+    fn window_row(exe: &str, hosted: bool) -> AppWindowRow {
+        AppWindowRow {
+            title: "Ledgerline - Invoices".to_string(),
+            exe_name: exe.to_string(),
+            exe_path: format!(r"C:\Apps\{exe}"),
+            hosted,
+            pid: 42,
+            hwnd: 4242,
+        }
+    }
+
+    #[test]
+    fn from_item_reads_the_binding_the_item_carries() {
+        let draft = EditDraft::from_item(&bound_item(&chrome_match()));
+        let app = draft.app.expect("a bound item must give the form a block to draw");
+        assert!(app.bound);
+        assert_eq!(app.process, "chrome.exe");
+        assert_eq!(app.path, chrome_match().path);
+        assert_eq!(app.args, r#"--profile-directory="Profile 2""#);
+        assert_eq!(app.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn an_item_with_no_binding_gives_the_form_no_block() {
+        // The positive control for the test above: `app` must not be `Some` for
+        // every item, which is what a block drawn unconditionally would need.
+        assert!(EditDraft::from_item(&item()).app.is_none());
+    }
+
+    #[test]
+    fn the_draft_carries_the_arguments_back_out_untouched() {
+        for args in [
+            r#"--profile-directory="Profile 2""#,
+            "  spaced  ",
+            r"--user-data-dir=C:\Users\me\Chrome Beta",
+        ] {
+            let m = AppMatch { args: args.to_string(), ..chrome_match() };
+            let round = AppMatchDraft::from_match(&m).to_match();
+            assert_eq!(round.args, args, "args: {args:?}");
+            assert_eq!(round, m, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn a_draft_never_carries_a_title_onto_an_unhosted_match() {
+        // Review 31's Important 1 as an invariant of the draft: an unhosted title
+        // is never matched on, so storing one is storing a value that looks live
+        // and is not. Deleting the `if self.hosted` in `to_match` gives
+        //     left: "Ledgerline - Invoices"  right: ""
+        let mut app = AppMatchDraft::from_match(&store_match());
+        app.hosted = false;
+        assert_eq!(app.to_match().title, "");
+        // Positive control: a hosted one keeps it, so the assertion above is not
+        // satisfied by a `to_match` that drops every title.
+        assert_eq!(AppMatchDraft::from_match(&store_match()).to_match().title, "Speedtest");
+    }
+
+    #[test]
+    fn choosing_a_path_derives_the_process_from_it() {
+        // The whole of the path-validation decision: the file-name tie-back
+        // `AppMatch::launchable_path` insists on is satisfied by construction
+        // rather than checked and refused. Deleting the derivation leaves
+        // `process` at "chrome.exe" against a path ending in "msedge.exe", and
+        // `launchable_path` then answers `None` for a path the user just chose.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.set_path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe");
+        assert_eq!(app.process, "msedge.exe");
+        assert!(
+            app.to_match().launchable_path().is_some(),
+            "a path chosen through the form must be one the launcher would accept"
+        );
+        // And the arguments and the trigger are the user's, not the file's.
+        assert_eq!(app.args, r#"--profile-directory="Profile 2""#);
+        assert_eq!(app.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn a_path_that_names_no_file_leaves_the_process_alone() {
+        // Half-typed, on the way to a real path. Taking an empty `process` off it
+        // would produce a match that can never fire again.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.set_path(r"C:\Program Files\");
+        assert_eq!(app.process, "chrome.exe");
+        assert_eq!(app.path, r"C:\Program Files\", "the box still shows what was typed");
+    }
+
+    #[test]
+    fn giving_a_store_binding_a_real_path_stops_it_being_a_store_binding() {
+        let mut app = AppMatchDraft::from_match(&store_match());
+        app.set_path(r"C:\Apps\Ledgerline.exe");
+        assert!(!app.hosted, "a file on disk is not an app inside a frame");
+        assert_eq!(app.title, "", "and its old frame title identifies nothing now");
+    }
+
+    #[test]
+    fn choosing_a_running_window_copies_that_one_rows_four_values() {
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.picking = true;
+        app.choose_window(&window_row("Ledgerline.exe", false));
+        assert_eq!(app.process, "Ledgerline.exe");
+        assert_eq!(app.path, r"C:\Apps\Ledgerline.exe");
+        assert_eq!(app.title, "", "an unhosted row records no title");
+        assert!(!app.hosted);
+        assert!(!app.picking, "choosing a row closes the list");
+        // The user's own settings survive a change of app.
+        assert_eq!(app.args, r#"--profile-directory="Profile 2""#);
+        assert_eq!(app.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn choosing_a_hosted_window_is_the_one_case_that_records_a_title() {
+        // The positive control for the assertion above, and the same rule
+        // `picker_ui::app_match_for` follows.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.choose_window(&window_row("Speedtest.exe", true));
+        assert!(app.hosted);
+        assert_eq!(app.title, "Ledgerline - Invoices");
+    }
+
+    #[test]
+    fn a_row_that_names_the_window_host_cannot_be_chosen() {
+        let refusal = window_row_refusal(&window_row("ApplicationFrameHost.exe", false));
+        assert!(refusal.is_some(), "matching the host fills this item into every Store app");
+        // Positive control: an ordinary row is offered.
+        assert_eq!(window_row_refusal(&window_row("Ledgerline.exe", false)), None);
+    }
+
+    #[test]
+    fn a_store_binding_offers_no_path_box_and_says_why() {
+        assert_eq!(app_path_row(true), AppPathRow::NotApplicable(APP_PATH_STORE_APP));
+        assert_eq!(app_path_row(false), AppPathRow::Editable);
+        assert!(
+            !APP_PATH_STORE_APP.to_lowercase().contains("hosted"),
+            "the mechanism must not reach the screen: {APP_PATH_STORE_APP:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_the_launcher_would_refuse_is_warned_about_and_not_refused() {
+        let bad = AppMatch { path: r"\\attacker\share\chrome.exe".to_string(), ..chrome_match() };
+        assert!(app_path_warning(&bad).is_some());
+        // Nothing to warn about for a good path, an empty one, or a Store app --
+        // the positive controls that stop the warning being permanent furniture.
+        assert_eq!(app_path_warning(&chrome_match()), None);
+        assert_eq!(app_path_warning(&store_match()), None);
+        assert_eq!(
+            app_path_warning(&AppMatch { path: String::new(), ..chrome_match() }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_store_warning_never_says_hosted() {
+        for text in [
+            app_path_warning(&AppMatch { path: r"..\x\chrome.exe".to_string(), ..chrome_match() })
+                .unwrap(),
+            APP_ARGS_HINT,
+            APP_REMOVED_NOTICE,
+            APP_ARGS_STORE_APP,
+        ] {
+            assert!(!text.to_lowercase().contains("hosted"), "{text:?}");
+            assert!(
+                !text.contains("ApplicationFrameHost"),
+                "the mechanism is not the fact: {text:?}"
+            );
+        }
+    }
+
+    // -- what a save does ---------------------------------------------------
+
+    #[test]
+    fn a_save_that_changed_nothing_leaves_the_binding_alone() {
+        assert_eq!(
+            app_match_edit(
+                Some(&chrome_match()),
+                Some(&AppMatchDraft::from_match(&chrome_match()))
+            ),
+            AppMatchEdit::Leave
+        );
+    }
+
+    #[test]
+    fn changing_the_arguments_writes_the_binding() {
+        // The positive control for the test above: `Leave` must not be the answer
+        // to everything, which is what an `app_match_edit` returning `Leave`
+        // unconditionally would give -- and that mutation makes the arguments box
+        // inert while every pure test of the draft keeps passing.
+        let mut draft = AppMatchDraft::from_match(&chrome_match());
+        draft.args = "--profile-directory=Personal".to_string();
+        assert_eq!(
+            app_match_edit(Some(&chrome_match()), Some(&draft)),
+            AppMatchEdit::Write(AppMatch {
+                args: "--profile-directory=Personal".to_string(),
+                ..chrome_match()
+            })
+        );
+    }
+
+    #[test]
+    fn removing_the_binding_removes_the_field_and_only_when_there_is_one() {
+        let mut draft = AppMatchDraft::from_match(&chrome_match());
+        draft.bound = false;
+        assert_eq!(app_match_edit(Some(&chrome_match()), Some(&draft)), AppMatchEdit::Remove);
+        // Nothing to remove: a `Remove` here would cost a PUT that changes nothing.
+        assert_eq!(app_match_edit(None, Some(&draft)), AppMatchEdit::Leave);
+    }
+
+    #[test]
+    fn a_form_that_drew_no_block_never_touches_the_field() {
+        // The failure this prevents: saving an item's NAME silently unbinding its
+        // app, on any item whose block the form declined to draw.
+        assert_eq!(app_match_edit(Some(&chrome_match()), None), AppMatchEdit::Leave);
+        assert_eq!(app_match_edit(None, None), AppMatchEdit::Leave);
+    }
+
+    #[test]
+    fn saving_an_edited_argument_string_reaches_the_item() {
+        // **The wiring pin for the write.** Deleting the `apply_app_match_to` call
+        // at the end of `apply_to` leaves every `app_match_edit` test above green
+        // and the arguments box permanently inert. This is what fails:
+        //     the arguments never reached the item
+        let item = bound_item(&chrome_match());
+        let mut draft = EditDraft::from_item(&item);
+        draft.app.as_mut().unwrap().args = "--profile-directory=Personal".to_string();
+
+        let saved = draft.apply_to(&item);
+        let stored = crate::vault_bridge::extract_app_match(&saved)
+            .expect("the arguments never reached the item");
+        assert_eq!(stored.args, "--profile-directory=Personal");
+        // And nothing else about the binding moved.
+        assert_eq!(stored.process, "chrome.exe");
+        assert_eq!(stored.path, chrome_match().path);
+        assert_eq!(stored.trigger, TriggerMode::Prompt);
+    }
+
+    #[test]
+    fn saving_an_edited_path_reaches_the_item_with_its_process_derived() {
+        let item = bound_item(&chrome_match());
+        let mut draft = EditDraft::from_item(&item);
+        draft.set_app_path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe");
+
+        let stored = crate::vault_bridge::extract_app_match(&draft.apply_to(&item)).unwrap();
+        assert_eq!(stored.process, "msedge.exe");
+        assert_eq!(stored.launchable_path(), Some(stored.path.as_str()));
+    }
+
+    #[test]
+    fn saving_a_changed_trigger_reaches_the_item() {
+        let item = bound_item(&chrome_match());
+        let mut draft = EditDraft::from_item(&item);
+        draft.app.as_mut().unwrap().trigger = TriggerMode::Auto;
+        let stored = crate::vault_bridge::extract_app_match(&draft.apply_to(&item)).unwrap();
+        assert_eq!(stored.trigger, TriggerMode::Auto);
+    }
+
+    #[test]
+    fn saving_a_removed_binding_takes_the_field_off_the_item() {
+        let item = bound_item(&chrome_match());
+        let mut draft = EditDraft::from_item(&item);
+        draft.app.as_mut().unwrap().bound = false;
+        let saved = draft.apply_to(&item);
+        assert!(crate::vault_bridge::extract_app_match(&saved).is_none());
+        // The rest of the item is untouched -- a Remove is one field, not a reset.
+        assert_eq!(saved.name, item.name);
+        assert_eq!(saved.favorite, item.favorite);
+    }
+
+    /// **The contract this feature could most easily have broken.**
+    ///
+    /// `an_edit_that_changes_nothing_produces_a_byte_identical_item` above proves
+    /// it for an item with no binding. This proves it for one WITH a binding,
+    /// whose field is JSON: a save that rewrote the field unconditionally would
+    /// replace whatever spelling is in the user's vault with the serializer's,
+    /// and this is what would notice.
+    #[test]
+    fn an_edit_that_changes_nothing_leaves_a_bound_item_byte_identical() {
+        let item = bound_item(&chrome_match());
+        let draft = EditDraft::from_item(&item);
+        assert_eq!(
+            serde_json::to_string(&draft.apply_to(&item)).unwrap(),
+            serde_json::to_string(&item).unwrap()
+        );
+    }
+
+    /// The same, for the shape a **previous build** wrote: five keys, no `args`.
+    /// Opening such an item in the editor and saving it must not grow the field.
+    #[test]
+    fn saving_an_untouched_binding_from_an_older_build_does_not_rewrite_it() {
+        let stored = r#"{"process":"Speedtest.exe","title":"Speedtest","hosted":true,"path":"C:\\Apps\\Speedtest.exe","trigger":"prompt"}"#;
+        let mut item = item();
+        item.fields.push(crate::vault_bridge::VaultField {
+            name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
+            value: Some(stored.to_string()),
+            other: serde_json::Map::new(),
+        });
+        let draft = EditDraft::from_item(&item);
+        let saved = draft.apply_to(&item);
+        assert_eq!(
+            saved.fields[0].value.as_deref(),
+            Some(stored),
+            "an untouched binding was rewritten on save"
+        );
+    }
+
+    /// Changing the item's TYPE in the create form must not throw away a binding
+    /// -- `app` is item-level, like the name and the folder.
+    #[test]
+    fn switching_kind_keeps_the_app_binding() {
+        let mut draft = EditDraft::from_item(&bound_item(&chrome_match()));
+        draft.set_kind(ItemKind::Card);
+        assert!(draft.app.is_some(), "changing the type menu unbound the app");
     }
 
     fn folder(id: &str, name: &str) -> Folder {
@@ -2270,9 +3282,10 @@ mod generator_row_tests {
         draft: &mut EditDraft,
         events: &[egui::Event],
     ) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false);
+            action = draw_detail_edit(ui, draft, &[], false, &mut apps);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -2509,6 +3522,330 @@ mod generator_row_tests {
                 pressed: false,
                 modifiers: egui::Modifiers::NONE,
             }],
+        );
+    }
+
+    // -- the app block ------------------------------------------------------
+    //
+    // These drive the WIDGETS. Every decision they exercise has a pure test in
+    // `tests` above; what only these can see is whether the form calls it --
+    // this crate's standing defect being a change that is correct in isolation
+    // and never reaches the behaviour it claims. Each names the mutation it
+    // catches.
+
+    /// A draft with a binding, and no item behind it: the form reads
+    /// `draft.app`, so a `VaultItem` would only be a longer way to set it.
+    fn app_draft(m: &AppMatch) -> EditDraft {
+        let mut draft = EditDraft::empty();
+        draft.name = "Ledgerline".to_string();
+        draft.app = Some(AppMatchDraft::from_match(m));
+        draft
+    }
+
+    fn chrome() -> AppMatch {
+        AppMatch {
+            process: "chrome.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            // Deliberately a path that does not exist, so the identity lookup
+            // resolves the same way on every machine (to the file name) and no
+            // assertion here depends on what is installed.
+            path: r"C:\Deskwarden Test\Chrome\chrome.exe".to_string(),
+            args: "--profile-directory=WorkProfile".to_string(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    fn store() -> AppMatch {
+        AppMatch {
+            process: "Speedtest.exe".to_string(),
+            title: "Speedtest".to_string(),
+            hosted: true,
+            path: String::new(),
+            args: String::new(),
+            trigger: TriggerMode::Hotkey,
+        }
+    }
+
+    /// Click `pos`, then type `text` into whatever took focus. Two frames,
+    /// because egui gives a widget focus on the frame the click lands and reads
+    /// text events on the next.
+    fn click_and_type(ctx: &egui::Context, draft: &mut EditDraft, pos: Pos2, text: &str) {
+        let _ = frame(ctx, draft, &click(pos));
+        let _ = frame(ctx, draft, &[egui::Event::Text(text.to_string())]);
+    }
+
+    #[test]
+    fn the_form_draws_an_app_block_for_a_bound_item() {
+        // Mutation this catches: delete the `app_block(ui, app, apps)` call in
+        // `draw_detail_edit`. Every pure test of the draft, of `app_match_edit`
+        // and of `apply_to` keeps passing while the whole block is invisible --
+        // which is exactly the shape of defect this crate keeps shipping.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let strings = painted.strings();
+        for needle in [
+            APP_BLOCK_HEADING,
+            APP_PATH_LABEL,
+            APP_ARGS_LABEL,
+            "Browse\u{2026}",
+            "Choose a running app\u{2026}",
+            "Remove app match",
+        ] {
+            assert!(strings.contains(&needle), "the app block is missing {needle:?}: {strings:?}");
+        }
+        // The app's NAME, not the raw path, is the heading of the block; the
+        // lookup has not answered yet on the frame after the first, so this is
+        // the file name -- which is what `app_identity` promises as its
+        // placeholder and its last fallback both.
+        assert!(strings.contains(&"chrome.exe"), "no app name painted: {strings:?}");
+    }
+
+    #[test]
+    fn a_form_with_no_binding_draws_no_app_block() {
+        // The positive control for the test above: without it, a block drawn
+        // unconditionally would satisfy it.
+        let ctx = styled_context();
+        let mut draft = EditDraft::empty();
+        draft.name = "Ledgerline".to_string();
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            !painted.strings().contains(&APP_BLOCK_HEADING),
+            "an unbound item was offered an app block: {:?}",
+            painted.strings()
+        );
+    }
+
+    #[test]
+    fn typing_in_the_arguments_box_edits_the_arguments() {
+        // Mutation this catches: `theme::text_field(ui, &mut app.path, false)`
+        // under the arguments label. The box still appears, the label still says
+        // "Command-line arguments", and every keystroke silently retunes the
+        // program path instead -- which the pure tests cannot see, because they
+        // set the field directly.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let box_rect = painted.rect_of("--profile-directory=WorkProfile");
+
+        click_and_type(&ctx, &mut draft, box_rect.center(), "Z");
+        let app = draft.app.as_ref().unwrap();
+        assert!(
+            app.args.contains('Z'),
+            "typing in the arguments box changed no arguments: {:?}",
+            app.args
+        );
+        assert_eq!(
+            app.path,
+            chrome().path,
+            "typing in the arguments box moved the program path"
+        );
+    }
+
+    #[test]
+    fn typing_in_the_path_box_edits_the_path() {
+        // The mirror, and the positive control: without it, both boxes could be
+        // bound to `args` and the test above would still pass.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let box_rect = painted.rect_of(chrome().path.as_str());
+
+        click_and_type(&ctx, &mut draft, box_rect.center(), "Z");
+        let app = draft.app.as_ref().unwrap();
+        assert_ne!(app.path, chrome().path, "typing in the path box changed no path");
+        assert_eq!(
+            app.args,
+            chrome().args,
+            "typing in the path box moved the command-line arguments"
+        );
+    }
+
+    #[test]
+    fn clicking_browse_asks_the_caller_to_open_the_file_dialog() {
+        // Mutation this catches: delete the button, or drop the
+        // `action = Some(EditAction::PickAppFile)`. `EditAction::PickAppFile` is
+        // `pub`, so having no producers left is not even a warning.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (idle, painted) = frame(&ctx, &mut draft, &[]);
+        assert_eq!(idle, EditAction::None, "the form reported an action with no input");
+
+        let (action, _) = frame(&ctx, &mut draft, &click(painted.rect_of("Browse\u{2026}").center()));
+        assert_eq!(action, EditAction::PickAppFile);
+    }
+
+    #[test]
+    fn a_click_that_misses_browse_asks_for_nothing() {
+        // The positive control: if any click in the form reported `PickAppFile`,
+        // the test above would pass with the button deleted.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let button = painted.rect_of("Browse\u{2026}");
+        let miss = Pos2::new(button.center().x, button.top() - 60.0);
+        let (action, _) = frame(&ctx, &mut draft, &click(miss));
+        assert_ne!(action, EditAction::PickAppFile, "a click that hit nothing opened the dialog");
+    }
+
+    #[test]
+    fn clicking_remove_stages_the_removal_rather_than_performing_it() {
+        // Mutation this catches: delete `app.bound = false`. The button stays,
+        // clicking it does nothing, and `app_match_edit`'s `Remove` arm becomes
+        // unreachable while its own test keeps passing.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+
+        let _ = frame(&ctx, &mut draft, &click(painted.rect_of("Remove app match").center()));
+        assert!(!draft.app.as_ref().unwrap().bound, "Remove did not stage a removal");
+        // A frame LATER: the block above was laid out before the click was
+        // processed, so the frame that carries the click still paints the
+        // pre-click state.
+        let (_, after) = frame(&ctx, &mut draft, &[]);
+        // Nothing has been written: the fields are still there, and the block
+        // says what is about to happen and offers the way back.
+        assert_eq!(draft.app.as_ref().unwrap().args, chrome().args);
+        assert!(
+            after.strings().contains(&"Undo remove"),
+            "a staged removal offers no way back: {:?}",
+            after.strings()
+        );
+    }
+
+    #[test]
+    fn clicking_a_trigger_pill_changes_the_trigger() {
+        // Mutation this catches: an inert pill row. `app_trigger_pills` writes
+        // straight into the draft, so nothing else in the crate would notice.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let auto = painted.rect_of(detail::trigger_label(TriggerMode::Auto));
+
+        let _ = frame(&ctx, &mut draft, &click(auto.center()));
+        assert_eq!(
+            draft.app.as_ref().unwrap().trigger,
+            TriggerMode::Auto,
+            "clicking the Auto pill left the trigger where it was"
+        );
+    }
+
+    #[test]
+    fn a_store_app_gets_a_read_only_path_row_and_keeps_its_trigger_and_remove() {
+        // The user's own choice for this case: state the reason, disable the
+        // file picker, leave the trigger and Remove working.
+        let ctx = styled_context();
+        let mut draft = app_draft(&store());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let strings = painted.strings();
+
+        assert!(
+            strings.contains(&APP_PATH_STORE_APP),
+            "a Store binding does not say why it has no path: {strings:?}"
+        );
+        assert!(strings.contains(&"Speedtest"), "the window title is not shown: {strings:?}");
+        assert!(strings.contains(&"Remove app match"), "Remove is gone: {strings:?}");
+        // The word the user must never see.
+        assert!(
+            !strings.iter().any(|s| s.to_lowercase().contains("hosted")),
+            "the mechanism reached the screen: {strings:?}"
+        );
+
+        // Browse is drawn but refuses: clicking it asks for nothing.
+        let (action, _) = frame(&ctx, &mut draft, &click(painted.rect_of("Browse\u{2026}").center()));
+        assert_ne!(
+            action,
+            EditAction::PickAppFile,
+            "a Store binding offered a file dialog whose answer it could not use"
+        );
+
+        // ...and the trigger still works, which is the half of the requirement a
+        // wholesale `add_enabled(false)` around the block would have broken.
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let auto = painted.rect_of(detail::trigger_label(TriggerMode::Auto));
+        let _ = frame(&ctx, &mut draft, &click(auto.center()));
+        assert_eq!(draft.app.as_ref().unwrap().trigger, TriggerMode::Auto);
+    }
+
+    #[test]
+    fn opening_the_process_picker_is_one_click_and_lists_what_windows_there_are() {
+        // The enumeration is the real desktop's, so nothing here asserts a row.
+        // What it asserts is that the list opens at all, that it is NOT populated
+        // before it is opened (the per-frame-I/O mutation), and that it closes
+        // again.
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        assert!(!draft.app.as_ref().unwrap().picking);
+        assert!(
+            draft.app.as_ref().unwrap().windows.is_empty(),
+            "the desktop was enumerated before anyone asked"
+        );
+
+        let open = painted.rect_of("Choose a running app\u{2026}");
+        let (_, listed) = frame(&ctx, &mut draft, &click(open.center()));
+        assert!(draft.app.as_ref().unwrap().picking, "the picker did not open");
+        assert!(
+            listed.strings().contains(&"Refresh") && listed.strings().contains(&"Close list"),
+            "the open picker has no controls: {:?}",
+            listed.strings()
+        );
+
+        let (_, after) = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &click(after.rect_of("Close list").center()));
+        assert!(!draft.app.as_ref().unwrap().picking, "the picker did not close");
+    }
+
+    /// **The `icon_probe` tripwire, answered.**
+    ///
+    /// `theme::icon_probe` identifies every drawn icon in this app by vertex
+    /// count alone, and `theme::no_two_drawn_icons_share_a_vertex_count` is a
+    /// live tripwire against two of them colliding. The app block paints
+    /// something none of them are -- a bitmap, from an executable's shell icon
+    /// -- so the question is whether that bitmap can be mistaken for a drawn
+    /// one.
+    ///
+    /// It cannot, and this measures it rather than asserting it: an
+    /// `egui::Image` paints a `Shape::Mesh`, and every probe matches
+    /// `Shape::Path` (or `Shape::Circle`, for the kebab). A mesh has no
+    /// `points` for a vertex count to be taken off. Two textures are drawn, at
+    /// two sizes, so the answer cannot be "this one happened not to collide".
+    #[test]
+    fn an_app_icon_bitmap_is_not_mistaken_for_any_drawn_icon() {
+        let ctx = styled_context();
+        let pixels = egui::ColorImage::from_rgba_unmultiplied([4, 4], &[200u8; 4 * 4 * 4]);
+        let texture =
+            ctx.load_texture("app-icon-probe-test", pixels, egui::TextureOptions::default());
+
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(18.0, 18.0)));
+            ui.add(egui::Image::new(&texture).fit_to_exact_size(egui::vec2(24.0, 24.0)));
+        });
+        let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+
+        assert!(theme::icon_probe::stars(&all).is_empty(), "a bitmap was read as a star");
+        assert!(theme::icon_probe::eyes(&all).is_empty(), "a bitmap was read as an eye");
+        assert!(theme::icon_probe::gears(&all).is_empty(), "a bitmap was read as a gear");
+        assert!(
+            theme::icon_probe::kebab_dots(&all).is_empty(),
+            "a bitmap was read as a kebab dot"
+        );
+        assert!(
+            theme::icon_probe::chevrons(&all).is_empty(),
+            "a bitmap was read as a chevron"
+        );
+
+        // Positive control: the probes are not simply blind. A real drawn icon
+        // in the same tree IS found, so "found nothing" above is a fact about
+        // the bitmap and not about the walker.
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            theme::eye_toggle(ui, false);
+        });
+        let drawn = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+        assert!(
+            !theme::icon_probe::eyes(&drawn).is_empty(),
+            "control: the eye probe finds no eye even when one is drawn"
         );
     }
 }

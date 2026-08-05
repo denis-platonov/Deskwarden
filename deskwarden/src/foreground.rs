@@ -730,15 +730,28 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 29] = [
+        const OPENS_NO_WINDOW: [&str; 31] = [
             "accounts",
             "app",
+            // Reads an executable's version resource and its shell icon.
+            // Draws nothing itself; the edit form paints what it returns.
+            "app_identity",
             "app_match",
             "backend_policy",
             "bw_path",
             "bw_serve",
             "dispatch",
             "favicon",
+            // **Judgement call, recorded rather than assumed.** It puts the
+            // shell's `IFileOpenDialog` on screen, so "opens no window" is
+            // true only in the sense this list means it: the tables above are
+            // about windows THIS crate opens through `eframe::run_ui_native`
+            // and must therefore raise itself, and this is not one -- it is a
+            // system-modal dialog the shell owns, foregrounds and destroys,
+            // with no title constant of ours and nothing for `raise_window`
+            // to match on. `RAISING_SITES` greps for `run_ui_native(TITLE,`,
+            // which this file has not got and cannot be given.
+            "file_picker",
             "fill_stats",
             "foreground",
             "hello",

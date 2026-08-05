@@ -2076,12 +2076,12 @@ fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
 /// it. (The picker's own `TRIGGER_CHOICES` is private to `picker_ui`, and this
 /// pass does not own that file; the wording below is held to it by
 /// `the_trigger_pills_say_what_the_picker_says`.)
-const TRIGGER_ORDER: [TriggerMode; 3] = [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
+pub(crate) const TRIGGER_ORDER: [TriggerMode; 3] = [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
 
 /// A trigger mode's pill label. Exhaustive with no catch-all: a fourth
 /// [`TriggerMode`] must be a compile error here rather than silently
 /// inheriting a neighbour's name.
-fn trigger_label(mode: TriggerMode) -> &'static str {
+pub(crate) fn trigger_label(mode: TriggerMode) -> &'static str {
     match mode {
         TriggerMode::Prompt => "Prompt",
         TriggerMode::Hotkey => "Hotkey",
@@ -2091,7 +2091,7 @@ fn trigger_label(mode: TriggerMode) -> &'static str {
 
 /// The sentence under the pills, saying what the selected mode does.
 /// Exhaustive for [`trigger_label`]'s reason.
-fn trigger_caption(mode: TriggerMode) -> &'static str {
+pub(crate) fn trigger_caption(mode: TriggerMode) -> &'static str {
     match mode {
         TriggerMode::Prompt => "Show the overlay when this app is focused.",
         TriggerMode::Hotkey => "Fill only when the fill hotkey is pressed.",
@@ -4748,6 +4748,7 @@ mod tests {
             title: String::new(),
             hosted: false,
             path: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
+            args: String::new(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -4760,6 +4761,7 @@ mod tests {
             title: "Speedtest".to_string(),
             hosted: true,
             path: r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe".to_string(),
+            args: String::new(),
             trigger: TriggerMode::Hotkey,
         }
     }

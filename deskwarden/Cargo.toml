@@ -45,6 +45,13 @@ windows = { version = "0.58", features = [
     # browser (vault_window/mod.rs::webbrowser_open) without shelling out to
     # cmd.exe.
     "Win32_UI_Shell",
+    # COMDLG_FILTERSPEC, for the file-type dropdown on the edit form's
+    # "Browse..." dialog (src/file_picker.rs). IFileOpenDialog itself is in
+    # Win32_UI_Shell above; only the filter struct lives in ::Common.
+    "Win32_UI_Shell_Common",
+    # GetFileVersionInfoW/VerQueryValueW, for reading an executable's
+    # FileDescription so the edit form can show "Google Chrome" rather than
+    # "chrome.exe" (src/app_identity.rs).
     "Win32_Storage_FileSystem",
 ] }
 serde = { version = "1", features = ["derive"] }

@@ -859,6 +859,14 @@ fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
         title: if w.hosted { w.title.clone() } else { String::new() },
         hosted: w.hosted,
         path: w.exe_path.clone(),
+        // **Empty, and deliberately not offered here.** There is nothing to
+        // copy off a live window: `AppMatch::args` is what the user wants the
+        // app started WITH, not what this one happened to be started with, and
+        // the two are different questions (a browser's running command line
+        // carries session and crash-recovery switches that would be nonsense to
+        // replay). The edit form is where arguments are typed -- see
+        // `vault_window::detail_edit`.
+        args: String::new(),
         trigger,
     }
 }

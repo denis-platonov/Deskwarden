@@ -11888,6 +11888,7 @@ mod tests {
                 title: title.to_string(),
                 hosted: true,
                 path: String::new(),
+                args: String::new(),
                 trigger,
             }
         }

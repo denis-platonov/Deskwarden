@@ -86,6 +86,33 @@ pub struct AppMatch {
     /// expected to go through.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    /// The command-line arguments to start [`Self::path`] with, **exactly as
+    /// the user typed them** -- one string, not a parsed vector.
+    ///
+    /// **This is what tells two windows of the same executable apart.** The
+    /// motivating case is a browser run under several profiles:
+    /// `chrome.exe --profile-directory="Profile 2"` is the *work* browser and
+    /// a different `--profile-directory` is the personal one, so two vault
+    /// items name the same `process` and the same `path` and differ only
+    /// here. It will serve two purposes -- the command line a launcher passes,
+    /// and the discriminator a future matcher uses -- and both of them need
+    /// the string the user wrote rather than this app's idea of it.
+    ///
+    /// **Stored verbatim: never re-quoted, re-escaped, split or trimmed.**
+    /// Windows has no single tokenisation of a command line (`CommandLineToArgvW`
+    /// is one convention among several, and the shells disagree), so anything
+    /// this app did to "normalise" the value would be a guess that a user could
+    /// not see, could not undo, and would have to type around. The one thing
+    /// nothing here promises is that the string is *safe to run* -- that is the
+    /// launcher's question, exactly as it is for [`Self::path`] (see
+    /// [`Self::launchable_path`]), and this field is deliberately not consulted
+    /// by anything that matches.
+    ///
+    /// Skipped when empty, so a match with no arguments still serializes to the
+    /// shape it had before this field existed, and every value already sitting
+    /// in a user's vault still parses.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub args: String,
     pub trigger: TriggerMode,
 }
 
@@ -99,6 +126,7 @@ impl AppMatch {
             title: String::new(),
             hosted: false,
             path: String::new(),
+            args: String::new(),
             trigger,
         }
     }
@@ -241,6 +269,24 @@ mod tests {
             title: "Speedtest".to_string(),
             hosted: true,
             path: r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe".to_string(),
+            // Deliberately EMPTY, so every byte-literal assertion below keeps
+            // pinning the exact shape that is already in real vaults. The
+            // arguments have their own fixture (`with_args`) and their own
+            // tests.
+            args: String::new(),
+            trigger: TriggerMode::Prompt,
+        }
+    }
+
+    /// The motivating case, as the user described it: two vault items naming
+    /// the same browser, told apart only by which profile it is started with.
+    fn with_args() -> AppMatch {
+        AppMatch {
+            process: "chrome.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            args: r#"--profile-directory="Profile 2""#.to_string(),
             trigger: TriggerMode::Prompt,
         }
     }
@@ -345,6 +391,96 @@ mod tests {
             AppMatch::for_process("a.exe", TriggerMode::Auto).to_field_value(),
             r#"{"process":"a.exe","trigger":"auto"}"#
         );
+    }
+
+    /// **The arguments reach the wire under their own key, and nowhere else.**
+    /// Written as the literal bytes rather than compared against
+    /// `to_field_value`'s own output, so this cannot re-derive its expectation
+    /// from the serializer under test. Renaming the field, or folding the
+    /// arguments into `path`, fails here with a string diff.
+    #[test]
+    fn the_arguments_serialize_under_their_own_key() {
+        assert_eq!(
+            with_args().to_field_value(),
+            r#"{"process":"chrome.exe","path":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe","args":"--profile-directory=\"Profile 2\"","trigger":"prompt"}"#
+        );
+    }
+
+    /// The whole point of the field: the string comes back **byte for byte**,
+    /// quotes and all. A serializer that trimmed, re-quoted or split the value
+    /// fails here rather than in a launcher three commits from now.
+    #[test]
+    fn the_arguments_round_trip_verbatim() {
+        for args in [
+            r#"--profile-directory="Profile 2""#,
+            "  --leading-and-trailing-space  ",
+            r"--user-data-dir=C:\Users\me\AppData\Local\Chrome Beta",
+            "--flag\twith\ttabs",
+            "-a -b -c \"quoted \\\"inner\\\" thing\"",
+        ] {
+            let m = AppMatch { args: args.to_string(), ..with_args() };
+            let parsed = AppMatch::from_field_value(&m.to_field_value()).unwrap();
+            assert_eq!(parsed.args, args, "args: {args:?}");
+            assert_eq!(parsed, m, "args: {args:?}");
+        }
+    }
+
+    /// **Backward compatibility for the shape shipped at `bc161b2`**, stated as
+    /// the literal bytes now sitting in real vaults -- a five-key value with no
+    /// `args`. Dropping `#[serde(default)]` from `args` fails here with
+    ///     called `Result::unwrap()` on an `Err` value: Error("missing field `args`", ...)
+    #[test]
+    fn a_match_saved_before_args_existed_still_parses_and_carries_none() {
+        let stored = r#"{"process":"Speedtest.exe","title":"Speedtest","hosted":true,"path":"C:\\Program Files\\WindowsApps\\Speedtest\\Speedtest.exe","trigger":"prompt"}"#;
+        let parsed = AppMatch::from_field_value(stored).expect("a shipped field value must parse");
+        assert_eq!(parsed.args, "", "an old value records no arguments");
+        // And the rest of it is untouched -- the new key must not have shifted
+        // any other value's meaning.
+        assert_eq!(parsed, captured());
+    }
+
+    /// The other half of compatibility: re-saving a match that has no arguments
+    /// must write the value back **exactly** as it was, not one key longer.
+    /// Deleting `args`'s `skip_serializing_if` gives
+    ///     left: {...,"path":"...","args":"","trigger":"prompt"}
+    #[test]
+    fn a_match_with_no_arguments_writes_no_args_key() {
+        let stored = r#"{"process":"Speedtest.exe","title":"Speedtest","hosted":true,"path":"C:\\Program Files\\WindowsApps\\Speedtest\\Speedtest.exe","trigger":"prompt"}"#;
+        assert_eq!(
+            AppMatch::from_field_value(stored).unwrap().to_field_value(),
+            stored,
+            "a re-save grew the user's field"
+        );
+        assert_eq!(
+            AppMatch::for_process("a.exe", TriggerMode::Auto).to_field_value(),
+            r#"{"process":"a.exe","trigger":"auto"}"#
+        );
+        // Positive control: a match that DOES carry arguments writes the key,
+        // so the two assertions above are not satisfied by a field that is
+        // never serialized at all.
+        assert!(with_args().to_field_value().contains(r#""args":"#));
+    }
+
+    /// The arguments are **not** part of what makes a path launchable, in
+    /// either direction: they cannot rescue a refused path and they cannot
+    /// spoil an accepted one. `launchable_path` answers "may this image be
+    /// started"; what it is started *with* is a separate question the launcher
+    /// asks separately.
+    #[test]
+    fn the_arguments_do_not_change_whether_the_path_is_launchable() {
+        let good = with_args();
+        assert!(good.launchable_path().is_some(), "the fixture itself must be launchable");
+        for args in ["", "--anything", "\" & calc.exe", "..\\..\\evil"] {
+            let m = AppMatch { args: args.to_string(), ..with_args() };
+            assert_eq!(m.launchable_path(), Some(m.path.as_str()), "args: {args:?}");
+            let bad = AppMatch { path: r"\\attacker\share\chrome.exe".to_string(), ..m };
+            assert_eq!(bad.launchable_path(), None, "args: {args:?}");
+        }
+    }
+
+    #[test]
+    fn for_process_records_no_arguments() {
+        assert_eq!(AppMatch::for_process("a.exe", TriggerMode::Prompt).args, "");
     }
 
     #[test]

@@ -225,6 +225,7 @@ mod tests {
                 title: title.to_string(),
                 path: format!(r"C:\Apps\{process}"),
                 hosted: true,
+                args: String::new(),
                 trigger: TriggerMode::Prompt,
             },
         )
