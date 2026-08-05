@@ -162,11 +162,107 @@ pub fn check_bw_status_details() -> BwStatusDetails {
 pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
     bw_status_stdout_in(data_dir, None)
         .map(|stdout| parse_bw_status_details(&stdout))
-        .unwrap_or(BwStatusDetails {
-            status: BwStatus::Unauthenticated,
-            user_email: None,
-            server_url: None,
-        })
+        .unwrap_or_else(unknown_status_details)
+}
+
+/// What `bw status` is taken to have said when it did not say anything: no
+/// account, no address, no server.
+///
+/// The same value whether the CLI could not be spawned at all, answered
+/// something unparseable, or simply did not answer inside
+/// [`STATUS_DEADLINE`]. Shared rather than written out three times because
+/// [`status_details_within`] has to be able to return *exactly* what a failed
+/// spawn returns -- a bounded wait that invented a different "unknown" would
+/// be a second unauthenticated-looking state for the rest of the app to
+/// disagree about.
+pub fn unknown_status_details() -> BwStatusDetails {
+    BwStatusDetails {
+        status: BwStatus::Unauthenticated,
+        user_email: None,
+        server_url: None,
+    }
+}
+
+/// How long anything may wait on a `bw status` before deciding it is not
+/// coming.
+///
+/// **Deliberately much shorter than `bw_serve::BACKEND_OP_TIMEOUT` (90s),
+/// which is the number this crate uses for the other untimed `bw` spawns**,
+/// and the difference is not impatience -- it is what the two failures cost.
+/// `BACKEND_OP_TIMEOUT` bounds *starting the backend*: give up early there
+/// and there is no vault. This bounds `bw status`, whose only consumer is the
+/// account name, address and server the vault window's toolbar shows
+/// (`StartupWork::produce` -> `vault_window::AccountDetails::Ready`). Give up
+/// early here and the toolbar is missing a name; the vault still opens, the
+/// session is still good, and nothing the user did is thrown away.
+///
+/// That asymmetry runs the other way too, and is the reason this number is
+/// small rather than merely bounded: this phase's budget is charged to
+/// `app_window::WORKING_DEADLINE`, the watchdog that CAN throw a healthy
+/// sign-in away. Every second credited to a cosmetic phase is a second the
+/// window spends refusing to give up on a `bw status` nobody is waiting to
+/// read.
+///
+/// Thirty seconds. `bw status` is a single CLI spawn, measured at 2.39s on
+/// the user's machine (see `main`'s `account_details_source`), so this is
+/// over ten times a real one and still an order of magnitude away from the
+/// backend-start budget. A literal rather than a borrowed constant: it is a
+/// claim about how long ONE `bw status` takes, and nothing in `bw_serve`
+/// should be able to move it.
+pub const STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits up to `budget` for a `bw status` that `spawn` is expected to run on
+/// a thread, and reports [`unknown_status_details`] if it does not arrive.
+///
+/// **The decision, separated from the spawning.** `check_bw_status_details`
+/// is a bare `Command::output()` with no timeout of its own, and every caller
+/// that has a deadline was previously bounding only *itself*: the window's
+/// watchdog would fire while the `bw` child was still running, and the user
+/// had by then watched a frozen spinner through a budget that claimed to
+/// cover this call and did not. This is what actually covers it.
+///
+/// It bounds the WAIT, not the child -- the `bw` process is left to finish
+/// and its answer is dropped. That is the same trade `main`'s
+/// `resettle_session_with` already makes against `BACKEND_OP_TIMEOUT`
+/// ("giving up and proceeding anyway is strictly safer"), and it is the only
+/// one available: `std::process::Child` has no timed wait, and killing a
+/// `bw status` mid-flight to save a toolbar label would be a worse bargain
+/// than dropping the label.
+///
+/// `spawn` is a parameter for the reason `account_details_source`'s is: it is
+/// how the timeout decision gets tested without a `bw` CLI, a real profile
+/// directory, or thirty seconds of waiting.
+pub fn status_details_within(
+    budget: std::time::Duration,
+    spawn: impl FnOnce(std::sync::mpsc::Sender<BwStatusDetails>),
+) -> BwStatusDetails {
+    let (tx, rx) = std::sync::mpsc::channel();
+    spawn(tx);
+    match rx.recv_timeout(budget) {
+        Ok(details) => details,
+        Err(e) => {
+            log::warn!(
+                "`bw status` did not answer within {budget:?} ({e}); opening without the \
+                 account name and server. The `bw` process is left to finish on its own -- \
+                 this bounds the wait, not the child."
+            );
+            unknown_status_details()
+        }
+    }
+}
+
+/// [`check_bw_status_details`] that cannot hold its caller for longer than
+/// [`STATUS_DEADLINE`].
+///
+/// The form `StartupWork::produce` calls, and the reason
+/// `app_window::WORKING_DEADLINE` can now name a real bound for its third
+/// phase instead of borrowing the backend-start budget as a guess.
+pub fn check_bw_status_details_bounded() -> BwStatusDetails {
+    status_details_within(STATUS_DEADLINE, |tx| {
+        std::thread::spawn(move || {
+            let _ = tx.send(check_bw_status_details());
+        });
+    })
 }
 
 /// Runs `bw logout`, for 3h's "Log out" footer action. Already being logged
@@ -5132,5 +5228,168 @@ mod login_frame_host_tests {
         // a region that contains both, rather than one needle matching twice.
         assert_ne!(gate_at, close_at);
         assert_eq!(builder.matches(close).count(), 1, "expected one close command");
+    }
+}
+
+/// **`bw status` is bounded, and the bound is a decision that can be read.**
+///
+/// The defect: `check_bw_status_details` is a bare `Command::output()`, and
+/// the only thing that claimed to cover it was
+/// `app_window::WORKING_DEADLINE` -- which bounds the WINDOW. When it fired
+/// the `bw` child was still running and the user had watched a frozen spinner
+/// through the whole budget.
+///
+/// Last module in the file on purpose: every source-position guard above
+/// slices at the FIRST `#[cfg(test)]`, so a test module introduced higher up
+/// would silently empty `production()` and vacate them all.
+#[cfg(test)]
+mod status_deadline_tests {
+    use super::*;
+    use std::sync::mpsc::Sender;
+    use std::time::{Duration, Instant};
+
+    fn answered(email: &str) -> BwStatusDetails {
+        BwStatusDetails {
+            status: BwStatus::Unlocked,
+            user_email: Some(email.to_string()),
+            server_url: Some("https://vault.example".to_string()),
+        }
+    }
+
+    /// Control for every negative below: an answer that arrives inside the
+    /// budget is passed straight through, so a `status_details_within` that
+    /// simply always returned "unknown" would fail here rather than looking
+    /// like a working timeout.
+    #[test]
+    fn an_answer_inside_the_budget_is_reported_verbatim() {
+        let got = status_details_within(Duration::from_secs(30), |tx: Sender<BwStatusDetails>| {
+            tx.send(answered("someone@example.test")).unwrap();
+        });
+        assert_eq!(got.status, BwStatus::Unlocked);
+        assert_eq!(got.user_email.as_deref(), Some("someone@example.test"));
+        assert_eq!(got.server_url.as_deref(), Some("https://vault.example"));
+    }
+
+    /// **The defect, as behaviour.** A `bw status` that never answers must
+    /// cost the caller its budget and not a second more. Before the bound the
+    /// only limit was the child's own, which is none.
+    #[test]
+    fn a_status_that_never_answers_costs_the_budget_and_not_the_child_s_lifetime() {
+        let budget = Duration::from_millis(150);
+        let started = Instant::now();
+        let got = status_details_within(budget, |tx: Sender<BwStatusDetails>| {
+            // Holds its sender for far longer than the budget, exactly as a
+            // wedged `bw` child does. Never joined -- that is the point: the
+            // caller must not be waiting on it.
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(20));
+                let _ = tx.send(answered("late@example.test"));
+            });
+        });
+        let waited = started.elapsed();
+
+        assert_eq!(
+            got, unknown_status_details(),
+            "a `bw status` that did not answer must read as the same 'we do not know' a failed \
+             spawn produces, not as a second unauthenticated-looking state"
+        );
+        assert!(
+            waited >= budget,
+            "the wait returned before its own budget ({waited:?} < {budget:?}), so this proves \
+             nothing about a bound -- it would pass against a function that never waited at all"
+        );
+        assert!(
+            waited < Duration::from_secs(10),
+            "the caller waited {waited:?} on a sender that does not answer for 20s, so the \
+             budget is not bounding anything and the spinner is frozen for the child's \
+             lifetime -- the whole defect"
+        );
+    }
+
+    /// A worker that dies without sending -- the panicked-thread case -- must
+    /// be the same "unknown", and must NOT cost the full budget: `recv_timeout`
+    /// reports `Disconnected` the moment the sender drops.
+    #[test]
+    fn a_worker_that_dies_without_answering_is_unknown_immediately() {
+        let started = Instant::now();
+        let got = status_details_within(Duration::from_secs(30), |tx: Sender<BwStatusDetails>| {
+            drop(tx);
+        });
+        assert_eq!(got, unknown_status_details());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a dead worker made the caller sit out the whole budget rather than being noticed \
+             when its sender dropped"
+        );
+    }
+
+    /// The budget is honoured as given rather than clamped to some internal
+    /// favourite: two different budgets must produce two different waits.
+    #[test]
+    fn a_longer_budget_really_does_wait_longer() {
+        let wait_for = |budget: Duration| {
+            let started = Instant::now();
+            let _ = status_details_within(budget, |tx: Sender<BwStatusDetails>| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(20));
+                    let _ = tx.send(answered("late@example.test"));
+                });
+            });
+            started.elapsed()
+        };
+        let short = wait_for(Duration::from_millis(50));
+        let long = wait_for(Duration::from_millis(600));
+        assert!(
+            long > short,
+            "the budget is ignored: {long:?} for a 600ms budget is no longer than {short:?} for \
+             a 50ms one, so `status_details_within` is waiting on something of its own choosing"
+        );
+    }
+
+    /// **The wiring.** The pure decision above is worth nothing if the
+    /// production call does not apply it. Deleting `STATUS_DEADLINE` from
+    /// `check_bw_status_details_bounded`, or unwrapping it back to a bare
+    /// `check_bw_status_details()`, fails here.
+    #[test]
+    fn the_bounded_form_applies_the_deadline_to_a_spawned_status() {
+        let source: &str = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub fn check_bw_status_details_bo", "unded()"))
+            .expect("the bounded form must still exist")
+            .1
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("a test module must still follow the production code")
+            .0;
+        assert!(
+            body.len() < source.len(),
+            "control: the split isolated a region rather than keeping the whole file"
+        );
+        assert!(
+            body.contains(concat!("status_details_wi", "thin(STATUS_DEADLINE,")),
+            "the bounded form no longer applies `STATUS_DEADLINE` -- so `bw status` is untimed \
+             again and `app_window::WORKING_DEADLINE`'s third term is a fiction once more"
+        );
+        assert!(
+            body.contains(concat!("thread::sp", "awn(")),
+            "the bounded form no longer runs `bw status` on a thread, so `recv_timeout` has \
+             nothing to time out ON and the bound cannot fire"
+        );
+    }
+
+    /// The number itself, argued rather than asserted equal to itself.
+    #[test]
+    fn the_status_deadline_is_generous_against_a_real_bw_status_and_cheap_against_the_watchdog() {
+        // ~2.39s measured warm (see `main`'s `account_details_source`).
+        assert!(
+            STATUS_DEADLINE >= Duration::from_secs(24),
+            "{STATUS_DEADLINE:?} is less than ten times a measured `bw status`; a slow machine \
+             would lose the toolbar's account name routinely"
+        );
+        assert!(
+            STATUS_DEADLINE < crate::bw_serve::BACKEND_OP_TIMEOUT,
+            "the account name is now budgeted as generously as starting the backend itself -- \
+             but its failure only blanks a label, while the watchdog this is charged to can \
+             throw away the whole sign-in"
+        );
     }
 }

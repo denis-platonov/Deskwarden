@@ -107,26 +107,41 @@ const READINESS_ATTEMPTS: u64 = 11;
 ///      11 `list_items()` calls, so the real worst case is 30s of sleeping plus
 ///      110s of waiting on a backend that answers slowly instead of not at all:
 ///      ~140s, not 30s.
-///   3. `login_ui::check_bw_status_details()`, unconditional and on the failure
-///      path too: a second untimed `bw` spawn, so a second
-///      `BACKEND_OP_TIMEOUT`.
+///   3. `login_ui::check_bw_status_details_bounded()`, unconditional and on the
+///      failure path too -- and **the one phase that now bounds ITSELF**. The
+///      bare `check_bw_status_details` is a `Command::output()` with no
+///      timeout, and while `produce` called it this term was the only one here
+///      that described nothing: it charged `BACKEND_OP_TIMEOUT` because "an
+///      untimed `bw` spawn costs what the others do", but no clock was on the
+///      spawn at all. When this deadline fired the child was still running and
+///      the user had watched a frozen spinner through the whole budget. The
+///      bounded form waits `login_ui::STATUS_DEADLINE` and then reports
+///      "unknown", so the term is read from the constant that actually bounds
+///      the phase, the same way phase 2 reads `READ_DEADLINE`.
 ///
-/// Hence 90 + (30 + 11*10) + 90 = **320s**. The previous sum credited phase 2
-/// with 30s and came to 210s -- which a slow-but-healthy startup can exceed
-/// while still being on its way to succeeding, and the deadline would then have
-/// thrown it away. That is exactly the outcome the generosity below is for, so
-/// the number was undoing its own stated reason.
+/// Hence 90 + (30 + 11*10) + 30 = **260s**, down 60s from the 320s that
+/// credited phase 3 with a backend-start budget it was not spending. A shorter
+/// deadline here is the better one, not a concession: the 60s given back was
+/// time the window spent refusing to give up on a `bw status` whose only
+/// consumer is the toolbar's account label. `STATUS_DEADLINE` is small for
+/// exactly that reason (see its own doc) -- losing that phase costs a label,
+/// while losing this deadline's race costs the whole sign-in.
 ///
-/// Deliberately generous: this is a watchdog on a stage the user cannot leave by
-/// any other route, and a false timeout on a slow machine throws away a healthy
-/// sign-in, while an over-long one only extends a wait the user is already
-/// watching a spinner through. It bounds the WINDOW, not the subprocess --
-/// `produce` is still untimed and its worker may still be running when this
-/// fires.
+/// The step before that fixed phase 2: the sum used to credit it 30s and come
+/// to 210s, which a slow-but-healthy startup can exceed while still on its way
+/// to succeeding.
+///
+/// Still deliberately generous where generosity is what is at stake: this is a
+/// watchdog on a stage the user cannot leave by any other route, and a false
+/// timeout on a slow machine throws away a healthy sign-in. Phases 1 and 2
+/// remain bounds on the WINDOW rather than on their subprocesses -- 230s of
+/// this total is still a budget the worker can overrun while `produce` runs on.
+/// Phase 3 is the first one where the worker itself stops waiting.
 pub const WORKING_DEADLINE: Duration = Duration::from_secs(
-    2 * crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
+    crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
         + crate::bw_serve::READINESS_DEADLINE.as_secs()
-        + READINESS_ATTEMPTS * crate::vault_bridge::READ_DEADLINE.as_secs(),
+        + READINESS_ATTEMPTS * crate::vault_bridge::READ_DEADLINE.as_secs()
+        + crate::login_ui::STATUS_DEADLINE.as_secs(),
 );
 
 /// What the one window is showing.
@@ -1017,17 +1032,30 @@ mod working_watchdog_tests {
     #[test]
     fn the_deadline_covers_every_phase_the_worker_runs() {
         use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE, readiness_schedule};
+        use crate::login_ui::STATUS_DEADLINE;
         use crate::vault_bridge::READ_DEADLINE;
         assert_eq!(
             WORKING_DEADLINE,
             BACKEND_OP_TIMEOUT
                 + READINESS_DEADLINE
                 + READ_DEADLINE * READINESS_ATTEMPTS as u32
-                + BACKEND_OP_TIMEOUT,
+                + STATUS_DEADLINE,
             "the working stage's deadline is no longer the sum of what actually bounds the \
              three phases `StartupWork::produce` runs -- an untimed backend start, the \
-             readiness probe's sleeps AND its per-attempt bridge reads, and an untimed `bw \
-             status` -- so a healthy-but-slow startup can be cut off"
+             readiness probe's sleeps AND its per-attempt bridge reads, and a `bw status` \
+             bounded by `STATUS_DEADLINE` -- so a healthy-but-slow startup can be cut off"
+        );
+        // **The third term is a real bound and not a borrowed guess.** It was
+        // `BACKEND_OP_TIMEOUT` while the phase was an untimed `Command::output()`
+        // -- a number describing a call nothing was timing. Reading
+        // `STATUS_DEADLINE` here is only honest while `produce` actually applies
+        // it, which `main.rs`'s
+        // `the_startup_worker_bounds_the_status_call_the_deadline_charges_for`
+        // is the other half of.
+        assert!(
+            STATUS_DEADLINE < BACKEND_OP_TIMEOUT,
+            "the status phase is budgeted as heavily as starting the backend again, which is \
+             the guess this term replaced rather than the bound it is supposed to be"
         );
         // **The claim `READINESS_ATTEMPTS` makes, checked against the real
         // function rather than agreed with it.** `wait_for_vault_ready` calls
@@ -1058,7 +1086,7 @@ mod working_watchdog_tests {
         // `READINESS_ATTEMPTS * READ_DEADLINE`, which is never negative -- it
         // cannot fail however far the source constants move. Not a
         // hypothetical: halving `BACKEND_OP_TIMEOUT` drops this deadline from
-        // 320s to 230s with all of the above green, which is precisely what the
+        // 260s to 215s with all of the above green, which is precisely what the
         // comment that used to stand here claimed could not happen. The two
         // below are compared against LITERALS declared in this module, so
         // nothing in `bw_serve` or `vault_bridge` can move both sides at once.
@@ -1075,6 +1103,29 @@ mod working_watchdog_tests {
              is merely slow is thrown away and the user is sent back through a fresh login for \
              nothing, which is the one harm this deadline's generosity exists to avoid"
         );
+        // **The floor's own argument, checked.** `MINIMUM_STARTUP_GRACE` is a
+        // literal so that rearranging the source constants cannot move it -- but
+        // a literal nothing checks is just a number someone once liked. Its
+        // stated reason is that it clears the part of the startup still bounded
+        // only by this WINDOW and not by the worker itself: phases 1 and 2. The
+        // status phase is excluded on purpose, because `produce` now bounds it.
+        // Unlike the two assertions above this one CAN fail on a source-constant
+        // change, and that is the point: if the untimed phases grow past the
+        // floor, the floor's argument is stale and has to be re-made rather than
+        // silently outgrown.
+        let still_unbounded_by_the_worker =
+            BACKEND_OP_TIMEOUT + READINESS_DEADLINE + READ_DEADLINE * READINESS_ATTEMPTS as u32;
+        assert!(
+            MINIMUM_STARTUP_GRACE > still_unbounded_by_the_worker,
+            "the floor ({MINIMUM_STARTUP_GRACE:?}) no longer clears the \
+             {still_unbounded_by_the_worker:?} of startup that only this window bounds, so it \
+             has stopped protecting a slow-but-healthy cold start from being thrown away"
+        );
+        assert!(
+            MINIMUM_STARTUP_GRACE < WORKING_DEADLINE,
+            "the floor has caught up with the deadline it is a floor ON; a floor equal to the \
+             sum is not a margin, it is the same claim written twice"
+        );
     }
 
     /// The longest anyone will sit in front of a spinner with no ✕, no tray and
@@ -1082,25 +1133,49 @@ mod working_watchdog_tests {
     /// the point past which a longer watchdog buys nothing, because the user has
     /// already killed the process.
     ///
-    /// Six minutes: generous against the ~5m20s the phases above can legitimately
+    /// Six minutes: generous against the ~4m20s the phases above can legitimately
     /// cost, and deliberately not derived from them, so that it is a bound on the
     /// definition rather than a restatement of it.
+    ///
+    /// Unchanged when phase 3 stopped being an untimed spawn and the deadline
+    /// fell to 260s. This is a claim about a PERSON -- how long anyone will sit
+    /// in front of a spinner with no way out -- and nothing about how the app
+    /// spends the time changes it. It simply has more headroom now.
     const SPINNER_PATIENCE: Duration = Duration::from_secs(6 * 60);
 
     /// The shortest deadline a startup may ever be given before the window
     /// abandons it.
     ///
-    /// Five minutes, as a LITERAL and deliberately not as a sum of the constants
+    /// **Four minutes -- re-argued, not relaxed.** It was five, and the argument
+    /// was that the three phases can legitimately cost ~5m20s on a cold `bw
+    /// serve`. That reasoning was sound while phase 3 was an untimed `bw status`
+    /// credited a 90s backend-start budget. It is not sound now:
+    /// `StartupWork::produce` calls `check_bw_status_details_bounded`, which
+    /// stops waiting after `login_ui::STATUS_DEADLINE` and reports "unknown", so
+    /// that phase CANNOT cost more than 30s however slow the machine is. A
+    /// five-minute floor now asserts time no phase is able to spend, and the
+    /// only thing it could do is force a future deadline to be padded past the
+    /// work it covers.
+    ///
+    /// Four minutes is where the same argument lands at the real phase costs.
+    /// What the floor protects is the part still bounded only by this WINDOW and
+    /// not by the worker: phase 1's untimed backend start (`BACKEND_OP_TIMEOUT`,
+    /// 90s) plus phase 2's sleeps and per-attempt bridge reads (30s + 11x10s),
+    /// which is 230s of work a slow-but-healthy cold start can genuinely
+    /// consume, and cutting it off costs the user the entire sign-in they have
+    /// just completed while buying nothing -- the recovery `main` runs
+    /// afterwards starts the same backend over again from scratch. 240s clears
+    /// that with the smallest margin that is still a margin, and leaves the
+    /// guard its teeth: halving `BACKEND_OP_TIMEOUT` yields 215s and trips this,
+    /// which is the exact scenario this floor was written for.
+    ///
+    /// Still a LITERAL and deliberately not a sum of the constants
     /// `WORKING_DEADLINE` is built from -- a floor spelled with those moves
-    /// whenever they do, which is exactly how a 320s deadline could become 230s
-    /// with this whole file green. The three phases the worker runs can
-    /// legitimately cost ~5m20s on a cold `bw serve`, and cutting a healthy
-    /// startup off costs the user the entire sign-in they have just completed
-    /// and buys nothing: the recovery `main` runs afterwards starts the same
-    /// backend over again from scratch. Below five minutes this deadline is
-    /// undoing its own stated reason, however the source constants were
-    /// rearranged to get there.
-    const MINIMUM_STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
+    /// whenever they do, which is how a 320s deadline could have become 230s
+    /// with this whole file green. Re-deriving the literal when a phase's real
+    /// bound changes is the intended way to change it; rearranging the source
+    /// constants is not.
+    const MINIMUM_STARTUP_GRACE: Duration = Duration::from_secs(4 * 60);
 }
 
 /// **The window's own close, run for real.**

@@ -5480,7 +5480,18 @@ impl StartupWork {
         // Last, and unconditional: the toolbar's account name and server come
         // from here, and a window that shows the vault with no idea whose it is
         // is worse than one that waited another moment for the answer.
-        let details = login_ui::check_bw_status_details();
+        //
+        // The BOUNDED form, and that is the whole of review's Important here.
+        // The unbounded one is a bare `Command::output()`, so the only limit on
+        // this line used to be `app_window::WORKING_DEADLINE` -- which bounds
+        // the window, not the child. When it fired the spawn was still running
+        // and the user had sat in front of a frozen spinner for the entire
+        // budget, a budget whose own doc named this phase as one of the three
+        // it covered. `login_ui::STATUS_DEADLINE` is what covers it now, and
+        // `WORKING_DEADLINE` charges this phase that number instead of guessing
+        // at `BACKEND_OP_TIMEOUT`. "Another moment" above is 30s and no longer
+        // a figure of speech.
+        let details = login_ui::check_bw_status_details_bounded();
         Self { child, items, details }
     }
 }
@@ -5578,6 +5589,90 @@ mod tests {
             let _ = c.wait();
         }
     }
+
+    /// An OS handle held on a spawned process, so that "did this exact process
+    /// stop?" stays answerable after its `Child` is gone.
+    ///
+    /// **This exists because `is_pid_running` cannot answer that question.** A
+    /// pid is not an identity: `stop_bw_serve` kills and then `wait()`s, and
+    /// `wait()` closes the last handle, at which point Windows is free to hand
+    /// that number to the next process that asks. Measured on this machine:
+    /// spawning, reaping and re-spawning 600 processes in a tight loop reused
+    /// 80 of the freed pids -- 13%. A `tasklist` lookup that lands after a
+    /// reuse reports the pid as running and the assertion reads it as "the
+    /// child was not stopped". That is the whole of the flake in
+    /// `a_second_deposit_stops_the_newcomer_and_keeps_the_parked_child`: it
+    /// only ever fails under load, because load is what fills the window
+    /// between `wait()` freeing the number and `tasklist` being scheduled to
+    /// look it up.
+    ///
+    /// A held handle closes that window at the source rather than papering
+    /// over it: Windows will not recycle a pid while any handle to the process
+    /// object is open, so the number this watch was opened on continues to
+    /// mean the process it was opened for, and nothing else, for as long as
+    /// the watch lives. The wait is then the OS's own -- blocking until the
+    /// process object is signalled -- so there is no poll to be slow and no
+    /// `tasklist` output to parse.
+    ///
+    /// Note what this does NOT change: the tests still spawn real child
+    /// processes and still put them through the real `stop_bw_serve`. Only the
+    /// *observation* is made unambiguous.
+    struct ProcessWatch {
+        handle: windows::Win32::Foundation::HANDLE,
+    }
+
+    impl ProcessWatch {
+        /// Opens the watch. Must be called while the process is still alive
+        /// and its `Child` still held -- that is what guarantees the pid still
+        /// names the process the caller means.
+        fn on(pid: u32) -> Self {
+            use windows::Win32::System::Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            };
+            let handle = unsafe {
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid)
+            }
+            .expect("the process must still be alive when its watch is opened");
+            Self { handle }
+        }
+
+        /// Blocks up to `budget` for the watched process to exit. `true` means
+        /// it has; `false` means it was still running when the budget ran out.
+        ///
+        /// A bounded blocking wait rather than a sleep-then-look: a sleep long
+        /// enough to be reliable under load is slow every other time, and one
+        /// short enough to be fast is the flake again.
+        fn exited_within(&self, budget: Duration) -> bool {
+            use windows::Win32::Foundation::WAIT_OBJECT_0;
+            use windows::Win32::System::Threading::WaitForSingleObject;
+            let ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
+            unsafe { WaitForSingleObject(self.handle, ms) == WAIT_OBJECT_0 }
+        }
+
+        /// Whether the process is still running *right now*, with no waiting.
+        fn still_running(&self) -> bool {
+            !self.exited_within(Duration::ZERO)
+        }
+    }
+
+    impl Drop for ProcessWatch {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+            }
+        }
+    }
+
+    /// How long a watch waits for a process that `stop_bw_serve` has already
+    /// killed AND reaped to show as exited.
+    ///
+    /// It should be signalled the instant the wait begins -- `stop_bw_serve`
+    /// calls `wait()`, which does not return until the process has actually
+    /// terminated. The budget is generous anyway so that a scheduler that
+    /// simply has not run this thread yet cannot be mistaken for a process
+    /// that was never stopped, and costs nothing in the passing case because
+    /// the wait returns as soon as the object is signalled.
+    const STOP_OBSERVATION_BUDGET: Duration = Duration::from_secs(10);
 
     #[test]
     fn backend_is_running_is_true_for_a_live_child() {
@@ -5717,6 +5812,16 @@ mod tests {
 
         let late_arrival = long_lived_command().spawn().unwrap();
         let late_pid = late_arrival.id();
+        // Watched from before the stop, for `ProcessWatch`'s reason -- and
+        // because this test shares the handoff suite's root cause: it asked
+        // `tasklist` (a whole extra process, ~6s on the developer's machine)
+        // about a pid nothing was keeping reserved.
+        let late_watch = ProcessWatch::on(late_pid);
+        let current_watch = ProcessWatch::on(current_pid);
+        assert!(
+            late_watch.still_running(),
+            "control: the late arrival was not alive to begin with"
+        );
         assert!(!adopt_started_child(&mut bw_serve_child, late_arrival));
 
         // The originally tracked child must still be the one in place...
@@ -5728,11 +5833,19 @@ mod tests {
         // ...and the redundant late arrival must actually have been stopped,
         // not merely dropped (which would leave it running, untracked).
         // `adopt_started_child` routes it through `stop_bw_serve`, which
-        // calls `wait()` after `kill()`, so the process is already reaped by
-        // the time this assertion runs.
+        // calls `wait()` after `kill()`, so the wait below is signalled
+        // immediately in the passing case.
         assert!(
-            !is_pid_running(late_pid),
+            late_watch.exited_within(STOP_OBSERVATION_BUDGET),
             "the redundant late-arriving child must be stopped, not orphaned"
+        );
+        // The other half, which the pid form could not state safely: the
+        // child that was KEPT is still alive. A version that stopped both
+        // would have satisfied the identity check above.
+        assert!(
+            current_watch.still_running(),
+            "the already-tracked child was stopped along with the late arrival, so the handle \
+             left in place names a dead backend"
         );
 
         kill_and_reap(&mut bw_serve_child);
@@ -5761,6 +5874,7 @@ mod tests {
         let handoff = StartupChildHandoff::new();
         let child = long_lived_command().spawn().unwrap();
         let pid = child.id();
+        let watch = ProcessWatch::on(pid);
 
         assert_eq!(handoff.deposit(child), HandoffDeposit::Parked);
 
@@ -5771,7 +5885,7 @@ mod tests {
             "the claimer must receive the very child the worker started"
         );
         assert!(
-            is_pid_running(pid),
+            watch.still_running(),
             "control: parking and claiming must not have stopped the child -- the point is to \
              hand a LIVE backend over, so recovery can stop it deliberately"
         );
@@ -5794,13 +5908,23 @@ mod tests {
 
         let late = long_lived_command().spawn().unwrap();
         let pid = late.id();
+        // Opened before the deposit, for `ProcessWatch`'s reason: after
+        // `stop_bw_serve` reaps the process the pid stops naming it, and this
+        // test carries the same reuse exposure the sibling below was actually
+        // bitten by.
+        let watch = ProcessWatch::on(pid);
+        assert!(
+            watch.still_running(),
+            "control: the late arrival was not alive to begin with"
+        );
         assert_eq!(handoff.deposit(late), HandoffDeposit::StoppedAfterClaim);
 
         // `stop_bw_serve` kills and then `wait()`s, so the process is already
-        // reaped by the time this runs -- the same reasoning
-        // `adopt_started_child_stops_a_late_arrival_...` relies on.
+        // reaped by the time this runs -- the wait below is signalled
+        // immediately in the passing case and only spends its budget when the
+        // child really was left running.
         assert!(
-            !is_pid_running(pid),
+            watch.exited_within(STOP_OBSERVATION_BUDGET),
             "a `bw serve` deposited after the startup window gave up must be stopped; leaving \
              it is the orphan that holds localhost:8087 against the next launch"
         );
@@ -5828,10 +5952,22 @@ mod tests {
         let handoff = StartupChildHandoff::new();
         let first = long_lived_command().spawn().unwrap();
         let first_pid = first.id();
+        // Both watches are opened while both processes are alive and their
+        // `Child`s are still held, which is what makes each pid still name the
+        // process this test means by it. See `ProcessWatch`: asking `tasklist`
+        // after `stop_bw_serve` has reaped the process is asking about a number
+        // Windows has already put back in the pool.
+        let first_watch = ProcessWatch::on(first_pid);
         assert_eq!(handoff.deposit(first), HandoffDeposit::Parked);
 
         let second = long_lived_command().spawn().unwrap();
         let second_pid = second.id();
+        let second_watch = ProcessWatch::on(second_pid);
+        assert!(
+            second_watch.still_running(),
+            "control: the newcomer was not alive before it was deposited, so proving it stopped \
+             afterwards would prove nothing about the deposit"
+        );
         assert_eq!(handoff.deposit(second), HandoffDeposit::StoppedAsRedundant);
 
         let mut claimed = handoff.claim();
@@ -5841,7 +5977,19 @@ mod tests {
             "the parked child must not be overwritten -- overwriting drops its handle, and a \
              dropped `Child` keeps running"
         );
-        assert!(!is_pid_running(second_pid), "the redundant newcomer must be stopped");
+        assert!(
+            second_watch.exited_within(STOP_OBSERVATION_BUDGET),
+            "the redundant newcomer must be stopped"
+        );
+        // The other half of the same claim, and the half a pid lookup could
+        // never have made safely: the child that was KEPT is still running.
+        // Without this, a `deposit` that stopped both would pass.
+        assert!(
+            first_watch.still_running(),
+            "the parked child was stopped along with the newcomer -- the claimer is handed a \
+             dead backend and starts over, which is the wasted re-auth this handoff exists to \
+             prevent"
+        );
         kill_and_reap(&mut claimed);
     }
 
@@ -5890,7 +6038,7 @@ mod tests {
             .expect("`produce` must publish the child it started through the handoff");
         for later in [
             concat!("wait_for_vault", "_ready(vault, schedule)"),
-            concat!("login_ui::check_bw_", "status_details()"),
+            concat!("login_ui::check_bw_", "status_details_bounded()"),
         ] {
             let at = body
                 .find(later)
@@ -5901,6 +6049,49 @@ mod tests {
                  published before it, or the deadline still finds no handle to adopt"
             );
         }
+    }
+
+    /// **The third phase is bounded, and `WORKING_DEADLINE` may say so.**
+    ///
+    /// `login_ui::check_bw_status_details` is a bare `Command::output()`. Left
+    /// on this line it made `app_window::WORKING_DEADLINE`'s third term -- a
+    /// documented `BACKEND_OP_TIMEOUT` for "an untimed `bw` spawn" -- a
+    /// statement about nothing: the deadline bounded the WINDOW, the spawn ran
+    /// on regardless, and the number in the doc was a guess at how long a call
+    /// nobody was timing might take. `produce` must call the form that carries
+    /// `login_ui::STATUS_DEADLINE`, and must not call the unbounded one.
+    ///
+    /// A ban paired with the positive rather than only the positive: adding a
+    /// second, unbounded status call beside the bounded one would leave the
+    /// positive green while restoring the unbounded phase.
+    #[test]
+    fn the_startup_worker_bounds_the_status_call_the_deadline_charges_for() {
+        let body = the_produce_body();
+        let banned = concat!("check_bw_status_details", "();");
+        assert!(
+            body.contains(concat!("check_bw_status_details_bo", "unded();")),
+            "`produce` no longer runs its `bw status` under a deadline of its own, so \
+             `app_window::WORKING_DEADLINE`'s third term is a fiction again and the user can \
+             watch a frozen spinner for the whole budget"
+        );
+        assert!(
+            !body.contains(banned),
+            "`produce` calls the UNBOUNDED `check_bw_status_details()`; it is a bare \
+             `Command::output()` with no timeout, and the window deadline that appears to \
+             cover it does not"
+        );
+        // Positive control for that negative: the banned needle really does
+        // match the spelling it bans, and really does NOT match the bounded
+        // form -- so `!contains` passing means the unbounded call is absent
+        // rather than the needle being unmatchable or matching both.
+        assert!(
+            concat!("let d = login_ui::check_bw_status_details", "();").contains(banned),
+            "control: the banned spelling does not match itself"
+        );
+        assert!(
+            !concat!("let d = login_ui::check_bw_status_details_bo", "unded();").contains(banned),
+            "control: the ban also matches the bounded form, so it could never distinguish them"
+        );
     }
 
     /// `StartupWork` must not also carry the handle. Two owners for one
@@ -10971,18 +11162,30 @@ mod tests {
         }
     }
 
-    /// Whether a process with the given id still exists, via `tasklist` --
-    /// used only by the `adopt_started_child` regression test above to prove
-    /// the discarded child was actually killed rather than merely dropped
-    /// (dropping a `Child` does not kill its process, which is exactly the
-    /// failure mode this test guards against).
-    fn is_pid_running(pid: u32) -> bool {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
-            .expect("tasklist must run");
-        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-    }
+    // `is_pid_running` used to live here: a `tasklist` spawn whose stdout was
+    // substring-searched for the pid, used by the four tests that prove a
+    // `Child` was stopped rather than merely dropped. It is gone, replaced by
+    // `ProcessWatch` (see its doc). Two reasons, and the first is the one that
+    // was actually costing runs:
+    //
+    //   1. It answered by starting a whole extra process and enumerating the
+    //      system's process table -- measured at ~6.0s per call on the
+    //      developer's machine, unloaded and repeatably, and past 60s under the
+    //      suite's own parallelism. In a 40-run sample of the bin suite, one
+    //      run took 89s with SIX tests over the 60-second mark, and every one
+    //      of the six was a test that spawns processes. Those tests were not
+    //      racing on anything they assert; they were racing the clock.
+    //   2. A pid is not an identity. `stop_bw_serve` kills and then `wait()`s,
+    //      and `wait()` lets the number go, so "is this pid running?" is a
+    //      question about a number the OS is free to reissue. Windows was
+    //      measured NOT to reissue promptly (0 of 1500 on the next spawn), so
+    //      this was not the trigger -- but a held handle removes it as a future
+    //      one for free, because a pid cannot be recycled while a handle to the
+    //      process object is open.
+    //
+    // Not replaced with a sleep-then-look: a sleep long enough to be reliable
+    // is slow every other time, and one short enough to be fast is the flake
+    // again.
 
     // ---------------------------------------------------------------------
     // Task 11 -- startup: resolve, point, resume.
