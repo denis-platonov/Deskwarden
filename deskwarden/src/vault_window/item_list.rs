@@ -2462,6 +2462,108 @@ mod row_tile_tests {
         );
     }
 
+    /// The bottom of the list's scrolling viewport, from the PANE's geometry
+    /// alone: the list frame is flush to the bottom of the pane and carries
+    /// `LIST_PADDING` of its own. Deliberately says nothing about rows, tile
+    /// heights or gaps -- it is the fixed edge the row stack is measured
+    /// AGAINST, and the whole point of the test below is that the two are
+    /// arrived at independently.
+    const VIEWPORT_BOTTOM: f32 = PANE_HEIGHT - LIST_PADDING;
+
+    /// Anything VISIBLE painted in the list's reserved right-hand gutter,
+    /// i.e. the scroll bar's track and handle -- the same "strictly right of
+    /// the tiles, narrower than the gutter" test the centring and clear-space
+    /// tests use, so all three agree on what "the bar is on screen" means.
+    fn gutter_marks(p: &Painted) -> Vec<egui::Rect> {
+        visibly_painted(p)
+            .filter(|r| r.right() > PANE_WIDTH - LIST_PADDING + 0.5 && r.width() < LIST_PADDING)
+            .collect()
+    }
+
+    /// Does a list of `n` rows actually OVERFLOW its viewport? Answered by
+    /// MEASURING the rows egui painted -- not by any arithmetic on
+    /// `ROW_TILE_HEIGHT` and `ROW_GAP`.
+    ///
+    /// Two independent signs, either of which means the stack did not fit:
+    /// the last tile egui laid out reaches past [`VIEWPORT_BOTTOM`], or
+    /// `show_rows` virtualized some rows away and painted fewer tiles than
+    /// there are items. On an unscrolled frame, so the row stack is measured
+    /// where it starts.
+    fn row_stack_overflows(n: usize) -> bool {
+        let items: Vec<VaultItem> = (0..n)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let p = paint(&items, None);
+        let tiles = row_tiles(&p);
+        tiles.len() < n
+            || tiles.last().is_some_and(|t| t.rect.bottom() > VIEWPORT_BOTTOM + 0.01)
+    }
+
+    #[test]
+    fn the_scrollbar_appears_on_the_very_first_list_that_does_not_fit() {
+        // THE DEFECT this pins: `draw_item_list` PREDICTS overflow from the
+        // row count in order to hide the bar on a list that fits, and that
+        // prediction has to include the gap BETWEEN rows. Drop the gap term
+        // and the prediction under-measures the stack by `(n-1) * ROW_GAP`,
+        // so at the boundary the bar is hidden on a list that really does
+        // overflow -- exactly what the code's own "ties go to SHOWING the
+        // bar" comment says must not happen. The suite tested 3 items and 40
+        // and nothing in between, so the boundary itself was never exercised.
+        //
+        // The boundary is FOUND, not asserted: `row_stack_overflows` reads
+        // back the tiles egui actually painted and compares them to the
+        // pane's own bottom edge. Recomputing `n * ROW_TILE_HEIGHT +
+        // (n-1) * ROW_GAP` here would have been the same sum the production
+        // line computes, and a test that agrees with the code by construction
+        // cannot disagree with it when it is wrong.
+        let overflow_at = (1..=40)
+            .find(|n| row_stack_overflows(*n))
+            .expect("no list of up to 40 rows overflowed a {PANE_HEIGHT}pt pane");
+        let fits_at = overflow_at - 1;
+        assert!(
+            fits_at > 3 && overflow_at < 40,
+            "the boundary is at {fits_at}/{overflow_at} rows, which is no longer strictly \
+             between the 3-row and 40-row lists the other scroll tests use -- this test is \
+             meant to cover the case NEITHER of those does"
+        );
+
+        // The list one row short of overflowing shows no bar at all, even
+        // with the pointer parked over it for `SETTLE_FRAMES`.
+        let fitting: Vec<VaultItem> = (0..fits_at)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let marks = gutter_marks(&paint_with(&fitting, None, SETTLE_FRAMES));
+        assert!(
+            marks.is_empty(),
+            "a {fits_at}-row list whose tiles all fit above y={VIEWPORT_BOTTOM} is still \
+             painting {marks:?} in its right-hand gutter"
+        );
+
+        // Add ONE row -- the first list that does not fit -- and the bar must
+        // be back. This is the assertion the zeroed gap term fails: it
+        // predicts {overflow_at} rows fit, and hides the bar on a list the
+        // measurement above just showed overflowing.
+        let overflowing: Vec<VaultItem> = (0..overflow_at)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let marks = gutter_marks(&paint_with(&overflowing, None, SETTLE_FRAMES));
+        assert!(
+            !marks.is_empty(),
+            "adding one row to {fits_at} pushes the tiles past y={VIEWPORT_BOTTOM}, so the list \
+             CAN scroll -- and nothing visible is painted in its gutter, so the user is not \
+             told. The overflow prediction is under-measuring the row stack"
+        );
+        // ...and it is egui's bar for THIS viewport, not some stray mark that
+        // happens to land in the gutter: the track runs the viewport's own
+        // height. A second, independent confirmation that the pane geometry
+        // the boundary was measured against is the one the bar belongs to.
+        assert!(
+            marks.iter().any(|r| (r.bottom() - VIEWPORT_BOTTOM).abs() < 0.5),
+            "the gutter marks {marks:?} do not reach the viewport's bottom edge at \
+             y={VIEWPORT_BOTTOM}, so they are not the scroll bar's track"
+        );
+    }
+
     #[test]
     fn an_unselected_row_is_a_white_tile_with_the_designs_hairline_border() {
         // THE REPORT, stated as an assertion. `background: #ffffff` on EVERY
