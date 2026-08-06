@@ -12193,10 +12193,28 @@ mod tests {
                 .unwrap_or_else(|| panic!("no \"matched ...\" line was logged; got {lines:?}"))
         }
 
+        /// `Injector::fill` takes the process-global `SEQUENCE_IN_FLIGHT` flag,
+        /// so two `process_foreground_event` tests that overlap would hand one
+        /// of them `ALREADY_TYPING` -- and this binary links the library
+        /// without `cfg(test)`, so the refusal notice would be a real message
+        /// box on the developer's desktop. The library's own guard for that
+        /// static is `mod`-private to it; same discipline, binary-local, in the
+        /// manner of `ACTIVE_DIR_LOCK` above. All five tests that call
+        /// `process_foreground_event` take it, including the ones that expect
+        /// no fill: the point is that only one of them is ever in there.
+        static FILL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        fn lock_fill() -> std::sync::MutexGuard<'static, ()> {
+            FILL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
         /// **Finding 1, for `TriggerMode::Auto`.** Deleting the `handle_match`
         /// call leaves this with an empty `Filled`.
         #[test]
         fn an_auto_trigger_match_is_filled_from_the_vault_into_the_window_that_matched() {
+            let _fill_guard = lock_fill();
             let mut server = mockito::Server::new();
             // The cache is empty, so this goes down `fill_from_vault`'s
             // documented bridge fallback rather than needing a populate.
@@ -12251,6 +12269,7 @@ mod tests {
         /// output is the value the mutation replaced with `None`.
         #[test]
         fn a_hotkey_trigger_match_arms_the_pending_fill_instead_of_filling_now() {
+            let _fill_guard = lock_fill();
             // Nothing here may reach the network: the Hotkey arm returns
             // before any vault read, and a bridge pointed at a closed port
             // proves it.
@@ -12293,6 +12312,7 @@ mod tests {
         /// unconditionally, without asking the engine anything.
         #[test]
         fn a_window_that_matches_nothing_is_neither_filled_nor_armed() {
+            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "1",
@@ -12324,6 +12344,7 @@ mod tests {
         /// asked for when autofill goes wrong.
         #[test]
         fn the_matched_log_line_names_a_title_matched_store_app_by_its_title() {
+            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "42",
@@ -12366,6 +12387,7 @@ mod tests {
         /// used the title would pass it and fail this one.
         #[test]
         fn the_matched_log_line_names_an_ordinary_app_by_its_executable() {
+            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "8",
