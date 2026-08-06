@@ -208,28 +208,37 @@ pub struct VaultWindowResult {
     /// does (stop the stale backend, re-authenticate, restart with the fresh
     /// token, repopulate the cache).
     pub needs_reauth: bool,
-    /// True if the titlebar's gear was clicked: the user asked for the
-    /// Preferences window, and this window closed only because eframe cannot
-    /// nest one native window's event loop inside another's. The caller
-    /// (`open_vault_window`) runs `prefs_ui::run`, applies whatever came
-    /// back, and reopens this window.
+    /// The settings the titlebar's gear's modal was left holding, if it was
+    /// opened at all during this window's life.
     ///
-    /// **A third field, not a reuse of either flag above, and the
-    /// distinction is not cosmetic.** `locked` and `needs_reauth` are
-    /// handled alike by the caller precisely because they mean the same
-    /// thing about the session -- it is gone -- and both therefore run the
-    /// full recovery: clear the cache, stop `bw serve`, re-authenticate,
-    /// restart, repopulate. Opening Preferences means nothing whatsoever
-    /// about the session. Folded into either flag, every visit to the gear
-    /// would make the user re-enter their master password to get back to a
-    /// vault that was never locked, and would tear down and restart a
-    /// perfectly healthy backend to do it. Distinct situations get distinct
-    /// fields here.
-    pub open_preferences: bool,
+    /// **This used to be `open_preferences: bool`, and the window used to
+    /// close to serve it.** `prefs_ui::run` was its own native window and
+    /// eframe cannot nest one event loop inside another, so the gear's only
+    /// route was: set a flag, close, let the caller open Preferences, then
+    /// reopen the vault -- which is exactly the disappearing window the user
+    /// asked to be rid of. The form is now drawn over this window by
+    /// `prefs_ui::draw_prefs_modal`, so nothing closes and there is no
+    /// request left to report; what is reported instead is the *answer*.
+    ///
+    /// `Some` means the modal was opened and dismissed at least once, and
+    /// carries the state it was left in. It does **not** mean anything
+    /// changed -- the caller compares against its own copy before writing, so
+    /// that "was anything edited" stays one decision made in one place.
+    ///
+    /// **Still its own field, not folded into `locked` or `needs_reauth`,**
+    /// for the reason it always was: those two mean the session is gone and
+    /// both run the full recovery (clear the cache, stop `bw serve`,
+    /// re-authenticate, restart, repopulate). Changing a preference means
+    /// nothing whatsoever about the session, and folding it in would make
+    /// every visit to the gear demand the master password. It is also, unlike
+    /// every other field here, **not a reason the window closed** -- the
+    /// window closed for whatever it closed for, and this rides along -- so
+    /// the caller handles it without a `continue`.
+    pub edited_settings: Option<crate::settings::Settings>,
     /// The account the user picked in the titlebar switcher. The window closed
     /// only because `main` has to tear one backend down and bring another one
     /// up, and that cannot happen while this window owns the event loop --
-    /// exactly the reason [`open_preferences`](Self::open_preferences) exists.
+    /// exactly the reason [`edited_settings`](Self::edited_settings) exists.
     ///
     /// **A fourth field, and distinct from all three above.** `locked` and
     /// `needs_reauth` mean the session is gone; this session was never lost.
@@ -237,7 +246,7 @@ pub struct VaultWindowResult {
     /// that recovery re-authenticates against **the account this process is
     /// already on** -- so the user would be asked for the master password of
     /// the account they were leaving, and would then be left on it. Folded into
-    /// `open_preferences` it would open the preferences window instead.
+    /// `edited_settings` it would be mistaken for a preference change instead.
     pub switch_to: Option<crate::accounts::AccountId>,
     /// True if the account menu's "Add account..." was clicked. The caller runs
     /// `add_account`, which opens a sign-in window and then settles onto the
@@ -418,13 +427,27 @@ pub fn build_frame(
     // is `FnMut + 'static` and can't return anything directly.
     let needs_reauth = Rc::new(RefCell::new(false));
     let needs_reauth_for_closure = needs_reauth.clone();
-    // See `VaultWindowResult::open_preferences`. Same `Rc<RefCell<_>>`
+    // See `VaultWindowResult::edited_settings`. Same `Rc<RefCell<_>>`
     // handoff as `locked` above and for the same mechanical reason (the
     // update closure is `FnMut + 'static` and cannot return anything), but
     // a separate cell rather than a share of either: see that field's doc
     // for why the three outcomes must not collapse into one.
-    let open_preferences = Rc::new(RefCell::new(false));
-    let open_preferences_for_closure = open_preferences.clone();
+    //
+    // Also the modal's *seed* on a second open. The gear can be clicked
+    // again later in the same window, and the caller has not written
+    // anything to disk yet at that point -- so re-reading `settings.json`
+    // would show the user the values they just changed away from. Whatever
+    // is in here wins; disk is only the first open's source.
+    let edited_settings: Rc<RefCell<Option<crate::settings::Settings>>> =
+        Rc::new(RefCell::new(None));
+    let edited_settings_for_closure = edited_settings.clone();
+    // The gear's modal, `Some` while it is up. `prefs_ui` owns the state and
+    // all of the drawing; this window owns only "is it open".
+    let mut prefs: Option<crate::prefs_ui::PrefsState> = None;
+    // `settings_path` is read below to place the window and again after the
+    // loop to save its geometry, so the closure gets its own copy to seed the
+    // modal from.
+    let settings_path_for_prefs = crate::settings::default_path();
     // See `VaultWindowResult::switch_to`. A fourth cell rather than a share of
     // any of the three above, for the reason that field's doc gives.
     let switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>> =
@@ -1261,16 +1284,31 @@ pub fn build_frame(
                 // square, matching the Lock pill's height and the avatar's
                 // diameter beside it.
                 if theme::gear_button(ui).clicked() {
-                    // The same two-step dance Lock does immediately below -- set
-                    // the flag, then ask the window to close -- and for a reason
-                    // specific to this control: `prefs_ui::run` is its own
-                    // `eframe` window on this same thread, and eframe cannot
-                    // nest one native event loop inside another. Calling it from
-                    // inside this frame closure is not an option, so the request
-                    // has to leave this window entirely and be served by the
-                    // caller once this loop has ended.
-                    *open_preferences_for_closure.borrow_mut() = true;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    // **NOT the two-step dance Lock does immediately below.**
+                    // This window stays exactly where it is; the form is drawn
+                    // over it, dimmed, by the block at the very end of this
+                    // closure. Closing here is what the gear used to do, back
+                    // when `prefs_ui::run` was a native window of its own and
+                    // eframe could not nest its event loop inside this one --
+                    // and a window that vanished and came back somewhere else
+                    // on a large screen is precisely the complaint this
+                    // replaces.
+                    //
+                    // Seeded from whatever the modal was last left holding, and
+                    // only from disk on the first open -- see
+                    // `edited_settings`. A re-click that re-read `settings.json`
+                    // would show values the user has already changed away from,
+                    // because nothing is written until this window closes.
+                    let seed = edited_settings_for_closure
+                        .borrow()
+                        .clone()
+                        .or_else(|| {
+                            settings_path_for_prefs
+                                .as_deref()
+                                .map(crate::settings::Settings::load)
+                        })
+                        .unwrap_or_default();
+                    prefs = Some(crate::prefs_ui::PrefsState::new(seed));
                 }
                 // **The avatar, the chevron beside it, and the menu they open
                 // together**, all inside one call -- see `account_menu`, which
@@ -1385,11 +1423,20 @@ pub fn build_frame(
         // be a fourth, Ctrl+Shift+F ("fill in app"), checked down in the
         // `DetailMode::Read` arm; it was removed with the header button it
         // was the keyboard equivalent of.
+        //
+        // **All three are off while the preferences modal is up.** Its scrim
+        // stops every click reaching this window, but a shortcut read straight
+        // off `ctx.input` never goes near hit-testing, so without this Ctrl+L
+        // would lock the vault and tear the session down from behind a modal
+        // that is meant to be blocking it -- and Ctrl+N would drop the user
+        // into a new-item form they cannot see. `keyboard_shortcuts_enabled`
+        // is the decision, made where a test can reach it.
+        let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
         let (ctrl_k, ctrl_l, ctrl_n) = ui.ctx().input(|i| {
             (
-                i.modifiers.ctrl && i.key_pressed(egui::Key::K),
-                i.modifiers.ctrl && i.key_pressed(egui::Key::L),
-                i.modifiers.ctrl && i.key_pressed(egui::Key::N),
+                shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
+                shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::L),
+                shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::N),
             )
         });
         if ctrl_k {
@@ -2954,6 +3001,27 @@ pub fn build_frame(
             }
         }
 
+        // **The preferences modal, and the only place this program draws the
+        // settings form over a window.** Last in the closure, after the folder
+        // editor and the launch confirmation, so its scrim covers the three
+        // panels *and* the titlebar the gear itself sits in -- which is what
+        // makes this window inert rather than merely covered.
+        //
+        // The edited settings are written into the outcome cell on every
+        // frame, not only on dismissal: the window can be closed from the OS
+        // (Alt+F4, taskbar) while the modal is up, and a change the user made
+        // and could see on screen must not be the one that gets lost.
+        //
+        // NOTHING HERE TOUCHES DISK. The caller compares against its own copy
+        // and calls `persist_preferences`; see `VaultWindowResult::edited_settings`.
+        if let Some(state) = prefs.as_mut() {
+            let action = crate::prefs_ui::draw_prefs_modal(ui.ctx(), state);
+            *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
+            if action == crate::prefs_ui::PrefsAction::Close {
+                prefs = None;
+            }
+        }
+
         // NOTHING SCHEDULES THE NEXT FRAME HERE ANY MORE. The
         // `request_repaint_after` that used to close this closure was reachable
         // only in the `Vault` state, because two branches of the body match
@@ -2964,7 +3032,7 @@ pub fn build_frame(
     (
         options,
         Box::new(vault_frame_fn),
-        VaultFrameHandles { locked, needs_reauth, open_preferences, switch_to, add_account, remove_account, account_details, last_geometry, settings_path },
+        VaultFrameHandles { locked, needs_reauth, edited_settings, switch_to, add_account, remove_account, account_details, last_geometry, settings_path },
     )
 }
 
@@ -2984,7 +3052,7 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
 pub struct VaultFrameHandles {
     locked: Rc<RefCell<bool>>,
     needs_reauth: Rc<RefCell<bool>>,
-    open_preferences: Rc<RefCell<bool>>,
+    edited_settings: Rc<RefCell<Option<crate::settings::Settings>>>,
     switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>>,
     /// See [`VaultWindowResult::add_account`] and
     /// [`VaultWindowResult::remove_account`].
@@ -3028,7 +3096,7 @@ impl VaultFrameHandles {
         // window's `settings.json` write is done, so the preferences save cannot
         // race it, and `persist_preferences` is a read-modify-write of the two
         // preference fields only, so it cannot clobber the geometry either.
-        let open_preferences = *self.open_preferences.borrow();
+        let edited_settings = self.edited_settings.borrow().clone();
         let switch_to = self.switch_to.borrow_mut().take();
         let add_account = *self.add_account.borrow();
         let remove_account = *self.remove_account.borrow();
@@ -3037,7 +3105,7 @@ impl VaultFrameHandles {
         // cost the caller its warm cache rather than failing, and this is the
         // one field whose absence means "spawn the CLI again".
         let account_details = self.account_details.borrow().clone();
-        VaultWindowResult { locked, needs_reauth, open_preferences, switch_to, add_account, remove_account, account_details }
+        VaultWindowResult { locked, needs_reauth, edited_settings, switch_to, add_account, remove_account, account_details }
     }
 }
 
@@ -4978,6 +5046,24 @@ fn sync_pill(
         (Some(Ok(())), None) => (theme::BLUE, format!("Synced {}", synced_ago_text(since_last_sync))),
         (None, None) => (theme::TEXT_GHOST, "Sync".to_string()),
     }
+}
+
+/// Whether this window's Ctrl+K / Ctrl+L / Ctrl+N are live on this frame.
+///
+/// One argument, and a function rather than an inline `&&`, because it is the
+/// half of "the vault is inert while Preferences is up" that a scrim cannot
+/// enforce. A modal's scrim intercepts *pointer* input by sitting on a higher
+/// layer; a shortcut read off `ctx.input` never consults a layer at all, so a
+/// Ctrl+L behind the modal would lock the vault and tear the session down.
+/// Made a named decision so `shortcuts_are_dead_while_preferences_is_up` can
+/// ask it directly instead of driving a whole frame to find out.
+///
+/// Deliberately keyed on the preferences modal only. The folder editor and the
+/// launch confirmation are reachable only from controls the modal covers, so
+/// neither can be up at the same time as this one, and adding them here would
+/// be guarding against a state that cannot occur.
+fn keyboard_shortcuts_enabled(preferences_open: bool) -> bool {
+    !preferences_open
 }
 
 /// What the window body shows this frame.
@@ -10700,24 +10786,29 @@ mod settings_gear_placement_tests {
         );
     }
 
-    /// The click has to do both halves. Setting the flag without closing
-    /// leaves the request sitting in a cell nobody reads until the user
-    /// closes the window by hand; closing without setting it loses the
-    /// request entirely and reads as a window that shut for no reason.
+    /// **The whole point of the modal: the vault window stays put.**
+    ///
+    /// This test asserted the exact opposite until the form moved in-window --
+    /// the gear used to set a flag and close, because `prefs_ui::run` owned a
+    /// native event loop of its own and eframe cannot nest one inside another.
+    /// The user's complaint was precisely that: click Settings, the vault
+    /// vanishes, and a differently-sized window appears somewhere else on a
+    /// large screen. So both halves are pinned in the negative and the
+    /// positive -- the click opens `prefs`, and it does not close anything.
     #[test]
-    fn the_gear_asks_for_preferences_and_then_closes_the_window() {
+    fn the_gear_opens_the_modal_and_leaves_the_window_open() {
         let body = gear_click_body();
-        let sets_flag = concat!("*open_preferences_for_", "closure.borrow_mut() = true;");
+        let opens = concat!("prefs = Some(crate::prefs_ui::", "PrefsState::new(seed));");
         let closes = concat!("ViewportCommand::", "Close");
 
         assert!(
-            body.contains(sets_flag),
-            "the gear's click does not record the request; `main` has nothing to act on: {body:?}"
+            body.contains(opens),
+            "the gear's click does not open the preferences modal, so nothing draws it: {body:?}"
         );
         assert!(
-            body.contains(closes),
-            "the gear's click does not close the window, so `prefs_ui::run` -- which is its own \
-             eframe window on this thread -- can never be reached: {body:?}"
+            !body.contains(closes),
+            "the gear's click still closes the vault window -- the exact behaviour the in-window \
+             modal exists to remove: {body:?}"
         );
     }
 
@@ -10725,7 +10816,7 @@ mod settings_gear_placement_tests {
     /// of those run the full recovery sequence: stop the backend,
     /// re-authenticate, restart, repopulate. Folding the gear into either
     /// would make every visit to Preferences demand the master password.
-    /// That is why `open_preferences` is its own field, and this is what
+    /// That is why `edited_settings` is its own field, and this is what
     /// stops a later tidy-up from collapsing the three.
     #[test]
     fn asking_for_preferences_is_neither_a_lock_nor_an_expired_session() {
@@ -12142,7 +12233,7 @@ mod switcher_wiring_tests {
     /// folded into either, asking to switch would prompt for the master
     /// password of the account being left and then leave the user on it, and
     /// asking to add would do the same for an account that does not exist yet.
-    /// `open_preferences` opens a different window entirely. Lock is the one
+    /// `edited_settings` carries a preference change out, not a session outcome. Lock is the one
     /// row that SHOULD set `locked`, and must set nothing else — it is a
     /// security action, and it lands on sign-in for the account that was
     /// locked rather than switching anywhere.
@@ -12162,8 +12253,8 @@ mod switcher_wiring_tests {
                 "flags an expired session, so it runs the re-authentication path",
             ),
             (
-                concat!("open_preferences_for_", "closure"),
-                "asks for the Preferences window instead",
+                concat!("edited_settings_for_", "closure"),
+                "reports a preference change instead",
             ),
         ];
 
@@ -12204,7 +12295,7 @@ mod switcher_wiring_tests {
     #[test]
     fn the_recorded_pick_is_read_back_out_into_the_result() {
         let production = production();
-        let result = concat!("VaultWindowResult { locked, needs_reauth,", " open_preferences,");
+        let result = concat!("VaultWindowResult { locked, needs_reauth,", " edited_settings,");
 
         for (read_back, what) in [
             (
@@ -12519,7 +12610,7 @@ mod account_details_tests {
         let handles = VaultFrameHandles {
             locked: Rc::new(RefCell::new(false)),
             needs_reauth: Rc::new(RefCell::new(false)),
-            open_preferences: Rc::new(RefCell::new(false)),
+            edited_settings: Rc::new(RefCell::new(None)),
             switch_to: Rc::new(RefCell::new(None)),
             add_account: Rc::new(RefCell::new(false)),
             remove_account: Rc::new(RefCell::new(false)),
@@ -12542,7 +12633,7 @@ mod account_details_tests {
         let unheld = VaultFrameHandles {
             locked: Rc::new(RefCell::new(false)),
             needs_reauth: Rc::new(RefCell::new(false)),
-            open_preferences: Rc::new(RefCell::new(false)),
+            edited_settings: Rc::new(RefCell::new(None)),
             switch_to: Rc::new(RefCell::new(None)),
             add_account: Rc::new(RefCell::new(false)),
             remove_account: Rc::new(RefCell::new(false)),
@@ -12809,13 +12900,19 @@ mod open_app_wiring_tests {
         haystack.match_indices(needle).count()
     }
 
-    /// The drain block: from the `take` to the comment that has always
-    /// followed the frame closure's tail.
+    /// The drain block: from the `take` to the block that follows it.
+    ///
+    /// That used to be the frame closure's tail comment. The preferences modal
+    /// is now drawn between the two -- deliberately last, so its scrim covers
+    /// everything including the titlebar -- so the terminator moved to it. The
+    /// `body.len() < 2600` control below is what keeps this honest: if this
+    /// anchor ever stops matching where it is meant to, the slice runs on and
+    /// that assertion fails rather than the `!contains` checks quietly passing.
     fn drain_body(source: &'static str) -> &'static str {
         let at = source.find(DRAIN).expect("the drain block is there");
         let end = source[at..]
-            .find(concat!("// NOTHING SCHEDULES THE NEXT", " FRAME HERE ANY MORE."))
-            .expect("the drain block is followed by the repaint comment it always was");
+            .find(concat!("// **The preferences modal, and the", " only place this program draws the"))
+            .expect("the drain block is followed by the preferences modal block");
         &source[at..at + end]
     }
 
@@ -13700,6 +13797,134 @@ mod edit_seam_argument_tests {
             "the last `seconds_left` refresh is inside the pane match, so the countdown \
              stops advancing in every arm but the one holding it -- which is what froze the \
              editor's previewed code for the whole edit session"
+        );
+    }
+}
+
+/// **The vault window is inert while Preferences is up, and the modal is
+/// really drawn.**
+///
+/// Two halves that need different techniques. Whether a click reaches a
+/// control behind the scrim is `prefs_ui::modal_tests`' question and is
+/// answered there against real frames. What is left over here is everything a
+/// scrim cannot reach: this window reads Ctrl+K/L/N straight off `ctx.input`,
+/// which never consults a layer, so the modal has to be *asked about* -- and
+/// the call that draws it at all has to exist, which no behavioural test in
+/// this file can see because `run` is the eframe application.
+#[cfg(test)]
+mod preferences_modal_wiring_tests {
+    use super::*;
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    fn occurrences(needle: &str) -> usize {
+        source().match_indices(needle).count()
+    }
+
+    /// The decision itself, asked directly.
+    #[test]
+    fn the_shortcuts_are_dead_while_preferences_is_up() {
+        assert!(
+            keyboard_shortcuts_enabled(false),
+            "Ctrl+K/L/N are off with no modal open, so this window has no keyboard at all"
+        );
+        assert!(
+            !keyboard_shortcuts_enabled(true),
+            "Ctrl+L still locks the vault from behind the preferences modal -- it tears the \
+             session down under a dialog that is supposed to be blocking it"
+        );
+    }
+
+    /// And that the shortcut block actually consults it. Without this, the
+    /// decision above is a function nothing calls.
+    #[test]
+    fn the_shortcut_block_asks_that_question_about_every_one_of_the_three() {
+        let asks = concat!("let shortcuts = keyboard_shortcuts_", "enabled(prefs.is_some());");
+        assert_eq!(
+            occurrences(asks),
+            1,
+            "the shortcut block does not compute {asks:?}, so nothing suppresses Ctrl+K/L/N"
+        );
+        assert_eq!(
+            occurrences(concat!("shortcuts && i.modifiers.", "ctrl && i.key_pressed")),
+            3,
+            "not all three of Ctrl+K, Ctrl+L and Ctrl+N are gated on the modal; the ungated \
+             one fires from behind it"
+        );
+    }
+
+    /// **Delete the draw call and this fails.** The gear sets `prefs`, and one
+    /// block draws it; with that block gone the click would silently do
+    /// nothing at all, which is indistinguishable from the button being inert.
+    #[test]
+    fn exactly_one_block_draws_the_preferences_modal() {
+        let draws = concat!("crate::prefs_ui::draw_prefs_", "modal(ui.ctx(), state)");
+        assert_eq!(
+            occurrences(draws),
+            1,
+            "expected {draws:?} exactly once -- zero means the gear opens nothing, and two \
+             means two scrims stacked over one window"
+        );
+        // And it is the LAST thing the frame closure draws, after the folder
+        // editor and the launch confirmation: an earlier scrim would sit
+        // *under* whichever of those was drawn after it, and under the
+        // titlebar the gear itself lives in.
+        let at = source().find(draws).expect("the draw call is there");
+        for (later, what) in [
+            (concat!("draw_folder_edit_", "modal(ui.ctx()"), "the folder editor"),
+            (concat!("draw_launch_confirm_", "modal(ui.ctx()"), "the launch confirmation"),
+        ] {
+            let other = source().find(later).expect("that modal is drawn too");
+            assert!(
+                other < at,
+                "the preferences modal is drawn BEFORE {what}, so its scrim sits under it"
+            );
+        }
+    }
+
+    /// **Nothing in this window writes the settings to disk.** The write-back
+    /// is `main`'s, next to the one `persist_preferences` call that knows not
+    /// to clobber the geometry this window saves on its way out. A save from
+    /// inside the frame closure would be a second writer racing that one.
+    #[test]
+    fn the_modal_never_persists_anything_itself() {
+        for forbidden in [
+            concat!("persist_", "preferences("),
+            concat!("Settings::", "save("),
+        ] {
+            assert_eq!(
+                occurrences(forbidden),
+                0,
+                "{forbidden:?} appears in the vault window, which is a second writer of \
+                 settings.json racing `main`'s"
+            );
+        }
+    }
+
+    /// The answer has to leave the window. A `PrefsState` edited into a local
+    /// that nothing reads back out is a preferences dialog whose every change
+    /// is discarded when the vault window closes.
+    #[test]
+    fn the_edited_settings_are_read_back_out_into_the_result() {
+        assert_eq!(
+            occurrences(concat!(
+                "*edited_settings_for_closure.borrow_mut() = ",
+                "Some(state.settings.clone());"
+            )),
+            1,
+            "the modal's state is never written into the outcome cell"
+        );
+        assert_eq!(
+            occurrences(concat!("let edited_settings = self.edited_", "settings.borrow().clone();")),
+            1,
+            "`finish` does not read the cell, so the edit never reaches `main`"
+        );
+        assert_eq!(
+            occurrences(concat!("VaultWindowResult { locked, needs_reauth,", " edited_settings,")),
+            1,
+            "the result does not carry the edited settings"
         );
     }
 }

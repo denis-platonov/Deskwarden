@@ -1196,7 +1196,7 @@ fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
 /// neither the bundled Archivo faces nor egui's fallback stack carry that
 /// codepoint, so as text it renders as a tofu box. Two strokes are also
 /// sharper at this size than any glyph would be.
-fn close_glyph(ui: &mut Ui) -> Response {
+pub fn close_glyph(ui: &mut Ui) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
     let color = if response.hovered() { INK } else { TEXT_GHOST };
     if response.hovered() {

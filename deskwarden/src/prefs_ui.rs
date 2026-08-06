@@ -221,8 +221,8 @@ impl Section {
 
 /// Everything the window edits, plus the one piece of transient UI state
 /// (the stepper's text buffer) that has to survive between frames.
-struct PrefsState {
-    settings: Settings,
+pub struct PrefsState {
+    pub settings: Settings,
     section: Section,
     /// What is currently *typed* into the minutes field, which is not the same
     /// as `settings.auto_lock_minutes`: mid-edit it may be empty, or "4" on the
@@ -245,7 +245,7 @@ impl PrefsState {
     /// opening Preferences on such a file makes `edited != settings` true in
     /// `main.rs` and writes the corrected value back, which is the right
     /// outcome: the file then says what the app is doing.
-    fn new(settings: Settings) -> Self {
+    pub fn new(settings: Settings) -> Self {
         let minutes = clamp_auto_lock_minutes(settings.auto_lock_minutes);
         Self {
             settings: Settings { auto_lock_minutes: minutes, ..settings },
@@ -853,6 +853,219 @@ pub fn run(settings: Settings) -> Settings {
 
     let edited = state.borrow().settings.clone();
     edited
+}
+
+// ---------------------------------------------------------------------------
+// The in-window modal
+//
+// The same form, over the vault window, instead of a window of its own.
+//
+// **Nothing about the settings form is duplicated here.** [`run`] above and
+// [`draw_prefs_modal`] below both call the one [`draw_prefs_body`], which is
+// where every section, card, row and control lives. What differs between the
+// two is only what surrounds it: `run` gets its background from
+// `theme::paint_window_background`, its title and its dismiss from
+// `draw_window_chrome`, and its 1000x780 from the OS; the modal paints its own
+// card, its own 44px header and its own scrim, because it has no window of its
+// own to get any of that from. Two shells over one body -- not two forms.
+//
+// `run` is deliberately kept. Preferences is also reachable from the tray with
+// no vault window open at all (and, in particular, with the vault LOCKED), and
+// a modal needs a window to be modal over. Opening the vault window for it
+// would mean demanding the master password to change a checkbox. So the tray
+// keeps a real window, and the gear -- which by definition already has a
+// window -- gets the modal.
+// ---------------------------------------------------------------------------
+
+/// The modal's own title bar: a touch taller than `ChromeMetrics::LOGIN`'s
+/// 40px because it carries no window controls and reads as a card header.
+const MODAL_HEADER_HEIGHT: f32 = 44.0;
+/// Breathing room left around the card, so the dimmed vault is visible on
+/// every side and the modal reads as sitting *over* it rather than replacing
+/// it. That visible frame is the whole point of the feature.
+const MODAL_SCREEN_MARGIN: f32 = 24.0;
+const MODAL_RADIUS: u8 = 12;
+const MODAL_TITLE: &str = "Preferences";
+/// The scrim's alpha, taken from `folder_modal` and the launch confirmation
+/// verbatim rather than picked again.
+const MODAL_SCRIM_ALPHA: u8 = 90;
+
+/// What a frame of the modal asks its host to do.
+///
+/// One variant besides `None`, and no `Save`/`Cancel` pair: this form commits
+/// as it is edited (every control writes straight into `PrefsState::settings`),
+/// exactly as it did when it was a window whose only exit was the ✕. A Cancel
+/// here would have to mean "put back the settings as they were on open", which
+/// nothing in `run` ever offered and nothing on disk records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefsAction {
+    None,
+    Close,
+}
+
+/// The card's rectangle for a given window content rect. Pure, so the "does it
+/// fit, and is it inset on every side" question is answerable without a frame.
+///
+/// 3e's 1000x740 body is a ceiling, not a demand: the vault window is
+/// resizable and its minimum is smaller than that, so on a small window the
+/// card is whatever is left after [`MODAL_SCREEN_MARGIN`] on each side. It is
+/// never larger than the pane it is over, which is what stops the header's ✕
+/// from being pushed off-screen.
+pub fn modal_card_rect(screen: Rect) -> Rect {
+    let width = (screen.width() - 2.0 * MODAL_SCREEN_MARGIN)
+        .clamp(0.0, WINDOW_SIZE[0]);
+    let height = (screen.height() - 2.0 * MODAL_SCREEN_MARGIN)
+        .clamp(0.0, WINDOW_SIZE[1] - 40.0 + MODAL_HEADER_HEIGHT);
+    Rect::from_center_size(screen.center(), Vec2::new(width, height))
+}
+
+/// The body's rectangle inside a card: everything under the header. Pure, and
+/// separate from [`modal_card_rect`] so a test can assert that the body and
+/// the header do not overlap.
+pub fn modal_body_rect(card: Rect) -> Rect {
+    Rect::from_min_max(
+        Pos2::new(card.min.x, (card.min.y + MODAL_HEADER_HEIGHT).min(card.max.y)),
+        card.max,
+    )
+}
+
+/// Draws the preferences form as a modal card over a dimmed scrim covering the
+/// whole window, returning what the host should do about it.
+///
+/// **The scrim is a full-window click-catcher on `Order::Foreground`**, the
+/// idiom `draw_folder_edit_modal` and `draw_launch_confirm_modal` already use:
+/// it sits above the sidebar, list and detail panels *and* above the titlebar,
+/// so nothing behind it can be clicked while this is up.
+///
+/// Measured, not assumed -- and the measurement narrowed the claim. egui
+/// blocks lower layers by ORDER, not by which pixels a higher one reserved, so
+/// removing the scrim's own `allocate_response` does not let a click through
+/// on its own. It is kept because it is what the other two modals do and
+/// because it states the intent at the call site, but the property that
+/// actually holds the line is the layer, and
+/// `a_click_on_the_scrim_never_reaches_the_vault_behind_it` asserts the
+/// property rather than the mechanism.
+///
+/// Clicking the scrim does
+/// **not** dismiss -- neither of the other two modals dismisses on a scrim
+/// click either, and a form that is committed as it is typed is the last place
+/// to add an accidental exit.
+///
+/// **Esc and the header ✕ both close**, matching those same two.
+///
+/// The host is still responsible for the parts a scrim cannot reach: keyboard
+/// shortcuts read straight off `ctx.input` bypass hit-testing entirely, so the
+/// caller must not run them while this is drawn. See
+/// `vault_window`'s Ctrl+K/L/N block.
+pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAction {
+    let mut action = PrefsAction::None;
+    let screen = ctx.content_rect();
+    let card = modal_card_rect(screen);
+
+    egui::Area::new(egui::Id::new("prefs-modal-scrim"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(Pos2::ZERO)
+        .show(ctx, |ui| {
+            ui.allocate_response(screen.size(), Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                CornerRadius::ZERO,
+                egui::Color32::from_black_alpha(MODAL_SCRIM_ALPHA),
+            );
+        });
+
+    // `fixed_pos`, not `anchor`. An anchored `Area` has to measure its content
+    // before it can centre it, so its first frame paints nothing at all -- and
+    // this card's geometry is computed here rather than measured, so there is
+    // nothing to wait for. See `an_anchored_area_paints_nothing_on_its_first_frame`.
+    egui::Area::new(egui::Id::new("prefs-modal"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(card.min)
+        .show(ctx, |ui| {
+            // Swallows anything aimed at the card that no control inside it
+            // claims. Allocated FIRST so the widgets drawn below -- later in
+            // the same layer, and therefore on top -- still win their clicks.
+            ui.allocate_rect(card, Sense::click());
+            ui.set_clip_rect(card);
+
+            let header = Rect::from_min_max(
+                card.min,
+                Pos2::new(card.max.x, (card.min.y + MODAL_HEADER_HEIGHT).min(card.max.y)),
+            );
+            {
+                let painter = ui.painter();
+                painter.rect_filled(card, CornerRadius::same(MODAL_RADIUS), theme::WINDOW_BG);
+                painter.rect_filled(header, CornerRadius::same(MODAL_RADIUS), theme::CARD);
+                // Square off the header's bottom corners: the fill above
+                // rounds all four, and a rounded bottom edge in the middle of
+                // the card reads as two stacked cards.
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(header.min.x, header.max.y - MODAL_RADIUS as f32),
+                        header.max,
+                    ),
+                    CornerRadius::ZERO,
+                    theme::CARD,
+                );
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(header.min.x, header.max.y - 1.0),
+                        header.max,
+                    ),
+                    CornerRadius::ZERO,
+                    theme::HAIRLINE,
+                );
+                painter.rect_stroke(
+                    card,
+                    CornerRadius::same(MODAL_RADIUS),
+                    Stroke::new(1.0, theme::BORDER),
+                    StrokeKind::Inside,
+                );
+            }
+
+            let galley = ui.painter().layout_no_wrap(
+                MODAL_TITLE.to_string(),
+                FontId::new(13.0, FontFamily::Proportional),
+                theme::INK,
+            );
+            ui.painter().galley(
+                Pos2::new(
+                    header.center().x - galley.size().x / 2.0,
+                    header.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                theme::INK,
+            );
+
+            // The ✕, in the header's right-hand end. `theme::close_glyph` is
+            // the same mark `card_header_with_close` puts on the overlay --
+            // drawn as two strokes, because U+2715 is a tofu box in this
+            // app's face.
+            let close_rect = Rect::from_center_size(
+                Pos2::new(header.max.x - 22.0, header.center().y),
+                Vec2::splat(16.0),
+            );
+            let mut close_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(close_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            if theme::close_glyph(&mut close_ui).clicked() {
+                action = PrefsAction::Close;
+            }
+
+            // **The one settings form**, given the body's rect exactly as
+            // `run`'s `CentralPanel` gives it the window's.
+            let body = modal_body_rect(card);
+            let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+            draw_prefs_body(&mut body_ui, state);
+        });
+
+    if action == PrefsAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        action = PrefsAction::Close;
+    }
+
+    action
 }
 
 #[cfg(test)]
@@ -1486,5 +1699,577 @@ mod tests {
         assert_eq!(increment_minutes(1), 2);
         assert_eq!(increment_minutes(15), 16);
         assert_eq!(increment_minutes(u64::MAX), u64::MAX, "saturating, not panicking");
+    }
+}
+
+/// Real frames of [`draw_prefs_modal`] -- the shell around the form, not the
+/// form itself, which [`tests`] above already reads shape by shape.
+///
+/// What is worth pinning here is everything the shell is *for*: the card sits
+/// inside the pane with the dimmed vault visible around it, the header's title
+/// and dismiss control do not collide, the two dismiss routes work and the
+/// third (a scrim click) deliberately does not -- and, above all, that a
+/// control behind the scrim cannot be clicked. That last one is the defect
+/// this whole feature exists to prevent: a modal that merely *covers* the
+/// vault, with its buttons still live underneath, is worse than no modal.
+#[cfg(test)]
+mod modal_tests {
+    use super::*;
+    use eframe::egui::Color32;
+
+    /// A vault-window-sized pane: larger than the card's ceiling on one axis
+    /// and not the other, so the clamp and the margin are both exercised.
+    const PANE: Vec2 = Vec2::new(1200.0, 820.0);
+
+    /// The stand-in vault control, in the dead centre of the pane -- i.e.
+    /// under the card, not merely under the scrim.
+    const BEHIND: Rect = Rect {
+        min: Pos2::new(560.0, 400.0),
+        max: Pos2::new(680.0, 428.0),
+    };
+
+    /// A second stand-in, out in the margin the card does not cover. This one
+    /// is the SCRIM's job and nothing else's: the card's own area cannot
+    /// shield it, so a test that only ever clicked `BEHIND` would pass with no
+    /// scrim at all. `the_card_alone_does_not_cover_the_margin` keeps that
+    /// distinction honest.
+    const BEHIND_IN_MARGIN: Rect = Rect {
+        min: Pos2::new(2.0, 2.0),
+        max: Pos2::new(20.0, 18.0),
+    };
+
+    // -----------------------------------------------------------------------
+    // The pure geometry, asked directly. No frame, no fonts, no harness.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_card_is_inset_on_every_side_so_the_vault_stays_visible_around_it() {
+        // A pane small enough that the ceiling does not bite: the card is
+        // margin-bound on both axes.
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0));
+        let card = modal_card_rect(screen);
+        assert_eq!(card.min.x - screen.min.x, MODAL_SCREEN_MARGIN);
+        assert_eq!(screen.max.x - card.max.x, MODAL_SCREEN_MARGIN);
+        assert_eq!(card.min.y - screen.min.y, MODAL_SCREEN_MARGIN);
+        assert_eq!(screen.max.y - card.max.y, MODAL_SCREEN_MARGIN);
+    }
+
+    #[test]
+    fn the_card_never_grows_past_the_designs_own_size_on_a_huge_window() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(3840.0, 2160.0));
+        let card = modal_card_rect(screen);
+        assert_eq!(card.width(), WINDOW_SIZE[0]);
+        assert_eq!(card.height(), WINDOW_SIZE[1] - 40.0 + MODAL_HEADER_HEIGHT);
+        // Still centred, which is the "do not make me hunt across a big
+        // screen for the same window" half of the request.
+        assert_eq!(card.center(), screen.center());
+    }
+
+    /// The vault window is resizable and its minimum is well under 3e's
+    /// 1000x740. A card that kept that size on a small window would put its
+    /// header -- and therefore its only mouse dismiss -- off the edge.
+    #[test]
+    fn the_card_never_spills_out_of_a_window_smaller_than_the_design() {
+        for size in [Vec2::new(760.0, 520.0), Vec2::new(400.0, 300.0), Vec2::new(60.0, 40.0)] {
+            let screen = Rect::from_min_size(Pos2::new(17.0, 23.0), size);
+            let card = modal_card_rect(screen);
+            assert!(
+                screen.contains_rect(card),
+                "a {size:?} window puts the card at {card:?}, outside the pane {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_body_starts_below_the_header_and_never_overlaps_it() {
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        let body = modal_body_rect(card);
+        let header = Rect::from_min_max(
+            card.min,
+            Pos2::new(card.max.x, card.min.y + MODAL_HEADER_HEIGHT),
+        );
+        assert!(card.contains_rect(body));
+        assert_eq!(body.min.y, header.max.y);
+        assert!(
+            !body.intersects(Rect::from_min_max(
+                header.min,
+                Pos2::new(header.max.x, header.max.y - 0.01)
+            )),
+            "the form is drawn under the title bar it is supposed to sit beneath"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Frames
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct Shot {
+        /// `(source, rendered, rect)` -- the second is not the first: see
+        /// `detail.rs`'s `collect_rendered_text`. `Galley::text()` is the
+        /// string that was HANDED to egui and is blind to truncation.
+        texts: Vec<(String, String, Rect)>,
+        fills: Vec<(Rect, Color32)>,
+    }
+
+    impl Shot {
+        fn find(&self, source: &str) -> Option<&(String, String, Rect)> {
+            self.texts.iter().find(|(s, _, _)| s == source)
+        }
+
+        fn sources(&self) -> Vec<&str> {
+            self.texts.iter().map(|(s, _, _)| s.as_str()).collect()
+        }
+
+        fn rect_of(&self, source: &str) -> Rect {
+            self.find(source)
+                .unwrap_or_else(|| {
+                    panic!("{source:?} was never painted; got {:?}", self.sources())
+                })
+                .2
+        }
+    }
+
+    /// The `aae9429` contract, kept: a label counts as visible only if its
+    /// rect is INSIDE the pane **and** the glyphs egui really laid are the
+    /// glyphs it was handed. Either half alone passes a label that has been
+    /// ellipsised to fit, or one drawn in full off the edge.
+    fn assert_visible(shot: &Shot, source: &str, pane: Rect) {
+        let (_, rendered, rect) = shot
+            .find(source)
+            .unwrap_or_else(|| panic!("{source:?} was never painted; got {:?}", shot.sources()));
+        assert!(
+            pane.contains_rect(*rect),
+            "{source:?} is painted at {rect:?}, outside {pane:?}"
+        );
+        assert_eq!(
+            rendered, source,
+            "{source:?} was elided to fit -- egui laid {rendered:?}"
+        );
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Shot) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let rendered: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect();
+                out.texts.push((
+                    text.galley.text().to_string(),
+                    rendered,
+                    Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+            }
+            egui::Shape::Rect(rect) => out.fills.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn raw_input(events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, PANE)),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(&[]), |_ui| {});
+        ctx
+    }
+
+    fn a_state() -> PrefsState {
+        PrefsState::new(Settings::default())
+    }
+
+    /// One frame of the modal, drawn over a stand-in for the vault: a button
+    /// in the middle of the pane, added BEFORE the modal exactly as the real
+    /// window's panels are. Returns what was painted, what the modal asked
+    /// for, and whether that button registered a click.
+    fn frame(
+        ctx: &egui::Context,
+        state: &mut PrefsState,
+        events: &[egui::Event],
+        with_modal: bool,
+    ) -> (Shot, PrefsAction, Behind) {
+        let mut action = PrefsAction::None;
+        let mut behind = Behind::default();
+        let output = ctx.run_ui(raw_input(events), |ui| {
+            behind.under_card = ui
+                .put(BEHIND, egui::Button::new("a vault control"))
+                .clicked();
+            behind.in_margin = ui
+                .put(BEHIND_IN_MARGIN, egui::Button::new("another"))
+                .clicked();
+            if with_modal {
+                action = draw_prefs_modal(ui.ctx(), state);
+            }
+        });
+        let mut shot = Shot::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut shot);
+        }
+        (shot, action, behind)
+    }
+
+    /// Whether each stand-in vault control took a click on this frame.
+    #[derive(Default)]
+    struct Behind {
+        under_card: bool,
+        in_margin: bool,
+    }
+
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// Where the header's dismiss mark is. It is drawn as two strokes rather
+    /// than the character U+2715 (a tofu box in this app's face), so it cannot
+    /// be found by name and its reserved space is computed instead -- the same
+    /// arithmetic `draw_prefs_modal` uses.
+    fn close_rect(card: Rect) -> Rect {
+        Rect::from_center_size(
+            Pos2::new(card.max.x - 22.0, card.min.y + MODAL_HEADER_HEIGHT / 2.0),
+            Vec2::splat(16.0),
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // The warm-up, and why the card is not an anchored `Area`
+    // -----------------------------------------------------------------------
+
+    /// **The control this whole harness rests on.** An `Area` that has to
+    /// CENTRE itself cannot place anything until it has measured its content,
+    /// so its first frame emits nothing but `Shape::Noop`. A test that read
+    /// frame 1 of such an area would be asserting about a blank screen, and
+    /// every "does not contain" check in this module would pass for the wrong
+    /// reason. Pinned here so the day it stops being true, this says so.
+    #[test]
+    fn an_anchored_area_paints_nothing_on_its_first_frame() {
+        let ctx = styled_context();
+        let output = ctx.run_ui(raw_input(&[]), |ui| {
+            egui::Area::new(egui::Id::new("anchored-control"))
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ui.ctx(), |ui| {
+                    ui.label("nothing here on frame one");
+                });
+        });
+        let mut shot = Shot::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut shot);
+        }
+        assert!(
+            shot.find("nothing here on frame one").is_none(),
+            "an anchored area painted on its first frame after all -- every first-frame \
+             assertion in this module needs revisiting"
+        );
+    }
+
+    /// **And this modal is no exception, `fixed_pos` or not.** Measured, not
+    /// assumed: an `Area` egui has never seen before paints nothing at all on
+    /// the frame it is created, and asks for another. So EVERY frame test
+    /// below runs a warm-up first -- and this one pins that the warm-up is
+    /// really necessary, so that none of them is quietly asserting about a
+    /// blank screen.
+    ///
+    /// The cost in the real window is one frame between the gear's click and
+    /// the card appearing, which egui has already requested a repaint for.
+    #[test]
+    fn the_modal_is_blank_on_its_first_frame_and_complete_on_its_second() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let (warm_up, _, _) = frame(&ctx, &mut state, &[], true);
+        assert!(
+            warm_up.find(MODAL_TITLE).is_none(),
+            "the modal painted on its first frame after all -- the warm-up every frame test \
+             below runs is no longer needed, and each of them should say so instead: {:?}",
+            warm_up.sources()
+        );
+
+        let (shot, _, _) = frame(&ctx, &mut state, &[], true);
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        assert_visible(&shot, MODAL_TITLE, card);
+        // And the form inside it, not just the shell.
+        assert_visible(&shot, Section::General.label(), card);
+        assert!(
+            shot.find(AUTO_LOCK_LABEL).is_some(),
+            "the first frame drew the shell but not the settings form; got {:?}",
+            shot.sources()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The shell
+    // -----------------------------------------------------------------------
+
+    /// A title long enough to reach the dismiss mark would overprint the only
+    /// mouse way out this modal has. Asserted as non-intersection, explicitly,
+    /// because both are in the same 44px strip.
+    #[test]
+    fn the_title_does_not_reach_the_dismiss_control() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (shot, _, _) = frame(&ctx, &mut state, &[], true);
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        let title = shot.rect_of(MODAL_TITLE);
+        let close = close_rect(card);
+        assert!(
+            !title.intersects(close),
+            "the title {title:?} runs into the dismiss mark at {close:?}"
+        );
+        assert!(card.contains_rect(close), "the dismiss mark is outside the card");
+    }
+
+    /// The dim itself. Without it the vault behind reads as live, which is the
+    /// visual half of the same claim the click tests make mechanically.
+    #[test]
+    fn the_whole_pane_is_dimmed_behind_the_card() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        // More than the two-frame warm-up the other tests need: egui fades a
+        // new `Area` in over `Style::animation_time`, so an early frame's
+        // scrim is a fraction of its final alpha. Read once it has settled --
+        // this is an assertion about the colour that was chosen, not about the
+        // fade, which is egui's and is fine.
+        let mut shot = Shot::default();
+        for _ in 0..24 {
+            shot = frame(&ctx, &mut state, &[], true).0;
+        }
+        let pane = Rect::from_min_size(Pos2::ZERO, PANE);
+        let scrim = shot
+            .fills
+            .iter()
+            .find(|(rect, _)| *rect == pane)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no full-pane rectangle was painted at all; got {:?}",
+                    shot.fills.iter().map(|(r, _)| *r).collect::<Vec<_>>()
+                )
+            })
+            .1;
+        assert_eq!(
+            (scrim.r(), scrim.g(), scrim.b()),
+            (0, 0, 0),
+            "the scrim is not black, so it tints the vault rather than dimming it"
+        );
+        assert_eq!(
+            scrim.a(),
+            MODAL_SCRIM_ALPHA,
+            "the scrim's alpha is not the one `folder_modal` and the launch confirmation use"
+        );
+        assert!(
+            scrim.a() < 255,
+            "the scrim is opaque, so the vault is hidden rather than dimmed -- the whole              point is that the window the user came from stays visible where it was"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Inertness -- the reason this feature exists
+    // -----------------------------------------------------------------------
+
+    /// **The control, first.** Without it every assertion below would pass
+    /// against a fixture whose button was never clickable in the first place.
+    #[test]
+    fn the_control_behind_the_modal_is_clickable_when_the_modal_is_not_there() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let _ = frame(&ctx, &mut state, &[], false);
+        let (_, _, behind) = frame(&ctx, &mut state, &click(BEHIND.center()), false);
+        assert!(
+            behind.under_card,
+            "the stand-in vault control under the card never registered a click at all"
+        );
+        let _ = frame(&ctx, &mut state, &[], false);
+        let (_, _, behind) = frame(&ctx, &mut state, &click(BEHIND_IN_MARGIN.center()), false);
+        assert!(
+            behind.in_margin,
+            "the stand-in vault control in the margin never registered a click at all"
+        );
+    }
+
+    /// **The other control, and the one that keeps the scrim from being dead
+    /// code.** The card's own area covers `BEHIND`, so a click there would be
+    /// blocked by the card whether or not a scrim existed. `BEHIND_IN_MARGIN`
+    /// is deliberately outside it -- measured here rather than assumed.
+    #[test]
+    fn the_card_alone_does_not_cover_the_margin() {
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        assert!(card.contains_rect(BEHIND));
+        assert!(
+            !card.intersects(BEHIND_IN_MARGIN),
+            "the margin fixture is under the card, so the scrim test below would pass              against no scrim at all"
+        );
+    }
+
+    /// **The defect this feature exists to prevent.** A click that lands on a
+    /// vault control behind a scrim is worse than no modal: the user believes
+    /// they are editing preferences and is in fact driving the vault.
+    #[test]
+    fn a_click_over_the_card_never_reaches_the_vault_behind_it() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let _ = frame(&ctx, &mut state, &[], true);
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, _, behind) = frame(&ctx, &mut state, &click(BEHIND.center()), true);
+        assert!(
+            !behind.under_card,
+            "a click over the preferences card reached the vault control underneath it"
+        );
+    }
+
+    /// And the same in the margin: the scrim is a click-catcher over the whole
+    /// pane, not only under the card.
+    #[test]
+    fn a_click_on_the_scrim_never_reaches_the_vault_behind_it() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        // A stand-in control out in the margin, where the scrim alone covers.
+        let corner = Pos2::new(6.0, 6.0);
+        assert!(
+            !modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE)).contains(corner),
+            "the fixture point is under the card, so this would not be testing the scrim"
+        );
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, action, _) = frame(&ctx, &mut state, &click(corner), true);
+        assert_eq!(
+            action,
+            PrefsAction::None,
+            "a scrim click dismissed the form -- neither `draw_folder_edit_modal` nor \
+             `draw_launch_confirm_modal` does that, and this form commits as it is typed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Dismissal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn escape_closes_the_modal() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, action, _) = frame(
+            &ctx,
+            &mut state,
+            &[egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            true,
+        );
+        assert_eq!(action, PrefsAction::Close);
+    }
+
+    #[test]
+    fn the_header_cross_closes_the_modal() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        // TWO warm-ups: one for egui to create the area, one for it to lay
+        // the dismiss mark out where a click can find it.
+        let _ = frame(&ctx, &mut state, &[], true);
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, action, _) = frame(&ctx, &mut state, &click(close_rect(card).center()), true);
+        assert_eq!(
+            action,
+            PrefsAction::Close,
+            "the dismiss mark did not close the modal, which leaves Esc as the only way out"
+        );
+    }
+
+    /// An idle frame answers `None`. Trivially true today, and the thing that
+    /// would break first if the dismiss mark's hit rect or the Esc check ever
+    /// drifted onto something that fires every frame -- a modal that closes on
+    /// its own is indistinguishable from a click that missed the gear.
+    #[test]
+    fn an_untouched_modal_stays_up() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, action, _) = frame(&ctx, &mut state, &[], true);
+        assert_eq!(action, PrefsAction::None);
+    }
+
+    /// The form is live inside the modal -- a nav click changes section. The
+    /// counterpart to the inertness tests above: the scrim must stop clicks
+    /// reaching the vault and must NOT stop them reaching the card.
+    #[test]
+    fn the_form_inside_the_modal_is_live() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        let body = modal_body_rect(card);
+        // The second nav row, by the same arithmetic `draw_nav` lays out with.
+        let second = Pos2::new(
+            body.min.x + NAV_PAD_X + 40.0,
+            body.min.y + NAV_PAD_Y + NAV_ITEM_HEIGHT + NAV_ITEM_GAP + NAV_ITEM_HEIGHT / 2.0,
+        );
+        let _ = frame(&ctx, &mut state, &[], true);
+        let _ = frame(&ctx, &mut state, &[], true);
+        assert_eq!(state.section, Section::General);
+        let _ = frame(&ctx, &mut state, &click(second), true);
+        assert_eq!(
+            state.section,
+            Section::ALL[1],
+            "the nav row under the modal's own card did not take the click"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // One form, two shells
+    // -----------------------------------------------------------------------
+
+    /// **The duplication guard.** Two places draw the preferences *shell*
+    /// (`run`'s window and `draw_prefs_modal`'s card) and exactly one draws
+    /// the form. A second copy of the body is how this project's recurring
+    /// defects start: a control fixed in one and left broken in the other.
+    #[test]
+    fn exactly_one_place_in_this_program_draws_the_settings_form() {
+        let source = include_str!("prefs_ui.rs");
+        let body_calls = concat!("draw_prefs_", "body(");
+        // The definition, `run`'s call, the modal's call, and `tests`' harness.
+        assert_eq!(
+            source.match_indices(body_calls).count(),
+            4,
+            "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
+             was added, confirm it is a shell and not a second form"
+        );
+        for forbidden in [concat!("fn draw_", "section("), concat!("fn draw_", "nav(")] {
+            assert_eq!(
+                source.match_indices(forbidden).count(),
+                1,
+                "{forbidden:?} is defined more than once"
+            );
+        }
     }
 }

@@ -3055,8 +3055,15 @@ fn open_vault_window(
     // earliest moment at which it is meaningful. What DOES have to happen
     // here is writing the new value into `*settings`, because that binding
     // -- not the file -- is what that reconciliation reads.
-    if result.open_preferences {
-        let edited = prefs_ui::run(settings.clone());
+    //
+    // **No `continue`, and no window opened here any more.** The gear used to
+    // close this window so `prefs_ui::run` could have the thread's event loop;
+    // the form is now drawn as a modal over the vault window itself, so what
+    // comes back is the answer rather than the request. It therefore arrives
+    // alongside whatever actually ended the session -- an ordinary close, a
+    // lock, a switch -- and is applied first, before any of those branches,
+    // rather than instead of them.
+    if let Some(edited) = result.edited_settings.clone() {
         if edited != *settings {
             *settings = edited;
             // `persist_preferences`, never a whole-struct `save`. This
