@@ -13,7 +13,6 @@ pub mod sidebar;
 
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
 use crate::fill_stats::FillStats;
-use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::login_ui::{
     draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics, CloseControl,
 };
@@ -320,10 +319,9 @@ struct FaviconResult {
 /// Mirrors `login_ui::run_login_flow`'s `Rc<RefCell<_>>` result handoff -- the
 /// update closure is `FnMut + 'static` and can't return anything directly.
 #[allow(clippy::too_many_arguments)]
-pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+pub fn build_frame(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
-    injector: &Injector<A, B>,
     // The account email (the toolbar avatar's initials) and the server URL
     // (the host a favicon is fetched from), either in hand or on their way --
     // see [`AccountDetails`]. Passed in from `main.rs`'s single
@@ -377,16 +375,13 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
     accounts: Option<crate::accounts::AccountsState>,
     pre_styled: bool,
 ) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
-    // `eframe::run_ui_native`'s update closure must be `'static` (it's handed
-    // to a real winit event loop, not run on a borrowed stack), but `injector`
-    // arrives here as a plain `&Injector<A, B>` borrowed from the caller's
-    // stack (see `main.rs`, which keeps its own `injector` alive across the
-    // whole run loop and can only lend a reference into this call). Cloning
-    // once, up front, turns it into an owned value the `move` closure below
-    // can actually capture; `Injector<A, B>`'s `Clone` impl (added for this)
-    // is trivial for the real fillers (`RealUiAutomation`/`RealSendInput` are
-    // zero-sized), so this is not a meaningful runtime cost.
-    let injector = injector.clone();
+    // **This window no longer takes an `Injector` at all.** It used to clone
+    // one into the `'static` update closure for exactly one consumer: the
+    // row context menu's "Fill in app" entry, the last manual fill trigger,
+    // removed at the user's request. Filling itself is untouched and lives
+    // where it always did -- `app::handle_match`/`fill_from_vault`, driven
+    // by Auto, Prompt and the global hotkey, each of which holds `main.rs`'s
+    // own injector directly and never went through this window.
 
     // **The account details, and the fact that this window never waits for
     // them.** On a hit they are here already and every frame including the
@@ -1871,9 +1866,6 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                             totp_state
                         ),
                     },
-                    item_list::RowCommand::Fill => {
-                        fill_item_into_app(&item, &cache, &injector, &fill_stats);
-                    }
                     item_list::RowCommand::OpenWebsite(url) => webbrowser_open(&url),
                     // Only from Read. A draft already open on this item IS
                     // what "Edit" asks for, so re-seeding it would do nothing
@@ -3056,10 +3048,9 @@ impl VaultFrameHandles {
 /// This is the tray-click host. The startup host is `app_window`, which calls
 /// [`build_frame`] directly -- see that function's doc.
 #[allow(clippy::too_many_arguments)]
-pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+pub fn run(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
-    injector: &Injector<A, B>,
     details: AccountDetails,
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
@@ -3070,7 +3061,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
     let (options, mut frame_fn, handles) = build_frame(
         cache,
         fill_stats,
-        injector,
         details,
         session_token,
         icon_cache_dir,
@@ -3096,107 +3086,6 @@ pub fn run<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone +
 /// session invalidated while this window is open is recovered from instead
 /// of leaving every subsequent write failing silently for the rest of the
 /// session (review Important 2).
-/// "Fill in app" for `item`: resolve its matched process to an open window
-/// and hand the fill to `app::fill_from_vault`.
-///
-/// Shared by the detail pane's Fill button and an item row's context-menu
-/// entry. Extracted rather than copied because both non-fatal outcomes
-/// (nothing matched yet, matched but not running) are only ever reported in
-/// the log, and a second copy of that reporting is a second place for it to
-/// go quietly missing.
-/// Why "Fill in app" did nothing, when it did nothing.
-///
-/// Three refusals rather than two, because the third used to be reported as
-/// the second: a dead binding fell through to "isn't currently open", which
-/// is false and reads as "try again once it is running" about a binding that
-/// will never fire however many apps are running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FillRefusal {
-    /// The item carries no readable `deskwarden:app-match` field.
-    NotBound,
-    /// It carries one that [`detail::app_match_is_dead`] calls dead -- see
-    /// [`fill_target`].
-    BindingIsDead,
-    /// A live binding whose app is not among the open windows.
-    NotOpen,
-}
-
-/// Which open window "Fill in app" should fill `item` into, or why none.
-///
-/// **The whole decision, as a pure function over a window list.**
-/// [`fill_item_into_app`] is untestable -- it enumerates the real desktop and
-/// drives a real injector -- and a decision that only exists inside it is a
-/// decision nothing can pin. That is not a hypothetical here: the check that
-/// a dead binding must not be filled through existed, was correct, was
-/// covered, and was consulted at exactly two sites that render TEXT.
-///
-/// **`find_window_for_process` is still the gate that protects the
-/// credential**, and it refuses a host process itself; this function cannot
-/// be routed around either, because it is the only place `fill_item_into_app`
-/// gets an hwnd from. The dead arm is here so the refusal has a NAME to
-/// report, and so `a_dead_binding_resolves_no_window_to_fill` can assert it
-/// without a desktop.
-fn fill_target<'a>(
-    item: &VaultItem,
-    windows: &'a [crate::window_list::WindowInfo],
-) -> Result<&'a crate::window_list::WindowInfo, FillRefusal> {
-    if detail::item_binding_is_dead(item) {
-        return Err(FillRefusal::BindingIsDead);
-    }
-    let app_match =
-        crate::vault_bridge::extract_app_match(item).ok_or(FillRefusal::NotBound)?;
-    crate::app::find_window_for_process(windows, &app_match.process)
-        .ok_or(FillRefusal::NotOpen)
-}
-
-/// What the log says about each refusal, off the item it is about.
-///
-/// Separate from [`fill_target`] so the decision can be asserted without the
-/// wording and the wording without the decision -- and in one place, because
-/// both of `fill_item_into_app`'s callers reach it and a second copy is a
-/// second place for a sentence to go quietly missing.
-fn fill_refusal_note(item: &VaultItem, why: FillRefusal) -> String {
-    let name = &item.name;
-    match why {
-        FillRefusal::NotBound => {
-            format!("\"Fill in app\" for {name}: no app is matched to this item yet")
-        }
-        FillRefusal::BindingIsDead => format!(
-            "\"Fill in app\" for {name}: the app match on this item names the process that \
-             owns the window for every Microsoft Store app, and recorded no window title to \
-             tell those apps apart, so Deskwarden ignores it -- there is no one app to fill. \
-             Use \u{201c}Add app\u{2026}\u{201d} in the tray menu to pick the app again, or \
-             Remove on the item's MATCHED APP card to clear it"
-        ),
-        FillRefusal::NotOpen => {
-            let process = crate::vault_bridge::extract_app_match(item)
-                .map(|m| m.process)
-                .unwrap_or_default();
-            format!("\"Fill in app\" for {name}: {process} isn't currently open")
-        }
-    }
-}
-
-fn fill_item_into_app<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
-    item: &VaultItem,
-    cache: &VaultCache,
-    injector: &Injector<A, B>,
-    fill_stats: &FillStats,
-) {
-    // Enumerated once, whatever the outcome: `fill_target` owns the decision
-    // and this function owns the two effects it can have.
-    let windows = crate::window_list::list_windows(std::process::id());
-    match fill_target(item, &windows) {
-        // fill_from_vault does its own credential lookup (from the cache, not
-        // `bw serve` -- see its doc comment) and the fill in one call --
-        // nothing else here needs to touch `injector` directly.
-        Ok(target) => {
-            crate::app::fill_from_vault(cache, injector, fill_stats, &item.id, target.hwnd)
-        }
-        Err(why) => log::info!("{}", fill_refusal_note(item, why)),
-    }
-}
-
 /// Move `item` to the trash and drop it out of this window's copy of the
 /// vault, returning the inline-band sentence to show (`None` on success).
 ///
@@ -4075,9 +3964,11 @@ fn draw_read_arm(
     // been an unlabelled keystroke that types the user's credentials into a
     // window, which is the reported complaint ("I'm not sure what it does")
     // with even the label taken away. Nothing was reworded to keep it
-    // discoverable, because the honest place for a manual fill is the row
-    // context menu's worded "Fill in app" -- which is untouched, as are the
-    // Auto, Prompt and global-hotkey triggers.
+    // discoverable. The row context menu's worded "Fill in app" outlived it
+    // by one commit and is gone too, on the same request -- so there is now
+    // NO manual fill trigger at all, and a fill happens the way the app's
+    // core function always meant it to: Auto, Prompt and the global hotkey,
+    // all untouched.
     action
 }
 
@@ -10353,151 +10244,6 @@ mod entered_no_code_reported_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
-mod fill_target_tests {
-    //! The whole of "Fill in app"'s decision, over a window list a test
-    //! writes -- no desktop, no process, no injector.
-
-    use super::{fill_refusal_note, fill_target, FillRefusal};
-    use crate::app_match::{AppMatch, TriggerMode};
-    use crate::vault_bridge::VaultItem;
-    use crate::window_list::WindowInfo;
-
-    const HOST: &str = "ApplicationFrameHost.exe";
-
-    fn login(id: &str) -> VaultItem {
-        serde_json::from_str(&format!(
-            r#"{{"id":"{id}","name":"Ledgerline","fields":[],"type":1,               "login":{{"username":"a.novak","password":"hunter2"}}}}"#
-        ))
-        .unwrap()
-    }
-
-    fn bound(process: &str, hosted: bool, title: &str) -> VaultItem {
-        crate::vault_bridge::with_app_match(
-            &login("id-1"),
-            &AppMatch {
-                process: process.to_string(),
-                title: title.to_string(),
-                hosted,
-                path: String::new(),
-                args: String::new(),
-                sequence: String::new(),
-                trigger: TriggerMode::Auto,
-            },
-        )
-    }
-
-    fn window(hwnd: isize, exe_name: &str, title: &str) -> WindowInfo {
-        WindowInfo {
-            hwnd,
-            pid: 12472,
-            exe_path: format!(r"C:\\Windows\\{exe_name}"),
-            exe_name: exe_name.to_string(),
-            title: title.to_string(),
-            hosted: false,
-        }
-    }
-
-    /// **The reviewer's exhibit, as an assertion.** Two Microsoft Store apps
-    /// are open, so the unattributable host frame is in the window list; the
-    /// item is bound to that host frame. Before the fix `find_window_for_
-    /// process` handed back the FIRST of them and `fill_from_vault` typed the
-    /// user's user name and password into whichever Store app happened to own
-    /// it -- in the same frame in which the MATCHED APP card was saying
-    /// Deskwarden ignores that binding.
-    #[test]
-    fn a_dead_binding_resolves_no_window_to_fill_however_many_store_apps_are_open() {
-        let windows = [
-            window(7, HOST, "Some Other Store App"),
-            window(8, HOST, "Speedtest"),
-        ];
-        let item = bound(HOST, false, "");
-        // The premise: a plain name compare really would have found one.
-        assert!(
-            windows.iter().any(|w| w.exe_name.eq_ignore_ascii_case(HOST)),
-            "the fixture holds no host frame, so nothing here is being refused"
-        );
-        assert_eq!(
-            fill_target(&item, &windows).map(|w| w.hwnd),
-            Err(FillRefusal::BindingIsDead),
-            "the fill resolved a window for a binding the pane says never fires"
-        );
-        // And it is reported as what it is, not as "isn't currently open" --
-        // which would tell the user to launch something that is running.
-        let note = fill_refusal_note(&item, FillRefusal::BindingIsDead);
-        assert!(note.contains("ignores it"), "{note}");
-        assert!(!note.contains("currently open"), "{note}");
-    }
-
-    /// The positive control on the test above: the same two open windows, and
-    /// a binding to a real executable that is among them, still fills.
-    /// Without this a `fill_target` that had simply stopped resolving
-    /// anything would pass.
-    #[test]
-    fn a_live_binding_still_resolves_the_window_it_names() {
-        let windows = [
-            window(7, HOST, "Some Other Store App"),
-            window(11, "Ledgerline.exe", "Ledgerline -- Invoices"),
-        ];
-        assert_eq!(
-            fill_target(&bound("Ledgerline.exe", false, ""), &windows).map(|w| w.hwnd),
-            Ok(11)
-        );
-        // Case-insensitively, the way every exe-name compare in this crate is.
-        assert_eq!(
-            fill_target(&bound("ledgerline.EXE", false, ""), &windows).map(|w| w.hwnd),
-            Ok(11)
-        );
-    }
-
-    /// The other two refusals, so the three are told apart and the messages
-    /// cannot collapse into one.
-    #[test]
-    fn an_unbound_item_and_a_closed_app_are_refused_as_themselves() {
-        let windows = [window(11, "Ledgerline.exe", "Ledgerline")];
-        let unbound = login("id-2");
-        assert_eq!(
-            fill_target(&unbound, &windows).map(|w| w.hwnd),
-            Err(FillRefusal::NotBound)
-        );
-        let elsewhere = bound("Mabl.exe", false, "");
-        assert_eq!(
-            fill_target(&elsewhere, &windows).map(|w| w.hwnd),
-            Err(FillRefusal::NotOpen)
-        );
-
-        let notes = [
-            fill_refusal_note(&unbound, FillRefusal::NotBound),
-            fill_refusal_note(&elsewhere, FillRefusal::NotOpen),
-            fill_refusal_note(&bound(HOST, false, ""), FillRefusal::BindingIsDead),
-        ];
-        for (i, a) in notes.iter().enumerate() {
-            for b in &notes[i + 1..] {
-                assert_ne!(a, b, "two refusals report the same sentence");
-            }
-        }
-        // The closed-app note names the app, which is the whole reason that
-        // arm reads the match again.
-        assert!(notes[1].contains("Mabl.exe"), "{}", notes[1]);
-    }
-
-    /// A hosted match the picker really can save -- an attributed Store app,
-    /// listed under its OWN executable name -- is not dead and still fills.
-    /// The refusal is about the HOST's name, not about Store apps, and a fix
-    /// that had refused every `hosted` match would fail here.
-    #[test]
-    fn an_attributed_store_app_is_not_collateral_damage() {
-        let windows = [window(21, "Ledgerline.exe", "Ledgerline")];
-        let item = bound("Ledgerline.exe", true, "Ledgerline");
-        assert!(
-            !crate::vault_window::detail::item_binding_is_dead(&item),
-            "the premise: a match with a real exe name is not dead"
-        );
-        assert_eq!(fill_target(&item, &windows).map(|w| w.hwnd), Ok(21));
-    }
-}
-
-#[cfg(test)]
 mod draw_read_arm_tests {
     //! The wiring tests for the detail pane's Read arm.
     //!
@@ -12596,7 +12342,7 @@ mod frame_host_tests {
     fn run_body() -> &'static str {
         let production = production();
         let at = production
-            .find(concat!("pub fn run<A: UiAutomationFiller", " + Clone + 'static,"))
+            .find(concat!("pub fn ", "run("))
             .expect(
                 "no `pub fn run` in this file -- the tray-click host was renamed or deleted; \
                  if renamed, update this needle",
@@ -12645,10 +12391,10 @@ mod frame_host_tests {
     fn the_shared_frame_is_built_without_opening_a_window() {
         let production = production();
         let build_at = production
-            .find(concat!("pub fn build_", "frame<A: UiAutomationFiller"))
+            .find(concat!("pub fn build_", "frame("))
             .expect("no `build_frame` in this file");
         let run_at = production
-            .find(concat!("pub fn run<A: UiAutomationFiller", " + Clone + 'static,"))
+            .find(concat!("pub fn ", "run("))
             .expect("no `run` in this file");
         assert!(
             build_at < run_at,

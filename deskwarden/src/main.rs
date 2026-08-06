@@ -609,7 +609,6 @@ fn main() {
 
     let cache_for_vault = cache.clone();
     let fill_stats_for_vault = fill_stats.clone();
-    let injector_for_vault = injector.clone();
     let icon_cache_dir_for_vault = icon_cache_dir.clone();
     let auto_lock_for_vault = settings.auto_lock();
     let accounts_for_vault = accounts_state.clone();
@@ -644,7 +643,6 @@ fn main() {
             let (_options, frame, handles) = vault_window::build_frame(
                 cache_for_vault.clone(),
                 fill_stats_for_vault,
-                &injector_for_vault,
                 // `Ready`, not a fetch of its own: `StartupWork::produce`
                 // already asked `bw status` on the worker thread, beside the
                 // spinner this window was showing at the time. That is the
@@ -1010,7 +1008,6 @@ fn main() {
         open_vault_window(
             &cache,
             &fill_stats,
-            &injector,
             &mut session_token,
             &mut bw_serve_child,
             &job,
@@ -1074,7 +1071,6 @@ fn main() {
                 open_vault_window(
                     &cache,
                     &fill_stats,
-                    &injector,
                     &mut session_token,
                     &mut bw_serve_child,
                     &job,
@@ -1629,7 +1625,6 @@ fn main() {
             open_vault_window(
                 &cache,
                 &fill_stats,
-                &injector,
                 &mut session_token,
                 &mut bw_serve_child,
                 &job,
@@ -2807,10 +2802,9 @@ fn drain_requests_queued_behind_a_window(pending: &mut VecDeque<MenuEvent>, sati
 /// reported back through `backend_op_tx`/`backend_op_rx` and applied by
 /// `main`'s own loop, same non-blocking shape as the update-download flow.
 #[allow(clippy::too_many_arguments)]
-fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller + Clone + 'static>(
+fn open_vault_window(
     cache: &Arc<VaultCache>,
     fill_stats: &deskwarden::fill_stats::FillStats,
-    injector: &Injector<A, B>,
     session_token: &mut String,
     bw_serve_child: &mut Option<Child>,
     job: &Arc<Option<job_object::KillOnCloseJob>>,
@@ -2981,7 +2975,6 @@ fn open_vault_window<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller
         vault_window::run(
             cache.clone(),
             fill_stats.clone(),
-            injector,
             details,
             session_token.clone(),
             icon_cache_dir.to_path_buf(),
@@ -7007,7 +7000,7 @@ mod tests {
         fn open_vault_window_body() -> &'static str {
             let production = production_half_of_this_file();
             let at = production
-                .find(concat!("fn open_vault_", "window<A: UiAutomationFiller"))
+                .find(concat!("fn open_vault_", "window("))
                 .expect("no `open_vault_window` in this file -- the vault window's one door");
             let after = &production[at..];
             let open = after.find('{').expect("`open_vault_window` has no body to slice");
@@ -8116,6 +8109,17 @@ mod tests {
             while let Some(offset) = production[from..].find(call) {
                 let at = from + offset;
                 from = at + call.len();
+                // The DECLARATION now matches this needle too:
+                // dropping the vault window's unused `Injector`
+                // parameter took `open_vault_window`'s `<A, B>`
+                // generics with it, so its `(` follows the name
+                // directly, exactly as a call's does. Skipped
+                // rather than respelled: a needle that matched only
+                // calls would have to encode the argument list, and
+                // would go quietly vacuous the next time one changed.
+                if production[..at].ends_with("fn ") {
+                    continue;
+                }
                 sites += 1;
                 let rest = &production[from..];
                 let end = rest.find(end_of_statement).unwrap_or_else(|| {
@@ -11760,6 +11764,17 @@ mod tests {
             while let Some(offset) = production[from..].find(call) {
                 let at = from + offset;
                 from = at + call.len();
+                // The DECLARATION now matches this needle too:
+                // dropping the vault window's unused `Injector`
+                // parameter took `open_vault_window`'s `<A, B>`
+                // generics with it, so its `(` follows the name
+                // directly, exactly as a call's does. Skipped
+                // rather than respelled: a needle that matched only
+                // calls would have to encode the argument list, and
+                // would go quietly vacuous the next time one changed.
+                if production[..at].ends_with("fn ") {
+                    continue;
+                }
                 sites += 1;
                 let rest = &production[from..];
                 let end = rest.find(end_of_statement).unwrap_or_else(|| {

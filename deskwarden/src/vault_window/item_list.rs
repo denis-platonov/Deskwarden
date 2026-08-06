@@ -57,7 +57,6 @@ pub enum RowCommand {
     CopyUsername,
     CopyPassword,
     CopyTotp,
-    Fill,
     /// Carries the URL, resolved from the item when the menu is built by the
     /// same rule the detail pane's AUTOFILL TARGETS card uses.
     OpenWebsite(String),
@@ -243,14 +242,15 @@ pub fn menu_entries(
         entries.push(enabled_command("Copy TOTP", RowCommand::CopyTotp));
     }
     // Login-only, through the existing predicate rather than an inline
-    // `item_type == Some(1)`: the fill path resolves exactly a username and
-    // a password, so every other kind would type two empty strings into
-    // whatever window is focused.
+    // `item_type == Some(1)`: a website is a login's property, and no other
+    // kind carries the `uris` this reads.
+    //
+    // **This block used to open with a worded "Fill in app" entry, and it is
+    // gone at the user's request** ("I'm not sure what it does") -- the same
+    // request that took the detail pane's Fill button and its CTRL+SHIFT+F
+    // chord out at 7da1bba. It was the last MANUAL fill trigger; Auto,
+    // Prompt and the global hotkey are untouched and are how a fill happens.
     if kind_offers_fill(kind) {
-        // Offered even when no app is matched to this item yet, matching the
-        // detail pane's own Fill button exactly -- `vault_window::mod` logs
-        // that case rather than treating it as an error.
-        entries.push(enabled_command("Fill in app", RowCommand::Fill));
         // The same URL the pane's AUTOFILL TARGETS card opens: the first
         // URI, when there is one.
         if let Some(url) =
@@ -1437,7 +1437,7 @@ mod menu_entry_tests {
     //! Every assertion here reads the WHOLE entry list, not "does entry X
     //! appear". A test that only probes for the entries it expects passes
     //! just as happily against a menu that also offers three things it must
-    //! not -- "Fill in app" on a card, say -- and this file's history is
+    //! not -- "Copy password" on a card, say -- and this file's history is
     //! full of tests that agreed with a broken predicate rather than
     //! checking it.
     use super::*;
@@ -1525,7 +1525,6 @@ mod menu_entry_tests {
                 "Copy username",
                 "Copy password",
                 "Copy TOTP",
-                "Fill in app",
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
@@ -1599,11 +1598,11 @@ mod menu_entry_tests {
     }
 
     #[test]
-    fn a_card_offers_neither_fill_nor_open_website_and_cannot_be_edited() {
-        // Both are login-only (`detail::kind_offers_fill`), and the edit
-        // form is still login-shaped (`detail::kind_offers_edit`) -- but
-        // those two are expressed differently on purpose: filling is ABSENT,
-        // editing is PRESENT AND GREYED.
+    fn a_card_offers_no_open_website_and_cannot_be_edited() {
+        // "Open website" is login-only (`detail::kind_offers_fill`), and the
+        // edit form is still login-shaped (`detail::kind_offers_edit`) --
+        // but those two are expressed differently on purpose: the website
+        // entry is ABSENT, editing is PRESENT AND GREYED.
         let entries = menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault);
         assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
         assert_eq!(enabled_labels(&entries), vec![MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
@@ -1630,6 +1629,52 @@ mod menu_entry_tests {
             .expect("no Edit entry");
         assert!(!edit.enabled);
         assert_eq!(edit.disabled_reason, Some(EDIT_DISABLED_REASON));
+    }
+
+    /// **The login-only gate on "Open website", asked of an item that is
+    /// NOT a login but carries a login blob anyway.**
+    ///
+    /// Until the row menu's "Fill in app" entry was removed at the user's
+    /// request, `kind_offers_fill` was pinned by the card tests above: it
+    /// guarded an entry that was pushed UNCONDITIONALLY inside its block,
+    /// so deleting the gate put "Fill in app" on a card and they failed.
+    /// With that entry gone the block holds only "Open website", which
+    /// reads `login.uris` and is therefore absent on an ordinary card by
+    /// accident of the item having no `login` at all -- and deleting the
+    /// gate outright then broke nothing. That is a gate nothing tests.
+    ///
+    /// `VaultItem`'s deserialisation is lenient (`other` swallows what it
+    /// does not name, and `login` is a plain `Option` no `type` agrees
+    /// with), so "a card carrying a login blob" is a shape the CLI can
+    /// hand us, not a hypothetical. This is the case that tells the two
+    /// apart, and it fails against `if true {`.
+    #[test]
+    fn a_non_login_carrying_a_login_blob_still_offers_no_open_website() {
+        let card_with_a_login = VaultItem {
+            login: full_login().login,
+            ..of_kind(Some(3))
+        };
+        // The premise: the blob really does hold the URI the entry reads,
+        // so its absence below is the KIND being refused and not an empty
+        // field.
+        assert_eq!(
+            card_with_a_login
+                .login
+                .as_ref()
+                .and_then(|l| l.uris.first())
+                .and_then(|u| u.uri.as_deref()),
+            Some("https://ledgerline.com"),
+            "the fixture carries no URI, so nothing here is being refused"
+        );
+        // And the positive control on the predicate itself: the SAME blob
+        // on a login-typed item does offer the entry.
+        assert!(labels(&menu_entries(&full_login(), &[], false, FilterSource::LiveVault))
+            .contains(&"Open website".to_string()));
+        assert_eq!(
+            labels(&menu_entries(&card_with_a_login, &[], false, FilterSource::LiveVault)),
+            vec!["Copy username", "Copy password", "Copy TOTP", "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
+            "a card carrying a login blob was offered a login-only entry"
+        );
     }
 
     #[test]
@@ -1668,7 +1713,6 @@ mod menu_entry_tests {
             vec![
                 "Copy username",
                 "Copy password",
-                "Fill in app",
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
@@ -1695,7 +1739,7 @@ mod menu_entry_tests {
         };
         assert_eq!(
             labels(&menu_entries(&empty, &[], false, FilterSource::LiveVault)),
-            vec!["Fill in app", "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
@@ -3284,7 +3328,7 @@ mod row_tile_tests {
     /// Every label the row menu can paint. The painted assertions below
     /// intersect what was drawn with this vocabulary, so they are ABSOLUTE
     /// ("exactly these entries") rather than "the ones I looked for" -- a
-    /// menu that also offered "Fill in app" on a card would fail them.
+    /// menu that also offered "Copy password" on a card would fail them.
     /// Every label a row menu can paint, live or out-of-vault.
     ///
     /// **This is an assertion input, not a message helper**: `menu_labels`
@@ -3297,11 +3341,10 @@ mod row_tile_tests {
     /// out-of-vault labels is what lets those same tests state that a LIVE
     /// row offers no Restore or Unarchive, rather than being unable to see
     /// one if it did.
-    const MENU_VOCABULARY: [&str; 14] = [
+    const MENU_VOCABULARY: [&str; 13] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
-        "Fill in app",
         "Open website",
         "Edit",
         MOVE_TO_FOLDER_LABEL,
@@ -3524,7 +3567,6 @@ mod row_tile_tests {
                 "Copy username",
                 "Copy password",
                 "Copy TOTP",
-                "Fill in app",
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
@@ -3535,7 +3577,7 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn a_right_click_on_a_card_paints_neither_fill_nor_open_website() {
+    fn a_right_click_on_a_card_paints_no_open_website() {
         // The painted half of `menu_entry_tests`' per-kind assertions: the
         // decision being right is worth nothing if the popup draws a fixed
         // list regardless.
@@ -3555,7 +3597,6 @@ mod row_tile_tests {
             vec![
                 "Copy username",
                 "Copy password",
-                "Fill in app",
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
@@ -3788,7 +3829,6 @@ mod row_tile_tests {
                 "Copy username",
                 "Copy password",
                 "Copy TOTP",
-                "Fill in app",
                 "Open website",
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
@@ -3985,11 +4025,10 @@ mod row_tile_tests {
     /// are written against this list rather than against a couple of
     /// hand-picked labels, so an entry added to the live menu later cannot
     /// quietly start appearing on a trashed item too.
-    const LIVE_ONLY_ENTRIES: [&str; 9] = [
+    const LIVE_ONLY_ENTRIES: [&str; 8] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
-        "Fill in app",
         "Open website",
         "Edit",
         MOVE_TO_FOLDER_LABEL,
