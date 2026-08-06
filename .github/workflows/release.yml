@@ -16,6 +16,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Re-run a release without deleting and re-pushing a public tag. Run it
+  # against the tag ref (`gh workflow run Release --ref vX.Y.Z`): every step
+  # below reads `github.ref_name`, which is the tag name for a tag ref
+  # whichever event started the run, so a dispatched run and a pushed one
+  # produce byte-identical output.
+  #
+  # Added because v0.5.0's tag push produced no run at all -- Actions
+  # enabled, workflow active, tag on the remote matching "v*.*.*", and no
+  # queued job. With no dispatch trigger the only remedies were retagging or
+  # publishing by hand, both worse than a button.
+  workflow_dispatch:
 
 permissions:
   contents: write
