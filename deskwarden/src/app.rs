@@ -169,22 +169,37 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                         );
                         return;
                     }
-                    match injector.fill(hwnd, &username, &password) {
-                        Ok(()) => fill_stats.record_fill(item_id),
+                    // `Injector::fill` is synchronous and already knows its
+                    // own outcome, so this path's semantics are exactly what
+                    // they always were. It is routed through the same sink so
+                    // that "what counts as a fill" is answered in one place
+                    // for both paths rather than by which arm a call sits in.
+                    let outcome = match injector.fill(hwnd, &username, &password) {
+                        Ok(()) => crate::fill_stats::FillOutcome::Typed,
                         Err(e) => {
-                            log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}")
+                            log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
+                            crate::fill_stats::FillOutcome::NotTyped
                         }
-                    }
+                    };
+                    fill_outcome_sink(fill_stats, item_id)(outcome);
                 }
-                Ok(FillAction::Sequence(plan)) => match injector.fill_sequence(hwnd, plan) {
-                    Ok(()) => fill_stats.record_fill(item_id),
-                    Err(e) => {
+                Ok(FillAction::Sequence(plan)) => {
+                    // **No `record_fill` on the `Ok` arm.** `fill_sequence`
+                    // returns as soon as the typing thread has been *started*,
+                    // so `Ok(())` cannot tell a sequence that typed a password
+                    // from one that refused before the first keystroke or was
+                    // abandoned when the user alt-tabbed -- and counting the
+                    // latter two floats an item that never filled to the top
+                    // of the picker. The sink is what records, from the thread
+                    // that knows.
+                    let sink = fill_outcome_sink(fill_stats, item_id);
+                    if let Err(e) = injector.fill_sequence(hwnd, plan, sink) {
                         log::error!(
                             "auto-type sequence failed for item {item_id} into hwnd {hwnd}: {e}"
                         );
                         REAL_NOTIFIER.refused(&e);
                     }
-                },
+                }
                 Err(refusal) => {
                     // Reaches the **user**, not only the log. A fill that
                     // quietly does nothing is indistinguishable from a hotkey
@@ -198,6 +213,32 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
         }
         Err(e) => log::error!("could not read vault item {item_id} to fill it: {e:?}"),
     }
+}
+
+/// **The wire between a fill's outcome and the count**, built once per fill.
+///
+/// The sequence path performs its typing on another thread, so the answer to
+/// "did that fill?" is not available when dispatch returns. This hands that
+/// thread a closure that owns everything it needs to answer later: `FillStats`
+/// is a `PathBuf` and the item id is copied, so the typing thread holds no
+/// borrow of anything the UI owns, and the UI never waits on it. The decision
+/// itself is [`crate::fill_stats::counts_as_a_fill`], a pure function with its
+/// own tests; this is only the wiring.
+///
+/// A free function rather than a closure written inline at each call site, so
+/// that both fill paths demonstrably share one policy and a test can exercise
+/// the wiring without a window, an injector or a vault.
+pub fn fill_outcome_sink(
+    fill_stats: &crate::fill_stats::FillStats,
+    item_id: &str,
+) -> crate::injector::OutcomeSink {
+    let fill_stats = fill_stats.clone();
+    let item_id = item_id.to_string();
+    Box::new(move |outcome| {
+        if crate::fill_stats::counts_as_a_fill(outcome) {
+            fill_stats.record_fill(&item_id);
+        }
+    })
 }
 
 /// The production notifier, named here for the same reason `REAL_OVERLAY` is:
@@ -1263,12 +1304,22 @@ mod fill_dispatch_tests {
 
     /// Records instead of typing. **There is no path from this test module to
     /// `SendInput`** -- the same discipline as `main.rs`'s `NeverTypes`.
+    ///
+    /// `reports` is what its "typing" claims to have done. The real filler
+    /// says this from its typing thread once the plan has run or stopped;
+    /// here it is said synchronously, so an assertion can follow the call.
+    /// `default_result` is what the non-sequence path returns, so the two
+    /// paths' counting can be tested apart.
     #[derive(Clone)]
-    struct RecordingFiller(Arc<Recorder>);
+    struct RecordingFiller {
+        rec: Arc<Recorder>,
+        reports: crate::fill_stats::FillOutcome,
+        default_result: Result<(), String>,
+    }
     impl SendInputFiller for RecordingFiller {
         fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {
-            self.0.default_fills.lock().unwrap().push((hwnd, user.into(), pass.into()));
-            Ok(())
+            self.rec.default_fills.lock().unwrap().push((hwnd, user.into(), pass.into()));
+            self.default_result.clone()
         }
         fn fill_sequence(
             &self,
@@ -1276,10 +1327,13 @@ mod fill_dispatch_tests {
             plan: Plan,
             guard: crate::injector::SequenceGuard,
         ) -> Result<(), String> {
+            let mut guard = guard;
+            guard.report(self.reports);
             // Released here, synchronously, rather than moved onto a thread:
-            // these tests want the next fill to be allowed to start.
+            // these tests want the next fill to be allowed to start, and they
+            // want the outcome to have reached the sink before they assert.
             drop(guard);
-            self.0.sequences.lock().unwrap().push((hwnd, plan.steps().to_vec()));
+            self.rec.sequences.lock().unwrap().push((hwnd, plan.steps().to_vec()));
             Ok(())
         }
     }
@@ -1305,13 +1359,38 @@ mod fill_dispatch_tests {
         cache
     }
 
+    /// A `FillStats` on a path unique to this call, **with its parent
+    /// directory created**.
+    ///
+    /// Both halves matter. `FillStats::new` reads whatever is already at the
+    /// path, so a fixed name would let one test's recorded fill be counted by
+    /// the next test to run. And `FillStats::save` writes the file but does
+    /// *not* create its parent, and swallows the error by design -- so
+    /// without the `create_dir_all` the count silently stays 0 and every
+    /// assertion about it passes for entirely the wrong reason, the negative
+    /// controls most of all. Every negative control below is paired with a
+    /// positive one on the same helper for exactly that reason.
+    fn scratch_stats(label: &str) -> crate::fill_stats::FillStats {
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-fill-dispatch-{label}-{}-{:?}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).expect("the stats directory is creatable");
+        crate::fill_stats::FillStats::new(dir.join("stats.json"))
+    }
+
     /// Runs one fill and hands back **both** things it can be judged by: what
     /// the filler was asked to type, and the `FillStats` it was given.
     ///
-    /// The stats live on a path unique to this call -- `FillStats::new` reads
-    /// whatever is already at the path, so a fixed name would let one test's
-    /// recorded fill be counted by the next test to run on the same thread.
-    fn fill_recording_stats(item: VaultItem) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
+    /// `reports` is what the filler's "typing" will claim to have done, and
+    /// `default_result` is what the non-sequence path will return.
+    fn fill_reporting(
+        item: VaultItem,
+        reports: crate::fill_stats::FillOutcome,
+        default_result: Result<(), String>,
+    ) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
         // `fill_from_vault` reaches `Injector::fill_sequence`, which contends
         // for a process-global "already typing" flag. See
         // `injector::sequence_test_lock`.
@@ -1319,40 +1398,100 @@ mod fill_dispatch_tests {
 
         let _ = sequence::take_notices();
         let rec = Arc::new(Recorder::default());
-        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-fill-dispatch-{}-{:?}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-        ));
-        // `FillStats::save` writes the file but does not create its parent,
-        // and swallows the error by design. Without this the count silently
-        // stayed 0 and every assertion about it would have passed for the
-        // wrong reason -- including the negative controls.
-        std::fs::create_dir_all(&dir).expect("the stats directory is creatable");
-        let stats = crate::fill_stats::FillStats::new(dir.join("stats.json"));
+        let injector = Injector {
+            ui: NoUiAutomation,
+            fallback: RecordingFiller { rec: rec.clone(), reports, default_result },
+        };
+        let stats = scratch_stats("dispatch");
         fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
         (rec, stats)
+    }
+
+    fn fill_recording_stats(item: VaultItem) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
+        fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()))
+    }
+
+    /// A filler whose typing succeeds and says so -- for the tests that are
+    /// about which path a fill took rather than about what it counted.
+    fn recording_filler(rec: &Arc<Recorder>) -> RecordingFiller {
+        RecordingFiller {
+            rec: rec.clone(),
+            reports: crate::fill_stats::FillOutcome::Typed,
+            default_result: Ok(()),
+        }
     }
 
     fn fill(item: VaultItem) -> Arc<Recorder> {
         fill_recording_stats(item).0
     }
 
-    /// **A sequence fill counts as a fill.**
+    // -- the sink: outcome in, count out ------------------------------------
+
+    /// **The wiring between the pure decision and the file.**
+    ///
+    /// The positive case runs first and on the *same helper*, so the two
+    /// negatives below cannot be passing because the harness records nothing
+    /// at all -- the failure mode a missing parent directory produces, and the
+    /// one that made an earlier "nothing was recorded" assertion meaningless.
+    #[test]
+    fn the_outcome_sink_records_only_an_outcome_that_counts() {
+        use crate::fill_stats::FillOutcome;
+
+        let typed = scratch_stats("sink-typed");
+        fill_outcome_sink(&typed, "item-1")(FillOutcome::Typed);
+        assert_eq!(typed.count("item-1"), 1, "the harness cannot record at all");
+
+        let partial = scratch_stats("sink-partial");
+        fill_outcome_sink(&partial, "item-1")(FillOutcome::Partial);
+        assert_eq!(partial.count("item-1"), 0, "a half-typed sequence was counted as a fill");
+
+        let untyped = scratch_stats("sink-untyped");
+        fill_outcome_sink(&untyped, "item-1")(FillOutcome::NotTyped);
+        assert_eq!(untyped.count("item-1"), 0, "a fill that typed nothing was counted");
+    }
+
+    /// **The sink credits the item it was handed**, and only that one.
+    ///
+    /// The id here is deliberately not the one every other fixture in this
+    /// module uses, so a call site that passed the wrong string -- the item's
+    /// *name*, a hard-coded id, an empty one -- fails here rather than
+    /// blending in.
+    #[test]
+    fn the_outcome_sink_credits_the_item_it_was_given() {
+        let stats = scratch_stats("sink-id");
+        fill_outcome_sink(&stats, "item-7")(crate::fill_stats::FillOutcome::Typed);
+
+        assert_eq!(stats.count("item-7"), 1, "the item the sink was built for was not credited");
+        assert_eq!(stats.count("item-1"), 0, "some other item was credited instead");
+    }
+
+    /// The sink owns its inputs outright, so the typing thread that runs it
+    /// borrows nothing the UI owns. If this ever stops compiling, the sink has
+    /// grown a lifetime and the typing thread has grown a way to outlive what
+    /// it points at.
+    #[test]
+    fn the_outcome_sink_can_be_moved_onto_another_thread() {
+        let stats = scratch_stats("sink-thread");
+        let sink = fill_outcome_sink(&stats, "item-1");
+        std::thread::spawn(move || sink(crate::fill_stats::FillOutcome::Typed))
+            .join()
+            .expect("the reporting thread finished");
+
+        assert_eq!(stats.count("item-1"), 1);
+    }
+
+    /// **A sequence that typed counts as a fill.**
     ///
     /// `record_fill` is what the picker orders its suggestions by, so an item
     /// filled only ever through the sequence path would stay at the bottom of
-    /// the list forever. Deleting `fill_stats.record_fill(item_id)` from the
-    /// `Ok(())` arm of the sequence branch left the whole suite green.
+    /// the list forever. Passing `Box::new(|_| {})` to `fill_sequence` instead
+    /// of `fill_outcome_sink(fill_stats, item_id)` fails here.
     ///
-    /// The **optimism** of that arm is a separate, already-recorded decision
-    /// and is not what this pins: `fill_sequence` returns as soon as the
-    /// typing thread is started, so `Ok(())` means "began", not "typed", and
-    /// this test asserts only that beginning is counted.
+    /// What "typed" means is the filler's word, reported through the guard --
+    /// which is the whole change. The `Ok(())` this call returns means the
+    /// typing *started*, and nothing counts a fill off it any more.
     #[test]
-    fn a_sequence_fill_is_recorded_against_the_item() {
+    fn a_sequence_that_typed_is_recorded_against_the_item() {
         let (rec, stats) = fill_recording_stats(item_with("{USERNAME}{TAB}{PASSWORD}"));
         assert_eq!(
             rec.sequences.lock().unwrap().len(),
@@ -1364,9 +1503,45 @@ mod fill_dispatch_tests {
         assert_eq!(stats.count("item-2"), 0, "an unrelated item was credited");
     }
 
-    /// The negative control the test above needs: a refused sequence must
-    /// **not** be recorded, so `record_fill` is tied to the `Ok` arm and not
-    /// merely to reaching the sequence branch at all.
+    /// **A sequence abandoned when the user alt-tabbed is not a fill.**
+    ///
+    /// The case the threaded design exists to handle, and the one the old
+    /// `Ok(()) => record_fill(item_id)` arm got wrong: the typing thread
+    /// started, so dispatch returned `Ok(())`, so the item was credited with a
+    /// password it never typed and climbed the picker for it. Everything about
+    /// this run is identical to the test above except the outcome reported.
+    #[test]
+    fn a_sequence_abandoned_part_way_is_not_recorded_as_a_fill() {
+        let (rec, stats) = fill_reporting(
+            item_with("{USERNAME}{TAB}{PASSWORD}"),
+            crate::fill_stats::FillOutcome::Partial,
+            Ok(()),
+        );
+        assert_eq!(
+            rec.sequences.lock().unwrap().len(),
+            1,
+            "this test is not exercising the sequence path"
+        );
+        assert_eq!(stats.count("item-1"), 0, "a half-typed sequence was counted as a fill");
+    }
+
+    /// **A sequence that reached the filler and typed nothing is not a fill.**
+    /// The runner's foreground check refusing on the very first step, or a
+    /// filler that could not restore foreground at all.
+    #[test]
+    fn a_sequence_that_typed_nothing_is_not_recorded_as_a_fill() {
+        let (rec, stats) = fill_reporting(
+            item_with("{USERNAME}{TAB}{PASSWORD}"),
+            crate::fill_stats::FillOutcome::NotTyped,
+            Ok(()),
+        );
+        assert_eq!(rec.sequences.lock().unwrap().len(), 1, "the sequence path was not reached");
+        assert_eq!(stats.count("item-1"), 0, "a sequence that typed nothing was counted");
+    }
+
+    /// The other negative control: a sequence refused at *plan* time never
+    /// reaches the filler at all, so nothing is there to report an outcome and
+    /// nothing may be counted.
     #[test]
     fn a_refused_sequence_is_not_recorded_as_a_fill() {
         // `{PICKCHARS}` is unimplemented, so `fill_action` refuses at plan
@@ -1377,6 +1552,35 @@ mod fill_dispatch_tests {
             "a refused sequence still reached the filler"
         );
         assert_eq!(stats.count("item-1"), 0, "a refused sequence was counted as a fill");
+    }
+
+    /// **The default path's counting is exactly what it was.** `Injector::fill`
+    /// is synchronous and its return value really does mean "typed", so a
+    /// successful default fill is still recorded -- routing it through the
+    /// shared sink must not have quietly changed that.
+    #[test]
+    fn a_default_fill_is_still_recorded_against_the_item() {
+        let (rec, stats) = fill_recording_stats(item_with(""));
+        assert_eq!(
+            rec.default_fills.lock().unwrap().len(),
+            1,
+            "this test is not exercising the default path"
+        );
+        assert_eq!(stats.count("item-1"), 1, "a default fill was not recorded");
+    }
+
+    /// And its negative control, which the default path always had implicitly:
+    /// a fill that returned an error is not a fill. Reporting `Typed`
+    /// regardless -- the shape of the sequence bug, transplanted -- fails here.
+    #[test]
+    fn a_default_fill_that_failed_is_not_recorded_as_a_fill() {
+        let (rec, stats) = fill_reporting(
+            item_with(""),
+            crate::fill_stats::FillOutcome::Typed,
+            Err("target window is not foreground".into()),
+        );
+        assert_eq!(rec.default_fills.lock().unwrap().len(), 1, "the default path was not reached");
+        assert_eq!(stats.count("item-1"), 0, "a failed default fill was counted as a fill");
     }
 
     /// **Delete `injector.fill_sequence(hwnd, plan)` from `fill_from_vault`
@@ -1438,6 +1642,11 @@ mod fill_dispatch_tests {
     /// deliberately allowed to touch the network.
     #[test]
     fn a_sequence_that_uses_a_one_time_code_fetches_it_and_types_it() {
+        // Contends for the same process-global "already typing" flag as the
+        // fills above (see `injector::sequence_test_lock`). Without this the
+        // sequence assertion below fails at random when an unrelated test
+        // happens to be holding a `SequenceGuard`.
+        let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
         let _folders = server
             .mock("GET", "/list/object/folders")
@@ -1458,7 +1667,7 @@ mod fill_dispatch_tests {
             .expect("seeds");
 
         let rec = Arc::new(Recorder::default());
-        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = crate::fill_stats::FillStats::new(
             std::env::temp_dir().join("deskwarden-fill-totp").join("stats.json"),
         );
@@ -1481,6 +1690,11 @@ mod fill_dispatch_tests {
     /// mention `{TOTP}` must not pay for the round trip at all.
     #[test]
     fn a_sequence_without_a_one_time_code_makes_no_totp_request() {
+        // Contends for the same process-global "already typing" flag as the
+        // fills above (see `injector::sequence_test_lock`). Without this the
+        // sequence assertion below fails at random when an unrelated test
+        // happens to be holding a `SequenceGuard`.
+        let _serialised = crate::injector::sequence_test_lock();
         let mut server = mockito::Server::new();
         let _folders = server
             .mock("GET", "/list/object/folders")
@@ -1496,7 +1710,7 @@ mod fill_dispatch_tests {
             .expect("seeds");
 
         let rec = Arc::new(Recorder::default());
-        let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = crate::fill_stats::FillStats::new(
             std::env::temp_dir().join("deskwarden-fill-nototp").join("stats.json"),
         );
