@@ -127,6 +127,43 @@ pub const DEFAULT_RATE: Duration = Duration::from_millis(3);
 /// common case (one password, one burst) costs exactly one extra check.
 pub const MAX_BURST: Duration = Duration::from_millis(250);
 
+/// The floor a `{DELAY=n}` typing rate is clamped to.
+///
+/// **Without it, `{DELAY=0}` switched both bounds off.** It parses cleanly --
+/// `key_sequence::whole_number` rejects *leading* zeros, not a bare zero -- and
+/// at `rate == 0` [`TextRun::chunk_units`] computes `MAX_BURST / 1ns`, i.e.
+/// 250,000,000 units, so a 5000-character password became **one** chunk with no
+/// foreground check anywhere inside it; and [`Step::projected`] returned
+/// `ZERO`, so [`MAX_SEQUENCE`] saw nothing at all. Both defences evaporated on
+/// a sequence a user can write by hand.
+///
+/// # Why a floor here, when a key press is charged nothing
+///
+/// [`MAX_SEQUENCE`]'s doc refuses to charge a key press an invented constant,
+/// and that refusal still stands. The cases are not the same, and the
+/// difference is the whole justification for this constant.
+///
+/// A key press really is one `SendInput` with no sleep in it, and [`run`]
+/// re-verifies foreground before **every single one** -- so charging it zero
+/// costs no safety, only the accuracy of one sentence. A `Step::Text` is the
+/// opposite: it is the one place `run` cannot look inside, so its projection is
+/// the *only* thing standing between the user and an unbounded gap. Charging it
+/// zero costs exactly the guarantee.
+///
+/// One millisecond is a floor, not a measurement, and it is deliberately
+/// wrong in the safe direction for both consumers: over-charging a keystroke
+/// makes [`MAX_BURST`] chunks *smaller* (more foreground checks, never fewer)
+/// and makes [`MAX_SEQUENCE`] refuse *sooner*. A rate of zero is not a rate
+/// anyone can deliver anyway -- `RealKeyboard::type_text` still makes a
+/// `SendInput` call per UTF-16 unit -- so this is a floor under a cost that
+/// provably exists, not a fiction about one that does not.
+///
+/// Clamping rather than refusing, because `{DELAY=0}` is a legible request
+/// ("as fast as you can") and refusing a sequence that parses, for a reason
+/// about our own internal arithmetic, would be a worse answer than honouring
+/// it at the fastest rate we can still bound.
+pub const MIN_RATE: Duration = Duration::from_millis(1);
+
 /// The longest a whole sequence may be projected to spend **typing and
 /// waiting**.
 ///
@@ -622,7 +659,9 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
                 // The rate change applies from here on, so the text typed
                 // *before* it must be flushed at the old rate first.
                 run.flush(&mut steps);
-                run.rate = Duration::from_millis(u64::from(*ms));
+                // Clamped: a rate of zero switches off both MAX_BURST chunking
+                // and the MAX_SEQUENCE bound. See MIN_RATE.
+                run.rate = Duration::from_millis(u64::from(*ms)).max(MIN_RATE);
             }
             Token::Modifier(Modifier::Enter) => {
                 // `~` is KeePass's shorthand for the Enter *key*, not a
@@ -1083,6 +1122,64 @@ mod plan_tests {
         assert!(
             matches!(plan(&parse(&too_long), &values()), Err(Refusal::TooLong(_))),
             "the delay half of the bound stopped working"
+        );
+    }
+
+    /// **`{DELAY=0}` used to switch off both bounds at once.**
+    ///
+    /// It parses cleanly -- `key_sequence::whole_number` rejects *leading*
+    /// zeros, not a bare zero -- and at `rate == 0`, `chunk_units` computed
+    /// `MAX_BURST / 1ns`, i.e. 250,000,000 units. A 5000-character password was
+    /// therefore **one** chunk, typed with no foreground check anywhere inside
+    /// it, while `projected()` returned `ZERO` so `MAX_SEQUENCE` saw nothing to
+    /// bound. The chunking tests covered `{DELAY=50}` and `{DELAY=100000}` and
+    /// never the one value that turned the machinery off.
+    ///
+    /// Both halves are asserted here, because clamping the rate without
+    /// charging the time (or the reverse) would fix one and leave the other.
+    #[test]
+    fn a_zero_typing_rate_is_clamped_rather_than_disabling_both_bounds() {
+        let password = "p".repeat(5_000);
+        assert_ne!(
+            password.as_str(),
+            USER,
+            "the fixture cannot tell a swap from a fill"
+        );
+
+        let p = plan(&parse("{DELAY=0}{PASSWORD}"), &Resolved { password: &password, ..values() })
+            .expect("{DELAY=0} parses, so it must plan rather than refuse");
+
+        // Half one: it is chopped, and every chunk is inside the burst bound,
+        // so `run` gets a foreground check between each of them.
+        assert!(p.len() > 1, "a 5000-unit run was not chopped at all");
+        for step in p.steps() {
+            assert!(
+                step.projected() <= MAX_BURST,
+                "a chunk projected {:?}, past MAX_BURST",
+                step.projected()
+            );
+        }
+
+        // Half two: the projection `MAX_SEQUENCE` reads is no longer zero.
+        assert_eq!(
+            p.projected(),
+            MIN_RATE * 5_000,
+            "the run must be charged at the floor rate, not at nothing"
+        );
+
+        // The clamp is about time, not about text: nothing was dropped,
+        // duplicated or reordered on the way.
+        assert_eq!(typed(&p), password, "the clamp changed what gets typed");
+
+        // And the bound it restored really bites. Before, this projected at
+        // zero and was waved through however long it was.
+        let huge = "p".repeat(MAX_SEQUENCE.as_millis() as usize + 1);
+        assert!(
+            matches!(
+                plan(&parse("{DELAY=0}{PASSWORD}"), &Resolved { password: &huge, ..values() }),
+                Err(Refusal::TooLong(_))
+            ),
+            "a zero-rate run past MAX_SEQUENCE was still waved through"
         );
     }
 
