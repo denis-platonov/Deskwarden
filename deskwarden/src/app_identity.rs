@@ -43,6 +43,11 @@ use windows::core::PCWSTR;
 use windows::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
 };
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    RRF_RT_REG_SZ,
+};
+use windows::core::PWSTR;
 
 /// The file name at the end of a Windows path, or `None` when there isn't one.
 ///
@@ -103,7 +108,11 @@ pub struct Probe {
     description: Option<String>,
     /// `ProductName` from the same place.
     product: Option<String>,
-    /// Whether the path could be stat'd **and named a file**.
+    /// The `DisplayName` of the Microsoft Store package the path belongs to,
+    /// when the path is a Store path and the package is registered for this
+    /// user. `None` for everything else, which is almost every path.
+    store_name: Option<String>,
+    /// The path a reachable **file** was proved at, or `None`.
     ///
     /// **This is the gate on the icon lookup, and that is its whole purpose.**
     /// The worker has just paid whatever the volume costs to answer; if it
@@ -116,7 +125,14 @@ pub struct Probe {
     /// `SHGetFileInfoW` answers for one perfectly well, with the shell's folder
     /// icon, and a folder icon beside the app's name is a picture of something
     /// that is not the app.
-    file: bool,
+    ///
+    /// **It is a path and not a `bool` because it is not always the path that
+    /// was asked for.** A Microsoft Store path expires (see
+    /// [`relocate_store_path`]), and when it does the worker proves the *same
+    /// executable under the package's current directory* instead -- so the one
+    /// shell call the UI thread is allowed to make has to be told where to
+    /// point.
+    file: Option<String>,
     /// Whether the path named a directory. See [`AppIdentityCache::label`]:
     /// a directory's own last component is not the app's name either, so a
     /// path that resolves to one is labelled by `process` instead.
@@ -277,17 +293,23 @@ impl AppIdentityCache {
                     // the box directly below.
                     process.to_string()
                 } else {
-                    display_name(
-                        probe.description.as_deref(),
-                        probe.product.as_deref(),
-                        path,
-                        process,
-                    )
+                    // The package's own `DisplayName` sits in the
+                    // `ProductName` slot: it is the same kind of fact (the
+                    // product this binary belongs to, per its publisher) and
+                    // it is only ever reached when the binary's own resource
+                    // said nothing. A Store app whose exe carries a
+                    // `FileDescription` is still named by that.
+                    let product = probe
+                        .product
+                        .as_deref()
+                        .or(probe.store_name.as_deref());
+                    display_name(probe.description.as_deref(), product, path, process)
                 };
                 // Gated on the path having named a reachable FILE, and only
                 // ever attempted once: a `None` here is remembered as "no
                 // icon", never retried per frame.
-                let icon = probe.file.then(|| load_icon(ctx, path)).flatten();
+                let icon =
+                    probe.file.as_deref().and_then(|found| load_icon(ctx, path, found));
                 self.entries.insert(path.to_string(), Entry::Ready { name, icon });
             }
         }
@@ -364,21 +386,46 @@ fn spawn_probe(path: &str) -> mpsc::Receiver<Probe> {
     let owned = path.to_string();
     std::thread::spawn(move || {
         let meta = std::fs::metadata(&owned);
-        let file = meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
         let directory = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let (description, product) = if file { version_names(&owned) } else { (None, None) };
-        let _ = tx.send(Probe { description, product, file, directory });
+        let mut file = meta
+            .as_ref()
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+            .then(|| owned.clone());
+        let mut store_name = None;
+        // Only a path that answered nothing pays for the Store lookup, so the
+        // ordinary case -- a live file anywhere on the machine -- is exactly as
+        // cheap as it was. A directory is not retried either: it was reached,
+        // it is simply not an app.
+        if file.is_none() && !directory {
+            for (root, name) in relocate_store_path(&owned) {
+                store_name = store_name.or(name);
+                if std::fs::metadata(&root).map(|m| m.is_file()).unwrap_or(false) {
+                    file = Some(root);
+                    break;
+                }
+            }
+        }
+        let (description, product) = match &file {
+            Some(found) => version_names(found),
+            None => (None, None),
+        };
+        let _ = tx.send(Probe { description, product, store_name, file, directory });
     });
     rx
 }
 
-fn load_icon(ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+/// `key` names the texture and is the path the cache is keyed on; `path` is
+/// where the pixels are read from. They differ for a relocated Store app: the
+/// cache still answers about the path the item stores, while the icon has to
+/// come off the executable that actually exists.
+fn load_icon(ctx: &egui::Context, key: &str, path: &str) -> Option<egui::TextureHandle> {
     let rgba = icon::extract_small_icon(path)?;
     let image = egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width as usize, rgba.height as usize],
         &rgba.rgba,
     );
-    Some(ctx.load_texture(format!("app-identity:{path}"), image, egui::TextureOptions::default()))
+    Some(ctx.load_texture(format!("app-identity:{key}"), image, egui::TextureOptions::default()))
 }
 
 /// `(FileDescription, ProductName)` out of `path`'s `VS_VERSIONINFO` resource,
@@ -485,6 +532,249 @@ unsafe fn version_string(block: &[u8], key: &str, name: &str) -> Option<String> 
     };
     let value = String::from_utf16_lossy(chars);
     (!value.trim().is_empty()).then_some(value)
+}
+
+
+// -- Microsoft Store (MSIX) packages ---------------------------------------
+//
+// A Store app's executable lives at
+// `%ProgramFiles%\WindowsApps\<PackageFullName>\<app>.exe`, and
+// `<PackageFullName>` **carries the package version**:
+//
+// ```text
+// AppleInc.iTunes_12139.10003.61011.0_x64__nzyj5cx40ttqa
+// ^ name          ^ version           ^arch  ^ publisher id
+// ```
+//
+// Every update installs into a *new* versioned directory and removes the old
+// one. So the absolute path this app stores when the user picks a Store app is
+// correct exactly until that app next updates, and then it names nothing --
+// the app is still installed, still running, still matched by process name, and
+// its path is a dead string. `fs::metadata` answers `ERROR_PATH_NOT_FOUND`, the
+// version resource cannot be read, `SHGetFileInfoW` has no file to ask about,
+// and the card falls all the way back to `iTunes.exe` with no icon. That is the
+// reported defect, and it is not a permissions problem: measured on this
+// machine, all 123 installed packages grant `BUILTIN\Users:(OI)(CI)(R)` on
+// their install directory, and a live Store executable resolves its name, its
+// version resource and its icon through the ordinary path with nothing special
+// done for it. Only *enumerating* `WindowsApps` itself is denied, which is why
+// the current directory cannot simply be looked for on disk.
+//
+// The three fields either side of the version -- name, architecture, publisher
+// id -- do not change across updates, and the per-user package repository under
+// `HKCU` lists every installed package by full name with its `PackageRootFolder`
+// and the package's `DisplayName`. So a dead path is repaired by reading a
+// registry key: no COM, no packaging API, and nothing that can block on a
+// volume.
+
+/// The `WindowsApps` directory a Store executable sits under, as a prefix test.
+///
+/// Compared case-insensitively and against a whole path component, so that
+/// `C:\My WindowsApps Backup\x.exe` is not mistaken for one.
+fn windowsapps_package_of(path: &str) -> Option<&str> {
+    let normalised = path.replace('/', "\\");
+    let lower = normalised.to_ascii_lowercase();
+    let at = lower.find("\\windowsapps\\")? + r"\windowsapps\".len();
+    // The component after it, which must be followed by something -- a path
+    // that stops at the package directory names no executable.
+    let rest = &path[at..];
+    let cut = rest.find(['\\', '/'])?;
+    let package = &rest[..cut];
+    // ...and there must be a file name below it, not just a trailing slash.
+    (!package.is_empty() && file_name_of(rest).is_some()).then_some(package)
+}
+
+/// `(name, architecture, publisher id)` out of a `PackageFullName`.
+///
+/// The form is `Name_Version_Arch__PublisherId`, and a package *name* may not
+/// contain an underscore, so splitting on `_` is exact rather than a guess: the
+/// empty fourth field is the doubled separator before the publisher id. A
+/// **resource** package (`..._Arch_split.scale-100_Publisher`) puts a resource
+/// id there instead and is rejected -- it holds satellite assets, never an
+/// executable, so relocating a path into one would be wrong.
+fn package_full_name_parts(full_name: &str) -> Option<(&str, &str, &str)> {
+    let parts: Vec<&str> = full_name.split('_').collect();
+    if parts.len() != 5 || !parts[3].is_empty() {
+        return None;
+    }
+    let (name, arch, publisher) = (parts[0], parts[2], parts[4]);
+    (!name.is_empty() && !arch.is_empty() && !publisher.is_empty()).then_some((
+        name, arch, publisher,
+    ))
+}
+
+/// Whether `candidate` is the same package as `(name, arch, publisher)`, at
+/// whatever version.
+///
+/// **The architecture is compared and not ignored.** A family is name plus
+/// publisher, and `Microsoft.VCLibs.140.00_..._x64__8wekyb3d8bbwe` and its
+/// `_x86__` twin are one family with two install directories -- picking the
+/// wrong one would relocate a 64-bit path into a 32-bit package.
+fn same_package(candidate: &str, name: &str, arch: &str, publisher: &str) -> bool {
+    match package_full_name_parts(candidate) {
+        Some((n, a, p)) => {
+            n.eq_ignore_ascii_case(name)
+                && a.eq_ignore_ascii_case(arch)
+                && p.eq_ignore_ascii_case(publisher)
+        }
+        None => false,
+    }
+}
+
+/// Where the per-user package repository lives. Readable by the user who
+/// installed the packages, which is the user whose vault this is.
+const PACKAGE_REPOSITORY: &str = concat!(
+    r"Software\Classes\Local Settings\Software\Microsoft\Windows",
+    r"\CurrentVersion\AppModel\Repository\Packages"
+);
+
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Every registered install directory for the same package as `full_name`,
+/// each with the package's `DisplayName` if it has one.
+///
+/// Usually one. More than one only while an update is staged, hence a list
+/// rather than an answer -- the caller picks the one the executable is actually
+/// in.
+fn registered_roots(full_name: &str) -> Vec<(String, Option<String>)> {
+    let Some((name, arch, publisher)) = package_full_name_parts(full_name) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for_each_registered_package(|candidate, key| {
+        if same_package(candidate, name, arch, publisher) {
+            // SAFETY: `key` is the open repository key the walker owns.
+            if let Some(root) = unsafe { registry_string(key, candidate, "PackageRootFolder") } {
+                let display = unsafe { registry_string(key, candidate, "DisplayName") };
+                found.push((root, display));
+            }
+        }
+        true
+    });
+    found
+}
+
+/// Calls `visit` with every installed package's full name and the open
+/// repository key, until it returns `false` or the packages run out.
+///
+/// One walk, one place the registry handle is opened and closed, so the handle
+/// cannot be leaked down one arm of a match.
+fn for_each_registered_package(mut visit: impl FnMut(&str, HKEY) -> bool) {
+    unsafe {
+        // Bound to a local: `PCWSTR(wide(..).as_ptr())` would drop the buffer
+        // at the end of the expression and pass a dangling pointer.
+        let path = wide(PACKAGE_REPOSITORY);
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), 0, KEY_READ, &mut key).is_err() {
+            return;
+        }
+        // A registry key name is at most 255 characters; a package full name is
+        // far shorter. The buffer is reused, and `len` is reset every turn
+        // because `RegEnumKeyExW` overwrites it with the length it wrote.
+        let mut buffer = [0u16; 256];
+        let mut index: u32 = 0;
+        loop {
+            let mut len = buffer.len() as u32;
+            if RegEnumKeyExW(
+                key,
+                index,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            )
+            .is_err()
+            {
+                break;
+            }
+            index += 1;
+            let candidate = String::from_utf16_lossy(&buffer[..len as usize]);
+            if !visit(&candidate, key) {
+                break;
+            }
+        }
+        let _ = RegCloseKey(key);
+    }
+}
+
+/// One `REG_SZ` value under `key\subkey`, or `None` if it is absent, empty, or
+/// not a string.
+///
+/// # Safety
+///
+/// `key` must be an open registry key.
+unsafe fn registry_string(key: HKEY, subkey: &str, value: &str) -> Option<String> {
+    let sub = wide(subkey);
+    let val = wide(value);
+    let mut size: u32 = 0;
+    // First call sizes the value, in BYTES, including its terminating NUL.
+    if RegGetValueW(
+        key,
+        PCWSTR(sub.as_ptr()),
+        PCWSTR(val.as_ptr()),
+        RRF_RT_REG_SZ,
+        None,
+        None,
+        Some(&mut size),
+    )
+    .is_err()
+        || size < 2
+    {
+        return None;
+    }
+    let mut buffer = vec![0u16; size as usize / 2 + 1];
+    let mut got = size;
+    if RegGetValueW(
+        key,
+        PCWSTR(sub.as_ptr()),
+        PCWSTR(val.as_ptr()),
+        RRF_RT_REG_SZ,
+        None,
+        Some(buffer.as_mut_ptr() as *mut core::ffi::c_void),
+        Some(&mut got),
+    )
+    .is_err()
+    {
+        return None;
+    }
+    // `RegGetValueW` guarantees a terminator; the terminator must not become
+    // part of the string.
+    let chars = match buffer.iter().position(|&c| c == 0) {
+        Some(nul) => &buffer[..nul],
+        None => &buffer[..],
+    };
+    let text = String::from_utf16_lossy(chars);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// The same executable under the current install directory of the Microsoft
+/// Store package `path` names an expired version of, plus that package's
+/// `DisplayName`.
+///
+/// Empty for every path that is not a Store path, which is nearly all of them
+/// -- so nothing but a dead `WindowsApps` path ever reaches the registry.
+///
+/// **This does not stat anything.** It is called from the worker thread and it
+/// returns candidates; whether one of them is really there is the caller's
+/// question, because the caller is the one allowed to pay for a file system.
+fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
+    let Some(package) = windowsapps_package_of(path) else {
+        return Vec::new();
+    };
+    let Some(file) = file_name_of(path) else {
+        return Vec::new();
+    };
+    registered_roots(package)
+        .into_iter()
+        .map(|(root, name)| {
+            let root = root.trim_end_matches(['\\', '/']);
+            (format!(r"{root}\{file}"), name)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -729,6 +1019,289 @@ mod tests {
         let (name, has_icon) = resolve(&mut cache, &ctx, &system_root, "Ledgerline.exe");
         assert_eq!(name, "Ledgerline.exe", "a folder's own name was shown as the app's");
         assert!(!has_icon, "a folder icon was drawn beside the app's name");
+    }
+
+
+    // -- Microsoft Store paths ----------------------------------------------
+
+    /// A real full name, kept in one place so every fixture below is a variation
+    /// on a string Windows actually produces. This is the one from the bug
+    /// report.
+    const ITUNES: &str = "AppleInc.iTunes_12139.10003.61011.0_x64__nzyj5cx40ttqa";
+
+    #[test]
+    fn a_store_path_yields_the_package_directory_it_sits_in() {
+        assert_eq!(
+            windowsapps_package_of(&format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe")),
+            Some(ITUNES)
+        );
+        // Windows accepts both separators, and the drive and the casing of
+        // "WindowsApps" are not fixed -- a path out of a vault field is
+        // whatever the user or the picker put there.
+        assert_eq!(
+            windowsapps_package_of(&format!("D:/Program Files/windowsapps/{ITUNES}/iTunes.exe")),
+            Some(ITUNES)
+        );
+        // A nested path inside the package still names the package.
+        assert_eq!(
+            windowsapps_package_of(&format!(
+                r"C:\Program Files\WindowsApps\{ITUNES}\bin\iTunes.exe"
+            )),
+            Some(ITUNES)
+        );
+    }
+
+    #[test]
+    fn a_path_that_merely_contains_the_word_is_not_a_store_path() {
+        // The positive control for the test above is that test; this one is the
+        // reason the match is against a whole path COMPONENT. A substring test
+        // would relocate this into whatever package it parsed out, which is a
+        // registry walk and a wrong answer for an ordinary folder.
+        assert_eq!(windowsapps_package_of(r"C:\My WindowsApps Backup\iTunes.exe"), None);
+        assert_eq!(windowsapps_package_of(r"C:\WindowsAppsData\Thing\x.exe"), None);
+        // A component that ENDS in the word, with a plausible package name
+        // below it. Measured: without this line a `find("windowsapps\\")`
+        // that dropped the leading separator passed this test, relocated
+        // an ordinary backup folder into the registry, and survived every
+        // other fixture here -- the two above only pin the case where the
+        // word STARTS a component.
+        assert_eq!(
+            windowsapps_package_of(r"C:\Backup\MyWindowsApps\Led_1.0.0.0_x64__abcdefghijklm\x.exe"),
+            None
+        );
+        // No package component at all, and no file below the package.
+        assert_eq!(windowsapps_package_of(r"C:\Program Files\WindowsApps\"), None);
+        assert_eq!(
+            windowsapps_package_of(&format!(r"C:\Program Files\WindowsApps\{ITUNES}")),
+            None
+        );
+        assert_eq!(
+            windowsapps_package_of(&format!(r"C:\Program Files\WindowsApps\{ITUNES}\")),
+            None
+        );
+        // ...and the ordinary case, which must never reach the registry.
+        assert_eq!(windowsapps_package_of(r"C:\Windows\System32\notepad.exe"), None);
+        assert_eq!(windowsapps_package_of(r"C:\Program Files\Google\Chrome\chrome.exe"), None);
+    }
+
+    #[test]
+    fn a_package_full_name_splits_into_name_architecture_and_publisher() {
+        // All three fields are DIFFERENT strings, and the version between them
+        // is a fourth: a parser that returned the wrong field, or the whole
+        // name, could not pass this.
+        assert_eq!(
+            package_full_name_parts(ITUNES),
+            Some(("AppleInc.iTunes", "x64", "nzyj5cx40ttqa"))
+        );
+        assert_eq!(
+            package_full_name_parts("NotepadPlusPlus_1.0.0.0_neutral__7njy0v32s6xk6"),
+            Some(("NotepadPlusPlus", "neutral", "7njy0v32s6xk6"))
+        );
+    }
+
+    #[test]
+    fn a_resource_package_or_a_malformed_name_is_not_relocatable() {
+        // A resource package puts a resource id where the empty field belongs.
+        // It holds satellite assets and never an executable, so relocating into
+        // one would move a path somewhere the app is not.
+        assert_eq!(
+            package_full_name_parts("AppleInc.iTunes_12139.1_x64_split.scale-100_nzyj5cx40ttqa"),
+            None
+        );
+        // Not a full name at all: an ordinary directory that happens to sit
+        // under WindowsApps, or a truncated one.
+        assert_eq!(package_full_name_parts("iTunes"), None);
+        assert_eq!(package_full_name_parts("AppleInc.iTunes_12139.1_x64"), None);
+        assert_eq!(package_full_name_parts("_12139.1_x64__nzyj5cx40ttqa"), None);
+        assert_eq!(package_full_name_parts("AppleInc.iTunes_12139.1_x64__"), None);
+    }
+
+    #[test]
+    fn the_same_package_at_a_newer_version_is_still_the_same_package() {
+        // The whole point: the version is the ONLY field allowed to differ,
+        // because it is the only field an update changes.
+        assert!(same_package(
+            "AppleInc.iTunes_12140.20000.70000.0_x64__nzyj5cx40ttqa",
+            "AppleInc.iTunes",
+            "x64",
+            "nzyj5cx40ttqa"
+        ));
+    }
+
+    #[test]
+    fn a_different_architecture_or_publisher_is_a_different_package() {
+        // Paired with the test above, and each of these differs from it in
+        // exactly ONE field -- so a `same_package` that compared only the name,
+        // or only the publisher, fails here rather than passing both.
+        assert!(
+            !same_package(
+                "AppleInc.iTunes_12140.2_x86__nzyj5cx40ttqa",
+                "AppleInc.iTunes",
+                "x64",
+                "nzyj5cx40ttqa"
+            ),
+            "a 32-bit package was accepted as the current version of a 64-bit one"
+        );
+        assert!(
+            !same_package(
+                "AppleInc.iTunes_12140.2_x64__8wekyb3d8bbwe",
+                "AppleInc.iTunes",
+                "x64",
+                "nzyj5cx40ttqa"
+            ),
+            "a different publisher's package of the same name was accepted"
+        );
+        assert!(!same_package(
+            "AppleInc.iCloud_12140.2_x64__nzyj5cx40ttqa",
+            "AppleInc.iTunes",
+            "x64",
+            "nzyj5cx40ttqa"
+        ));
+    }
+
+    #[test]
+    fn a_path_outside_windowsapps_never_reaches_the_registry() {
+        // Not a performance nicety: it is the guarantee that adding this route
+        // changed nothing for the paths that already worked, and for the dead
+        // network share this module's worker exists to survive.
+        assert!(relocate_store_path(r"C:\Program Files\Google\Chrome\chrome.exe").is_empty());
+        assert!(relocate_store_path(r"\\dead-share\apps\Ledgerline.exe").is_empty());
+        assert!(relocate_store_path("").is_empty());
+    }
+
+    /// An installed Store package that really has an executable in it, as
+    /// `(package full name, install root, one .exe file name)`.
+    ///
+    /// Live: what is installed depends on the machine, so the tests below skip
+    /// themselves when there is nothing to look at rather than asserting about
+    /// a package that might not be there.
+    fn an_installed_store_app() -> Option<(String, String, String)> {
+        let mut answer = None;
+        for_each_registered_package(|full_name, key| {
+            if package_full_name_parts(full_name).is_none() {
+                return true;
+            }
+            // SAFETY: `key` is the repository key the walker holds open.
+            let Some(root) = (unsafe { registry_string(key, full_name, "PackageRootFolder") })
+            else {
+                return true;
+            };
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                return true;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.to_ascii_lowercase().ends_with(".exe")
+                    && entry.path().is_file()
+                    // Something with a real icon, which the stub launchers
+                    // shipped beside some packages do not have.
+                    && icon::extract_small_icon(&entry.path().to_string_lossy()).is_some()
+                {
+                    answer = Some((full_name.to_string(), root, name));
+                    return false;
+                }
+            }
+            true
+        });
+        answer
+    }
+
+    /// The path the user's item would hold after the app updated: the right
+    /// package, the right executable, a version that is no longer installed.
+    fn expired_path(full_name: &str, exe: &str) -> String {
+        let (name, arch, publisher) = package_full_name_parts(full_name).expect("a full name");
+        format!(r"C:\Program Files\WindowsApps\{name}_1.0.0.0_{arch}__{publisher}\{exe}")
+    }
+
+    #[test]
+    fn an_expired_store_path_is_relocated_onto_the_installed_version() {
+        let Some((full_name, root, exe)) = an_installed_store_app() else {
+            return;
+        };
+        let expired = expired_path(&full_name, &exe);
+        assert!(
+            std::fs::metadata(&expired).is_err(),
+            "the fixture must really be dead, or it proves nothing: {expired}"
+        );
+        let relocated = relocate_store_path(&expired);
+        let wanted = format!(r"{}\{exe}", root.trim_end_matches('\\'));
+        assert!(
+            relocated.iter().any(|(p, _)| p.eq_ignore_ascii_case(&wanted)),
+            "{expired}\n  did not relocate onto {wanted}\n  got {relocated:?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_store_path_shows_the_apps_name_and_icon_again() {
+        // The reported defect, end to end and through the same `label` the form
+        // calls: a Store path whose version has gone is what shows `iTunes.exe`
+        // with no icon.
+        let Some((full_name, _, exe)) = an_installed_store_app() else {
+            return;
+        };
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let expired = expired_path(&full_name, &exe);
+        let (name, has_icon) = resolve(&mut cache, &ctx, &expired, "Ledgerline.exe");
+        assert!(has_icon, "{expired}\n  resolved with no icon");
+        assert_ne!(
+            name, exe,
+            "a Store app was still labelled by its file name after being relocated"
+        );
+        assert_ne!(name, "Ledgerline.exe", "the match's process name was shown instead");
+        assert!(!name.trim().is_empty());
+    }
+
+    #[test]
+    fn a_store_path_for_an_app_that_is_not_installed_still_degrades_quietly() {
+        // The positive control for the two tests above, and the one that keeps
+        // them honest: without it, a `label` that handed every WindowsApps path
+        // some icon would pass them both. This package is Apple's real iTunes
+        // full name -- if it is installed here the test has nothing to say, so
+        // it steps aside rather than asserting something machine-dependent.
+        let path = format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe");
+        if !relocate_store_path(&path).is_empty() {
+            return;
+        }
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let (name, has_icon) = resolve(&mut cache, &ctx, &path, "Ledgerline.exe");
+        assert_eq!(name, "iTunes.exe", "an uninstalled app was given a name it does not have");
+        assert!(!has_icon, "an unreachable path was given an icon -- a generic one is a lie");
+    }
+
+    #[test]
+    fn an_unreachable_store_path_does_not_make_the_form_wait_for_it() {
+        // The guarantee the registry walk must not have cost: the UI thread
+        // never blocks, and a path that resolves to nothing resolves to nothing
+        // promptly. `resolve` panics if it never settles.
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let path = format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe");
+        let started = Instant::now();
+        let _ = resolve(&mut cache, &ctx, &path, "Ledgerline.exe");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "a dead Store path took {:?} to give up",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn typing_a_store_path_one_character_at_a_time_still_starts_no_probe() {
+        // `fa505c8`'s guarantee, re-measured on the path shape that now has a
+        // registry walk behind it: every prefix of this path is a path that has
+        // never been seen before, and several of them parse as plausible
+        // package directories.
+        let ctx = ctx();
+        let mut cache = AppIdentityCache::default();
+        let full = format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe");
+        let typed = keystrokes(&full);
+        assert!(typed.len() > 30, "the fixture must be long enough to be a leak");
+        for prefix in &typed {
+            let _ = cache.label(&ctx, prefix, "iTunes.exe");
+        }
+        assert_eq!(cache.probed(), 0, "typing a Store path started {} lookups", cache.probed());
     }
 
     #[test]
