@@ -199,9 +199,16 @@ fn walk(
     *visited += 1;
 
     let control_type = unsafe { element.CurrentControlType() }.map(|t| t.0).unwrap_or(0);
+    // **Fails CLOSED, unlike every other property here.** This one is the
+    // redactor's switch: `false` sends the element's `Name` (and `HelpText`)
+    // through the heuristic alone, which catches `hunter2!9x` and does not
+    // catch `swordfish`. A UIA call can error for reasons that have nothing
+    // to do with the answer -- a slow provider, an element torn down
+    // mid-walk -- so an errored read must not be reported as "not a
+    // password". One over-redacted label is the correct price.
     let is_password = unsafe { element.CurrentIsPassword() }
         .map(|b| b.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
 
     if control_type == UIA_EditControlTypeId.0 || is_password {
         out.push(describe(element, path, control_type, is_password));
@@ -353,7 +360,10 @@ fn print_full(reports: &[WindowReport]) {
             println!("  HelpText        : {}", redact(&f.help_text, f.is_password));
             println!("  LabeledBy.Name  : {}", redact(&f.labeled_by, false));
             println!("  AriaRole        : {}", quote_or_empty(&f.aria_role));
-            println!("  AriaProperties  : {}", quote_or_empty(&f.aria_properties));
+            // Free text, and Chromium puts `valuetext=` in it -- so it goes
+            // through the redactor like every other free-text field, not
+            // through `quote_or_empty`.
+            println!("  AriaProperties  : {}", redact(&f.aria_properties, f.is_password));
             println!("  IsPassword      : {}", f.is_password);
             println!("  IsEnabled       : {}   IsOffscreen: {}", f.is_enabled, f.is_offscreen);
             println!(

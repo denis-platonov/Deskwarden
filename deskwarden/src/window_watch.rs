@@ -135,7 +135,7 @@ pub const HOSTED_APP_WINDOW_CLASS: &str = "Windows.UI.Core.CoreWindow";
 /// an application in its own right.
 ///
 /// Case-insensitive, because every other exe-name comparison in this crate is
-/// (`MatchEngine::lookup`, `app::find_window_for_process`) and Windows paths
+/// (`MatchEngine::lookup`, `MatchEngine::rebuild`) and Windows paths
 /// are.
 pub fn is_host_process(exe_name: &str) -> bool {
     HOST_PROCESSES.iter().any(|host| host.eq_ignore_ascii_case(exe_name))

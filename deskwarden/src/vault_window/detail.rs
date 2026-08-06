@@ -1897,14 +1897,22 @@ pub fn draw_detail_read(
                 // user's credentials while the other launched a program was
                 // not a distinction the strip made.
                 //
-                // **Only the manual trigger went.** Autofill on focus, the
-                // prompt overlay and the global hotkey are untouched, and
-                // the item list's row context menu still offers a plainly
-                // worded "Fill in app" (`item_list::menu_entries`) -- which
-                // is the manual trigger, now on the surface that says what
-                // it is. `fill_target` and `app::find_window_for_process`
-                // still refuse a dead binding and a host process for every
-                // one of those paths.
+                // **Every manual trigger has since gone.** The row context
+                // menu's "Fill in app" entry followed this button out
+                // (`item_list::menu_entries`), and `fill_target`,
+                // `fill_item_into_app` and `app::find_window_for_process`
+                // were deleted with them. What remains is autofill on
+                // focus, the prompt overlay and the global hotkey -- all
+                // three of which take their hwnd straight off a
+                // `window_watch::ForegroundEvent` and never resolved one
+                // through that function in the first place.
+                //
+                // **The host-process refusal lives in `match_engine`, not
+                // on this path.** `MatchEngine::lookup` answers a
+                // host-owned window from the title table and never reads a
+                // stored process name, and `picker_ui::host_process_refusal`
+                // stops such a match being saved at all. No surviving fill
+                // path can reach a credential without passing them.
                 //
                 // **In the header, and gated on no kind at all.** Every
                 // other control in this strip is per-kind because it acts
@@ -2459,28 +2467,6 @@ fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
         return "";
     }
     &m.path
-}
-
-/// Whether *this item's* binding is one [`app_match_is_dead`] calls dead.
-///
-/// The item-level spelling of that predicate, so the places that must act on
-/// it ask one question rather than each unpacking the field for themselves.
-/// An item with no field, and an item whose field will not parse, are both
-/// `false`: there is no binding to be dead, and the fill path's own "no app is
-/// matched to this item yet" is the honest report for them.
-///
-/// **This is now consulted where it actually protects the credential** --
-/// `vault_window::mod`'s `fill_target`, which is the only place
-/// `fill_item_into_app` gets an hwnd from, and which BOTH of that function's
-/// callers reach. It used to have a second, shallower caller in
-/// `item_offers_fill`: the predicate behind the header's "Fill in app" button
-/// and its `CTRL+SHIFT+F` chord, which stopped the pane *offering* what
-/// `fill_target` would refuse. That button and that chord were removed at the
-/// user's request, so the shallow spelling went with them and the deep one
-/// -- the one commit `aae9429`'s own doc called "the load-bearing" gate --
-/// stayed exactly where it was.
-pub fn item_binding_is_dead(item: &VaultItem) -> bool {
-    crate::vault_bridge::extract_app_match(item).is_some_and(|m| app_match_is_dead(&m))
 }
 
 /// Which of the card's three bodies an item asks for.
@@ -5562,11 +5548,16 @@ mod tests {
         );
     }
 
-    /// A Fill button on a card would type two empty strings into whatever
-    /// window is focused, and an AUTOFILL TARGETS card would advertise a
-    /// capability the fill path refuses to provide for non-logins.
+    /// An AUTOFILL TARGETS card on a non-login would advertise a capability
+    /// autofill refuses to provide for it, and LOGIN CREDENTIALS would head a
+    /// section with no credentials under it.
+    ///
+    /// The "Fill in app" absence asserted below is a tombstone, not this
+    /// test's subject: the header button that painted that label was removed
+    /// in `7da1bba`, and the row that used to read `expected` for it is the
+    /// one that would come back first if the button did.
     #[test]
-    fn only_a_login_renders_the_fill_button_and_the_autofill_targets_card() {
+    fn only_a_login_renders_the_autofill_targets_and_credentials_cards() {
         for kind in EVERY_KIND {
             let mut item = an_item(item_type_for(kind));
             // Give every kind a login object carrying a URI, so the autofill
@@ -6801,45 +6792,6 @@ mod tests {
         // assertion above is not satisfied by a constant on either side.
         assert!(any_dead, "no shape in the matrix was dead");
         assert!(any_live, "no shape in the matrix was live");
-    }
-
-    /// **`item_binding_is_dead` is decided by the BINDING and by nothing
-    /// else**, over every kind and all three binding states.
-    ///
-    /// This used to be `only_a_fillable_kind_with_a_binding_that_can_fire_
-    /// offers_a_fill`, asserting the removed `item_offers_fill`. That
-    /// predicate was the shallow half of commit `aae9429`'s fix -- "do not
-    /// OFFER what the fill path will refuse" -- and it went with the header
-    /// button and the `CTRL+SHIFT+F` chord that were its only two callers.
-    /// The half that refuses the fill is `vault_window::mod`'s `fill_target`,
-    /// which asks this same function and is pinned by
-    /// `a_dead_binding_resolves_no_window_to_fill`; what is left to assert
-    /// HERE is that the answer this hands it is kind-independent, which is
-    /// the property the old matrix's own controls were checking.
-    #[test]
-    fn a_binding_is_dead_or_not_whatever_kind_carries_it() {
-        for kind in EVERY_KIND {
-            let bare = an_item(item_type_for(kind));
-            assert!(
-                !item_binding_is_dead(&bare),
-                "{kind:?}: an item bound to nothing has no binding to be dead"
-            );
-            let dead = bound_to(&bare, &a_dead_host_match());
-            assert!(
-                item_binding_is_dead(&dead),
-                "{kind:?}: a dead binding was not recognised as dead"
-            );
-            let live = bound_to(&bare, &a_desktop_match());
-            assert!(
-                !item_binding_is_dead(&live),
-                "{kind:?}: a LIVE binding was called dead, which is the control"
-            );
-        }
-        // The control on `item_binding_is_dead` itself: it is the binding
-        // that decides, and the three inputs really do differ.
-        assert!(item_binding_is_dead(&bound_to(&a_login(), &a_dead_host_match())));
-        assert!(!item_binding_is_dead(&bound_to(&a_login(), &a_desktop_match())));
-        assert!(!item_binding_is_dead(&a_login()));
     }
 
     /// The card's words for a dead binding: it must say it is ignored, and it
@@ -11555,15 +11507,27 @@ mod tests {
 
     /// And it does nothing at all on a binding that may not be launched --
     /// the same refusal the link and the button obey, because it is the same
-    /// function. A dead binding, a Store app, and a match with no program
-    /// file: the three shapes `app_launch_plan` turns down.
+    /// function. A dead binding, a Store app, a match with no program file,
+    /// and a match whose recorded path `launchable_path` rejects: **all
+    /// FOUR** shapes `app_launch_plan` turns down. The fourth was pinned at
+    /// `app_open_refusal` alone and never through a real keystroke, which is
+    /// the one refusal shape that had no end-to-end witness.
     #[test]
     fn the_open_chord_is_refused_wherever_open_is() {
         let no_path = AppMatch {
             path: String::new(),
             ..a_browser_match()
         };
-        for m in [a_dead_match(), a_store_match(), no_path] {
+        let bad_path = AppMatch {
+            path: r"C:\Apps\..\chrome.exe".to_string(),
+            ..a_browser_match()
+        };
+        // The premise for the fourth: it is refused for the PATH and not for
+        // being dead or hosted, so it is genuinely the shape the other three
+        // do not cover.
+        assert!(bad_path.launchable_path().is_none(), "the bad-path fixture is launchable");
+        assert!(!app_match_is_dead(&bad_path) && !bad_path.hosted);
+        for m in [a_dead_match(), a_store_match(), no_path, bad_path] {
             let item = bound_to(&a_login_on_the_web(), &m);
             let mut pane = Pane::new();
             let frame = pane.frame(&item, &TotpState::NoSecret, open_app_chord_events());
