@@ -343,10 +343,19 @@ mod tests {
         let mut engine = MatchEngine::new();
         engine.rebuild(&[entry("keepsolid", HOST, TriggerMode::Prompt)]);
 
-        // Deleting the `filter` in `rebuild` gives
-        //     "the frame host is still matched, so every Store app fills this item"
+        // Deleting the `filter` in `rebuild` does NOT fail this test, and
+        // the comment that said it did was wrong for two years' worth of
+        // reviews. `lookup_parts` short-circuits on `is_host_process(exe)`
+        // before it ever reads `by_process`, so a host entry that reached
+        // that table is unreachable THROUGH THIS FUNCTION. What this test
+        // kills is the removal of `lookup_parts`'s own branch -- the second
+        // guard, tested on its own in
+        // `a_host_owned_window_is_never_answered_from_the_process_table`.
+        // The filter is asserted about directly, on the table it builds, by
+        // `rebuild_keeps_the_frame_host_out_of_the_process_table`.
+        //
         // Note the empty title: a host-owned window with no title reaches
-        // neither table, which is the second guard, tested on its own below.
+        // neither table.
         assert!(
             engine.lookup_parts(HOST, "").is_none(),
             "the frame host is still matched, so every Store app fills this item"
@@ -357,13 +366,67 @@ mod tests {
         assert!(engine.lookup_parts(HOST, "KeepSolid").is_none());
     }
 
+    /// **`rebuild` keeps the frame host out of the process table**, said
+    /// about the table and not through `lookup_parts`.
+    ///
+    /// The invariant nothing else in this file can state. `rebuild` filters
+    /// `is_host_process` out of `by_process` and `lookup_parts` refuses
+    /// `is_host_process` before reading `by_process`; either one alone gives
+    /// the user the right answer today, so every test that goes in through
+    /// `lookup_parts` is satisfied by the second and says nothing about the
+    /// first. Deleting `rebuild`'s `filter` outright leaves the whole suite
+    /// green -- measured, 1564 passed and 0 failed -- which is what three
+    /// comments in this module used to claim it did not.
+    ///
+    /// It matters because the two agree on `is_host_process` by hand. The
+    /// day `lookup_parts` stops being private, or grows a caller that reads
+    /// `by_process` directly, or its branch is refactored away as
+    /// "redundant", the filter is the only thing left -- and if the filter
+    /// has meanwhile rotted, the user's `ApplicationFrameHost.exe` match
+    /// fires on every Store app again, which is the reported bug.
+    ///
+    /// Built the way `a_host_owned_window_is_never_answered_from_the_process_
+    /// table` builds its fixture -- reading `by_process` directly, because
+    /// the public path cannot see this -- and with a real entry beside the
+    /// host one, so that "filter everything out" fails it too.
+    #[test]
+    fn rebuild_keeps_the_frame_host_out_of_the_process_table() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[
+            entry("keepsolid", HOST, TriggerMode::Prompt),
+            entry("ledgerline", "Ledgerline.exe", TriggerMode::Auto),
+        ]);
+
+        // Deleting the `filter` gives
+        //     left: ["applicationframehost.exe", "ledgerline.exe"]
+        //     right: ["ledgerline.exe"]
+        // and inverting its sense gives
+        //     left: ["applicationframehost.exe"]  right: ["ledgerline.exe"]
+        let mut keys: Vec<&str> = engine.by_process.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["ledgerline.exe"],
+            "the process table is {keys:?}. {HOST} owns the top-level window for every \
+             Microsoft Store app, so an entry keyed on it there is a match on all of \
+             them -- and the only other thing standing between that entry and the user \
+             is one `if` in the private `lookup_parts`"
+        );
+    }
+
     #[test]
     fn dropping_a_host_entry_does_not_drop_the_good_ones_beside_it() {
         // The positive control for the test above, and the mutation it kills:
         // a `rebuild` that filtered out everything (or simply stopped
         // building the table) would satisfy "the host is not matched" while
-        // making the whole feature inert. Inverting the filter's sense gives
+        // making the whole feature inert. Inverting the filter's sense --
+        // `filter(|(_, m)| is_host_process(&m.process))` -- gives
         //     "a real app stopped being matched"
+        // and NOT the second assertion below, which holds either way for the
+        // reason given in the test above: `lookup_parts` never reaches
+        // `by_process` for a host exe. The inversion's other half -- that the
+        // host entry is now IN the table -- is what
+        // `rebuild_keeps_the_frame_host_out_of_the_process_table` sees.
         let mut engine = MatchEngine::new();
         engine.rebuild(&[
             entry("keepsolid", HOST, TriggerMode::Prompt),

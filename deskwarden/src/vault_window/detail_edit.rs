@@ -6199,6 +6199,9 @@ mod sequence_builder_tests {
 #[cfg(test)]
 mod edit_pane_layout_tests {
     use super::*;
+    // One copy of "what counts as ink", shared with `detail.rs`'s read-pane
+    // suite. See [`detail::shape_ink`] for why it lives there.
+    use detail::shape_ink::{glyph_ink, ink_of};
     use eframe::egui::{Pos2, Rect, Vec2};
 
     /// The narrowest the detail pane can be, derived from the three constants
@@ -6266,7 +6269,25 @@ mod edit_pane_layout_tests {
         /// That is the same blindness one level up from the one the rects
         /// field was added to close, which was itself one level up from the
         /// texts field. See [`ink_of`] for what counts as drawn.
+        ///
+        /// `Rect` is NOT in here -- it has [`Painted::rect_ink`], so that the
+        /// non-vacuity assertion on this field still says what it says: that
+        /// the tallest form really paints carets.
         marks: Vec<(&'static str, Rect)>,
+        /// The ink each filled rect really lays down, which is not
+        /// [`Painted::rects`]'s box.
+        ///
+        /// Kept apart from `rects` rather than replacing it, because the two
+        /// answer different questions and `bar_rects` needs the first: the
+        /// scroll bar's WIDTH is `RectShape::rect`'s width, and a bar measured
+        /// against its blurred bounds would report a width it does not have.
+        /// What the assertions need this for is the other question -- whether
+        /// any of the ink is painted where the reader cannot reach it. A rect
+        /// recorded at 280..298 on a 298pt pane covers 274..304 with a 6pt
+        /// outside stroke, 270..308 with a 20pt blur, and 275.9..302.1 rotated
+        /// 0.6 rad, and until this field existed every one of those was in
+        /// bounds as far as this module could tell. See [`ink_of`].
+        rect_ink: Vec<(Rect, egui::Color32)>,
     }
 
     impl Painted {
@@ -6329,19 +6350,18 @@ mod edit_pane_layout_tests {
                 painted.texts.push((text.galley.text().to_string(), rect));
                 painted.rendered.push((text.galley.text().to_string(), rendered, rect));
                 // ... and the box the ink really covers. See `Painted::glyphs`.
-                let mut ink: Option<Rect> = None;
-                for row in text.galley.rows.iter() {
-                    for glyph in row.glyphs.iter() {
-                        let at = text.pos + row.pos.to_vec2() + glyph.pos.to_vec2();
-                        let box_ = Rect::from_min_size(at, glyph.size());
-                        ink = Some(ink.map_or(box_, |r: Rect| r.union(box_)));
-                    }
-                }
-                if let Some(ink) = ink {
+                if let Some(ink) = glyph_ink(text) {
                     painted.glyphs.push((text.galley.text().to_string(), ink));
                 }
             }
-            egui::Shape::Rect(rect) => painted.rects.push((rect.rect, rect.fill)),
+            egui::Shape::Rect(rect) => {
+                painted.rects.push((rect.rect, rect.fill));
+                // ... and, separately, the ink that box really lays down,
+                // which is NOT `rect.rect`. See [`Painted::rect_ink`].
+                if let Some((_, ink)) = ink_of(shape) {
+                    painted.rect_ink.push((ink, rect.fill));
+                }
+            }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -6358,65 +6378,6 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// What counts as **painted** for a shape that is neither a galley nor a
-    /// filled rect: ink a reader could actually see, and the box it covers.
-    ///
-    /// `None` for three kinds of shape that are allocated but not drawn, each
-    /// of which is a vacuous assertion this crate has shipped or nearly did:
-    ///
-    /// * [`egui::Shape::Noop`], which paints nothing by definition. `Vec`,
-    ///   `Text` and `Rect` are handled by their own arms above and never
-    ///   reach here.
-    /// * A shape whose fill AND whose stroke are transparent. That is the
-    ///   alpha-0 trap this pane already met once: egui's floating scroll bar
-    ///   is allocated at full size and drawn at alpha 0 while the pointer is
-    ///   away, and a sibling test once certified the placement of exactly
-    ///   such a bar. The test is on the ALPHA, not on `Stroke::is_empty`,
-    ///   which only recognises the single colour `Color32::TRANSPARENT` and
-    ///   would call an invisible red stroke visible.
-    /// * A shape whose visual bounds are empty or infinite -- a zero-area
-    ///   shape covers no pixel, and `visual_bounding_rect` answers
-    ///   `Rect::NOTHING` for several of the cases above.
-    ///
-    /// Everything else is ink, boxed by `visual_bounding_rect()`, which
-    /// already includes the stroke's own width. Where the colour is a UV
-    /// callback its alpha is not knowable here, so it counts as ink: for a
-    /// test whose job is to catch things out of bounds, that is the safe
-    /// direction.
-    fn ink_of(shape: &egui::Shape) -> Option<(&'static str, Rect)> {
-        use egui::epaint::{ColorMode, PathStroke};
-        let stroked = |stroke: &egui::Stroke| stroke.width > 0.0 && stroke.color.a() > 0;
-        let path_stroked = |stroke: &PathStroke| {
-            stroke.width > 0.0
-                && match &stroke.color {
-                    ColorMode::Solid(color) => color.a() > 0,
-                    ColorMode::UV(_) => true,
-                }
-        };
-        let (kind, visible) = match shape {
-            egui::Shape::Circle(s) => ("a circle", s.fill.a() > 0 || stroked(&s.stroke)),
-            egui::Shape::Ellipse(s) => ("an ellipse", s.fill.a() > 0 || stroked(&s.stroke)),
-            egui::Shape::LineSegment { stroke, .. } => ("a line", stroked(stroke)),
-            egui::Shape::Path(s) => ("a path", s.fill.a() > 0 || path_stroked(&s.stroke)),
-            egui::Shape::QuadraticBezier(s) => {
-                ("a quadratic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
-            }
-            egui::Shape::CubicBezier(s) => {
-                ("a cubic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
-            }
-            egui::Shape::Mesh(_) => ("a mesh", true),
-            egui::Shape::Callback(_) => ("a backend callback", true),
-            egui::Shape::Noop
-            | egui::Shape::Vec(_)
-            | egui::Shape::Text(_)
-            | egui::Shape::Rect(_) => return None,
-        };
-        if !visible {
-            return None;
-        }
-        let bounds = shape.visual_bounding_rect();
-        (bounds.is_positive() && bounds.is_finite()).then_some((kind, bounds))
-    }
 
     fn raw_input(pane: Vec2, events: &[egui::Event]) -> egui::RawInput {
         egui::RawInput {
@@ -7173,6 +7134,26 @@ mod edit_pane_layout_tests {
                  and not the pane's",
                 rect.left(),
                 rect.right(),
+                pane.x
+            );
+        }
+
+        // ... and what those boxes really cover, which the loop above is
+        // blind to: a stroke, a shadow's blur and a rotation all put ink
+        // outside `RectShape::rect`, and this pane clips every point of it.
+        assert!(
+            !painted.rect_ink.is_empty(),
+            "the tallest form paints no visible box at all, so the loop below asserts \
+             about nothing"
+        );
+        for (ink, fill) in &painted.rect_ink {
+            assert!(
+                within_pane(*ink, pane),
+                "a {fill:?} box lays ink over x = {}..{} on a {}pt-wide pane. Its recorded \
+                 rect may well be inside; its stroke, its blur or its rotation is not, and \
+                 this pane does not scroll horizontally",
+                ink.left(),
+                ink.right(),
                 pane.x
             );
         }

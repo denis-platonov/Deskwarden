@@ -11782,9 +11782,120 @@ mod tests {
 /// answers with the layout job's source string and is therefore blind to a
 /// run that was elided to nothing. Each test carries the control that says
 /// what it would look like to be blind.
+/// What counts as **painted**, for the geometry suites on both panes.
+///
+/// One copy, deliberately. This function is subtle in three separate ways
+/// (the alpha test, the `Rect::NOTHING` test, and the stroke expansion), it
+/// was written once for `detail_edit.rs` and immediately needed by
+/// `detail.rs`, and a second copy is how the two would drift. It lives here
+/// rather than in `vault_window/mod.rs` because `detail_edit.rs` already
+/// depends on this module (`detail::TotpState`) and nothing depends on
+/// `detail_edit.rs`, so this is the direction that adds no edge.
+#[cfg(test)]
+pub(crate) mod shape_ink {
+    use eframe::egui;
+
+    /// Ink a reader could actually see, and the box it covers -- for ANY
+    /// leaf shape, including [`egui::Shape::Rect`].
+    ///
+    /// `None` for four kinds of shape that are allocated but not drawn, each
+    /// of which is a vacuous assertion this crate has shipped or nearly did:
+    ///
+    /// * [`egui::Shape::Noop`], which paints nothing by definition, and
+    ///   [`egui::Shape::Vec`] and [`egui::Shape::Text`], which are not leaves:
+    ///   a `Vec` is recursed into by the caller's `walk` and a galley's ink is
+    ///   its GLYPH boxes, which `Shape::visual_bounding_rect` does not answer
+    ///   (it answers the layout job's box, which inside a wrapped row is the
+    ///   whole wrap width).
+    /// * A shape whose fill AND whose stroke are transparent. That is the
+    ///   alpha-0 trap these panes already met once: egui's floating scroll bar
+    ///   is allocated at full size and drawn at alpha 0 while the pointer is
+    ///   away, and a sibling test once certified the placement of exactly
+    ///   such a bar. The test is on the ALPHA, not on `Stroke::is_empty`,
+    ///   which only recognises the single colour `Color32::TRANSPARENT` and
+    ///   would call an invisible red stroke visible.
+    /// * A shape whose visual bounds are empty or infinite -- a zero-area
+    ///   shape covers no pixel, and `visual_bounding_rect` answers
+    ///   `Rect::NOTHING` for several of the cases above.
+    ///
+    /// Everything else is ink, boxed by `visual_bounding_rect()`.
+    ///
+    /// **`Rect` is in here, and the box it reports is NOT `RectShape::rect`.**
+    /// That was this function's own blind spot for one commit: `walk` recorded
+    /// the geometric rect and routed everything else through here, and the
+    /// doc-comment said `Rect` was "handled by its own arm". It is, for the
+    /// scroll bar's WIDTH -- but the ink is not the rect.
+    /// `RectShape::visual_bounding_rect` expands it by the whole stroke width
+    /// for [`egui::StrokeKind::Outside`], by half the stroke for `Middle`, by
+    /// `blur_width / 2` (which is how epaint renders every `Shadow` this app
+    /// paints), and then by whatever `angle` adds. Measured on a 298pt pane
+    /// with a box recorded at 280..298: a 6pt outside stroke covers 274..304,
+    /// a 20pt blur covers 270..308, and a 0.6 rad rotation covers
+    /// 275.9..302.1. All three are ink past the pane's edge that the recorded
+    /// rect is silent about.
+    ///
+    /// Where the colour is a UV callback its alpha is not knowable here, so it
+    /// counts as ink: for a test whose job is to catch things out of bounds,
+    /// that is the safe direction.
+    pub(crate) fn ink_of(shape: &egui::Shape) -> Option<(&'static str, egui::Rect)> {
+        use egui::epaint::{ColorMode, PathStroke};
+        let stroked = |stroke: &egui::Stroke| stroke.width > 0.0 && stroke.color.a() > 0;
+        let path_stroked = |stroke: &PathStroke| {
+            stroke.width > 0.0
+                && match &stroke.color {
+                    ColorMode::Solid(color) => color.a() > 0,
+                    ColorMode::UV(_) => true,
+                }
+        };
+        let (kind, visible) = match shape {
+            egui::Shape::Rect(s) => ("a box", s.fill.a() > 0 || stroked(&s.stroke)),
+            egui::Shape::Circle(s) => ("a circle", s.fill.a() > 0 || stroked(&s.stroke)),
+            egui::Shape::Ellipse(s) => ("an ellipse", s.fill.a() > 0 || stroked(&s.stroke)),
+            egui::Shape::LineSegment { stroke, .. } => ("a line", stroked(stroke)),
+            egui::Shape::Path(s) => ("a path", s.fill.a() > 0 || path_stroked(&s.stroke)),
+            egui::Shape::QuadraticBezier(s) => {
+                ("a quadratic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
+            }
+            egui::Shape::CubicBezier(s) => {
+                ("a cubic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
+            }
+            egui::Shape::Mesh(_) => ("a mesh", true),
+            egui::Shape::Callback(_) => ("a backend callback", true),
+            egui::Shape::Noop | egui::Shape::Vec(_) | egui::Shape::Text(_) => return None,
+        };
+        if !visible {
+            return None;
+        }
+        let bounds = shape.visual_bounding_rect();
+        (bounds.is_positive() && bounds.is_finite()).then_some((kind, bounds))
+    }
+
+    /// The box a galley's GLYPHS really cover, in absolute coordinates, or
+    /// `None` for a run that laid out no glyph at all.
+    ///
+    /// Not `Galley::size()`, which is the box the LAYOUT was given: inside a
+    /// `horizontal_wrapped` row that is the whole wrap width, so a 40pt word
+    /// reports a 93.7pt box and appears to spill into a lane it never
+    /// touches. Every one of this crate's earlier geometry blindnesses has
+    /// been a galley answering about the layout job rather than about the
+    /// pixels.
+    pub(crate) fn glyph_ink(text: &egui::epaint::TextShape) -> Option<egui::Rect> {
+        let mut ink: Option<egui::Rect> = None;
+        for row in text.galley.rows.iter() {
+            for glyph in row.glyphs.iter() {
+                let at = text.pos + row.pos.to_vec2() + glyph.pos.to_vec2();
+                let box_ = egui::Rect::from_min_size(at, glyph.size());
+                ink = Some(ink.map_or(box_, |r: egui::Rect| r.union(box_)));
+            }
+        }
+        ink
+    }
+}
+
 #[cfg(test)]
 mod read_pane_scroll_tests {
     use super::*;
+    use super::shape_ink::{glyph_ink, ink_of};
 
     /// The narrowest the detail pane can be: 900 - 212 - 390 = 298pt,
     /// derived rather than written out for the same reason `MIN_PANE` above
@@ -11806,11 +11917,37 @@ mod read_pane_scroll_tests {
     const ROOMY: f32 = 2400.0;
 
     /// Every string the frame painted, as (source, glyphs, rect), plus every
-    /// filled rectangle.
+    /// filled rectangle -- and, since `5fc41ef`'s sibling fix on the edit
+    /// pane, everything else that lays down ink.
+    ///
+    /// The first two fields are **not a partition of what a frame draws**,
+    /// and this suite spent its whole life believing they were. `walk` ended
+    /// `_ => {}`, so a circle, a line, a path, a curve or a mesh was
+    /// DISCARDED, and `the_lane_leaves_the_cards_eighteen_points_of_clear_
+    /// space` -- which documents itself as counting "anything visibly painted
+    /// in the lane, whatever it is" -- counted only `Shape::Rect`. A filled
+    /// circle at x = 274..290 and a 3pt line at 274.5..298.5, both squarely
+    /// inside the 18pt that test names, left the entire suite green. The runs
+    /// were not consulted either, so a LABEL drawn into the lane was equally
+    /// invisible.
     #[derive(Default)]
     struct Shot {
         runs: Vec<(String, String, egui::Rect)>,
         rects: Vec<(egui::Rect, egui::Color32)>,
+        /// The box each run's GLYPHS really cover, which is not the box in
+        /// `runs` -- that one is `Galley::size()`, the layout job's width.
+        /// See [`shape_ink::glyph_ink`].
+        glyphs: Vec<(String, egui::Rect)>,
+        /// The ink each filled rect really lays down, which is not `rects`'s
+        /// box: a stroke, a `blur_width` (how epaint renders every `Shadow`)
+        /// and an `angle` all put ink outside `RectShape::rect`. Kept apart
+        /// from `rects` because `bar_rects` needs the geometric rect to
+        /// measure the bar's WIDTH against, and this to ask the other
+        /// question -- where the ink actually goes.
+        rect_ink: Vec<(egui::Rect, egui::Color32)>,
+        /// Every OTHER shape that lays down ink, named and boxed: carets,
+        /// icons, circles, lines, curves, meshes. See [`shape_ink::ink_of`].
+        marks: Vec<(&'static str, egui::Rect)>,
     }
 
     impl Shot {
@@ -11856,14 +11993,29 @@ mod read_pane_scroll_tests {
                     glyphs,
                     egui::Rect::from_min_size(text.pos, text.galley.size()),
                 ));
+                if let Some(ink) = glyph_ink(text) {
+                    shot.glyphs.push((text.galley.text().to_string(), ink));
+                }
             }
-            egui::Shape::Rect(rect) => shot.rects.push((rect.rect, rect.fill)),
+            egui::Shape::Rect(rect) => {
+                shot.rects.push((rect.rect, rect.fill));
+                if let Some((_, ink)) = ink_of(shape) {
+                    shot.rect_ink.push((ink, rect.fill));
+                }
+            }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, shot);
                 }
             }
-            _ => {}
+            // NOT `_ => {}`. That is what this suite used to end with, and it
+            // threw away every circle, line, path, curve and mesh the pane
+            // drew. See [`Shot`] and [`shape_ink::ink_of`].
+            other => {
+                if let Some(mark) = ink_of(other) {
+                    shot.marks.push(mark);
+                }
+            }
         }
     }
 
@@ -12561,14 +12713,36 @@ mod read_pane_scroll_tests {
     /// Frames enough for egui to fade a floating scroll bar all the way in,
     /// with the pointer parked over the pane throughout.
     ///
-    /// **Frame 1 is useless here and the count is not decoration.** egui
-    /// emits both of the bar's rects on the very first frame with alpha 0
-    /// and fades them up over the following frames; a test that read frame 1
-    /// would certify the placement of a bar that was never drawn, which is
-    /// exactly how this crate has already shipped a vacuous scroll-bar test.
-    /// `bar_rects` therefore requires a VISIBLE fill, and this many frames is
-    /// what makes one exist. Same number, and the same reason, as
-    /// `item_list.rs`'s `SETTLE_FRAMES`.
+    /// **The stated reason used to be folklore, and the real one is the
+    /// opposite fade.** This comment claimed egui emits both of the bar's
+    /// rects at alpha 0 on frame 1 and that twenty frames is what makes a
+    /// VISIBLE bar exist. It does not reproduce: set to **1**,
+    /// `the_body_scroll_bar_is_flush_to_the_outer_edge_of_its_own_lane`
+    /// still passes, because `ShortPane::new`'s two throwaway frames plus
+    /// the parked pointer already yield a visible bar. What makes a bar
+    /// visible is the POINTER, not the count.
+    ///
+    /// The count is load-bearing for the other direction, on the pane that
+    /// has nothing to scroll. Measured at `NARROW` x [`ROOMY`] with this set
+    /// to 1: egui paints the floating bar's trough and handle at
+    /// **x = 292..298, y = 147..2382, alpha 0x66** -- a full-height bar, on a
+    /// body that fits -- and fades it out over the following frames. So
+    /// `the_lane_leaves_the_cards_eighteen_points_of_clear_space` would fail
+    /// on its roomy half, reporting a lane intruder that the reader never
+    /// sees, and `the_previous_password_rows_are_the_lane_tests_one_known_
+    /// intruder` with it. Twenty frames is what lets a bar that should not
+    /// be there finish going away.
+    ///
+    /// What makes the flush test non-vacuous is neither: it is the parked
+    /// pointer and `bar_rects`'s `fill.a() > 0` clause, together. Take the
+    /// pointer out of [`settled`] and the bar is allocated and drawn at
+    /// alpha 0; `bar_rects` finds nothing and the test correctly reports
+    /// that the pane "paints nothing at all in its scroll lane". Take the
+    /// alpha clause out as well and the test passes **green on a bar that
+    /// was never drawn** -- the vacuous scroll-bar test this crate has
+    /// already shipped once. Both measured.
+    ///
+    /// Same number as `item_list.rs`'s `SETTLE_FRAMES`.
     const SETTLE_FRAMES: usize = 20;
 
     /// The tallest item minus its binding: at [`NARROW`] the app card's path
@@ -12579,6 +12753,67 @@ mod read_pane_scroll_tests {
         let mut item = the_tallest_item();
         item.fields.clear();
         item
+    }
+
+    /// [`the_tallest_item_without_its_binding`] minus its **previous
+    /// passwords**, for the one test that asks what is in the lane.
+    ///
+    /// The same exclusion as the binding above, for the same reason, found
+    /// the moment the lane test stopped being blind to everything that is
+    /// not a `Shape::Rect`. Measured at [`NARROW`], each of the five history
+    /// rows paints its reveal eye as a `Shape::Path` at
+    /// **x = 285.26..303.56** and a `Shape::Circle` at 292.01..296.81 -- ink
+    /// that starts 11pt inside the lane the cards are meant to leave clear
+    /// and runs 5.6pt off the right edge of the pane, where it is clipped.
+    /// The row's masked run reaches x = 280.2 as well. That is the same
+    /// horizontal defect the binding's path row has: a row that does not fit
+    /// [`NARROW`] and does not wrap.
+    ///
+    /// It is EXCLUDED here rather than asserted about because this test's
+    /// subject is the scroll lane's width, and a test that fails for a
+    /// different defect reports the wrong one -- the module already holds
+    /// the binding apart on exactly that reasoning. What must not happen is
+    /// the exclusion growing silently, so
+    /// `the_previous_password_rows_are_the_lane_tests_one_known_intruder`
+    /// pins it: those rows, and nothing else, are what the roomy pane paints
+    /// past the cards' edge.
+    fn the_tallest_item_the_lane_can_speak_about() -> VaultItem {
+        let mut item = the_tallest_item_without_its_binding();
+        item.other.remove("passwordHistory");
+        item
+    }
+
+    /// **Everything the frame lays ink with that BEGINS at or past `edge`** --
+    /// boxes by the ink they really cover, runs by their GLYPHS, and every
+    /// other shape by [`shape_ink::ink_of`].
+    ///
+    /// Not `Shot::rects`, which was this suite's entire notion of "painted"
+    /// until the walker was fixed, and which is blind three separate ways: to
+    /// a rect's own stroke, blur and rotation; to circles, lines, paths,
+    /// curves and meshes; and to text.
+    ///
+    /// "Begins at or past" and not "overlaps", deliberately: the pane and
+    /// header backgrounds span the full width and cross the edge by
+    /// construction, and a run that starts left of the edge and reaches over
+    /// it is a row that is too wide, which is a different report.
+    fn lane_ink(shot: &Shot, edge: f32) -> Vec<(String, egui::Rect)> {
+        let mut found: Vec<(String, egui::Rect)> = Vec::new();
+        for (ink, fill) in &shot.rect_ink {
+            if fill.a() > 0 && ink.left() >= edge - 0.5 {
+                found.push((format!("a {fill:?} box"), *ink));
+            }
+        }
+        for (label, ink) in &shot.glyphs {
+            if ink.left() >= edge - 0.5 {
+                found.push((format!("the run {label:?}"), *ink));
+            }
+        }
+        for (kind, ink) in &shot.marks {
+            if ink.left() >= edge - 0.5 {
+                found.push(((*kind).to_string(), *ink));
+            }
+        }
+        found
     }
 
     /// [`SETTLE_FRAMES`] frames with the pointer in the middle of the pane,
@@ -12656,9 +12891,19 @@ mod read_pane_scroll_tests {
     /// protected only by the accident of sharing a helper with
     /// `detail_edit.rs`, which did have an absolute-x assertion.
     ///
-    /// **All three assertions below are load-bearing.** Checked one at a
-    /// time, so that none is later dropped as redundant and none is
-    /// documented as the essential one when it is not:
+    /// **Three checks that DIAGNOSE three defects -- not three independent
+    /// detections.** Each was verified to fire, with the numbers below, on
+    /// the change named beside it; what none of them is, is a defect the
+    /// other two would miss. Given WIDTH (`|w - 6| <= 0.5`) and FLUSH
+    /// (`|left - 292| <= 0.5`) both passing, `right <= 299.0` follows
+    /// arithmetically, so OVERHANG can only fire inside that slop. The
+    /// `bar_outer_margin = -3.0` case below fails FLUSH too; OVERHANG merely
+    /// fires first and names it far better -- "hangs 3pt off the right edge
+    /// of the pane it scrolls" against "leaves -3pt of dead gap". That is
+    /// what all three are for, and it is why none should be dropped as
+    /// redundant: a reader who sees one must not be told another's story.
+    /// (`5fc41ef` had to correct a doc that misattributed exactly this kind
+    /// of essentiality.)
     ///
     /// * dropping `scrollbar_in_gutter` altogether leaves egui's floating
     ///   default, a sliver pinned to the pane's right edge -- measured here at
@@ -12742,26 +12987,36 @@ mod read_pane_scroll_tests {
     /// at `NARROW - BODY_PAD_X` on both heights; this states what stands
     /// between that edge and the pane's, which is the quantity the user
     /// actually reported on. Anything VISIBLY painted in the lane counts
-    /// against the clear space, whatever it is.
+    /// against the clear space, whatever it is -- a box, a run's glyphs, a
+    /// circle, a line, a path, a curve or a mesh, through [`lane_ink`].
+    ///
+    /// **That sentence used to be false.** `walk` ended `_ => {}` and this
+    /// test read `Shot::rects`, so only `Shape::Rect` counted: a filled
+    /// circle at x = 274..290 and a 3pt line at 274.5..298.5, both squarely
+    /// inside the 18pt this test names and the line overhanging the pane's
+    /// edge, left the whole suite green. A label drawn into the lane was
+    /// equally invisible, since the runs were not consulted either.
+    /// `the_lane_test_sees_ink_that_is_not_a_rect` is the control that says
+    /// so, and it fails on a walker that discards those shapes.
+    ///
+    /// The item is [`the_tallest_item_the_lane_can_speak_about`] -- the
+    /// previous-password rows are held apart, and pinned, for the reason
+    /// given there.
     #[test]
     fn the_lane_leaves_the_cards_eighteen_points_of_clear_space() {
-        let item = the_tallest_item_without_its_binding();
+        let item = the_tallest_item_the_lane_can_speak_about();
 
         // Scrolling: the nearest visible ink past the cards' edge is the bar.
         let pane = egui::vec2(NARROW, SHORT);
         let edge = lane_left(pane);
         let shot = settled(pane, &item);
-        let nearest = shot
-            .rects
-            .iter()
-            .filter(|(rect, fill)| fill.a() > 0 && rect.left() >= edge - 0.5)
-            .map(|(rect, _)| rect.left())
-            .fold(pane.x, f32::min);
+        let found = lane_ink(&shot, edge);
+        let nearest = found.iter().map(|(_, r)| r.left()).fold(pane.x, f32::min);
         assert!(
             (nearest - edge - 18.0).abs() <= 0.5,
             "the first ink past the cards' edge on a scrolling pane is at x = {nearest}, \
              leaving {}pt of clear space and not the 18 the lane is meant to give \
-             ({BODY_PAD_X}pt lane less a {}pt bar flush to the outer edge)",
+             ({BODY_PAD_X}pt lane less a {}pt bar flush to the outer edge): {found:?}",
             nearest - edge,
             theme::SCROLLBAR_WIDTH
         );
@@ -12770,18 +13025,279 @@ mod read_pane_scroll_tests {
         let roomy = egui::vec2(NARROW, ROOMY);
         let edge = lane_left(roomy);
         let shot = settled(roomy, &item);
-        let intruders: Vec<egui::Rect> = shot
-            .rects
-            .iter()
-            .filter(|(rect, fill)| fill.a() > 0 && rect.left() >= edge - 0.5)
-            .map(|(rect, _)| *rect)
-            .collect();
+
+        // The control this half went without. `intruders.is_empty()` is what
+        // a pane that painted NOTHING says too -- and a pane that painted
+        // nothing is what a regression in `draw_detail_read`, in `settled`,
+        // or in `walk` itself looks like from here. The first half is safe
+        // without one (its `fold(pane.x, min)` seed makes an empty result
+        // fail); this half is not. So: the body really is on screen, and the
+        // ink really is being collected, just not in the lane.
+        assert!(
+            shot.sources().contains(&"Ada Lovelace"),
+            "the roomy pane painted no item name, so it drew no body at all and the \
+             emptiness below is vacuous: {:?}",
+            shot.sources()
+        );
+        assert!(
+            lane_ink(&shot, 0.0).len() > 20,
+            "the roomy pane reports only {} pieces of ink across its whole width, so \
+             `lane_ink` is not collecting and the emptiness below is vacuous",
+            lane_ink(&shot, 0.0).len()
+        );
+
+        let intruders = lane_ink(&shot, edge);
         assert!(
             intruders.is_empty(),
-            "a body with nothing to scroll still paints {} rect(s) starting past the cards' edge \
-             at x = {edge}, so the reader sees less than the {BODY_PAD_X}pt of padding \
-             this pane is meant to have: {intruders:?}",
+            "a body with nothing to scroll still paints {} piece(s) of ink starting past \
+             the cards' edge at x = {edge}, so the reader sees less than the \
+             {BODY_PAD_X}pt of padding this pane is meant to have: {intruders:?}",
             intruders.len()
         );
+    }
+
+    /// **The lane test can see ink that is not a `Shape::Rect`.**
+    ///
+    /// The reviewer's two plants, exactly: a filled red circle at
+    /// x = 274..290 and a 3pt red line at 274.5..298.5, both inside the 18pt
+    /// of clear space and the line overhanging the pane's right edge. On the
+    /// walker this suite shipped for its whole life -- `_ => {}` -- neither
+    /// reached `Shot` at all and the assertion above was silent about them.
+    /// A label is planted too, because the runs were not consulted either.
+    ///
+    /// Deliberately NOT a plant into the roomy shot followed by
+    /// `assert!(!intruders.is_empty())`: that would pass on a `lane_ink` that
+    /// returned everything. Each plant is named and its ink is compared to
+    /// the numbers above, which are not the numbers `lane_ink` is given.
+    #[test]
+    fn the_lane_test_sees_ink_that_is_not_a_rect() {
+        let pane = egui::vec2(NARROW, ROOMY);
+        let ctx = ShortPane::new(pane).ctx;
+        let edge = lane_left(pane);
+        let red = egui::Color32::RED;
+        let galley = ctx.fonts_mut(|f| {
+            f.layout_no_wrap("HI".to_string(), egui::FontId::proportional(12.0), red)
+        });
+
+        let mut shot = Shot::default();
+        for shape in [
+            egui::Shape::circle_filled(egui::pos2(282.0, 100.0), 8.0, red),
+            egui::Shape::LineSegment {
+                points: [egui::pos2(276.0, 120.0), egui::pos2(297.0, 120.0)],
+                stroke: egui::Stroke::new(3.0, red),
+            },
+            egui::Shape::Text(egui::epaint::TextShape::new(
+                egui::pos2(280.0, 140.0),
+                galley,
+                red,
+            )),
+        ] {
+            walk(&shape, &mut shot);
+        }
+
+        let found = lane_ink(&shot, edge);
+        assert_eq!(
+            found.len(),
+            3,
+            "a circle at 274..290, a line at 274.5..298.5 and a label at x = 280 were \
+             planted in the {BODY_PAD_X}pt lane of a {NARROW}pt pane, all three past the \
+             cards' edge at x = {edge}. The lane test found {}: {found:?}",
+            found.len()
+        );
+        let circle = found
+            .iter()
+            .find(|(k, _)| k == "a circle")
+            .unwrap_or_else(|| panic!("no circle among {found:?}"));
+        assert!(
+            (circle.1.left() - 274.0).abs() <= 0.01 && (circle.1.right() - 290.0).abs() <= 0.01,
+            "the circle's ink is {}..{}, not the 274..290 it covers",
+            circle.1.left(),
+            circle.1.right()
+        );
+        let line = found
+            .iter()
+            .find(|(k, _)| k == "a line")
+            .unwrap_or_else(|| panic!("no line among {found:?}"));
+        assert!(
+            (line.1.left() - 274.5).abs() <= 0.01 && (line.1.right() - 298.5).abs() <= 0.01,
+            "the line's ink is {}..{}, not the 274.5..298.5 its 3pt stroke covers -- a \
+             stroke's own width is half of what puts this one off the pane",
+            line.1.left(),
+            line.1.right()
+        );
+        assert!(
+            found.iter().any(|(k, _)| k.starts_with("the run")),
+            "the label planted at x = 280 is not in the lane's ink, so a caption drawn \
+             into the lane would still be invisible here: {found:?}"
+        );
+
+        // ... and the invisible ones are still not ink. An alpha-0 fill and
+        // an "invisible red" stroke are the trap this suite's sibling met.
+        let mut blank = Shot::default();
+        for shape in [
+            egui::Shape::circle_filled(
+                egui::pos2(282.0, 100.0),
+                8.0,
+                egui::Color32::from_rgba_premultiplied(255, 0, 0, 0),
+            ),
+            egui::Shape::LineSegment {
+                points: [egui::pos2(276.0, 120.0), egui::pos2(297.0, 120.0)],
+                stroke: egui::Stroke::new(
+                    3.0,
+                    egui::Color32::from_rgba_premultiplied(255, 0, 0, 0),
+                ),
+            },
+        ] {
+            walk(&shape, &mut blank);
+        }
+        assert!(
+            lane_ink(&blank, edge).is_empty(),
+            "a shape drawn at alpha 0 counts as ink, so the floating scroll bar egui \
+             allocates and does not draw would fail this lane: {:?}",
+            lane_ink(&blank, edge)
+        );
+    }
+
+    /// **A box's ink is not its `RectShape::rect`**, and both walkers now say
+    /// so. This is `5fc41ef`'s own blind spot, one level down: it routed
+    /// every shape but `Rect` through `ink_of` and recorded `Rect` by the
+    /// geometric rect, which excludes the stroke, the blur and the rotation.
+    ///
+    /// The three plants are measured, at the edge of a [`NARROW`] pane, and
+    /// the recorded rect passes `<= 298` in every one of them:
+    ///
+    /// | planted at 280..298 | ink actually covers |
+    /// |---|---|
+    /// | 6pt `StrokeKind::Outside` | 274..304 |
+    /// | 20pt `blur_width` | 270..308 |
+    /// | rotated 0.6 rad | 275.9..302.1 |
+    ///
+    /// `blur_width` is not hypothetical: it is how epaint renders every
+    /// `Shadow` this app paints.
+    #[test]
+    fn a_boxs_ink_is_not_the_rect_it_was_recorded_at() {
+        use egui::epaint::{RectShape, StrokeKind};
+        let at = egui::Rect::from_min_max(egui::pos2(280.0, 10.0), egui::pos2(298.0, 30.0));
+        let red = egui::Color32::RED;
+        let cases = [
+            (
+                "a 6pt outside stroke",
+                egui::Shape::Rect(RectShape::new(
+                    at,
+                    0,
+                    red,
+                    egui::Stroke::new(6.0, red),
+                    StrokeKind::Outside,
+                )),
+                (274.0_f32, 304.0_f32),
+            ),
+            (
+                "a 20pt blur",
+                egui::Shape::Rect(RectShape::filled(at, 0, red).with_blur_width(20.0)),
+                (270.0, 308.0),
+            ),
+            (
+                "a 0.6 rad rotation",
+                egui::Shape::Rect(RectShape::filled(at, 0, red).with_angle(0.6)),
+                (275.9, 302.1),
+            ),
+        ];
+        for (what, shape, (left, right)) in cases {
+            let mut shot = Shot::default();
+            walk(&shape, &mut shot);
+            assert_eq!(
+                shot.rects.len(),
+                1,
+                "{what}: the geometric rect is still recorded, for `bar_rects`"
+            );
+            assert!(
+                (shot.rects[0].0.right() - 298.0).abs() <= 0.01,
+                "{what}: the premise is that the RECORDED rect is inside a {NARROW}pt \
+                 pane, and it ends at {}",
+                shot.rects[0].0.right()
+            );
+            assert_eq!(shot.rect_ink.len(), 1, "{what}: no ink was recorded at all");
+            let ink = shot.rect_ink[0].0;
+            assert!(
+                (ink.left() - left).abs() <= 0.1 && (ink.right() - right).abs() <= 0.1,
+                "{what}: the ink is {}..{}, not the {left}..{right} it covers -- a box \
+                 recorded inside the pane whose ink is outside it is exactly what the \
+                 overflow tests were blind to",
+                ink.left(),
+                ink.right()
+            );
+            assert!(
+                ink.right() > NARROW,
+                "{what}: the plant is supposed to leave a {NARROW}pt pane and does not, \
+                 so this case proves nothing"
+            );
+        }
+
+        // A box that is allocated and not drawn is still not ink -- neither
+        // an alpha-0 fill nor an "invisible red" stroke.
+        let mut blank = Shot::default();
+        let invisible = egui::Color32::from_rgba_premultiplied(255, 0, 0, 0);
+        walk(
+            &egui::Shape::Rect(RectShape::new(
+                at,
+                0,
+                invisible,
+                egui::Stroke::new(6.0, invisible),
+                StrokeKind::Outside,
+            )),
+            &mut blank,
+        );
+        assert!(
+            blank.rect_ink.is_empty(),
+            "an invisible box counts as ink, which is how the floating scroll bar egui \
+             draws at alpha 0 would be certified as painted: {:?}",
+            blank.rect_ink
+        );
+    }
+
+    /// **The one thing the lane test is allowed not to see**, pinned.
+    ///
+    /// [`the_tallest_item_the_lane_can_speak_about`] drops the previous
+    /// passwords because those rows overflow [`NARROW`] on their own account.
+    /// An exclusion nobody measures is an exclusion that grows, so this
+    /// states exactly what comes back when they are put back: five reveal
+    /// eyes -- a `Shape::Path` and a `Shape::Circle` each -- starting inside
+    /// the lane, and nothing else.
+    ///
+    /// If a later change makes those rows fit, this test fails and the
+    /// exclusion above should be deleted. If it makes something ELSE spill
+    /// into the lane, this test fails too and names it.
+    #[test]
+    fn the_previous_password_rows_are_the_lane_tests_one_known_intruder() {
+        let pane = egui::vec2(NARROW, ROOMY);
+        let edge = lane_left(pane);
+        let shot = settled(pane, &the_tallest_item_without_its_binding());
+        let found = lane_ink(&shot, edge);
+
+        let mut kinds: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec![
+                "a circle", "a circle", "a circle", "a circle", "a circle", "a path", "a path",
+                "a path", "a path", "a path",
+            ],
+            "what the roomy pane paints past the cards' edge is no longer the five \
+             previous-password reveal eyes the lane test excludes: {found:?}"
+        );
+        for (kind, ink) in &found {
+            let (left, right) = if kind == "a path" {
+                (285.26_f32, 303.56_f32)
+            } else {
+                (292.01, 296.81)
+            };
+            assert!(
+                (ink.left() - left).abs() <= 0.1 && (ink.right() - right).abs() <= 0.1,
+                "{kind} of a previous-password row is at {}..{}, not the {left}..{right} \
+                 measured when this exclusion was written",
+                ink.left(),
+                ink.right()
+            );
+        }
     }
 }
