@@ -1270,7 +1270,15 @@ mod fill_dispatch_tests {
             self.0.default_fills.lock().unwrap().push((hwnd, user.into(), pass.into()));
             Ok(())
         }
-        fn fill_sequence(&self, hwnd: isize, plan: Plan) -> Result<(), String> {
+        fn fill_sequence(
+            &self,
+            hwnd: isize,
+            plan: Plan,
+            guard: crate::injector::SequenceGuard,
+        ) -> Result<(), String> {
+            // Released here, synchronously, rather than moved onto a thread:
+            // these tests want the next fill to be allowed to start.
+            drop(guard);
             self.0.sequences.lock().unwrap().push((hwnd, plan.steps().to_vec()));
             Ok(())
         }
@@ -1297,15 +1305,78 @@ mod fill_dispatch_tests {
         cache
     }
 
-    fn fill(item: VaultItem) -> Arc<Recorder> {
+    /// Runs one fill and hands back **both** things it can be judged by: what
+    /// the filler was asked to type, and the `FillStats` it was given.
+    ///
+    /// The stats live on a path unique to this call -- `FillStats::new` reads
+    /// whatever is already at the path, so a fixed name would let one test's
+    /// recorded fill be counted by the next test to run on the same thread.
+    fn fill_recording_stats(item: VaultItem) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
+        // `fill_from_vault` reaches `Injector::fill_sequence`, which contends
+        // for a process-global "already typing" flag. See
+        // `injector::sequence_test_lock`.
+        let _serialised = crate::injector::sequence_test_lock();
+
         let _ = sequence::take_notices();
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: RecordingFiller(rec.clone()) };
-        let dir = std::env::temp_dir()
-            .join(format!("deskwarden-fill-dispatch-{:?}", std::thread::current().id()));
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-fill-dispatch-{}-{:?}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+        // `FillStats::save` writes the file but does not create its parent,
+        // and swallows the error by design. Without this the count silently
+        // stayed 0 and every assertion about it would have passed for the
+        // wrong reason -- including the negative controls.
+        std::fs::create_dir_all(&dir).expect("the stats directory is creatable");
         let stats = crate::fill_stats::FillStats::new(dir.join("stats.json"));
         fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
-        rec
+        (rec, stats)
+    }
+
+    fn fill(item: VaultItem) -> Arc<Recorder> {
+        fill_recording_stats(item).0
+    }
+
+    /// **A sequence fill counts as a fill.**
+    ///
+    /// `record_fill` is what the picker orders its suggestions by, so an item
+    /// filled only ever through the sequence path would stay at the bottom of
+    /// the list forever. Deleting `fill_stats.record_fill(item_id)` from the
+    /// `Ok(())` arm of the sequence branch left the whole suite green.
+    ///
+    /// The **optimism** of that arm is a separate, already-recorded decision
+    /// and is not what this pins: `fill_sequence` returns as soon as the
+    /// typing thread is started, so `Ok(())` means "began", not "typed", and
+    /// this test asserts only that beginning is counted.
+    #[test]
+    fn a_sequence_fill_is_recorded_against_the_item() {
+        let (rec, stats) = fill_recording_stats(item_with("{USERNAME}{TAB}{PASSWORD}"));
+        assert_eq!(
+            rec.sequences.lock().unwrap().len(),
+            1,
+            "this test is not exercising the sequence path"
+        );
+        assert_eq!(stats.count("item-1"), 1, "a sequence fill was not recorded");
+        // The count is against *this* item and is not a blanket increment.
+        assert_eq!(stats.count("item-2"), 0, "an unrelated item was credited");
+    }
+
+    /// The negative control the test above needs: a refused sequence must
+    /// **not** be recorded, so `record_fill` is tied to the `Ok` arm and not
+    /// merely to reaching the sequence branch at all.
+    #[test]
+    fn a_refused_sequence_is_not_recorded_as_a_fill() {
+        // `{PICKCHARS}` is unimplemented, so `fill_action` refuses at plan
+        // time and the filler is never reached.
+        let (rec, stats) = fill_recording_stats(item_with("{USERNAME}{PICKCHARS}"));
+        assert!(
+            rec.sequences.lock().unwrap().is_empty(),
+            "a refused sequence still reached the filler"
+        );
+        assert_eq!(stats.count("item-1"), 0, "a refused sequence was counted as a fill");
     }
 
     /// **Delete `injector.fill_sequence(hwnd, plan)` from `fill_from_vault`

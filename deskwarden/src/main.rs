@@ -12071,6 +12071,21 @@ mod tests {
             fn fill(&self, _: isize, _: &str, _: &str) -> Result<(), String> {
                 panic!("the SendInput fallback must not be reached: UI Automation answered Ok(true)")
             }
+
+            /// This used to be inherited from a defaulted trait method, which
+            /// meant the panic above guarded only half the door: changing that
+            /// default to `Ok(())` sent these tests down the sequence path,
+            /// where they succeeded quietly and recorded a fill. Overriding it
+            /// here states the same thing `fill` does -- **no test in this
+            /// module reaches `SendInput`** -- for both paths.
+            fn fill_sequence(
+                &self,
+                _: isize,
+                _: deskwarden::injector::sequence::Plan,
+                _: deskwarden::injector::SequenceGuard,
+            ) -> Result<(), String> {
+                panic!("the SendInput fallback must not be reached: no test here types a sequence")
+            }
         }
 
         fn recording_injector(filled: &Filled) -> Injector<RecordingUi, NeverTypes> {

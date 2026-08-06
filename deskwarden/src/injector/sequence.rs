@@ -56,6 +56,15 @@
 //! the long gap, the dangerous one -- is *always* followed by a check before
 //! anything is typed.
 //!
+//! **Both the chop and the projection count UTF-16 code units, not
+//! characters**, because that is the unit the keyboard actually pauses on:
+//! `RealKeyboard::type_text` sleeps once per `encode_utf16` unit. Counting
+//! characters made every astral-plane character (emoji, CJK extension B)
+//! cost two sleeps against a budget of one, so a burst projected at 249ms
+//! really slept up to 498ms and the gap between two foreground checks was
+//! twice its stated bound. Text in the BMP -- accents, ordinary CJK,
+//! Cyrillic -- was never affected, which is why it survived so long.
+//!
 //! # Refuse the whole sequence, or type what we can?
 //!
 //! Refuse. Every time, and before the first keystroke.
@@ -79,6 +88,11 @@
 //! password sits in memory waiting. [`MAX_SEQUENCE`] bounds the *projected*
 //! total, and a sequence over it is refused at plan time -- before the
 //! password is even asked for a second time.
+//!
+//! That bound covers typing and delays. It does **not** cover key presses,
+//! which are charged nothing: an arbitrarily long run of `{TAB}` passes it.
+//! See [`MAX_SEQUENCE`]'s own doc for why that is a correction to the claim
+//! rather than a gap in the defence.
 //!
 //! # Secrets
 //!
@@ -113,11 +127,35 @@ pub const DEFAULT_RATE: Duration = Duration::from_millis(3);
 /// common case (one password, one burst) costs exactly one extra check.
 pub const MAX_BURST: Duration = Duration::from_millis(250);
 
-/// The longest a whole sequence may be *projected* to take.
+/// The longest a whole sequence may be projected to spend **typing and
+/// waiting**.
 ///
 /// Sixty seconds is far more than any real sign-in flow -- the motivating
 /// Microsoft 365 case is about three -- and far less than the hour a
 /// `{DELAY 3600000}` would ask for. See the module doc.
+///
+/// # What this does not bound
+///
+/// Key presses are charged nothing by [`Step::projected`], so a sequence of
+/// nothing but `{TAB}` and `{ENTER}` passes this check at any length. The
+/// bound is on typing and delays, not on step count, and the doc used to
+/// claim more than that.
+///
+/// This is a wrong claim rather than a hole in the defence, and the
+/// distinction is worth being exact about. The thing [`MAX_SEQUENCE`] exists
+/// to stop is a fill that stays *armed* -- a plaintext password sitting in
+/// memory while a `{DELAY 3600000}` runs down, and a foreground check that
+/// will eventually pass on some unrelated window. A run of bare key presses
+/// arms nothing: it carries no password, it sleeps nowhere, and [`run`]
+/// re-verifies foreground before every single one of them, so the user
+/// switching away stops it at the next key. It is the user's own authored
+/// sequence typing navigation keys into the window they aimed it at, quickly.
+///
+/// Charging a key some invented per-press constant would make the sentence
+/// "bounded at 60s" literally true at the cost of putting a fiction into
+/// [`Step::projected`], which [`MAX_BURST`] chunking also depends on being an
+/// honest projection of real time. Correcting the claim is the cheaper and
+/// more truthful of the two.
 pub const MAX_SEQUENCE: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
@@ -195,11 +233,22 @@ impl Step {
     /// How long this step is expected to take. Used both for [`MAX_BURST`]
     /// chunking and for the [`MAX_SEQUENCE`] bound, so the two cannot disagree
     /// about what a step costs.
+    ///
+    /// **Text is counted in UTF-16 code units, because that is what the
+    /// keyboard sleeps on**: `RealKeyboard::type_text` pauses once per
+    /// `encode_utf16` unit, so an astral-plane character (emoji, CJK
+    /// extension B) costs two pauses and not one. Counting `chars` here made
+    /// every projection of such text exactly half its real duration.
     pub fn projected(&self) -> Duration {
         match self {
-            Self::Text { text, rate } => *rate * text.chars().count() as u32,
-            // A key press is one `SendInput` call; it is not free, but it is
-            // not measurable against a 250ms burst either.
+            Self::Text { text, rate } => *rate * text.encode_utf16().count() as u32,
+            // **A key press is charged nothing, and that is a real gap in
+            // [`MAX_SEQUENCE`]'s bound** -- see that constant's doc. It is
+            // charged nothing rather than a made-up constant because its real
+            // cost genuinely is one `SendInput` batch with no sleep anywhere
+            // in it (`RealKeyboard::press_key` sends the whole chord in a
+            // single call and returns), and inventing a number here would put
+            // a fiction into the same function `MAX_BURST` chunking trusts.
             Self::Key { .. } => Duration::ZERO,
             Self::Wait(d) => *d,
         }
@@ -408,10 +457,17 @@ impl TextRun {
         Self { pending: String::new(), rate }
     }
 
-    /// The most characters that fit in one burst at this rate. At least one,
-    /// so a `{DELAY=100000}` cannot produce a zero-length chunk and loop
-    /// forever.
-    fn chunk_chars(&self) -> usize {
+    /// The most **UTF-16 code units** that fit in one burst at this rate. At
+    /// least one, so a `{DELAY=100000}` cannot produce a zero-length chunk and
+    /// loop forever.
+    ///
+    /// Units, not characters, because a unit is what the keyboard sleeps on:
+    /// [`crate::injector::send_input::RealKeyboard::type_text`] pauses once
+    /// per `encode_utf16` unit. Budgeting sleeps but spending *characters* is
+    /// how a burst projected at 249ms came to sleep 498ms of astral-plane
+    /// text -- a half-second hole between two foreground checks, from a
+    /// counter that was right for every character in the BMP.
+    fn chunk_units(&self) -> usize {
         let rate = self.rate.max(Duration::from_nanos(1));
         (MAX_BURST.as_nanos() / rate.as_nanos()).max(1) as usize
     }
@@ -420,11 +476,34 @@ impl TextRun {
         if self.pending.is_empty() {
             return;
         }
-        let chunk = self.chunk_chars();
-        let chars: Vec<char> = self.pending.chars().collect();
-        for window in chars.chunks(chunk) {
-            out.push(Step::Text { text: window.iter().collect(), rate: self.rate });
+        let budget = self.chunk_units();
+        let mut start = 0usize;
+        let mut used = 0usize;
+        for (idx, ch) in self.pending.char_indices() {
+            let cost = ch.len_utf16();
+            // `used > 0` keeps a single character that is on its own wider
+            // than the budget from producing an empty chunk and looping: an
+            // astral character costs 2 units and a one-unit budget is
+            // reachable via `{DELAY=250}`. A surrogate pair is never split,
+            // so that one case overshoots by exactly one unit's rate -- the
+            // smallest overshoot that still emits a character at all.
+            if used > 0 && used + cost > budget {
+                // Slicing the accumulated `String` allocates each chunk once,
+                // at exactly its size. The previous `Vec<char>` + `collect()`
+                // grew an intermediate buffer per chunk, handing reallocated
+                // plaintext back to the allocator on the way.
+                out.push(Step::Text {
+                    text: self.pending[start..idx].to_string(),
+                    rate: self.rate,
+                });
+                start = idx;
+                used = 0;
+            }
+            used += cost;
         }
+        // `pending` is non-empty and `start` always sits on a character
+        // boundary strictly before its end, so this tail is never empty.
+        out.push(Step::Text { text: self.pending[start..].to_string(), rate: self.rate });
         // The accumulated plaintext must not be handed back to the allocator
         // when this `String` is reallocated or dropped: `clear` alone would
         // leave the bytes in the buffer.
@@ -816,6 +895,67 @@ mod plan_tests {
 
     // -- bursts -------------------------------------------------------------
 
+    /// **The burst bound is measured in the units the keyboard really sleeps
+    /// on.**
+    ///
+    /// `RealKeyboard::type_text` sleeps once per `encode_utf16` unit, so an
+    /// astral-plane character costs *two* sleeps. Projecting and chopping by
+    /// `char` made a burst of emoji take exactly twice its projection --
+    /// 249ms projected, 498ms really slept -- and that doubling is the gap
+    /// between two foreground checks.
+    ///
+    /// The fixture is deliberately **mixed and non-uniform**: one astral
+    /// character (2 units) alternating with one BMP character (1 unit), so a
+    /// `chars()` count and an `encode_utf16()` count disagree by a ratio the
+    /// assertions below can actually see. A fixture of pure emoji would have
+    /// let an off-by-exactly-2 error look like a units/chars mix-up either
+    /// way round.
+    #[test]
+    fn an_astral_burst_is_projected_and_chopped_at_its_real_cost() {
+        // 160 chars, 240 UTF-16 code units: the two counts differ by 1.5x.
+        let astral = "\u{1F600}a".repeat(80);
+        assert_eq!(astral.chars().count(), 160);
+        assert_eq!(astral.encode_utf16().count(), 240);
+
+        let v = Resolved { password: &astral, ..values() };
+        let p = plan(&parse("{PASSWORD}"), &v).unwrap();
+        assert!(p.len() > 1, "720ms of real typing must not be one burst");
+
+        for step in p.steps() {
+            let Step::Text { text, rate } = step else { continue };
+            // What `plan` believes a step costs is what `type_text` will
+            // really sleep -- not a `chars()` projection of it.
+            assert_eq!(
+                step.projected(),
+                *rate * text.encode_utf16().count() as u32,
+                "a step's projection is not the time the keyboard will really take"
+            );
+            assert!(
+                step.projected() <= MAX_BURST,
+                "a burst of {:?} exceeds {MAX_BURST:?}",
+                step.projected()
+            );
+        }
+
+        // Round-tripping proves no surrogate pair was chopped in half: a
+        // split pair could not have reassembled into the original `String`.
+        assert_eq!(typed(&p), astral, "chopping lost, reordered or split a character");
+    }
+
+    /// The BMP case the fix must not disturb: Cyrillic is 1 unit per char, so
+    /// units and chars agree and the chunking is exactly what it always was.
+    #[test]
+    fn bmp_text_is_chopped_by_the_same_count_as_before() {
+        let cyrillic = "\u{43F}\u{430}\u{440}\u{43E}\u{43B}\u{44C}".repeat(40);
+        assert_eq!(cyrillic.chars().count(), cyrillic.encode_utf16().count());
+        let v = Resolved { password: &cyrillic, ..values() };
+        let p = plan(&parse("{PASSWORD}"), &v).unwrap();
+        for step in p.steps() {
+            assert!(step.projected() <= MAX_BURST, "{:?}", step.projected());
+        }
+        assert_eq!(typed(&p), cyrillic);
+    }
+
     #[test]
     fn a_long_run_of_text_is_split_so_foreground_can_be_rechecked() {
         let long = "x".repeat(500);
@@ -881,6 +1021,35 @@ mod plan_tests {
         assert!(matches!(p, Err(Refusal::TooLong(_))), "{p:?}");
     }
 
+    /// **What [`MAX_SEQUENCE`] does not bound, pinned so it stays a decision.**
+    ///
+    /// A key press is charged `Duration::ZERO`, so a run of `{TAB}` passes the
+    /// total-time check at any length. That is deliberate -- see
+    /// [`MAX_SEQUENCE`]'s doc for why charging an invented constant would be
+    /// worse -- but it was previously only true by accident, and the doc
+    /// claimed otherwise. This test is what makes changing it a choice rather
+    /// than a surprise.
+    ///
+    /// It also pins the half that *is* bounded, so a future "charge keys
+    /// something" change cannot quietly stop bounding delays.
+    #[test]
+    fn keys_are_charged_nothing_against_the_total_bound_but_delays_are() {
+        // Twenty thousand tab presses: hours of real typing, no projected
+        // cost, and it plans.
+        let many_keys = "{TAB}".repeat(20_000);
+        let p = plan(&parse(&many_keys), &values()).expect("a key-only sequence is not refused");
+        assert_eq!(p.len(), 20_000, "the keys did not all become steps");
+        assert_eq!(p.projected(), Duration::ZERO, "a key press is charged nothing");
+
+        // The bounded half, in the same test so the two claims cannot drift:
+        // one delay past the limit is still refused.
+        let too_long = format!("{{DELAY {}}}", MAX_SEQUENCE.as_millis() + 1);
+        assert!(
+            matches!(plan(&parse(&too_long), &values()), Err(Refusal::TooLong(_))),
+            "the delay half of the bound stopped working"
+        );
+    }
+
     /// **Secrets: a dropped `Plan` does not hand the password to the
     /// allocator in the clear.**
     ///
@@ -907,6 +1076,63 @@ mod plan_tests {
             !plaintext_reached_the_allocator(move || drop(built)),
             "a dropped Plan released the password in the clear"
         );
+    }
+
+    /// **Secrets: a `plan` that refuses *after* accumulating the password does
+    /// not hand it to the allocator either.**
+    ///
+    /// The test above covers the success path only: it drops a built [`Plan`],
+    /// so what it pins is `Drop for Plan`. The refusal path never builds one.
+    /// `{PASSWORD}{PICKCHARS}` pushes the whole password into
+    /// `TextRun::pending`, then returns `Err` before any `flush`, so no `Plan`
+    /// exists and `Drop for Plan` never runs. **The only thing between that
+    /// password and the allocator is `impl Drop for TextRun`** -- and
+    /// replacing its `zeroize` with a no-op left the whole suite green.
+    ///
+    /// The five shapes below reach that state by genuinely different routes --
+    /// an unsupported token, a dangling modifier, a grouping, an over-long
+    /// delay, and a `{S:Field}` accumulated before an unrelated refusal -- so
+    /// a fix that only rescued one of them is visible here.
+    #[test]
+    fn a_refused_plan_does_not_release_the_accumulated_password_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // Positive control, in this test rather than borrowed from the one
+        // above, so this test fails loudly if the instrument goes deaf.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the allocator watch is not seeing an unwiped drop"
+        );
+
+        // **Leaked on purpose.** An owned `String` moved into the closure is
+        // freed by the closure's *own* drop, inside the watched region, which
+        // trips the probe even when the wipe under test works perfectly. The
+        // leak makes the only free that can happen inside the region the one
+        // this test is actually about.
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+
+        for sequence in [
+            "{PASSWORD}{PICKCHARS}",      // unsupported token, after the field
+            "{S:PIN}{PASSWORD}{PICKCHARS}", // a custom field accumulated first
+            "{PASSWORD}(x)",              // a grouping
+            "{PASSWORD}^",                // a modifier left dangling at the end
+            "{PASSWORD}{DELAY 3600000}",  // refused by the total-time bound
+        ] {
+            let tokens = parse(sequence);
+            assert!(
+                !plaintext_reached_the_allocator(move || {
+                    let v = Resolved { password, ..values() };
+                    assert!(
+                        plan(&tokens, &v).is_err(),
+                        "{sequence} was expected to refuse, so this test is \
+                         not exercising the refusal path at all"
+                    );
+                }),
+                "the plaintext accumulated by {sequence} reached the allocator \
+                 in the clear when plan refused"
+            );
+        }
     }
 }
 
