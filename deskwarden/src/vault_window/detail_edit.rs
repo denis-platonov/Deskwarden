@@ -1550,6 +1550,87 @@ pub fn sequence_source<'a>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Will this sequence run at all?
+// ---------------------------------------------------------------------------
+
+/// The one-time code the edit-time check plans against, when the item has a
+/// secret at all.
+///
+/// Six zeroes, never the live code. [`injector::sequence::plan`] reads exactly
+/// two things about a code: whether it is EMPTY (which is the refusal) and how
+/// many characters it is (which feeds the projected-time bound). Every code
+/// this app can fetch is six digits, so a six-character stand-in answers both
+/// questions the same way the real one would -- and keeps a secret out of a
+/// check that runs on every frame the edit form is drawn.
+const TOTP_STAND_IN: &str = "000000";
+
+/// What [`sequence_refusal`] hands [`injector::sequence::plan`] as the code.
+///
+/// **The whole of the editor's TOTP judgement, and deliberately narrow.**
+/// [`detail::TotpState::NoSecret`] is derived from the item every frame -- it
+/// means this item has no TOTP secret, so no fill will ever resolve `{TOTP}`,
+/// and that is knowable now. The other four states are all about *this
+/// moment*: the poll is in flight, the poll reported nothing, the bridge is
+/// unavailable, or a code is in hand. None of those is a property of the item
+/// the user is editing, so warning about them would be telling the user to fix
+/// something that is not broken. They get the stand-in, and no warning.
+fn edit_time_totp(totp: &detail::TotpState) -> Option<&'static str> {
+    match totp {
+        detail::TotpState::NoSecret => None,
+        detail::TotpState::Fetching
+        | detail::TotpState::NoCodeReported
+        | detail::TotpState::Unavailable
+        | detail::TotpState::Code { .. } => Some(TOTP_STAND_IN),
+    }
+}
+
+/// The refusal this sequence would meet at fill time, asked of the runner
+/// itself.
+///
+/// **This calls [`injector::sequence::plan`]. It does not re-derive one rule
+/// of it.** That is the whole design: `plan` is the only place that decides
+/// whether a sequence can be typed, and a second copy of "an unknown token is
+/// refused, a grouping character is refused, a modifier before text is
+/// refused" living in the editor would drift from it on the first token this
+/// build learns to type. The only thing this function does is *build the
+/// values* `plan` needs, which is exactly what the fill path does too -- see
+/// [`edit_time_totp`] for the one value that is a stand-in and why.
+///
+/// The [`Plan`](injector::sequence::Plan) on the success path is dropped
+/// immediately, and its `Drop` wipes the plaintext it copied.
+pub fn sequence_refusal(
+    tokens: &[Token],
+    source: &ResolveSource<'_>,
+) -> Option<crate::injector::sequence::Refusal> {
+    let values = crate::injector::sequence::Resolved {
+        username: source.username,
+        password: source.password,
+        totp: edit_time_totp(source.totp),
+        custom: source.custom.clone(),
+    };
+    crate::injector::sequence::plan(tokens, &values).err()
+}
+
+/// The sentence shown over the keystroke block when the sequence cannot run.
+///
+/// The refusal's own words after the prefix, not a paraphrase: `Refusal`
+/// already names the offending construct ("uses {PICKCHARS}, which this build
+/// cannot type"), and the editor saying it differently from the notification
+/// the user gets at fill time would be two vocabularies for one fact.
+const SEQUENCE_REFUSED_PREFIX: &str = "This will not run \u{2014} ";
+
+/// The warning line for `sequence`, or `None` when it would type fine.
+///
+/// Asked of [`sequence_view`]'s tokens, not of `parse`: an item that stores no
+/// sequence is filled with [`key_sequence::DEFAULT_SEQUENCE`], so a login with
+/// no user name really would refuse, and the empty string is exactly the case
+/// where the user has never opened this block to see why.
+pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<String> {
+    let refusal = sequence_refusal(&sequence_view(sequence).tokens, source)?;
+    Some(format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()))
+}
+
 /// The three trigger pills, bound to the draft rather than reporting a click.
 ///
 /// The order, the words and the caption are `detail`'s -- the read pane's card
@@ -1753,6 +1834,19 @@ fn app_sequence_block(
 ) {
     theme::field_label(ui, APP_SEQUENCE_LABEL);
     let view = sequence_view(&app.sequence);
+
+    // **Above the fold, and before the block splits.** A sequence that the
+    // runner will refuse outright is not a detail of the builder -- it is the
+    // fact that this binding does nothing at all, and the builder is SHUT by
+    // default. Drawn here it is on screen in both states, so the user who
+    // never opens the block still finds out before the fill silently does
+    // nothing. `theme::ERROR`, the same ink the form's own "Name is required."
+    // wears, because it is the same kind of statement: this will not work, and
+    // here is the thing to change.
+    if let Some(warning) = sequence_warning(&app.sequence, source) {
+        ui.label(RichText::new(warning).size(11.0).color(theme::ERROR));
+        ui.add_space(4.0);
+    }
 
     // Shut, this is three lines: what would be typed, said in words, and the
     // way in. See `AppMatchDraft::sequence_open`.
@@ -2258,7 +2352,20 @@ pub fn draw_detail_edit(
                     // under the box it fills, built from the same widgets
                     // every other row here uses. **The overlay's generator is
                     // a separate, still-outstanding task.**
-                    ui.horizontal(|ui| {
+                    //
+                    // **Wrapped, not `horizontal`.** This row is the one place
+                    // in the whole form whose content has a floor rather than
+                    // a share: "Generate", a 110pt combo box and a
+                    // `DragValue` wide enough for " chars" come to 279.4pt of
+                    // content, and the card at the app's MINIMUM window size
+                    // offers 264. An unwrapped row does not shrink to fit --
+                    // it pushes the card out to 307pt inside a 298pt pane,
+                    // and every `available_width()` measured after it answers
+                    // with the inflated number. That is `aae9429`'s defect
+                    // exactly, and `horizontal_wrapped` is the same mechanism
+                    // that already holds the keystroke builder's chip row
+                    // (see `every_chip_and_button_is_reachable_at_the_apps_minimum_width`).
+                    ui.horizontal_wrapped(|ui| {
                         if theme::secondary_button(ui, "Generate").clicked() {
                             action = EditAction::GeneratePassword;
                         }
@@ -5714,6 +5821,359 @@ mod sequence_builder_tests {
             reopened.strings()
         );
     }
+
+    // -- will it run at all? the decisions ---------------------------------
+    //
+    // The editor used to show a sequence that the runner refuses BEFORE the
+    // first keystroke as perfectly writable, and the user found out when a
+    // fill silently did nothing. These pin `sequence_refusal`, which answers
+    // that question by asking `injector::sequence::plan` -- the runner's own
+    // function -- rather than by re-deriving one of its rules.
+
+    use crate::injector::sequence::Refusal;
+
+    /// A `ResolveSource` over [`item`], with the TOTP state the caller names.
+    fn source_for<'a>(item: &'a VaultItem, totp: &'a detail::TotpState) -> ResolveSource<'a> {
+        let login = item.login.as_ref().unwrap();
+        sequence_source(
+            login.username.as_deref().unwrap_or(""),
+            login.password.as_deref().map_or("", |v| v.as_str()),
+            Some(item),
+            totp,
+        )
+    }
+
+    /// **Every refusal the editor claims to know about, and the SAME variant
+    /// the runner would raise.**
+    ///
+    /// Not "some warning appears": the variant, compared against
+    /// [`Refusal`]'s own discriminants. A check that only asserted "is
+    /// `Some`" would pass on an editor that answered `Nothing` to every
+    /// question, which is a warning that names the wrong thing to go and fix.
+    #[test]
+    fn the_editor_knows_the_refusals_that_are_facts_about_the_item() {
+        let item = item();
+        let totp = detail::TotpState::NoSecret;
+        let source = source_for(&item, &totp);
+
+        // A field this item does not have. `PIN` it HAS -- see `item()` --
+        // so the fixture's two halves deliberately differ and a check that
+        // matched any `{S:...}` at all would be caught by the control below.
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{S:Missing}"), &source),
+            Some(Refusal::Unresolved("a field called Missing".to_string()))
+        );
+        // A token a KeePass-authored sequence may carry and this build cannot
+        // type.
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{PICKCHARS}"), &source),
+            Some(Refusal::Unsupported("{PICKCHARS}".to_string()))
+        );
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{CLEARFIELD}"), &source),
+            Some(Refusal::Unsupported("{CLEARFIELD}".to_string()))
+        );
+        // A grouping character, which the parser carries faithfully and the
+        // runner refuses faithfully.
+        assert!(matches!(
+            sequence_refusal(&key_sequence::parse("(ab)"), &source),
+            Some(Refusal::Unsupported(_))
+        ));
+        // A modifier with no key after it -- values-independent, so knowable.
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("+{S:PIN}"), &source),
+            Some(Refusal::DanglingModifier("Shift".to_string()))
+        );
+        // `{TOTP}` on an item with no secret at all.
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{TOTP}"), &source),
+            Some(Refusal::Unresolved("a one-time code".to_string()))
+        );
+
+        // **The control.** A sequence built out of what this item really has
+        // is not warned about, so none of the above is an editor that simply
+        // refuses everything.
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{USERNAME}{TAB}{PASSWORD}{ENTER}"), &source),
+            None
+        );
+        assert_eq!(sequence_refusal(&key_sequence::parse("{S:PIN}"), &source), None);
+    }
+
+    /// **The refusals the editor must NOT claim**, which is the other half of
+    /// being honest about what is knowable.
+    ///
+    /// A `{TOTP}` is refusable at edit time only when the item has no secret.
+    /// The other four [`detail::TotpState`]s are about THIS MOMENT -- the poll
+    /// is in flight, the poll reported nothing, the bridge is unavailable, a
+    /// code is in hand -- and none of them is a property of the item the user
+    /// is editing. Warning about those would send the user to fix something
+    /// that is not broken, and the warning would come and go on its own while
+    /// they looked at it.
+    #[test]
+    fn the_editor_does_not_warn_about_a_one_time_code_that_is_merely_late() {
+        let item = item();
+        for state in [
+            detail::TotpState::Fetching,
+            detail::TotpState::NoCodeReported,
+            detail::TotpState::Unavailable,
+            live_code(),
+        ] {
+            let source = source_for(&item, &state);
+            assert_eq!(
+                sequence_refusal(&key_sequence::parse("{TOTP}"), &source),
+                None,
+                "the editor warned about {{TOTP}} in the {state:?} state, which is not a \
+                 fact about the item"
+            );
+        }
+        // The control on the loop: the ONE state that is a fact about the
+        // item still warns, so the four above are not passing because the
+        // check was switched off.
+        let none = detail::TotpState::NoSecret;
+        assert_eq!(
+            sequence_refusal(&key_sequence::parse("{TOTP}"), &source_for(&item, &none)),
+            Some(Refusal::Unresolved("a one-time code".to_string()))
+        );
+    }
+
+    /// **The stand-in code is six characters, and that is load-bearing.**
+    ///
+    /// `plan` reads two things about a one-time code: whether it is empty, and
+    /// how long it is (which feeds the projected-time bound). A stand-in of
+    /// the wrong length would make the editor and the runner disagree about
+    /// `MAX_SEQUENCE` on a sequence full of `{TOTP}`s. Pinned against the
+    /// runner's real code length rather than against the literal.
+    #[test]
+    fn the_stand_in_code_is_the_length_a_real_one_is() {
+        assert_eq!(
+            TOTP_STAND_IN.chars().count(),
+            TOTP_CODE.chars().count(),
+            "the stand-in and a real one-time code are different lengths, so the editor and \
+             the runner will disagree about how long a sequence takes"
+        );
+        assert!(
+            !TOTP_STAND_IN.is_empty(),
+            "an empty stand-in would make every {{TOTP}} refuse, in every state"
+        );
+        // And it is NOT the real code: this check runs every frame and must
+        // not be a second home for a secret.
+        assert_ne!(TOTP_STAND_IN, TOTP_CODE);
+    }
+
+    /// **The warning says what the runner says.**
+    ///
+    /// Compared against `Refusal::message()` computed in this test, so a
+    /// paraphrase in the editor -- "this sequence is invalid" -- fails here.
+    /// That is the drift this project has a defect class from: the notification
+    /// the user gets at fill time and the warning they get at edit time have to
+    /// be one vocabulary.
+    #[test]
+    fn the_warning_is_the_runners_own_sentence() {
+        let item = item();
+        let totp = detail::TotpState::NoSecret;
+        let source = source_for(&item, &totp);
+
+        for sequence in ["{PICKCHARS}", "{S:Missing}", "{TOTP}", "+{S:PIN}"] {
+            let refusal = sequence_refusal(&key_sequence::parse(sequence), &source)
+                .unwrap_or_else(|| panic!("{sequence} was not refused at all"));
+            let warning = sequence_warning(sequence, &source)
+                .unwrap_or_else(|| panic!("{sequence} produced no warning"));
+            assert_eq!(warning, format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()));
+            // ...and the sentence really does NAME the offending construct,
+            // which is the whole point of showing it.
+            assert!(
+                warning.len() > SEQUENCE_REFUSED_PREFIX.len() + 10,
+                "the warning for {sequence} is {warning:?}, which names nothing"
+            );
+        }
+        assert_eq!(sequence_warning("{USERNAME}{TAB}{PASSWORD}", &source), None);
+    }
+
+    /// **The empty sequence is judged as the DEFAULT, because that is what
+    /// would be typed.**
+    ///
+    /// An item that stores no sequence is filled with
+    /// `key_sequence::DEFAULT_SEQUENCE`, so a login with no user name really
+    /// does refuse -- and the empty string is exactly the case where the user
+    /// has never opened the block and has no other way to find out. Asked of
+    /// `sequence_view`'s tokens rather than of `parse`, and this is what says
+    /// so.
+    #[test]
+    fn a_stored_sequence_of_nothing_is_judged_as_the_default() {
+        let mut item = item();
+        item.login.as_mut().unwrap().username = None;
+        let totp = detail::TotpState::NoSecret;
+        // The draft's own boxes are what get saved, so an empty user name box
+        // is what the editor judges -- see `sequence_source`.
+        let source = sequence_source("", "correct-horse-battery", Some(&item), &totp);
+
+        // **Asked of `sequence_warning`, not of `sequence_refusal`.** The
+        // expansion is `sequence_warning`'s own argument, and a version of it
+        // that called `parse` instead of `sequence_view` -- judging the empty
+        // string as "types nothing" -- survives every assertion that hands
+        // `sequence_refusal` tokens the TEST expanded. It was caught only by
+        // driving the function that does the expanding, which is the shape
+        // this crate's reviews keep finding.
+        assert_eq!(
+            sequence_warning("", &source).as_deref(),
+            Some(
+                format!(
+                    "{SEQUENCE_REFUSED_PREFIX}{}",
+                    Refusal::Unresolved("a username".to_string()).message()
+                )
+                .as_str()
+            ),
+            "the empty sequence was judged as typing nothing rather than as the default"
+        );
+        // The pure function underneath agrees, given the same tokens.
+        assert_eq!(
+            sequence_refusal(&sequence_view("").tokens, &source),
+            Some(Refusal::Unresolved("a username".to_string()))
+        );
+
+        // The control: with a user name in the box, the same empty sequence is
+        // fine. So the warning above is about the value and not about the
+        // sequence being empty -- and a `parse`-based expansion, which would
+        // answer `Nothing` here, fails this line too.
+        let filled =
+            sequence_source("ada@contoso.test", "correct-horse-battery", Some(&item), &totp);
+        assert_eq!(sequence_warning("", &filled), None);
+        assert_eq!(sequence_refusal(&sequence_view("").tokens, &filled), None);
+    }
+
+    // -- ...and the wiring, at the call the drawn form really makes ---------
+
+    /// **The warning is on screen with the builder SHUT.**
+    ///
+    /// This is the requirement, not a nicety: the block is shut by default and
+    /// a user may never open it, so a warning only visible inside it is a
+    /// warning the user hit the bug without ever seeing. Deleting the
+    /// `sequence_warning(...)` call in `app_sequence_block` fails here.
+    #[test]
+    fn a_sequence_that_cannot_run_says_so_from_the_closed_state() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{PICKCHARS}");
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+
+        // The premise: the block really is shut.
+        assert!(!draft.app.as_ref().unwrap().sequence_open, "the builder started open");
+        assert!(
+            painted.strings().contains(&APP_SEQUENCE_OPEN),
+            "the way into the builder is not on screen, so this is not the closed state"
+        );
+
+        let expected = sequence_warning("{PICKCHARS}", &source_for(&item, &live_code())).unwrap();
+        assert!(
+            painted.strings().contains(&expected.as_str()),
+            "the closed block does not say the sequence will not run. Wanted {expected:?}, \
+             painted: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// ...and it is still there once the builder is open, where the user has
+    /// gone to do something about it.
+    #[test]
+    fn the_warning_survives_opening_the_builder() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{PICKCHARS}");
+        let painted = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let expected = sequence_warning("{PICKCHARS}", &source_for(&item, &live_code())).unwrap();
+        assert!(
+            painted.strings().contains(&expected.as_str()),
+            "the open builder dropped the warning: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **A sequence that runs is not warned about**, in either state.
+    ///
+    /// Without this, an `app_sequence_block` that painted the warning
+    /// unconditionally -- or one that computed it from a constant -- would
+    /// pass both tests above.
+    #[test]
+    fn a_sequence_that_runs_is_not_warned_about() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}{ENTER}");
+        for painted in [
+            frame(&ctx, PANE, &mut draft.clone(), &item, &live_code(), &[]),
+            open_builder(&ctx, PANE, &mut draft, &item, &live_code()),
+        ] {
+            let shouted: Vec<&str> = painted
+                .strings()
+                .into_iter()
+                .filter(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX))
+                .collect();
+            assert!(
+                shouted.is_empty(),
+                "a sequence this item can type was warned about: {shouted:?}"
+            );
+        }
+    }
+
+    /// **The call site's ARGUMENTS, not just the call.**
+    ///
+    /// Both arguments are substituted and the drawn form must change:
+    ///
+    /// * the SEQUENCE -- the same item, two different drafts, must produce two
+    ///   different warnings. A call site that passed a constant sequence, or
+    ///   the item's stored one instead of the draft's, passes every test above
+    ///   and fails here.
+    /// * the SOURCE -- the same draft, two different TOTP states, must produce
+    ///   a warning in one and none in the other. A call site that built its own
+    ///   `ResolveSource` out of nothing, or passed a defaulted one, fails here.
+    ///
+    /// This is the shape the crate's reviews keep finding: an argument nulled
+    /// at a call site under a pure function that is exhaustively tested.
+    #[test]
+    fn the_drawn_warning_follows_both_of_its_arguments() {
+        let item = item();
+        let ctx = styled_context(PANE);
+
+        // -- the sequence argument -----------------------------------------
+        let mut missing_field = draft_for(&item, "{S:Missing}");
+        let mut unknown_token = draft_for(&item, "{PICKCHARS}");
+        let a = frame(&ctx, PANE, &mut missing_field, &item, &live_code(), &[]);
+        let b = frame(&ctx, PANE, &mut unknown_token, &item, &live_code(), &[]);
+        let said = |p: &Painted| -> String {
+            p.strings()
+                .into_iter()
+                .find(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX))
+                .unwrap_or_else(|| panic!("no warning was painted; painted: {:?}", p.strings()))
+                .to_string()
+        };
+        let (said_a, said_b) = (said(&a), said(&b));
+        assert_ne!(
+            said_a, said_b,
+            "two different broken sequences produced the same warning, so the drawn warning \
+             is not reading the draft's own sequence"
+        );
+        assert!(said_a.contains("Missing"), "{said_a:?} does not name the missing field");
+        assert!(said_b.contains("PICKCHARS"), "{said_b:?} does not name the unknown token");
+
+        // -- the source argument -------------------------------------------
+        // One draft, drawn twice, differing ONLY in the TOTP state handed to
+        // the form.
+        let mut totp_draft = draft_for(&item, "{TOTP}");
+        let with_secret = frame(&ctx, PANE, &mut totp_draft.clone(), &item, &live_code(), &[]);
+        let no_secret =
+            frame(&ctx, PANE, &mut totp_draft, &item, &detail::TotpState::NoSecret, &[]);
+        assert!(
+            !with_secret.strings().iter().any(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX)),
+            "a {{TOTP}} with a live code was warned about: {:?}",
+            with_secret.strings()
+        );
+        assert!(
+            no_secret.strings().iter().any(|s| s.starts_with(SEQUENCE_REFUSED_PREFIX)),
+            "a {{TOTP}} on an item with no secret was NOT warned about, so the drawn warning \
+             is not reading the TOTP state it was handed: {:?}",
+            no_secret.strings()
+        );
+    }
 }
 
 /// The edit form's SHAPE, on a pane too short to hold it.
@@ -5773,6 +6233,19 @@ mod edit_pane_layout_tests {
         /// Every filled rectangle, so the scroll bar -- which paints no
         /// string at all -- can be found by its geometry.
         rects: Vec<(Rect, egui::Color32)>,
+        /// The box the run's GLYPHS really cover, which is not
+        /// [`Painted::texts`]'s box.
+        ///
+        /// `Galley::size()` is the box the LAYOUT was given, and inside a
+        /// `horizontal_wrapped` row that is the whole wrap width: the word
+        /// "seconds" reports a 93.7pt box for 40pt of ink, and it therefore
+        /// appears to sit on top of the wait field beside it. Every one of
+        /// this crate's earlier geometry blindnesses has been a galley
+        /// answering about the layout job rather than about the pixels
+        /// (`Galley::text()` for the characters, this for the box), so the
+        /// overlap assertion is asked of the glyph positions egui really
+        /// placed -- the same source `Painted::rendered` reads.
+        glyphs: Vec<(String, Rect)>,
     }
 
     impl Painted {
@@ -5834,6 +6307,18 @@ mod edit_pane_layout_tests {
                     .collect();
                 painted.texts.push((text.galley.text().to_string(), rect));
                 painted.rendered.push((text.galley.text().to_string(), rendered, rect));
+                // ... and the box the ink really covers. See `Painted::glyphs`.
+                let mut ink: Option<Rect> = None;
+                for row in text.galley.rows.iter() {
+                    for glyph in row.glyphs.iter() {
+                        let at = text.pos + row.pos.to_vec2() + glyph.pos.to_vec2();
+                        let box_ = Rect::from_min_size(at, glyph.size());
+                        ink = Some(ink.map_or(box_, |r: Rect| r.union(box_)));
+                    }
+                }
+                if let Some(ink) = ink {
+                    painted.glyphs.push((text.galley.text().to_string(), ink));
+                }
             }
             egui::Shape::Rect(rect) => painted.rects.push((rect.rect, rect.fill)),
             egui::Shape::Vec(shapes) => {
@@ -6395,6 +6880,279 @@ mod edit_pane_layout_tests {
             scrolls, fits,
             "the form card spans {scrolls:?} on a pane that scrolls and {fits:?} on one that \
              does not -- the bar's lane is being reserved conditionally"
+        );
+    }
+
+    // -- the whole form, at the size the app can really be made ------------
+
+    /// The item behind the tallest form: a login with a user name, a password,
+    /// a TOTP secret and a custom `PIN`, so the keystroke builder's palette is
+    /// as WIDE as this app can make it. Every value differs from every other:
+    /// a fixture whose password equalled its user name would let a row that
+    /// drew the wrong one pass.
+    fn palette_item() -> VaultItem {
+        VaultItem {
+            id: "layout-1".to_string(),
+            name: "Contoso 365".to_string(),
+            fields: vec![crate::vault_bridge::VaultField {
+                name: Some("PIN".to_string()),
+                value: Some("8421".to_string()),
+                other: serde_json::Map::new(),
+            }],
+            login: Some(LoginData {
+                username: Some("ada@contoso.test".to_string()),
+                password: Some("correct-horse-battery".to_string().into()),
+                totp: Some("JBSWY3DPEHPK3PXP".to_string().into()),
+                uris: Vec::new(),
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// **The tallest and widest thing this form can be**, drawn on `pane`.
+    ///
+    /// [`tallest_draft`]'s conditions -- creating a Login, the generator row
+    /// showing, an app binding present, the name error up -- plus the one this
+    /// suite could not reach before: the keystroke builder OPEN, which adds
+    /// the chip row, three palettes, two boxes and the eye. Opened by CLICKING
+    /// the button the user clicks, not by setting the flag, so the form drawn
+    /// here is one the app can really be in.
+    ///
+    /// The pane is deliberately tall. Height is
+    /// `save_and_cancel_are_on_screen_at_the_minimum_window_size`'s subject
+    /// and is answered by scrolling; WIDTH is this one's, and a form that
+    /// overflows horizontally cannot be scrolled to on this pane at all. Every
+    /// field must therefore be drawn rather than culled below the fold, or the
+    /// widths of the ones underneath would go unmeasured.
+    fn tallest_form_with_the_builder_open(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        item: &VaultItem,
+        totp: &detail::TotpState,
+    ) -> Painted {
+        let shut = frame_for(ctx, pane, draft, true, &[], Some(item), totp);
+        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let click = vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let _ = frame_for(ctx, pane, draft, true, &click, Some(item), totp);
+        assert!(
+            draft.app.as_ref().unwrap().sequence_open,
+            "the builder did not open, so this is not the tallest form"
+        );
+        frame_for(ctx, pane, draft, true, &[], Some(item), totp)
+    }
+
+    /// A pane as tall as the whole form needs, so nothing is culled. Not a
+    /// claim about the app -- the WIDTH is, and that is `MIN_PANE_WIDTH`.
+    const UNCULLED_PANE_HEIGHT: f32 = 4000.0;
+
+    /// The live one-time code the tall form is drawn against. Different from
+    /// every other value in `palette_item`, deliberately.
+    fn live_code() -> detail::TotpState {
+        detail::TotpState::Code { code: "776699".to_string(), seconds_left: 21 }
+    }
+
+    /// **Nothing the tallest form paints is outside the pane it is painted
+    /// on** -- not a glyph, and not a box either.
+    ///
+    /// This is the recorded defect, measured: the form's card came out
+    /// **309.4pt wide inside a 298pt pane**. Not one widget was out of bounds,
+    /// which is exactly why it survived every assertion this suite already
+    /// had -- the card overflowed to the right and its contents, laid inside
+    /// it, still fell under 298. What overflowed was the card itself, and with
+    /// it every `available_width()` measured after it, which is the mechanism
+    /// `aae9429` documented when an unwrapped path inflated the read pane's
+    /// app card to 467.8 and pushed `Open` 87% off the edge.
+    ///
+    /// So the rects are asserted about and not only the text. The cause was
+    /// one row: "Generate" plus a 110pt combo box plus a `DragValue` is
+    /// 279.4pt of content in a 264pt card, and `ui.horizontal` does not wrap.
+    ///
+    /// **Positive control**: verified to FAIL with that row back at
+    /// `ui.horizontal` -- two boxes at x = 0..309.4 -- and to pass with it
+    /// wrapped. It cannot pass by accident.
+    #[test]
+    fn nothing_on_the_tallest_edit_form_is_painted_outside_the_minimum_pane() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let item = palette_item();
+        let painted =
+            tallest_form_with_the_builder_open(&ctx, pane, &mut draft, &item, &live_code());
+
+        // The premise: this really is the form with the builder open. Without
+        // it, a regression that stopped drawing the builder would make every
+        // assertion below trivially true.
+        assert!(
+            painted.strings().contains(&APP_SEQUENCE_REVEAL),
+            "the builder's eye is not on screen, so this is not the tallest form: {:?}",
+            painted.strings()
+        );
+
+        for (label, rect) in &painted.glyphs {
+            assert!(
+                within_pane(*rect, pane),
+                "the run {label:?} draws ink at x = {}..{} on a {}pt-wide pane -- this pane \
+                 does not scroll horizontally, so that ink is unreachable",
+                rect.left(),
+                rect.right(),
+                pane.x
+            );
+        }
+        for (rect, fill) in &painted.rects {
+            assert!(
+                within_pane(*rect, pane),
+                "a {fill:?} box spans x = {}..{} on a {}pt-wide pane. If that is the form's \
+                 card, then every available_width() measured inside it is the box's width \
+                 and not the pane's",
+                rect.left(),
+                rect.right(),
+                pane.x
+            );
+        }
+    }
+
+    /// Inside the pane **on the axis the user cannot scroll**.
+    ///
+    /// Horizontal only, and the omission is deliberate rather than a
+    /// weakening. Vertical reach on this form is already two other tests'
+    /// subject -- `save_and_cancel_are_on_screen_at_the_minimum_window_size`
+    /// and `the_form_scrolls_to_its_last_field_while_the_buttons_stay_put` --
+    /// and it is answered by SCROLLING, so a y outside the pane is a thing the
+    /// user can reach. An x outside it is not: this pane refuses horizontal
+    /// scrolling on purpose. Width is what this test exists for, and width is
+    /// where the 309.4pt card was.
+    ///
+    /// The y is also the one axis a glyph box cannot be trusted about.
+    /// `Glyph::size` is the font's full ascent-plus-descent cell, not the ink,
+    /// so the bottom-pinned Cancel button -- which the suite above already
+    /// proves is on screen -- reports a box 2.1pt below a pane its galley fits
+    /// inside. Asserting on that would be asserting about font metrics.
+    fn within_pane(rect: Rect, pane: Vec2) -> bool {
+        rect.left() >= 0.0 && rect.right() <= pane.x
+    }
+
+    /// **No two runs on the tallest form are drawn on top of each other.**
+    ///
+    /// Being inside the pane is not the same as being readable: two controls
+    /// can both be in bounds and still occupy the same pixels, which
+    /// `contains_rect` says nothing about. `horizontal_wrapped` is the fix for
+    /// the width above, and a row that wrapped onto a line it had not reserved
+    /// height for is precisely how that fix would go wrong.
+    ///
+    /// Asked of `Painted::glyphs` and NOT of `Painted::texts`: a galley laid
+    /// inside a wrapped row reports the WRAP WIDTH as its size, so the word
+    /// "seconds" claims a 93.7pt box for 40pt of ink and appears to sit on top
+    /// of the wait field beside it. That is one false report, and one is
+    /// enough to make an overlap assertion something you have to carry an
+    /// exception list for -- which is how it stops being an assertion. The
+    /// glyph positions are what egui really placed.
+    #[test]
+    fn no_two_runs_on_the_tallest_edit_form_overlap() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let item = palette_item();
+        let painted =
+            tallest_form_with_the_builder_open(&ctx, pane, &mut draft, &item, &live_code());
+
+        // The premise. A form drawn as three runs would pass the loop below
+        // and prove nothing; the real one draws upwards of sixty.
+        assert!(
+            painted.glyphs.len() > 40,
+            "only {} runs were painted -- the form was not drawn in full, so this test is \
+             not exercising the layout",
+            painted.glyphs.len()
+        );
+
+        for i in 0..painted.glyphs.len() {
+            for j in (i + 1)..painted.glyphs.len() {
+                let (left, a) = &painted.glyphs[i];
+                let (right, b) = &painted.glyphs[j];
+                let shared = a.intersect(*b);
+                // Sub-pixel touching is antialiasing, not an overlap; half a
+                // point in BOTH axes is ink on ink.
+                assert!(
+                    shared.width() <= 0.5 || shared.height() <= 0.5,
+                    "{left:?} at {a:?} and {right:?} at {b:?} are drawn over each other, \
+                     sharing {shared:?}"
+                );
+            }
+        }
+    }
+
+    /// **The controls on the two assertions above.**
+    ///
+    /// Both are loops over what a frame happened to paint, and a loop over an
+    /// empty list passes. These feed the same predicates hand-built geometry
+    /// no layout produced and demand that each one refuses it -- the same
+    /// shape, and the same reason, as `detail.rs`'s `assert_visible_refuses_*`
+    /// pair.
+    #[test]
+    fn the_layout_predicates_refuse_the_geometry_they_exist_to_catch() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+
+        // The card as it really was measured: 309.4 wide on a 298pt pane.
+        let overflowing = Rect::from_min_max(Pos2::new(0.0, 41.0), Pos2::new(309.4, 913.9));
+        assert!(
+            !within_pane(overflowing, pane),
+            "a 309.4pt-wide card is being called inside a {}pt pane",
+            pane.x
+        );
+        // ...and the control on THAT: the fixed card is accepted, so the
+        // refusal above is about the width and not about the rect being
+        // hand-built.
+        let fitting = Rect::from_min_max(Pos2::new(0.0, 41.0), Pos2::new(292.0, 913.9));
+        assert!(within_pane(fitting, pane), "a 292pt card does not fit a {}pt pane", pane.x);
+        // `within_pane` is horizontal by design, so it must also refuse a box
+        // off the LEFT edge -- a one-sided check would pass everything the
+        // wrap fix could get wrong on the other side.
+        let off_left = Rect::from_min_max(Pos2::new(-3.0, 41.0), Pos2::new(200.0, 913.9));
+        assert!(!within_pane(off_left, pane), "a box starting at x = -3 is being called inside");
+        // ...and it must NOT refuse a box that is merely far below the pane,
+        // which is the scrollable axis and which the glyph metrics lie about.
+        let below = Rect::from_min_max(Pos2::new(10.0, 9000.0), Pos2::new(200.0, 9014.0));
+        assert!(
+            within_pane(below, pane),
+            "a box below a pane that SCROLLS vertically is being called unreachable"
+        );
+
+        // Two runs sharing ink, which the overlap loop must refuse.
+        let a = Rect::from_min_max(Pos2::new(19.0, 1213.9), Pos2::new(60.0, 1227.9));
+        let b = Rect::from_min_max(Pos2::new(40.0, 1215.0), Pos2::new(108.0, 1229.9));
+        let shared = a.intersect(b);
+        assert!(
+            shared.width() > 0.5 && shared.height() > 0.5,
+            "two runs overlapping by {shared:?} are being called disjoint"
+        );
+        // And two that merely share an edge are not an overlap.
+        let touching = Rect::from_min_max(Pos2::new(60.0, 1213.9), Pos2::new(108.0, 1227.9));
+        let grazed = a.intersect(touching);
+        assert!(
+            grazed.width() <= 0.5 || grazed.height() <= 0.5,
+            "two runs that share an edge ({grazed:?}) are being called an overlap"
         );
     }
 }
