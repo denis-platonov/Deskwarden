@@ -1386,9 +1386,10 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
         ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
 
         // Spec section 5's keyboard model for this window: Ctrl+K focuses
-        // search, Ctrl+L locks, Ctrl+N opens the new-item form. Ctrl+Shift+F
-        // ("fill in app") is checked separately, down in the `DetailMode::Read`
-        // arm below, where the selected item is already in scope.
+        // search, Ctrl+L locks, Ctrl+N opens the new-item form. There used to
+        // be a fourth, Ctrl+Shift+F ("fill in app"), checked down in the
+        // `DetailMode::Read` arm; it was removed with the header button it
+        // was the keyboard equivalent of.
         let (ctrl_k, ctrl_l, ctrl_n) = ui.ctx().input(|i| {
             (
                 i.modifiers.ctrl && i.key_pressed(egui::Key::K),
@@ -2333,9 +2334,8 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                             }
                             let delete_pending = item_delete_pending.as_ref().map(|(id, _)| id.as_str()) == Some(item.id.as_str());
 
-                            // Everything this arm *draws* -- the pane and the
-                            // Ctrl+Shift+F gate over it -- lives in
-                            // `draw_read_arm` rather than here, so it can be
+                            // Everything this arm *draws* -- the pane -- lives
+                            // in `draw_read_arm` rather than here, so it can be
                             // driven headlessly by a test. See that
                             // function's doc for why that is not a stylistic
                             // preference on this particular arm.
@@ -2357,9 +2357,6 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                             let login = item.login.as_ref();
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
-                                DetailAction::Fill => {
-                                    fill_item_into_app(item, &cache, &injector, &fill_stats);
-                                }
                                 DetailAction::CopyUsername => {
                                     if let Some(username) = login.and_then(|l| l.username.as_deref()) {
                                         ui.ctx().copy_text(username.to_string());
@@ -3842,10 +3839,13 @@ fn apply_totp_poll_result(
     }
 }
 
-/// Everything `run`'s `DetailMode::Read` arm *draws*: the detail pane itself
-/// and the Ctrl+Shift+F gate layered over it. Returns the single
-/// [`DetailAction`] the arm then acts on; it performs no side effects of its
-/// own, so a test can call it with nothing but an `egui::Context`.
+/// Everything `run`'s `DetailMode::Read` arm *draws*: the detail pane itself.
+/// Returns the single [`DetailAction`] the arm then acts on; it performs no
+/// side effects of its own, so a test can call it with nothing but an
+/// `egui::Context`.
+///
+/// It used to layer a `CTRL+SHIFT+F` gate over the pane as well; that chord
+/// went with the header button it was the keyboard equivalent of.
 ///
 /// **This is a function, and not a block inside `run`'s closure, because the
 /// single most load-bearing line of commit b758f5e had no test.** That commit
@@ -3854,9 +3854,7 @@ fn apply_totp_poll_result(
 /// *never called* for a card, a note, an identity or an SSH key, and every
 /// kind-aware decision in `detail.rs` is correct and inert -- this
 /// repository's most-repeated defect shape. Reinstating the guard left all
-/// 392 tests green. The same hole covered the [`fill_hotkey_applies`] call
-/// site: reverting it to a bare `ui.ctx().input(..)` check kept
-/// `fill_hotkey_applies_tests` green while the hotkey filled a card again.
+/// 392 tests green.
 ///
 /// Neither is observable by running the app: the vault this was built against
 /// holds 1656 items and every one of them is a login. `draw_read_arm_tests`
@@ -4060,7 +4058,7 @@ fn draw_read_arm(
     // worker thread and is cached per path for the life of the window.
     apps: &mut crate::app_identity::AppIdentityCache,
 ) -> DetailAction {
-    let mut action = draw_detail_read(
+    let action = draw_detail_read(
         ui,
         item,
         folder,
@@ -4071,42 +4069,16 @@ fn draw_read_arm(
         icon,
         apps,
     );
-    // Ctrl+Shift+F (spec section 5) is the keyboard equivalent of clicking
-    // "Fill in app" -- checked here, not at the top level, because it needs
-    // exactly the selected `item` and the button click above doesn't. Gated
-    // on the item's kind by the same predicate the button is; see
-    // `fill_hotkey_applies`.
-    if fill_hotkey_applies(
-        item,
-        ui.ctx()
-            .input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::F)),
-    ) {
-        action = DetailAction::Fill;
-    }
+    // **CTRL+SHIFT+F used to be read here, and is gone with the button it
+    // was the keyboard equivalent of.** Its whole identity was "clicking
+    // Fill in app, from the keyboard"; with the button removed it would have
+    // been an unlabelled keystroke that types the user's credentials into a
+    // window, which is the reported complaint ("I'm not sure what it does")
+    // with even the label taken away. Nothing was reworded to keep it
+    // discoverable, because the honest place for a manual fill is the row
+    // context menu's worded "Fill in app" -- which is untouched, as are the
+    // Auto, Prompt and global-hotkey triggers.
     action
-}
-
-/// Whether Ctrl+Shift+F should fill the currently selected item.
-///
-/// Gated on exactly the predicate the "Fill in app" button is
-/// (`detail::item_offers_fill`), not on a second copy of the rule: the
-/// shortcut is that button's keyboard equivalent, so hiding the button for a
-/// card while leaving the shortcut live would keep the very door open that
-/// hiding it was meant to close -- two empty strings typed into whatever
-/// window is focused. Pulled out of the `egui` closure so that pairing is
-/// something a test can assert rather than something a reader has to notice.
-///
-/// Its *call site* is `draw_read_arm`, which is itself a function rather than
-/// a block inside `run`'s closure, so `draw_read_arm_tests` can prove the
-/// wiring as well as the rule -- reverting the call site to a bare
-/// `ui.ctx().input(..)` check used to leave every test here green.
-/// Takes the ITEM, not just its kind, because the button's predicate does:
-/// `detail::item_offers_fill` is the kind AND the item's binding not being
-/// dead, and a chord that stayed on the kind alone would be the door left
-/// open beside a hidden button -- the exact failure this doc's own second
-/// paragraph describes, one field further down.
-fn fill_hotkey_applies(item: &VaultItem, pressed: bool) -> bool {
-    pressed && detail::item_offers_fill(item, crate::vault_bridge::ItemKind::of(item))
 }
 
 /// Whether `run`'s per-frame TOTP block should spawn a new background poll
@@ -10526,111 +10498,12 @@ mod fill_target_tests {
 }
 
 #[cfg(test)]
-mod fill_hotkey_applies_tests {
-    use super::fill_hotkey_applies;
-    use crate::app_match::{AppMatch, TriggerMode};
-    use crate::vault_bridge::{ItemKind, VaultItem};
-
-    /// An item of `kind`, carrying no `deskwarden:app-match` field at all.
-    fn item_of_kind(kind: ItemKind) -> VaultItem {
-        let item_type = match kind {
-            ItemKind::Login => 1,
-            ItemKind::SecureNote => 2,
-            ItemKind::Card => 3,
-            ItemKind::Identity => 4,
-            ItemKind::SshKey => 5,
-            ItemKind::Unknown(other) => other,
-        };
-        let item: VaultItem = serde_json::from_str(&format!(
-            r#"{{"id":"id-1","name":"Ledgerline","fields":[],"type":{item_type}}}"#
-        ))
-        .unwrap();
-        // The premise of every case below: the fixture really is the kind it
-        // is named for, so a builder that silently produced a Login for
-        // everything could not make these assertions vacuous.
-        assert_eq!(ItemKind::of(&item), kind, "the fixture is not the kind it claims");
-        item
-    }
-
-    /// A login bound to a match `MatchEngine` can never look up: the host
-    /// process that owns the top-level window for every Microsoft Store app,
-    /// with no title recorded to tell those apps apart.
-    fn login_with_a_dead_binding() -> VaultItem {
-        let item = crate::vault_bridge::with_app_match(
-            &item_of_kind(ItemKind::Login),
-            &AppMatch {
-                process: "ApplicationFrameHost.exe".to_string(),
-                title: String::new(),
-                hosted: false,
-                path: String::new(),
-                args: String::new(),
-                sequence: String::new(),
-                trigger: TriggerMode::Auto,
-            },
-        );
-        assert!(
-            crate::vault_window::detail::item_binding_is_dead(&item),
-            "the premise: this binding really is dead"
-        );
-        item
-    }
-
-    /// Ctrl+Shift+F is the keyboard equivalent of the "Fill in app" button,
-    /// so it has to be gated by the same predicate. Gating only the button
-    /// would leave the hotkey typing two empty strings into the focused
-    /// window for exactly the kinds the button was hidden from -- a fix
-    /// correct at one layer and inert at the door next to it, which is the
-    /// shape this repository's ledger keeps recording.
-    #[test]
-    fn the_fill_hotkey_is_gated_by_the_same_rule_as_the_fill_button() {
-        for kind in [
-            ItemKind::Login,
-            ItemKind::SecureNote,
-            ItemKind::Card,
-            ItemKind::Identity,
-            ItemKind::SshKey,
-            ItemKind::Unknown(9),
-        ] {
-            let item = item_of_kind(kind);
-            assert_eq!(
-                fill_hotkey_applies(&item, true),
-                crate::vault_window::detail::item_offers_fill(&item, kind),
-                "{kind:?}: the hotkey and the button disagree"
-            );
-        }
-    }
-
-    /// **The door beside the hidden button.** The header stops drawing Fill
-    /// for a dead binding; a chord still gated on the KIND alone would reach
-    /// `fill_item_into_app` for the very item the pane just said Deskwarden
-    /// ignores. The pair below is the whole assertion: the same kind, the
-    /// same press, differing only in the binding.
-    #[test]
-    fn the_fill_hotkey_is_refused_on_a_login_whose_binding_is_dead() {
-        assert!(
-            fill_hotkey_applies(&item_of_kind(ItemKind::Login), true),
-            "the control: an unbound login is exactly what the hotkey is for"
-        );
-        assert!(
-            !fill_hotkey_applies(&login_with_a_dead_binding(), true),
-            "Ctrl+Shift+F fired on a binding the pane says never fires"
-        );
-    }
-
-    #[test]
-    fn an_unpressed_hotkey_fills_nothing_even_on_a_login() {
-        assert!(!fill_hotkey_applies(&item_of_kind(ItemKind::Login), false));
-    }
-}
-
-#[cfg(test)]
 mod draw_read_arm_tests {
     //! The wiring tests for the detail pane's Read arm.
     //!
     //! `detail.rs`'s own tests prove `draw_detail_read` obeys the per-kind
-    //! decisions. They cannot prove that `run` ever *calls* it, nor that the
-    //! Ctrl+Shift+F gate is the one at the call site. Both of those were
-    //! untested until this module existed, and both are load-bearing: commit
+    //! decisions. They cannot prove that `run` ever *calls* it. That was
+    //! untested until this module existed, and it is load-bearing: commit
     //! b758f5e's entire contribution was deleting an `item_type != Some(1)`
     //! early return from this arm, and reinstating it left all 392 tests
     //! green while every kind-aware behaviour silently disappeared.
@@ -10804,33 +10677,46 @@ mod draw_read_arm_tests {
         }
     }
 
-    /// **The regression guard for the hotkey call site.** `fill_hotkey_applies`
-    /// being correct proves nothing about whether the arm calls it: reverting
-    /// this call site to a bare `ui.ctx().input(..)` check leaves
-    /// `fill_hotkey_applies_tests` entirely green while Ctrl+Shift+F fills a
-    /// card with two empty strings again.
+    /// **CTRL+SHIFT+F does nothing in this window any more, and that is the
+    /// point of this test.**
+    ///
+    /// It replaces `the_fill_hotkey_gate_is_wired_at_the_call_site_for_
+    /// every_kind`, which pinned that the arm really consulted
+    /// `fill_hotkey_applies` before firing a fill. The button that chord was
+    /// the keyboard equivalent of was removed at the user's request and the
+    /// chord went with it, so the wiring that test guarded no longer exists.
+    ///
+    /// What is worth guarding NOW is the other direction: an unlabelled
+    /// keystroke that types the user's credentials must not come back by
+    /// accident. So the harness still presses the real CTRL+SHIFT+F event
+    /// into the arm, on a login -- the one kind that used to answer it -- and
+    /// on every other kind, and the arm must report nothing at all.
+    ///
+    /// `an_unpressed_hotkey_returns_no_action_on_a_login` was folded in here:
+    /// with the chord gone, "not pressed" and "pressed" are the same case,
+    /// and the pressed one is the stronger of the two.
     #[test]
-    fn the_fill_hotkey_gate_is_wired_at_the_call_site_for_every_kind() {
+    fn ctrl_shift_f_is_no_longer_a_fill_in_this_window_for_any_kind() {
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
-            let (action, _) = run_read_arm(&item, None, true);
-            let expected = if crate::vault_window::detail::kind_offers_fill(kind) {
-                DetailAction::Fill
-            } else {
-                DetailAction::None
-            };
-            assert_eq!(
-                action, expected,
-                "{kind:?}: Ctrl+Shift+F at the call site disagrees with kind_offers_fill"
-            );
+            for pressed in [false, true] {
+                let (action, texts) = run_read_arm(&item, None, pressed);
+                assert_eq!(
+                    action,
+                    DetailAction::None,
+                    "{kind:?}: CTRL+SHIFT+F pressed={pressed} produced {action:?} -- the \
+                     chord is live again"
+                );
+                // The positive control: the arm really did draw the pane, so
+                // "no action" is not the vacuous answer of a frame that
+                // painted nothing. `an_item` names every fixture "Sample".
+                assert!(
+                    texts.iter().any(|t| t == "Sample"),
+                    "{kind:?}: the arm painted no pane, so it could not have answered a \
+                     chord either; painted: {texts:?}"
+                );
+            }
         }
-    }
-
-    /// The other half: the gate must not manufacture a fill out of nothing.
-    #[test]
-    fn an_unpressed_hotkey_returns_no_action_on_a_login() {
-        let (action, _) = run_read_arm(&an_item(Some(1)), None, false);
-        assert_eq!(action, DetailAction::None);
     }
 
     /// **The folder this arm is handed reaches the header.**

@@ -64,11 +64,6 @@ const TITLE_MIN: f32 = 120.0;
 /// inside a row the design draws, and this is the vertical space in a
 /// rearrangement the design does not draw at all.
 const HEADER_ROW_GAP: f32 = 10.0;
-/// The primary action's label and its chord, named once so the widths
-/// [`header_layout`] reserves are measured from the very strings that are
-/// later painted.
-const FILL_LABEL: &str = "Fill in app";
-const FILL_HINT: &str = "CTRL+SHIFT+F";
 /// The body below the strip: `padding: 18px 24px`.
 const BODY_PAD_X: i8 = 24;
 const BODY_PAD_Y: i8 = 18;
@@ -337,7 +332,6 @@ pub const MAX_HISTORY_ROWS: usize = 8;
 pub enum DetailAction {
     None,
     Edit,
-    Fill,
     CopyUsername,
     CopyPassword,
     CopyTotp,
@@ -936,9 +930,10 @@ pub enum CopyShortcut {
 ///
 /// The chords are KeePass's, which password-manager users already have in
 /// their fingers. All three are free in this app, checked rather than
-/// assumed: `vault_window::mod` takes CTRL+K, CTRL+L and CTRL+N, the fill
-/// button takes CTRL+SHIFT+F, the login window takes CTRL+H, and the global
-/// fill hotkey is CTRL+ALT+B.
+/// assumed: `vault_window::mod` takes CTRL+K, CTRL+L and CTRL+N, the login
+/// window takes CTRL+H, and the global fill hotkey is CTRL+ALT+B. (It used to
+/// take CTRL+SHIFT+F as well, for the header's "Fill in app" button; button
+/// and chord are both gone, so that key is free again.)
 ///
 /// **CTRL+ALT+B not colliding with CTRL+B is a fact about Windows, not about
 /// egui.** An earlier version of this comment claimed the two were "a
@@ -958,8 +953,11 @@ pub enum CopyShortcut {
 /// *open* URL and CTRL+SHIFT+U for *copy* URL. CTRL+U is already this app's
 /// copy-username, so the shifted form is the one that stays consistent with
 /// both. Checked free rather than assumed, over the whole crate: the only
-/// SHIFT chord anywhere in it is `vault_window::mod`'s CTRL+SHIFT+F, and the
-/// only other binding on `U` is the CTRL+U above.
+/// other SHIFT chord anywhere in it is [`OPEN_APP_CHORD`]'s CTRL+SHIFT+O --
+/// `vault_window::mod`'s CTRL+SHIFT+F is gone with the button it belonged to
+/// -- and the only other binding on `U` is the CTRL+U above. Both surviving
+/// SHIFT chords are in [`pane_chords`], which is what the collision guard
+/// actually walks; this paragraph is the part of the survey no table can do.
 ///
 /// **A shifted chord is only safe here because of `matches_exact`.** Under
 /// the `consume_key` this pane used to call, CTRL+SHIFT+U *was* CTRL+U and a
@@ -1547,16 +1545,15 @@ struct HeaderLayout {
     /// The controls have moved off the title's line onto their own, right
     /// aligned underneath it. The strip gets taller; nothing is dropped.
     stacked: bool,
-    /// "Fill in app" still carries its `CTRL+SHIFT+F` hint.
-    hint: bool,
 }
 
 /// **What the header gives up, in order, as the pane narrows -- and it is
 /// never the title.**
 ///
 /// The commit that made the controls claim their width first fixed a real
-/// bug (a "Fill in app" measured painting at x = -34.5, entirely off a 298pt
-/// pane) and introduced its mirror image: with the controls served first the
+/// bug (the header's primary button, since removed, measured painting at
+/// x = -34.5, entirely off a 298pt pane) and introduced its mirror image:
+/// with the controls served first the
 /// title got the remainder, the remainder at 298pt was 21.6pt, and egui
 /// elided a 26-character name down to a lone "…" painted *inside the strip's
 /// left padding, on top of the avatar*. A layout that fits by annihilating
@@ -1565,46 +1562,37 @@ struct HeaderLayout {
 /// painted-text assertion in this file reads the full name off a galley that
 /// drew one ellipsis.
 ///
-/// So the title is given a floor ([`TITLE_MIN`]) and everything else is
-/// ranked by how much it costs to lose:
+/// So the title is given a floor ([`TITLE_MIN`]) and the one thing left to
+/// spend is **the single line**: below the width at which the controls and a
+/// [`TITLE_MIN`]-wide title both fit beside the avatar, the controls move to
+/// their own row under the title. The strip gets taller, which the design
+/// does not draw -- but the design also does not draw a 298pt pane, and a
+/// taller strip costs some body space while the alternative costs the item's
+/// name.
 ///
-/// 1. **The shortcut hint.** Pure redundancy -- twelve monospace characters
-///    annotating a chord that works whether or not they are painted, and
-///    wider than the label they annotate. First to go, and it does not come
-///    back on the way down: a strip that regained ornament as the window
-///    shrank would be harder to reason about than one that only ever sheds.
-/// 2. **The single line.** Below that the controls move to their own row
-///    under the title. The strip gets taller, which the design does not draw
-///    -- but the design also does not draw a 298pt pane, and a taller strip
-///    costs some body space while the alternative costs the item's name.
+/// **There used to be a rung above this one**: the header's primary button
+/// carried a `CTRL+SHIFT+F` shortcut hint that was dropped first, being pure
+/// redundancy. The button and its chord are both gone, so the ladder has one
+/// rung and this function one decision. What has NOT changed is that the
+/// stacked branch is still reached at the app's own minimum: the star and the
+/// kebab plus their gap are 82pt, and at 298pt the strip has 250pt inside its
+/// padding of which the avatar and its gap take 58, leaving 192 -- less than
+/// the 82 + 14 + 120 one line needs.
 ///
 /// Nothing is ever dropped, and no control is ever shrunk below its 34px hit
-/// target. The arithmetic says why there is no third option: at 298pt the
-/// strip has 250pt inside its padding, the avatar and its gap take 58, and
-/// the star, the kebab and a hintless "Fill in app" take about 188 of the
-/// 192 left. Even reduced to icons the three controls plus their gaps leave
-/// the title 0-ish points on one line. One row at that width means dropping
-/// a control; stacking keeps all three, worded.
+/// target.
 ///
 /// Pure, and taking measured widths rather than measuring them, for this
 /// file's standing reason: a decision reachable only from inside an eframe
 /// closure is a decision that will not be tested.
-fn header_layout(content_width: f32, controls_with_hint: f32, controls_bare: f32) -> HeaderLayout {
+fn header_layout(content_width: f32, controls: f32) -> HeaderLayout {
     // What is left of the strip's content box once the avatar and the gap
     // after it are taken -- the band the controls and the title share.
     let beside_avatar = content_width - HEADER_AVATAR - HEADER_GAP;
-    let fits_on_one_line =
-        |controls: f32| controls + HEADER_GAP + TITLE_MIN <= beside_avatar;
-    if fits_on_one_line(controls_with_hint) {
-        HeaderLayout { stacked: false, hint: true }
-    } else if fits_on_one_line(controls_bare) {
-        HeaderLayout { stacked: false, hint: false }
-    } else {
-        // Stacked, and hintless: the ladder only descends. The controls' own
-        // row is the full content width rather than `beside_avatar`, so it
-        // has 58pt more to work with than the branch above just rejected.
-        HeaderLayout { stacked: true, hint: false }
-    }
+    // Stacked, when they do not both fit: the controls' own row is the full
+    // content width rather than `beside_avatar`, so it has 58pt more to work
+    // with than the one-line branch just rejected.
+    HeaderLayout { stacked: controls + HEADER_GAP + TITLE_MIN > beside_avatar }
 }
 
 /// `modifiers+key` and **nothing else held**, taken out of the event queue.
@@ -1697,13 +1685,6 @@ pub fn draw_detail_read(
     // re-derived per widget, so the header, the chrome, the body and the
     // metadata strip cannot disagree about what this item is.
     let kind = ItemKind::of(item);
-    // **Derived once, beside `kind`, for the same reason `kind` is.** The
-    // header measures the room its controls need and then draws them, and
-    // those two must not be able to disagree -- drift between them is what
-    // put a control off the edge of the pane once already (see
-    // `controls_width` below). It is also what `fill_hotkey_applies` asks, so
-    // the button and Ctrl+Shift+F cannot end up offering different things.
-    let offers_fill = item_offers_fill(item, kind);
     let login = item.login.as_ref();
     let username = login.and_then(|l| l.username.as_deref()).unwrap_or("");
     let password = login
@@ -1805,30 +1786,16 @@ pub fn draw_detail_read(
             ui.set_width(content_width);
 
             // **Measured before anything is drawn, and drawn the way the
-            // measurement said.** `header_primary_button_width` lays the very
-            // galleys the button will paint, so the room reserved here and
-            // the room taken below cannot drift apart -- which is the failure
-            // mode that put this control off the edge of the pane once
-            // already.
+            // measurement said.** Drift between the room the strip reserves
+            // and the room its controls take is the failure mode that put a
+            // control off the edge of the pane once already.
             //
-            // A kind that offers no fill contributes neither the button nor
-            // the gap before it, so the strip does not reserve space for a
-            // control it will not draw.
-            let controls_width = |hint: Option<&str>| {
-                let fill = if offers_fill {
-                    HEADER_GAP + theme::header_primary_button_width(ui, FILL_LABEL, hint)
-                } else {
-                    0.0
-                };
-                // The star and the kebab, square at the strip's own control
-                // height, plus the one gap between them.
-                theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP + fill
-            };
-            let layout = header_layout(
-                content_width,
-                controls_width(Some(FILL_HINT)),
-                controls_width(None),
-            );
+            // The star and the kebab, square at the strip's own control
+            // height, plus the one gap between them -- the whole of what this
+            // strip now draws. There is no per-item term any more: the worded
+            // primary button that used to contribute one has been removed.
+            let controls_width = theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP;
+            let layout = header_layout(content_width, controls_width);
 
             // The three pieces of the strip, as closures, because the two
             // arrangements below draw exactly the same controls in exactly
@@ -1921,29 +1888,24 @@ pub fn draw_detail_read(
                         action = DetailAction::Delete;
                     }
                 });
-                // **Stays in the strip, and stays worded.** It is this
-                // app's primary action, not one of the items the user
-                // asked to have relocated into the kebab. What it gives up
-                // when the pane is narrow is its shortcut hint and then
-                // its line, never its label -- see `header_layout`.
+                // **The strip's worded "Fill in app" button used to sit
+                // here, and was REMOVED at the user's request**: "Fill in
+                // app button I think we can remove -- I'm not sure what it
+                // does". It had become the second of two adjacent controls
+                // acting on the matched app -- the other one, the app's
+                // name as a link, opens it -- and one of the two typing the
+                // user's credentials while the other launched a program was
+                // not a distinction the strip made.
                 //
-                // Not drawn for a kind that cannot be filled: the fill
-                // path resolves exactly a username and a password, so this
-                // button on a card would type two empty strings into
-                // whatever window happens to be focused. See
-                // `kind_offers_fill`.
+                // **Only the manual trigger went.** Autofill on focus, the
+                // prompt overlay and the global hotkey are untouched, and
+                // the item list's row context menu still offers a plainly
+                // worded "Fill in app" (`item_list::menu_entries`) -- which
+                // is the manual trigger, now on the surface that says what
+                // it is. `fill_target` and `app::find_window_for_process`
+                // still refuse a dead binding and a host process for every
+                // one of those paths.
                 //
-                // Not drawn for a DEAD binding either -- see
-                // `item_offers_fill`. The card below is printing "Deskwarden
-                // is ignoring this match, so it never fires" in this same
-                // frame; a live Fill above it would be an offer to act
-                // through it anyway.
-                if offers_fill
-                    && theme::header_primary_button(ui, FILL_LABEL, layout.hint.then_some(FILL_HINT))
-                        .clicked()
-                {
-                    action = DetailAction::Fill;
-                }
                 // **In the header, and gated on no kind at all.** Every
                 // other control in this strip is per-kind because it acts
                 // on the item's *contents* -- Fill needs a username and a
@@ -2497,39 +2459,24 @@ fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
 
 /// Whether *this item's* binding is one [`app_match_is_dead`] calls dead.
 ///
-/// The item-level spelling of that predicate, so the two places that must act
-/// on it -- the header's Fill button here, and `vault_window::mod`'s
-/// `fill_item_into_app` -- ask one question rather than each unpacking the
-/// field for themselves. An item with no field, and an item whose field will
-/// not parse, are both `false`: there is no binding to be dead, and the fill
-/// path's own "no app is matched to this item yet" is the honest report for
-/// them.
+/// The item-level spelling of that predicate, so the places that must act on
+/// it ask one question rather than each unpacking the field for themselves.
+/// An item with no field, and an item whose field will not parse, are both
+/// `false`: there is no binding to be dead, and the fill path's own "no app is
+/// matched to this item yet" is the honest report for them.
+///
+/// **This is now consulted where it actually protects the credential** --
+/// `vault_window::mod`'s `fill_target`, which is the only place
+/// `fill_item_into_app` gets an hwnd from, and which BOTH of that function's
+/// callers reach. It used to have a second, shallower caller in
+/// `item_offers_fill`: the predicate behind the header's "Fill in app" button
+/// and its `CTRL+SHIFT+F` chord, which stopped the pane *offering* what
+/// `fill_target` would refuse. That button and that chord were removed at the
+/// user's request, so the shallow spelling went with them and the deep one
+/// -- the one commit `aae9429`'s own doc called "the load-bearing" gate --
+/// stayed exactly where it was.
 pub fn item_binding_is_dead(item: &VaultItem) -> bool {
     crate::vault_bridge::extract_app_match(item).is_some_and(|m| app_match_is_dead(&m))
-}
-
-/// Whether the pane offers "Fill in app" for this item at all -- the ONE
-/// predicate behind the header button, the room the header strip reserves for
-/// it, and `vault_window::mod`'s `fill_hotkey_applies`.
-///
-/// [`kind_offers_fill`] is the first half and answers "could a fill of this
-/// item mean anything" (see its doc: a card has no username and password to
-/// type). [`item_binding_is_dead`] is the second and answers "is there an app
-/// this fill could go to". A dead binding fails the second: the card in the
-/// same frame is printing [`APP_MATCH_DEAD_NOTICE`] -- *Deskwarden is ignoring
-/// this match, so it never fires* -- and a live blue Fill beside that sentence
-/// is the pane offering to act through a binding it has just said it never
-/// acts through. Worse than the trigger pills that commit `8db47a0` removed
-/// for the same reason: the pills only changed which of three things did not
-/// happen, and this types the user's password into whatever the resolution
-/// picks.
-///
-/// **Not the only gate, and deliberately not the load-bearing one.** The
-/// refusal that actually protects the credential is in
-/// `app::find_window_for_process`, which cannot be bypassed by any caller.
-/// This one is so that the pane does not *offer* what that one will refuse.
-pub fn item_offers_fill(item: &VaultItem, kind: ItemKind) -> bool {
-    kind_offers_fill(kind) && !item_binding_is_dead(item)
 }
 
 /// Which of the card's three bodies an item asks for.
@@ -4781,17 +4728,16 @@ mod tests {
                 painted.iter().any(|t| t == expected),
                 "the pane never said {expected:?}; it painted {painted:?}"
             );
-            // "Fill in app" is still a word. The read pane's other controls
-            // are DRAWN now -- the favourite star, the kebab that carries
-            // Edit and Delete, the reveal eye -- so their absence has to be
-            // asserted against the shapes. Asserting the old strings here
-            // would be a test that cannot fail: no pane in this app paints
-            // the word "Delete" outside an open menu any more.
-            assert!(
-                !painted.iter().any(|t| t == "Fill in app"),
-                "the out-of-vault pane offers Fill, which acts through the live item list \
-                 and would do nothing for this item"
-            );
+            // There used to be a `!painted.contains("Fill in app")` here.
+            // It is DELETED rather than kept, by this test's own stated
+            // rule: the read pane's controls are DRAWN now, so their
+            // absence has to be asserted against the shapes, and "asserting
+            // the old strings here would be a test that cannot fail". With
+            // the header's Fill button removed, no pane in this app paints
+            // that word at all, so the assertion had become exactly the
+            // always-true check the comment warns about. The shape
+            // assertions below are what actually distinguish an
+            // out-of-vault pane from a live one.
             assert!(
                 frame.stars.is_empty(),
                 "the out-of-vault pane draws a favourite star, which writes through the \
@@ -5636,10 +5582,15 @@ mod tests {
             let texts = painted(&item, &TotpState::NoSecret);
             let expected = kind == ItemKind::Login;
 
-            assert_eq!(
-                contains(&texts, "Fill in app"),
-                expected,
-                "{kind:?}: wrong Fill button presence; painted: {texts:?}"
+            // The header's "Fill in app" button was removed at the user's
+            // request. Asserted as an absolute over EVERY kind rather than
+            // dropped: the row that used to read `expected` here is the one
+            // that would come back first if the button did, and this fails
+            // the moment any pane paints that label again.
+            assert!(
+                !contains(&texts, "Fill in app"),
+                "{kind:?}: the removed header Fill button is painted again; painted: \
+                 {texts:?}"
             );
             assert_eq!(
                 contains(&texts, "AUTOFILL TARGETS"),
@@ -6043,10 +5994,14 @@ mod tests {
             });
             let texts = painted(&item, &TotpState::NoSecret);
 
-            assert_eq!(
-                contains(&texts, "Fill in app"),
-                kind_offers_fill(kind),
-                "{kind:?}: the Fill button disagrees with kind_offers_fill"
+            // The header Fill button this row used to check is removed; the
+            // AUTOFILL TARGETS card and the metadata strip below are the
+            // surfaces `kind_offers_fill` still gates, and they are what
+            // keeps this matrix meaningful. The absolute stays so the button
+            // cannot creep back in unnoticed.
+            assert!(
+                !contains(&texts, "Fill in app"),
+                "{kind:?}: the removed header Fill button is painted again"
             );
             assert_eq!(
                 contains(&texts, "AUTOFILL TARGETS"),
@@ -6844,73 +6799,36 @@ mod tests {
         assert!(any_live, "no shape in the matrix was live");
     }
 
-    /// **The frame that said both things at once.** The reviewer's exhibit
-    /// was one frame painting "...ignoring this match, so it never fires..."
-    /// and a live blue "Fill in app" above it. Asserted on the PANE, not on
-    /// the predicate: a gate correct in `item_offers_fill` and never reached
-    /// by the header is this repository's signature defect.
+    /// **`item_binding_is_dead` is decided by the BINDING and by nothing
+    /// else**, over every kind and all three binding states.
+    ///
+    /// This used to be `only_a_fillable_kind_with_a_binding_that_can_fire_
+    /// offers_a_fill`, asserting the removed `item_offers_fill`. That
+    /// predicate was the shallow half of commit `aae9429`'s fix -- "do not
+    /// OFFER what the fill path will refuse" -- and it went with the header
+    /// button and the `CTRL+SHIFT+F` chord that were its only two callers.
+    /// The half that refuses the fill is `vault_window::mod`'s `fill_target`,
+    /// which asks this same function and is pinned by
+    /// `a_dead_binding_resolves_no_window_to_fill`; what is left to assert
+    /// HERE is that the answer this hands it is kind-independent, which is
+    /// the property the old matrix's own controls were checking.
     #[test]
-    fn a_dead_binding_is_not_offered_a_fill_in_the_frame_that_says_it_never_fires() {
-        let dead = bound_to(&a_login(), &a_dead_host_match());
-        let mut pane = Pane::new();
-        let frame = pane.idle(&dead, &TotpState::NoSecret);
-
-        // The premise, read off the same frame: the card really is saying the
-        // binding is ignored. Without it this test would pass on a pane that
-        // drew no card at all.
-        assert!(
-            frame.strings().iter().any(|t| t.contains("ignoring this match")),
-            "the card is not calling this binding dead, so there is nothing to contradict: \
-             {:?}",
-            frame.strings()
-        );
-        assert!(
-            !frame.painted(FILL_LABEL),
-            "the pane offers {FILL_LABEL:?} on a binding it has just said never fires: {:?}",
-            frame.strings()
-        );
-
-        // **The positive control, and it is the whole test.** The same kind,
-        // the same pane, differing only in the binding -- so a header that
-        // had simply stopped drawing Fill altogether could not pass.
-        let mut pane = Pane::new();
-        let live = pane.idle(&bound_to(&a_login(), &a_desktop_match()), &TotpState::NoSecret);
-        assert!(
-            live.painted(FILL_LABEL),
-            "a login bound to a LIVE match lost its Fill button: {:?}",
-            live.strings()
-        );
-        let mut pane = Pane::new();
-        let unbound = pane.idle(&a_login(), &TotpState::NoSecret);
-        assert!(
-            unbound.painted(FILL_LABEL),
-            "an unbound login lost its Fill button: {:?}",
-            unbound.strings()
-        );
-    }
-
-    /// The predicate behind the frame above, over every kind and both
-    /// bindings, so the pair the header and `fill_hotkey_applies` share is
-    /// pinned in one place.
-    #[test]
-    fn only_a_fillable_kind_with_a_binding_that_can_fire_offers_a_fill() {
+    fn a_binding_is_dead_or_not_whatever_kind_carries_it() {
         for kind in EVERY_KIND {
             let bare = an_item(item_type_for(kind));
-            assert_eq!(
-                item_offers_fill(&bare, kind),
-                kind_offers_fill(kind),
-                "{kind:?}: an item bound to nothing should follow the kind alone"
+            assert!(
+                !item_binding_is_dead(&bare),
+                "{kind:?}: an item bound to nothing has no binding to be dead"
             );
             let dead = bound_to(&bare, &a_dead_host_match());
             assert!(
-                !item_offers_fill(&dead, kind),
-                "{kind:?}: a dead binding is still offered a fill"
+                item_binding_is_dead(&dead),
+                "{kind:?}: a dead binding was not recognised as dead"
             );
             let live = bound_to(&bare, &a_desktop_match());
-            assert_eq!(
-                item_offers_fill(&live, kind),
-                kind_offers_fill(kind),
-                "{kind:?}: a LIVE binding changed the answer, which is the control"
+            assert!(
+                !item_binding_is_dead(&live),
+                "{kind:?}: a LIVE binding was called dead, which is the control"
             );
         }
         // The control on `item_binding_is_dead` itself: it is the binding
@@ -8318,40 +8236,36 @@ mod tests {
         );
     }
 
-    /// The strip's one remaining button is the design's `height: 34px`
-    /// filled primary, with its shortcut hint at 10px monospace beside its
-    /// 13px label rather than appended to it at the label's own size.
-    ///
-    /// The outlined half of the old pair is gone with Edit; what stands
-    /// beside the primary now is the star and the kebab, and
-    /// `the_star_and_the_kebab_share_the_strips_34px_hit_target` pins those
-    /// to the same height so the strip still sits on one line.
-    #[test]
-    fn the_header_primary_button_is_the_designs_34px_filled_control() {
-        let item = an_item(Some(1));
-        let rects = painted_rects(&item, &TotpState::NoSecret);
-        assert!(
-            rects
-                .iter()
-                .any(|(r, fill)| r.height() == 34.0 && *fill == theme::BLUE),
-            "no 34px blue-filled \"Fill in app\" button: {rects:?}"
-        );
-
-        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        assert_eq!(only(&painted, "Fill in app").1.size, 13.0);
-        let (_, hint) = only(&painted, "CTRL+SHIFT+F");
-        assert_eq!(hint.size, 10.0, "the shortcut hint is not the design's 10px");
-        assert_eq!(hint.family, egui::FontFamily::Monospace);
-    }
+    // `the_header_primary_button_is_the_designs_34px_filled_control` stood
+    // here and is DELETED. Every one of its assertions was about the header's
+    // "Fill in app" button -- that a 34px `theme::BLUE`-filled rect existed,
+    // that the label was 13px, that a `CTRL+SHIFT+F` hint sat beside it at
+    // 10px monospace. The button was removed at the user's request, so there
+    // is no subject left: the test could only be made to pass by asserting
+    // something else. The strip's remaining controls have their own test
+    // immediately below, which no longer measures itself against the button.
+    //
+    // `theme::header_primary_button` and `header_primary_button_width` are
+    // now unused by this crate's own code. They are left in `theme.rs`
+    // untouched and still covered by that module's tests.
 
     /// The two drawn controls are square at the strip's own 34px control
-    /// height, so their HIT TARGETS match the button between them rather
+    /// height, so their HIT TARGETS are the strip's full 34px band rather
     /// than being only as big as the marks they paint.
     ///
     /// A star drawn at its own 18px would look identical in a screenshot and
     /// be half as easy to hit, which is exactly the kind of regression a
     /// shape-drawn control invites: nothing about the painted geometry says
     /// how big the clickable area is.
+    ///
+    /// **The band used to be read off the header's "Fill in app" button**,
+    /// which stood between these two and was the one 34px `theme::BLUE` rect
+    /// in the strip. That button was removed at the user's request, so the
+    /// band is now derived from [`theme::HEADER_BUTTON_HEIGHT`] -- the very
+    /// constant the strip lays itself out with -- centred on each mark. The
+    /// defect this was written for is untouched by that change: an 18px star
+    /// still fails the edge click 15pt above its own centre, and the two
+    /// controls are still required to share one centre line.
     #[test]
     fn the_star_and_the_kebab_share_the_strips_34px_hit_target() {
         let item = a_login();
@@ -8359,30 +8273,28 @@ mod tests {
         let frame = pane.idle(&item, &TotpState::NoSecret);
         let star = frame.star().rect;
         let kebab = frame.kebab();
-        let primary = painted_rects(&item, &TotpState::NoSecret)
-            .into_iter()
-            .find(|(r, fill)| r.height() == 34.0 && *fill == theme::BLUE)
-            .map(|(r, _)| r)
-            .expect("no 34px primary button to measure the icons against");
+        let band = theme::HEADER_BUTTON_HEIGHT;
+        assert_eq!(band, 34.0, "the strip's control height is no longer the design's 34px");
 
         // The marks are smaller than the band they sit in, so the painted
         // geometry alone cannot say how big the hit target is. Two things
-        // can: that both sit on the primary's own centre line, and that a
-        // click near the TOP EDGE of the primary's 34px band -- well outside
-        // the marks themselves -- still activates each of them.
+        // can: that both sit on ONE centre line, and that a click near the
+        // TOP EDGE of the 34px band -- well outside the marks themselves --
+        // still activates each of them.
+        assert!(
+            (star.center().y - kebab.center().y).abs() <= 0.5,
+            "the star and the kebab are not on one centre line: {star:?} {kebab:?}"
+        );
         for (name, mark) in [("star", star), ("kebab", kebab)] {
             assert!(
-                (mark.center().y - primary.center().y).abs() <= 0.5,
-                "the {name} is not on the primary button's centre line"
-            );
-            assert!(
-                mark.height() < primary.height(),
+                mark.height() < band,
                 "the {name}'s painted mark already fills the whole 34px band, so the \
                  edge click below proves nothing about its hit target"
             );
         }
 
-        let corner = |mark: egui::Rect| egui::pos2(mark.center().x, primary.top() + 2.0);
+        let corner =
+            |mark: egui::Rect| egui::pos2(mark.center().x, mark.center().y - band / 2.0 + 2.0);
 
         let mut star_pane = Pane::new();
         let _ = star_pane.idle(&item, &TotpState::NoSecret);
@@ -8410,10 +8322,11 @@ mod tests {
     /// Every other geometry test in this file lays the pane out at
     /// [`PANE`] -- 900pt, which is a ~1500px window. The app's own minimum
     /// is 900px WIDE IN TOTAL, and at that size the detail column is
-    /// [`MIN_PANE`]: 298pt. With four worded buttons in this strip,
-    /// "Fill in app" was measured painting at x = -34.5..21.9 -- entirely
-    /// off the pane -- and "Favourite" overlapping the item's own title.
-    /// Nothing caught it, because nothing tried that width.
+    /// [`MIN_PANE`]: 298pt. With four worded buttons in this strip, the
+    /// primary ("Fill in app", since removed) was measured painting at
+    /// x = -34.5..21.9 -- entirely off the pane -- and "Favourite"
+    /// overlapping the item's own title. Nothing caught it, because nothing
+    /// tried that width.
     ///
     /// The first attempt at this test asserted two things -- controls inside
     /// the pane, and `control.left() >= title.right()` -- and both held while
@@ -8451,9 +8364,13 @@ mod tests {
 
         let title = frame.rect_of("Ledgerline Treasury Portal");
         let avatar = frame.avatar_tile();
+        // The header's "Fill in app" button was a third entry here until it
+        // was removed at the user's request. The two that remain are the two
+        // the original defect actually mispainted -- the star sat on the
+        // avatar at 27.3..45.9 -- so every clause below still fails against
+        // the state this test was written for.
         let controls = [
             ("the favourite star", frame.star().rect),
-            ("the Fill in app button", frame.rect_of("Fill in app")),
             ("the kebab", frame.kebab()),
         ];
 
@@ -8537,9 +8454,15 @@ mod tests {
         let mut item = a_login();
         item.name = "Ledgerline Treasury Portal".to_string();
 
-        // 4pt steps through the two rearrangement thresholds (~420pt, where
-        // the controls come back onto the title's line, and ~497pt, where the
-        // shortcut hint returns) and out the far side of both.
+        // 4pt steps through the rearrangement threshold and out the far side
+        // of it. There used to be two -- ~420pt, where the controls came back
+        // onto the title's line, and ~497pt, where the removed Fill button's
+        // shortcut hint returned. With the button and its hint gone the
+        // controls are a fixed 82pt, so the one threshold left is ~322pt
+        // (82 + 14 + TITLE_MIN, plus the avatar's 58 and the strip's 48 of
+        // padding). MIN_PANE is 298, below it, so this sweep still starts on
+        // the stacked side and crosses to the other -- which is the whole
+        // point of a band.
         let mut width = MIN_PANE;
         while width <= 560.0 {
             let mut pane = Pane::wide(width);
@@ -8567,7 +8490,6 @@ mod tests {
             let avatar = frame.avatar_tile();
             for (name, rect) in [
                 ("the favourite star", frame.star().rect),
-                ("the Fill in app button", frame.rect_of("Fill in app")),
                 ("the kebab", frame.kebab()),
             ] {
                 assert!(
@@ -8594,6 +8516,36 @@ mod tests {
         assert!(
             MIN_PANE < PANE,
             "the minimum-width test is laying out a WIDER pane than the ordinary one"
+        );
+    }
+
+    /// **`header_layout` still has two answers, and the stacked one is still
+    /// the answer at the app's own minimum.**
+    ///
+    /// Removing the header's "Fill in app" button took a rung off this
+    /// ladder: the strip's controls used to be a per-item width with a
+    /// shortcut hint that could be shed, and are now a fixed star + gap +
+    /// kebab. A collapse that far can quietly leave a function with one
+    /// reachable branch, and this is the pane whose controls were once
+    /// painted at x = -34.5 -- so the branch that keeps them off the title at
+    /// 298pt is asserted directly rather than inferred from the sweep above.
+    ///
+    /// The controls' width is spelled the way `draw_detail_read` spells it,
+    /// and the content width the way the strip's `Frame` produces it, so this
+    /// cannot pass on numbers the real header does not use.
+    #[test]
+    fn the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide_one() {
+        let controls = theme::HEADER_BUTTON_HEIGHT * 2.0 + HEADER_GAP;
+        let content = |pane: f32| pane - f32::from(HEADER_PAD_X) * 2.0;
+
+        assert!(
+            header_layout(content(MIN_PANE), controls).stacked,
+            "at the app's minimum the controls and a {TITLE_MIN}pt title are being kept on \
+             one line -- which is how the strip painted a control off the pane before"
+        );
+        assert!(
+            !header_layout(content(PANE), controls).stacked,
+            "the ordinary {PANE}pt pane is stacking, so the unstacked branch is dead"
         );
     }
 
