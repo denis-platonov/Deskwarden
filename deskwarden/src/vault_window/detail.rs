@@ -12557,4 +12557,231 @@ mod read_pane_scroll_tests {
             "the identity card spans {scrolls:?} on a pane that scrolls and {fits:?} on one              that does not -- the bar's lane is being reserved conditionally"
         );
     }
+
+    /// Frames enough for egui to fade a floating scroll bar all the way in,
+    /// with the pointer parked over the pane throughout.
+    ///
+    /// **Frame 1 is useless here and the count is not decoration.** egui
+    /// emits both of the bar's rects on the very first frame with alpha 0
+    /// and fades them up over the following frames; a test that read frame 1
+    /// would certify the placement of a bar that was never drawn, which is
+    /// exactly how this crate has already shipped a vacuous scroll-bar test.
+    /// `bar_rects` therefore requires a VISIBLE fill, and this many frames is
+    /// what makes one exist. Same number, and the same reason, as
+    /// `item_list.rs`'s `SETTLE_FRAMES`.
+    const SETTLE_FRAMES: usize = 20;
+
+    /// The tallest item minus its binding: at [`NARROW`] the app card's path
+    /// row widens the body sideways and paints into the lane on its own
+    /// account, which is the separate horizontal defect noted in
+    /// `assert_visible` and not what these assertions are about.
+    fn the_tallest_item_without_its_binding() -> VaultItem {
+        let mut item = the_tallest_item();
+        item.fields.clear();
+        item
+    }
+
+    /// [`SETTLE_FRAMES`] frames with the pointer in the middle of the pane,
+    /// which is what the app is doing whenever the user is looking at this
+    /// pane and reaching for the bar.
+    fn settled(size: egui::Vec2, item: &VaultItem) -> Shot {
+        let mut pane = ShortPane::new(size);
+        let over = vec![egui::Event::PointerMoved(pane.bounds().center())];
+        let mut shot = pane.frame(item, over.clone());
+        for _ in 1..SETTLE_FRAMES {
+            shot = pane.frame(item, over.clone());
+        }
+        shot
+    }
+
+    /// The left edge of the lane [`BODY_PAD_X`] reserves.
+    fn lane_left(pane: egui::Vec2) -> f32 {
+        pane.x - f32::from(BODY_PAD_X)
+    }
+
+    /// Every VISIBLE rectangle that starts inside the reserved lane and is
+    /// tall and narrow enough to be a scroll bar rather than a card spilling
+    /// into it.
+    ///
+    /// The search and the assertions it feeds answer two different
+    /// questions, and the filter is written so that it cannot answer the
+    /// assertions'.
+    ///
+    /// * **Is this a bar?** -- the width ceiling is the LANE's width, not the
+    ///   bar's, deliberately. egui's floating default is a 2pt sliver, and
+    ///   a ceiling set at [`theme::SCROLLBAR_WIDTH`] would quietly accept it
+    ///   as a well-formed bar. What a sliver fails is the assertion, not the
+    ///   search. The height floor drops the hairlines and row separators
+    ///   that the overflowing card paints across the lane at [`NARROW`].
+    /// * **Is the bar where it belongs?** -- NOT asked here. In particular
+    ///   there is no `rect.right() <= pane.x` clause: `detail_edit.rs` had
+    ///   one and `5fc41ef` removed it, because it made the identical clause
+    ///   in the assertion unfailable and made a bar OVERHANGING the pane
+    ///   vanish from the search instead of failing it -- reporting "no bar
+    ///   was painted, so this test is vacuous" in place of the real problem.
+    ///   An overhanging bar is FOUND here and REJECTED below, by a message
+    ///   that says it overhangs.
+    fn bar_rects(shot: &Shot, pane: egui::Vec2) -> Vec<egui::Rect> {
+        let lane = lane_left(pane);
+        shot.rects
+            .iter()
+            .filter(|(rect, fill)| {
+                fill.a() > 0
+                    && rect.left() >= lane - 0.5
+                    && rect.width() > 0.0
+                    && rect.width() <= f32::from(BODY_PAD_X) + 0.5
+                    && rect.height() > f32::from(BODY_PAD_X)
+            })
+            .map(|(rect, _)| *rect)
+            .collect()
+    }
+
+    /// **Where the read pane's bar is, in absolute pane coordinates.**
+    ///
+    /// The user's report was that the read pane's right padding had shrunk:
+    /// a bar centred in its 24pt lane left 9pt of clear space between the
+    /// cards and the bar and 9pt of dead gap behind it, against the pane's
+    /// own edge where nothing is compared to it. `72c0fea` moved the rule
+    /// into `theme::scrollbar_in_gutter` -- the bar takes the OUTERMOST
+    /// `SCROLLBAR_WIDTH` of the lane -- which gives this pane 18pt of clear
+    /// space and nothing behind the bar. Measured on a 298pt pane: the lane
+    /// is x = 274..298, the cards end at 274, and the bar's two rects (the
+    /// trough and the handle) both span 292..298.
+    ///
+    /// **Until this test existed the read pane asserted NOTHING about that.**
+    /// Its seven scroll tests locate ink anywhere in the lane and none names
+    /// a position, so setting `bar_outer_margin = 18.0` here -- the bar hard
+    /// against the cards with 18pt of dead gap behind it, the reported defect
+    /// in its worst form -- left the whole suite green. The placement was
+    /// protected only by the accident of sharing a helper with
+    /// `detail_edit.rs`, which did have an absolute-x assertion.
+    ///
+    /// **All three assertions below are load-bearing.** Checked one at a
+    /// time, so that none is later dropped as redundant and none is
+    /// documented as the essential one when it is not:
+    ///
+    /// * dropping `scrollbar_in_gutter` altogether leaves egui's floating
+    ///   default, a sliver pinned to the pane's right edge -- measured here at
+    ///   296..298, 2pt wide. That fails the WIDTH check first; with the width
+    ///   check neutered the FLUSH check fires on its own
+    ///   (`spans x = 296..298 but the outermost 6pt ... is 292..298`), because
+    ///   flushness is measured from the bar's LEFT edge and a narrow bar that
+    ///   shares the right edge does not share the left one;
+    /// * `bar_outer_margin = 18.0` -- the bar hard against the cards -- fails
+    ///   the FLUSH check and nothing else in this test;
+    /// * `bar_outer_margin = -3.0` puts the bar at 295..301, straddling the
+    ///   pane edge. It is FOUND by `bar_rects` and fails the OVERHANG check,
+    ///   which is the whole point of not filtering on overhang. Push it far
+    ///   enough out (-10.0, 302..308) and egui clips every pixel of it before
+    ///   it is ever tessellated: then there is no bar in the shot to reject,
+    ///   and the empty-`bars` assertion fires instead -- which is the true
+    ///   report, since the reader sees no bar at all.
+    #[test]
+    fn the_body_scroll_bar_is_flush_to_the_outer_edge_of_its_own_lane() {
+        let pane = egui::vec2(NARROW, SHORT);
+        let item = the_tallest_item_without_its_binding();
+        let shot = settled(pane, &item);
+
+        let bars = bar_rects(&shot, pane);
+        assert!(
+            !bars.is_empty(),
+            "a body that overflows a {NARROW}x{SHORT}pt pane paints nothing at all in its \
+             scroll lane, so nothing tells the reader there is more below"
+        );
+        // The outermost `SCROLLBAR_WIDTH` of the lane, absolute: 292..298.
+        let bar_left = pane.x - theme::SCROLLBAR_WIDTH;
+        for bar in &bars {
+            assert!(
+                (bar.width() - theme::SCROLLBAR_WIDTH).abs() <= 0.5,
+                "the scroll bar is {}pt wide, not {}pt -- this is egui's floating default \
+                 painted over the card, not a bar in the reserved lane. Bars: {bars:?}",
+                bar.width(),
+                theme::SCROLLBAR_WIDTH
+            );
+            // Three separate assertions, because they fail for three
+            // different reasons and a reader who sees one must not be told
+            // another's story.
+            assert!(
+                bar.right() <= pane.x + 0.5,
+                "the scroll bar spans x = {}..{} and so hangs {}pt off the right edge of \
+                 the {}pt pane it scrolls -- that ink is painted outside the panel \
+                 altogether, where the pane clips it. Bars: {bars:?}",
+                bar.left(),
+                bar.right(),
+                bar.right() - pane.x,
+                pane.x
+            );
+            assert!(
+                (bar.left() - bar_left).abs() <= 0.5,
+                "the scroll bar spans x = {}..{} but the outermost {}pt of the \
+                 {BODY_PAD_X}pt lane is {bar_left}..{} -- the bar is not flush to the \
+                 pane's outer edge, so it leaves {}pt of the reader's padding as a dead \
+                 gap BEHIND itself and only {}pt of clear space between it and the cards, \
+                 which is the report this lane exists to answer. Bars: {bars:?}",
+                bar.left(),
+                bar.right(),
+                theme::SCROLLBAR_WIDTH,
+                pane.x,
+                pane.x - bar.right(),
+                bar.left() - lane_left(pane)
+            );
+        }
+    }
+
+    /// The other side of the same measurement: with the bar showing there are
+    /// 18 of the lane's 24 points clear between the cards and the bar, and
+    /// with nothing to scroll all 24 are clear.
+    ///
+    /// Ink that BEGINS at or past that edge is what counts: the pane and
+    /// header backgrounds span the whole width and cross it by construction,
+    /// and at [`NARROW`] the tall card overflows its own width and spills
+    /// across it -- the separate horizontal defect noted in `assert_visible`,
+    /// which every test in this module already holds apart from the lane.
+    ///
+    /// `the_bar_does_not_move_the_cards` already pins the cards' right edge
+    /// at `NARROW - BODY_PAD_X` on both heights; this states what stands
+    /// between that edge and the pane's, which is the quantity the user
+    /// actually reported on. Anything VISIBLY painted in the lane counts
+    /// against the clear space, whatever it is.
+    #[test]
+    fn the_lane_leaves_the_cards_eighteen_points_of_clear_space() {
+        let item = the_tallest_item_without_its_binding();
+
+        // Scrolling: the nearest visible ink past the cards' edge is the bar.
+        let pane = egui::vec2(NARROW, SHORT);
+        let edge = lane_left(pane);
+        let shot = settled(pane, &item);
+        let nearest = shot
+            .rects
+            .iter()
+            .filter(|(rect, fill)| fill.a() > 0 && rect.left() >= edge - 0.5)
+            .map(|(rect, _)| rect.left())
+            .fold(pane.x, f32::min);
+        assert!(
+            (nearest - edge - 18.0).abs() <= 0.5,
+            "the first ink past the cards' edge on a scrolling pane is at x = {nearest}, \
+             leaving {}pt of clear space and not the 18 the lane is meant to give \
+             ({BODY_PAD_X}pt lane less a {}pt bar flush to the outer edge)",
+            nearest - edge,
+            theme::SCROLLBAR_WIDTH
+        );
+
+        // Not scrolling: the whole lane is clear.
+        let roomy = egui::vec2(NARROW, ROOMY);
+        let edge = lane_left(roomy);
+        let shot = settled(roomy, &item);
+        let intruders: Vec<egui::Rect> = shot
+            .rects
+            .iter()
+            .filter(|(rect, fill)| fill.a() > 0 && rect.left() >= edge - 0.5)
+            .map(|(rect, _)| *rect)
+            .collect();
+        assert!(
+            intruders.is_empty(),
+            "a body with nothing to scroll still paints {} rect(s) starting past the cards' edge \
+             at x = {edge}, so the reader sees less than the {BODY_PAD_X}pt of padding \
+             this pane is meant to have: {intruders:?}",
+            intruders.len()
+        );
+    }
 }
