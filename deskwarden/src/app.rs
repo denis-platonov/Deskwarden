@@ -163,6 +163,18 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
             match fill_action(&item, totp.as_deref()) {
                 Ok(FillAction::Default) => {
                     let (username, password) = credentials_for(&item);
+                    // **The one plaintext password on this arm's stack, and
+                    // now the one that gets wiped.** `credentials_for` hands
+                    // back an owned `String` clone that lives for the whole
+                    // arm -- across a UIA attempt, a SendInput fallback and a
+                    // refusal -- and dropped it back to the allocator in the
+                    // clear. Every other holder of a resolved secret in this
+                    // crate zeroizes (`Plan`, `TextRun`, `LoginForm`,
+                    // `hello::unlock_password_for`); wrapping at the call site
+                    // wipes on every exit including the early return and an
+                    // unwind, without changing `credentials_for`'s signature
+                    // or its callers.
+                    let password = zeroize::Zeroizing::new(password);
                     if username.is_empty() && password.is_empty() {
                         log::warn!(
                             "vault item {item_id} has no login credentials; nothing to fill"
@@ -178,6 +190,32 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                         Ok(()) => crate::fill_stats::FillOutcome::Typed,
                         Err(e) => {
                             log::error!("fill failed for item {item_id} into hwnd {hwnd}: {e}");
+                            // **A refusal reaches the user here too**, for the
+                            // reason spelled out on the `Err(refusal)` arm
+                            // below: a fill that quietly does nothing is
+                            // indistinguishable from a hotkey that never
+                            // registered. `d6ff857` gave this path the
+                            // one-fill-at-a-time guard, so it can now refuse
+                            // exactly as the Sequence arm can -- and the user
+                            // who pressed the hotkey has no idea which of the
+                            // two paths their item was on.
+                            //
+                            // **Only the refusal, and not every `Err`.** The
+                            // other ways this returns `Err` are a foreground
+                            // that moved between the match and the keystroke
+                            // and a failed `SendInput` call: Win32 diagnostics
+                            // with no action behind them, and a modal box is
+                            // an expensive way to tell a user something they
+                            // cannot act on. A UIA failure does not reach here
+                            // at all -- `Injector::fill` logs it and falls
+                            // back, and a fallback that then succeeds returns
+                            // `Ok`. [`ALREADY_TYPING`] is the one error whose
+                            // text is written for a person and names the way
+                            // out of the state it reports, which is what makes
+                            // it worth interrupting them with.
+                            if e == crate::injector::ALREADY_TYPING {
+                                REAL_NOTIFIER.refused(&e);
+                            }
                             crate::fill_stats::FillOutcome::NotTyped
                         }
                     };
@@ -1622,5 +1660,133 @@ mod fill_dispatch_tests {
         assert!(sequence::take_notices().is_empty());
         let _ = fill(item_with(""));
         assert!(sequence::take_notices().is_empty());
+    }
+
+    /// Runs one **default** fill while something else genuinely holds the
+    /// one-fill-at-a-time flag, and hands back everything that fill can be
+    /// judged by.
+    ///
+    /// The flag is taken for real rather than faked by a filler that returns
+    /// the sentence: what is under test is the arm's response to
+    /// `Injector::fill`'s *own* refusal, and a fixture that manufactures the
+    /// string would keep passing if the guard were removed from the default
+    /// path altogether -- which is the regression `d6ff857` exists to prevent.
+    ///
+    /// It does its own locking rather than going through `fill_reporting`,
+    /// because the guard has to be held *across* the fill and
+    /// `sequence_test_lock` is not reentrant. Both are taken here in the same
+    /// order every other test in the crate takes them: the test lock first,
+    /// so a test that acquires the flag without it cannot race this one.
+    fn fill_while_something_else_is_typing(
+        item: VaultItem,
+    ) -> (Arc<Recorder>, crate::fill_stats::FillStats, Vec<String>) {
+        let _serialised = crate::injector::sequence_test_lock();
+        let _ = sequence::take_notices();
+        let held =
+            crate::injector::SequenceGuard::acquire().expect("nothing else holds the flag");
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("refused-default");
+        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
+        drop(held);
+        (rec, stats, sequence::take_notices())
+    }
+
+    /// **A refused default fill reaches the user, exactly as a refused
+    /// sequence does.**
+    ///
+    /// This is the whole asymmetry: `d6ff857` gave both fill paths the guard,
+    /// so both can refuse -- but only the Sequence arm told anyone. A default
+    /// fill that quietly does nothing is indistinguishable from a hotkey that
+    /// never registered, and the user's next move differs completely between
+    /// the two.
+    #[test]
+    fn a_refused_default_fill_tells_the_user_something_is_already_typing() {
+        let (rec, _stats, notices) = fill_while_something_else_is_typing(item_with(""));
+
+        // Nothing was typed by either path: the fixture really did refuse.
+        assert!(rec.default_fills.lock().unwrap().is_empty());
+        assert!(rec.sequences.lock().unwrap().is_empty());
+
+        assert_eq!(notices.len(), 1, "the user was not told: {notices:?}");
+        assert_eq!(notices[0], crate::injector::ALREADY_TYPING);
+        // The sentence must be actionable, for the same reason the sequence
+        // path's is: a bare "no" is the thing being ruled out.
+        assert!(notices[0].contains("press the hotkey again"), "got: {}", notices[0]);
+    }
+
+    /// **A refused default fill still records nothing**, which is the half of
+    /// this that must not have moved. The notifier is a side channel; the
+    /// count is the accounting, and a refusal is not a fill.
+    #[test]
+    fn a_refused_default_fill_counts_no_fill() {
+        let (_rec, stats, _notices) = fill_while_something_else_is_typing(item_with(""));
+        assert_eq!(stats.count("item-1"), 0, "a refused fill was counted");
+    }
+
+    /// **Negative control, and the reason the arm tests the error rather than
+    /// notifying on every one.**
+    ///
+    /// A default fill fails for reasons that are not refusals -- the
+    /// foreground moved between the match and the keystroke, a `SendInput`
+    /// call returned 0. Those are logged, they count nothing, and they are
+    /// diagnostics a modal box could tell the user nothing useful about. Only
+    /// the refusal has a sentence written for a person and a way out of the
+    /// state it names.
+    #[test]
+    fn a_default_fill_that_failed_for_another_reason_opens_no_dialog() {
+        let (rec, stats) = fill_reporting(
+            item_with(""),
+            crate::fill_stats::FillOutcome::Typed,
+            Err("SendInput delivered 0 of 2 events".to_string()),
+        );
+
+        // Positive control: the fill really was attempted and really did fail.
+        assert_eq!(rec.default_fills.lock().unwrap().len(), 1);
+        assert_eq!(stats.count("item-1"), 0, "a failed fill was counted");
+        assert!(sequence::take_notices().is_empty(), "a Win32 diagnostic was shown to the user");
+    }
+
+    /// **The default arm's own copy of the password does not reach the
+    /// allocator in the clear.**
+    ///
+    /// `LoginData::password` is already a `Zeroizing<String>`, so every clone
+    /// of the cached item wipes itself -- which left exactly one plaintext
+    /// copy on this path: the `String` `credentials_for` builds out of it,
+    /// live for the whole default arm. That copy is what this watches, and it
+    /// is why the assertion below is meaningful rather than being satisfied by
+    /// the wipes that were already there: replace the `Zeroizing::new` in
+    /// `fill_from_vault`'s Default arm with the bare `password` and this
+    /// fails, with the rest of the module green.
+    ///
+    /// The item is built here rather than by `item_with` so the password is
+    /// the probe string; the cache and the fixture are built **before** the
+    /// watch is armed, so what the watch sees is only what the fill itself
+    /// released.
+    #[test]
+    fn a_default_fill_does_not_release_the_password_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        let _serialised = crate::injector::sequence_test_lock();
+        let _ = sequence::take_notices();
+
+        let mut item = item_with("");
+        item.login.as_mut().expect("the fixture has a login").password =
+            Some(String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8").into());
+
+        let cache = cache_with(item);
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("default-lifetime");
+
+        let leaked = plaintext_reached_the_allocator(|| {
+            fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+        });
+
+        // Positive control: the fill really did take the default path and
+        // really did handle the probe, so a `false` above cannot mean "nothing
+        // happened".
+        assert_eq!(rec.default_fills.lock().unwrap().len(), 1);
+        assert!(!leaked, "the default fill freed the password in the clear");
     }
 }
