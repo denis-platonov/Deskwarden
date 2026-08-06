@@ -12210,6 +12210,87 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
 
+        /// **The lock above is a discipline, and this is what enforces it.**
+        ///
+        /// `FILL_LOCK` is taken by hand at the top of five test bodies. Delete
+        /// one of those lines, or add a sixth `process_foreground_event` test
+        /// without one, and nothing fails: the race it closes is microseconds
+        /// wide and is won almost always. What losing it costs is not a red
+        /// test but a **real `MessageBoxW` on the developer's desktop** --
+        /// this binary links the library without `cfg(test)`, so it compiles
+        /// `RealNotifier::refused`'s dialog branch and not its recorder, and
+        /// `ALREADY_TYPING` is exactly the error `fill_from_vault` shows the
+        /// user. A hazard whose only symptom is an occasional window that no
+        /// CI run would ever see is precisely the kind that has to be held at
+        /// the source, in the manner of this file's other shape guards.
+        ///
+        /// It pins the property rather than a list: *every* test in this
+        /// module that dispatches a foreground event takes the lock, and takes
+        /// it **before** the dispatch. A sixth test is welcome; a sixth
+        /// unguarded one is not.
+        #[test]
+        fn every_test_here_that_dispatches_a_foreground_event_takes_the_fill_lock() {
+            // Every needle is `concat!`-split, so this test cannot match its
+            // own text and pronounce a module guarded that is nothing but it.
+            let source = include_str!("main.rs");
+            let head = concat!("    mod the_dispatch_that_actually", "_fills {");
+            let at =
+                source.find(head).expect("this module's own header is gone from main.rs");
+            let rest = &source[at..];
+            let end = rest.find(concat!("mod startup_shape", "_tests")).expect(
+                "nothing closes this module's slice, so the guard would read the rest of \
+                 the file and check tests that are not these",
+            );
+            let module = &rest[..end];
+
+            let dispatch = concat!("process_foreground", "_event(");
+            let take_lock = concat!("lock", "_fill();");
+
+            // The needles still match something, and the slice really is this
+            // module. Without this a rename on either side would leave the
+            // loop below with nothing to check and passing for that reason.
+            assert_eq!(
+                module.matches(dispatch).count(),
+                5,
+                "this module no longer has exactly five foreground dispatches. That is \
+                 allowed -- but the count is here so that adding or renaming one makes \
+                 someone re-read the loop below rather than letting it quietly check \
+                 fewer tests than it used to"
+            );
+
+            let mut checked = 0;
+            for case in module.split(concat!("#[te", "st]")).skip(1) {
+                let Some(dispatched_at) = case.find(dispatch) else {
+                    continue;
+                };
+                let locked_at = case.find(take_lock).unwrap_or_else(|| {
+                    panic!(
+                        "a test in this module calls `process_foreground_event` without \
+                         taking `FILL_LOCK`. `Injector::fill` takes the process-global \
+                         `SEQUENCE_IN_FLIGHT` flag, and this binary compiles the \
+                         notifier's real `MessageBoxW` branch -- so losing that race \
+                         opens a task-modal window on the desktop of whoever ran \
+                         `cargo test`. The offending body starts: {:?}",
+                        &case[..case.len().min(300)]
+                    )
+                });
+                assert!(
+                    locked_at < dispatched_at,
+                    "a test in this module takes `FILL_LOCK` only *after* it has already \
+                     dispatched, which guards nothing at all: {:?}",
+                    &case[..case.len().min(300)]
+                );
+                checked += 1;
+            }
+            assert_eq!(
+                checked, 5,
+                "the per-test split found {checked} dispatching tests, not the five the \
+                 count above says are there -- the `#[test]` split has stopped lining up \
+                 with the bodies, so this guard is checking something other than what it \
+                 says it checks"
+            );
+        }
+
         /// **Finding 1, for `TriggerMode::Auto`.** Deleting the `handle_match`
         /// call leaves this with an empty `Filled`.
         #[test]
