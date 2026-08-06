@@ -995,98 +995,21 @@ pub const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 // so it would have sat here indefinitely with a doc comment describing a
 // control that no longer exists.
 
-/// The detail pane's filled header button (design 2b's "Fill in app":
-/// `height: 34px; padding: 0 14px; border-radius: 8px; background: #1b3fa0;
-/// color: #ffffff; font-size: 13px; font-weight: 600`) with its shortcut hint
-/// nested inside the same pill at `font-size: 10px; opacity: 0.85`.
-///
-/// [`primary_button`] renders a hint by *appending it to the label*, so it
-/// comes out at the label's own 13px in the label's own weight -- the design
-/// draws a distinctly smaller, softer monospace run. Same two-galley
-/// construction as [`toolbar_button_with_shortcut`], which had the identical
-/// requirement one pane over.
-///
-/// `shortcut` is an `Option` because the hint is the first thing this control
-/// gives up when the strip it sits on runs out of room: on a narrow pane the
-/// twelve monospace characters of "CTRL+SHIFT+F" are wider than the label they
-/// annotate, and the chord keeps working whether or not they are painted. See
-/// `detail.rs`'s `header_layout`, which is what decides.
-pub fn header_primary_button(ui: &mut Ui, label: &str, shortcut: Option<&str>) -> Response {
-    let (label_galley, hint_galley) = header_primary_galleys(ui, label, shortcut);
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(
-            header_primary_width_of(&label_galley, hint_galley.as_ref()),
-            HEADER_BUTTON_HEIGHT,
-        ),
-        Sense::click(),
-    );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.painter().rect_filled(rect, CornerRadius::same(8), BLUE);
-
-    let label_pos = Pos2::new(
-        rect.min.x + HEADER_PRIMARY_PAD_X,
-        rect.center().y - label_galley.size().y / 2.0,
-    );
-    let label_width = label_galley.size().x;
-    ui.painter().galley(label_pos, label_galley, Color32::WHITE);
-    if let Some(hint_galley) = hint_galley {
-        let hint_pos = Pos2::new(
-            label_pos.x + label_width + HEADER_PRIMARY_GAP,
-            rect.center().y - hint_galley.size().y / 2.0,
-        );
-        ui.painter()
-            .galley(hint_pos, hint_galley, HEADER_PRIMARY_HINT);
-    }
-    response
-}
-
-const HEADER_PRIMARY_PAD_X: f32 = 14.0;
-const HEADER_PRIMARY_GAP: f32 = 8.0;
-/// The hint's `opacity: 0.85`, over the blue fill -- `from_white_alpha(217)`,
-/// spelled out because that constructor is not `const`.
-const HEADER_PRIMARY_HINT: Color32 = Color32::from_rgba_premultiplied(217, 217, 217, 217);
-
-/// [`header_primary_button`]'s two runs, laid out but not painted.
-///
-/// Shared with [`header_primary_button_width`] rather than measured twice: a
-/// caller that reserves room for this pill and a pill that then allocates a
-/// different width is exactly the drift that put "Fill in app" off the left
-/// edge of the pane in the first place.
-fn header_primary_galleys(
-    ui: &Ui,
-    label: &str,
-    shortcut: Option<&str>,
-) -> (Arc<egui::Galley>, Option<Arc<egui::Galley>>) {
-    let label_galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
-        Color32::WHITE,
-    );
-    let hint_galley = shortcut.map(|shortcut| {
-        ui.painter().layout_no_wrap(
-            shortcut.to_string(),
-            FontId::new(10.0, FontFamily::Monospace),
-            HEADER_PRIMARY_HINT,
-        )
-    });
-    (label_galley, hint_galley)
-}
-
-fn header_primary_width_of(label: &Arc<egui::Galley>, hint: Option<&Arc<egui::Galley>>) -> f32 {
-    label.size().x
-        + hint.map_or(0.0, |hint| HEADER_PRIMARY_GAP + hint.size().x)
-        + HEADER_PRIMARY_PAD_X * 2.0
-}
-
-/// Exactly what [`header_primary_button`] would allocate, without drawing it
-/// -- so a caller can find out whether it has room for the pill *before*
-/// committing to a layout that has to hold it.
-pub fn header_primary_button_width(ui: &Ui, label: &str, shortcut: Option<&str>) -> f32 {
-    let (label_galley, hint_galley) = header_primary_galleys(ui, label, shortcut);
-    header_primary_width_of(&label_galley, hint_galley.as_ref())
-}
+// The FILLED 34px header button (design 2b's "Fill in app") is gone with the
+// control it drew. Commit `7da1bba` removed that button from the detail pane
+// at the user's request -- two adjacent controls acted on one application,
+// one launching it and one typing credentials into it, with nothing in the
+// strip saying which was which -- and took `DetailAction::Fill`, the
+// `CTRL+SHIFT+F` chord and the pane's own test for the pill with it.
+//
+// `header_primary_button` and `header_primary_button_width` were left `pub`
+// and unused by that commit, together with their private galley/width
+// helpers and the `HEADER_PRIMARY_*` numbers. Deleted here rather than kept:
+// a lib crate raises no dead-code warning for a `pub` item, so they would
+// have sat here indefinitely as a doc comment describing a control that no
+// longer exists -- the same reason the outlined 34px button above was
+// deleted rather than parked. `HEADER_BUTTON_HEIGHT` stays: `star_toggle`
+// and `kebab_button` still lay themselves out with it.
 
 /// The small outlined control at the right-hand end of a detail-pane row
 /// (design 2b's "Copy" / "Reveal" / "Open": `height: 28px; padding: 0 10px;
@@ -1120,8 +1043,9 @@ const ROW_BUTTON_TEXT_SIZE: f32 = 12.0;
 /// pane's MATCHED APP footer, which puts its controls beside the notes when
 /// they fit on that line and on a line of their own when they do not. Laying
 /// the same galley the button will lay is the whole point: a caller that
-/// estimated would reserve room the button then overflows, which is the drift
-/// `header_primary_button_width` exists to prevent in the header strip.
+/// estimated would reserve room the button then overflows -- the drift the
+/// header strip's own deleted `header_primary_button_width` existed to
+/// prevent, before the button it measured was removed.
 pub fn row_button_width(ui: &Ui, label: &str) -> f32 {
     let galley = ui.painter().layout_no_wrap(
         label.to_string(),
@@ -2026,8 +1950,9 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 pub const SCROLLBAR_WIDTH: f32 = 6.0;
 
 /// Configures `ui` so that an [`egui::ScrollArea`] shown inside it reserves a
-/// `gutter`-wide lane down its right-hand edge and draws its bar CENTRED in
-/// that lane, instead of over the content's own right edge.
+/// `gutter`-wide lane down its right-hand edge and draws its bar in the
+/// OUTERMOST [`SCROLLBAR_WIDTH`] of that lane, instead of over the content's
+/// own right edge.
 ///
 /// The caller MUST pair this with
 /// `.scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)` and with a
@@ -2048,46 +1973,56 @@ pub const SCROLLBAR_WIDTH: f32 = 6.0;
 ///   handle on a white track, i.e. invisible. Fixing that would have meant
 ///   overriding three widget states just to style a scroll bar.
 ///
-/// The centring itself is `bar_outer_margin`: egui pins a floating bar's
+/// The placement itself is `bar_outer_margin`: egui pins a floating bar's
 /// RIGHT edge at `outer_rect.right() - bar_outer_margin`, and the outer rect
 /// now ends at the container's own right edge because of the reserved lane.
-/// Half the leftover lane on each side therefore centres it. `floating_width`
-/// is raised to the full `bar_width` so the bar does not GROW leftward over
-/// the content when hovered -- a bar that only stays centred while dormant
-/// would not have fixed the report.
+/// Zero therefore puts the bar flush to the lane's OUTER edge -- where the
+/// platform's own scroll bars sit -- and leaves every point of the lane's
+/// slack on the inner side, between the bar and the content.
+/// `floating_width` is raised to the full `bar_width` so the bar does not
+/// GROW leftward over the content when hovered -- a bar that only stayed put
+/// while dormant would not have fixed the report.
 ///
-/// # Centring is not the balanced placement, and the item list no longer uses it
+/// # Why the outer edge and not the centre
 ///
-/// A follow-up report -- "the right padding feels smaller", on a list that
-/// DOES scroll, so the bar is genuinely needed -- measured out like this on
-/// the item list's 10pt lane: 10pt of clear space left of the tiles, 2pt
-/// right of them. There is a floor on that asymmetry and it is not zero.
-/// Every caller of this function pins two things by test: the content ends
-/// at `pane_right - gutter` (so the lane is exactly `gutter` wide and cannot
-/// be widened without moving the content), and the content keeps ONE width
-/// whether or not the bar is showing. The lane is therefore clear space when
-/// the bar is hidden and ink when it is not, so the hidden state and the
-/// shown state CANNOT both be symmetric: showing the bar costs the right
-/// side at least [`SCROLLBAR_WIDTH`]. That is the floor, and centring misses
-/// it by the outer half of the leftover lane -- 2pt on a 10pt gutter, 9pt on
-/// the read pane's 24pt one -- spent on a gap between the bar and the pane's
-/// own edge that the reader is not comparing to anything.
+/// The report: "the right padding feels smaller", on a list that DOES
+/// scroll, so the bar is genuinely needed. Measured on the item list's 10pt
+/// lane it was 10pt of clear space left of the tiles against 2pt right of
+/// them. There is a floor on that asymmetry and it is not zero. Every caller
+/// of this function pins two things by test: the content ends at
+/// `pane_right - gutter` (so the lane is exactly `gutter` wide and cannot be
+/// widened without moving the content), and the content keeps ONE width
+/// whether or not the bar is showing. The same strip of pane is therefore
+/// clear space when the bar is hidden and ink when it is not, so the hidden
+/// state and the shown state CANNOT both be symmetric: showing the bar costs
+/// the right side at least [`SCROLLBAR_WIDTH`]. Equal is unreachable; the
+/// floor -- `gutter - SCROLLBAR_WIDTH` of clear space -- is reachable, and
+/// `bar_outer_margin = 0` is what reaches it.
 ///
-/// `item_list.rs` therefore re-aims `bar_outer_margin` to 0 immediately
-/// after calling this, putting the bar flush to the lane's outer edge where
-/// the platform's own scroll bars sit, and taking its clear space from 2pt
-/// to the floor's 4pt. The rule belongs HERE, applied to every caller: it
-/// would take `detail.rs`'s read pane from 9pt of clear space to 18pt, and
-/// `detail_edit.rs`'s form -- whose lane is also 10pt, so whose residual is
-/// also 2pt, i.e. the same defect unreported -- to 4pt. It is not applied
-/// here yet only because both of those panes pin the centred placement in
-/// tests of their own, in files outside the change that measured this.
+/// Centring missed that floor by the OUTER half of the leftover lane, spent
+/// on a gap between the bar and the pane's own edge that the reader is not
+/// comparing to anything: 2pt of the item list's and the edit form's 10pt
+/// lanes, and 9pt of the read pane's 24pt one.
+///
+/// **Stated as "the outermost `SCROLLBAR_WIDTH` of the lane", not as a
+/// margin.** The rejected alternative was to keep centring for wide lanes
+/// and go flush only for narrow ones -- some threshold above which a gap
+/// behind the bar reads as deliberate rather than as lost padding. There is
+/// no such threshold in the design to read off, and it would make the three
+/// panes disagree about where a scroll bar lives for no reason a reader
+/// could see. The wide lane's numbers are better under the flush rule
+/// anyway: the read pane's right-hand clear space goes from 9pt to 18pt
+/// against 24pt on the left, i.e. from a quarter of the left side's to
+/// three quarters of it.
+///
+/// The other rejected framing was "the bar is flush to the CONTENT", which
+/// is the placement the very first report complained about.
 pub fn scrollbar_in_gutter(ui: &mut Ui, gutter: f32) {
     let scroll = &mut ui.spacing_mut().scroll;
     scroll.floating_allocated_width = gutter;
     scroll.bar_width = SCROLLBAR_WIDTH;
     scroll.floating_width = SCROLLBAR_WIDTH;
-    scroll.bar_outer_margin = (gutter - SCROLLBAR_WIDTH) / 2.0;
+    scroll.bar_outer_margin = 0.0;
 }
 
 /// Makes the floating bar of an [`egui::ScrollArea`] shown inside `ui` paint

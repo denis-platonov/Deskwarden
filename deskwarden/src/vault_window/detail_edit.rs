@@ -2134,8 +2134,10 @@ fn app_block(
 /// scroll bar, so the bar is drawn BESIDE the card rather than on top of it.
 ///
 /// 10pt, which is `item_list.rs`'s `LIST_PADDING` -- the same lane width that
-/// list already ships, leaving 2pt of clear space either side of a
-/// [`theme::SCROLLBAR_WIDTH`] bar centred in it.
+/// list already ships, leaving 4pt of clear space between the card and a
+/// [`theme::SCROLLBAR_WIDTH`] bar sitting flush to the lane's outer edge,
+/// and nothing behind the bar. See `theme::scrollbar_in_gutter` for why
+/// that 4pt is the floor and 10 is unreachable while the bar is showing.
 ///
 /// **Where it comes from is the difference from the two siblings.** In
 /// `item_list.rs` and `detail.rs` the lane REPLACES a right padding those
@@ -2299,7 +2301,11 @@ pub fn draw_detail_edit(
             // pointer is already on it. Commit `68f86cb` made the form
             // scrollable but left nothing on screen to say so, which is half
             // of the report it answered ("cannot scroll"). Same lane, and the
-            // same reason, as `item_list.rs`'s list and `detail.rs`'s body.
+            // same reason, as `item_list.rs`'s list and `detail.rs`'s body -- and,
+            // since the rule moved into the helper, the same PLACEMENT: the bar takes
+            // the outermost `theme::SCROLLBAR_WIDTH` of the lane rather than sitting
+            // centred in it, so all 4pt of the 10pt lane's slack falls between the bar
+            // and the card instead of 2pt there and 2pt behind the bar.
             theme::scrollbar_in_gutter(ui, FORM_SCROLL_GUTTER);
             // ... and the bar is hidden outright when there is nothing to
             // scroll: a full-height 6pt bar down a form that cannot move is
@@ -6664,16 +6670,29 @@ mod edit_pane_layout_tests {
     }
 
     /// **Finding 1, stated as geometry.** The bar the form scrolls with is a
-    /// [`theme::SCROLLBAR_WIDTH`] bar centred in a reserved lane -- not
-    /// egui's floating default, which is a 1.2pt sliver pinned to the pane's
-    /// extreme right and only widened once the pointer is already on it.
+    /// [`theme::SCROLLBAR_WIDTH`] bar filling the OUTER end of a reserved lane
+    /// -- not egui's floating default, which is a 1.2pt sliver pinned to the
+    /// pane's extreme right and only widened once the pointer is already on it.
+    ///
+    /// **This assertion was CENTRING and is now flush.** Finding 1 was about
+    /// the bar's WIDTH and about it being in a lane of its own at all; the
+    /// centring was the placement `theme::scrollbar_in_gutter` happened to ship
+    /// with, and it left 2pt of the 10pt lane behind the bar, against the pane's
+    /// own edge, where nothing is being compared to it. The item list measured
+    /// that as a real report ("the right padding feels smaller") and went flush;
+    /// the rule now lives in the helper, so this form follows. The assertion is
+    /// not weaker for it -- it still pins the bar to an ABSOLUTE x, one that is
+    /// still inside the lane and still clear of the card, and the same 0.5pt
+    /// tolerance would catch the same 1.2pt sliver (which egui pins to
+    /// `pane.x`, i.e. to the lane's outer edge with width 1.2, so the WIDTH
+    /// assertion above is what rejects it now that the position no longer does).
     ///
     /// Commit `68f86cb` made this form scrollable and left nothing on screen
     /// to say so; the user who reported "cannot scroll" got no affordance.
     /// Both sibling panes (`item_list.rs`, `detail.rs`) already draw the bar
     /// this way.
     #[test]
-    fn the_form_scroll_bar_is_a_full_bar_centred_in_its_own_lane() {
+    fn the_form_scroll_bar_is_a_full_bar_at_the_outer_edge_of_its_own_lane() {
         let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
         let ctx = styled_context(pane);
         let mut draft = tallest_draft();
@@ -6687,7 +6706,8 @@ mod edit_pane_layout_tests {
             pane.x,
             pane.y
         );
-        let centre = lane_left(pane) + FORM_SCROLL_GUTTER / 2.0;
+        // The lane's outermost `SCROLLBAR_WIDTH`, in absolute pane coordinates.
+        let bar_left = pane.x - theme::SCROLLBAR_WIDTH;
         for bar in &bars {
             assert!(
                 (bar.width() - theme::SCROLLBAR_WIDTH).abs() <= 0.5,
@@ -6697,10 +6717,15 @@ mod edit_pane_layout_tests {
                 theme::SCROLLBAR_WIDTH
             );
             assert!(
-                (bar.center().x - centre).abs() <= 0.5,
-                "the scroll bar's centre is at x = {} but the {FORM_SCROLL_GUTTER}pt lane's \
-                 is at {centre} -- the bar is not centred in its lane. Bars: {bars:?}",
-                bar.center().x
+                (bar.left() - bar_left).abs() <= 0.5 && bar.right() <= pane.x + 0.5,
+                "the scroll bar spans x = {}..{} but the outermost \
+                 {}pt of the {FORM_SCROLL_GUTTER}pt lane is {bar_left}..{} -- the bar \
+                 is not flush to the pane's outer edge, so it is spending the \
+                 reader's padding on a gap behind itself. Bars: {bars:?}",
+                bar.left(),
+                bar.right(),
+                theme::SCROLLBAR_WIDTH,
+                pane.x
             );
         }
     }

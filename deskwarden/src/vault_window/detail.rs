@@ -2012,9 +2012,13 @@ pub fn draw_detail_read(
     // The RIGHT padding is 0 here because the scroll bar below is given that
     // lane instead -- `theme::scrollbar_in_gutter` reserves exactly
     // `BODY_PAD_X` for itself, so the cards still end at
-    // `pane.right() - BODY_PAD_X` as they always did, and the bar is centred
-    // in the padding rather than drawn hard against them. Same arrangement,
-    // and the same reason, as `item_list.rs`'s list.
+    // `pane.right() - BODY_PAD_X` as they always did, and the bar takes the
+    // OUTERMOST `theme::SCROLLBAR_WIDTH` of that padding -- flush to the pane's
+    // edge, where the platform's own bars sit, so every point of the lane's
+    // slack falls between the bar and the cards (18pt of the 24) rather than
+    // half of it behind the bar (9pt and 9pt, which is what this pane shipped).
+    // Same arrangement, and the same reason, as `item_list.rs`'s list; the
+    // helper's doc comment is where that rule is argued.
     let body = egui::Rect::from_min_max(
         egui::pos2(
             pane.left() + f32::from(BODY_PAD_X),
@@ -8245,9 +8249,12 @@ mod tests {
     // something else. The strip's remaining controls have their own test
     // immediately below, which no longer measures itself against the button.
     //
-    // `theme::header_primary_button` and `header_primary_button_width` are
-    // now unused by this crate's own code. They are left in `theme.rs`
-    // untouched and still covered by that module's tests.
+    // `theme::header_primary_button` and `header_primary_button_width` were
+    // left `pub` and unused by that commit, with no test anywhere in the crate
+    // once this one went -- so they have since been DELETED, together with
+    // their private galley/width helpers and the `HEADER_PRIMARY_*` numbers.
+    // `theme.rs` carries the tombstone. `theme::HEADER_BUTTON_HEIGHT` stays,
+    // and is what the band below is now derived from.
 
     /// The two drawn controls are square at the strip's own 34px control
     /// height, so their HIT TARGETS are the strip's full 34px band rather
