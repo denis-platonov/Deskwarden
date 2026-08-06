@@ -457,6 +457,42 @@ impl TextRun {
         Self { pending: String::new(), rate }
     }
 
+    /// Appends to the accumulator **without ever letting `String` grow it**.
+    ///
+    /// This is the half of the wipe that was missing. `push_str` past capacity
+    /// goes through `GlobalAlloc::realloc`, and when the block moves, the old
+    /// buffer -- password and all -- is handed back to the allocator unwiped.
+    /// Neither [`Self::flush`]'s `zeroize` nor `Drop for TextRun` can reach
+    /// it: both act on the buffer that exists *now*, and by then the leaked
+    /// one is long gone. It happened on the **ordinary success path**, for any
+    /// sequence with content after `{PASSWORD}`.
+    ///
+    /// So growth is done by hand here: allocate a buffer that is big enough,
+    /// copy across, **wipe the old one, and only then release it**. After this
+    /// returns, `push_str` below is guaranteed to fit, so `String` never
+    /// reallocates this buffer at all.
+    ///
+    /// Doubling rather than reserving exactly keeps a long sequence from being
+    /// quadratic; the floor gives a first allocation that an ordinary username
+    /// does not immediately outgrow.
+    fn push(&mut self, text: &str) {
+        if self.pending.capacity() - self.pending.len() < text.len() {
+            let needed = self.pending.len() + text.len();
+            let mut grown =
+                String::with_capacity(needed.max(self.pending.capacity() * 2).max(64));
+            grown.push_str(&self.pending);
+            // Before the handover, not after: the assignment is what frees the
+            // old buffer, and it must already be zeroed when it goes.
+            self.pending.zeroize();
+            self.pending = grown;
+        }
+        debug_assert!(
+            self.pending.capacity() - self.pending.len() >= text.len(),
+            "the hand-grown buffer must leave String nothing to reallocate"
+        );
+        self.pending.push_str(text);
+    }
+
     /// The most **UTF-16 code units** that fit in one burst at this rate. At
     /// least one, so a `{DELAY=100000}` cannot produce a zero-length chunk and
     /// loop forever.
@@ -548,25 +584,25 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
         }
 
         match token {
-            Token::Literal(text) => run.pending.push_str(text),
+            Token::Literal(text) => run.push(text),
             Token::Field(FieldRef::Username) => {
                 if values.username.is_empty() {
                     return Err(Refusal::Unresolved("a username".into()));
                 }
-                run.pending.push_str(values.username);
+                run.push(values.username);
             }
             Token::Field(FieldRef::Password) => {
                 if values.password.is_empty() {
                     return Err(Refusal::Unresolved("a password".into()));
                 }
-                run.pending.push_str(values.password);
+                run.push(values.password);
             }
             Token::Field(FieldRef::Totp) => match values.totp {
-                Some(code) if !code.is_empty() => run.pending.push_str(code),
+                Some(code) if !code.is_empty() => run.push(code),
                 _ => return Err(Refusal::Unresolved("a one-time code".into())),
             },
             Token::Field(FieldRef::Custom(name)) => match values.custom_value(name) {
-                Some(value) if !value.is_empty() => run.pending.push_str(value),
+                Some(value) if !value.is_empty() => run.push(value),
                 _ => return Err(Refusal::Unresolved(format!("a field called {name}"))),
             },
             Token::Key(key) => {
@@ -1134,6 +1170,93 @@ mod plan_tests {
             );
         }
     }
+
+    /// **Secrets: the accumulator does not hand the password to the allocator
+    /// when it grows.**
+    ///
+    /// The two tests above watch `dealloc`, and `dealloc` is not how a
+    /// growing `String` releases its old buffer -- `realloc` is. While
+    /// `Watcher::realloc` forwarded blindly, both of them were silent on this
+    /// axis, and `TextRun::pending` was a plain `String` grown with
+    /// `push_str`: the password went in first, the literal after it forced the
+    /// grow, and the old block -- password and all -- went back to the
+    /// allocator unwiped on the **ordinary success path**. `Drop for TextRun`
+    /// and `flush`'s `zeroize` both act on the *current* buffer and never saw
+    /// it.
+    ///
+    /// Any sequence with content after `{PASSWORD}` reaches it:
+    /// `{PASSWORD}@contoso.com`, `{PASSWORD}{S:PIN}`, or a `{USERNAME}` long
+    /// enough that the accumulator grows part-way through the password.
+    ///
+    /// **Two positive controls, not one.** The bare drop proves the watch is
+    /// armed at all; the grown `String` proves it is armed *on the growth
+    /// axis specifically*, which is the half that was missing. Without the
+    /// second, deleting the `realloc` scan again would leave this test green
+    /// and vacuous -- the exact shape of failure this module's doc warns
+    /// about.
+    #[test]
+    fn growing_the_accumulator_does_not_release_the_password_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // The fixture must not be able to mistake one string for another.
+        assert_ne!(PROBE, USER, "the fixture cannot tell the password from the username");
+        assert!(!FILLER.contains(PROBE), "the filler would trip the probe on its own");
+
+        // Control one: the instrument is armed.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the allocator watch is not seeing an unwiped drop"
+        );
+
+        // Control two: the instrument is armed *on growth*. Built exactly
+        // like `TextRun::pending` -- empty, then the probe, then a literal
+        // that forces the grow -- so a heap that answered the subject's grow
+        // in place would answer this one in place too, and this control would
+        // fail rather than let the subject pass vacuously.
+        let mut grown = String::new();
+        grown.push_str(PROBE);
+        assert!(
+            plaintext_reached_the_allocator(|| grown.push_str(FILLER)),
+            "the allocator watch is not seeing a reallocated buffer"
+        );
+        drop(grown);
+
+        // **Leaked on purpose**, for the reason the refusal test above gives:
+        // the only free inside the watched region must be the one under test.
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+        // The literal comes *after* the field, so the password is already in
+        // the accumulator when the grow happens.
+        let tokens = parse(&format!("{{PASSWORD}}{FILLER}"));
+        let mut built: Option<Plan> = None;
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                built = Some(
+                    plan(&tokens, &Resolved { password, ..values() }).expect("plans"),
+                );
+            }),
+            "TextRun::pending's reallocated buffer released the password in the clear"
+        );
+
+        // The plan really did carry the password, so a refusal cannot be what
+        // made the assertion above pass.
+        let built = built.expect("the watched region built a plan");
+        assert!(typed(&built).contains(PROBE), "the plan never held the password");
+    }
+
+    /// Long enough that growing a probe-sized accumulation to hold it moves
+    /// the block rather than extending it in place. Only `z`, so it can never
+    /// contain the probe.
+    const FILLER: &str = concat!(
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    );
 }
 
 #[cfg(test)]

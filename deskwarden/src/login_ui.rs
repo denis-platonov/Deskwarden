@@ -4830,8 +4830,36 @@ pub(crate) mod password_lifetime_tests {
             unsafe { System.alloc_zeroed(layout) }
         }
 
+        /// **The axis this instrument was deaf on.** A `String` grown past
+        /// its capacity does not `dealloc` its old buffer -- it `realloc`s,
+        /// and the old block goes back to the allocator through *this*
+        /// method. While this forwarded blindly, every `!leaked` assertion in
+        /// the crate was silent about growth, which is the one mechanism the
+        /// `flush` comment in `injector::sequence` says it was worried about.
+        ///
+        /// **The scan happens before the call, never after.** Once
+        /// `System.realloc` returns, the old block may already be freed and
+        /// reading it is a use-after-free that the allocator's own debug
+        /// assertions abort on -- so the block is read while it is still
+        /// unambiguously ours, and the verdict is held until the return value
+        /// says whether it moved.
+        ///
+        /// **Only a block that moved was released.** An in-place grow hands
+        /// nothing back to the allocator and must not be flagged, or every
+        /// wipe-then-grow would look like a leak at random depending on what
+        /// the heap felt like doing.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            unsafe { System.realloc(ptr, layout, new_size) }
+            let carried = layout.size() >= PROBE.len()
+                && WATCHING.with(Cell::get)
+                && {
+                    let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
+                    block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes())
+                };
+            let moved = unsafe { System.realloc(ptr, layout, new_size) };
+            if carried && !moved.is_null() && moved != ptr {
+                SEEN.with(|seen| seen.set(true));
+            }
+            moved
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
