@@ -39,6 +39,7 @@ use deskwarden::bw_serve::{
     READINESS_DEADLINE,
 };
 use deskwarden::dispatch;
+use deskwarden::injector::sequence::Notifier;
 use deskwarden::injector::{
     Injector, RealSendInput, RealUiAutomation, SendInputFiller, UiAutomationFiller,
 };
@@ -937,6 +938,7 @@ fn main() {
             &engine,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
+            &deskwarden::injector::sequence::REAL_NOTIFIER,
         );
     }
 
@@ -1670,7 +1672,14 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    fill_from_vault(&cache, &injector, &fill_stats, &item_id, hwnd);
+                    fill_from_vault(
+                        &cache,
+                        &injector,
+                        &fill_stats,
+                        &item_id,
+                        hwnd,
+                        &deskwarden::injector::sequence::REAL_NOTIFIER,
+                    );
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
@@ -1865,6 +1874,7 @@ fn main() {
                 &engine,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &deskwarden::injector::sequence::REAL_NOTIFIER,
             );
         }
     }
@@ -2307,6 +2317,7 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     engine: &MatchEngine,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
+    notifier: &dyn Notifier,
 ) {
     // Our own windows (prompt overlay, process picker, login) are focused,
     // always-on-top windows, so showing one fires EVENT_SYSTEM_FOREGROUND for
@@ -2348,7 +2359,9 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             deskwarden::app::window_label(&event.exe_name, &event.title),
             m.trigger
         );
-        if let Some(armed) = handle_match(cache, injector, fill_stats, item_id, m, event) {
+        if let Some(armed) =
+            handle_match(cache, injector, fill_stats, item_id, m, event, notifier)
+        {
             *pending_hotkey_fill = Some(armed);
         }
     }
@@ -12193,101 +12206,69 @@ mod tests {
                 .unwrap_or_else(|| panic!("no \"matched ...\" line was logged; got {lines:?}"))
         }
 
-        /// `Injector::fill` takes the process-global `SEQUENCE_IN_FLIGHT` flag,
-        /// so two `process_foreground_event` tests that overlap would hand one
-        /// of them `ALREADY_TYPING` -- and this binary links the library
-        /// without `cfg(test)`, so the refusal notice would be a real message
-        /// box on the developer's desktop. The library's own guard for that
-        /// static is `mod`-private to it; same discipline, binary-local, in the
-        /// manner of `ACTIVE_DIR_LOCK` above. All five tests that call
-        /// `process_foreground_event` take it, including the ones that expect
-        /// no fill: the point is that only one of them is ever in there.
-        static FILL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-        fn lock_fill() -> std::sync::MutexGuard<'static, ()> {
-            FILL_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        /// The recorder every dispatching test below hands to
+        /// `process_foreground_event`, and the reason there is no lock here
+        /// any more.
+        ///
+        /// `Injector::fill` takes the process-global `SEQUENCE_IN_FLIGHT`
+        /// flag, so two of these tests that overlapped would hand one of them
+        /// `ALREADY_TYPING` -- and this binary links the library **without**
+        /// `cfg(test)`, so when the refusal went to a `RealNotifier` whose
+        /// silence was a `#[cfg(test)]` gate, that notice was a real
+        /// task-modal message box on the desktop of whoever ran `cargo test`.
+        /// A `FILL_LOCK` mutex used to narrow that race, and a source-position
+        /// guard used to check that all five tests took it.
+        ///
+        /// Neither is needed now, because the hazard is not narrowed but
+        /// **absent**: the notifier is a parameter, this is the only one these
+        /// tests have, and it opens nothing. A sixth dispatching test cannot
+        /// forget to take a lock, because there is no lock to take -- it
+        /// cannot compile without passing a notifier, and the only notifier
+        /// that opens a window is the library's production one, which
+        /// `the_production_dispatch_uses_the_real_notifier` holds to the three
+        /// lines in `run` that no test executes -- and forbids outright here.
+        fn recorder() -> deskwarden::injector::sequence::RecordingNotifier {
+            deskwarden::injector::sequence::RecordingNotifier::default()
         }
 
-        /// **The lock above is a discipline, and this is what enforces it.**
+        /// **What is left unreachable, held by source position.**
         ///
-        /// `FILL_LOCK` is taken by hand at the top of five test bodies. Delete
-        /// one of those lines, or add a sixth `process_foreground_event` test
-        /// without one, and nothing fails: the race it closes is microseconds
-        /// wide and is won almost always. What losing it costs is not a red
-        /// test but a **real `MessageBoxW` on the developer's desktop** --
-        /// this binary links the library without `cfg(test)`, so it compiles
-        /// `RealNotifier::refused`'s dialog branch and not its recorder, and
-        /// `ALREADY_TYPING` is exactly the error `fill_from_vault` shows the
-        /// user. A hazard whose only symptom is an occasional window that no
-        /// CI run would ever see is precisely the kind that has to be held at
-        /// the source, in the manner of this file's other shape guards.
-        ///
-        /// It pins the property rather than a list: *every* test in this
-        /// module that dispatches a foreground event takes the lock, and takes
-        /// it **before** the dispatch. A sixth test is welcome; a sixth
-        /// unguarded one is not.
+        /// Handing the notifier in is what makes a test-opened dialog
+        /// unrepresentable; it also means production has to hand in the real
+        /// one, on lines inside `run` that no test can execute. Swap those for
+        /// a recorder and every test in this file stays green while the
+        /// shipped app silently stops telling anyone why a fill did nothing --
+        /// the exact failure mode `app::prompt_wiring_tests` guards for the
+        /// overlay. So the three production hand-overs are counted here.
         #[test]
-        fn every_test_here_that_dispatches_a_foreground_event_takes_the_fill_lock() {
-            // Every needle is `concat!`-split, so this test cannot match its
-            // own text and pronounce a module guarded that is nothing but it.
+        fn the_production_dispatch_uses_the_real_notifier() {
             let source = include_str!("main.rs");
-            let head = concat!("    mod the_dispatch_that_actually", "_fills {");
-            let at =
-                source.find(head).expect("this module's own header is gone from main.rs");
-            let rest = &source[at..];
-            let end = rest.find(concat!("mod startup_shape", "_tests")).expect(
-                "nothing closes this module's slice, so the guard would read the rest of \
-                 the file and check tests that are not these",
-            );
-            let module = &rest[..end];
-
-            let dispatch = concat!("process_foreground", "_event(");
-            let take_lock = concat!("lock", "_fill();");
-
-            // The needles still match something, and the slice really is this
-            // module. Without this a rename on either side would leave the
-            // loop below with nothing to check and passing for that reason.
+            // Split so this test's own text is not one of the three.
+            let real = concat!("&deskwarden::injector::sequence::", "REAL_", "NOTIFIER,");
+            // Bare, for the test half: not merely "not passed as an argument"
+            // but *not nameable at all* below the boundary, so
+            // a bare `.refused("x")` on the production notifier, written
+            // straight into a test body, is caught too.
+            let named = concat!("REAL_", "NOTIFIER");
+            // Only the half of the file above the tests: the definition of
+            // `process_foreground_event` separates production from fixtures.
+            let boundary = source
+                .find(concat!("fn process_foreground", "_event<A:"))
+                .expect("`process_foreground_event`'s definition is gone from main.rs");
             assert_eq!(
-                module.matches(dispatch).count(),
-                5,
-                "this module no longer has exactly five foreground dispatches. That is \
-                 allowed -- but the count is here so that adding or renaming one makes \
-                 someone re-read the loop below rather than letting it quietly check \
-                 fewer tests than it used to"
+                source[..boundary].matches(real).count(),
+                3,
+                "expected the real notifier to be named exactly three times in `run` -- the \
+                 two `process_foreground_event` calls and the hotkey `fill_from_vault`. Fewer \
+                 means a production fill can refuse without telling the user; more means a \
+                 fourth production path appeared that nobody has thought about"
             );
-
-            let mut checked = 0;
-            for case in module.split(concat!("#[te", "st]")).skip(1) {
-                let Some(dispatched_at) = case.find(dispatch) else {
-                    continue;
-                };
-                let locked_at = case.find(take_lock).unwrap_or_else(|| {
-                    panic!(
-                        "a test in this module calls `process_foreground_event` without \
-                         taking `FILL_LOCK`. `Injector::fill` takes the process-global \
-                         `SEQUENCE_IN_FLIGHT` flag, and this binary compiles the \
-                         notifier's real `MessageBoxW` branch -- so losing that race \
-                         opens a task-modal window on the desktop of whoever ran \
-                         `cargo test`. The offending body starts: {:?}",
-                        &case[..case.len().min(300)]
-                    )
-                });
-                assert!(
-                    locked_at < dispatched_at,
-                    "a test in this module takes `FILL_LOCK` only *after* it has already \
-                     dispatched, which guards nothing at all: {:?}",
-                    &case[..case.len().min(300)]
-                );
-                checked += 1;
-            }
             assert_eq!(
-                checked, 5,
-                "the per-test split found {checked} dispatching tests, not the five the \
-                 count above says are there -- the `#[test]` split has stopped lining up \
-                 with the bodies, so this guard is checking something other than what it \
-                 says it checks"
+                source[boundary..].matches(named).count(),
+                0,
+                "a test passes the real notifier. That opens a task-modal `MessageBoxW` on \
+                 the desktop of whoever ran `cargo test`, which is the entire hazard this \
+                 parameter exists to remove: use `recorder()`"
             );
         }
 
@@ -12295,7 +12276,6 @@ mod tests {
         /// call leaves this with an empty `Filled`.
         #[test]
         fn an_auto_trigger_match_is_filled_from_the_vault_into_the_window_that_matched() {
-            let _fill_guard = lock_fill();
             let mut server = mockito::Server::new();
             // The cache is empty, so this goes down `fill_from_vault`'s
             // documented bridge fallback rather than needing a populate.
@@ -12327,6 +12307,7 @@ mod tests {
                 &engine,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &recorder(),
             );
 
             assert_eq!(
@@ -12350,7 +12331,6 @@ mod tests {
         /// output is the value the mutation replaced with `None`.
         #[test]
         fn a_hotkey_trigger_match_arms_the_pending_fill_instead_of_filling_now() {
-            let _fill_guard = lock_fill();
             // Nothing here may reach the network: the Hotkey arm returns
             // before any vault read, and a bridge pointed at a closed port
             // proves it.
@@ -12372,6 +12352,7 @@ mod tests {
                 &engine,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &recorder(),
             );
 
             assert_eq!(
@@ -12393,7 +12374,6 @@ mod tests {
         /// unconditionally, without asking the engine anything.
         #[test]
         fn a_window_that_matches_nothing_is_neither_filled_nor_armed() {
-            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "1",
@@ -12412,6 +12392,7 @@ mod tests {
                 &engine,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
+                &recorder(),
             );
 
             assert!(filled.seen().is_empty(), "an unmatched window must never be filled");
@@ -12425,7 +12406,6 @@ mod tests {
         /// asked for when autofill goes wrong.
         #[test]
         fn the_matched_log_line_names_a_title_matched_store_app_by_its_title() {
-            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "42",
@@ -12445,6 +12425,7 @@ mod tests {
                     &engine,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
+                    &recorder(),
                 );
             });
 
@@ -12468,7 +12449,6 @@ mod tests {
         /// used the title would pass it and fail this one.
         #[test]
         fn the_matched_log_line_names_an_ordinary_app_by_its_executable() {
-            let _fill_guard = lock_fill();
             let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "8",
@@ -12488,6 +12468,7 @@ mod tests {
                     &engine,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
+                    &recorder(),
                 );
             });
 

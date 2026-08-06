@@ -4,7 +4,7 @@
 
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::injector::ui_automation;
-use crate::injector::sequence::{self, Notifier};
+use crate::injector::sequence;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
 use crate::key_sequence;
 use crate::overlay_ui;
@@ -123,12 +123,24 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 /// unlock), so a miss falls back to the bridge -- serving the fill rather
 /// than failing it outright -- and logs a warning, since a miss here is a
 /// bug signal worth noticing rather than silently swallowing.
+///
+/// **Takes the notifier rather than reaching for a global.** The three
+/// refusals below reach the user through whatever was handed in; production
+/// hands in `sequence::REAL_NOTIFIER` and a test hands in a
+/// [`sequence::RecordingNotifier`], so no test in *either* crate can put a
+/// task-modal window on a desktop. See [`sequence::Notifier`] for what this
+/// replaced and why a `#[cfg(test)]` gate could not do it.
+///
+/// `&dyn` and not a third type parameter: the call is once per fill, and the
+/// alternative would have added a turbofish-shaped burden to every one of this
+/// function's and [`handle_match`]'s call sites for nothing.
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
     injector: &Injector<A, B>,
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     hwnd: isize,
+    notifier: &dyn sequence::Notifier,
 ) {
     let item = cache
         .items()
@@ -214,7 +226,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                             // out of the state it reports, which is what makes
                             // it worth interrupting them with.
                             if e == crate::injector::ALREADY_TYPING {
-                                REAL_NOTIFIER.refused(&e);
+                                notifier.refused(&e);
                             }
                             crate::fill_stats::FillOutcome::NotTyped
                         }
@@ -235,7 +247,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                         log::error!(
                             "auto-type sequence failed for item {item_id} into hwnd {hwnd}: {e}"
                         );
-                        REAL_NOTIFIER.refused(&e);
+                        notifier.refused(&e);
                     }
                 }
                 Err(refusal) => {
@@ -245,7 +257,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                     // completely between the two.
                     let message = refusal.message();
                     log::error!("refusing to fill item {item_id}: {message}");
-                    REAL_NOTIFIER.refused(&message);
+                    notifier.refused(&message);
                 }
             }
         }
@@ -278,11 +290,6 @@ pub fn fill_outcome_sink(
         }
     })
 }
-
-/// The production notifier, named here for the same reason `REAL_OVERLAY` is:
-/// so the line that *decides* to notify sits next to the decision it belongs
-/// to, while the thing that opens a window stays out of every test's way.
-const REAL_NOTIFIER: sequence::RealNotifier = sequence::RealNotifier;
 
 /// The stored auto-type sequence for `item`, or `""` if it has no app match
 /// or the match records none.
@@ -370,11 +377,12 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     item_id: &str,
     m: &AppMatch,
     window: &crate::window_watch::ForegroundEvent,
+    notifier: &dyn sequence::Notifier,
 ) -> Option<(String, isize)> {
     let hwnd = window.hwnd;
     match m.trigger {
         TriggerMode::Auto => {
-            fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
+            fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
             None
         }
         TriggerMode::Prompt => {
@@ -404,7 +412,7 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // one no test can reach, and an argument written here is an
             // argument nothing can check (review 32's Important 1).
             if prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
-                fill_from_vault(cache, injector, fill_stats, item_id, hwnd);
+                fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
             }
             None
         }
@@ -1288,34 +1296,49 @@ mod fill_dispatch_tests {
         crate::fill_stats::FillStats::new(dir.join("stats.json"))
     }
 
-    /// Runs one fill and hands back **both** things it can be judged by: what
-    /// the filler was asked to type, and the `FillStats` it was given.
+    /// Runs one fill and hands back **all three** things it can be judged by:
+    /// what the filler was asked to type, the `FillStats` it was given, and
+    /// what the user was told.
     ///
     /// `reports` is what the filler's "typing" will claim to have done, and
     /// `default_result` is what the non-sequence path will return.
+    ///
+    /// The notices come back from a [`sequence::RecordingNotifier`] this
+    /// fixture *owns and passes in*, not from a thread-local that a production
+    /// notifier writes to when it happens to be compiled under `cfg(test)`.
+    /// That is the whole change: the recorder is the only notifier this fill
+    /// has, so there is no configuration in which it opens a window instead.
     fn fill_reporting(
         item: VaultItem,
         reports: crate::fill_stats::FillOutcome,
         default_result: Result<(), String>,
-    ) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
+    ) -> (Arc<Recorder>, crate::fill_stats::FillStats, Vec<String>) {
         // `fill_from_vault` reaches `Injector::fill_sequence`, which contends
         // for a process-global "already typing" flag. See
         // `injector::sequence_test_lock`.
         let _serialised = crate::injector::sequence_test_lock();
 
-        let _ = sequence::take_notices();
         let rec = Arc::new(Recorder::default());
         let injector = Injector {
             ui: NoUiAutomation,
             fallback: RecordingFiller { rec: rec.clone(), reports, default_result },
         };
         let stats = scratch_stats("dispatch");
-        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
-        (rec, stats)
+        let notifier = sequence::RecordingNotifier::default();
+        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242, &notifier);
+        (rec, stats, notifier.take())
     }
 
     fn fill_recording_stats(item: VaultItem) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
-        fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()))
+        let (rec, stats, _) = fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()));
+        (rec, stats)
+    }
+
+    /// A fill judged by what it typed **and** what the user was told.
+    fn fill_with_notices(item: VaultItem) -> (Arc<Recorder>, Vec<String>) {
+        let (rec, _stats, notices) =
+            fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()));
+        (rec, notices)
     }
 
     /// A filler whose typing succeeds and says so -- for the tests that are
@@ -1419,7 +1442,7 @@ mod fill_dispatch_tests {
     /// this run is identical to the test above except the outcome reported.
     #[test]
     fn a_sequence_abandoned_part_way_is_not_recorded_as_a_fill() {
-        let (rec, stats) = fill_reporting(
+        let (rec, stats, _notices) = fill_reporting(
             item_with("{USERNAME}{TAB}{PASSWORD}"),
             crate::fill_stats::FillOutcome::Partial,
             Ok(()),
@@ -1437,7 +1460,7 @@ mod fill_dispatch_tests {
     /// filler that could not restore foreground at all.
     #[test]
     fn a_sequence_that_typed_nothing_is_not_recorded_as_a_fill() {
-        let (rec, stats) = fill_reporting(
+        let (rec, stats, _notices) = fill_reporting(
             item_with("{USERNAME}{TAB}{PASSWORD}"),
             crate::fill_stats::FillOutcome::NotTyped,
             Ok(()),
@@ -1481,7 +1504,7 @@ mod fill_dispatch_tests {
     /// regardless -- the shape of the sequence bug, transplanted -- fails here.
     #[test]
     fn a_default_fill_that_failed_is_not_recorded_as_a_fill() {
-        let (rec, stats) = fill_reporting(
+        let (rec, stats, _notices) = fill_reporting(
             item_with(""),
             crate::fill_stats::FillOutcome::Typed,
             Err("target window is not foreground".into()),
@@ -1578,7 +1601,14 @@ mod fill_dispatch_tests {
         let stats = crate::fill_stats::FillStats::new(
             std::env::temp_dir().join("deskwarden-fill-totp").join("stats.json"),
         );
-        fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+        fill_from_vault(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            &sequence::RecordingNotifier::default(),
+        );
 
         totp.assert();
         let sequences = rec.sequences.lock().unwrap();
@@ -1621,7 +1651,14 @@ mod fill_dispatch_tests {
         let stats = crate::fill_stats::FillStats::new(
             std::env::temp_dir().join("deskwarden-fill-nototp").join("stats.json"),
         );
-        fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+        fill_from_vault(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            &sequence::RecordingNotifier::default(),
+        );
 
         assert_eq!(rec.sequences.lock().unwrap().len(), 1);
         totp.expect(0).assert();
@@ -1637,13 +1674,12 @@ mod fill_dispatch_tests {
     }
 
     /// **The refusal reaches the user, not only the log.** Deleting the
-    /// `REAL_NOTIFIER.refused(&message)` line leaves every other test in this
+    /// `notifier.refused(&message)` line leaves every other test in this
     /// module green and fails only here -- which is the whole point of it
     /// being a separate assertion.
     #[test]
     fn a_refused_sequence_tells_the_user_which_construct_stopped_it() {
-        let _ = fill(item_with("{USERNAME}{PICKCHARS}{PASSWORD}"));
-        let notices = sequence::take_notices();
+        let (_rec, notices) = fill_with_notices(item_with("{USERNAME}{PICKCHARS}{PASSWORD}"));
         assert_eq!(notices.len(), 1, "the user was not told: {notices:?}");
         assert!(
             notices[0].contains("{PICKCHARS}"),
@@ -1656,10 +1692,8 @@ mod fill_dispatch_tests {
     /// Without this, a notifier that fired on every fill would pass.
     #[test]
     fn a_fill_that_works_does_not_interrupt_the_user() {
-        let _ = fill(item_with("{USERNAME}{TAB}{PASSWORD}"));
-        assert!(sequence::take_notices().is_empty());
-        let _ = fill(item_with(""));
-        assert!(sequence::take_notices().is_empty());
+        assert!(fill_with_notices(item_with("{USERNAME}{TAB}{PASSWORD}")).1.is_empty());
+        assert!(fill_with_notices(item_with("")).1.is_empty());
     }
 
     /// Runs one **default** fill while something else genuinely holds the
@@ -1681,15 +1715,15 @@ mod fill_dispatch_tests {
         item: VaultItem,
     ) -> (Arc<Recorder>, crate::fill_stats::FillStats, Vec<String>) {
         let _serialised = crate::injector::sequence_test_lock();
-        let _ = sequence::take_notices();
         let held =
             crate::injector::SequenceGuard::acquire().expect("nothing else holds the flag");
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = scratch_stats("refused-default");
-        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242);
+        let notifier = sequence::RecordingNotifier::default();
+        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242, &notifier);
         drop(held);
-        (rec, stats, sequence::take_notices())
+        (rec, stats, notifier.take())
     }
 
     /// **A refused default fill reaches the user, exactly as a refused
@@ -1715,6 +1749,43 @@ mod fill_dispatch_tests {
         assert!(notices[0].contains("press the hotkey again"), "got: {}", notices[0]);
     }
 
+    /// **The third refusal call site, which nothing used to reach.**
+    ///
+    /// `fill_from_vault` tells the user in three places -- the default arm's
+    /// `ALREADY_TYPING`, the planning refusal, and the `Err` of
+    /// `fill_sequence` -- and only the first two were pinned. Deleting
+    /// `notifier.refused(&e)` from the Sequence arm left the whole suite
+    /// green, so a sequence fill that was refused because something else was
+    /// already typing said nothing at all to the user while the default fill
+    /// for the same item said the same sentence the same way.
+    ///
+    /// It goes through the **real** refusal rather than a fixture that returns
+    /// an error: `Injector::fill_sequence` acquires the one-at-a-time flag
+    /// itself, so holding it is what production holding it looks like, and a
+    /// manufactured `Err` would keep passing if that guard were removed.
+    #[test]
+    fn a_sequence_refused_because_something_else_is_typing_tells_the_user_too() {
+        let (rec, _stats, notices) =
+            fill_while_something_else_is_typing(item_with("{USERNAME}{TAB}{PASSWORD}"));
+
+        // Positive control: the fill really did take the sequence path and
+        // really was stopped before it typed anything by either route.
+        assert!(rec.sequences.lock().unwrap().is_empty());
+        assert!(rec.default_fills.lock().unwrap().is_empty());
+
+        assert_eq!(notices.len(), 1, "the user was not told: {notices:?}");
+        assert_eq!(notices[0], crate::injector::ALREADY_TYPING);
+    }
+
+    /// And the accounting half of it: a sequence refused before it started is
+    /// not a fill, exactly as a refused default fill is not.
+    #[test]
+    fn a_sequence_refused_before_it_started_counts_no_fill() {
+        let (_rec, stats, _notices) =
+            fill_while_something_else_is_typing(item_with("{USERNAME}{TAB}{PASSWORD}"));
+        assert_eq!(stats.count("item-1"), 0, "a refused sequence was counted");
+    }
+
     /// **A refused default fill still records nothing**, which is the half of
     /// this that must not have moved. The notifier is a side channel; the
     /// count is the accounting, and a refusal is not a fill.
@@ -1735,7 +1806,7 @@ mod fill_dispatch_tests {
     /// state it names.
     #[test]
     fn a_default_fill_that_failed_for_another_reason_opens_no_dialog() {
-        let (rec, stats) = fill_reporting(
+        let (rec, stats, notices) = fill_reporting(
             item_with(""),
             crate::fill_stats::FillOutcome::Typed,
             Err("SendInput delivered 0 of 2 events".to_string()),
@@ -1744,7 +1815,7 @@ mod fill_dispatch_tests {
         // Positive control: the fill really was attempted and really did fail.
         assert_eq!(rec.default_fills.lock().unwrap().len(), 1);
         assert_eq!(stats.count("item-1"), 0, "a failed fill was counted");
-        assert!(sequence::take_notices().is_empty(), "a Win32 diagnostic was shown to the user");
+        assert!(notices.is_empty(), "a Win32 diagnostic was shown to the user");
     }
 
     /// **The default arm's own copy of the password does not reach the
@@ -1768,7 +1839,6 @@ mod fill_dispatch_tests {
         use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
 
         let _serialised = crate::injector::sequence_test_lock();
-        let _ = sequence::take_notices();
 
         let mut item = item_with("");
         item.login.as_mut().expect("the fixture has a login").password =
@@ -1779,8 +1849,9 @@ mod fill_dispatch_tests {
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = scratch_stats("default-lifetime");
 
+        let notifier = sequence::RecordingNotifier::default();
         let leaked = plaintext_reached_the_allocator(|| {
-            fill_from_vault(&cache, &injector, &stats, "item-1", 4242);
+            fill_from_vault(&cache, &injector, &stats, "item-1", 4242, &notifier);
         });
 
         // Positive control: the fill really did take the default path and

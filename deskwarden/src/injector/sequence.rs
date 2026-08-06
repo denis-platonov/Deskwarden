@@ -1650,11 +1650,22 @@ pub(crate) mod run_tests {
 ///
 /// A trait so the decision to notify is pinned by a test with a recorder,
 /// rather than by a `MessageBoxW` nothing can call.
+///
+/// **Passed in, never reached for.** There used to be a `RealNotifier` whose
+/// `refused` recorded under `#[cfg(test)]` and opened a window otherwise, and
+/// production named it through a `const REAL_NOTIFIER` inside `fill_from_vault`.
+/// A `cfg(test)` gate is a property of a *compilation unit*, and `main.rs`
+/// links this library compiled **without** it -- so every binary test that
+/// reached that const got the real task-modal dialog, on the desktop of
+/// whoever ran `cargo test`. The gate is gone; the only way to a dialog is to
+/// hold a [`FnNotifier`] whose function is `show_refusal`, which is
+/// `pub(crate)` and so cannot be named from the binary at all; the only such
+/// value is [`REAL_NOTIFIER`], named exclusively on lines no test executes.
 pub trait Notifier {
     fn refused(&self, detail: &str);
 }
 
-/// The production notifier: a plain task-modal message box, on its own thread.
+/// Shows the user a refusal: a plain task-modal message box, on its own thread.
 ///
 /// On its own thread because `MessageBoxW` blocks until dismissed, and the
 /// caller is either the app's message loop (a plan-time refusal) or the typing
@@ -1662,54 +1673,82 @@ pub trait Notifier {
 /// would freeze the tray and every window, and the second would hold the
 /// plan's memory alive for as long as the box was on screen. Fire and forget:
 /// there is no answer to read back, because there is nothing to ask.
-pub struct RealNotifier;
-
-impl Notifier for RealNotifier {
-    fn refused(&self, detail: &str) {
-        log::warn!("autofill refused: {detail}");
-        let detail = detail.to_string();
-        // **Under test this records instead of opening a window.** A message
-        // box in a test suite is a real window on a real desktop that a real
-        // person has to dismiss, and this crate's rule is that no test opens
-        // one. Recording is also strictly better than skipping: it lets
-        // `app::fill_dispatch_tests` assert that the user was *actually*
-        // told, which is the half of "not just the log" that a `MessageBoxW`
-        // nothing can call could never pin.
-        #[cfg(test)]
-        {
-            NOTICES.with(|n| n.borrow_mut().push(detail));
-            return;
+///
+/// A free `fn` and not a method body, for exactly the reason [`crate::app::FnPresenter`]
+/// gives: it lets the production notifier be a struct literal naming this
+/// function, with no argument and no expression in it for a mutation to hide
+/// in. It compiles in every configuration, including under `cfg(test)` -- what
+/// keeps it out of the suite is that nothing in a test can name it, not a gate
+/// that only one of the two crates agrees with.
+pub(crate) fn show_refusal(detail: &str) {
+    log::warn!("autofill refused: {detail}");
+    let detail = detail.to_string();
+    std::thread::spawn(move || {
+        use windows::core::HSTRING;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let text = HSTRING::from(detail);
+        let caption = HSTRING::from("Deskwarden autofill");
+        unsafe {
+            MessageBoxW(None, &text, &caption, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
         }
-        #[cfg(not(test))]
-        std::thread::spawn(move || {
-            use windows::core::HSTRING;
-            use windows::Win32::UI::WindowsAndMessaging::{
-                MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-            };
-            let text = HSTRING::from(detail);
-            let caption = HSTRING::from("Deskwarden autofill");
-            unsafe {
-                MessageBoxW(
-                    None,
-                    &text,
-                    &caption,
-                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST,
-                );
-            }
-        });
+    });
+}
+
+/// A [`Notifier`] that is nothing but the function it forwards to.
+///
+/// The same shape, and for the same reason, as [`crate::app::FnPresenter`]:
+/// a function *reference* rather than a hand-written `impl` per notifier, so
+/// the production value can be a struct literal with nothing computed in it.
+pub struct FnNotifier {
+    /// Asked to tell the user that a fill was refused, and why.
+    pub refused: fn(&str),
+}
+
+impl Notifier for FnNotifier {
+    fn refused(&self, detail: &str) {
+        (self.refused)(detail);
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// What [`RealNotifier`] would have shown the user, on this thread.
-    static NOTICES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+/// The production notifier: the real dialog, named and not called.
+///
+/// This is the whole of the refusal path no test can execute, and it is data.
+/// It is named on three lines in `main.rs` and one in [`crate::injector`], all
+/// of them production-only; `notifier_wiring_tests` below holds this literal
+/// by source position, and `main`'s own guard holds the four call sites.
+pub const REAL_NOTIFIER: FnNotifier = FnNotifier { refused: show_refusal };
+
+/// A [`Notifier`] that remembers what it was asked to show and opens nothing.
+///
+/// **Deliberately not `#[cfg(test)]`.** The binary's tests link this library
+/// compiled without `cfg(test)`, so a recorder that only exists under the gate
+/// is a recorder the binary's tests cannot have -- and "cannot have a recorder"
+/// was precisely how they ended up with the dialog. Existing in every
+/// configuration is what lets `main.rs`'s dispatch tests pass one, and so what
+/// makes the hazard unrepresentable rather than merely avoided by discipline.
+///
+/// A `Mutex` and not a `RefCell`, because [`crate::injector::perform`] runs on
+/// the typing thread and a notifier handed to it must be `Sync`.
+#[derive(Default)]
+pub struct RecordingNotifier(std::sync::Mutex<Vec<String>>);
+
+impl RecordingNotifier {
+    /// Everything this has been asked to show, cleared.
+    pub fn take(&self) -> Vec<String> {
+        let mut held = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut held)
+    }
 }
 
-/// Everything [`RealNotifier`] has been asked to show on this thread, cleared.
-#[cfg(test)]
-pub(crate) fn take_notices() -> Vec<String> {
-    NOTICES.with(|n| std::mem::take(&mut *n.borrow_mut()))
+impl Notifier for RecordingNotifier {
+    fn refused(&self, detail: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(detail.to_string());
+    }
 }
 
 #[cfg(test)]
@@ -1717,12 +1756,50 @@ mod notifier_tests {
     use super::*;
 
     #[test]
-    fn a_refusal_is_recorded_verbatim() {
-        let _ = take_notices();
-        RealNotifier.refused("the auto-type sequence uses {PICKCHARS}");
-        assert_eq!(take_notices(), vec!["the auto-type sequence uses {PICKCHARS}".to_string()]);
-        // ...and taking clears, so one test cannot see another's notice.
-        assert!(take_notices().is_empty());
+    fn a_recorder_keeps_every_refusal_verbatim_and_taking_clears() {
+        let rec = RecordingNotifier::default();
+        rec.refused("the auto-type sequence uses {PICKCHARS}");
+        assert_eq!(rec.take(), vec!["the auto-type sequence uses {PICKCHARS}".to_string()]);
+        // ...and taking clears, so one assertion cannot see another's notice.
+        assert!(rec.take().is_empty());
+    }
+
+    /// An [`FnNotifier`] forwards to the function it was built from -- the one
+    /// line of code between [`REAL_NOTIFIER`]'s field and the real dialog.
+    #[test]
+    fn an_fn_notifier_forwards_to_the_function_it_was_built_from() {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(detail: &str) {
+            SEEN.lock().unwrap().push(detail.to_string());
+        }
+        let n = FnNotifier { refused: record };
+        n.refused("something is already typing");
+        assert_eq!(&*SEEN.lock().unwrap(), &["something is already typing".to_string()]);
+    }
+
+    /// **The one line that reaches a real window, held by source position.**
+    ///
+    /// Nothing can execute [`REAL_NOTIFIER`]'s initialiser under test, so
+    /// nothing else can tell that it still names `show_refusal` rather than
+    /// something quieter -- and a production build that silently stopped
+    /// telling the user anything would leave the whole suite green. This is
+    /// the same device, for the same reason, as `app::prompt_wiring_tests`.
+    #[test]
+    fn the_production_notifier_is_the_real_dialog_and_nothing_computed() {
+        // `concat!`-split so this test cannot match its own text.
+        let needle =
+            concat!("const REAL_NOTIFIER: FnNotifier = FnNotifier { ", "refused: show_refusal };");
+        let source = include_str!("sequence.rs");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "expected {needle:?} exactly once in sequence.rs. The production notifier is the \
+             one value in this crate that opens a real window, and it is a struct literal of \
+             one function reference precisely so that there is no expression in it for a \
+             mutation to hide in -- wrapping `show_refusal` in a closure here would re-open \
+             the hole that shape exists to close"
+        );
     }
 }
 

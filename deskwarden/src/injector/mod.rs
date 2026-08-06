@@ -565,7 +565,7 @@ impl SendInputFiller for RealSendInput {
             // typing, and not merely until the spawn returns. Everything the
             // thread then does is [`perform`], which is a function precisely
             // so that something other than a live `SendInput` can call it.
-            perform(&send_input::RealKeyboard, hwnd, plan, guard, &sequence::RealNotifier);
+            perform(&send_input::RealKeyboard, hwnd, plan, guard, &sequence::REAL_NOTIFIER);
         });
         Ok(())
     }
@@ -666,10 +666,11 @@ mod orchestration_tests {
 
     /// A notifier that records instead of opening a window.
     ///
-    /// Deliberately **not** `RealNotifier`: that one is silent under test only
-    /// because of a `cfg(test)` gate, and the bin links the lib without
-    /// `cfg(test)`, so a test that leans on the gate is one fixture away from
-    /// a real message box on a real desktop.
+    /// Deliberately **not** the production notifier. There is now no
+    /// configuration in which the production one is silent -- `REAL_NOTIFIER`
+    /// is `show_refusal` in every build -- so a test that reached for it would
+    /// open a real message box on a real desktop rather than merely risking
+    /// one. Recording is what a test is entitled to; the dialog is not.
     #[derive(Default)]
     struct RecordingNotifier(RefCell<Vec<String>>);
     impl sequence::Notifier for RecordingNotifier {
