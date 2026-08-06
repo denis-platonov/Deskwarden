@@ -30,6 +30,17 @@ pub trait UiAutomationFiller {
 /// Whether a typing run is in flight. See [`SequenceGuard`].
 static SEQUENCE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+/// **What a caller is told when [`SequenceGuard::acquire`] says no.**
+///
+/// One constant and not two literals, because both fill paths now refuse
+/// through it -- [`Injector::fill`] and [`Injector::fill_sequence`] -- and a
+/// user who pressed the hotkey has no idea which of the two they were on. The
+/// sentence has to name the state ("something is already typing"), the way out
+/// of it (wait, or switch away), and the retry, because a refusal that only
+/// says "no" is indistinguishable from a hotkey that never registered.
+pub const ALREADY_TYPING: &str = "an auto-type sequence is already being typed; wait for it to \
+     finish, or switch away to stop it, then press the hotkey again";
+
 /// Proof that the holder, and nobody else, may synthesise keystrokes right now.
 ///
 /// # What goes wrong without it
@@ -205,7 +216,48 @@ pub struct Injector<A: UiAutomationFiller, B: SendInputFiller> {
 }
 
 impl<A: UiAutomationFiller, B: SendInputFiller> Injector<A, B> {
+    /// The default fill: UI Automation first, keystrokes if that finds nothing.
+    ///
+    /// # It takes the same permission to type that a sequence does
+    ///
+    /// [`SequenceGuard::acquire`] used to be called only from
+    /// [`Self::fill_sequence`], so this path synthesised keystrokes with **no
+    /// reference to `SEQUENCE_IN_FLIGHT` at all**. With a guard held --
+    /// i.e. with a sequence sitting in the middle of a `{DELAY 2000}` -- a
+    /// hotkey press or an `Auto` dispatch for a second item reached here and
+    /// really typed, and the two runs interleaved their keystrokes into one
+    /// field. That is precisely the failure [`SequenceGuard`]'s doc claims to
+    /// prevent, and the guard's own words for it applied to itself: the checks
+    /// were individually correct and jointly useless.
+    ///
+    /// The acquisition wraps the **whole** dispatch and not just the fallback,
+    /// which is deliberate. UI Automation synthesises no keystrokes, so it is
+    /// not contending for the keyboard -- but it *is* contending for the target
+    /// window's fields, and setting a password into a control while another
+    /// thread is typing a different password into the same window is the same
+    /// unrecoverable mess by a different route. Holding it across the match
+    /// also means there is one acquisition on this path rather than one per
+    /// arm, so a future third arm cannot be added without it.
+    ///
+    /// # It stays synchronous, and it refuses rather than queues
+    ///
+    /// Nothing here spawns a thread. A [`Plan`] built by [`default_plan`]
+    /// contains no `Wait` step -- there is no `{DELAY}` in a default fill -- so
+    /// the only time it costs the UI thread is the typing itself, which is what
+    /// this path has always cost it. Staying synchronous keeps this method's
+    /// `Result` meaning what it has always meant, which is what lets
+    /// `app::fill_from_vault` turn it straight into a [`FillOutcome`] instead of
+    /// needing a sink and a thread.
+    ///
+    /// So a refusal is simply an `Err` the caller already handles. See
+    /// [`ALREADY_TYPING`] for why it is a sentence and not a silent `Ok(())`.
     pub fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {
+        // Named, not `_`: a bare `_` pattern drops immediately and would
+        // release the right to type before a single character was sent, which
+        // is the one way to write this that compiles and guards nothing.
+        let Some(_holds_the_keyboard) = SequenceGuard::acquire() else {
+            return Err(ALREADY_TYPING.to_string());
+        };
         match self.ui.fill(hwnd, user, pass) {
             Ok(true) => Ok(()),
             Ok(false) => self.fallback.fill(hwnd, user, pass),
@@ -259,11 +311,7 @@ impl<A: UiAutomationFiller, B: SendInputFiller> Injector<A, B> {
             // relying on a reader to work out that a sink never invoked and a
             // sink invoked with `NotTyped` happen to mean the same thing.
             on_outcome(FillOutcome::NotTyped);
-            return Err(
-                "an auto-type sequence is already being typed; wait for it to \
-                 finish, or switch away to stop it, then press the hotkey again"
-                    .to_string(),
-            );
+            return Err(ALREADY_TYPING.to_string());
         };
         guard.reports_to(on_outcome);
         self.fallback.fill_sequence(hwnd, plan, guard)
@@ -314,6 +362,21 @@ fn outcome_of_a_run(result: &Result<(), String>) -> FillOutcome {
 /// answers `holds_foreground` however a test says and **sends no real input**
 /// -- can drive it, and a recording notifier can stand in for the message box.
 ///
+/// # Two things this is **not** covered for, stated so nobody assumes it is
+///
+/// The allocator probe in `login_ui::password_lifetime_tests` is
+/// `thread_local!`, and the real `fill_sequence` runs this on a thread it
+/// spawns. So no `!leaked` assertion anywhere can see the production drop of a
+/// sequence's [`Plan`] -- what is covered is this function called directly, on
+/// the test's own thread. The wipe is a property of `Drop for Plan` and is
+/// pinned there; the claim that it happens *on the typing thread* is not
+/// something the instrument can reach.
+///
+/// And `sequence::run_tests::FakeKeyboard::holds_foreground` ignores its
+/// `hwnd` and answers from a script, so a caller that passed the *wrong*
+/// window here would be invisible to every test that drives this. The `hwnd`
+/// hand-off from `fill_sequence` to `perform` is unpinned.
+///
 /// # The order of the last three acts is the contract
 ///
 /// **The plan is wiped first**, and only then is the flag released and the
@@ -346,15 +409,130 @@ fn perform<K: sequence::Keyboard, N: sequence::Notifier>(
     // nothing can vouch for.
 }
 
+/// **The sequence template the default fill is, spelled out.**
+///
+/// [`crate::key_sequence::DEFAULT_SEQUENCE`] is `{USERNAME}{TAB}{PASSWORD}`
+/// and that is what a fill with both credentials types. The two elisions are
+/// not a shortcut, they are the only way to keep the old behaviour: the old
+/// body called `type_text(user)` unconditionally, and typing an **empty**
+/// string sends no keystrokes -- whereas [`sequence::plan`] refuses a
+/// `{USERNAME}` it cannot resolve with [`sequence::Refusal::Unresolved`]. Left
+/// in, a login that stores only a password -- which the vault permits, and
+/// which filled perfectly well yesterday -- would stop filling at all.
+///
+/// **The `{TAB}` is never elided, including when both are empty.** It looks
+/// like a case worth tidying and it is not ours to tidy: `fill_via_send_input`
+/// pressed Tab between two `type_text` calls with no reference to whether
+/// either had anything to type, so a password-only item has always had a Tab
+/// pressed *before* its password. That may well be wrong, but this change is
+/// about bounding the gap between foreground checks, and quietly deleting a
+/// keystroke from every password-only fill on the way past is exactly the kind
+/// of unrelated behaviour change a security fix must not smuggle in. It is
+/// recorded, not fixed.
+///
+/// A template and not a plan: the string returned here holds placeholders and
+/// never a secret. The one copy of the password is made by [`sequence::plan`],
+/// into a [`Plan`], which wipes it.
+fn default_sequence_for(user: &str, pass: &str) -> String {
+    let mut template = String::new();
+    if !user.is_empty() {
+        template.push_str("{USERNAME}");
+    }
+    template.push_str("{TAB}");
+    if !pass.is_empty() {
+        template.push_str("{PASSWORD}");
+    }
+    template
+}
+
+/// The default fill as a [`Plan`], so it runs through the same machinery a
+/// stored sequence does.
+///
+/// Built by parsing a template and planning it rather than by assembling
+/// [`sequence::Step`]s here, so that the [`MAX_BURST`](sequence::MAX_BURST)
+/// chunking, the UTF-16 projection, the [`MIN_RATE`](sequence::MIN_RATE) floor
+/// and the [`MAX_SEQUENCE`](sequence::MAX_SEQUENCE) bound are the *same*
+/// tested code and not a second implementation of each that has to be kept in
+/// step.
+fn default_plan(user: &str, pass: &str) -> Result<Plan, String> {
+    sequence::plan(
+        &crate::key_sequence::parse(&default_sequence_for(user, pass)),
+        &sequence::Resolved { username: user, password: pass, totp: None, custom: vec![] },
+    )
+    .map_err(|refusal| refusal.message())
+}
+
+/// **The default fill's typing, as a function a test can call** -- the same
+/// move [`perform`] is, for the same reason.
+///
+/// Everything in [`RealSendInput::fill`] except the one
+/// [`send_input::ensure_foreground`] call, which is a live Win32 round trip
+/// with sleeps in it and cannot be entered from a test. What is left is
+/// generic over [`sequence::Keyboard`], so `sequence::run_tests::FakeKeyboard`
+/// -- which answers `holds_foreground` however a test says and **sends no real
+/// input** -- can drive the whole default fill and a test can watch it abandon
+/// a password half-typed when the window goes away. Left inline behind
+/// `SendInput` it would have been the shape this crate keeps getting caught
+/// by: a guarantee at a call site that nothing can read back.
+fn fill_by_typing<K: sequence::Keyboard>(
+    kb: &K,
+    hwnd: isize,
+    user: &str,
+    pass: &str,
+) -> Result<(), String> {
+    let plan = default_plan(user, pass)?;
+    let result = sequence::run(kb, hwnd, &plan);
+    // Explicit and first, for the reason `perform` drops its plan first:
+    // nothing that observes this fill's end -- the caller's `FillOutcome`, the
+    // log line, the `SequenceGuard` release one frame up -- may observe it
+    // while the plaintext is still on this stack.
+    drop(plan);
+    result
+}
+
 #[derive(Clone, Copy)]
 pub struct RealSendInput;
 impl SendInputFiller for RealSendInput {
+    /// **Types the default fill as a plan, not as a straight line.**
+    ///
+    /// This used to be `ensure_foreground(hwnd)?` followed by
+    /// `fill_via_send_input`, which typed the username, pressed Tab and typed
+    /// the password at 3ms per UTF-16 unit with **no further verification of
+    /// anything**. One check, then roughly 120ms of unchecked typing for a
+    /// forty-character credential pair, and proportionally more for a
+    /// passphrase -- while the sequence path a few lines down re-checks the
+    /// foreground before every step and chops any burst longer than
+    /// [`sequence::MAX_BURST`] so that it can. Every item in every existing
+    /// vault stores no sequence and therefore takes *this* path, so the
+    /// 250ms guarantee -- corrected once for UTF-16 and once for `{DELAY=0}` --
+    /// existed only on the minority one.
+    ///
+    /// The fix is to stop having two implementations. [`default_plan`] turns
+    /// the fill into the plan it always was, and [`sequence::run`] performs it,
+    /// which inherits the per-step foreground re-check, the burst chop, the
+    /// rate floor and the zeroizing `Drop for Plan` in a form that cannot drift
+    /// from the sequence path because it *is* the sequence path.
+    ///
+    /// **What is deliberately not collapsed is [`Injector::fill`]'s dispatch.**
+    /// UI Automation fills *named fields* without focus and without a
+    /// keystroke; a plan types at whatever has focus. Those stay two different
+    /// acts, and the UIA-first order is untouched -- see
+    /// [`Injector::fill_sequence`]'s doc, which makes that argument at length.
+    /// What changed is only how the SendInput fallback types once UIA has
+    /// declined, which is the one place the two paths were doing the same act
+    /// by two different means.
+    ///
+    /// Still synchronous, and still one [`send_input::ensure_foreground`]: that
+    /// first call *restores* focus, which is right exactly once, right after
+    /// our own overlay closes. Every check after it is
+    /// [`send_input::RealKeyboard::holds_foreground`], which is passive and
+    /// stops rather than yanking the user's window back.
     fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {
         // Verify (and if necessary restore) foreground before typing anything.
         // On mismatch this returns Err and nothing is typed, rather than
         // blasting a password into an unverified window.
         send_input::ensure_foreground(hwnd)?;
-        send_input::fill_via_send_input(user, pass).map_err(|e| e.to_string())
+        fill_by_typing(&send_input::RealKeyboard, hwnd, user, pass)
     }
 
     /// Restores foreground once, then hands the plan to a thread.
@@ -519,9 +697,14 @@ mod orchestration_tests {
         let _lock = sequence_test_lock();
         const HWND: isize = 0x4321;
 
+        // Not `assert_ne!(Typed, Partial)`, which was what stood here: two
+        // distinct variants of a `PartialEq` enum can never be equal, so it
+        // read like the crate's two-inputs-agree guard while pinning nothing.
+        // What the two arms below actually have to differ in is the answer
+        // this suite cares about, so that is what is asserted.
         assert_ne!(
-            FillOutcome::Typed,
-            FillOutcome::Partial,
+            crate::fill_stats::counts_as_a_fill(FillOutcome::Typed),
+            crate::fill_stats::counts_as_a_fill(FillOutcome::Partial),
             "the fixture cannot tell a completed run from an abandoned one"
         );
 
@@ -866,8 +1049,345 @@ mod orchestration_tests {
         assert_eq!(reported.seen(), vec![FillOutcome::Partial]);
     }
 
+    // -- the default fill is a plan too ------------------------------------
+
+    /// The two must never be able to stand in for one another: a fixture whose
+    /// user name and password agree cannot tell a fill from a swap, and cannot
+    /// tell "typed the username twice" from "typed both". Asserted, not merely
+    /// written differently, so that editing one of them back into the other is
+    /// a failure rather than a silently weaker suite.
+    const FILL_USER: &str = "hedge.sparrow@contoso.example";
+    const FILL_PASS: &str = "Vv4-quixotic-LANTERN-7";
+
+    #[test]
+    fn the_fill_fixture_can_tell_the_username_from_the_password() {
+        assert_ne!(FILL_USER, FILL_PASS, "the fixture cannot tell a swap from a fill");
+    }
+
+    /// **The default fill types the same three things it always did.**
+    ///
+    /// The behaviour `fill_via_send_input` had, now expressed as a plan. If the
+    /// template ever loses a piece or reorders them, this is what says so.
+    #[test]
+    fn the_default_fill_types_the_username_then_tab_then_the_password() {
+        use sequence::run_tests::FakeKeyboard;
+        let kb = FakeKeyboard::new();
+
+        fill_by_typing(&kb, 0x99, FILL_USER, FILL_PASS).expect("a default fill types");
+
+        assert_eq!(
+            kb.transcript(),
+            vec![
+                format!("type {FILL_USER}"),
+                "press TAB".to_string(),
+                format!("type {FILL_PASS}"),
+            ]
+        );
+    }
+
+    /// **The gap between foreground checks, which is the whole finding.**
+    ///
+    /// The old body asked once and then typed the username, a Tab and the
+    /// password with nothing in between -- ~120ms unchecked for a short
+    /// credential pair, proportionally more for a passphrase. Now every step is
+    /// preceded by its own check, exactly as a stored sequence's is.
+    #[test]
+    fn the_default_fill_re_checks_the_foreground_before_every_step() {
+        use sequence::run_tests::FakeKeyboard;
+        let kb = FakeKeyboard::new();
+
+        fill_by_typing(&kb, 0x99, FILL_USER, FILL_PASS).expect("a default fill types");
+
+        let plan = default_plan(FILL_USER, FILL_PASS).expect("the same plan it just ran");
+        assert!(plan.len() > 1, "a one-step plan would make this assertion meaningless");
+        assert_eq!(
+            kb.foreground_checks() as usize,
+            plan.len(),
+            "the default fill did not re-check the foreground once per step"
+        );
+    }
+
+    /// **A long credential is chopped, so no single burst outruns
+    /// [`sequence::MAX_BURST`].**
+    ///
+    /// The 250ms guarantee the sequence path is built around, on the path every
+    /// item in every existing vault actually takes. A passphrase used to be one
+    /// unbroken burst of `SendInput` calls with no check anywhere inside it;
+    /// the projection of the whole plan below is many times the burst bound,
+    /// and not one step is.
+    #[test]
+    fn a_long_credential_is_chopped_so_no_burst_outruns_the_bound() {
+        // 500 units at the 3ms default rate is ~1.5s of typing: six bursts, not
+        // one. A real passphrase or a generated 128-character password lands in
+        // the same territory.
+        let long_password = "q".repeat(500);
+        let plan = default_plan(FILL_USER, &long_password).expect("plans");
+
+        assert!(
+            plan.projected() > sequence::MAX_BURST * 4,
+            "the fixture is too short to need chopping, so this proves nothing"
+        );
+        let bursts = plan
+            .steps()
+            .iter()
+            .filter(|s| matches!(s, sequence::Step::Text { .. }))
+            .count();
+        assert!(
+            bursts > 2,
+            "a long password was not split into bursts (got {bursts} text steps)"
+        );
+        for step in plan.steps() {
+            assert!(
+                step.projected() <= sequence::MAX_BURST,
+                "a single burst is projected at {:?}, over the {:?} bound",
+                step.projected(),
+                sequence::MAX_BURST
+            );
+        }
+    }
+
+    /// **A default fill whose window goes away stops, and the password never
+    /// arrives.**
+    ///
+    /// The behaviour that did not exist at all before: the old body would have
+    /// typed the password into whatever had taken the foreground. The fake
+    /// keyboard sends no real input, so this exercises the abandonment without
+    /// a window and without a keystroke.
+    #[test]
+    fn a_default_fill_stops_when_the_window_goes_away_before_the_password() {
+        use sequence::run_tests::FakeKeyboard;
+        // In front for the username, gone by the Tab.
+        let kb = FakeKeyboard::loses_foreground_after(1);
+
+        let err = fill_by_typing(&kb, 0x99, FILL_USER, FILL_PASS)
+            .expect_err("a fill into a window that went away must not report success");
+
+        assert!(err.contains("no longer in front"), "got: {err}");
+        assert_eq!(
+            kb.transcript(),
+            vec![format!("type {FILL_USER}")],
+            "the fill kept typing after the window it was aimed at had gone"
+        );
+        assert!(
+            !kb.transcript().iter().any(|line| line.contains(FILL_PASS)),
+            "the password was typed into a window that was no longer ours"
+        );
+    }
+
+    /// **A login with no user name still fills.**
+    ///
+    /// `plan` refuses an unresolvable `{USERNAME}`, and the old straight line
+    /// simply typed an empty string and sent no keystrokes. Leaving
+    /// `{USERNAME}` in the template unconditionally would have turned every
+    /// password-only item in the vault -- which the vault permits -- into a
+    /// fill that refuses outright.
+    #[test]
+    fn a_login_with_no_username_still_fills_its_password() {
+        use sequence::run_tests::FakeKeyboard;
+        let kb = FakeKeyboard::new();
+
+        fill_by_typing(&kb, 0x99, "", FILL_PASS).expect("a password-only login still fills");
+
+        assert_eq!(
+            kb.transcript(),
+            vec!["press TAB".to_string(), format!("type {FILL_PASS}")],
+            "a password-only fill must type exactly what the straight line did"
+        );
+    }
+
+    /// The other half, and the reason the `{TAB}` is unconditional: the old
+    /// body pressed Tab between two `type_text` calls whatever either
+    /// contained, so a username-only fill has always ended on a Tab.
+    #[test]
+    fn a_login_with_no_password_still_fills_its_username() {
+        use sequence::run_tests::FakeKeyboard;
+        let kb = FakeKeyboard::new();
+
+        fill_by_typing(&kb, 0x99, FILL_USER, "").expect("a username-only login still fills");
+
+        assert_eq!(
+            kb.transcript(),
+            vec![format!("type {FILL_USER}"), "press TAB".to_string()],
+        );
+    }
+
+    /// The template, pinned directly, so a change to it is visible as a change
+    /// to it and not only as a change to four transcripts.
+    #[test]
+    fn the_default_template_elides_only_what_it_cannot_resolve() {
+        assert_eq!(default_sequence_for(FILL_USER, FILL_PASS), "{USERNAME}{TAB}{PASSWORD}");
+        assert_eq!(default_sequence_for("", FILL_PASS), "{TAB}{PASSWORD}");
+        assert_eq!(default_sequence_for(FILL_USER, ""), "{USERNAME}{TAB}");
+        // Reached only if a caller skips `app::fill_from_vault`'s empty-
+        // credentials warning; it is the straight line's own behaviour, which
+        // pressed Tab and typed nothing either side of it.
+        assert_eq!(default_sequence_for("", ""), "{TAB}");
+    }
+
+    /// The template it builds really is the crate's stated default, rather
+    /// than a second spelling of it that could drift.
+    #[test]
+    fn the_default_template_is_the_crates_default_sequence() {
+        assert_eq!(
+            default_sequence_for(FILL_USER, FILL_PASS),
+            crate::key_sequence::DEFAULT_SEQUENCE
+        );
+    }
+
+    // -- one fill at a time, on the default path too -------------------------
+
+    /// A fallback that reports whether anything else could have typed while it
+    /// was running -- i.e. whether the default path really holds the guard for
+    /// the duration, rather than acquiring and dropping it on the way past.
+    struct ChecksTheFlag {
+        free_during_the_fill: RefCell<Option<bool>>,
+    }
+    impl SendInputFiller for ChecksTheFlag {
+        fn fill(&self, _: isize, _: &str, _: &str) -> Result<(), String> {
+            *self.free_during_the_fill.borrow_mut() = Some(SequenceGuard::acquire().is_some());
+            Ok(())
+        }
+        fn fill_sequence(&self, _: isize, _: Plan, _: SequenceGuard) -> Result<(), String> {
+            panic!("this test is about the default path")
+        }
+    }
+
+    /// **The finding: a default fill used to type while a sequence was mid
+    /// `{DELAY}`.**
+    ///
+    /// With a guard held, `Injector::fill` succeeded and the fallback really
+    /// typed -- two runs interleaving keystrokes into one field, which is
+    /// exactly what `SequenceGuard`'s doc says it prevents. Neither the UIA arm
+    /// nor the keystroke arm may be reached now, so the refusal is checked
+    /// before the dispatch and not inside one branch of it.
+    #[test]
+    fn a_default_fill_is_refused_while_something_else_is_typing() {
+        let _serialised = sequence_test_lock();
+        let injector = Injector {
+            ui: FakeUi { result: Ok(false), calls: RefCell::new(0) },
+            fallback: FakeFallback::new(),
+        };
+
+        let held = SequenceGuard::acquire().expect("nothing else holds it");
+        let err = injector
+            .fill(7, FILL_USER, FILL_PASS)
+            .expect_err("a default fill during a sequence must be refused, not typed");
+
+        assert!(err.contains("already being typed"), "got: {err}");
+        assert_eq!(
+            *injector.fallback.calls.borrow(),
+            0,
+            "the refused fill still reached the keyboard"
+        );
+        assert_eq!(
+            *injector.ui.calls.borrow(),
+            0,
+            "the refused fill still reached UI Automation, which sets the same fields"
+        );
+
+        // The positive control: the refusal is a state, not a latch. Without
+        // this, a `fill` hard-wired to `Err` would pass everything above.
+        drop(held);
+        injector.fill(7, FILL_USER, FILL_PASS).expect("a fill once the other run has finished");
+        assert_eq!(*injector.fallback.calls.borrow(), 1);
+    }
+
+    /// The other direction: while a default fill is running, nothing else may
+    /// start. Acquiring the guard and dropping it before the typing -- the
+    /// `let Some(_) = ...` spelling, which compiles -- passes the test above
+    /// and fails here.
+    #[test]
+    fn nothing_else_may_type_while_a_default_fill_is_running() {
+        let _serialised = sequence_test_lock();
+        let injector = Injector {
+            ui: FakeUi { result: Ok(false), calls: RefCell::new(0) },
+            fallback: ChecksTheFlag { free_during_the_fill: RefCell::new(None) },
+        };
+
+        injector.fill(7, FILL_USER, FILL_PASS).expect("the fill runs");
+
+        assert_eq!(
+            *injector.fallback.free_during_the_fill.borrow(),
+            Some(false),
+            "a second run could have started typing in the middle of a default fill"
+        );
+    }
+
+    /// A default fill that failed must not wedge auto-type for the session:
+    /// the guard is released on the error path as well as the happy one.
+    #[test]
+    fn a_failed_default_fill_still_releases_the_keyboard() {
+        let _serialised = sequence_test_lock();
+        let injector = Injector {
+            ui: FakeUi { result: Ok(false), calls: RefCell::new(0) },
+            fallback: FakeFallback::failing(),
+        };
+
+        injector.fill(7, FILL_USER, FILL_PASS).expect_err("the fallback refuses");
+
+        assert!(
+            SequenceGuard::acquire().is_some(),
+            "a failed default fill left the guard held and auto-type wedged"
+        );
+    }
+
+    /// **A sequence is refused while a default fill is running**, which is the
+    /// same flag seen from the other side. Both paths refusing each other is
+    /// the property; either one alone is not.
+    #[test]
+    fn a_sequence_is_refused_while_a_default_fill_holds_the_keyboard() {
+        let _serialised = sequence_test_lock();
+        let injector = Injector {
+            ui: FakeUi { result: Ok(false), calls: RefCell::new(0) },
+            fallback: StillTyping::new(),
+        };
+
+        // Stand in for a default fill in progress: `Injector::fill` holds
+        // exactly this, for exactly as long as it is typing.
+        let typing_a_default_fill = SequenceGuard::acquire().expect("nothing else holds it");
+        let reported = Reported::default();
+
+        let err = injector
+            .fill_sequence(7, a_plan(), reported.sink())
+            .expect_err("a sequence during a default fill must be refused");
+
+        assert!(err.contains("already being typed"), "got: {err}");
+        assert_eq!(*injector.fallback.calls.borrow(), 0, "the refused sequence reached the filler");
+        assert_eq!(
+            reported.seen(),
+            vec![FillOutcome::NotTyped],
+            "the refused sequence did not report that it typed nothing"
+        );
+        drop(typing_a_default_fill);
+    }
+
+    /// Both refusals say the same sentence, because a user who pressed a
+    /// hotkey does not know which path they were on. Two literals could drift
+    /// into one path explaining itself and the other saying something else.
+    #[test]
+    fn both_paths_refuse_with_the_same_sentence() {
+        let _serialised = sequence_test_lock();
+        let injector = Injector {
+            ui: FakeUi { result: Ok(false), calls: RefCell::new(0) },
+            fallback: FakeFallback::new(),
+        };
+        let held = SequenceGuard::acquire().expect("nothing else holds it");
+
+        let default_refusal = injector.fill(7, FILL_USER, FILL_PASS).unwrap_err();
+        let sequence_refusal =
+            injector.fill_sequence(7, a_plan(), ignored()).unwrap_err();
+        drop(held);
+
+        assert_eq!(default_refusal, sequence_refusal);
+        assert_eq!(default_refusal, ALREADY_TYPING);
+        // The sentence has to be actionable: a bare "no" is indistinguishable
+        // from a hotkey that never registered.
+        assert!(default_refusal.contains("press the hotkey again"), "got: {default_refusal}");
+    }
+
     #[test]
     fn does_not_fall_back_when_ui_automation_succeeds() {
+        let _serialised = sequence_test_lock();
         let ui = FakeUi { result: Ok(true), calls: RefCell::new(0) };
         let injector = Injector { ui, fallback: FakeFallback::new() };
 
@@ -879,6 +1399,7 @@ mod orchestration_tests {
 
     #[test]
     fn falls_back_when_ui_automation_finds_no_fields() {
+        let _serialised = sequence_test_lock();
         let ui = FakeUi { result: Ok(false), calls: RefCell::new(0) };
         let injector = Injector { ui, fallback: FakeFallback::new() };
 
@@ -889,6 +1410,7 @@ mod orchestration_tests {
 
     #[test]
     fn falls_back_when_ui_automation_errors() {
+        let _serialised = sequence_test_lock();
         let ui = FakeUi { result: Err("com failure".into()), calls: RefCell::new(0) };
         let injector = Injector { ui, fallback: FakeFallback::new() };
 
@@ -899,6 +1421,7 @@ mod orchestration_tests {
 
     #[test]
     fn passes_the_target_hwnd_to_the_fallback() {
+        let _serialised = sequence_test_lock();
         // The fallback has to know which window it's meant to be typing into
         // so it can verify foreground; before this it typed blind.
         let ui = FakeUi { result: Ok(false), calls: RefCell::new(0) };
@@ -911,6 +1434,7 @@ mod orchestration_tests {
 
     #[test]
     fn surfaces_a_fallback_refusal_as_an_error() {
+        let _serialised = sequence_test_lock();
         // If the fallback refuses because the target isn't foreground, that
         // must reach the caller (which logs it), not be swallowed.
         let ui = FakeUi { result: Ok(false), calls: RefCell::new(0) };

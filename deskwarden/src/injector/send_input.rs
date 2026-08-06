@@ -4,19 +4,15 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_SHIFT,
-    VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
-/// Pause between individual simulated keystrokes.
-///
-/// `SendInput` delivers keystrokes far faster than a human types, and controls
-/// that do per-character work on the UI thread (the game launchers this
-/// fallback exists for, in particular) can drop characters under that rate. A
-/// few milliseconds per character is imperceptible to the user and
-/// substantially reduces the risk. This is a mitigation, not a guarantee:
-/// detecting and recovering from a partially delivered batch is out of scope.
-const INTER_KEYSTROKE_DELAY: Duration = Duration::from_millis(3);
+// The pause between individual simulated keystrokes used to be a second 3ms
+// constant here, next to `sequence::DEFAULT_RATE`. There is now one typing path
+// and therefore one constant: see `sequence::DEFAULT_RATE`, which carries the
+// reason (controls that do per-character work on their own UI thread drop
+// characters delivered faster than that) and is the rate `plan` stamps onto
+// every `Step::Text` a default fill produces.
 
 /// How long to let a foreground transition settle before re-checking it.
 const FOREGROUND_SETTLE: Duration = Duration::from_millis(120);
@@ -69,24 +65,13 @@ pub fn ensure_foreground(hwnd: isize) -> Result<(), String> {
     ))
 }
 
-/// Types `username`, presses Tab, then types `password`, into whatever
-/// control currently has keyboard focus, using simulated raw keystrokes via
-/// `SendInput`. This is the fallback injector for windows that don't expose
-/// a usable UI Automation tree (see `ui_automation.rs`).
-pub fn fill_via_send_input(username: &str, password: &str) -> windows::core::Result<()> {
-    type_text(username)?;
-    press_tab()?;
-    type_text(password)?;
-    Ok(())
-}
-
-fn type_text(text: &str) -> windows::core::Result<()> {
-    for ch in text.encode_utf16() {
-        send_unicode_char(ch)?;
-        std::thread::sleep(INTER_KEYSTROKE_DELAY);
-    }
-    Ok(())
-}
+// `fill_via_send_input`, its `type_text` and its `press_tab` used to live here:
+// a straight line that typed the username, pressed Tab and typed the password
+// with one foreground check in front of the lot and none inside it. The default
+// fill now goes through `injector::default_plan` and `sequence::run` like every
+// other fill, which re-verifies the foreground before each burst, so the three
+// of them are gone rather than left behind as a second way to type that nothing
+// calls and no test covers.
 
 fn send_unicode_char(ch: u16) -> windows::core::Result<()> {
     let mut down = keybd_input(0, KEYEVENTF_UNICODE);
@@ -94,12 +79,6 @@ fn send_unicode_char(ch: u16) -> windows::core::Result<()> {
     let mut up = keybd_input(0, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
     up.wScan = ch;
 
-    send(&[to_input(down), to_input(up)])
-}
-
-fn press_tab() -> windows::core::Result<()> {
-    let down = keybd_input(VK_TAB.0, KEYBD_EVENT_FLAGS(0));
-    let up = keybd_input(VK_TAB.0, KEYEVENTF_KEYUP);
     send(&[to_input(down), to_input(up)])
 }
 

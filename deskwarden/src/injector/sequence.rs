@@ -110,11 +110,18 @@ use zeroize::Zeroize;
 
 /// The pause between simulated keystrokes when the sequence does not say.
 ///
-/// The same 3ms [`crate::injector::send_input`] already uses, and for the same
-/// reason: controls that do per-character work on their own UI thread drop
-/// characters delivered faster than that. Shared as a constant here rather
-/// than a second literal so a sequence with no `{DELAY=n}` types at exactly
-/// the rate the default fill does.
+/// Controls that do per-character work on their own UI thread -- the game
+/// launchers the SendInput fallback exists for, in particular -- drop
+/// characters delivered faster than this. Three milliseconds is imperceptible
+/// to the user and substantially reduces the risk; it is a mitigation and not
+/// a guarantee, since detecting a partially delivered batch is out of scope.
+///
+/// **The one such constant in the crate.** `send_input` used to hold a second
+/// 3ms literal of its own for the default fill's straight-line typing. The
+/// default fill is now a [`Plan`] like any other (see
+/// [`crate::injector::default_plan`]), so a fill with no `{DELAY=n}` types at
+/// this rate because it is stamped with this constant, rather than because two
+/// literals happen to agree.
 pub const DEFAULT_RATE: Duration = Duration::from_millis(3);
 
 /// The longest a single uninterrupted burst of typing may be projected to
@@ -150,10 +157,21 @@ pub const MAX_BURST: Duration = Duration::from_millis(250);
 /// the *only* thing standing between the user and an unbounded gap. Charging it
 /// zero costs exactly the guarantee.
 ///
-/// One millisecond is a floor, not a measurement, and it is deliberately
-/// wrong in the safe direction for both consumers: over-charging a keystroke
-/// makes [`MAX_BURST`] chunks *smaller* (more foreground checks, never fewer)
-/// and makes [`MAX_SEQUENCE`] refuse *sooner*. A rate of zero is not a rate
+/// One millisecond is a floor, not a measurement, and **on the axis it is a
+/// floor for** it is wrong in the safe direction for both consumers:
+/// over-charging a keystroke makes [`MAX_BURST`] chunks *smaller* (more
+/// foreground checks, never fewer) and makes [`MAX_SEQUENCE`] refuse *sooner*.
+///
+/// It is not, however, the only axis, and the claim used to be made without
+/// that qualification. [`Step::projected`] charges a text unit its `rate` and
+/// nothing for the `SendInput` call that accompanies every one of them, so at
+/// **any** rate the real elapsed time of a burst exceeds its projection by
+/// roughly `units x syscall cost`. At the tightest chunk that is a few percent
+/// over the [`MAX_BURST`] gap rather than under it. The bound is therefore
+/// approximate in the unsafe direction by a small constant factor, not exact;
+/// it is stated here rather than papered over, because the alternative is
+/// putting a measured syscall cost into a projection that has to stay a pure
+/// function of the plan. A rate of zero is not a rate
 /// anyone can deliver anyway -- `RealKeyboard::type_text` still makes a
 /// `SendInput` call per UTF-16 unit -- so this is a floor under a cost that
 /// provably exists, not a fiction about one that does not.
@@ -599,7 +617,21 @@ impl Drop for TextRun {
 /// against by construction: there is nothing here that needs a window to
 /// exercise.
 pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
-    let mut steps: Vec<Step> = Vec::new();
+    // **A `Plan` from the first push, not a bare `Vec<Step>` wrapped up at the
+    // end.** `Plan`'s own doc says why -- "a `Vec<Step>` would hand the
+    // plaintext password back to the allocator on every early return in this
+    // module" -- and this function was the one place that did exactly that.
+    // `run.flush` empties the accumulator into these steps at every `{KEY}`,
+    // `{DELAY}` and `{DELAY=n}`, so any sequence with a key or a delay after
+    // `{PASSWORD}` had the password sitting in a `Step::Text` here; and five
+    // of the six `return Err` paths below sit *after* that point, so each of
+    // them dropped a `Vec` full of plaintext with no wipe anywhere on it.
+    // Wrapping at the end put the guarantee where the failures were not.
+    //
+    // Named `acc` rather than shadowing `steps`, so that a future `push` to a
+    // bare local is a name that does not exist rather than one that silently
+    // works. See `sequence_refusal_tests`.
+    let mut acc = Plan { steps: Vec::new() };
     let mut run = TextRun::new(DEFAULT_RATE);
     let mut pending_mods = ModSet::default();
     let mut pending_mod_label: Option<String> = None;
@@ -646,19 +678,19 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
                 if virtual_key(key.token).is_none() {
                     return Err(Refusal::UntypableKey(key.token.to_string()));
                 }
-                run.flush(&mut steps);
-                steps.push(Step::Key { key, mods: pending_mods });
+                run.flush(&mut acc.steps);
+                acc.steps.push(Step::Key { key, mods: pending_mods });
                 pending_mods = ModSet::default();
                 pending_mod_label = None;
             }
             Token::Delay(ms) => {
-                run.flush(&mut steps);
-                steps.push(Step::Wait(Duration::from_millis(u64::from(*ms))));
+                run.flush(&mut acc.steps);
+                acc.steps.push(Step::Wait(Duration::from_millis(u64::from(*ms))));
             }
             Token::DelayRate(ms) => {
                 // The rate change applies from here on, so the text typed
                 // *before* it must be flushed at the old rate first.
-                run.flush(&mut steps);
+                run.flush(&mut acc.steps);
                 // Clamped: a rate of zero switches off both MAX_BURST chunking
                 // and the MAX_SEQUENCE bound. See MIN_RATE.
                 run.rate = Duration::from_millis(u64::from(*ms)).max(MIN_RATE);
@@ -669,8 +701,8 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
                 let Some(key) = enter_key() else {
                     return Err(Refusal::UntypableKey("ENTER".into()));
                 };
-                run.flush(&mut steps);
-                steps.push(Step::Key { key, mods: pending_mods });
+                run.flush(&mut acc.steps);
+                acc.steps.push(Step::Key { key, mods: pending_mods });
                 pending_mods = ModSet::default();
                 pending_mod_label = None;
             }
@@ -692,9 +724,9 @@ pub fn plan(tokens: &[Token], values: &Resolved<'_>) -> Result<Plan, Refusal> {
     if let Some(label) = pending_mod_label {
         return Err(Refusal::DanglingModifier(label));
     }
-    run.flush(&mut steps);
+    run.flush(&mut acc.steps);
 
-    let plan = Plan { steps };
+    let plan = acc;
     if plan.is_empty() {
         return Err(Refusal::Nothing);
     }
@@ -765,6 +797,16 @@ mod plan_tests {
         Resolved { username: USER, password: PASS, totp: Some("123456"), custom: vec![("PIN", "4821")] }
     }
 
+    /// **Never call this inside a `plaintext_reached_the_allocator` closure.**
+    ///
+    /// It concatenates every text step into an ordinary `String` that nothing
+    /// wipes, so the plaintext it builds goes back to the allocator in the
+    /// clear when the caller drops it. That is harmless for the assertions in
+    /// this module, which run outside any watch -- and it is a live trap for a
+    /// future `!leaked` assertion, which would fail on this helper's own
+    /// temporary and be read as a defect in `plan`. See
+    /// `refusal_lifetime_tests`, which deliberately asserts with `contains`
+    /// rather than collecting anything.
     fn typed(plan: &Plan) -> String {
         plan.steps()
             .iter()
@@ -1412,6 +1454,29 @@ pub(crate) mod run_tests {
             me
         }
 
+        /// Everything actually emitted, as a flat list a sibling module can
+        /// read. `Emitted` is private to this module and stays that way; what
+        /// leaves is a rendering, which is all `injector::mod`'s tests need to
+        /// say "it typed the username, pressed Tab, then typed the password"
+        /// -- and, crucially, enough to catch a run that stopped early or that
+        /// swapped the two.
+        pub(crate) fn transcript(&self) -> Vec<String> {
+            self.emitted
+                .borrow()
+                .iter()
+                .map(|e| match e {
+                    Emitted::Text(t) => format!("type {t}"),
+                    Emitted::Key(k, _) => format!("press {k}"),
+                    Emitted::Waited(d) => format!("wait {}ms", d.as_millis()),
+                })
+                .collect()
+        }
+
+        /// How many times [`Keyboard::holds_foreground`] has been asked.
+        pub(crate) fn foreground_checks(&self) -> u32 {
+            self.checks.get()
+        }
+
         fn note(&self, e: Emitted) -> Result<(), String> {
             let n = self.emissions.get();
             self.emissions.set(n + 1);
@@ -1658,5 +1723,109 @@ mod notifier_tests {
         assert_eq!(take_notices(), vec!["the auto-type sequence uses {PICKCHARS}".to_string()]);
         // ...and taking clears, so one test cannot see another's notice.
         assert!(take_notices().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refusal_lifetime_tests {
+    use super::*;
+    use crate::key_sequence::parse;
+    use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+    /// **A refusal that happens after a flush must not release the password.**
+    ///
+    /// `plan` accumulated into a bare `Vec<Step>` and only wrapped it in a
+    /// [`Plan`] at the very end, so the wipe existed only for sequences that
+    /// *succeeded*. `run.flush` moves the accumulated text into a
+    /// [`Step::Text`] at every `{KEY}`, `{DELAY}` and `{DELAY=n}`, so a
+    /// sequence with any of those after `{PASSWORD}` had the plaintext sitting
+    /// in that `Vec` -- and five separate `return Err` paths dropped it there,
+    /// unwiped, straight to the allocator.
+    ///
+    /// The existing lifetime tests all assert on plans that **succeed**, which
+    /// is why nothing saw it: the one route they never took was the failing
+    /// one. Each sequence below refuses at a *different* `return Err`, because
+    /// they are five sites and not one.
+    #[test]
+    fn a_refusal_after_a_flush_does_not_release_the_password() {
+        // The probe is awake on this thread and in this direction. Without
+        // this, a probe that had gone deaf would make every assertion below
+        // pass by saying nothing.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe cannot see an unwiped password, so this test proves nothing"
+        );
+
+        // Leaked, so that building `Resolved` inside the watch allocates
+        // nothing that carries the probe on its own.
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+        let values = || Resolved { username: "u", password, totp: None, custom: vec![] };
+
+        // The fixture check: the prefix these all share really does flush the
+        // password **mid-parse**, before the refusing token is reached.
+        //
+        // Asserting merely that *some* step holds the password is not enough
+        // and this test said so wrongly at first: `plan` flushes once more at
+        // the end, so `{PASSWORD}` alone also puts the password in a step, and
+        // weakening the prefix to that left this passing. What distinguishes a
+        // mid-parse flush is that the password is in a step which is **not the
+        // last** -- there is a `{TAB}` after it, which is exactly what forced
+        // the flush that the refusing token then abandons.
+        let prefix = plan(&parse("{PASSWORD}{TAB}"), &values()).expect("the prefix plans");
+        let before_the_last = &prefix.steps()[..prefix.len() - 1];
+        assert!(
+            before_the_last
+                .iter()
+                .any(|s| matches!(s, Step::Text { text, .. } if text.contains(PROBE))),
+            "the fixture never flushed the password mid-parse, so the refusals below \
+             would prove nothing"
+        );
+        drop(prefix);
+
+        for sequence in [
+            // Unresolved -- a custom field the item has not got.
+            "{PASSWORD}{TAB}{S:NOPE}",
+            // Unsupported -- a construct this build cannot type.
+            "{PASSWORD}{TAB}{PICKCHARS}",
+            // DanglingModifier, from the end-of-token-list check.
+            "{PASSWORD}{TAB}+",
+            // Unsupported -- a grouping.
+            "{PASSWORD}{TAB}(x)",
+            // DanglingModifier, from the in-loop check: a different `return`.
+            "{PASSWORD}{TAB}+hello",
+        ] {
+            let tokens = parse(sequence);
+            let mut refused = false;
+            let leaked = plaintext_reached_the_allocator(|| {
+                refused = plan(&tokens, &values()).is_err();
+            });
+            assert!(refused, "{sequence} was expected to refuse, and planned");
+            assert!(
+                !leaked,
+                "{sequence} handed the password to the allocator in the clear"
+            );
+        }
+    }
+
+    /// The control the reviewer used to isolate the leak to the flushed step:
+    /// a refusal reached **before** any flush has nothing in the accumulator's
+    /// `Vec` to release, and was already clean. It is here so that a future
+    /// change which makes the flushing case leak again cannot be mistaken for
+    /// the probe having gone quiet across the board.
+    #[test]
+    fn a_refusal_before_any_flush_was_never_the_leaking_case() {
+        let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
+        let tokens = parse("{PASSWORD}{S:NOPE}");
+        let mut refused = false;
+        let leaked = plaintext_reached_the_allocator(|| {
+            refused = plan(
+                &tokens,
+                &Resolved { username: "u", password, totp: None, custom: vec![] },
+            )
+            .is_err();
+        });
+        assert!(refused, "the fixture was expected to refuse");
+        assert!(!leaked);
     }
 }
