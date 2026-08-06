@@ -81,7 +81,47 @@ pub fn fill_via_ui_automation(hwnd: isize, username: &str, password: &str) -> Re
             password_element.GetCurrentPatternAs(UIA_ValuePatternId)?;
 
         username_value.SetValue(&BSTR::from(username))?;
-        password_value.SetValue(&BSTR::from(password))?;
+
+        // **The one unwiped plaintext copy left on the default fill path, cut
+        // from two to one -- and the remaining one is a documented gap, not an
+        // oversight.**
+        //
+        // `credentials_for`'s `String` was wiped in `4a559b9`; `Plan` and
+        // `TextRun` zeroize on drop. This line was what remained. `BSTR::from
+        // (&str)` does two things: it collects the UTF-16 into an ordinary
+        // `Vec<u16>`, and it hands that to `SysAllocStringLen`, which COPIES
+        // it into a fresh COM allocation. So there were *two* plaintext
+        // buffers, and the `Vec` was released to Rust's allocator unwiped.
+        //
+        // That one is fixable with no `unsafe` at all: own the vector, wrap it
+        // in `Zeroizing`, and call the same `from_wide` that `From<&str>`
+        // calls internally -- identical code path, one fewer live copy.
+        let wide = zeroize::Zeroizing::new(password.encode_utf16().collect::<Vec<u16>>());
+        password_value.SetValue(&BSTR::from_wide(&wide)?)?;
+
+        // **What is NOT fixed here, deliberately: the `BSTR`'s own buffer.**
+        //
+        // A `BSTR` frees itself with `SysFreeString` on drop, which does not
+        // wipe. Wiping it means writing through its pointer before it drops,
+        // and `BSTR::as_ptr` returns `*const u16` -- so it means casting away
+        // constness and trusting that the pointer is the unique, writable COM
+        // allocation. Reading `windows-strings` says it is, for a non-empty
+        // `BSTR`; for an EMPTY one `as_ptr` returns a pointer into a
+        // `const EMPTY: [u16; 1]` static, and writing there is undefined
+        // behaviour in a read-only page. That is a guard on an implementation
+        // detail of a third-party crate, reached through a const-cast, on the
+        // live fill path -- and nothing in this crate can test it: reaching
+        // this function needs a real COM apartment, a real window and a real
+        // UIA tree, so no `!leaked` assertion can ever cover it.
+        //
+        // A wrong wipe here is worse than a documented gap, so this is the
+        // gap, stated: **after a UIA fill, one COM-allocated copy of the
+        // password is freed without being zeroized.** Its lifetime is the two
+        // statements above. Closing it properly wants either a `BSTR` whose
+        // storage this module allocates itself (`SysAllocStringLen` called
+        // here, `SysFreeString` in a local `Drop`, with the wipe in between)
+        // or an upstream `as_mut_ptr`; both are more change than a release
+        // review should make blind.
 
         Ok(true)
     }

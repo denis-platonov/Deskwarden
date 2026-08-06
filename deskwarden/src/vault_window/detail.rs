@@ -4187,9 +4187,21 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
 ///   revealed 40-character password overflows even the stacked line, so the
 ///   line it is on is the width it wraps at.
 ///
-/// Pinned by `the_previous_password_rows_fit_the_narrowest_pane`, and by
-/// `the_lane_leaves_the_cards_eighteen_points_of_clear_space`, which no
-/// longer has to hold these rows apart.
+/// **The two halves are pinned by different tests, and for one release they
+/// were not.** `a9dad37`'s message says "Neither half of the repair is
+/// optional... Pinned by `the_previous_password_rows_fit_the_narrowest_pane`
+/// and `the_lane_leaves_the_cards_eighteen_points_of_clear_space`". That is
+/// true of the STACKING half only. Both of those render with
+/// `RevealState::default()`, so the only value either measures is the
+/// ten-bullet mask -- and the mask fits the stacked line unwrapped, which is
+/// exactly why the wrap makes no difference to them. Deleting
+/// `job.wrap.max_width = room` below left all 1597 lib tests green while a
+/// revealed previous password ran to x = 351.2 on a 298pt pane whose cards
+/// end at 274: the same defect `a9dad37` exists to fix, one click away. The
+/// wrapping half is pinned by
+/// `a_revealed_previous_password_fits_the_narrowest_pane_too`, which reveals
+/// five 41-character entries and is the only test here that sets a reveal
+/// flag.
 fn masked_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -12019,6 +12031,19 @@ pub(crate) mod shape_ink {
     ///
     /// Everything else is ink, boxed by `visual_bounding_rect()`.
     ///
+    /// **One caveat on that sentence, recorded rather than fixed.** A
+    /// [`egui::epaint::RectShape`] carries a `brush` as well as a `fill` -- a
+    /// textured or image rect -- and the visibility test above reads only
+    /// `fill.a()` and the stroke. A rect with an alpha-0 `fill`, no stroke and
+    /// a live `brush` paints a picture and is reported here as `None`.
+    /// Neither pane paints one today (nothing in this crate sets `brush`;
+    /// the icons are `Shape::Mesh` and `Shape::Path`), so no assertion is
+    /// currently blind because of it -- but the first image rect to arrive
+    /// would be invisible to every lane and overflow test in this file, which
+    /// is the same shape of blindness the `_ => {}` arm had. Left alone
+    /// deliberately: a `brush` clause with nothing that can exercise it is an
+    /// untested branch pretending to be coverage.
+    ///
     /// **`Rect` is in here, and the box it reports is NOT `RectShape::rect`.**
     /// That was this function's own blind spot for one commit: `walk` recorded
     /// the geometric rect and routed everything else through here, and the
@@ -13501,5 +13526,157 @@ mod read_pane_scroll_tests {
             spilled.is_empty(),
             "a masked run still reaches past the cards' right edge at x = {edge}: {spilled:?}"
         );
+    }
+
+    /// **A previous password long enough to need the wrap, REVEALED.**
+    ///
+    /// 44 characters, and every row's password is distinct so that five runs
+    /// really means five rows and not one counted five times.
+    const LONG_HISTORY_PASSWORD: &str = "correct-horse-battery-staple-9f3c2a71bd4";
+
+    /// [`the_tallest_item_without_its_binding`] with its five `old-secret-N`
+    /// entries replaced by ones that cannot fit their line unwrapped.
+    ///
+    /// 13 characters was never a wrap fixture. The whole item is kept rather
+    /// than a fresh minimal login, so this measures the same pane, the same
+    /// cards and the same lane the two sibling tests do.
+    fn the_tallest_item_with_a_long_history() -> VaultItem {
+        let mut item = the_tallest_item_without_its_binding();
+        let history: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                serde_json::json!({
+                    "lastUsedDate": "2026-07-30T09:15:00.000Z",
+                    "password": format!("{LONG_HISTORY_PASSWORD}{i}"),
+                })
+            })
+            .collect();
+        item.other
+            .insert("passwordHistory".to_string(), serde_json::Value::Array(history));
+        item
+    }
+
+    /// [`settled`], with every previous-password row already revealed.
+    ///
+    /// The flag is set on the pane rather than driven through the eyes,
+    /// because a click is a second thing that can go wrong and the reveal is
+    /// not what this is measuring. `each_history_row_is_revealed_only_by_its_
+    /// own_flag` is what pins the flag to the row.
+    fn settled_revealing_the_history(size: egui::Vec2, item: &VaultItem) -> Shot {
+        let mut pane = ShortPane::new(size);
+        pane.reveal.password_history = [true; MAX_HISTORY_ROWS];
+        let over = vec![egui::Event::PointerMoved(pane.bounds().center())];
+        let mut shot = pane.frame(item, over.clone());
+        for _ in 1..SETTLE_FRAMES {
+            shot = pane.frame(item, over.clone());
+        }
+        shot
+    }
+
+    /// **The other half of [`masked_row`]'s repair: the WRAP WIDTH, which
+    /// nothing pinned.**
+    ///
+    /// `the_previous_password_rows_fit_the_narrowest_pane` and
+    /// `the_lane_leaves_the_cards_eighteen_points_of_clear_space` both render
+    /// with `RevealState::default()`, so the only value either of them ever
+    /// measures is the ten-bullet mask -- and the mask fits the stacked line
+    /// unwrapped. Deleting `job.wrap.max_width = room;` therefore left all
+    /// 1597 lib tests green while a revealed previous password ran to
+    /// x = 351.2 and its reveal eye to 346.7, on a 298pt pane whose cards end
+    /// at 274. That is the same defect `a9dad37` exists to fix, one click
+    /// away. `a9dad37`'s message claims "Neither half of the repair is
+    /// optional... Pinned by" those two tests; the stacking half was, the
+    /// wrapping half was not. This is the missing half.
+    ///
+    /// Held to the CARDS' right edge and not the pane's, for the reason its
+    /// sibling gives: a control that has merely stopped being clipped is
+    /// still one the user finds under the scroll bar.
+    ///
+    /// The vacuity controls come first, and there are two kinds. "No ink past
+    /// the cards" is also what a pane that drew no history reports, so the
+    /// five revealed runs are counted. And a revealed value that happened to
+    /// fit its line would measure the wrap no more than the mask does, so the
+    /// runs are shown to have really wrapped.
+    #[test]
+    fn a_revealed_previous_password_fits_the_narrowest_pane_too() {
+        let pane = egui::vec2(NARROW, ROOMY);
+        let edge = lane_left(pane);
+        let item = the_tallest_item_with_a_long_history();
+        let shot = settled_revealing_the_history(pane, &item);
+
+        // The rows are really on the pane, and really in the clear: five
+        // distinct plaintext runs, one per history entry.
+        let revealed: Vec<&(String, egui::Rect)> = shot
+            .glyphs
+            .iter()
+            .filter(|(label, _)| label.starts_with(LONG_HISTORY_PASSWORD))
+            .collect();
+        assert_eq!(
+            revealed.len(),
+            5,
+            "the pane painted {} revealed previous passwords, not the five this item \
+             carries -- so the emptiness below would be vacuous: {:?}",
+            revealed.len(),
+            shot.sources()
+        );
+        // The eyes that go with them, counted by DIFFERENCE against the same
+        // pane with the history taken away, exactly as the masked sibling
+        // does: the card's header draws a path of its own.
+        let paths = |shot: &Shot| shot.marks.iter().filter(|(kind, _)| *kind == "a path").count();
+        let mut without = the_tallest_item_with_a_long_history();
+        without.other.remove("passwordHistory");
+        let eyes = paths(&shot) - paths(&settled_revealing_the_history(pane, &without));
+        assert_eq!(
+            eyes, 5,
+            "the revealed previous-password rows contribute {eyes} reveal eyes, not five"
+        );
+
+        // The property. Every piece of ink the revealed pane lays -- the
+        // runs' glyphs and every non-text mark, the eyes among them -- is
+        // inside the cards.
+        let spilled: Vec<&&(String, egui::Rect)> = revealed
+            .iter()
+            .filter(|(_, ink)| ink.right() > edge + 0.5)
+            .collect();
+        assert!(
+            spilled.is_empty(),
+            "a REVEALED previous password reaches past the cards' right edge at \
+             x = {edge}, into the {BODY_PAD_X}pt scroll lane -- the value's wrap width is \
+             gone, so the run drew its full unwrapped length: {spilled:?}"
+        );
+        let past: Vec<&(&str, egui::Rect)> = shot
+            .marks
+            .iter()
+            .filter(|(_, ink)| ink.right() > edge + 0.5)
+            .collect();
+        assert!(
+            past.is_empty(),
+            "a mark on the revealed pane reaches past the cards' right edge at x = {edge} \
+             -- a reveal eye pushed off the card by a value that did not fold: {past:?}"
+        );
+
+        // ... and the runs really did fold, so the assertion above is about a
+        // wrap and not about a value that happened to fit. Measured against
+        // the height of the masked run on the same pane, which is one line by
+        // construction.
+        let masked = "\u{2022}".repeat(MASKED_BULLETS);
+        let one_line = settled(pane, &item)
+            .glyphs
+            .iter()
+            .filter(|(label, _)| *label == masked)
+            .map(|(_, ink)| ink.height())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            one_line > 0.0,
+            "the masked pane painted no bullet run to measure a line against"
+        );
+        for (label, ink) in &revealed {
+            assert!(
+                ink.height() > one_line * 1.5,
+                "the revealed run {label:?} is {}pt tall against a {one_line}pt line, so it \
+                 fitted on one line and this test measures the wrap no better than the \
+                 masked fixtures do -- lengthen LONG_HISTORY_PASSWORD",
+                ink.height()
+            );
+        }
     }
 }

@@ -247,7 +247,43 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                         log::error!(
                             "auto-type sequence failed for item {item_id} into hwnd {hwnd}: {e}"
                         );
-                        notifier.refused(&e);
+                        // **The same rule the Default arm applies, and for
+                        // the same reason.** This used to call
+                        // `notifier.refused(&e)` on every `Err`, which
+                        // contradicted the argument made twelve lines above:
+                        // that a Win32 foreground/`SendInput` diagnostic is
+                        // an expensive way to tell a user something they
+                        // cannot act on.
+                        //
+                        // The argument that an abandoned sequence is
+                        // different -- the user has watched half a login
+                        // typed, so they are owed a word -- is a good one,
+                        // and it is **not about this `Err`**.
+                        // `Injector::fill_sequence` returns as soon as the
+                        // typing thread has been *started*, so the only two
+                        // things that can arrive here both happen before a
+                        // single keystroke: [`ALREADY_TYPING`], from the
+                        // one-at-a-time guard, and
+                        // `send_input::ensure_foreground`'s "target window
+                        // {hwnd} is not foreground after N attempts" -- an
+                        // HWND number and a retry count, raised as an
+                        // `MB_TOPMOST` task-modal box in exactly the
+                        // situation `RealSendInput::fill_sequence`'s own doc
+                        // calls common right after our overlay closes.
+                        //
+                        // The genuinely abandoned run -- the foreground
+                        // re-check refusing between steps, with the username
+                        // already typed -- never comes back through this
+                        // return value at all. It is reported from inside the
+                        // typing thread by `injector::perform`, which calls
+                        // `Notifier::refused` on every `Err` from
+                        // `sequence::run` and is untouched by this. So the
+                        // half-typed login is still reported; what stopped
+                        // being reported is a diagnostic about a fill that
+                        // typed nothing.
+                        if e == crate::injector::ALREADY_TYPING {
+                            notifier.refused(&e);
+                        }
                     }
                 }
                 Err(refusal) => {
@@ -1777,6 +1813,89 @@ mod fill_dispatch_tests {
         assert_eq!(notices[0], crate::injector::ALREADY_TYPING);
     }
 
+    /// A filler whose sequence path fails the way the real one's single
+    /// pre-keystroke failure fails: `ensure_foreground` gave up, the guard is
+    /// told nothing was typed, and the message is the Win32 diagnostic.
+    ///
+    /// Written out rather than added as a field on `RecordingFiller`, so that
+    /// the shape under test is visibly `RealSendInput::fill_sequence`'s early
+    /// return and not a manufactured error in a fixture that also does five
+    /// other things.
+    struct ForegroundLostFiller {
+        rec: Arc<Recorder>,
+    }
+    impl SendInputFiller for ForegroundLostFiller {
+        fn fill(&self, hwnd: isize, user: &str, pass: &str) -> Result<(), String> {
+            self.rec.default_fills.lock().unwrap().push((hwnd, user.into(), pass.into()));
+            Ok(())
+        }
+        fn fill_sequence(
+            &self,
+            _hwnd: isize,
+            plan: Plan,
+            guard: crate::injector::SequenceGuard,
+        ) -> Result<(), String> {
+            let mut guard = guard;
+            guard.report(crate::fill_stats::FillOutcome::NotTyped);
+            drop(guard);
+            drop(plan);
+            Err("refusing to type: target window 4242 is not foreground \
+                 (foreground is 99) after 5 attempts"
+                .to_string())
+        }
+    }
+
+    /// **The two arms apply the same rule to the same error class.**
+    ///
+    /// `a_default_fill_that_failed_for_another_reason_opens_no_dialog` is this
+    /// test's twin on the other arm, and for one release the two arms
+    /// disagreed: the Default arm filtered to [`ALREADY_TYPING`] on the stated
+    /// grounds that a Win32 foreground diagnostic is "an expensive way to tell
+    /// a user something they cannot act on", while the Sequence arm called
+    /// `notifier.refused(&e)` on every `Err` -- including that exact
+    /// diagnostic, as an `MB_TOPMOST` task-modal box, in the moments right
+    /// after our own overlay closes, which the sequence path's own doc calls
+    /// the common case.
+    ///
+    /// What is **not** given up is the report the user actually needs. A run
+    /// abandoned mid-sequence, with the username already on screen, does not
+    /// return through `fill_sequence` at all -- `Ok(())` there means "the
+    /// thread started" -- and is reported by `injector::perform`, which is
+    /// untouched. `injector::orchestration_tests` pins that half.
+    #[test]
+    fn a_sequence_that_failed_for_another_reason_opens_no_dialog() {
+        let _serialised = crate::injector::sequence_test_lock();
+
+        let rec = Arc::new(Recorder::default());
+        let injector =
+            Injector { ui: NoUiAutomation, fallback: ForegroundLostFiller { rec: rec.clone() } };
+        let stats = scratch_stats("sequence-diagnostic");
+        let notifier = sequence::RecordingNotifier::default();
+        fill_from_vault(
+            &cache_with(item_with("{USERNAME}{TAB}{PASSWORD}")),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            &notifier,
+        );
+
+        // Positive control: the fill really did take the sequence path and
+        // really did fail there. Without this, "no dialog" is also what a
+        // fill that never ran reports.
+        assert!(
+            rec.default_fills.lock().unwrap().is_empty(),
+            "the fill took the default arm, so this says nothing about the sequence arm"
+        );
+        assert_eq!(stats.count("item-1"), 0, "a failed sequence was counted");
+
+        assert!(
+            notifier.take().is_empty(),
+            "a Win32 foreground diagnostic was raised as a task-modal box on the sequence \
+             arm, which is exactly what the default arm refuses to do with the same error"
+        );
+    }
+
     /// And the accounting half of it: a sequence refused before it started is
     /// not a fill, exactly as a refused default fill is not.
     #[test]
@@ -1837,6 +1956,20 @@ mod fill_dispatch_tests {
     #[test]
     fn a_default_fill_does_not_release_the_password_in_the_clear() {
         use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // **The instrument is awake, in this thread and in this direction.**
+        // `refusal_lifetime_tests` opens with exactly this line and says why:
+        // without it, a probe that had gone deaf makes the assertion below
+        // pass by saying nothing. This test relied instead on "the fill
+        // really ran", which is a different fact -- a fill can run in full
+        // while the watch reports on nothing at all. A deaf instrument
+        // reporting clean is the exact failure this suite exists to catch,
+        // and the one shape it cannot catch in itself.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe cannot see an unwiped password, so this test proves nothing"
+        );
 
         let _serialised = crate::injector::sequence_test_lock();
 

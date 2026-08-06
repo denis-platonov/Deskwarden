@@ -1253,6 +1253,63 @@ mod plan_tests {
         );
     }
 
+    /// **Secrets: a `Plan` dropped while the stack UNWINDS does not release
+    /// the password either.**
+    ///
+    /// `login_ui` has `an_unwind_does_not_release_the_master_password_in_the_
+    /// clear` for `LoginForm`, and this is its `Plan` equivalent, which was
+    /// absent. Success (the test above), refusal-before-flush and
+    /// refusal-after-flush (`refusal_lifetime_tests`) were all covered; the
+    /// unwind was not.
+    ///
+    /// It is not a hypothetical exit. A `Plan` is moved onto the typing
+    /// thread (`RealSendInput::fill_sequence`), and a panic anywhere in
+    /// `perform` -- an arithmetic overflow in the burst chop, an `expect` on
+    /// a poisoned lock -- unwinds that thread with the plan live. What
+    /// carries the password out is `Drop for Plan`, and `Drop` running during
+    /// an unwind is a different fact from `Drop` running at end of scope only
+    /// in that nothing here had ever asserted it.
+    ///
+    /// Both halves are needed. The control shows the watch really does see an
+    /// ordinary `String` go past *on an unwinding stack* -- panic machinery
+    /// allocates, and an instrument that lost the thread there would make the
+    /// assertion below pass by seeing nothing at all.
+    #[test]
+    fn an_unwind_does_not_release_the_password_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+        use std::panic::AssertUnwindSafe;
+
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || {
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    let _held = bare;
+                    panic!("deliberate: unwinding past a live plan");
+                }));
+            }),
+            "control: an ordinary String unwound past the allocator unnoticed, so the \
+             assertion below is about an instrument that sees nothing"
+        );
+
+        // Built outside the watch, for the reason the test above gives: the
+        // temporaries of building a plan are not what this is measuring.
+        let password = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        let built = plan(
+            &parse("{USERNAME}{TAB}{PASSWORD}"),
+            &Resolved { password: &password, ..values() },
+        )
+        .expect("plans");
+        assert!(
+            !plaintext_reached_the_allocator(move || {
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(move || {
+                    let _held = built;
+                    panic!("deliberate: unwinding past a live plan");
+                }));
+            }),
+            "an unwind past a live Plan released the password in the clear"
+        );
+    }
+
     /// **Secrets: a `plan` that refuses *after* accumulating the password does
     /// not hand it to the allocator either.**
     ///
