@@ -327,6 +327,23 @@ impl AppIdentityCache {
     /// being far longer than the gap between two keystrokes.
     pub const SETTLE: Duration = Self::POLL_INTERVAL;
 
+    /// Pretend a probe already ran for `path` and answered `name` (and
+    /// `icon`). **Test-only, and the only way a UI test can exercise a
+    /// resolved name at all**: every real answer comes off a `VS_VERSIONINFO`
+    /// resource on a file that exists on the machine running the test, so a
+    /// test that wanted "this app is called Ledgerline Accounting Suite" would
+    /// otherwise have to ship a signed binary.
+    ///
+    /// It writes the same `Entry::Ready` a real probe produces, through the
+    /// same map [`Self::label`] reads, so a caller that stopped asking this
+    /// cache -- or asked it about the wrong string -- still fails: the seeded
+    /// name simply never reaches the screen.
+    #[cfg(test)]
+    pub fn seed_ready(&mut self, path: &str, name: &str, icon: Option<egui::TextureHandle>) {
+        self.entries
+            .insert(path.to_string(), Entry::Ready { name: name.to_string(), icon });
+    }
+
     /// How many paths have been probed. Test-only: the leak this module's
     /// debounce exists to prevent is a *count*, and counting is the only way to
     /// see it.

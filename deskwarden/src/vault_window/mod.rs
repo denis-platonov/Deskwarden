@@ -2348,6 +2348,7 @@ pub fn build_frame<A: UiAutomationFiller + Clone + 'static, B: SendInputFiller +
                                 delete_pending,
                                 &mut reveal,
                                 icons.textures.get(item.id.as_str()),
+                                &mut app_identities,
                             );
                             // `item` and `totp_code` already hold everything
                             // a copy action needs -- `draw_detail_read` only
@@ -4053,6 +4054,11 @@ fn draw_read_arm(
     delete_pending: bool,
     reveal: &mut detail::RevealState,
     icon: Option<&egui::TextureHandle>,
+    // The window's one `AppIdentityCache`, threaded through to the read pane
+    // for the same reason the edit form gets it: the `MATCHED APP` card now
+    // shows what the bound app is really CALLED, and that answer comes off a
+    // worker thread and is cached per path for the life of the window.
+    apps: &mut crate::app_identity::AppIdentityCache,
 ) -> DetailAction {
     let mut action = draw_detail_read(
         ui,
@@ -4063,6 +4069,7 @@ fn draw_read_arm(
         delete_pending,
         reveal,
         icon,
+        apps,
     );
     // Ctrl+Shift+F (spec section 5) is the keyboard equivalent of clicking
     // "Fill in app" -- checked here, not at the top level, because it needs
@@ -7696,11 +7703,13 @@ mod app_block_wiring_tests {
     }
 
     #[test]
-    fn both_editors_are_handed_the_one_identity_cache() {
+    fn every_pane_that_names_an_app_is_handed_the_one_identity_cache() {
         assert_eq!(
             occurrences(source(), PASSES_THE_CACHE),
-            2,
-            "expected {PASSES_THE_CACHE:?} exactly twice -- once per draft editor. Constructing \
+            3,
+            "expected {PASSES_THE_CACHE:?} exactly three times -- once per draft editor, and \
+             once for the READ pane, whose MATCHED APP card now shows what the bound app is \
+             really called. Constructing \
              a cache inside the frame closure instead would resolve the matched app's name and \
              re-upload its icon on EVERY repaint, which is the per-frame I/O `app_identity` \
              exists to prevent"
@@ -10727,6 +10736,7 @@ mod draw_read_arm_tests {
                 false,
                 &mut reveal,
                 None,
+                &mut crate::app_identity::AppIdentityCache::default(),
             );
         });
 

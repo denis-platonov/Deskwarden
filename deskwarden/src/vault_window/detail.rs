@@ -1014,6 +1014,57 @@ fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
     }
 }
 
+/// The one chord on this pane that is not a copy: **open the matched app**.
+///
+/// The user asked for the app's name to "be clickable like link and have Ctrl
+/// + shortcut". Spelled as `(modifiers, key, chord)` -- the same triple
+/// [`COPY_SHORTCUTS`] carries, for the same reason: the chord a row PAINTS and
+/// the keys the handler is wired to have to be one value or they drift.
+///
+/// **Standalone rather than a fifth row of [`COPY_SHORTCUTS`], and that is a
+/// decision about honesty, not tidiness.** Every function hanging off that
+/// table is about copying -- `copy_shortcut_action` returns a `Copy*`,
+/// `copy_shortcut_label` names *a field whose value goes on the clipboard*,
+/// and `copy_row`'s tooltip and its toast both say "copied". Adding "open the
+/// app" to it would put a `CopyShortcut::OpenApp` variant through all four and
+/// raise "Application copied" over a launched process. It is also not a
+/// sibling *table*: there is one of it, and a one-row table is a shape
+/// pretending to be a set.
+///
+/// **The collision guard still covers it**, which is the thing that mattered:
+/// `no_two_bindings_share_a_chord` now walks [`pane_chords`], which is
+/// `COPY_SHORTCUTS` **plus this**, so a future binding cannot silently shadow
+/// it or be shadowed by it.
+///
+/// `O` for *open*, and free -- checked over the whole crate rather than
+/// assumed: `Key::O` appears in no other expression in it. Shifted, because
+/// plain CTRL+O is the universal "open a file" and this opens a program;
+/// shifted chords are safe here only because [`consume_chord`] matches
+/// modifiers exactly (see [`COPY_SHORTCUTS`]'s own note, where CTRL+SHIFT+U
+/// versus CTRL+U turns on the same fact).
+const OPEN_APP_CHORD: (egui::Modifiers, egui::Key, &str) = (
+    egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+    egui::Key::O,
+    "CTRL+SHIFT+O",
+);
+
+/// Every chord this pane consumes, named, so the collision guard sees all of
+/// them and not only the copies. See [`OPEN_APP_CHORD`].
+#[cfg(test)]
+fn pane_chords() -> Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)> {
+    let mut all: Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)> = COPY_SHORTCUTS
+        .iter()
+        .map(|(which, modifiers, key, chord)| match which {
+            CopyShortcut::Username => ("copy Username", *modifiers, *key, *chord),
+            CopyShortcut::Password => ("copy Password", *modifiers, *key, *chord),
+            CopyShortcut::Totp => ("copy One-time code", *modifiers, *key, *chord),
+            CopyShortcut::Url => ("copy Website", *modifiers, *key, *chord),
+        })
+        .collect();
+    all.push(("open the matched app", OPEN_APP_CHORD.0, OPEN_APP_CHORD.1, OPEN_APP_CHORD.2));
+    all
+}
+
 /// How long a copy confirmation stays up, in seconds. The user asked for
 /// "5 seconds tooltip".
 const COPY_TOAST_SECONDS: f64 = 5.0;
@@ -1367,13 +1418,46 @@ fn row_offers_copy(value: &str) -> bool {
 /// it is not bound to.
 fn shortcut_hint(ui: &mut egui::Ui, hint: Option<CopyShortcut>) {
     if let Some(which) = hint {
-        ui.label(
-            RichText::new(copy_shortcut_chord(which))
-                .size(10.0)
-                .family(egui::FontFamily::Monospace)
-                .color(theme::TEXT_GHOST),
-        );
+        chord_hint(ui, copy_shortcut_chord(which));
     }
+}
+
+/// One chord, painted on a row's control line. **The one place this pane draws
+/// a key**, so the `MATCHED APP` card's open chord looks exactly like the copy
+/// chords beside it rather than being a second treatment of the same idea --
+/// which is what made it discoverable at all.
+fn chord_hint(ui: &mut egui::Ui, chord: &str) {
+    ui.label(
+        RichText::new(chord)
+            .size(CHORD_HINT_SIZE)
+            .family(egui::FontFamily::Monospace)
+            .color(theme::TEXT_GHOST),
+    );
+}
+
+/// The size a chord hint is painted at, in one place so
+/// [`chord_hint_width`] measures the run [`chord_hint`] will lay and not a
+/// different one.
+const CHORD_HINT_SIZE: f32 = 10.0;
+
+/// How wide [`chord_hint`] will be.
+///
+/// **The `MATCHED APP` card has to know**, and nothing else on this pane does.
+/// Every other row's value is short and leaves the control group room by
+/// accident; the App row's value is an app's full name laid to an explicit
+/// wrap width, and a value laid to the WHOLE value column leaves the control
+/// group nothing -- which is precisely how `Remove` came to be drawn on top
+/// of the card's notes. Measured through the same galley rather than
+/// estimated, so the reservation and the drawing cannot disagree.
+fn chord_hint_width(ui: &egui::Ui, chord: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            chord.to_string(),
+            egui::FontId::new(CHORD_HINT_SIZE, egui::FontFamily::Monospace),
+            theme::TEXT_GHOST,
+        )
+        .size()
+        .x
 }
 
 /// Which copy a chord asks for, given what the selected item actually
@@ -1590,6 +1674,18 @@ pub fn draw_detail_read(
     // falls back to the colored-initials monogram, same as every other
     // avatar in this app when no favicon is available.
     icon: Option<&egui::TextureHandle>,
+    // The window's one cache of "what is this executable really called, and
+    // what does it look like" -- the SAME cache the edit form's app block
+    // uses, held by `vault_window::mod`'s `run` and living as long as the
+    // window. `&mut` because asking it about a path it has not seen is what
+    // starts the (debounced, worker-thread) lookup; see `app_identity`.
+    //
+    // **Not a resolved name and icon passed in already**, which was the
+    // smaller signature: the decision about WHICH path to resolve is
+    // [`app_name_lookup_path`]'s and belongs on this side of the boundary
+    // with the match it is about, and moving it into `vault_window::mod`
+    // would put it where this file's tests cannot call it.
+    apps: &mut crate::app_identity::AppIdentityCache,
 ) -> DetailAction {
     let mut action = DetailAction::None;
     // **First, before anything is drawn or any chord is resolved.** A copy
@@ -1629,6 +1725,36 @@ pub fn draw_detail_read(
         .filter(|_| kind_offers_fill(kind))
         .unwrap_or("");
 
+    // **The binding, derived up here beside `website` and for the same
+    // reason**: CTRL+SHIFT+O is resolved before anything is drawn, and the
+    // chord and the `MATCHED APP` card must not be able to disagree about
+    // which app is bound. Both the parsed match and the raw presence of the
+    // field, because they are three states and not two -- see
+    // `app_card_body`.
+    let app_match = crate::vault_bridge::extract_app_match(item);
+    let app_field_present = crate::vault_bridge::has_app_match_field(item);
+    // The app's real NAME and its icon, resolved once per path by the
+    // window's cache -- off this thread, and never per frame. The path is
+    // `app_name_lookup_path`'s choice, NOT `m.path`: a dead binding is
+    // deliberately looked up under `""` so that nothing is probed and the raw
+    // `process` is what comes back. The two arguments are deliberately
+    // different fields and a test fixture in which they agree would not be
+    // able to tell them apart.
+    let (app_name, app_icon, app_pending) = {
+        let (path, process) = match app_match.as_ref() {
+            Some(m) => (app_name_lookup_path(m), m.process.as_str()),
+            None => ("", ""),
+        };
+        let label = apps.label(ui.ctx(), path, process);
+        (label.name.to_string(), label.icon.cloned(), label.pending)
+    };
+    if app_pending {
+        // A channel is not input, and egui does not repaint for one. Same
+        // cadence the edit form's app block asks for.
+        ui.ctx()
+            .request_repaint_after(crate::app_identity::AppIdentityCache::POLL_INTERVAL);
+    }
+
     // **Consumed before anything below is drawn.** `consume_key` takes the
     // event out of the queue, so a chord that means "copy" here cannot also
     // reach a text field or a button underneath. What it resolves to is
@@ -1641,6 +1767,14 @@ pub fn draw_detail_read(
             .find(|(_, modifiers, key, _)| consume_chord(i, *modifiers, *key))
             .map(|(which, _, _, _)| *which)
     });
+    // The one non-copy chord, taken out of the queue in the same pass and for
+    // the same reason. Applied at the very end, after the copies and after
+    // any click, so a deliberate act on a specific control always wins. What
+    // it resolves to is `app_name_open_action`'s decision -- the same one the
+    // name-as-link and the footer's `Open` obey -- so a chord cannot start
+    // something those two refuse.
+    let open_app_chord =
+        ui.input_mut(|i| consume_chord(i, OPEN_APP_CHORD.0, OPEN_APP_CHORD.1));
 
     // Whatever stacking the container handed us, kept for the body below --
     // the cards there still lay themselves out with it.
@@ -2118,16 +2252,23 @@ pub fn draw_detail_read(
     // `APP_CARD_HEADING`. Last of the body cards, above the metadata strip:
     // the cards above are the item's own contents, and this one is about what
     // Deskwarden does with them.
-    let app_match = crate::vault_bridge::extract_app_match(item);
-    // **The FIELD, not the parsed match.** A field that will not parse is a
-    // binding the user can see in every other Bitwarden client and must be
-    // able to clear from here; asking `app_match.is_some()` filed it as "no
-    // field at all" and hid the card outright on a non-fillable kind. See
-    // `app_card_body`.
-    let app_field_present = crate::vault_bridge::has_app_match_field(item);
+    //
+    // `app_match` and `app_field_present` are derived at the top of this
+    // function, beside `website` -- **the FIELD as well as the parsed match**,
+    // because a field that will not parse is a binding the user can see in
+    // every other Bitwarden client and must be able to clear from here, and
+    // asking `app_match.is_some()` filed it as "no field at all" and hid the
+    // card outright on a non-fillable kind. See `app_card_body`.
     if app_card_visible(app_field_present, kind) {
         card(ui, APP_CARD_HEADING, |ui| {
-            app_match_card(ui, app_match.as_ref(), app_field_present, website, &mut action);
+            app_match_card(
+                ui,
+                app_match.as_ref(),
+                app_field_present,
+                website,
+                ResolvedApp { name: &app_name, icon: app_icon.as_ref() },
+                &mut action,
+            );
         });
         ui.add_space(CARD_GAP);
     }
@@ -2170,6 +2311,21 @@ pub fn draw_detail_read(
                 // this chord painted as its label, so the two agree by
                 // construction rather than by inspection.
                 note_copied(ui.ctx(), copy_shortcut_label(which));
+            }
+        }
+    }
+    // **After the copies and after every click**, so a deliberate act on a
+    // specific control wins over a keystroke -- the ordering the copy chords
+    // already have. No toast: this starts a program, and the program
+    // appearing is the confirmation. `vault_window::mod` raises the
+    // confirmation dialog whenever the plan carries vault `args`, and reports
+    // a failure band when Windows refuses -- all of which this inherits by
+    // reporting the very same `DetailAction::OpenApp` the footer's `Open`
+    // does. There is still exactly one `launch_app` call in this program.
+    if matches!(action, DetailAction::None) && open_app_chord {
+        if let Some(m) = app_match.as_ref() {
+            if let Some(open) = app_name_open_action(m, website) {
+                action = open;
             }
         }
     }
@@ -2292,6 +2448,53 @@ pub fn app_match_is_dead(m: &AppMatch) -> bool {
     crate::window_watch::is_host_process(&m.process) && !(m.hosted && !m.title.is_empty())
 }
 
+/// Which path this card hands [`AppIdentityCache::label`] to find the app's
+/// real name and icon -- or `""`, meaning **do not look it up at all**.
+///
+/// The user's report: *"Matched app should show normal name with icon and not
+/// mabl.exe"*. The edit form has done this since `4b05adb`; this is the same
+/// cache, asked from the read pane, and it is asked through a function rather
+/// than by passing `&m.path` at the call site so that the one case that must
+/// NOT be dressed up is a decision a test can call.
+///
+/// **That case is a dead binding** ([`app_match_is_dead`]). Its `process` is a
+/// host name -- `ApplicationFrameHost.exe` -- and its `path`, when one was
+/// recorded, is the real `C:\Windows\System32\ApplicationFrameHost.exe`, which
+/// exists, carries a `FileDescription` of *Application Frame Host*, and has a
+/// perfectly good shell icon. Resolving it would paint a Windows internal's
+/// name and icon directly above [`APP_MATCH_DEAD_NOTICE`] -- *Deskwarden is
+/// ignoring this match, so it never fires* -- which is a broken binding
+/// wearing the costume of a working one. The raw `process` is what the user
+/// needs to see: it is the evidence of what went wrong, and it is the string
+/// the notice's advice ("pick the app again, or Remove") is about.
+///
+/// `""` rather than a second `if` at the draw site, because
+/// [`AppIdentityCache::label`] already answers an empty path from `process`
+/// alone -- **no thread, no `fs::metadata`, no `SHGetFileInfoW`, no icon**.
+/// One rule, expressed by choosing the input rather than by branching around
+/// the output.
+///
+/// Every other case goes to the cache and is handled there, deliberately:
+///
+///  * a **Microsoft Store** match needs nothing special. Its `process` is the
+///    packaged app's own exe (`Speedtest.exe`, not the frame host) and its
+///    `path` is under `WindowsApps`, so the cache either reads the name and
+///    icon or -- far more often, those directories being ACL'd -- fails to
+///    open the file and degrades to the file name, which is the exe name this
+///    row used to print. The word *hosted* still never reaches the screen:
+///    [`APP_HOSTED_NOTE`] is what explains this match, unchanged.
+///  * a **path that no longer exists** -- uninstalled, moved, or on a share
+///    that is down -- degrades the same way: `fs::metadata` fails on the
+///    worker, so the name falls back to the file name, no icon is fetched at
+///    all, and no dialog is raised. The `Program file` row below is still
+///    showing the full path, which is the thing the user has to act on.
+fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
+    if app_match_is_dead(m) {
+        return "";
+    }
+    &m.path
+}
+
 /// Whether *this item's* binding is one [`app_match_is_dead`] calls dead.
 ///
 /// The item-level spelling of that predicate, so the two places that must act
@@ -2380,11 +2583,36 @@ fn app_card_visible(has_field: bool, kind: ItemKind) -> bool {
 struct AppRow {
     label: &'static str,
     value: String,
+    /// **What a click on the row puts on the clipboard, which is not always
+    /// what the row shows.**
+    ///
+    /// Equal to `value` on every row but `App`, and the exception is the
+    /// point of the field. That row now *displays* the app's real name --
+    /// `Google Chrome` -- and it copies `chrome.exe`, because the clipboard
+    /// is a thing the user is about to paste somewhere and the only place a
+    /// matched app's identity is ever pasted (a shortcut, a script, a bug
+    /// report, this app's own Program file box) wants the executable name.
+    /// "Google Chrome" pastes into nothing.
+    ///
+    /// The exe name is therefore still on the card even though the row no
+    /// longer prints it on its own line: the `Program file` row below is
+    /// showing the full path, which ends in it.
+    copy: String,
     /// `false` for a placeholder. It reaches [`copy_row`]'s `copyable`, so a
     /// row saying "Not recorded" is inert -- no tint, no hand, no tooltip, no
     /// toast -- for the same reason an empty Password row is (see
     /// [`row_offers_copy`]).
+    ///
+    /// Derived from [`Self::copy`] and not from `value`: a row that showed a
+    /// resolved name and had nothing to copy would offer a tint, a hand and a
+    /// toast over an empty clipboard, which is the exact defect
+    /// [`row_offers_copy`] exists to refuse.
     real: bool,
+    /// Whether this row is the one that carries the app's icon and its link
+    /// -- true for `App` and nothing else. A flag rather than a `label ==
+    /// "App"` test at the draw site, because a label is a word on the screen
+    /// and this is a fact about the row.
+    app: bool,
 }
 
 /// The placeholder for a `path` this match never captured -- every match saved
@@ -2398,8 +2626,13 @@ const APP_PATH_UNRECORDED: &str = "Not recorded";
 /// keys -- but the trigger is a control rather than a row of text, so it is
 /// not here; it is [`trigger_label`]'s three pills, drawn after these.
 ///
-///  * **App** -- `process`, the executable's file name. This is the thing the
-///    match engine actually compares, so it is first.
+///  * **App** -- `name`: what the app is *called*, resolved from the
+///    executable's version resource by [`AppIdentityCache`] and passed in.
+///    The user's report was that this row said `mabl.exe` where the edit form
+///    already said the app's real name. It still COPIES `process` (see
+///    [`AppRow::copy`]) and it is still first: it is the app, and the thing
+///    the match engine compares is the file name at the end of the path
+///    directly below.
 ///  * **Window title** -- `title`, and ONLY when `hosted`. An unhosted title
 ///    is inert by design (see [`AppMatch::hosted`]): every one saved during
 ///    the one commit that recorded titles for every row is deliberately never
@@ -2409,17 +2642,26 @@ const APP_PATH_UNRECORDED: &str = "Not recorded";
 ///    answers "is this safe to execute", this row answers "what did the picker
 ///    record", and showing nothing for a path that fails the launch check
 ///    would hide the very corruption a user needs to see in order to fix it.
-fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
+fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
     let mut rows = vec![AppRow {
         label: "App",
-        value: m.process.clone(),
+        // **`name`, not `m.process`** -- the whole of the user's report.
+        // Resolved by `AppIdentityCache` off the path
+        // [`app_name_lookup_path`] chose, and passed in rather than looked up
+        // here because this function is pure and that lookup is file I/O on a
+        // worker thread.
+        value: name.to_string(),
+        copy: m.process.clone(),
         real: row_offers_copy(&m.process),
+        app: true,
     }];
     if m.hosted && !m.title.is_empty() {
         rows.push(AppRow {
             label: "Window title",
             value: m.title.clone(),
+            copy: m.title.clone(),
             real: true,
+            app: false,
         });
     }
     let recorded = row_offers_copy(&m.path);
@@ -2430,7 +2672,13 @@ fn app_match_rows(m: &AppMatch) -> Vec<AppRow> {
         } else {
             APP_PATH_UNRECORDED.to_string()
         },
+        // The path itself, empty when there is none -- NOT the placeholder,
+        // which is this pane's own word and must never be what a click puts
+        // on the clipboard. Keeping it here is what lets `real` be one
+        // expression over `copy` on every row.
+        copy: m.path.clone(),
         real: recorded,
+        app: false,
     });
     rows
 }
@@ -2834,6 +3082,34 @@ fn open_choice_action(choice: &OpenChoice) -> DetailAction {
     }
 }
 
+/// What clicking the App row's NAME does, and what [`OPEN_APP_CHORD`] does --
+/// or `None`, meaning the name is **plain text, not a link**.
+///
+/// The user asked for the matched app's name to "be clickable like link and
+/// have Ctrl + shortcut". This is that, and it is one expression so the link,
+/// the chord and the footer's `Open` button cannot end up meaning three
+/// different things.
+///
+/// **It goes through [`app_launch_plan`], which is the only constructor of a
+/// [`LaunchPlan`] and the only gate.** Nothing here re-decides what may be
+/// started: the link inherits, for free and unavoidably, that function's
+/// refusal of a dead binding and of a Store app, the `launchable_path` shape
+/// check, the confirmation dialog `vault_window::mod` raises whenever the plan
+/// carries vault `args`, and the failure band that tells "moved or
+/// uninstalled" apart from "Windows refused". There is exactly one
+/// `launch_app` call in this program (`ea4028f`, with a wiring test that
+/// counts it); this adds a second *way to ask*, not a second way to launch.
+///
+/// **`None` makes the name inert rather than a link that does nothing.** A
+/// dead binding, a Store app, a match with no recorded `path` and a path
+/// `launchable_path` refuses all reach here, and every one of them already has
+/// its own sentence on the card ([`app_card_notes`], via [`app_open_refusal`])
+/// saying why there is no Open. A blue, hand-cursored name beside that
+/// sentence would be a fourth promise the card has just finished withdrawing.
+fn app_name_open_action(m: &AppMatch, website: &str) -> Option<DetailAction> {
+    app_launch_plan(m, website).map(DetailAction::OpenApp)
+}
+
 /// The website entry's label. A constant so the source pin and the draw site
 /// cannot drift.
 const OPEN_WEBSITE_LABEL: &str = "Open website";
@@ -2944,6 +3220,11 @@ fn app_match_card(
     // open and the URL that card is showing are one expression (see
     // `draw_detail_read`, which derives it once).
     website: &str,
+    // What the matched app is really CALLED, and what it looks like --
+    // resolved by `vault_window::mod`'s `AppIdentityCache` off the path
+    // [`app_name_lookup_path`] chose, on a worker thread, once per path. See
+    // [`ResolvedApp`].
+    app: ResolvedApp<'_>,
     action: &mut DetailAction,
 ) {
     let m = match app_card_body(app_match, field_present) {
@@ -2966,12 +3247,17 @@ fn app_match_card(
             return;
         }
     };
-    for (index, app_row) in app_match_rows(m).iter().enumerate() {
+    // Resolved once for the row and for the chord, so a name that is a link
+    // and a chord that does nothing cannot end up on the same card.
+    let open = app_name_open_action(m, website);
+    for (index, app_row) in app_match_rows(m, app.name).iter().enumerate() {
         if index > 0 {
             theme::row_rule(ui);
         }
-        if app_row.real {
-            app_value_row(ui, app_row.label, &app_row.value, action);
+        if app_row.app {
+            app_name_row(ui, app_row, app.icon, open.as_ref(), action);
+        } else if app_row.real {
+            app_value_row(ui, app_row.label, &app_row.value, &app_row.copy, action);
         } else {
             row(
                 ui,
@@ -3041,30 +3327,9 @@ fn app_match_card(
     app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), action);
 }
 
-/// The word on the card's one destructive control, in one place: the button
-/// draws it and [`app_footer_controls_width`] measures it, and a footer that
-/// reserved room for a different string than it drew would be exactly the
-/// drift that put the wide layout's controls off the pane.
+/// The word on the card's one destructive control, in one place, so the
+/// button and every test that names it read one string.
 const APP_REMOVE_LABEL: &str = "Remove";
-
-/// How much room [`app_card_footer`]'s controls need to sit on the notes'
-/// line, with the gap that really separates them.
-///
-/// Measured through [`theme::row_button_width`] -- the same galley the button
-/// will lay -- rather than estimated, so the decision here and the drawing
-/// below cannot disagree about whether they fit.
-fn app_footer_controls_width(ui: &egui::Ui, choices: &[OpenChoice]) -> f32 {
-    let remove = theme::row_button_width(ui, APP_REMOVE_LABEL);
-    let open = match choices {
-        // No Open at all -- see `app_open_choices`. Remove is the whole
-        // control group, and it is never absent: every body this footer draws
-        // offers it.
-        [] => return remove,
-        [only] => theme::row_button_width(ui, &open_choice_label(only)),
-        _ => theme::row_button_width(ui, OPEN_MENU_LABEL),
-    };
-    remove + CONTROL_GAP + open
-}
 
 /// One of the card's real rows: [`credential_row`], except that the value
 /// **wraps**.
@@ -3091,7 +3356,174 @@ fn app_footer_controls_width(ui: &egui::Ui, choices: &[OpenChoice]) -> f32 {
 /// -- shapes that already break or already fit -- so widening the change
 /// would put every row's geometry on this pane in the blast radius of a
 /// defect reported about one card.
-fn app_value_row(ui: &mut egui::Ui, label: &str, value: &str, action: &mut DetailAction) {
+/// What the `MATCHED APP` card was told the bound app is called and looks
+/// like.
+///
+/// **A struct rather than two parameters, deliberately.** The one defect shape
+/// this feature has already produced is an argument swapped or nulled at a
+/// call site while the pure function underneath stayed exhaustively tested --
+/// `apps.label(ctx, &app.path, &app.process)` becoming `(&app.process,
+/// &app.process)`, which survived because the fixture's two inputs agreed. A
+/// `&str` and an `Option<&TextureHandle>` cannot be transposed for each other,
+/// and naming them here means the call site reads as the two facts it is
+/// passing rather than as two positional arguments.
+#[derive(Clone, Copy)]
+pub struct ResolvedApp<'a> {
+    /// `Google Chrome`, or the executable's file name when nothing could be
+    /// resolved -- [`AppIdentityCache::label`] never yields nothing.
+    pub name: &'a str,
+    /// `None` whenever there is no icon: no path, an unreachable one, a
+    /// directory, an icon-less binary, or a probe still out. Never a
+    /// placeholder graphic -- an app with no icon simply has none.
+    pub icon: Option<&'a egui::TextureHandle>,
+}
+
+/// How big the matched app's icon is drawn, and the gap between it and the
+/// name. The edit form's app block draws the same icon at the same 18pt (see
+/// `detail_edit::app_block`); one number in each file rather than a shared
+/// constant would be two, so this is the read pane's and the sizes are held
+/// together by `the_read_pane_draws_the_app_icon_at_the_edit_forms_size`.
+const APP_ICON_SIZE: f32 = 18.0;
+const APP_ICON_GAP: f32 = 8.0;
+
+/// The `App` row: the icon, the app's real name, and -- when there is
+/// something to open -- a link and a chord that open it.
+///
+/// **Three things one click can mean, split by where it lands**, which is the
+/// Website row's own arrangement (see `draw_detail_read`) and is safe for the
+/// same reason: `row_impl` senses the tile on a `UiBuilder` background, egui
+/// registers that before the `Ui`'s children, and a click goes to the topmost
+/// widget under the pointer and to nothing else. So the NAME opens the app and
+/// the rest of the tile copies the executable name.
+///
+/// `open` is [`app_name_open_action`]'s answer and is not re-decided here.
+/// `None` means the name is drawn as plain ink text with no hand cursor and no
+/// click at all -- see that function for why a link that does nothing is worse
+/// than no link.
+fn app_name_row(
+    ui: &mut egui::Ui,
+    app_row: &AppRow,
+    icon: Option<&egui::TextureHandle>,
+    open: Option<&DetailAction>,
+    action: &mut DetailAction,
+) {
+    // Measured on the card's own `Ui`, before `copy_row` builds the band --
+    // the same fixed point `app_value_row` measures on, and for the same
+    // reason: inside the band `available_width` is derived from a `max_rect`
+    // the `ScrollArea` grew to fit last frame's widest child.
+    // **Room is reserved for the icon AND for the chord**, because the name
+    // is laid to an explicit width and whatever it takes, the control group
+    // does not get. Leaving the chord out of this sum drew `CTRL+SHIFT+O` at
+    // x = 308.4 on a 298pt pane -- off the edge, unreadable, and the same
+    // shape as the footer collision one row below.
+    let column = (app_card_value_width(ui)
+        - if icon.is_some() { APP_ICON_SIZE + APP_ICON_GAP } else { 0.0 })
+        .max(0.0);
+    let chord = chord_hint_width(ui, OPEN_APP_CHORD.2) + CONTROL_GAP;
+    let show_chord = open.is_some() && app_row_chord_fits(column, chord);
+    let name_width = (column - if show_chord { chord } else { 0.0 }).max(0.0);
+    let mut opened = false;
+    copy_row(
+        ui,
+        app_row.label,
+        |ui| {
+            if let Some(texture) = icon {
+                ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(egui::vec2(APP_ICON_SIZE, APP_ICON_SIZE)),
+                );
+                ui.add_space(APP_ICON_GAP);
+            }
+            // Laid HERE with an explicit wrap width, exactly as the
+            // `Program file` path is: a resolved name is longer than the
+            // `mabl.exe` this row used to print, and a run left to a
+            // horizontal layout's `Extend` is what inflated this card to
+            // 467.8pt in a 298pt pane once already. `break_anywhere` is not
+            // needed -- a real app name has spaces -- but the width is.
+            let mut job = egui::text::LayoutJob::simple(
+                app_row.value.clone(),
+                egui::FontId::new(ROW_VALUE_SIZE, egui::FontFamily::Proportional),
+                if open.is_some() { theme::BLUE } else { theme::INK },
+                name_width,
+            );
+            job.wrap.break_anywhere = true;
+            let galley = ui.painter().layout_job(job);
+            match open {
+                Some(_) => {
+                    opened = theme::link_galley(ui, galley)
+                        .on_hover_text(format!("{APP_OPEN_HOVER} \u{b7} {}", OPEN_APP_CHORD.2))
+                        .clicked();
+                }
+                None => {
+                    ui.label(galley);
+                }
+            }
+        },
+        // The chord, on the control line where every other row's is -- when
+        // it does something AND there is room for it. See
+        // [`app_row_chord_fits`]; the link's own tooltip names it either way.
+        |ui| {
+            if show_chord {
+                chord_hint(ui, OPEN_APP_CHORD.2);
+            }
+        },
+        DetailAction::CopyValue(app_row.copy.clone()),
+        // No COPY chord: this row's chord opens. `copy_row` would otherwise
+        // paint it a second time and its tooltip would call it a copy.
+        None,
+        app_row.real,
+        action,
+    );
+    if opened {
+        if let Some(open) = open {
+            *action = open.clone();
+        }
+    }
+}
+
+/// What hovering the app's name promises. One string, because the link says it
+/// and nothing else may. **It carries the chord**, which is what keeps the
+/// shortcut discoverable on the narrow panes where [`app_row_chord_fits`]
+/// declines to paint it.
+const APP_OPEN_HOVER: &str = "Open this app";
+
+/// The least room the app's NAME may be laid out in. Below this a name is
+/// broken across a line per word or worse, and the row grows into a ribbon.
+///
+/// Enough for `Waypoint Browser` at [`ROW_VALUE_SIZE`] on one line, which is
+/// about as short as a real `FileDescription` gets.
+const APP_NAME_MIN_WIDTH: f32 = 90.0;
+
+/// Whether the App row paints its chord hint, given the room its value column
+/// has and what the hint costs.
+///
+/// **The chord is the first thing dropped, not the name.** At the app's
+/// minimum window size the value column is about 95pt and `CTRL+SHIFT+O` is
+/// about 72pt of it: reserving room for the hint unconditionally left the
+/// name 15pt, which broke `Ledgerline Accounting Suite` into a column one
+/// syllable wide and grew the card past the bottom of the pane. Reserving
+/// nothing drew the hint at x = 308 on a 298pt pane, where egui culled it --
+/// the pane does not scroll sideways, so an unpainted hint and an unreachable
+/// one are the same thing.
+///
+/// So the hint is painted where it fits and omitted where it does not, and
+/// [`APP_OPEN_HOVER`] names the chord in the link's tooltip on every pane --
+/// which is the surface [`COPY_SHORTCUTS`]'s own doc calls this pane's
+/// primary one for chords anyway.
+///
+/// Pure, and given both numbers rather than a `Ui`, so the decision is
+/// callable without a frame.
+fn app_row_chord_fits(column: f32, chord: f32) -> bool {
+    column - chord >= APP_NAME_MIN_WIDTH
+}
+
+fn app_value_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    copy: &str,
+    action: &mut DetailAction,
+) {
     // **Measured on the card's own `Ui`, before `copy_row` builds the row's
     // band.** Inside the band `ui.available_width()` is derived from a
     // `max_rect` the `ScrollArea` grew to fit LAST frame's widest child --
@@ -3126,9 +3558,13 @@ fn app_value_row(ui: &mut egui::Ui, label: &str, value: &str, action: &mut Detai
             ui.label(galley);
         },
         |_ui| {},
-        DetailAction::CopyValue(value.to_string()),
+        // `copy`, not `value`: the `Program file` row shows this pane's own
+        // "Not recorded" placeholder when there is no path, and a click must
+        // never put a word this pane invented on the clipboard. See
+        // [`AppRow::copy`].
+        DetailAction::CopyValue(copy.to_string()),
         None,
-        row_offers_copy(value),
+        row_offers_copy(copy),
         action,
     );
 }
@@ -3168,10 +3604,10 @@ fn app_card_value_width(ui: &egui::Ui) -> f32 {
 /// unreadable field's Remove is the same control in the same place -- not a
 /// second button that happens to say the same word.
 ///
-/// **It stacks when those two columns will not hold it, and that is not a
-/// nicety.** Every other row on this pane has a short value and one small
-/// control; this one carries a paragraph and up to two buttons, and the label
-/// column is a fixed [`ROW_LABEL_WIDTH`] whatever the pane's width is. At the
+/// **It always stacks, and that is not a nicety.** Every other row on this
+/// pane has a short value and one small control; this one carries a paragraph
+/// and up to two buttons, and the label column is a fixed [`ROW_LABEL_WIDTH`]
+/// whatever the pane's width is. At the
 /// app's minimum window size the detail pane is 298pt, which left the value
 /// and the controls about 70pt between them: `Open Ledgerline.exe` was drawn
 /// starting at x = 283.7 on a pane 298 wide -- 14 of its 110pt on screen --
@@ -3215,80 +3651,79 @@ fn app_card_footer(
             }
         });
     };
-    // What is left of the row for the controls once the card's own padding
-    // and the fixed label column are taken out -- 162pt, which at the app's
-    // minimum window size is most of the pane. Through `app_card_value_width`
-    // and NOT `ui.available_width()`: see `app_card_content_width` for why
-    // the latter answers with a width this card grew for itself.
-    let room = app_card_value_width(ui);
-    if room < app_footer_controls_width(ui, choices) {
-        app_card_footer_stacked(ui, notes, draw_notes, choices, action);
-        return;
-    }
-    row(
-        ui,
-        "",
-        draw_notes,
-        |ui| {
-            // **One click, no arming.** `confirm_click`'s two-click gate is
-            // reserved for the item Delete, which trashes the whole item;
-            // this removes one custom field, the card says so immediately by
-            // flipping to `APP_MATCH_EMPTY_NOTICE`, and that notice names the
-            // way to put it back. Making this the third armed control on the
-            // pane would have cost `draw_detail_read` another parameter and
-            // `vault_window::mod` another piece of per-item pending state,
-            // for a click whose undo is four clicks in the tray.
-            //
-            // Hand-editing `process` and `path` is deliberately NOT offered
-            // here -- see the module's own note on the card.
-            app_card_remove_control(ui, action);
-            // **After Remove, so it reads BEFORE it.** This control group is
-            // laid out right-to-left (see `row_body`), and Open is the
-            // ordinary action while Remove is the destructive one.
-            app_card_open_control(ui, choices, action);
-        },
-    );
-}
-
-/// [`app_card_footer`] on a pane too narrow to hold the controls beside the
-/// notes: the notes take the row's whole content width, and the controls get
-/// a line of their own beneath them.
-///
-/// The controls line starts at the card's own [`CARD_PAD_X`] -- the left edge
-/// every label above it sits on -- and reads Open, then Remove, which is what
-/// the wide layout's right-to-left group paints. Added in the opposite source
-/// order there for that reason; here the layout is left-to-right, so they are
-/// added in the order they are read. Two layouts, one control set.
-///
-/// `horizontal_wrapped` rather than a plain `horizontal`, so a longer program
-/// name or a future third control takes a second line instead of the fate
-/// this whole function exists to undo.
-fn app_card_footer_stacked(
-    ui: &mut egui::Ui,
-    notes: &[&str],
-    draw_notes: impl FnOnce(&mut egui::Ui),
-    choices: &[OpenChoice],
-    action: &mut DetailAction,
-) {
-    // Only when there is something to say: an empty notes row would be a
-    // band of padding above the controls.
+    // **Always stacked, and the side-by-side layout this replaced is the
+    // user's second report about this card: "Remove button is on top of long
+    // description - should be left aligned".**
+    //
+    // It was on top of it, literally and by construction. `row_body` lays a
+    // band `left_to_right`, puts the label cell, then the VALUE, and only
+    // then opens a `right_to_left` group for the controls -- so the controls
+    // get whatever width the value left behind. The notes are drawn with
+    // `set_max_width(app_card_value_width(ui))`, i.e. **the whole value
+    // column**, so what they left behind was zero, and egui laid Remove and
+    // Open right-aligned inside a zero-width region: on top of the sentence.
+    // The `room < app_footer_controls_width` test above could never see it,
+    // because it compared the controls against the column's full width while
+    // the notes had already taken all of it.
+    //
+    // The obvious repair -- shrink the notes by the controls' width -- was
+    // rejected: `app_card_notes` is never empty for any body this footer
+    // draws (a bound match always carries `trigger_caption`, and
+    // `app_notice_with_remove` passes exactly one sentence), and every one of
+    // those sentences is a paragraph that wants the whole column. Squeezing a
+    // 200-character notice into 162 - 110 = 52pt to keep two buttons on its
+    // line trades a collision for a ten-line ribbon. So the controls get
+    // their own line, always, left-aligned on the same [`CARD_PAD_X`] every
+    // label above them sits on -- which is what the user asked for, and what
+    // the narrow pane was already doing.
+    //
+    // The width test is gone with the branch it chose between. It answered
+    // one question -- "do the controls fit beside the notes?" -- that now has
+    // one answer.
+    //
+    // Only when there is something to say: an empty notes row would be a band
+    // of padding above the controls.
     if !notes.is_empty() {
         row(ui, "", draw_notes, |_ui| {});
     }
+    // **`app_card_content_width` and NOT `ui.available_width()`**, which is
+    // the same distinction the rows above make: the `ScrollArea` grows its
+    // content `Ui` to fit last frame's widest child, so `available_width` here
+    // is a width this card may have grown for itself, and a wrapped row laid
+    // out against it does not wrap where the pane ends. See
+    // [`app_card_content_width`].
+    let line = (app_card_content_width(ui) - f32::from(CARD_PAD_X) * 2.0).max(0.0);
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_width(line);
+            // `horizontal_wrapped` rather than a plain `horizontal`, so a
+            // longer program name or a future third control takes a second
+            // line instead of the fate this whole function exists to undo.
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                // Open first, so it reads first: it is the ordinary action
+                // and Remove is the destructive one.
                 app_card_open_control(ui, choices, action);
                 app_card_remove_control(ui, action);
             });
         });
 }
 
-/// The card's one destructive control, in one place because two layouts draw
-/// it -- see [`app_card_footer_stacked`].
+/// The card's one destructive control, in one place because [`app_card_footer`]
+/// draws it for the bound card and for [`app_notice_with_remove`] alike.
+///
+/// **One click, no arming.** `confirm_click`'s two-click gate is reserved for
+/// the item Delete, which trashes the whole item; this removes one custom
+/// field, the card says so immediately by flipping to
+/// [`APP_MATCH_EMPTY_NOTICE`], and that notice names the way to put it back.
+/// Making this the third armed control on the pane would have cost
+/// `draw_detail_read` another parameter and `vault_window::mod` another piece
+/// of per-item pending state, for a click whose undo is four clicks in the
+/// tray.
+///
+/// Hand-editing `process` and `path` is deliberately NOT offered here -- see
+/// the module's own note on the card.
 fn app_card_remove_control(ui: &mut egui::Ui, action: &mut DetailAction) {
     if theme::row_button(ui, APP_REMOVE_LABEL)
         .on_hover_text("Stop autofilling this item into that app")
@@ -4242,7 +4677,17 @@ mod tests {
             // No folder: this harness reads the pane's BODY, and every one of
             // its callers would have to gain a folder to keep saying what it
             // says. The header's own subtitle has `Pane`, which carries one.
-            draw_detail_read(ui, item, None, 3, totp, delete_pending, &mut reveal, None);
+            draw_detail_read(
+                ui,
+                item,
+                None,
+                3,
+                totp,
+                delete_pending,
+                &mut reveal,
+                None,
+                &mut crate::app_identity::AppIdentityCache::default(),
+            );
         });
 
         let mut texts = Vec::new();
@@ -4280,6 +4725,8 @@ mod tests {
             eyes: Vec::new(),
             kebab_dots: Vec::new(),
             segments: Vec::new(),
+            images: Vec::new(),
+            shapes: egui::Shape::Noop,
             // The out-of-vault pane copies nothing, so it has no deadline of
             // its own; no test here reads this.
             repaint_delay: std::time::Duration::MAX,
@@ -4295,6 +4742,8 @@ mod tests {
         frame.eyes = theme::icon_probe::eyes(&all);
         frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
         frame.segments = theme::icon_probe::line_segments(&all);
+        collect_images(&all, &mut frame.images);
+        frame.shapes = all;
         (texts, frame)
     }
 
@@ -4465,6 +4914,22 @@ mod tests {
         rects
     }
 
+    /// Every TEXTURED rectangle -- which is what an `egui::Image` paints in
+    /// this version of egui, and the only trace an icon leaves: it paints no
+    /// string, and `collect_rects` throws the brush away and would report it
+    /// as an ordinary transparent fill.
+    fn collect_images(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.brush.is_some() => out.push(rect.rect),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_images(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn collect_rects(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
         match shape {
             egui::Shape::Rect(rect) => out.push((rect.rect, rect.fill)),
@@ -4555,7 +5020,17 @@ mod tests {
 
         let mut reveal = reveal;
         ctx.run_ui(input(), |ui| {
-            draw_detail_read(ui, item, None, 3, totp, false, &mut reveal, None);
+            draw_detail_read(
+                ui,
+                item,
+                None,
+                3,
+                totp,
+                false,
+                &mut reveal,
+                None,
+                &mut crate::app_identity::AppIdentityCache::default(),
+            );
         })
         .shapes
     }
@@ -4623,6 +5098,13 @@ mod tests {
         /// The folder name the window would have resolved for this item --
         /// `None` unless a test sets it, which is the vault's usual case.
         folder: Option<String>,
+        /// The window's `AppIdentityCache`, carried across frames exactly as
+        /// `vault_window::mod`'s `run` carries it. Empty unless a test seeds
+        /// it (see [`Pane::knows_app`]): nothing in this suite names a path
+        /// that exists on the machine running it, so a real probe would
+        /// always answer "gone" and the resolved-name half of this card
+        /// would be untestable.
+        apps: crate::app_identity::AppIdentityCache,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -4653,6 +5135,14 @@ mod tests {
         eyes: Vec<egui::Rect>,
         kebab_dots: Vec<(egui::Rect, egui::Color32)>,
         segments: Vec<egui::Rect>,
+        /// Every textured rect -- the matched app's icon is the only one this
+        /// pane can paint. See [`collect_images`].
+        images: Vec<egui::Rect>,
+        /// This frame's whole shape tree, kept so a test can hand it to
+        /// `theme::icon_probe` directly. The `Frame` fields above are each one
+        /// probe's answer; a test asking "did the icon confuse ALL of them"
+        /// needs the tree.
+        shapes: egui::Shape,
         /// The soonest this frame asked egui to come back on its own.
         ///
         /// egui redraws on input; anything with a DEADLINE has to say so, or
@@ -4860,7 +5350,36 @@ mod tests {
                 reveal: RevealState::default(),
                 delete_pending: false,
                 folder: None,
+                apps: crate::app_identity::AppIdentityCache::default(),
             }
+        }
+
+        /// The same pane, on a machine where the executable at `path` really
+        /// is called `name`.
+        ///
+        /// **`path`, not `process`** -- which is the whole point of seeding
+        /// through the cache rather than handing the pane a name. The cache is
+        /// keyed on the path, so a wiring that passed `process` where the path
+        /// goes finds nothing and paints the exe name, and every test below
+        /// that names a resolved name fails. That is the exact substitution
+        /// (`apps.label(ctx, &app.path, &app.process)` -> `(&app.process,
+        /// &app.process)`) this feature has already shipped once.
+        fn knows_app(mut self, path: &str, name: &str) -> Self {
+            self.apps.seed_ready(path, name, None);
+            self
+        }
+
+        /// The same, with an icon -- a 2x2 texture, because what is asserted
+        /// is that an image is painted at all and at what size, never what is
+        /// in it.
+        fn knows_app_with_icon(mut self, path: &str, name: &str) -> Self {
+            let texture = self.ctx.load_texture(
+                "test-app-icon",
+                egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]),
+                egui::TextureOptions::default(),
+            );
+            self.apps.seed_ready(path, name, Some(texture));
+            self
         }
 
         /// The same pane, drawing an item the window has resolved a folder
@@ -4891,6 +5410,7 @@ mod tests {
                         self.delete_pending,
                         &mut self.reveal,
                         None,
+                        &mut self.apps,
                     );
                 },
             );
@@ -4904,6 +5424,8 @@ mod tests {
                 eyes: Vec::new(),
                 kebab_dots: Vec::new(),
                 segments: Vec::new(),
+                images: Vec::new(),
+                shapes: egui::Shape::Noop,
                 repaint_delay: output
                     .viewport_output
                     .values()
@@ -4923,6 +5445,8 @@ mod tests {
             frame.eyes = theme::icon_probe::eyes(&all);
             frame.kebab_dots = theme::icon_probe::kebab_dots(&all);
             frame.segments = theme::icon_probe::line_segments(&all);
+            collect_images(&all, &mut frame.images);
+            frame.shapes = all;
             frame
         }
 
@@ -5940,20 +6464,42 @@ mod tests {
 
     #[test]
     fn the_cards_rows_name_the_app_and_the_program_file() {
-        let rows = app_match_rows(&a_desktop_match());
+        // The resolved name is deliberately none of the three strings the
+        // match itself carries: a fixture whose display name equalled its
+        // process or its path's file name could not tell "the row shows the
+        // resolved name" from "the row shows what it always did".
+        let rows = app_match_rows(&a_desktop_match(), RESOLVED_NAME);
         assert_eq!(
             rows,
             vec![
-                AppRow { label: "App", value: "Ledgerline.exe".to_string(), real: true },
+                AppRow {
+                    label: "App",
+                    // What the user SEES: the app's real name ...
+                    value: RESOLVED_NAME.to_string(),
+                    // ... and what a click COPIES: the executable, which is
+                    // the thing that pastes anywhere useful.
+                    copy: "Ledgerline.exe".to_string(),
+                    real: true,
+                    app: true,
+                },
                 AppRow {
                     label: "Program file",
                     value: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
+                    copy: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
                     real: true,
+                    app: false,
                 },
             ],
             "the rows are not the user's \"name, path\""
         );
     }
+
+    /// What the version resource of the fixture's executable says the app is
+    /// called. **Not `Ledgerline.exe`, and not `Ledgerline`**: it has to
+    /// differ from the `process`, from the path's file name and from the
+    /// path's own directory names, or a test that finds it on screen cannot
+    /// say which of those it found.
+    const RESOLVED_NAME: &str = "Ledgerline Accounting Suite";
 
     /// Every match saved before `path` existed -- a shape still sitting in
     /// real vaults. The row must say so, and must not offer to copy the words
@@ -5961,16 +6507,20 @@ mod tests {
     #[test]
     fn a_match_that_recorded_no_program_file_says_so_and_that_row_is_inert() {
         let m = AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto);
-        let rows = app_match_rows(&m);
+        let rows = app_match_rows(&m, RESOLVED_NAME);
         let path = rows
             .iter()
             .find(|r| r.label == "Program file")
             .expect("the card dropped the Program file row entirely");
         assert_eq!(path.value, "Not recorded");
         assert!(!path.real, "the placeholder would be copied to the clipboard");
+        assert_eq!(
+            path.copy, "",
+            "the pane's own placeholder is what a click would put on the clipboard"
+        );
         // Control: a match that DID record one is copyable, so `real` is not
         // simply always false.
-        let recorded = app_match_rows(&a_desktop_match());
+        let recorded = app_match_rows(&a_desktop_match(), RESOLVED_NAME);
         assert!(recorded.iter().find(|r| r.label == "Program file").unwrap().real);
     }
 
@@ -5988,12 +6538,12 @@ mod tests {
         assert_eq!(stored.title, "Ledgerline - Invoices", "the premise: it HAS a title");
         assert!(!stored.hosted);
         assert!(
-            !app_match_rows(&stored).iter().any(|r| r.label == "Window title"),
+            !app_match_rows(&stored, RESOLVED_NAME).iter().any(|r| r.label == "Window title"),
             "an inert title is drawn as if it matched something"
         );
         // Control: the row exists at all, for the match that really is keyed
         // on its title.
-        assert!(app_match_rows(&a_store_match())
+        assert!(app_match_rows(&a_store_match(), RESOLVED_NAME)
             .iter()
             .any(|r| r.label == "Window title" && r.value == "Speedtest"));
     }
@@ -10638,7 +11188,658 @@ mod tests {
             assert!(!frame.painted(label), "an unreadable field offered {label:?}");
         }
     }
+    // -----------------------------------------------------------------
+    // The app's real NAME and its icon, the link on it, and the chord.
+    //
+    // The user's three reports about this one card: "Matched app should show
+    // normal name with icon and not mabl.exe", "should be clickable like link
+    // and have Ctrl + shortcut", and "Matched app Remove button is on top of
+    // long description - should be left aligned".
+    // -----------------------------------------------------------------
+
+    /// What `chrome.exe`'s version resource says the app is called.
+    ///
+    /// **Deliberately unlike every other string in the fixture.** It is not
+    /// the `process`, not the path's file name, not any directory in the
+    /// path, and not a prefix or suffix of any of them -- so a test that
+    /// finds it on screen has found the resolved name and nothing else.
+    /// `apps.label(ctx, &m.path, &m.process)` mutated to `(&m.process,
+    /// &m.process)` is the exact shape that survived once already, because
+    /// the fixture it was tested against had a path and a process that agreed.
+    const CHROME_NAME: &str = "Waypoint Browser";
+    /// The path `a_browser_match` records -- the cache's KEY, spelled once.
+    const CHROME_PATH: &str = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+    /// A dead binding with a REAL program file: the frame host's own
+    /// executable, which exists on every Windows machine, carries a
+    /// `FileDescription` and has a shell icon. That is what makes "a dead
+    /// binding must not be dressed up" a decision rather than an accident.
+    fn a_dead_match() -> AppMatch {
+        let mut dead = AppMatch::for_process("ApplicationFrameHost.exe", TriggerMode::Prompt);
+        dead.path = r"C:\Windows\System32\ApplicationFrameHost.exe".to_string();
+        dead
+    }
+
+    /// A pane that has already resolved the browser fixture's name.
+    fn a_pane_that_knows_chrome() -> Pane {
+        Pane::new().knows_app(CHROME_PATH, CHROME_NAME)
+    }
+
+    /// The one keystroke `OPEN_APP_CHORD` names.
+    fn open_app_chord_events() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: OPEN_APP_CHORD.1,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: OPEN_APP_CHORD.0,
+        }]
+    }
+
+    /// The premise for every assertion below: the constants really are what
+    /// the fixture carries, and they really are distinguishable. A
+    /// `CHROME_PATH` that had drifted from `a_browser_match` would seed a key
+    /// nothing asks about, and every test here would then be asserting about
+    /// the unresolved fallback while looking like it was not.
+    #[test]
+    fn the_seeded_path_is_the_path_the_fixture_records() {
+        assert_eq!(a_browser_match().path, CHROME_PATH);
+        assert_ne!(CHROME_NAME, a_browser_match().process);
+        assert_ne!(
+            Some(CHROME_NAME),
+            crate::app_identity::file_name_of(CHROME_PATH),
+            "the resolved name equals the path's own file name, so finding it on screen \
+             could not tell a resolved name from the fallback"
+        );
+        assert!(
+            !CHROME_PATH.contains(CHROME_NAME),
+            "the resolved name is a substring of the path, so the Program file row alone \
+             would satisfy a `painted` assertion about it"
+        );
+    }
+
+    /// **The report.** The card says what the app is called; it does not say
+    /// `chrome.exe` where the name goes.
+    #[test]
+    fn the_matched_app_card_shows_the_apps_real_name_and_not_the_executable() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = a_pane_that_knows_chrome();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert!(
+            frame.painted(CHROME_NAME),
+            "the App row still does not say what the app is called; painted {:?}",
+            frame.strings()
+        );
+        // And it really is the App row's value, in the same value column the
+        // Program file row's is -- not some other string on the pane.
+        assert_eq!(
+            frame.rect_of(CHROME_NAME).left(),
+            frame.rect_of(CHROME_PATH).left(),
+            "the resolved name is not in the value column the Program file row is in"
+        );
+        assert!(
+            !frame.painted("chrome.exe"),
+            "the executable name is still drawn on its own line: {:?}",
+            frame.strings()
+        );
+    }
+
+    /// **The wiring, as the substitution that has already shipped once.**
+    ///
+    /// The cache is keyed on the PATH. A `draw_detail_read` that handed it
+    /// `process` where the path goes finds nothing, and the row falls back.
+    /// Seeding under `process` and demanding that the name does NOT appear is
+    /// that mutation, run.
+    #[test]
+    fn the_name_is_looked_up_by_the_path_and_not_by_the_process() {
+        let m = a_browser_match();
+        let item = bound_to(&a_login_on_the_web(), &m);
+        let mut pane = Pane::new().knows_app(&m.process, CHROME_NAME);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !frame.painted(CHROME_NAME),
+            "a name seeded under the PROCESS reached the screen, so the card is asking \
+             the cache about the wrong string: {:?}",
+            frame.strings()
+        );
+        // The control on the control: seeded under the PATH, it does.
+        let mut right = a_pane_that_knows_chrome();
+        assert!(right.idle(&item, &TotpState::NoSecret).painted(CHROME_NAME));
+    }
+
+    /// **A path that no longer exists** -- uninstalled, moved, or a share
+    /// that is down. Nothing resolves, so the row is the executable name it
+    /// always was: no blank, no spinner, no error, no dialog.
+    #[test]
+    fn an_app_whose_executable_is_gone_is_still_named_by_its_executable() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        // No seed at all, and `CHROME_PATH` names nothing on a machine
+        // running this suite: the probe is the real one and it fails.
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            frame.painted("chrome.exe"),
+            "an app whose file is gone has no name at all on the card: {:?}",
+            frame.strings()
+        );
+        // And the path is still on the card, because it is the thing the
+        // user has to act on.
+        assert!(frame.painted(CHROME_PATH), "{:?}", frame.strings());
+        // No icon, and nothing that reads as an error.
+        assert!(frame.images.is_empty(), "an icon was drawn for a file that is not there");
+    }
+
+    /// **A dead binding is shown plainly, as the raw name it is.**
+    ///
+    /// Its `process` is the frame host, whose real executable exists in
+    /// System32 with a `FileDescription` and an icon of its own. Dressing it
+    /// up would put a Windows internal's name and icon above the sentence
+    /// saying this binding never fires.
+    #[test]
+    fn a_dead_binding_is_not_dressed_up_with_a_resolved_name() {
+        let dead = a_dead_match();
+        assert!(app_match_is_dead(&dead), "the premise");
+        let item = bound_to(&a_login_on_the_web(), &dead);
+        // Seeded under the RIGHT key: this pane COULD resolve it. It must
+        // decline to ask.
+        let mut pane = Pane::new().knows_app(&dead.path, "Application Frame Host");
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert!(
+            !frame.painted("Application Frame Host"),
+            "a dead binding was given a friendly name: {:?}",
+            frame.strings()
+        );
+        assert!(
+            frame.painted("ApplicationFrameHost.exe"),
+            "the raw process name -- the evidence of what went wrong -- is gone: {:?}",
+            frame.strings()
+        );
+        assert!(
+            frame.painted(APP_MATCH_DEAD_NOTICE),
+            "the premise: this card really is saying the binding is dead"
+        );
+    }
+
+    /// And it is [`app_name_lookup_path`] that refuses it, not the drawing.
+    #[test]
+    fn a_dead_binding_is_looked_up_under_no_path_at_all() {
+        let live = a_browser_match();
+        assert_eq!(
+            app_name_lookup_path(&live),
+            CHROME_PATH,
+            "a live binding must be looked up under its own program file"
+        );
+        assert_ne!(
+            app_name_lookup_path(&live),
+            live.process,
+            "the lookup key is the path, and this fixture's path and process differ -- if \
+             this ever passes, the fixture has stopped being able to tell them apart"
+        );
+        assert_eq!(
+            app_name_lookup_path(&a_dead_match()),
+            "",
+            "a dead binding is handed a real path, so a probe is spawned, a shell icon is \
+             fetched and a Windows internal is named on the card"
+        );
+    }
+
+    /// A Microsoft Store match is NOT special-cased: it is looked up like any
+    /// other, and the word `hosted` still never reaches the screen.
+    #[test]
+    fn a_store_match_is_looked_up_like_any_other_and_never_says_hosted() {
+        let m = a_store_match();
+        assert_eq!(
+            app_name_lookup_path(&m),
+            m.path,
+            "a Store match's own recorded program file is what its name comes from"
+        );
+        let item = bound_to(&a_login_on_the_web(), &m);
+        let mut pane = Pane::new().knows_app(&m.path, "Speedtest by Ookla");
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(frame.painted("Speedtest by Ookla"), "{:?}", frame.strings());
+        for word in ["hosted", "FrameHost"] {
+            assert!(
+                !frame.strings().iter().any(|s| s.contains(word)),
+                "{word:?} reached the screen: {:?}",
+                frame.strings()
+            );
+        }
+        // And it is still explained, and still not launchable.
+        assert!(frame.painted(APP_HOSTED_NOTE), "{:?}", frame.strings());
+        assert!(frame.painted(APP_OPEN_HOSTED_NOTE), "{:?}", frame.strings());
+    }
+
+    // -- the icon -------------------------------------------------------
+
+    /// The icon is painted, at the size the edit form paints it, beside the
+    /// name -- and the same card without one paints no image at all, which is
+    /// what makes the assertion about the icon and not about some other
+    /// texture this pane happens to draw.
+    #[test]
+    fn the_read_pane_draws_the_app_icon_at_the_edit_forms_size() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+
+        let mut without = a_pane_that_knows_chrome();
+        let bare = without.idle(&item, &TotpState::NoSecret);
+        assert!(
+            bare.images.is_empty(),
+            "this pane paints a texture even with no app icon, so finding one below \
+             proves nothing: {:?}",
+            bare.images
+        );
+
+        let mut with = Pane::new().knows_app_with_icon(CHROME_PATH, CHROME_NAME);
+        let frame = with.idle(&item, &TotpState::NoSecret);
+        assert_eq!(frame.images.len(), 1, "expected exactly one icon: {:?}", frame.images);
+        let icon = frame.images[0];
+        assert!(
+            (icon.width() - APP_ICON_SIZE).abs() < 0.01
+                && (icon.height() - APP_ICON_SIZE).abs() < 0.01,
+            "the icon is {}x{}pt, not the {APP_ICON_SIZE}pt the edit form draws",
+            icon.width(),
+            icon.height()
+        );
+        // Beside the name, to its LEFT, on the same line.
+        let name = frame.rect_of(CHROME_NAME);
+        assert!(
+            icon.right() <= name.left() + 0.01,
+            "the icon at {icon:?} overlaps the name at {name:?}"
+        );
+        assert!(
+            (icon.center().y - name.center().y).abs() < APP_ICON_SIZE,
+            "the icon at {icon:?} is not on the name's line at {name:?}"
+        );
+    }
+
+    /// **The `icon_probe` tripwire, answered here rather than assumed.**
+    ///
+    /// Every drawn icon in this app is identified by vertex count alone, and
+    /// `theme::no_two_drawn_icons_share_a_vertex_count` is a live guard
+    /// against two colliding. This card now paints a bitmap. Measured, on the
+    /// real pane: adding the icon changes no probe's answer.
+    #[test]
+    fn the_app_icon_is_not_mistaken_for_any_drawn_icon() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut without = a_pane_that_knows_chrome();
+        let bare = without.idle(&item, &TotpState::NoSecret);
+        let mut with = Pane::new().knows_app_with_icon(CHROME_PATH, CHROME_NAME);
+        let frame = with.idle(&item, &TotpState::NoSecret);
+
+        assert_eq!(frame.images.len(), 1, "the premise: an icon really was painted");
+        assert_eq!(
+            frame.stars.len(),
+            bare.stars.len(),
+            "the app icon was counted as a favourite star"
+        );
+        assert_eq!(frame.eyes.len(), bare.eyes.len(), "the app icon was counted as an eye");
+        assert_eq!(
+            frame.kebab_dots.len(),
+            bare.kebab_dots.len(),
+            "the app icon was counted as a kebab dot"
+        );
+        assert_eq!(
+            frame.segments.len(),
+            bare.segments.len(),
+            "the app icon was counted as a line segment"
+        );
+        assert_eq!(
+            theme::icon_probe::gears(&frame.shapes).len(),
+            theme::icon_probe::gears(&bare.shapes).len(),
+            "the app icon was counted as a gear"
+        );
+        // The control: the probes are not blind on this pane -- it really
+        // does draw eyes and a star for this item, so the equalities above
+        // are not 0 == 0.
+        assert!(
+            !bare.eyes.is_empty() && !bare.stars.is_empty(),
+            "no drawn icon is on this pane at all"
+        );
+    }
+
+    // -- the link and the chord -----------------------------------------
+
+    /// **Clicking the NAME opens the app, and copies nothing** -- the split
+    /// the Website row already makes -- and it reports the very action the
+    /// footer's Open reports.
+    #[test]
+    fn clicking_the_apps_name_opens_it_without_copying() {
+        let m = a_browser_match();
+        let item = bound_to(&a_login_on_the_web(), &m);
+        let mut pane = a_pane_that_knows_chrome();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let name = laid_out.rect_of(CHROME_NAME);
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, name.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::OpenApp(app_launch_plan(&m, WEB).expect("a launchable match")),
+            "clicking the app's name reported {:?}",
+            clicked.action
+        );
+        // And it is the SAME action the Open control reports, not a
+        // look-alike built here: one launch path, asked from two places.
+        assert_eq!(
+            Some(clicked.action),
+            app_open_choices(&m, WEB).first().map(open_choice_action),
+            "the link and the Open control do different things"
+        );
+    }
+
+    /// And a click anywhere else in the same tile copies the EXECUTABLE name
+    /// -- not the friendly one, which pastes into nothing.
+    #[test]
+    fn clicking_elsewhere_in_the_app_tile_copies_the_executable_name() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = a_pane_that_knows_chrome();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let label = laid_out.rect_of("App");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue("chrome.exe".to_string()),
+            "the App tile copied {:?} -- the clipboard wants the executable, which is what \
+             pastes into a shortcut, a script or this app's own Program file box",
+            clicked.action
+        );
+    }
+
+    /// **A name with nothing to open is plain text.** A blue, hand-cursored
+    /// link that silently does nothing is the defect class this card has
+    /// spent the day removing, so the click falls through to the tile's copy.
+    #[test]
+    fn a_name_with_no_open_is_not_a_link() {
+        let mut no_path = a_browser_match();
+        no_path.path = String::new();
+        assert!(app_name_open_action(&no_path, WEB).is_none(), "the premise");
+        let item = bound_to(&a_login_on_the_web(), &no_path);
+        // With no path there is nothing to resolve: the name IS the process,
+        // which is what the cache answers an empty path with.
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let name = laid_out.rect_of("chrome.exe");
+
+        let clicked = pane.click(&item, &TotpState::NoSecret, name.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue("chrome.exe".to_string()),
+            "clicking the name of an app that cannot be opened reported {:?}",
+            clicked.action
+        );
+        // The refusal is still on screen, which is the other half: the card
+        // says why there is no Open rather than merely omitting one.
+        assert!(laid_out.painted(APP_OPEN_NO_PATH_NOTE), "{:?}", laid_out.strings());
+        // And the chord is not advertised either.
+        assert!(
+            !laid_out.painted(OPEN_APP_CHORD.2),
+            "a chord that does nothing is painted on the row: {:?}",
+            laid_out.strings()
+        );
+    }
+
+    /// The chord opens the app, through the same one action.
+    #[test]
+    fn the_open_chord_opens_the_matched_app() {
+        let m = a_browser_match();
+        let item = bound_to(&a_login_on_the_web(), &m);
+        let mut pane = a_pane_that_knows_chrome();
+        let frame = pane.frame(&item, &TotpState::NoSecret, open_app_chord_events());
+        assert_eq!(
+            frame.action,
+            DetailAction::OpenApp(app_launch_plan(&m, WEB).expect("a launchable match")),
+            "{} reported {:?}",
+            OPEN_APP_CHORD.2,
+            frame.action
+        );
+    }
+
+    /// And it does nothing at all on a binding that may not be launched --
+    /// the same refusal the link and the button obey, because it is the same
+    /// function. A dead binding, a Store app, and a match with no program
+    /// file: the three shapes `app_launch_plan` turns down.
+    #[test]
+    fn the_open_chord_is_refused_wherever_open_is() {
+        let no_path = AppMatch {
+            path: String::new(),
+            ..a_browser_match()
+        };
+        for m in [a_dead_match(), a_store_match(), no_path] {
+            let item = bound_to(&a_login_on_the_web(), &m);
+            let mut pane = Pane::new();
+            let frame = pane.frame(&item, &TotpState::NoSecret, open_app_chord_events());
+            assert_eq!(
+                frame.action,
+                DetailAction::None,
+                "{} started {:?}, which the card refuses to offer an Open for",
+                OPEN_APP_CHORD.2,
+                m.process
+            );
+        }
+    }
+
+    /// The chord is **discoverable the way the copy chords are**: painted on
+    /// the row's control line, in the same place, read from the same tuple
+    /// the handler is wired to.
+    #[test]
+    fn the_open_chord_is_painted_on_the_app_row() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = a_pane_that_knows_chrome();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let chord = frame.rect_of(OPEN_APP_CHORD.2);
+        let name = frame.rect_of(CHROME_NAME);
+        assert!(
+            (chord.center().y - name.center().y).abs() < ROW_CONTENT_HEIGHT,
+            "the chord at {chord:?} is not on the App row at {name:?}"
+        );
+        assert!(
+            chord.left() > name.right(),
+            "the chord at {chord:?} is not in the control group, right of the name at {name:?}"
+        );
+    }
+
+    /// **No two chords on this pane are the same keystroke** -- the copies
+    /// AND the open, which is why `pane_chords` exists rather than the guard
+    /// staying on `COPY_SHORTCUTS` alone.
+    #[test]
+    fn no_two_pane_chords_share_a_keystroke() {
+        let all = pane_chords();
+        assert_eq!(all.len(), COPY_SHORTCUTS.len() + 1, "a binding fell out of the guard");
+        for (index, (name, modifiers, key, chord)) in all.iter().enumerate() {
+            assert_eq!(
+                *chord,
+                format!(
+                    "CTRL{}+{}",
+                    if modifiers.shift { "+SHIFT" } else { "" },
+                    key.name()
+                ),
+                "{name}'s chord does not spell the keys it is bound to"
+            );
+            for (other, other_modifiers, other_key, _) in &all[index + 1..] {
+                assert!(
+                    !(modifiers == other_modifiers && key == other_key),
+                    "{name} and {other} are both bound to {modifiers:?}+{key:?}"
+                );
+            }
+        }
+    }
+
+    /// **What the chord hint costs, and what is dropped when it will not
+    /// fit** -- the name is never the thing that gives way.
+    ///
+    /// Both numbers, not a `Ui`: the decision is callable without a frame,
+    /// and the two directions are asserted against the same threshold the
+    /// drawing uses.
+    #[test]
+    fn the_chord_hint_is_dropped_before_the_apps_name_is_squeezed() {
+        // A column that can hold the name AND the hint.
+        assert!(app_row_chord_fits(APP_NAME_MIN_WIDTH + 80.0, 72.0));
+        // Exactly enough is enough ...
+        assert!(app_row_chord_fits(APP_NAME_MIN_WIDTH + 72.0, 72.0));
+        // ... and one point less is not.
+        assert!(!app_row_chord_fits(APP_NAME_MIN_WIDTH + 71.0, 72.0));
+        // The case that produced the defect: the minimum window's value
+        // column is about 95pt and `CTRL+SHIFT+O` about 72pt of it.
+        assert!(
+            !app_row_chord_fits(95.0, 72.0),
+            "at the app's minimum window size the hint is reserved room, which leaves the \
+             name 23pt and breaks it into a ribbon"
+        );
+    }
+
+    /// At the app's minimum window size the card fits, the app's real name is
+    /// laid out **whole** -- not elided -- and the chord is not painted; the
+    /// link's own tooltip is what still names it.
+    #[test]
+    fn at_the_minimum_window_size_the_name_survives_and_the_chord_moves_to_the_tooltip() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = Pane::wide(MIN_PANE).knows_app(CHROME_PATH, CHROME_NAME);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        assert_eq!(
+            frame.rendered_glyphs(CHROME_NAME),
+            CHROME_NAME,
+            "the app's name was elided on a {MIN_PANE}pt pane -- the glyphs really laid are \
+             not the whole name"
+        );
+        let name = frame.rect_of(CHROME_NAME);
+        assert!(
+            name.right() <= MIN_PANE,
+            "the name is painted to x = {} on a {MIN_PANE}pt pane that does not scroll \
+             sideways",
+            name.right()
+        );
+        assert!(
+            !frame.painted(OPEN_APP_CHORD.2),
+            "the chord is painted on a pane with no room for it, which is where egui culled \
+             it off the right edge: {:?}",
+            frame.strings()
+        );
+        // **And the name was not squeezed to make room for it.** The line
+        // above is satisfied two ways -- the hint correctly omitted, and the
+        // hint drawn past the pane and culled -- and only this tells them
+        // apart: reserving room for the hint here leaves the name about 15pt,
+        // which lays `Waypoint Browser` out one syllable per line.
+        assert!(
+            name.height() <= ROW_VALUE_SIZE * 3.0,
+            "the app's name occupies {}pt of height on a {MIN_PANE}pt pane -- it has been \
+             broken into a ribbon to keep the chord hint on the line",
+            name.height()
+        );
+
+        // ... and it is still discoverable, on the surface `COPY_SHORTCUTS`
+        // calls this pane's primary one for chords.
+        let hovered = pane.hover_settled(&item, &TotpState::NoSecret, name.center());
+        assert!(
+            hovered
+                .strings()
+                .iter()
+                .any(|s| s.contains(OPEN_APP_CHORD.2) && s.contains(APP_OPEN_HOVER)),
+            "hovering the app's name on a narrow pane names neither the act nor the chord: \
+             {:?}",
+            hovered.strings()
+        );
+
+        // The control on the control: on a comfortable pane the hint IS
+        // painted, so the absence above is about the width and not about the
+        // hint having been deleted.
+        let mut wide = Pane::wide(PANE).knows_app(CHROME_PATH, CHROME_NAME);
+        assert!(
+            wide.idle(&item, &TotpState::NoSecret).painted(OPEN_APP_CHORD.2),
+            "the chord is painted on no pane at all"
+        );
+    }
+
+    // -- the footer: Remove, left-aligned, off the notes -----------------
+
+    /// **The user's third report: "Matched app Remove button is on top of
+    /// long description - should be left aligned".**
+    ///
+    /// It really was on top of it: the notes were drawn with
+    /// `set_max_width(app_card_value_width(ui))` -- the whole value column --
+    /// and `row_body` then opened the control group in what was left, which
+    /// was nothing. Asserting that each rect is inside the pane could not
+    /// have caught it; two rects can both be on screen and still be drawn on
+    /// top of each other. So this asserts NON-INTERSECTION, explicitly, at
+    /// the app's minimum window size and at a comfortable one, with a
+    /// resolved name on the card.
+    #[test]
+    fn the_footers_controls_never_overlap_the_cards_notes() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        for width in [MIN_PANE, PANE] {
+            let mut pane = Pane::wide(width).knows_app(CHROME_PATH, CHROME_NAME);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let note = frame.rect_of(trigger_caption(TriggerMode::Prompt));
+            for control in [APP_REMOVE_LABEL, OPEN_MENU_LABEL] {
+                let rect = frame.rect_of(control);
+                assert!(
+                    !rect.intersects(note),
+                    "on a {width}pt pane {control:?} is painted at {rect:?}, on top of the \
+                     note at {note:?}"
+                );
+                // Below it, not beside it -- which is what "its own line"
+                // means and what non-intersection alone would not pin (two
+                // rects on one line miss each other by a hair and still read
+                // as the old layout).
+                assert!(
+                    rect.top() >= note.bottom(),
+                    "on a {width}pt pane {control:?} at {rect:?} is on the note's line \
+                     at {note:?}"
+                );
+            }
+            // **Left aligned**, the user's word: the controls line starts on
+            // the card's own left edge, where the labels are -- NOT out in
+            // the value column where the notes and every other row's value
+            // sit. Open is the leftmost of the two.
+            let open = frame.rect_of(OPEN_MENU_LABEL);
+            let label = frame.rect_of("App");
+            assert!(
+                open.left() < note.left(),
+                "on a {width}pt pane the controls line starts at {} -- out in the value \
+                 column, which begins at {}",
+                open.left(),
+                note.left()
+            );
+            assert!(
+                open.left() >= label.left(),
+                "on a {width}pt pane the controls line starts at {}, left of the card's own \
+                 label column at {}",
+                open.left(),
+                label.left()
+            );
+            assert!(
+                frame.rect_of(APP_REMOVE_LABEL).left() > open.left(),
+                "Remove is not after Open on the controls line"
+            );
+        }
+    }
+
+    /// The premise for the test above, and the reason it is worth running at
+    /// `PANE`: the wide pane is where the overlap happened. If this ever
+    /// fails, the note has stopped being drawn and the non-intersection above
+    /// is vacuous.
+    #[test]
+    fn the_card_really_does_carry_a_note_at_every_width() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        for width in [MIN_PANE, PANE] {
+            let mut pane = Pane::wide(width);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                frame.painted(trigger_caption(TriggerMode::Prompt)),
+                "no note on a {width}pt pane: {:?}",
+                frame.strings()
+            );
+            // The glyphs really laid, not the source: a note elided away
+            // would still have a rect for the test above to miss.
+            assert_eq!(
+                frame.rendered_glyphs(trigger_caption(TriggerMode::Prompt)),
+                trigger_caption(TriggerMode::Prompt),
+                "the note was elided on a {width}pt pane"
+            );
+        }
+    }
 }
+
 
 /// The read pane's SHAPE, on a pane too short to hold the item in it.
 ///
@@ -10749,6 +11950,7 @@ mod read_pane_scroll_tests {
         ctx: egui::Context,
         size: egui::Vec2,
         reveal: RevealState,
+        apps: crate::app_identity::AppIdentityCache,
     }
 
     impl ShortPane {
@@ -10767,7 +11969,14 @@ mod read_pane_scroll_tests {
                 ctx,
                 size,
                 reveal: RevealState::default(),
+                apps: crate::app_identity::AppIdentityCache::default(),
             }
+        }
+
+        /// See [`Pane::knows_app`]. Keyed on the PATH, deliberately.
+        fn knows_app(mut self, path: &str, name: &str) -> Self {
+            self.apps.seed_ready(path, name, None);
+            self
         }
 
         fn bounds(&self) -> egui::Rect {
@@ -10791,6 +12000,7 @@ mod read_pane_scroll_tests {
                         false,
                         &mut self.reveal,
                         None,
+                        &mut self.apps,
                     );
                 },
             );
@@ -11016,7 +12226,15 @@ mod read_pane_scroll_tests {
     /// this against that layout, not assumed.
     #[test]
     fn the_matched_app_card_is_reachable_on_the_shortest_window() {
-        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        // **Resolved, and to something LONGER than the exe name it replaced.**
+        // The card now draws an app's real name where `Ledgerline.exe` used
+        // to be, and a longer run in a fixed column is more width, not less --
+        // which is the shape that put this card 467.8pt inside a 298pt pane
+        // in the first place. Seeded on the PATH, which is the cache's key.
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT)).knows_app(
+            r"C:\Deskwarden Test\Ledgerline\Ledgerline.exe",
+            TALL_ITEM_APP_NAME,
+        );
         let item = the_tallest_item();
         let bounds = pane.bounds();
 
@@ -11060,12 +12278,35 @@ mod read_pane_scroll_tests {
             // inside a 298pt pane and every label above still passed. The
             // path is the widest thing this pane can be asked to draw, and
             // it is the one that inflated the card.
-            "Ledgerline.exe",
+            //
+            // The App row's value is the RESOLVED name now -- longer than the
+            // `Ledgerline.exe` this list used to name, and the reason this
+            // test is worth re-running for this change at all.
+            TALL_ITEM_APP_NAME,
             r"C:\Deskwarden Test\Ledgerline\Ledgerline.exe",
+            // The sentence the controls used to be drawn on top of.
+            trigger_caption(TriggerMode::Prompt),
         ] {
             assert_visible(&after, source, bounds);
         }
+
+        // **Nothing on the card is drawn on top of anything else on it.**
+        // `assert_visible` says every control is on the pane; it cannot say
+        // they are not stacked, which is exactly what the user reported.
+        let note = after.rect_of(trigger_caption(TriggerMode::Prompt)).expect("the note");
+        for control in ["Open Ledgerline.exe", "Remove"] {
+            let rect = after.rect_of(control).expect("the control");
+            assert!(
+                !rect.intersects(note),
+                "{control:?} at {rect:?} is painted on top of the note at {note:?}"
+            );
+        }
     }
+
+    /// What the tall fixture's executable is called. Unlike its `process`,
+    /// unlike its path's file name, and unlike every directory in its path --
+    /// see `tests::CHROME_NAME` for why that matters.
+    const TALL_ITEM_APP_NAME: &str = "Ledgerline Accounting Suite";
 
     /// The header stays where it is. It is the only thing held out of the
     /// scroll area, and the reason is that a scrolled-away title leaves no

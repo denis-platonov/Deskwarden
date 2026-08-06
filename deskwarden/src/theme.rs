@@ -1152,11 +1152,29 @@ pub fn row_button_width(ui: &Ui, label: &str) -> f32 {
 /// `selectable(false)` because egui's default text selection would take the
 /// press for a drag-select and the row would stop reporting clicks at all.
 pub fn link_label(ui: &mut Ui, text: &str, size: f32) -> Response {
-    let response = ui.add(
-        egui::Label::new(RichText::new(text).size(size).color(BLUE))
-            .selectable(false)
-            .sense(Sense::click()),
-    );
+    link_widget(ui, egui::Label::new(RichText::new(text).size(size).color(BLUE)))
+}
+
+/// The same link, from text the caller has **already laid out**.
+///
+/// A `Galley` rather than a `&str` because the one other link on this app's
+/// detail pane -- the matched app's name -- has to wrap inside a fixed column
+/// on a 298pt pane, and `Label` given anything but a finished galley re-lays
+/// it with the surrounding layout's own wrap width (`f32::INFINITY` in a
+/// horizontal row), which is how an unwrapped run inflated that very card to
+/// 467.8pt once already. The caller lays the job, this paints it as a link.
+///
+/// **One link widget, two ways to feed it**: the blue, the pointing hand and
+/// the un-selectable click sense are [`link_widget`]'s and are not written out
+/// a second time, so the two links on this pane cannot start behaving
+/// differently. The colour is the caller's here -- a galley carries its own --
+/// and [`BLUE`] is what the caller must lay it in.
+pub fn link_galley(ui: &mut Ui, galley: std::sync::Arc<egui::Galley>) -> Response {
+    link_widget(ui, egui::Label::new(galley))
+}
+
+fn link_widget(ui: &mut Ui, label: egui::Label) -> Response {
+    let response = ui.add(label.selectable(false).sense(Sense::click()));
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
