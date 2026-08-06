@@ -769,11 +769,11 @@ pub fn draw_item_list(
     // Design 2b's list padding (`padding: 10px`), applied here now that the
     // pane's panel frame has none -- see the header strip's comment above.
     //
-    // The RIGHT padding is 0 because the scroll bar is given that lane
-    // instead: see `theme::scrollbar_in_gutter` below, which reserves exactly
-    // `LIST_PADDING` for itself. The row tiles therefore still end at
-    // `pane_right - LIST_PADDING`, unchanged, and the bar is centred in the
-    // padding rather than drawn hard against the tiles.
+    // The RIGHT padding is 0 because the scroll bar's lane replaces it: see
+    // `theme::scrollbar_in_gutter` below, which reserves the padding PLUS
+    // `theme::SCROLLBAR_WIDTH` on a list that can scroll, so the padding
+    // survives as clear space between the tiles and the bar instead of being
+    // eaten by it.
     egui::Frame::new()
         .inner_margin(Margin {
             left: LIST_PADDING as i8,
@@ -804,57 +804,86 @@ pub fn draw_item_list(
                 draw_list_placeholder(ui, placeholder);
                 return;
             }
-            theme::scrollbar_in_gutter(ui, LIST_PADDING);
-            // ... and pushed HARD AGAINST the lane's outer edge rather
-            // than centred in it, so every point of slack the lane has left
-            // falls on the side the reader is comparing: between the tiles
-            // and the bar.
-            //
-            // Why this is the most that can be done. Three things are pinned
-            // by tests, and together they fix the answer:
-            //
-            // * the tiles end at `pane_right - LIST_PADDING` (so the lane is
-            //   EXACTLY `LIST_PADDING` wide -- it cannot be widened without
-            //   moving the tiles);
-            // * a list that FITS has the same clear space on both sides of
-            //   its tiles, i.e. `LIST_PADDING` (so the empty lane counts as
-            //   clear space);
-            // * the tiles keep one width whether or not the bar shows.
-            //
-            // The lane is therefore clear space when the bar is hidden and
-            // ink when it is not, so the two states CANNOT both be
-            // symmetric: showing the bar must cost the right-hand side at
-            // least the bar's own width. `SCROLLBAR_WIDTH` is the floor, and
-            // `bar_outer_margin = 0` is what reaches it -- 10pt of clear
-            // space on the left against 10 - 6 = 4 on the right, where
-            // centring the bar spent another 2pt of that side on a gap
-            // between the bar and the pane's edge that nobody is comparing
-            // anything to. It also puts the bar where the platform's own
-            // scroll bars sit -- flush to the edge, reading as the pane's
-            // chrome rather than as something standing inside its padding.
-            //
-            // Set HERE and not in `theme::scrollbar_in_gutter`, which still
-            // centres, because that helper is shared with the read pane and
-            // the edit form and their tests pin the centred placement. The
-            // rule belongs in the helper; see its doc comment.
-            ui.spacing_mut().scroll.bar_outer_margin = 0.0;
-            // ... and hidden outright when there is nothing to scroll. The
-            // lane is still reserved (that is what `AlwaysVisible` below is
-            // for, and the tiles must not resize), but a full-height 6pt bar
-            // painted down a list that cannot move leaves 2pt of clear space
-            // on the right against 10pt on the left -- the tiles are
-            // symmetric and the bar is what reads as the smaller padding.
-            //
-            // Predicted from the row count rather than read back from last
-            // frame's `ScrollArea` output, which would be a frame late and so
-            // would flash a bar for one frame whenever the filter changed.
-            // The pitch is `show_rows`' own: one tile per row plus a gap
-            // BETWEEN rows. Ties go to SHOWING the bar -- being wrong the
-            // other way would hide a bar on a list that really can scroll.
+            // **Does this list actually overflow?** Predicted from the row
+            // count rather than read back from last frame's `ScrollArea`
+            // output, which would be a frame late and so would flash a bar
+            // for one frame whenever the filter changed. The pitch is
+            // `show_rows`' own: one tile per row plus a gap BETWEEN rows.
+            // Ties go to CAN SCROLL -- being wrong the other way would hide
+            // a bar on a list that really can move.
             let content_height = filtered.len() as f32 * ROW_TILE_HEIGHT
                 + filtered.len().saturating_sub(1) as f32 * ROW_GAP;
-            if content_height < ui.available_height() {
+            let fits = content_height < ui.available_height();
+            // **The bar gets a lane of its own, OUTSIDE the padding.**
+            //
+            // THE REPORT, third time: "still diff size of spaces on left
+            // (correct) and right (too small)". The left gap measures
+            // `LIST_PADDING`; with a bar showing, the right one measured
+            // `LIST_PADDING - theme::SCROLLBAR_WIDTH` = 4pt, because the bar
+            // was drawn INSIDE the 10pt lane that IS the padding. Pushing it
+            // flush to the pane's outer edge (the previous attempt) put all
+            // 4pt of the leftover on the side being compared, and 4pt was
+            // provably the floor -- so long as the lane stayed 10pt wide.
+            //
+            // So the lane is widened instead: `LIST_PADDING +
+            // SCROLLBAR_WIDTH` on a list that can scroll. The bar still sits
+            // flush to the outer edge (`scrollbar_in_gutter` pins it there),
+            // which leaves a full `LIST_PADDING` of CLEAR space between the
+            // tiles' right edge and the bar. Left, right, top and bottom all
+            // read 10pt, in both states.
+            //
+            // **What this gives up, deliberately: the tiles no longer keep
+            // one width across the overflow boundary.** They are
+            // `SCROLLBAR_WIDTH` narrower once the list can scroll, so
+            // filtering a long list down past the boundary widens them by
+            // 6pt. That was the constraint the two previous attempts held
+            // fixed, and holding it is exactly what made 4pt a floor: the
+            // same strip of pane cannot be clear space when the bar is
+            // hidden and ink when it is not unless the content moves. A 6pt
+            // wobble while typing in the search box is a smaller defect than
+            // a padding that reads permanently lopsided on every list long
+            // enough to scroll -- which is the defect that has now been
+            // reported three times.
+            //
+            // A list that FITS keeps the plain `LIST_PADDING` lane and hides
+            // the bar outright, so its right gap is the padding itself. The
+            // alternative -- reserving the wide lane unconditionally -- would
+            // have kept the tile width constant at the cost of a 16pt right
+            // gap against 10pt on the left on every short list, i.e. the
+            // original complaint with the sign flipped.
+            theme::scrollbar_in_gutter(
+                ui,
+                if fits { LIST_PADDING } else { LIST_PADDING + theme::SCROLLBAR_WIDTH },
+            );
+            if fits {
                 theme::hide_scrollbar(ui);
+            } else {
+                // **And the bar stays painted with the pointer away.**
+                //
+                // egui's floating bar fades to nothing when the pointer
+                // leaves the scroll area (`dormant_handle_opacity` is 0).
+                // With the lane reserved outside the padding that fade is no
+                // longer free: it empties a `SCROLLBAR_WIDTH` strip that the
+                // tiles have already paid for, so the right-hand gap flicks
+                // between `LIST_PADDING` and `LIST_PADDING +
+                // SCROLLBAR_WIDTH` depending on where the mouse is. Measured
+                // on the real list: 10pt with the pointer over it, 16pt
+                // without -- the same complaint the other way up, and the
+                // state a screenshot is most likely to catch.
+                //
+                // Holding the dormant opacities at the ACTIVE ones (rather
+                // than at 1.0, or at `ScrollStyle::solid()`) keeps exactly
+                // the appearance the bar already has whenever the pointer is
+                // over the list, which is the state the reader has been
+                // looking at all along -- and avoids `solid()`, which takes
+                // the handle's colour from `widgets.inactive.bg_fill`, i.e.
+                // `theme::CARD`: a white handle on a white track.
+                //
+                // Only on a list that CAN scroll. A list that fits still
+                // paints no bar at all.
+                let scroll = &mut ui.spacing_mut().scroll;
+                scroll.dormant_background_opacity = scroll.active_background_opacity;
+                scroll.dormant_handle_opacity = scroll.active_handle_opacity;
             }
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1983,8 +2012,16 @@ mod row_tile_tests {
 
     const PANE_WIDTH: f32 = 390.0;
     const PANE_HEIGHT: f32 = 700.0;
-    /// A row tile spans the pane minus the list frame's `padding: 10px`.
+    /// A row tile on a list that FITS: the pane minus the list frame's
+    /// `padding: 10px` on each side.
     const TILE_WIDTH: f32 = PANE_WIDTH - 2.0 * LIST_PADDING;
+    /// A row tile on a list that CAN SCROLL, which is
+    /// [`theme::SCROLLBAR_WIDTH`] narrower: the bar is given a lane of its
+    /// own OUTSIDE the padding, so that the padding survives as clear space
+    /// between the tiles and the bar rather than being drawn over. The two
+    /// widths differing is the constraint this list deliberately gives up --
+    /// see the production comment at `scrollbar_in_gutter`'s call site.
+    const SCROLLING_TILE_WIDTH: f32 = TILE_WIDTH - theme::SCROLLBAR_WIDTH;
 
     fn login(name: &str, username: &str) -> VaultItem {
         VaultItem {
@@ -2269,7 +2306,8 @@ mod row_tile_tests {
                 // tile -- egui emits one per row for the layout itself.
                 !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
                     && r.blur_width == 0.0
-                    && (r.rect.width() - TILE_WIDTH).abs() < 0.5
+                    && ((r.rect.width() - TILE_WIDTH).abs() < 0.5
+                        || (r.rect.width() - SCROLLING_TILE_WIDTH).abs() < 0.5)
                     && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
             })
             .cloned()
@@ -2395,17 +2433,19 @@ mod row_tile_tests {
         // and centring was spending 2pt of a 4pt budget on the side of the
         // bar nobody compares anything to.
         //
-        // The gutter is the list's own `padding: 10px` on the right, i.e.
-        // x in [380, 390] at this pane. A 6pt bar flush to that gutter's
-        // OUTER edge occupies [384, 390]. ABSOLUTE numbers, not "the bar is
-        // right of the tiles" -- and both slacks are now pinned to a number
-        // each rather than only to each other, which is strictly more than
-        // the centring version said.
+        // The lane is the list's `padding: 10px` PLUS a 6pt strip of its
+        // own, i.e. x in [374, 390] at this pane, and a 6pt bar flush to that
+        // lane's OUTER edge occupies [384, 390]. ABSOLUTE numbers, not "the
+        // bar is right of the tiles" -- and both slacks are pinned to a
+        // number each rather than only to each other.
         //
-        // Paired with the tile geometry, which must NOT move: giving the
-        // gutter to the scroll area only works if the bar takes its space
-        // from the content, so the tiles still span 10..380.
-        const GUTTER: std::ops::Range<f32> = 380.0..390.0;
+        // The slack INSIDE the lane is therefore a full `LIST_PADDING`, which
+        // is the whole point: the padding is no longer the thing the bar is
+        // drawn on top of. The tiles pay for it, ending at 374 rather than
+        // 380 -- see `the_tiles_narrow_by_exactly_the_bars_width_when_the_
+        // list_can_scroll`, which pins that price.
+        const GUTTER: std::ops::Range<f32> =
+            (PANE_WIDTH - LIST_PADDING - theme::SCROLLBAR_WIDTH)..PANE_WIDTH;
         let items: Vec<VaultItem> = (0..40)
             .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
             .collect();
@@ -2420,12 +2460,13 @@ mod row_tile_tests {
         for tile in row_tiles(&p) {
             assert!(
                 (tile.rect.left() - LIST_PADDING).abs() < 0.5
-                    && (tile.rect.right() - (PANE_WIDTH - LIST_PADDING)).abs() < 0.5,
-                "a row tile spans {}..{}, expected {LIST_PADDING}..{} -- the tiles must keep \
-                 their exact width when the scrollbar is given the gutter",
+                    && (tile.rect.right() - GUTTER.start).abs() < 0.5,
+                "a row tile spans {}..{}, expected {LIST_PADDING}..{} -- the tiles must end at \
+                 the scrollbar lane's INNER edge, leaving the padding clear between them and \
+                 the bar",
                 tile.rect.left(),
                 tile.rect.right(),
-                PANE_WIDTH - LIST_PADDING
+                GUTTER.start
             );
         }
 
@@ -2456,13 +2497,11 @@ mod row_tile_tests {
             let slack_left = bar.left() - GUTTER.start;
             let slack_right = GUTTER.end - bar.right();
             assert!(
-                (slack_left - (LIST_PADDING - theme::SCROLLBAR_WIDTH)).abs() < 0.51
-                    && slack_right.abs() < 0.51,
-                "the scrollbar has {slack_left}pt of gutter to its left and {slack_right}pt to \
-                 its right, expected {}pt and 0pt -- all of the gutter's slack belongs on the \
-                 TILE side, where it reads as padding, and none of it between the bar and the \
-                 pane's own outer edge",
-                LIST_PADDING - theme::SCROLLBAR_WIDTH
+                (slack_left - LIST_PADDING).abs() < 0.51 && slack_right.abs() < 0.51,
+                "the scrollbar has {slack_left}pt of lane to its left and {slack_right}pt to \
+                 its right, expected {LIST_PADDING}pt and 0pt -- the whole of the list's \
+                 padding belongs on the TILE side, where the reader compares it to the left \
+                 gap, and none of it between the bar and the pane's own outer edge"
             );
         }
     }
@@ -2567,40 +2606,27 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn the_clear_space_beside_a_scrolling_lists_tiles_is_at_its_floor() {
-        // THE REPORT, one state on from the one `092da70` closed. That
-        // commit hid the bar on a list that CANNOT scroll, which is the
-        // vault the reporter had on screen. On a list that CAN, the bar is
-        // genuinely needed and the asymmetry it creates is real: 10pt of
-        // clear space left of the tiles against 2pt right of them.
+    fn the_clear_space_beside_a_scrolling_lists_tiles_matches_the_left() {
+        // THE REPORT, third time: "still diff size of spaces on left
+        // (correct) and right (too small)". Measured on a list that scrolls,
+        // the right gap was 4pt against the left's 10.
         //
-        // WHY 2pt CANNOT SIMPLY BECOME 10pt. Three properties are pinned
-        // elsewhere in this module, and together they leave exactly one
-        // free number:
+        // This test USED to assert 4pt and call it a floor. The floor was
+        // real, but only under a constraint that turned out to be the wrong
+        // one to keep: that the tiles hold ONE width whether or not the bar
+        // is showing. With the tiles pinned at `PANE_WIDTH - LIST_PADDING`,
+        // the bar's lane IS the padding, so the same strip of pane has to be
+        // clear space in one state and ink in the other, and showing the bar
+        // must cost the right side at least `SCROLLBAR_WIDTH`.
         //
-        //   * the tiles end at `PANE_WIDTH - LIST_PADDING` at every item
-        //     count, so the reserved lane is exactly `LIST_PADDING` wide
-        //     and cannot be widened without moving the tiles;
-        //   * a list that FITS leaves `LIST_PADDING` of clear space on both
-        //     sides, so the EMPTY lane counts as clear space;
-        //   * the tiles keep one width whether or not the bar is showing --
-        //     what `AlwaysVisible` plus the reserved lane buys, and what
-        //     `092da70` measured `VisibleWhenNeeded` breaking by 10pt.
-        //
-        // The same strip of pane is therefore clear space when the bar is
-        // hidden and ink when it is not, so the two states cannot BOTH be
-        // symmetric. Showing the bar must cost the right-hand side at least
-        // the bar's own width. `theme::SCROLLBAR_WIDTH` is the floor, and
-        // this asserts the list is AT it -- which is a statement about
-        // where the bar sits, because any gap left between the bar and the
-        // pane's outer edge comes straight out of the side being compared.
-        // The centred placement this list shipped with left 2pt there, and
-        // so missed the floor by 2pt.
-        //
-        // "Balanced" is therefore not "equal" here, and saying so is the
-        // point: equal is unreachable, the floor is reachable, and pinning
-        // the floor makes any future widening of the bar -- or any gap
-        // reintroduced behind it -- fail loudly.
+        // That constraint is now given up on purpose. The bar's lane sits
+        // OUTSIDE the padding, so the tiles end `SCROLLBAR_WIDTH` earlier on
+        // a list that scrolls and the padding survives intact between them
+        // and the bar. **Equal is therefore reachable, and this asserts
+        // equality** -- the thing the reader was actually asking for. The
+        // price is pinned separately, by
+        // `the_tiles_narrow_by_exactly_the_bars_width_when_the_list_can_
+        // scroll`, so giving it up cannot happen quietly.
         let items: Vec<VaultItem> = (0..40)
             .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
             .collect();
@@ -2625,31 +2651,128 @@ mod row_tile_tests {
             "the tiles have {clear_left}pt of clear space to their left, not the design's \
              {LIST_PADDING}pt -- something is being painted in the LEFT gutter"
         );
-        let floor = LIST_PADDING - theme::SCROLLBAR_WIDTH;
         assert!(
-            (clear_right - floor).abs() < 0.51,
+            (clear_right - LIST_PADDING).abs() < 0.51,
             "with the bar showing the tiles have {clear_left}pt of clear space to their \
-             left and {clear_right}pt to their right. {floor}pt is the most the right side \
-             can have -- the {LIST_PADDING}pt lane less the {}pt bar -- so the bar is not \
-             flush to the pane's outer edge, and is spending {}pt of the reader's padding \
-             on a gap behind itself. Visible rects: {:?}",
-            theme::SCROLLBAR_WIDTH,
-            floor - clear_right,
+             left and {clear_right}pt to their right, and both should be the design's \
+             {LIST_PADDING}pt. The bar is eating {}pt of the right-hand padding instead of \
+             sitting in its own lane beyond it. Visible rects: {:?}",
+            LIST_PADDING - clear_right,
             visibly_painted(&p).collect::<Vec<_>>()
         );
 
-        // **The positive control.** The measurement above has to RESPOND to
-        // the bar, not report `LIST_PADDING - SCROLLBAR_WIDTH` for any list
-        // at all. The same fixture one row short of overflowing must give a
-        // different, larger answer -- and the floor must be genuinely
-        // smaller than the padding, or "at the floor" and "symmetric" would
-        // be the same assertion and this could not fail for its own reason.
+        // **The positive control.** Equality on its own is cheap: a
+        // measurement that never saw the bar would report `LIST_PADDING` on
+        // both sides too, which is exactly the reading the previous two
+        // attempts' tests were fooled by on an alpha-0 frame. So the bar
+        // must be BETWEEN the tile edge and the pane edge -- i.e. the right
+        // gap has to be strictly less than the distance to the pane's own
+        // edge, and by exactly the bar's width.
+        let to_pane_edge = PANE_WIDTH - tile.right();
         assert!(
-            floor < LIST_PADDING - 0.51,
-            "the bar is {}pt wide in a {LIST_PADDING}pt lane, so the floor {floor}pt IS the \
-             padding and this test cannot tell a flush bar from no bar at all",
+            (to_pane_edge - clear_right - theme::SCROLLBAR_WIDTH).abs() < 0.51,
+            "the tiles end {to_pane_edge}pt short of the pane's right edge and report \
+             {clear_right}pt of clear space, a difference of {}pt. It should be the {}pt \
+             bar and nothing else -- if it is zero, no bar was measured and the equality \
+             above says nothing about the state the reader complained of",
+            to_pane_edge - clear_right,
             theme::SCROLLBAR_WIDTH
         );
+    }
+
+    #[test]
+    fn the_tiles_narrow_by_exactly_the_bars_width_when_the_list_can_scroll() {
+        // **The price of the fix above, stated out loud.** Two attempts at
+        // this defect held the tiles at ONE width across the overflow
+        // boundary, and that is precisely what made the right-hand gap
+        // 4pt instead of 10 -- the bar had nowhere to go but the padding.
+        // Giving the bar a lane of its own moves the tiles' right edge in by
+        // `SCROLLBAR_WIDTH` the moment a list can scroll, so filtering a long
+        // list down past the boundary widens the tiles by 6pt.
+        //
+        // That is a real, if small, wobble, and it is a DECISION: a 6pt
+        // change while typing in the search box against a padding that reads
+        // permanently lopsided on every list long enough to scroll. This
+        // pins the size of the wobble so it cannot grow, and pins that it
+        // happens at all so nobody re-derives the old floor by accident.
+        //
+        // The boundary is FOUND from painted output, not asserted, so the
+        // two fixtures really are one row either side of it.
+        let overflow_at = (1..=40)
+            .find(|n| row_stack_overflows(*n))
+            .expect("no list of up to 40 rows overflowed the pane");
+        let fitting: Vec<VaultItem> = (0..overflow_at - 1)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let overflowing: Vec<VaultItem> = (0..overflow_at)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let fits_tile = row_tiles(&paint_with(&fitting, None, SETTLE_FRAMES))[0].rect;
+        let scrolls_tile = row_tiles(&paint_with(&overflowing, None, SETTLE_FRAMES))[0].rect;
+
+        assert!(
+            (fits_tile.left() - scrolls_tile.left()).abs() < 0.5,
+            "the tiles start at x={} when the list fits and x={} when it scrolls -- only the \
+             RIGHT edge is meant to move; the left padding is the one the reader called \
+             correct",
+            fits_tile.left(),
+            scrolls_tile.left()
+        );
+        assert!(
+            (fits_tile.width() - TILE_WIDTH).abs() < 0.5,
+            "a {}-row list that fits lays its tiles out {}pt wide, expected {TILE_WIDTH} -- \
+             the scrollbar lane is being reserved on a list with nothing to scroll, which \
+             would leave {}pt of clear space on the right against {LIST_PADDING}pt on the left",
+            fitting.len(),
+            fits_tile.width(),
+            LIST_PADDING + theme::SCROLLBAR_WIDTH
+        );
+        assert!(
+            (scrolls_tile.width() - SCROLLING_TILE_WIDTH).abs() < 0.5,
+            "adding one row makes the tiles {}pt wide, expected {SCROLLING_TILE_WIDTH} -- the \
+             lane the bar needs must come out of the CONTENT, not out of the padding",
+            scrolls_tile.width()
+        );
+    }
+
+    #[test]
+    fn a_scrolling_lists_bar_stays_painted_with_the_pointer_away_from_the_list() {
+        // **The gap must not depend on where the mouse is.** The bar now has
+        // a lane of its own outside the padding, which the tiles pay
+        // `SCROLLBAR_WIDTH` for. egui's floating bar fades to alpha 0 when
+        // the pointer leaves the scroll area, and if it did that here the
+        // paid-for lane would sit empty: 10pt of clear space on the right
+        // with the pointer over the list, 16pt without. A screenshot of an
+        // idle window would catch the 16.
+        //
+        // `paint` runs frames with NO pointer at all, which is the dormant
+        // state; `SETTLE_FRAMES` deliberately parks the pointer over the
+        // list, so every other scroll test in this module is asking the
+        // easier question. Both are asserted here so the two states cannot
+        // drift apart.
+        let items: Vec<VaultItem> = (0..40)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        for (p, state) in [
+            (paint(&items, None), "with the pointer away"),
+            (paint_with(&items, None, SETTLE_FRAMES), "with the pointer over the list"),
+        ] {
+            let marks = gutter_marks(&p);
+            assert!(
+                !marks.is_empty(),
+                "a {}-row list paints nothing visible in its scrollbar lane {state}. The lane \
+                 is reserved either way -- the tiles are {SCROLLING_TILE_WIDTH}pt wide, not \
+                 {TILE_WIDTH} -- so an unpainted bar leaves {}pt of clear space on the right \
+                 against {LIST_PADDING}pt on the left. Visible rects: {:?}",
+                items.len(),
+                LIST_PADDING + theme::SCROLLBAR_WIDTH,
+                visibly_painted(&p).collect::<Vec<_>>()
+            );
+        }
+
+        // The positive control: a list that FITS still paints no bar at all
+        // in either state, so the change above is scoped to lists that can
+        // actually scroll and has not simply forced a bar on everything.
         let fits_at = (1..=40)
             .find(|n| row_stack_overflows(*n))
             .expect("no list of up to 40 rows overflowed the pane")
@@ -2657,29 +2780,69 @@ mod row_tile_tests {
         let fitting: Vec<VaultItem> = (0..fits_at)
             .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
             .collect();
-        let q = paint_with(&fitting, None, SETTLE_FRAMES);
-        let fitting_tile = row_tiles(&q)[0].rect;
-        let (_, fits_right) = clear_space_beside_tiles(&q, fitting_tile);
         assert!(
-            (fits_right - LIST_PADDING).abs() < 0.51,
-            "a {fits_at}-row list that fits reports {fits_right}pt of clear space on the \
-             right, not {LIST_PADDING}pt -- `clear_space_beside_tiles` is not measuring the \
-             bar at all, so the floor assertion above is vacuous"
+            gutter_marks(&paint(&fitting, None)).is_empty(),
+            "a {fits_at}-row list that fits is painting a bar with the pointer away"
         );
+    }
 
-        // ...and the tiles sit in the same place in both, which is the
-        // property the whole arrangement exists for: the clear space
-        // changed and the CONTENT did not.
-        assert!(
-            (fitting_tile.left() - tile.left()).abs() < 0.5
-                && (fitting_tile.right() - tile.right()).abs() < 0.5,
-            "a tile spans {}..{} on a list that fits and {}..{} on one that scrolls -- the \
-             lane is being reserved conditionally after all",
-            fitting_tile.left(),
-            fitting_tile.right(),
-            tile.left(),
-            tile.right()
-        );
+    #[test]
+    fn the_gap_above_the_first_tile_is_the_same_as_the_gap_beside_it() {
+        // THE REPORT, the half nobody had ever measured: "also feels on top
+        // is smaller as well". Two rounds of work went into the side gaps
+        // while the top was only ever asserted as an ABSOLUTE y coordinate
+        // (`STRIP_HEIGHT + LIST_PADDING`), which is a statement about the
+        // layout, not about what the eye compares. If the header strip's own
+        // ink stopped short of `STRIP_HEIGHT`, or something were painted
+        // between the strip and the list, the absolute assertion would stay
+        // green while the visible gap shrank.
+        //
+        // So this measures INK to INK, the same way `clear_space_beside_
+        // tiles` measures the sides: from the bottom of the lowest thing
+        // painted above the first tile down to that tile's top edge, counting
+        // only what actually overlaps the tile's own column. Then it compares
+        // that to the left gap MEASURED IN THE SAME FRAME rather than to
+        // `LIST_PADDING`, so "the top matches the left" cannot pass by both
+        // sides drifting together.
+        //
+        // Run on a list that fits AND on one that overflows, unscrolled --
+        // the vertical gap has nothing to do with the scrollbar, and saying
+        // so is the point: the answer must not depend on the state the side
+        // gaps do.
+        for n in [3usize, 40usize] {
+            let items: Vec<VaultItem> = (0..n)
+                .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+                .collect();
+            // NOT `SETTLE_FRAMES`: that pumps the wheel, and a scrolled list
+            // has its first tile clipped by the viewport rather than sitting
+            // its padding below the strip.
+            let p = paint(&items, None);
+            let tile = row_tiles(&p)[0].rect;
+
+            let mut gap_above = tile.top();
+            for r in visibly_painted(&p) {
+                let shares_the_column =
+                    r.right() > tile.left() + 0.5 && r.left() < tile.right() - 0.5;
+                if shares_the_column && r.bottom() <= tile.top() + 0.01 {
+                    gap_above = gap_above.min(tile.top() - r.bottom());
+                }
+            }
+            let (gap_left, _) = clear_space_beside_tiles(&p, tile);
+
+            assert!(
+                (gap_above - gap_left).abs() < 0.51,
+                "on a {n}-row list there is {gap_above}pt of clear space above the first \
+                 tile and {gap_left}pt beside it. The reader compares those two directly, \
+                 so they have to be the same number"
+            );
+            assert!(
+                (gap_above - LIST_PADDING).abs() < 0.51,
+                "on a {n}-row list the gap above the first tile is {gap_above}pt, not the \
+                 design's {LIST_PADDING}pt -- the list frame's TOP margin is no longer the \
+                 same padding as its sides, or something is being painted between the \
+                 header strip and the list"
+            );
+        }
     }
 
     /// The bottom of the list's scrolling viewport, from the PANE's geometry
@@ -4834,7 +4997,16 @@ mod move_error_band_tests {
             .rects
             .iter()
             .filter(|(rect, _)| {
-                (rect.width() - (PANE_WIDTH - 2.0 * LIST_PADDING)).abs() < 0.5
+                // Either legitimate tile width. A 100-row list SCROLLS, and a
+                // list that can scroll lays its tiles out `SCROLLBAR_WIDTH`
+                // narrower so the bar gets a lane outside the padding -- see
+                // `row_tile_tests::the_tiles_narrow_by_exactly_the_bars_
+                // width_when_the_list_can_scroll`. This test is about the
+                // row PITCH, so it must find the rows in both states rather
+                // than silently finding none in one of them.
+                let full = PANE_WIDTH - 2.0 * LIST_PADDING;
+                ((rect.width() - full).abs() < 0.5
+                    || (rect.width() - (full - theme::SCROLLBAR_WIDTH)).abs() < 0.5)
                     && (rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
             })
             .map(|(rect, _)| *rect)
