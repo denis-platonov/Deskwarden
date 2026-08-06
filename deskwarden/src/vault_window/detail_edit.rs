@@ -6252,6 +6252,21 @@ mod edit_pane_layout_tests {
         /// overlap assertion is asked of the glyph positions egui really
         /// placed -- the same source `Painted::rendered` reads.
         glyphs: Vec<(String, Rect)>,
+        /// Every OTHER shape the frame drew ink with, named and boxed:
+        /// carets, icons, circles, lines, curves, meshes.
+        ///
+        /// This field exists because the two above it are not a partition.
+        /// `walk` used to end `_ => {}`, so a shape that was neither a
+        /// galley nor a filled rect was DISCARDED, and every assertion in
+        /// this module was silent about it. Instrumenting the discard on the
+        /// tallest form found three `Shape::Path` -- the combo boxes' carets,
+        /// one of them at x = 188.8..198.6, in the very row the 309.4pt card
+        /// defect lived in. A later layout could push a caret past the pane's
+        /// edge without moving a single rect, and nothing here would say so.
+        /// That is the same blindness one level up from the one the rects
+        /// field was added to close, which was itself one level up from the
+        /// texts field. See [`ink_of`] for what counts as drawn.
+        marks: Vec<(&'static str, Rect)>,
     }
 
     impl Painted {
@@ -6332,8 +6347,75 @@ mod edit_pane_layout_tests {
                     walk(shape, painted);
                 }
             }
-            _ => {}
+            // NOT `_ => {}`. Everything else that draws ink is recorded by
+            // its visual bounds, so the assertions below can see a caret, an
+            // icon, a circle or a line leave the pane. See [`Painted::marks`].
+            other => {
+                if let Some(mark) = ink_of(other) {
+                    painted.marks.push(mark);
+                }
+            }
         }
+    }
+
+    /// What counts as **painted** for a shape that is neither a galley nor a
+    /// filled rect: ink a reader could actually see, and the box it covers.
+    ///
+    /// `None` for three kinds of shape that are allocated but not drawn, each
+    /// of which is a vacuous assertion this crate has shipped or nearly did:
+    ///
+    /// * [`egui::Shape::Noop`], which paints nothing by definition. `Vec`,
+    ///   `Text` and `Rect` are handled by their own arms above and never
+    ///   reach here.
+    /// * A shape whose fill AND whose stroke are transparent. That is the
+    ///   alpha-0 trap this pane already met once: egui's floating scroll bar
+    ///   is allocated at full size and drawn at alpha 0 while the pointer is
+    ///   away, and a sibling test once certified the placement of exactly
+    ///   such a bar. The test is on the ALPHA, not on `Stroke::is_empty`,
+    ///   which only recognises the single colour `Color32::TRANSPARENT` and
+    ///   would call an invisible red stroke visible.
+    /// * A shape whose visual bounds are empty or infinite -- a zero-area
+    ///   shape covers no pixel, and `visual_bounding_rect` answers
+    ///   `Rect::NOTHING` for several of the cases above.
+    ///
+    /// Everything else is ink, boxed by `visual_bounding_rect()`, which
+    /// already includes the stroke's own width. Where the colour is a UV
+    /// callback its alpha is not knowable here, so it counts as ink: for a
+    /// test whose job is to catch things out of bounds, that is the safe
+    /// direction.
+    fn ink_of(shape: &egui::Shape) -> Option<(&'static str, Rect)> {
+        use egui::epaint::{ColorMode, PathStroke};
+        let stroked = |stroke: &egui::Stroke| stroke.width > 0.0 && stroke.color.a() > 0;
+        let path_stroked = |stroke: &PathStroke| {
+            stroke.width > 0.0
+                && match &stroke.color {
+                    ColorMode::Solid(color) => color.a() > 0,
+                    ColorMode::UV(_) => true,
+                }
+        };
+        let (kind, visible) = match shape {
+            egui::Shape::Circle(s) => ("a circle", s.fill.a() > 0 || stroked(&s.stroke)),
+            egui::Shape::Ellipse(s) => ("an ellipse", s.fill.a() > 0 || stroked(&s.stroke)),
+            egui::Shape::LineSegment { stroke, .. } => ("a line", stroked(stroke)),
+            egui::Shape::Path(s) => ("a path", s.fill.a() > 0 || path_stroked(&s.stroke)),
+            egui::Shape::QuadraticBezier(s) => {
+                ("a quadratic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
+            }
+            egui::Shape::CubicBezier(s) => {
+                ("a cubic curve", s.fill.a() > 0 || path_stroked(&s.stroke))
+            }
+            egui::Shape::Mesh(_) => ("a mesh", true),
+            egui::Shape::Callback(_) => ("a backend callback", true),
+            egui::Shape::Noop
+            | egui::Shape::Vec(_)
+            | egui::Shape::Text(_)
+            | egui::Shape::Rect(_) => return None,
+        };
+        if !visible {
+            return None;
+        }
+        let bounds = shape.visual_bounding_rect();
+        (bounds.is_positive() && bounds.is_finite()).then_some((kind, bounds))
     }
 
     fn raw_input(pane: Vec2, events: &[egui::Event]) -> egui::RawInput {
@@ -6616,13 +6698,26 @@ mod edit_pane_layout_tests {
         pane.x - FORM_SCROLL_GUTTER
     }
 
-    /// Every coloured rectangle painted wholly inside the reserved lane and
+    /// Every coloured rectangle that STARTS inside the reserved lane and is
     /// narrow enough to be a scroll bar rather than a card spilling into it.
     ///
-    /// The width ceiling is the LANE's width, not the bar's, on purpose: the
-    /// defect this test exists for painted a 1.2pt sliver, and a filter set
-    /// at the bar's own width would have quietly accepted it. What the sliver
-    /// fails is the assertion, not the search.
+    /// The search and the assertions it feeds are for two different
+    /// questions, and the filter is written so they cannot answer each
+    /// other's.
+    ///
+    /// * **Is this a bar?** -- the width ceiling is the LANE's width, not the
+    ///   bar's, on purpose: the defect this test exists for painted a 1.2pt
+    ///   sliver, and a filter set at the bar's own width would have quietly
+    ///   accepted it. What the sliver fails is the assertion, not the search.
+    /// * **Is the bar where it belongs?** -- not asked here. The filter used
+    ///   to require `rect.right() <= pane.x + 0.5`, which made the identical
+    ///   clause in the assertion below unfailable, and made a bar that
+    ///   OVERHANGS the pane disappear from the search rather than fail it.
+    ///   Verified: with the bar pushed to 296..302 the two callers reported
+    ///   "no scroll bar was painted, so this test is vacuous" and "a form that
+    ///   overflows a 300pt pane paints no scroll bar at all" -- both the
+    ///   opposite of what had happened. An overhanging bar is now FOUND here
+    ///   and REJECTED there, by a message that says it overhangs.
     fn bar_rects(painted: &Painted, pane: Vec2) -> Vec<Rect> {
         let lane = lane_left(pane);
         painted
@@ -6631,7 +6726,6 @@ mod edit_pane_layout_tests {
             .filter(|(rect, fill)| {
                 fill.a() > 0
                     && rect.left() >= lane - 0.5
-                    && rect.right() <= pane.x + 0.5
                     && rect.width() > 0.0
                     && rect.width() <= FORM_SCROLL_GUTTER + 0.5
                     && rect.height() > FORM_SCROLL_GUTTER
@@ -6683,9 +6777,20 @@ mod edit_pane_layout_tests {
     /// the rule now lives in the helper, so this form follows. The assertion is
     /// not weaker for it -- it still pins the bar to an ABSOLUTE x, one that is
     /// still inside the lane and still clear of the card, and the same 0.5pt
-    /// tolerance would catch the same 1.2pt sliver (which egui pins to
-    /// `pane.x`, i.e. to the lane's outer edge with width 1.2, so the WIDTH
-    /// assertion above is what rejects it now that the position no longer does).
+    /// tolerance still catches the same 1.2pt sliver.
+    ///
+    /// **Both of the two assertions below are load-bearing, and this is
+    /// written down so that neither is later removed as redundant.** An
+    /// earlier version of this note claimed the WIDTH check was the one that
+    /// rejects the sliver "now that the position no longer does". That is
+    /// false, and it was checked both ways. egui pins its floating sliver to
+    /// the pane's right edge, so on a 298pt pane the sliver is 296.8..298:
+    /// the width check fires first (`1.2000122pt wide, not 6pt`), but with
+    /// the width check neutered the FLUSH check fires on its own
+    /// (`the scroll bar spans x = 296.8..298 but the outermost 6pt ... is
+    /// 292..298`) -- because flushness is measured from the bar's LEFT edge,
+    /// and a narrow bar that shares the right edge does not share the left
+    /// one. Neither check is a spare.
     ///
     /// Commit `68f86cb` made this form scrollable and left nothing on screen
     /// to say so; the user who reported "cannot scroll" got no affordance.
@@ -6716,8 +6821,22 @@ mod edit_pane_layout_tests {
                 bar.width(),
                 theme::SCROLLBAR_WIDTH
             );
+            // Two separate assertions, because they fail for two different
+            // reasons and a reader who sees one must not be told the other's
+            // story. `bar_rects` no longer filters overhanging bars out, so
+            // this first one can actually fail.
             assert!(
-                (bar.left() - bar_left).abs() <= 0.5 && bar.right() <= pane.x + 0.5,
+                bar.right() <= pane.x + 0.5,
+                "the scroll bar spans x = {}..{} and so hangs {}pt off the right edge of \
+                 the {}pt pane it scrolls -- that ink is painted outside the panel \
+                 altogether, where the pane clips it. Bars: {bars:?}",
+                bar.left(),
+                bar.right(),
+                bar.right() - pane.x,
+                pane.x
+            );
+            assert!(
+                (bar.left() - bar_left).abs() <= 0.5,
                 "the scroll bar spans x = {}..{} but the outermost \
                  {}pt of the {FORM_SCROLL_GUTTER}pt lane is {bar_left}..{} -- the bar \
                  is not flush to the pane's outer edge, so it is spending the \
@@ -7052,6 +7171,29 @@ mod edit_pane_layout_tests {
                 "a {fill:?} box spans x = {}..{} on a {}pt-wide pane. If that is the form's \
                  card, then every available_width() measured inside it is the box's width \
                  and not the pane's",
+                rect.left(),
+                rect.right(),
+                pane.x
+            );
+        }
+
+        // ... and everything that is neither. A caret, an icon, a line or a
+        // curve can leave the pane without moving one rect or one glyph, and
+        // until [`Painted::marks`] existed this loop had nothing to read:
+        // `walk` threw those shapes away. The tallest form really paints
+        // three of them -- the combo boxes' carets.
+        assert!(
+            !painted.marks.is_empty(),
+            "the tallest form paints no shape that is neither text nor a filled box, so \
+             the loop below asserts about nothing -- either the combo boxes' carets have \
+             stopped being drawn, or `ink_of` has stopped recognising them"
+        );
+        for (kind, rect) in &painted.marks {
+            assert!(
+                within_pane(*rect, pane),
+                "{kind} draws ink at x = {}..{} on a {}pt-wide pane -- it is neither a \
+                 glyph nor a filled box, so the two loops above are silent about it, and \
+                 this pane does not scroll horizontally, so that ink is unreachable",
                 rect.left(),
                 rect.right(),
                 pane.x
