@@ -2055,6 +2055,33 @@ pub const SCROLLBAR_WIDTH: f32 = 6.0;
 /// is raised to the full `bar_width` so the bar does not GROW leftward over
 /// the content when hovered -- a bar that only stays centred while dormant
 /// would not have fixed the report.
+///
+/// # Centring is not the balanced placement, and the item list no longer uses it
+///
+/// A follow-up report -- "the right padding feels smaller", on a list that
+/// DOES scroll, so the bar is genuinely needed -- measured out like this on
+/// the item list's 10pt lane: 10pt of clear space left of the tiles, 2pt
+/// right of them. There is a floor on that asymmetry and it is not zero.
+/// Every caller of this function pins two things by test: the content ends
+/// at `pane_right - gutter` (so the lane is exactly `gutter` wide and cannot
+/// be widened without moving the content), and the content keeps ONE width
+/// whether or not the bar is showing. The lane is therefore clear space when
+/// the bar is hidden and ink when it is not, so the hidden state and the
+/// shown state CANNOT both be symmetric: showing the bar costs the right
+/// side at least [`SCROLLBAR_WIDTH`]. That is the floor, and centring misses
+/// it by the outer half of the leftover lane -- 2pt on a 10pt gutter, 9pt on
+/// the read pane's 24pt one -- spent on a gap between the bar and the pane's
+/// own edge that the reader is not comparing to anything.
+///
+/// `item_list.rs` therefore re-aims `bar_outer_margin` to 0 immediately
+/// after calling this, putting the bar flush to the lane's outer edge where
+/// the platform's own scroll bars sit, and taking its clear space from 2pt
+/// to the floor's 4pt. The rule belongs HERE, applied to every caller: it
+/// would take `detail.rs`'s read pane from 9pt of clear space to 18pt, and
+/// `detail_edit.rs`'s form -- whose lane is also 10pt, so whose residual is
+/// also 2pt, i.e. the same defect unreported -- to 4pt. It is not applied
+/// here yet only because both of those panes pin the centred placement in
+/// tests of their own, in files outside the change that measured this.
 pub fn scrollbar_in_gutter(ui: &mut Ui, gutter: f32) {
     let scroll = &mut ui.spacing_mut().scroll;
     scroll.floating_allocated_width = gutter;
