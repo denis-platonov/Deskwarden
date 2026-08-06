@@ -298,6 +298,54 @@ fn outcome_of_a_run(result: &Result<(), String>) -> FillOutcome {
     }
 }
 
+/// **The typing thread's entire body, as a function a test can call.**
+///
+/// It used to be the closure inside `RealSendInput::fill_sequence`'s
+/// `thread::spawn`, which sits behind `SendInput` and cannot be entered from a
+/// test. One line in it -- `guard.report(outcome_of_a_run(&result))` -- was the
+/// whole of `b14b6b2` in production, and nothing could read it back: replacing
+/// it with a constant `FillOutcome::Typed` left the entire suite green,
+/// silently reinstating the pre-`b14b6b2` defect in which an abandoned
+/// sequence records a fill and climbs the picker's MRU. Everything *around*
+/// that line was exhaustively tested; the line itself was not pinned anywhere.
+///
+/// Generic over [`sequence::Keyboard`] and [`sequence::Notifier`] rather than
+/// hard-wired to the real ones, so `sequence::run_tests::FakeKeyboard` -- which
+/// answers `holds_foreground` however a test says and **sends no real input**
+/// -- can drive it, and a recording notifier can stand in for the message box.
+///
+/// # The order of the last three acts is the contract
+///
+/// **The plan is wiped first**, and only then is the flag released and the
+/// sink run. That was not what the code did: `let mut guard = guard` moved the
+/// guard out of the closure's capture, making it a local that dropped *before*
+/// the still-captured `plan`. So the "already typing" flag went back and the
+/// sink ran -- writing a JSON file synchronously -- while a plaintext password
+/// was still sitting on this thread's stack, the exact reverse of what the
+/// comment underneath claimed. The explicit `drop(plan)` is what makes the
+/// code and the comment agree, and it costs nothing.
+fn perform<K: sequence::Keyboard, N: sequence::Notifier>(
+    kb: &K,
+    hwnd: isize,
+    plan: Plan,
+    mut guard: SequenceGuard,
+    notifier: &N,
+) {
+    let result = sequence::run(kb, hwnd, &plan);
+    // **First.** Wiping the password is not allowed to wait behind a
+    // bookkeeping callback, and nothing that observes this run's end may
+    // observe it while the plaintext is still here.
+    drop(plan);
+    guard.report(outcome_of_a_run(&result));
+    if let Err(e) = result {
+        sequence::Notifier::refused(notifier, &e);
+    }
+    // `guard` drops here: the flag is released and the outcome delivered,
+    // after the wipe. On a panic anywhere above, unwinding still drops both,
+    // and the outcome reported is the default `NotTyped` rather than a fill
+    // nothing can vouch for.
+}
+
 #[derive(Clone, Copy)]
 pub struct RealSendInput;
 impl SendInputFiller for RealSendInput {
@@ -334,20 +382,12 @@ impl SendInputFiller for RealSendInput {
             return Err(e);
         }
         std::thread::spawn(move || {
-            // `guard` is moved onto this thread so the "already typing" flag
-            // stays set for as long as this thread is really typing, and not
-            // merely until the spawn returns.
-            let mut guard = guard;
-            let result = sequence::run(&send_input::RealKeyboard, hwnd, &plan);
-            guard.report(outcome_of_a_run(&result));
-            if let Err(e) = result {
-                sequence::Notifier::refused(&sequence::RealNotifier, &e);
-            }
-            // `plan` is dropped here, on this thread, wiping the password --
-            // whether it finished, aborted, or failed. `guard` is dropped with
-            // it, releasing the flag and reporting the outcome; on a panic,
-            // unwinding does both, and the outcome it reports is the default
-            // `NotTyped` rather than a fill nothing can vouch for.
+            // `guard` and `plan` are moved onto this thread so the "already
+            // typing" flag stays set for as long as this thread is really
+            // typing, and not merely until the spawn returns. Everything the
+            // thread then does is [`perform`], which is a function precisely
+            // so that something other than a live `SendInput` can call it.
+            perform(&send_input::RealKeyboard, hwnd, plan, guard, &sequence::RealNotifier);
         });
         Ok(())
     }
@@ -444,6 +484,81 @@ mod orchestration_tests {
             },
         )
         .expect("plans")
+    }
+
+    /// A notifier that records instead of opening a window.
+    ///
+    /// Deliberately **not** `RealNotifier`: that one is silent under test only
+    /// because of a `cfg(test)` gate, and the bin links the lib without
+    /// `cfg(test)`, so a test that leans on the gate is one fixture away from
+    /// a real message box on a real desktop.
+    #[derive(Default)]
+    struct RecordingNotifier(RefCell<Vec<String>>);
+    impl sequence::Notifier for RecordingNotifier {
+        fn refused(&self, detail: &str) {
+            self.0.borrow_mut().push(detail.to_string());
+        }
+    }
+
+    /// **`b14b6b2`, pinned at the one place production runs it.**
+    ///
+    /// The line that decides whether an interrupted password counts as a fill
+    /// lived inside a `thread::spawn` closure behind `SendInput`, where no test
+    /// could reach it: replacing it with a hard-wired `FillOutcome::Typed` left
+    /// the whole suite green, quietly reinstating the defect where an abandoned
+    /// sequence records a fill and climbs the picker's MRU. Now that the body is
+    /// [`perform`], a `FakeKeyboard` can drive it.
+    ///
+    /// The two arms must not be able to stand in for one another, so they
+    /// differ in the keyboard, in the reported outcome, **and** in whether the
+    /// user was told -- and the second `acquire` doubles as proof that the
+    /// first run released the flag on its way out.
+    #[test]
+    fn the_typing_thread_reports_what_the_run_actually_did() {
+        use sequence::run_tests::FakeKeyboard;
+        let _lock = sequence_test_lock();
+        const HWND: isize = 0x4321;
+
+        assert_ne!(
+            FillOutcome::Typed,
+            FillOutcome::Partial,
+            "the fixture cannot tell a completed run from an abandoned one"
+        );
+
+        // A run that finishes reports `Typed`, and has nothing to warn about.
+        let finished = Reported::default();
+        let mut guard = SequenceGuard::acquire().expect("the flag is free");
+        guard.reports_to(finished.sink());
+        let told = RecordingNotifier::default();
+        perform(&FakeKeyboard::new(), HWND, a_plan(), guard, &told);
+        assert_eq!(
+            finished.seen(),
+            vec![FillOutcome::Typed],
+            "a completed run must count as a fill"
+        );
+        assert!(
+            told.0.borrow().is_empty(),
+            "a completed run has nothing to tell the user"
+        );
+
+        // The same call with the foreground gone before the first step reports
+        // `Partial`, which `fill_stats::counts_as_a_fill` does not count.
+        let abandoned = Reported::default();
+        let mut guard =
+            SequenceGuard::acquire().expect("the finished run released the flag on its way out");
+        guard.reports_to(abandoned.sink());
+        let told = RecordingNotifier::default();
+        perform(&FakeKeyboard::loses_foreground_after(0), HWND, a_plan(), guard, &told);
+        assert_eq!(
+            abandoned.seen(),
+            vec![FillOutcome::Partial],
+            "an abandoned sequence must not record a fill"
+        );
+        assert_eq!(
+            told.0.borrow().len(),
+            1,
+            "an abandoned sequence must tell the user why it stopped"
+        );
     }
 
     /// A filler that **keeps** the guard instead of releasing it: what the

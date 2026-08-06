@@ -1260,7 +1260,7 @@ mod plan_tests {
 }
 
 #[cfg(test)]
-mod run_tests {
+pub(crate) mod run_tests {
     use super::*;
     use crate::key_sequence::parse;
     use std::cell::{Cell, RefCell};
@@ -1283,7 +1283,7 @@ mod run_tests {
     /// however the test says. **It sends no real input**, which is the same
     /// discipline `main.rs`'s `NeverTypes` applies -- there is no code path
     /// from this test module to `SendInput`.
-    struct FakeKeyboard {
+    pub(crate) struct FakeKeyboard {
         /// Foreground answers, consumed one per check. Exhausting the list
         /// means "still in front" -- so a test only has to say when it stops.
         answers: RefCell<std::collections::VecDeque<bool>>,
@@ -1296,7 +1296,7 @@ mod run_tests {
     }
 
     impl FakeKeyboard {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 answers: RefCell::new(Default::default()),
                 checks: Cell::new(0),
@@ -1307,7 +1307,7 @@ mod run_tests {
         }
 
         /// Foreground for the first `n` checks, then gone for good.
-        fn loses_foreground_after(n: usize) -> Self {
+        pub(crate) fn loses_foreground_after(n: usize) -> Self {
             let me = Self::new();
             let mut answers: std::collections::VecDeque<bool> = std::iter::repeat(true).take(n).collect();
             answers.push_back(false);
