@@ -1634,6 +1634,14 @@ fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
     points
 }
 
+/// The square [`eye_toggle`] allocates for itself.
+///
+/// Public because the width of the reveal control is what decides whether a
+/// masked row's label, value and eye fit on one line -- see `detail.rs`'s
+/// `masked_row`. A caller that guessed 28 here and a control retuned to 32
+/// there is a row that overflows its card again, silently.
+pub const EYE_TOGGLE_SIZE: f32 = 28.0;
+
 /// A masked row's reveal control: an open eye while the value is hidden
 /// ("click to see it"), struck through once it is showing ("click to hide
 /// it"). The same way every password manager spells this, and the reason
@@ -1644,11 +1652,10 @@ fn eye_outline(center: Pos2, half_w: f32, half_h: f32) -> Vec<Pos2> {
 /// now the only thing on that line: the `CTRL+B` text that used to sit beside
 /// it moved into the row's hover tooltip.
 pub fn eye_toggle(ui: &mut Ui, revealed: bool) -> Response {
-    const SIZE: f32 = 28.0;
     const HALF_W: f32 = 8.5;
     const HALF_H: f32 = 5.0;
 
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(EYE_TOGGLE_SIZE), Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }

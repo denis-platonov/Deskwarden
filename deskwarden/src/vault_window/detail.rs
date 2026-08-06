@@ -88,6 +88,11 @@ const CONTROL_GAP: f32 = 8.0;
 const ROW_CONTENT_HEIGHT: f32 = 28.0;
 /// The row label column's `width: 130px`, and its `font-size: 12px`.
 const ROW_LABEL_WIDTH: f32 = 130.0;
+/// The gap between the two lines of a [`RowShape::Stacked`] row. Smaller than
+/// [`ROW_GAP`], which separates two COLUMNS: the label and the value below it
+/// are one field, and a gap as wide as the one between fields would read as
+/// two.
+const STACKED_LABEL_GAP: f32 = 4.0;
 const ROW_LABEL_SIZE: f32 = 12.0;
 /// `font-size: 14px` on a row's value.
 const ROW_VALUE_SIZE: f32 = 14.0;
@@ -2214,6 +2219,7 @@ pub fn draw_detail_read(
                 // cannot drift if that gate ever changes.
                 row_offers_copy(website),
                 &mut action,
+                RowShape::Columns,
             );
             if opened {
                 action = DetailAction::OpenWebsite(website.to_string());
@@ -3410,6 +3416,7 @@ fn app_name_row(
         None,
         app_row.real,
         action,
+        RowShape::Columns,
     );
     if opened {
         if let Some(open) = open {
@@ -3503,6 +3510,7 @@ fn app_value_row(
         None,
         row_offers_copy(copy),
         action,
+        RowShape::Columns,
     );
 }
 
@@ -3780,6 +3788,56 @@ fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
         });
 }
 
+/// How a row arranges its label against its value.
+///
+/// The two-column form is the design, and every row on this pane uses it
+/// wherever it fits. [`RowShape::Stacked`] is what a row falls back to when
+/// it does NOT fit -- see [`masked_row`], which is the only thing that asks
+/// for it and the only place the choice is made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RowShape {
+    /// Label in its fixed [`ROW_LABEL_WIDTH`] column, value beside it,
+    /// controls right-aligned on the same line.
+    Columns,
+    /// Label on its own line, value and controls on the next -- the whole
+    /// content box wide, because that is the width that was missing.
+    Stacked,
+}
+
+/// The width a card row's content box really has: from the card's own left
+/// edge to the right edge the reader can actually see, less the row's
+/// `padding: 0 16px` on both sides.
+///
+/// **The clip rect, and NOT `ui.available_width()`** -- the distinction
+/// [`app_card_content_width`] documents at length, and the one this whole
+/// repair turns on. The body is a `ScrollArea`, which grows its content `Ui`
+/// to fit last frame's widest child; a masked row that overflowed its card
+/// grew it, and every later question asked of `available_width` then got the
+/// overflowed width back and concluded there was room. Measured on the
+/// previous-password rows at the narrowest pane: the card's own rect ends at
+/// 274, and `available_width` inside a row said the line ran to 308.4 --
+/// which is precisely where the reveal eye was being right-aligned to.
+///
+/// The clip rect is the viewport, and on this pane it already stops at the
+/// cards' edge: `theme::scrollbar_in_gutter` hands the outermost
+/// [`BODY_PAD_X`] to the scroll lane, so the `ScrollArea` clips its content
+/// at `pane.right() - BODY_PAD_X` whether or not a bar is showing. Nothing
+/// drawn inside a row can move it.
+///
+/// Takes the `Ui` a card's contents are drawn in, whose `max_rect().left()`
+/// is the card's own left edge; [`row_line_width`] is the same quantity
+/// asked from inside the row's frame.
+fn row_content_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.max_rect().left() - f32::from(CARD_PAD_X) * 2.0).max(0.0)
+}
+
+/// [`row_content_width`], asked from inside a row's own `Frame` -- where the
+/// left padding has already been applied to `max_rect` and only the right
+/// one is still owed.
+fn row_line_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.max_rect().left() - f32::from(CARD_PAD_X)).max(0.0)
+}
+
 /// One row of a card (design 2b: `display: flex; align-items: center; gap:
 /// 16px; padding: 13px 16px`) -- a fixed `width: 130px` label column, the
 /// value taking whatever is left, and the row's controls right-aligned.
@@ -3793,7 +3851,7 @@ fn row(
     value: impl FnOnce(&mut egui::Ui),
     controls: impl FnOnce(&mut egui::Ui),
 ) {
-    row_impl(ui, label, value, controls, egui::Sense::hover());
+    row_impl(ui, label, value, controls, egui::Sense::hover(), RowShape::Columns);
 }
 
 /// [`row`], plus: **clicking anywhere in the tile copies its value.**
@@ -3838,6 +3896,9 @@ fn copy_row(
     // is about to paint, through `row_offers_copy`.
     copyable: bool,
     action: &mut DetailAction,
+    // How the label sits against the value. [`RowShape::Columns`] for every
+    // row whose contents fit the pane; see [`RowShape`].
+    shape: RowShape,
 ) {
     // **The chord is added FIRST, which puts it at the far RIGHT.** The
     // control group packs right-to-left, so the earliest widget is the
@@ -3859,10 +3920,10 @@ fn copy_row(
     // the sense it was handed. See [`row_offers_copy`] for why the row is
     // made inert rather than merely silent.
     if !copyable {
-        row_impl(ui, label, value, controls, egui::Sense::hover());
+        row_impl(ui, label, value, controls, egui::Sense::hover(), shape);
         return;
     }
-    let response = row_impl(ui, label, value, controls, egui::Sense::click());
+    let response = row_impl(ui, label, value, controls, egui::Sense::click(), shape);
     // **Asked for only while the tile itself is what the pointer is on.**
     // `Response::hovered` is egui's answer to "which one widget would a click
     // go to", so over the eye or the website link it is the CHILD that is
@@ -3897,6 +3958,7 @@ fn row_impl(
     value: impl FnOnce(&mut egui::Ui),
     controls: impl FnOnce(&mut egui::Ui),
     sense: egui::Sense,
+    shape: RowShape,
 ) -> egui::Response {
     let clickable = sense == egui::Sense::click();
     let scope = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
@@ -3905,7 +3967,7 @@ fn row_impl(
         // the row has been laid out, and a fill added then would cover the
         // row's own text.
         let tint = ui.painter().add(egui::Shape::Noop);
-        row_body(ui, label, value, controls);
+        row_body(ui, label, value, controls, shape);
         tint
     });
     let response = scope.response;
@@ -3932,11 +3994,50 @@ fn row_body(
     label: &str,
     value: impl FnOnce(&mut egui::Ui),
     controls: impl FnOnce(&mut egui::Ui),
+    shape: RowShape,
 ) {
     egui::Frame::new()
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // The fallback for a row that does not fit its card: the label
+            // takes a line of its own and the value gets the whole content
+            // box. **Room was what was missing, so room is what the second
+            // line supplies** -- the same answer, and the same sentence,
+            // [`app_card_footer`] reached for when its controls were laid on
+            // top of its notes at [`NARROW`]. Chosen by [`masked_row`], never
+            // here; see [`RowShape`].
+            if shape == RowShape::Stacked {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, STACKED_LABEL_GAP);
+                    // Not the fixed column: on this line there is nothing to
+                    // line up with, and 130pt of reserved space beside a
+                    // "3 days ago" would be a second, invisible indent.
+                    // `row_line_width`, never `ui.available_width()`: see
+                    // [`row_content_width`]. The width this row is trying to
+                    // fit into cannot be read from a `Ui` a row like this one
+                    // has already stretched.
+                    let line = row_line_width(ui);
+                    label_cell(ui, label, line, LabelFit::ToText);
+                    let band = egui::vec2(line, ROW_CONTENT_HEIGHT);
+                    ui.allocate_ui_with_layout(
+                        band,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            value(ui);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                                    controls(ui);
+                                },
+                            );
+                        },
+                    );
+                });
+                return;
+            }
             // **`align-items: center` needs a band with a definite height.**
             // In a plain `ui.horizontal`, egui places each child as the row
             // grows, so the first child (a 13pt label) lands at the top and a
@@ -3952,7 +4053,7 @@ fn row_body(
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    label_cell(ui, label);
+                    label_cell(ui, label, ROW_LABEL_WIDTH, LabelFit::ToColumn);
                     ui.add_space(ROW_GAP);
                     value(ui);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3965,20 +4066,37 @@ fn row_body(
         });
 }
 
+/// Whether a label OCCUPIES the width it was laid out in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LabelFit {
+    /// It does -- the fixed [`ROW_LABEL_WIDTH`] column of a
+    /// [`RowShape::Columns`] row, whatever the label says.
+    ToColumn,
+    /// It does not: it takes only the width its glyphs need. For a
+    /// [`RowShape::Stacked`] row, whose label is alone on its line with
+    /// nothing to the right of it to line up.
+    ToText,
+}
+
 /// A row's label column: exactly [`ROW_LABEL_WIDTH`] wide whatever the label
 /// says, so the values beside it line up down the whole pane. Painted rather
 /// than `ui.label`ed because a label allocates its own text width.
-fn label_cell(ui: &mut egui::Ui, label: &str) {
+///
+/// `column` is the width the text is WRAPPED in; `fit` says whether the cell
+/// then takes that width or only its glyphs'. See [`LabelFit`].
+fn label_cell(ui: &mut egui::Ui, label: &str, column: f32, fit: LabelFit) {
     let galley = ui.painter().layout(
         label.to_string(),
         egui::FontId::new(ROW_LABEL_SIZE, egui::FontFamily::Proportional),
         theme::TEXT_FAINT,
-        ROW_LABEL_WIDTH,
+        column,
     );
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ROW_LABEL_WIDTH, galley.size().y),
-        egui::Sense::hover(),
-    );
+    let width = match fit {
+        LabelFit::ToColumn => column,
+        LabelFit::ToText => galley.size().x,
+    };
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(width, galley.size().y), egui::Sense::hover());
     let pos = egui::pos2(rect.left(), rect.center().y - galley.size().y / 2.0);
     ui.painter().galley(pos, galley, theme::TEXT_FAINT);
 }
@@ -4017,6 +4135,7 @@ fn credential_row(
         hint,
         row_offers_copy(value),
         action,
+        RowShape::Columns,
     );
 }
 
@@ -4039,6 +4158,38 @@ fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: 
 /// secrets, so the treatment the spec calls for ("exactly as passwords are")
 /// is literally the same code rather than a second copy that drifts. The
 /// bullet run is `max(8)` so a short value does not leak its length.
+///
+/// **It is the one row that measures itself before it is drawn**, because it
+/// is the one row that could not be made to fit any other way. In the
+/// two-column shape the value gets
+/// `row_content_width - ROW_LABEL_WIDTH - ROW_GAP` less its controls, which
+/// on the narrowest the detail pane can be (298pt: 900 - 212 - 390) is 44pt.
+/// A ten-bullet mask is 94.2pt. So every masked row on that pane overflowed
+/// its card, and the reveal eye -- allocated after the value, wherever the
+/// value happened to end -- was painted at x = 285.26..303.56 on a pane whose
+/// cards end at 274 and whose own right edge is 298: the whole control inside
+/// the scroll lane, 5.6pt of it clipped away entirely. Measured on the
+/// previous-password rows, which are five of them in a column; the login
+/// password, card number, card security code and SSH private key are the same
+/// row and were the same defect.
+///
+/// Neither half of the repair is optional:
+///
+/// * **[`RowShape::Stacked`] when the columns do not fit**, which buys the
+///   whole content box (218pt at 298) instead of 44. Not elision: this row's
+///   value IS the point of the row, and `\u{2026}` where a password was is a
+///   row that has stopped doing its job. Not a shorter mask either -- the
+///   mask is short already, and a revealed password is longer than any of
+///   them.
+/// * **A wrap width on the value, always.** The masked run is a
+///   `LayoutJob`, and a `LayoutJob`'s `wrap.max_width` defaults to infinity
+///   -- which is why the run above ran past the card instead of folding. A
+///   revealed 40-character password overflows even the stacked line, so the
+///   line it is on is the width it wraps at.
+///
+/// Pinned by `the_previous_password_rows_fit_the_narrowest_pane`, and by
+/// `the_lane_leaves_the_cards_eighteen_points_of_clear_space`, which no
+/// longer has to hold these rows apart.
 fn masked_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -4053,6 +4204,42 @@ fn masked_row(
     } else {
         "•".repeat(MASKED_BULLETS)
     };
+    // What the control group on this row's value line really costs: the eye,
+    // plus the chord this row paints beside it when it has one, plus the gap
+    // between them. Read off the same helpers that draw them, so a retuned
+    // control cannot leave this measurement behind.
+    let controls_width = theme::EYE_TOGGLE_SIZE
+        + hint.map_or(0.0, |which| {
+            CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
+        });
+    let content = row_content_width(ui);
+    
+    // Laid out unwrapped, which is the question being asked: how wide does
+    // this value WANT to be?
+    let natural = ui
+        .painter()
+        .layout_job(theme::letterspaced_mono(
+            &shown,
+            MASKED_SIZE,
+            MASKED_TRACKING,
+            theme::INK,
+        ))
+        .size()
+        .x;
+    let beside_the_label = content - ROW_LABEL_WIDTH - ROW_GAP - controls_width;
+    let shape = if natural <= beside_the_label {
+        RowShape::Columns
+    } else {
+        RowShape::Stacked
+    };
+    // The width the value really has on the line it ends up on. `max(1.0)`
+    // rather than `max(0.0)`: egui treats a zero wrap width as "no wrapping",
+    // which is the behaviour this exists to withdraw.
+    let room = match shape {
+        RowShape::Columns => beside_the_label,
+        RowShape::Stacked => content - controls_width,
+    }
+    .max(1.0);
     copy_row(
         ui,
         label,
@@ -4060,12 +4247,22 @@ fn masked_row(
             // `font-family: ui-monospace; font-size: 15px; letter-spacing:
             // 0.08em` -- the tracking is what stops a bullet run reading as
             // one solid blob.
-            ui.label(theme::letterspaced_mono(
-                &shown,
-                MASKED_SIZE,
-                MASKED_TRACKING,
-                theme::INK,
-            ));
+            let mut job =
+                theme::letterspaced_mono(&shown, MASKED_SIZE, MASKED_TRACKING, theme::INK);
+            job.wrap.max_width = room;
+            // **`break_anywhere`, for the reason the `Program file` path row
+            // gives**: egui breaks at word boundaries, and neither a bullet
+            // run nor a password has any.
+            job.wrap.break_anywhere = true;
+            // **Laid here and handed over as a `Galley`, and that is not
+            // style.** Given a `LayoutJob`, `Label` re-lays it and overwrites
+            // `wrap.max_width` with its own -- `f32::INFINITY` inside a
+            // horizontal layout, whose wrap mode is `Extend`. So the width set
+            // two lines up would be discarded and the run would draw its full
+            // length anyway, which is exactly the defect. Same discovery, and
+            // the same repair, as `app_row_view`'s.
+            let galley = ui.painter().layout_job(job);
+            ui.label(galley);
         },
         |ui| {
             // AN EYE, not the words "Reveal"/"Hide". The state it shows is
@@ -4094,6 +4291,7 @@ fn masked_row(
         // the mask.
         row_offers_copy(value),
         action,
+        shape,
     );
 }
 
@@ -4404,6 +4602,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
         // practice -- but "in practice" is what the Password row had too.
         row_offers_copy(code),
         action,
+        RowShape::Columns,
     );
 }
 
@@ -12755,34 +12954,6 @@ mod read_pane_scroll_tests {
         item
     }
 
-    /// [`the_tallest_item_without_its_binding`] minus its **previous
-    /// passwords**, for the one test that asks what is in the lane.
-    ///
-    /// The same exclusion as the binding above, for the same reason, found
-    /// the moment the lane test stopped being blind to everything that is
-    /// not a `Shape::Rect`. Measured at [`NARROW`], each of the five history
-    /// rows paints its reveal eye as a `Shape::Path` at
-    /// **x = 285.26..303.56** and a `Shape::Circle` at 292.01..296.81 -- ink
-    /// that starts 11pt inside the lane the cards are meant to leave clear
-    /// and runs 5.6pt off the right edge of the pane, where it is clipped.
-    /// The row's masked run reaches x = 280.2 as well. That is the same
-    /// horizontal defect the binding's path row has: a row that does not fit
-    /// [`NARROW`] and does not wrap.
-    ///
-    /// It is EXCLUDED here rather than asserted about because this test's
-    /// subject is the scroll lane's width, and a test that fails for a
-    /// different defect reports the wrong one -- the module already holds
-    /// the binding apart on exactly that reasoning. What must not happen is
-    /// the exclusion growing silently, so
-    /// `the_previous_password_rows_are_the_lane_tests_one_known_intruder`
-    /// pins it: those rows, and nothing else, are what the roomy pane paints
-    /// past the cards' edge.
-    fn the_tallest_item_the_lane_can_speak_about() -> VaultItem {
-        let mut item = the_tallest_item_without_its_binding();
-        item.other.remove("passwordHistory");
-        item
-    }
-
     /// **Everything the frame lays ink with that BEGINS at or past `edge`** --
     /// boxes by the ink they really cover, runs by their GLYPHS, and every
     /// other shape by [`shape_ink::ink_of`].
@@ -12999,12 +13170,17 @@ mod read_pane_scroll_tests {
     /// `the_lane_test_sees_ink_that_is_not_a_rect` is the control that says
     /// so, and it fails on a walker that discards those shapes.
     ///
-    /// The item is [`the_tallest_item_the_lane_can_speak_about`] -- the
-    /// previous-password rows are held apart, and pinned, for the reason
-    /// given there.
+    /// The item is [`the_tallest_item_without_its_binding`]: the binding's
+    /// path row is still held apart for the reason given there, and the
+    /// previous-password rows are NOT, because they now fit. They used to be
+    /// this test's one licensed intruder -- five reveal eyes at
+    /// x = 285.26..303.56, 11pt inside a lane meant to stay clear and 5.6pt
+    /// off the pane -- held out through a second helper and pinned by a test
+    /// of their own. `masked_row` was taught to stack and to wrap, both went
+    /// away, and this test is back on the whole item minus the binding.
     #[test]
     fn the_lane_leaves_the_cards_eighteen_points_of_clear_space() {
-        let item = the_tallest_item_the_lane_can_speak_about();
+        let item = the_tallest_item_without_its_binding();
 
         // Scrolling: the nearest visible ink past the cards' edge is the bar.
         let pane = egui::vec2(NARROW, SHORT);
@@ -13255,49 +13431,75 @@ mod read_pane_scroll_tests {
         );
     }
 
-    /// **The one thing the lane test is allowed not to see**, pinned.
+    /// **The previous-password rows fit the narrowest pane the app has.**
     ///
-    /// [`the_tallest_item_the_lane_can_speak_about`] drops the previous
-    /// passwords because those rows overflow [`NARROW`] on their own account.
-    /// An exclusion nobody measures is an exclusion that grows, so this
-    /// states exactly what comes back when they are put back: five reveal
-    /// eyes -- a `Shape::Path` and a `Shape::Circle` each -- starting inside
-    /// the lane, and nothing else.
+    /// This is the test that replaced `the_previous_password_rows_are_the_
+    /// lane_tests_one_known_intruder`, which pinned the opposite: at
+    /// [`NARROW`] each of the five rows painted its reveal eye as a
+    /// `Shape::Path` at x = 285.26..303.56 and a `Shape::Circle` at
+    /// 292.01..296.81, on a pane 298pt wide whose cards end at 274. The eye
+    /// sat wholly inside the reserved scroll lane and 5.6pt of it was clipped
+    /// away; the row's masked run reached 280.2. See [`masked_row`] for what
+    /// the row does about it now.
     ///
-    /// If a later change makes those rows fit, this test fails and the
-    /// exclusion above should be deleted. If it makes something ELSE spill
-    /// into the lane, this test fails too and names it.
+    /// Asserted against the CARDS' right edge rather than the pane's, because
+    /// a control that has merely stopped being clipped is still one the user
+    /// finds under the scroll bar.
+    ///
+    /// The vacuity controls matter here more than usual: "no ink past the
+    /// cards' edge" is also what a pane that drew no history at all reports,
+    /// and dropping the rows is a repair this test would otherwise certify.
+    /// So it counts the eyes and the masked runs first.
     #[test]
-    fn the_previous_password_rows_are_the_lane_tests_one_known_intruder() {
+    fn the_previous_password_rows_fit_the_narrowest_pane() {
         let pane = egui::vec2(NARROW, ROOMY);
         let edge = lane_left(pane);
         let shot = settled(pane, &the_tallest_item_without_its_binding());
-        let found = lane_ink(&shot, edge);
 
-        let mut kinds: Vec<&str> = found.iter().map(|(k, _)| k.as_str()).collect();
-        kinds.sort_unstable();
+        // The rows are really on the pane: five masked runs, and the eyes
+        // that go with them. `the_tallest_item` seeds exactly five previous
+        // passwords.
+        let masked = "\u{2022}".repeat(MASKED_BULLETS);
+        let runs = shot.runs.iter().filter(|(s, _, _)| *s == masked).count();
         assert_eq!(
-            kinds,
-            vec![
-                "a circle", "a circle", "a circle", "a circle", "a circle", "a path", "a path",
-                "a path", "a path", "a path",
-            ],
-            "what the roomy pane paints past the cards' edge is no longer the five \
-             previous-password reveal eyes the lane test excludes: {found:?}"
+            runs, 5,
+            "the pane painted {runs} masked runs, not the five previous passwords this \
+             item carries -- the emptiness below would be vacuous: {:?}",
+            shot.sources()
         );
-        for (kind, ink) in &found {
-            let (left, right) = if kind == "a path" {
-                (285.26_f32, 303.56_f32)
-            } else {
-                (292.01, 296.81)
-            };
-            assert!(
-                (ink.left() - left).abs() <= 0.1 && (ink.right() - right).abs() <= 0.1,
-                "{kind} of a previous-password row is at {}..{}, not the {left}..{right} \
-                 measured when this exclusion was written",
-                ink.left(),
-                ink.right()
-            );
-        }
+        // The eyes, counted by DIFFERENCE against the same pane with the
+        // history taken away -- the pane's header draws a path of its own, so
+        // an absolute count would be pinning a number that belongs to another
+        // control.
+        let paths = |shot: &Shot| shot.marks.iter().filter(|(kind, _)| *kind == "a path").count();
+        let mut without = the_tallest_item_without_its_binding();
+        without.other.remove("passwordHistory");
+        let eyes = paths(&shot) - paths(&settled(pane, &without));
+        assert_eq!(
+            eyes, 5,
+            "the previous-password rows contribute {eyes} reveal eyes, not five -- so the \
+             rows lost their controls rather than gaining room for them"
+        );
+
+        // ... and every piece of ink any of them lays is inside the cards.
+        let past: Vec<&(&str, egui::Rect)> = shot
+            .marks
+            .iter()
+            .filter(|(_, ink)| ink.right() > edge + 0.5)
+            .collect();
+        assert!(
+            past.is_empty(),
+            "a reveal eye still reaches past the cards' right edge at x = {edge}, into the \
+             {BODY_PAD_X}pt scroll lane: {past:?}"
+        );
+        let spilled: Vec<&(String, egui::Rect)> = shot
+            .glyphs
+            .iter()
+            .filter(|(label, ink)| *label == masked && ink.right() > edge + 0.5)
+            .collect();
+        assert!(
+            spilled.is_empty(),
+            "a masked run still reaches past the cards' right edge at x = {edge}: {spilled:?}"
+        );
     }
 }
