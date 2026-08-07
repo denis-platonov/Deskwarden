@@ -50,14 +50,32 @@
 //! is `Zeroizing` at its exact final capacity, so it never reallocs and is
 //! wiped on drop.
 //!
-//! # Nothing in this module logs
+//! # No line of THIS FILE logs, and that is exactly the claim
 //!
-//! No log macro, no print macro, no `dbg!`, no panic carrying data.
-//! The hex is never formatted into any message, and errors carry a
-//! `&'static str` category rather than data. `the_breach_module_never_logs`
-//! enforces it over this file's source, on the bare macro tokens rather than
-//! on fully-qualified paths -- `use log::debug;` is the ordinary spelling and
-//! a path-only guard never sees it.
+//! `the_breach_module_never_logs` reads *this file's* production source and
+//! nothing else. So the guarantee is: **no code in `breach.rs` writes a log
+//! macro, a print macro, a `dbg!` or a data-carrying panic, and the hex is
+//! never formatted into any message.** It is file-scoped, and it is worth
+//! saying plainly that a file-scoped guard is not a claim about the hash's
+//! whole lifetime -- it cannot be, because a guard that reads one file cannot
+//! see another.
+//!
+//! What narrows the gap, stated exactly: `hex_digest` is **private**, so the
+//! whole 40 characters exist as one string only inside this file, and every
+//! line that can hold them is a line the guard reads.
+//!
+//! What the gap still is, stated equally exactly: [`split_hash`] is `pub` and
+//! returns the 35-character suffix as a `Zeroizing<String>`. A future caller
+//! elsewhere in the crate could hold it, and could log it, and no guard in
+//! this file would see that. Today there is no such caller --
+//! `the_whole_hash_is_not_reachable_outside_this_module` is only about
+//! `hex_digest`, and it is not a claim about the suffix. The honest summary
+//! is: this file does not log, and this file is the only place the *complete*
+//! hash is assembled.
+//!
+//! The needles are the bare macro tokens rather than fully-qualified paths:
+//! `use log::debug;` is the ordinary spelling and a path-only guard never
+//! sees it.
 
 use crate::http_agent::TotalBounded;
 use eframe::egui;
@@ -142,6 +160,16 @@ const SUFFIX_LEN: usize = 35;
 
 /// The SHA-1 hash of `password`, as uppercase hex, in a wiped-on-drop buffer.
 ///
+/// **Private, and deliberately so.** This was `pub(crate)` and had no caller
+/// outside [`split_hash`]; what it had instead was a use as an oracle. Any
+/// module in the crate could ask it for the complete 40 characters and then
+/// hand them to something that puts text on a wire. The types in this file
+/// exist to make that impossible to spell, and a crate-visible function that
+/// returns the whole hash is the plainest way around them. There is now no
+/// way to obtain the other 35 characters outside this module except as the
+/// `Zeroizing` suffix `split_hash` returns, which only ever gets compared
+/// against text that came back.
+///
 /// `password` is borrowed -- it is the `Zeroizing<String>` that already lives
 /// in `LoginData` (`vault_bridge.rs`) and **no heap copy of it is made here**;
 /// `Sha1::digest` reads the borrow directly.
@@ -159,7 +187,7 @@ const SUFFIX_LEN: usize = 35;
 /// back to the allocator without wiping it. Pre-reserved capacity means zero
 /// reallocs and exactly one wipe, on drop. `the_hex_buffer_never_reallocates`
 /// pins the capacity at both ends.
-pub(crate) fn hex_digest(password: &str) -> Zeroizing<String> {
+fn hex_digest(password: &str) -> Zeroizing<String> {
     // Stack array, wiped on drop.
     let mut digest = Zeroizing::new([0u8; 20]);
     digest.copy_from_slice(Sha1::digest(password.as_bytes()).as_slice());
@@ -236,7 +264,30 @@ pub fn split_hash(password: &str) -> (Prefix, Zeroizing<String>) {
 /// breached" if absence were the only signal. `Malformed` means
 /// **structurally unparseable** and nothing else.
 ///
-/// # A count of zero is a decoy, not a malformation
+/// # The line that carries OUR suffix is judged before its count is
+///
+/// Every rule below about skipping a line applies to lines that are *not*
+/// ours. A line whose 35 characters match the suffix we asked about is the
+/// answer to the question, and if its count cannot be used then we do not
+/// have an answer -- so that line returns `Err(Malformed)` and the caller
+/// paints `Unavailable`. It must never fall through to `Ok(None)`.
+///
+/// That distinction is the whole of this function's safety. "Skip the line"
+/// and "the password is fine" are the same output whenever any *other* line
+/// in the body parsed, and a padded body always has other lines that parse.
+/// So a match with an unusable count used to read as `Safe` on a breached
+/// password, which is the one answer this module must never invent.
+///
+/// `Unavailable` rather than a saturating count, and the two are not
+/// interchangeable: an overflowing count is all digits, so it is known to be
+/// a real and enormous number and `u64::MAX` loses nothing (the advice does
+/// not vary by count). A count of `"lots"`, `"-5"` or `""` is not a number at
+/// all; saturating it would put a fabricated 18-quintillion figure in front
+/// of the user, and choosing any other number would be equally invented.
+/// "Could not check" is the true statement, and it is the one that fails
+/// closed.
+///
+/// # A count of zero is a decoy on any line but ours
 ///
 /// `Add-Padding: true` is HIBP's own privacy hardening for this API, and this
 /// crate sends it: the response is bulked out with randomly generated decoy
@@ -247,9 +298,26 @@ pub fn split_hash(password: &str) -> (Prefix, Zeroizing<String>) {
 /// such line, short-circuiting before it could reach a genuine match. Turning
 /// on the natural next privacy step for a privacy feature would therefore
 /// have made every lookup a permanent `Unavailable` -- silently. A zero-count
-/// line is now **skipped**: it counts as a well-formed line, so an all-decoy
-/// body is `Safe` (genuinely not breached, which is what it means), and it is
-/// never matched, so `BreachStatus::Breached(0)` stays unrepresentable.
+/// line whose suffix is not ours is **skipped**: it counts as a well-formed
+/// line, so an all-decoy body is `Safe` (genuinely not breached, which is
+/// what it means).
+///
+/// A zero count on a line carrying **our** suffix is a different thing, and
+/// the honest description of it is: *we do not know what it means.* HIBP is
+/// not documented to return a real count of zero, and a decoy is generated
+/// randomly, so a decoy colliding with our 35 characters is a 16^-35 event --
+/// but neither of those is a fact this code can check, and the old comment
+/// asserted the first as though it were. So it is treated as unusable, the
+/// same as `"abc"`: `Err(Malformed)`, `Unavailable`. That keeps
+/// `BreachStatus::Breached(0)` unrepresentable, removes an unverifiable
+/// protocol assumption from the safe path, and costs one astronomically rare
+/// spurious "couldn't check" instead of one wrong green badge.
+///
+/// # Duplicate lines report the LARGEST count
+///
+/// A body should not list the same suffix twice, but if it does, reporting
+/// the first one understates the breach by whatever the later lines say.
+/// The whole loop runs and the maximum wins.
 ///
 /// # A count too large for `u64` saturates
 ///
@@ -282,8 +350,20 @@ pub fn parse_range_body(body: &str, suffix: &str) -> Result<Option<u64>, Malform
             continue;
         }
         let count_text = count_text.trim();
+
+        // **Whose line is this** is decided before the count is judged, and
+        // that ordering is the safety property. Every `continue` below means
+        // "this line is not evidence"; for a line that is not ours that is
+        // true and harmless, and for a line that IS ours it silently turns a
+        // breached password into `Ok(None)` -> `Safe` the moment any other
+        // line in the body parsed -- which, under padding, is always.
+        let is_ours = line_suffix.eq_ignore_ascii_case(suffix);
+
         // Not digits (empty, signed, hex, prose) -- not a range line.
         if count_text.is_empty() || !count_text.bytes().all(|b| b.is_ascii_digit()) {
+            if is_ours {
+                return Err(Malformed("unusable count on the matching line"));
+            }
             continue;
         }
         // All digits, so the only way parsing can fail is overflow, and an
@@ -295,12 +375,18 @@ pub fn parse_range_body(body: &str, suffix: &str) -> Result<Option<u64>, Malform
         saw_well_formed_line = true;
 
         if count == 0 {
+            if is_ours {
+                // Not knowably a decoy and not knowably a count. See the doc.
+                return Err(Malformed("zero count on the matching line"));
+            }
             // HIBP padding. Skipped rather than matched, so Breached(0) is
             // unrepresentable; counted above, so an all-decoy body is Safe.
             continue;
         }
-        if found.is_none() && line_suffix.eq_ignore_ascii_case(suffix) {
-            found = Some(count);
+        if is_ours {
+            // The largest, not the first: a duplicate that says more is the
+            // one worth reporting.
+            found = Some(found.map_or(count, |seen: u64| seen.max(count)));
         }
     }
 
@@ -337,6 +423,73 @@ pub fn breach_phrase(count: u64) -> String {
     )
 }
 
+/// Where a range lookup may be addressed -- the other half of [`Prefix`].
+///
+/// **The field is private and neither constructor accepts caller-supplied
+/// text.** That is the entire type.
+///
+/// [`Prefix`] closed the door on the path *tail*: a call site cannot put the
+/// whole 40-character hash where the five-character prefix belongs, because
+/// it cannot build a `Prefix` out of one. But `check_prefix` took
+/// `base_url: &str` and did `format!("{base_url}/{}", prefix.as_str())`, and
+/// `hex_digest` was `pub(crate)` -- so the identical leak was one argument to
+/// the left, and it compiled:
+///
+/// ```text
+/// check_prefix(&format!("{HIBP_RANGE_BASE}/{}", hex_digest(pw)), &prefix, ..)
+/// ```
+///
+/// The privacy guard could not see it either. It supplies its own `base_url`
+/// and then asserts the request line it computes *from that same value*, so
+/// it is strong against a header nobody anticipated and worthless against a
+/// path the caller chose. A newtype on one argument and a bare `&str` on the
+/// one right next to it is not a closed door; it is a door with the frame
+/// left out.
+///
+/// So the parameter no longer carries text at all. [`BaseUrl::production`]
+/// takes **nothing**, and [`BaseUrl::loopback`] takes a `u16` port -- a type
+/// that cannot hold a hex character, let alone forty of them. There is no
+/// spelling of a call site that smuggles hash material through this argument,
+/// and that is a fact the compiler enforces at sites not yet written, exactly
+/// as `Prefix` does.
+///
+/// The inner `String` is not `Zeroizing`, for the same reason `Prefix`'s is
+/// not: an endpoint is not a secret. It is constrained because it is the
+/// place secrets could be *hidden*, not because it is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseUrl(String);
+
+impl BaseUrl {
+    /// The real Have I Been Pwned range API.
+    ///
+    /// Takes no argument, so there is nothing a caller can put into it. This
+    /// and the endpoint pin are the only places the constant is named.
+    pub fn production() -> Self {
+        BaseUrl(HIBP_RANGE_BASE.to_string())
+    }
+
+    /// A mock on `127.0.0.1`, for tests.
+    ///
+    /// The **port is the only thing a caller supplies**; scheme, host and
+    /// path are fixed here. A test cannot point this at another machine and
+    /// cannot append a path segment to it, so the one seam this module has
+    /// for testing is a seam a `u16` fits through and nothing else does.
+    pub fn loopback(port: u16) -> Self {
+        BaseUrl(format!("http://127.0.0.1:{port}/range"))
+    }
+
+    /// The base, for interpolation into the range URL.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for BaseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// The agent for [`check_prefix`]: one small text response, bounded by total
 /// elapsed time. See [`crate::http_agent`] for why the shape is a type.
 pub fn build_agent() -> TotalBounded {
@@ -349,11 +502,15 @@ pub fn build_agent() -> TotalBounded {
 /// `updater::check_for_update`, so tests point it at a local mock and no test
 /// in this crate ever reaches the real API.
 ///
-/// **Only `prefix` is interpolated into the URL, and `prefix` is a
-/// [`Prefix`]** -- a newtype whose only constructor is [`split_hash`], so the
-/// five-character bound is a compiler fact here rather than a convention this
-/// function has to check. Everything that could identify the password stays
-/// in `suffix`, which is only ever compared against text that came back.
+/// **Both halves of the URL are newtypes with private fields, and neither can
+/// be built out of the hash.** `prefix` is a [`Prefix`], whose only
+/// constructor is [`split_hash`]; `base_url` is a [`BaseUrl`], whose two
+/// constructors take no argument and a `u16` respectively. So the whole
+/// string this function puts on the wire is composed of exactly two values
+/// that the compiler already knows cannot carry password material -- not one
+/// checked value next to one free-form one. Everything that could identify
+/// the password stays in `suffix`, which is only ever compared against text
+/// that came back.
 ///
 /// `Add-Padding: true` asks HIBP to bulk the response out with decoy suffixes
 /// so its size does not identify the bucket. It is a constant, carries
@@ -365,12 +522,12 @@ pub fn build_agent() -> TotalBounded {
 /// collapses to [`BreachStatus::Unavailable`]. None of them collapse to
 /// `Safe`; a lookup that did not happen must never paint a green badge.
 pub fn check_prefix(
-    base_url: &str,
+    base_url: &BaseUrl,
     prefix: &Prefix,
     suffix: &Zeroizing<String>,
     agent: &TotalBounded,
 ) -> BreachStatus {
-    let url = format!("{base_url}/{}", prefix.as_str());
+    let url = format!("{}/{}", base_url.as_str(), prefix.as_str());
     let Ok(response) = agent
         .get(&url)
         .set("User-Agent", USER_AGENT)
@@ -415,7 +572,7 @@ pub const BREACH_POLL_INTERVAL: Duration = Duration::from_millis(150);
 /// named at one call site ([`BreachCache::live`]), and every test builds its
 /// own [`BreachCheck`] instead.
 fn live_check(prefix: &Prefix, suffix: &Zeroizing<String>) -> BreachStatus {
-    check_prefix(HIBP_RANGE_BASE, prefix, suffix, &build_agent())
+    check_prefix(&BaseUrl::production(), prefix, suffix, &build_agent())
 }
 
 /// What the cache knows about one prefix.
@@ -742,34 +899,119 @@ mod tests {
         }
     }
 
-    /// **A count of zero is HIBP's padding, not a broken body.**
+    /// **A count of zero on a line that is NOT ours is padding; on a line
+    /// that IS ours it is an answer we cannot read.**
     ///
-    /// This test used to assert the opposite. `Add-Padding: true` -- the
-    /// natural next privacy step for a privacy feature, and now the header
-    /// this crate sends -- returns decoy suffixes with a count of 0, and
-    /// returning `Err` on the first one short-circuited the whole body: every
-    /// lookup would have become a permanent `Unavailable`, silently, with no
-    /// test covering it.
+    /// This test has been through both wrong answers. It first asserted that
+    /// any zero count was `Err` -- which short-circuited the whole body and
+    /// would have made every padded lookup a permanent `Unavailable`. It then
+    /// asserted that a zero count on our *own* suffix was `Safe`, on the
+    /// stated ground that "HIBP never returns a count of 0". That is not
+    /// something this code can check; it is a protocol assumption written in
+    /// a comment, sitting directly on the path that paints a green badge.
     ///
-    /// What must still hold is the thing the old behaviour was reaching for:
-    /// `Breached(0)` must be unrepresentable. It is, because a zero-count
-    /// line is never matched -- not even when it carries our own suffix.
+    /// So: decoys elsewhere in the body are skipped and an all-decoy body is
+    /// `Safe` (covered by `an_all_decoy_body_is_safe_not_unavailable`), and a zero on our own
+    /// line is `Unavailable`. `Breached(0)` stays unrepresentable either way,
+    /// which is what the original was reaching for.
     #[test]
-    fn a_zero_count_for_our_own_suffix_is_safe_and_never_breached_zero() {
+    fn a_zero_count_on_our_own_line_is_unavailable_not_safe() {
         // Shaped exactly like a range line in every other respect, and
         // carrying the very suffix we are looking for.
         let body = format!("{PASSWORD_SUFFIX}:0\r\n");
-        assert_eq!(
-            parse_range_body(&body, PASSWORD_SUFFIX),
-            Ok(None),
-            "a decoy carrying our own suffix is still a decoy"
+        assert!(
+            parse_range_body(&body, PASSWORD_SUFFIX).is_err(),
+            "a zero count on our own line is not a readable answer"
         );
-        assert_eq!(status_for(&body), BreachStatus::Safe);
+        assert_eq!(status_for(&body), BreachStatus::Unavailable);
         assert_ne!(
             status_for(&body),
             BreachStatus::Breached(0),
-            "HIBP never returns a count of 0, so Breached(0) must be unrepresentable"
+            "Breached(0) must be unrepresentable"
         );
+    }
+
+    /// **The dangerous shape, for the zero case: our line, in a body whose
+    /// other lines parse.**
+    ///
+    /// The single-line version above cannot fail through `Ok(None)`, because
+    /// with no other well-formed line the body is `Err` anyway. This one can:
+    /// every decoy around our line is well-formed, so `saw_well_formed_line`
+    /// is already true and a `continue` on our own line resolves to `Ok(None)`
+    /// -- `Safe`, on the one line that was about this password.
+    #[test]
+    fn a_zero_count_on_our_own_line_in_a_mixed_body_is_not_safe() {
+        let body = format!(
+            "{}{PASSWORD_SUFFIX}:0\r\n{}",
+            "8BB9E9DF6591605A2E953C3B1A7D4749954:0\r\n",
+            "A5244143F8AE5B6494A94FC9C4678F30BCD:75379\r\n"
+        );
+        // Control: the surrounding lines really are well-formed on their own,
+        // so this body really is the mixed shape and not a degenerate one.
+        assert_eq!(
+            parse_range_body(&body, NEAR_MISS_LAST),
+            Ok(None),
+            "control: the other lines parse, so a skip of our line lands on Ok(None)"
+        );
+        assert_ne!(status_for(&body), BreachStatus::Safe, "our own line read as Safe");
+        assert_eq!(status_for(&body), BreachStatus::Unavailable);
+    }
+
+    /// **The dangerous shape, for the non-numeric case.**
+    ///
+    /// `a_non_numeric_count_is_not_a_range_line` builds a body of one line, so
+    /// its `Err` comes from "no well-formed line at all" and it would pass
+    /// just as green with the matching line skipped. This body has decoys and
+    /// a real other line around ours, so the skip is survivable and the answer
+    /// is `Ok(None)` -- `Safe` -- unless the matching line is treated as the
+    /// answer it is.
+    #[test]
+    fn a_non_numeric_count_on_our_own_line_in_a_mixed_body_is_not_safe() {
+        for count in ["not-a-number", "-5", "+5", "0x20", "", "1 2", "9e9"] {
+            let body = format!(
+                "{}{PASSWORD_SUFFIX}:{count}\r\n{}",
+                "8BB9E9DF6591605A2E953C3B1A7D4749954:0\r\n",
+                "A5244143F8AE5B6494A94FC9C4678F30BCD:75379\r\n"
+            );
+            // Control: with our line taken out of the question the body is a
+            // perfectly good `Ok(None)`, so `Safe` is genuinely reachable here
+            // and the assertion below is not vacuous.
+            assert_eq!(
+                parse_range_body(&body, NEAR_MISS_LAST),
+                Ok(None),
+                "control failed for count {count:?}"
+            );
+            assert_ne!(
+                status_for(&body),
+                BreachStatus::Safe,
+                "count {count:?} on our own line read as Safe -- a green badge on a password \
+                 whose answer we could not read"
+            );
+            assert_eq!(status_for(&body), BreachStatus::Unavailable, "count {count:?}");
+        }
+    }
+
+    /// **A body that lists our suffix twice reports the LARGEST count.**
+    ///
+    /// Reporting the first understates the breach by whatever the later lines
+    /// say. The two counts are far apart and in both orders, so a test that
+    /// merely happened to see the bigger one first cannot pass.
+    #[test]
+    fn duplicate_lines_for_our_suffix_report_the_largest_count() {
+        let small = 7u64;
+        let large = 987_654u64;
+        for (a, b) in [(small, large), (large, small)] {
+            let body = format!("{PASSWORD_SUFFIX}:{a}\r\n{PASSWORD_SUFFIX}:{b}\r\n");
+            assert_eq!(
+                parse_range_body(&body, PASSWORD_SUFFIX),
+                Ok(Some(large)),
+                "duplicate counts {a} then {b} did not report the largest"
+            );
+        }
+        // And a duplicate whose second line is unusable still cannot make the
+        // password read as Safe -- it is our line either way.
+        let body = format!("{PASSWORD_SUFFIX}:{small}\r\n{PASSWORD_SUFFIX}:abc\r\n");
+        assert_ne!(status_for(&body), BreachStatus::Safe);
     }
 
     /// The padded fixtures really are padded, and the decoys really do sit on
@@ -986,7 +1228,7 @@ mod tests {
 
         let suffix = Zeroizing::new(PASSWORD_SUFFIX.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1008,7 +1250,7 @@ mod tests {
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1028,7 +1270,7 @@ mod tests {
 
         let suffix = Zeroizing::new(PASSWORD_SUFFIX.to_string());
         check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1063,7 +1305,7 @@ mod tests {
 
         let suffix = Zeroizing::new(PASSWORD_SUFFIX.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1089,7 +1331,7 @@ mod tests {
 
         let suffix = Zeroizing::new(PASSWORD_SUFFIX.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1152,7 +1394,7 @@ mod tests {
 
         let (prefix, suffix) = split_hash("password");
         let status = check_prefix(
-            &format!("http://127.0.0.1:{port}/range"),
+            &BaseUrl::loopback(port),
             &prefix,
             &suffix,
             &build_agent(),
@@ -1252,7 +1494,7 @@ mod tests {
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1267,7 +1509,7 @@ mod tests {
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1282,7 +1524,7 @@ mod tests {
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
         let status = check_prefix(
-            &format!("{}/range", server.url()),
+            &BaseUrl::loopback(server.socket_address().port()),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1305,7 +1547,7 @@ mod tests {
         };
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
         let status = check_prefix(
-            &format!("http://127.0.0.1:{port}/range"),
+            &BaseUrl::loopback(port),
             &password_prefix(),
             &suffix,
             &build_agent(),
@@ -1466,6 +1708,29 @@ mod tests {
             "there is top-level source below the cfg(test) marker; the guards in this file do \
              not read it"
         );
+
+        // **The strip is line-based**, and drops only lines whose first
+        // non-space characters are `//`. That is exact for this file because
+        // this file has no block comments -- an assumption the guards were
+        // relying on silently, and which is now enforced. A `/* ... */` block
+        // leaves its contents in the "production" text, so the guards fire on
+        // prose; a `//` written inside a block comment goes the other way and
+        // hides a line from every one of them.
+        //
+        // What is NOT fixed here, said plainly: a `//` sequence inside a
+        // *string literal* would still drop that line, and no line-based
+        // strip can tell the two apart. Nothing in this file has one; the
+        // guards that matter are absence-guards, whose failure direction from
+        // an unstripped comment is to fire rather than to miss; and the real
+        // fix is a Rust lexer, which is not worth carrying here.
+        for marker in [concat!("/", "*"), concat!("*", "/")] {
+            assert!(
+                !code.contains(marker),
+                "breach.rs production code contains {marker:?}. Every guard in this file reads \
+                 a line-based strip that removes only `//` lines, so a block comment is scanned \
+                 as though it were code -- and can hide code from the scan"
+            );
+        }
     }
 
     /// Every `.rs` file under `src/`, as (path relative to `src/`, contents) --
@@ -1676,11 +1941,24 @@ mod tests {
         // The two that cannot be banned, pinned instead.
         assert_eq!(
             source.matches(concat!("forma", "t!")).count(),
-            2,
-            "a new `format!` in breach.rs production code. The range URL and the breach phrase \
-             are the only two, and the thing most worth formatting here is the hash -- so a \
-             third has to be added to this count deliberately"
+            3,
+            "a new `format!` in breach.rs production code. The three are the range URL, the \
+             breach phrase and `BaseUrl::loopback`, and the thing most worth formatting here is \
+             the hash -- so a fourth has to be added to this count deliberately"
         );
+        // Each of the three pinned to what it may build, so the count cannot
+        // be satisfied by a *different* three.
+        for target in [
+            concat!("format!(\"{}/{}\", base_url.as_str(), ", "prefix.as_str())"),
+            concat!("\"Found in a known data breach ({} times).", " Change this password.\","),
+            concat!("format!(\"http://127.0.0.1:{port}", "/range\")"),
+        ] {
+            assert!(
+                source.contains(target),
+                "the pinned `format!` {target:?} is gone, so the count of 3 is now pinning \
+                 something else"
+            );
+        }
         assert_eq!(
             source.matches(concat!("writ", "e!")).count(),
             1,
@@ -1755,6 +2033,140 @@ mod tests {
             2,
             "a Prefix is constructed somewhere other than split_hash. The two expected \
              occurrences are the declaration and split_hash's own"
+        );
+    }
+
+    /// **`base_url` was the unclosed half of the door `Prefix` closed.**
+    ///
+    /// `check_prefix` composes its URL out of exactly two values. The newtype
+    /// review closed one of them and left the other a bare `&str`, sitting
+    /// next to a `pub(crate) hex_digest`, so this compiled and put the whole
+    /// 40-character hash in the path:
+    ///
+    /// ```text
+    /// check_prefix(&format!("{RANGE_BASE}/{}", hex_digest(pw)), &prefix, ..)
+    /// ```
+    ///
+    /// `the_request_head_carries_nothing_beyond_the_allowlist` cannot catch
+    /// that and never could: it supplies the base itself and then asserts the
+    /// request line it computes *from its own input*, so a path chosen by the
+    /// caller is invisible to it by construction. Only the type can close it.
+    ///
+    /// The compiler does the enforcing, *given* the field stays private and
+    /// the constructors keep taking nothing and a `u16`. A `pub` on the
+    /// field, or a third constructor that takes a `&str`, reopens the hole
+    /// with nothing to say about it -- which is what this test is for.
+    #[test]
+    fn the_base_url_field_is_private_and_built_from_no_caller_supplied_text() {
+        const DECL: &str = concat!("pub struct BaseU", "rl(String);");
+        const NAME: &str = concat!("BaseU", "rl(");
+        const PARAM: &str = concat!("base_url: &BaseU", "rl,");
+        // Split three ways, not two: the endpoint constant's own name is
+        // counted in the test half by `no_test_in_this_file_can_reach_the_
+        // real_api`, and spelling it whole here would trip that count.
+        const PRODUCTION_CTOR: &str = concat!("BaseU", "rl(HIBP_RANGE_", "BASE.to_string())");
+        const LOOPBACK_CTOR: &str =
+            concat!("BaseU", "rl(format!(\"http://127.0.0.1:{port}/range\"))");
+
+        let production = this_module_production_code();
+        assert_strip_worked(&production);
+
+        assert!(
+            production.contains(DECL),
+            "the declaration is no longer {DECL:?}. A `pub` on the tuple field would let any \
+             call site in the crate build a BaseUrl out of the whole hash"
+        );
+        assert!(
+            production.contains(PARAM),
+            "check_prefix no longer takes a &BaseUrl, so its URL is composed from caller text \
+             again"
+        );
+
+        // The two signatures, spelled out. Neither takes anything a caller
+        // could put hash material into: one takes no argument at all, and the
+        // other takes a u16, which cannot hold a hex character.
+        assert!(
+            production.contains(concat!("pub fn producti", "on() -> Self")),
+            "BaseUrl::production no longer takes zero arguments"
+        );
+        assert!(
+            production.contains(concat!("pub fn loopb", "ack(port: u16) -> Self")),
+            "BaseUrl::loopback no longer takes exactly a u16 port -- a &str or a String here is \
+             the whole hole reopened"
+        );
+
+        // And the bodies: whatever each one builds, it is not something a
+        // caller handed it.
+        assert!(
+            production.contains(PRODUCTION_CTOR),
+            "BaseUrl::production no longer builds itself out of the pinned constant"
+        );
+        assert!(
+            production.contains(LOOPBACK_CTOR),
+            "BaseUrl::loopback no longer builds a fixed loopback URL out of nothing but the port"
+        );
+
+        assert_eq!(
+            production.matches(NAME).count(),
+            3,
+            "a BaseUrl is constructed somewhere other than its two constructors. The three \
+             expected occurrences are the declaration, production() and loopback()"
+        );
+    }
+
+    /// **The other 35 characters cannot be obtained outside this module.**
+    ///
+    /// `hex_digest` returns the complete 40-character hash and was
+    /// `pub(crate)` with no caller outside `split_hash`. What it had instead
+    /// of a caller was a use: any module in the crate could ask it for the
+    /// whole hash and hand the result to something that writes text. Both
+    /// newtypes in this file exist to make that unspellable, and a
+    /// crate-visible function returning the hash is the plainest way past
+    /// them.
+    ///
+    /// It is private now. Two halves, because either alone can go blind: the
+    /// visibility is read off this file's production source, and the name is
+    /// searched for across every other file in `src/` -- because a `pub use`
+    /// or a re-export somewhere else would restore it without changing a
+    /// character here.
+    #[test]
+    fn the_whole_hash_is_not_reachable_outside_this_module() {
+        const FN_NAME: &str = concat!("hex_dig", "est");
+
+        let production = this_module_production_code();
+        assert_strip_worked(&production);
+
+        // Positive control: the needle matches the live declaration.
+        assert!(
+            production.contains(&format!("fn {FN_NAME}(password: &str)")),
+            "needle {FN_NAME:?} no longer matches the live declaration, so this guard is blind"
+        );
+        for visibility in ["pub fn ", "pub(crate) fn ", "pub(super) fn ", "pub(in "] {
+            assert!(
+                !production.contains(&format!("{visibility}{FN_NAME}")),
+                "{FN_NAME} is {visibility:?} again. It hands out all 40 characters, which is \
+                 exactly what Prefix and BaseUrl exist to make unspellable"
+            );
+        }
+
+        let files = crate_source_files();
+        assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
+        let this = files
+            .iter()
+            .find(|(path, _)| path == "breach.rs")
+            .expect("the walk did not reach breach.rs");
+        assert!(this.1.contains(FN_NAME), "control: the walk's copy of breach.rs is not it");
+
+        let offenders: Vec<&str> = files
+            .iter()
+            .filter(|(path, _)| path != "breach.rs")
+            .filter(|(_, text)| text.contains(FN_NAME))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{FN_NAME} is named outside breach.rs: {offenders:?}. Nothing outside this module \
+             may hold the whole hash"
         );
     }
 
@@ -2269,9 +2681,16 @@ mod tests {
         /// match the one production site that legitimately uses it, and the
         /// test text must be the text that really contains these tests.
         #[test]
-        fn no_cache_test_can_reach_the_real_api() {
+        fn no_test_in_this_file_can_reach_the_real_api() {
             const LIVE: &str = concat!("BreachCache::li", "ve(");
             const ENDPOINT: &str = concat!("HIBP_RANGE_", "BASE");
+            // The neighbour the BaseUrl fix created. The live base
+            // constructor is public, takes no argument, names the endpoint,
+            // and `check_prefix` takes one -- so a test that builds it has a
+            // two-line path to api.pwnedpasswords.com that names neither the
+            // constant nor the live cache. It is banned here for the same
+            // reason both of those are.
+            const LIVE_BASE: &str = concat!("BaseUrl::producti", "on(");
 
             let full = this_module_source();
             let cut = full
@@ -2296,9 +2715,20 @@ mod tests {
             );
 
             assert!(
+                production.contains(LIVE_BASE),
+                "control: {LIVE_BASE:?} no longer names the live base constructor in production"
+            );
+
+            assert!(
                 !tests.contains(LIVE),
                 "a test constructs the live cache, whose workers call the real \
                  api.pwnedpasswords.com"
+            );
+            assert!(
+                !tests.contains(LIVE_BASE),
+                "a test builds the production base URL. Handed to check_prefix that is a real \
+                 request to api.pwnedpasswords.com from the test suite; every test here uses \
+                 BaseUrl::loopback"
             );
             // The endpoint constant is named in exactly one test: the pin,
             // which only compares it to a string literal.
