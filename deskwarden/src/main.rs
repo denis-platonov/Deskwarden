@@ -2936,6 +2936,166 @@ const _: fn() = || {
     assert_send::<SessionEstate>();
 };
 
+/// How a stretch of parked work ended, from the waiting thread's side.
+///
+/// The estate comes back on all three. That is the whole point of the type:
+/// there is no variant that means "the state is gone", because there is no
+/// path that loses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum EstateOutcome {
+    /// The worker ran to the end and said so.
+    Completed,
+    /// The worker was still running when the deadline expired. It has NOT
+    /// been stopped -- it cannot be -- but it can no longer reach the estate.
+    DeadlineExpired,
+    /// The worker unwound. Whatever it had already written is kept.
+    WorkerPanicked,
+}
+
+/// Where the estate lives while another thread mutates it.
+///
+/// **This is the answer to the hole the ledger records at `progress.md:14240`
+/// (obstacle 5).** The design it replaces MOVED `engine`, `child`, `token`
+/// and `details` into a worker and got them back as a returned payload, while
+/// keeping a deadline and a dead-worker poll that end the wait and throw the
+/// payload away. On either of those two paths `main` was left holding an
+/// empty [`MatchEngine`] -- autofill silently dead -- and `child: None` while
+/// a real `bw serve` still held `BW_SERVE_PORT`, so every later start failed
+/// `PortHeld`. Both with the suite green.
+///
+/// Here the estate is not moved through the worker at all. It is parked in a
+/// slot both threads can reach, the worker edits it through [`Self::with`],
+/// and the waiting thread takes it back with [`Self::reclaim`] AFTER the wait
+/// ends -- however it ended. See [`work_on_the_parked_estate`].
+///
+/// **The slot is an `Option` and `reclaim` empties it, and that is what makes
+/// the deadline path safe rather than merely tidy.** A worker abandoned on
+/// the deadline is still running and will still call `with`; from the reclaim
+/// onward those calls find the slot empty and answer `None`, so an abandoned
+/// worker writes into nothing instead of racing the thread that now owns the
+/// state again.
+///
+/// **Short critical sections, not one long one.** The worker must NOT hold
+/// this across a whole teardown. If it did, the deadline could not read the
+/// estate back -- it would block until the worker finished, which is the very
+/// thing the deadline exists to stop waiting for. The bound on how long
+/// `reclaim` can block is therefore the length of one `with`, and every
+/// caller owes that.
+///
+/// The cost of the same choice: a worker abandoned between two `with` calls
+/// leaves the estate half-updated. That is deliberate. Half-updated is a
+/// state the app can log, look at and recover from; the alternative on
+/// offer -- an empty engine and a stranded backend -- is not.
+#[allow(dead_code)]
+struct EstatePark {
+    slot: Arc<Mutex<Option<SessionEstate>>>,
+}
+
+#[allow(dead_code)]
+impl EstatePark {
+    /// Parks `estate`. The value is now reachable only through this type.
+    fn holding(estate: SessionEstate) -> Self {
+        Self { slot: Arc::new(Mutex::new(Some(estate))) }
+    }
+
+    /// A second handle on the same slot, for the worker thread.
+    fn handle(&self) -> Self {
+        Self { slot: Arc::clone(&self.slot) }
+    }
+
+    /// Runs `edit` against the parked estate, or answers `None` because the
+    /// waiting thread has already taken it back.
+    ///
+    /// `None` is not an error to unwrap on: it is the abandoned worker's
+    /// notice that it is no longer the owner and should stop. It is logged
+    /// here rather than at every call site, because a worker that keeps going
+    /// after this is a bug in the caller and the log is where it will be read.
+    fn with<R>(&self, edit: impl FnOnce(&mut SessionEstate) -> R) -> Option<R> {
+        // `unwrap_or_else(PoisonError::into_inner)`, exactly as
+        // `StartupChildHandoff` does: see this type's poisoning note on
+        // `reclaim`.
+        let mut held = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        match held.as_mut() {
+            Some(live) => Some(edit(live)),
+            None => {
+                log::warn!(
+                    "a parked-estate edit was dropped: the waiting thread has already taken \
+                     the session state back, so this worker was abandoned (deadline or panic) \
+                     and is no longer the owner of what it is trying to write"
+                );
+                None
+            }
+        }
+    }
+
+    /// Takes the estate back out. The slot is empty afterwards.
+    ///
+    /// **Poisoning is recovered from, never propagated.** A worker that
+    /// panicked while holding the lock poisons it, and `lock().unwrap()` here
+    /// would turn "the worker died" into "the state is unreachable" -- the
+    /// same loss obstacle 5 describes, arrived at by a different route, and
+    /// the panic path is precisely the one this type exists to survive. There
+    /// is no invariant across fields for a poisoned lock to have left
+    /// half-written that a successful `with` could not also have left: the
+    /// slot is one `Option` and the estate's fields are independent.
+    fn reclaim(&self) -> Option<SessionEstate> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+/// Hands `estate` to `work` on a worker thread, waits `deadline` for it, and
+/// gives the estate back whatever happened.
+///
+/// The three ways the wait can end map one-to-one onto [`EstateOutcome`], and
+/// **the read-back is below the match, on the single path all three join** --
+/// deliberately, so that a future edit cannot give one outcome its own return
+/// that forgets it. This is the shape the ledger prescribes at
+/// `progress.md:14285`.
+///
+/// The panic path is detected by the sender being dropped as the worker
+/// unwinds: `work` is called before the send, so an unwind drops the sender
+/// without one and the wait ends `Disconnected`. The mutex guard `with` holds
+/// lives in a frame INSIDE `work`, so it is released earlier in the same
+/// unwind than the sender is dropped -- the reclaim below can never be racing
+/// a guard held by a thread that is already gone.
+///
+/// The worker is not joined. On the deadline path it is still running by
+/// definition, and there is nothing to wait for: the reclaim has emptied the
+/// slot, so everything it does from here on is a `None` from `with`.
+#[allow(dead_code)]
+fn work_on_the_parked_estate(
+    estate: SessionEstate,
+    deadline: Duration,
+    work: impl FnOnce(&EstatePark) + Send + 'static,
+) -> (SessionEstate, EstateOutcome) {
+    let park = EstatePark::holding(estate);
+    let worker_view = park.handle();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    // Not joined; see this function's doc.
+    let _worker = std::thread::spawn(move || {
+        let signal = done_tx;
+        work(&worker_view);
+        let _ = signal.send(());
+    });
+
+    let outcome = match done_rx.recv_timeout(deadline) {
+        Ok(()) => EstateOutcome::Completed,
+        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+        Err(mpsc::RecvTimeoutError::Disconnected) => EstateOutcome::WorkerPanicked,
+    };
+
+    // THE READ-BACK. One statement, below all three arms, naming no field --
+    // the whole value comes home or nothing does, and there is no partial
+    // spelling of this that compiles.
+    let recovered = park.reclaim().expect(
+        "the parked session state was gone at the read-back. Only this line ever empties the \
+         slot and it runs once, so this means a second reclaimer was added -- and the thread \
+         that owns the session would be left with no session at all",
+    );
+    (recovered, outcome)
+}
+
 /// The immutable half of what a vault session runs against: borrowed, never
 /// mutated, never in the estate.
 ///
@@ -8348,6 +8508,120 @@ mod tests {
             );
         }
 
+        /// Every `.field` / `field:` mention of one of the estate's own fields
+        /// in `region`, which is how a partial read-back has to be spelled.
+        ///
+        /// A read-back that loses `child` is either `recovered.child = None`
+        /// or `SessionEstate { child: None, ..recovered }`; there is no third
+        /// spelling that reaches one field of a value it holds by name. Both
+        /// are counted here, and
+        /// [`the_field_mention_scanner_sees_a_partial_read_back`] holds the
+        /// scanner to that claim in both directions.
+        fn field_mentions(region: &str, fields: &[String]) -> Vec<String> {
+            let mut found = Vec::new();
+            for field in fields {
+                for spelling in [format!(".{field}"), format!("{field}:")] {
+                    if region.contains(&spelling) {
+                        found.push(spelling);
+                    }
+                }
+            }
+            found
+        }
+
+        /// The scanner fires on both spellings of a dropped field and on
+        /// neither of the two things the read-back really does contain.
+        ///
+        /// Without this the guard below could be passing because the scanner
+        /// is blind, which is the failure this crate keeps shipping: a check
+        /// that is correct in isolation and reaches nothing.
+        #[test]
+        fn the_field_mention_scanner_sees_a_partial_read_back() {
+            let fields: Vec<String> =
+                ["child", "engine", "token"].iter().map(|s| s.to_string()).collect();
+            for (source, want) in [
+                ("let mut back = park.reclaim().expect(m); back.child = None;", true),
+                ("SessionEstate { engine: MatchEngine::new(), ..back }", true),
+                ("back.engine = MatchEngine::new();", true),
+                ("let recovered = park.reclaim().expect(m);", false),
+                ("self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()", false),
+                ("done_rx.recv_timeout(deadline)", false),
+            ] {
+                assert_eq!(
+                    !field_mentions(source, &fields).is_empty(),
+                    want,
+                    "the field-mention scanner answered wrongly for {source:?}. A scanner that \
+                     cannot see a dropped field makes the guard below vacuous; one that fires \
+                     on the read-back's own statements makes it noise"
+                );
+            }
+        }
+
+        /// **The read-back moves the whole estate and names not one field of
+        /// it -- so no field can be dropped on the way home.**
+        ///
+        /// This is the guard for the failure the ledger records as obstacle 5
+        /// (`progress.md:14240`): a `child` that does not come back strands a
+        /// real `bw serve` on the port and every later start fails `PortHeld`;
+        /// an `engine` replaced by a fresh one disarms autofill for the rest
+        /// of the session. Neither is observable from a test that cannot spawn
+        /// a process, so it is made unspellable instead of merely asserted:
+        /// the read-back is one `take` of one whole value, and the moment any
+        /// field is named there, this fails.
+        #[test]
+        fn the_read_back_moves_the_whole_estate_and_names_no_field_of_it() {
+            let code = production_code();
+            let fields = estate_fields();
+
+            let driver = super::body_of(&code, concat!("fn work_on_the_parked_", "estate("));
+            let taker = super::body_of(&code, concat!("fn recl", "aim(&self)"));
+            assert!(
+                (200..4_000).contains(&driver.len()),
+                "the sliced parked-estate driver is {} bytes, which is not that function",
+                driver.len()
+            );
+            assert!(
+                (10..600).contains(&taker.len()),
+                "the sliced `reclaim` is {} bytes, which is not that method",
+                taker.len()
+            );
+            for (what, body, marker) in [
+                ("the driver", &driver, "recv_timeout"),
+                ("the taker", &taker, "take()"),
+            ] {
+                assert!(
+                    body.contains(marker),
+                    "control: {marker:?} is not in {what}, so the slice is not the code this \
+                     guard is about"
+                );
+            }
+
+            let region = format!("{driver}\n{taker}");
+            let mentions = field_mentions(&region, &fields);
+            assert!(
+                mentions.is_empty(),
+                "the read-back names {mentions:?}. It must move the WHOLE estate: naming a \
+                 field is how a read-back drops one, and the two that matter are silent -- a \
+                 `child` left behind strands a live `bw serve` on the port so every later \
+                 start fails `PortHeld`, and an `engine` replaced by a fresh one disarms \
+                 autofill for the rest of the session. Both with the suite green; both are \
+                 the recorded obstacle 5"
+            );
+
+            // The scanner is not merely quiet everywhere: over the estate's
+            // own destructure -- the one place in this file that legitimately
+            // names fields -- it fires. Without this, a `fields` that parsed
+            // empty would make the assertion above pass for free.
+            let over_the_destructure = field_mentions(&estate_destructure(), &fields);
+            assert!(
+                over_the_destructure.len() >= 3,
+                "control: the same scanner, with the same field list, found only {} field \
+                 mentions in the estate's own destructure, which names all ten. The field \
+                 list or the scanner is empty and the assertion above proved nothing",
+                over_the_destructure.len()
+            );
+        }
+
         /// `MatchEngine` is not `Clone`, and cannot quietly become so.
         ///
         /// A cloned engine compiles -- it is two `HashMap`s -- and silently
@@ -8557,6 +8831,247 @@ mod tests {
     /// No test could see it, because the only thing that knew the answer was a
     /// loop body inside a function that opens a real eframe window. So the
     /// answer is a value now, and these drive it directly.
+    /// **The estate comes home on all three paths -- normal completion, the
+    /// deadline, and a worker that unwound.**
+    ///
+    /// The ledger's obstacle 5 (`progress.md:14240`) is a design in which the
+    /// deadline and the dead-worker poll each end the wait and throw the
+    /// worker's whole result away, leaving `main` with an empty
+    /// [`MatchEngine`] and a `child` of `None` beside a live `bw serve` -- and
+    /// the suite green, because nothing looked. These three tests are what
+    /// looks. Each one has the worker mutate the estate OBSERVABLY before its
+    /// path is taken, so a path that discards the state fails rather than
+    /// passing quietly, and each asserts the premise (the estate does not
+    /// already hold what the worker will write) before asserting the
+    /// consequence.
+    ///
+    /// Nothing here spawns a process, opens a window, binds a port or touches
+    /// a real config path: the estate is built over a scratch directory and a
+    /// bridge pointed at a port nothing listens on, and it is never asked to
+    /// speak to either.
+    mod the_parked_estate_comes_home {
+        use super::*;
+
+        /// What the worker writes into the token. Deliberately not the value
+        /// the fixture starts with; see [`nothing_of_the_works_is_there_yet`].
+        const AFTER: &str = "the-token-the-worker-wrote";
+
+        /// The process the worker arms the engine for.
+        const ARMED: &str = "notepad.exe";
+
+        /// A scratch directory for the estate's session store. Never read or
+        /// written by these tests: `SessionStore` is a path until something
+        /// asks it to load or save, and nothing here does.
+        fn scratch(tag: &str) -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "deskwarden-parked-estate-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory");
+            dir
+        }
+
+        /// An estate holding none of what the worker will write.
+        ///
+        /// The bridge points at port 1, which nothing listens on, so a stray
+        /// request would fail rather than reach a real `bw serve`. Nothing
+        /// here makes one.
+        fn fresh_estate(dir: &std::path::Path) -> SessionEstate {
+            SessionEstate {
+                cache: Arc::new(VaultCache::new(VaultBridge::new(
+                    "http://127.0.0.1:1".to_string(),
+                ))),
+                engine: MatchEngine::new(),
+                child: None,
+                token: "the-token-the-session-started-with".to_string(),
+                details: None,
+                task_in_progress: None,
+                store: session_store::SessionStore::new(dir.join("session.bin")),
+                active_account: None,
+                accounts: None,
+                settings: deskwarden::settings::Settings::default(),
+            }
+        }
+
+        /// What the worker does to the estate: three fields, of three
+        /// different shapes, so a read-back that carries a `String` but not a
+        /// `MatchEngine` cannot pass.
+        fn the_work(est: &mut SessionEstate) {
+            est.token = AFTER.to_string();
+            est.engine.rebuild(&[(
+                "item-7".to_string(),
+                deskwarden::app_match::AppMatch::for_process(
+                    ARMED,
+                    deskwarden::app_match::TriggerMode::Auto,
+                ),
+            )]);
+            est.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+        }
+
+        /// The premise: none of the three is already true. Without this, a
+        /// read-back that returned a DEFAULT estate could satisfy the
+        /// assertions below by accident.
+        fn nothing_of_the_works_is_there_yet(est: &SessionEstate) {
+            assert_ne!(est.token, AFTER, "control: the fixture already holds the worker's token");
+            assert!(
+                est.engine
+                    .lookup(&foreground(ARMED))
+                    .is_none(),
+                "control: the fixture's engine is already armed for {ARMED}, so an engine that \
+                 never reached the worker would pass the check below"
+            );
+            assert!(
+                est.task_in_progress.is_none(),
+                "control: the fixture already has a task in progress"
+            );
+        }
+
+        /// The consequence: all three of the worker's writes came home.
+        fn the_worker_reached_the_estate(est: &SessionEstate, path: &str) {
+            assert_eq!(
+                est.token, AFTER,
+                "on {path} the session token the worker wrote did not come back. What `main` \
+                 would be holding is the stale token the lock invalidated"
+            );
+            assert!(
+                est.engine.lookup(&foreground(ARMED)).is_some(),
+                "on {path} the match engine came back unarmed. That is the recorded obstacle-5 \
+                 failure exactly: autofill silently dead for the rest of the process, with no \
+                 stand-down message and nothing in the log tying it to the lock"
+            );
+            assert!(
+                est.task_in_progress.is_some(),
+                "on {path} the in-progress backend task did not come back, so the tray would \
+                 never stop saying it was working"
+            );
+        }
+
+        /// Path 1 of 3: the worker finished.
+        #[test]
+        fn the_happy_path_reads_the_estate_back() {
+            let dir = scratch("happy");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
+                    assert!(
+                        park.with(the_work).is_some(),
+                        "the worker must own the estate while it is running"
+                    );
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::Completed,
+                "a worker that ran to the end inside its deadline completed"
+            );
+            the_worker_reached_the_estate(&back, "the happy path");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Path 2 of 3: the deadline expired with the worker still running.
+        ///
+        /// **This is obstacle 5's own path**, and the test is built so that
+        /// abandoning the worker cannot be confused with waiting for it: the
+        /// worker blocks on a channel the test can only send on AFTER the
+        /// call has returned, so the call demonstrably did not join it.
+        ///
+        /// It also proves the second half of the mechanism -- that the
+        /// abandoned worker is locked OUT. Once released it tries one more
+        /// write and reports whether the slot was still there; it must not
+        /// be, or a worker that wakes up ten seconds later would be writing
+        /// into state the main thread owns again.
+        #[test]
+        fn the_deadline_reads_the_estate_back_and_shuts_the_worker_out() {
+            let dir = scratch("deadline");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (late_tx, late_rx) = mpsc::channel::<bool>();
+
+            let began = Instant::now();
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_millis(750), move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker starts as the owner");
+                    // Held until the test says so -- so the deadline is the
+                    // only thing that can end the wait.
+                    release_rx.recv().expect("the test must release this worker");
+                    let late = park
+                        .with(|est| est.token = "written after the deadline".to_string())
+                        .is_some();
+                    let _ = late_tx.send(late);
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::DeadlineExpired,
+                "the worker was still blocked when the deadline passed, so the wait ended on \
+                 the deadline and on nothing else"
+            );
+            assert!(
+                began.elapsed() >= Duration::from_millis(700),
+                "control: the call returned in {:?}, faster than the deadline it was given, so \
+                 it did not end on the deadline and this test is about some other path",
+                began.elapsed()
+            );
+            the_worker_reached_the_estate(&back, "the deadline path");
+
+            release_tx.send(()).expect("the worker is still alive to be released");
+            let late = late_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the released worker must answer");
+            assert!(
+                !late,
+                "the abandoned worker could still reach the estate after the deadline read it \
+                 back. Two owners of one session state is the split the estate exists to \
+                 remove, and this one would land its writes on a value the main thread has \
+                 already moved on with"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Path 3 of 3: the worker panicked, holding the lock.
+        ///
+        /// The panic is raised INSIDE `with`, i.e. while the mutex guard is
+        /// held, so the lock is left poisoned. That is the point: a `reclaim`
+        /// that unwrapped the poison would turn a dead worker into an
+        /// unreachable session -- obstacle 5 by a second route -- so it
+        /// recovers with `PoisonError::into_inner` instead, and this test is
+        /// what says so.
+        ///
+        /// The panic message is printed by the default hook. That is noise in
+        /// the test output, not a failure; the hook is left alone because it
+        /// is process-wide and these tests run beside others.
+        #[test]
+        fn a_panicking_worker_does_not_poison_the_estate_out_of_reach() {
+            let dir = scratch("panic");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
+                    let _: Option<()> = park.with(|est| {
+                        the_work(est);
+                        panic!("a deliberate panic, raised while the estate's lock is held");
+                    });
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::WorkerPanicked,
+                "the worker unwound without signalling, and that must be reported as a panic \
+                 rather than as the completion it is not: the caller's next decision -- whether \
+                 the session is settled -- turns on the difference"
+            );
+            the_worker_reached_the_estate(&back, "the panic path");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     mod what_a_finished_vault_session_means {
         use super::super::{vault_follow_up, VaultFollowUp};
         use deskwarden::vault_window::VaultWindowResult;
