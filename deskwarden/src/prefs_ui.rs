@@ -960,14 +960,20 @@ pub fn modal_body_rect(card: Rect) -> Rect {
 /// it sits above the sidebar, list and detail panels *and* above the titlebar,
 /// so nothing behind it can be clicked while this is up.
 ///
-/// Measured, not assumed -- and the measurement narrowed the claim. egui
-/// blocks lower layers by ORDER, not by which pixels a higher one reserved, so
-/// removing the scrim's own `allocate_response` does not let a click through
-/// on its own. It is kept because it is what the other two modals do and
-/// because it states the intent at the call site, but the property that
-/// actually holds the line is the layer, and
-/// `a_click_on_the_scrim_never_reaches_the_vault_behind_it` asserts the
-/// property rather than the mechanism.
+/// **`ui.allocate_response(screen.size(), ..)` is what makes that true, and it
+/// is not an idiom.** This doc used to say the opposite -- that egui "blocks by
+/// layer order rather than reserved pixels", so removing the call "does not let
+/// a click through", and it was kept only as a matter of style. That was
+/// measured false. On egui 0.35 `Memory::layer_id_at` hit-tests against the
+/// `Area`'s **stored rect**, and an area's stored rect is what it allocated: a
+/// scrim that allocates nothing has a near-zero rect and blocks nothing outside
+/// the card. Deleting this one line lets a click land on a vault control out in
+/// the margin while the card sits over the middle of the screen -- and did so
+/// with the whole `prefs_ui::` suite green, because the test named for that
+/// property was only asserting that a scrim click does not dismiss.
+/// `a_click_on_the_scrim_never_reaches_the_vault_behind_it` now asserts on the
+/// control behind, at the card and out in the margin, and dies when this line
+/// goes.
 ///
 /// Clicking the scrim does
 /// **not** dismiss -- neither of the other two modals dismisses on a scrim
@@ -980,6 +986,19 @@ pub fn modal_body_rect(card: Rect) -> Rect {
 /// shortcuts read straight off `ctx.input` bypass hit-testing entirely, so the
 /// caller must not run them while this is drawn. See
 /// `vault_window`'s Ctrl+K/L/N block.
+///
+/// **`ctx.input` IS NOT LAYER-AWARE, and only Ctrl+K/L/N are gated.** The gate
+/// is `keyboard_shortcuts_enabled`, which the host turns off for those three
+/// and for nothing else. Raw text -- anything reaching a `TextEdit` behind this
+/// modal, or any other `ctx.input` read the vault window grows later -- is not
+/// gated by the scrim at all, because a scrim gates the pointer and nothing
+/// else. It is unreachable in production today only because the one route into
+/// this modal is a gear click, and clicking the gear surrenders keyboard focus
+/// from whatever had it. **That is a coincidence of the current UI, not a
+/// guarantee.** A second route in -- a shortcut, a menu item, a restored
+/// session that reopens the modal -- would leave focus wherever it was, and the
+/// next reader who assumes "the modal is up, so input is blocked" will be
+/// wrong. Anything new that reads `ctx.input` must be gated explicitly.
 pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAction {
     let mut action = PrefsAction::None;
     let screen = ctx.content_rect();
@@ -1814,6 +1833,18 @@ mod modal_tests {
         max: Pos2::new(20.0, 18.0),
     };
 
+    /// A third stand-in, in the margin at the FAR corner of the pane.
+    ///
+    /// `BEHIND_IN_MARGIN` is at the top left, which every rectangle anchored at
+    /// `Pos2::ZERO` covers -- including a scrim that allocated only the card's
+    /// size instead of the screen's. That mutation passed every assertion in
+    /// this module. This fixture is the other end: a scrim has to have
+    /// allocated the whole pane to shield it.
+    const BEHIND_IN_FAR_MARGIN: Rect = Rect {
+        min: Pos2::new(PANE.x - 22.0, PANE.y - 20.0),
+        max: Pos2::new(PANE.x - 4.0, PANE.y - 4.0),
+    };
+
     // -----------------------------------------------------------------------
     // The pure geometry, asked directly. No frame, no fonts, no harness.
     // -----------------------------------------------------------------------
@@ -1988,6 +2019,9 @@ mod modal_tests {
             behind.in_margin = ui
                 .put(BEHIND_IN_MARGIN, egui::Button::new("another"))
                 .clicked();
+            behind.in_far_margin = ui
+                .put(BEHIND_IN_FAR_MARGIN, egui::Button::new("a third"))
+                .clicked();
             if with_modal {
                 action = draw_prefs_modal(ui.ctx(), state);
             }
@@ -2004,6 +2038,7 @@ mod modal_tests {
     struct Behind {
         under_card: bool,
         in_margin: bool,
+        in_far_margin: bool,
     }
 
     fn click(pos: Pos2) -> Vec<egui::Event> {
@@ -2188,6 +2223,13 @@ mod modal_tests {
             behind.in_margin,
             "the stand-in vault control in the margin never registered a click at all"
         );
+        let _ = frame(&ctx, &mut state, &[], false);
+        let (_, _, behind) = frame(&ctx, &mut state, &click(BEHIND_IN_FAR_MARGIN.center()), false);
+        assert!(
+            behind.in_far_margin,
+            "the stand-in vault control in the FAR margin never registered a click at all, so \
+             the assertion that the scrim shields it proves nothing"
+        );
     }
 
     /// **The other control, and the one that keeps the scrim from being dead
@@ -2201,6 +2243,23 @@ mod modal_tests {
         assert!(
             !card.intersects(BEHIND_IN_MARGIN),
             "the margin fixture is under the card, so the scrim test below would pass              against no scrim at all"
+        );
+        assert!(
+            !card.intersects(BEHIND_IN_FAR_MARGIN),
+            "the far-margin fixture is under the card, so the scrim test below would pass \
+             against no scrim at all"
+        );
+        // And the two margin fixtures are on opposite sides of the card, which
+        // is the whole reason there are two: a scrim anchored at `Pos2::ZERO`
+        // that under-allocates covers the near one and not the far one.
+        assert!(
+            BEHIND_IN_MARGIN.max.x < card.min.x && BEHIND_IN_MARGIN.max.y < card.min.y,
+            "the near margin fixture is not before the card on both axes"
+        );
+        assert!(
+            BEHIND_IN_FAR_MARGIN.min.x > card.max.x && BEHIND_IN_FAR_MARGIN.min.y > card.max.y,
+            "the far margin fixture is not past the card on both axes, so it does not catch a \
+             scrim that allocated too little"
         );
     }
 
@@ -2222,23 +2281,83 @@ mod modal_tests {
 
     /// And the same in the margin: the scrim is a click-catcher over the whole
     /// pane, not only under the card.
+    ///
+    /// **This test used to assert only that a scrim click does not DISMISS.**
+    /// It bound `(_, action, _)`, threw the `Behind` away, and never looked at
+    /// the one property its own name promises -- so `BEHIND_IN_MARGIN`, set up
+    /// for exactly this and kept honest by `the_card_alone_does_not_cover_the_
+    /// margin`, was exercised by the positive control and by nothing else.
+    /// Deleting the scrim's `allocate_response` let a margin click through to
+    /// the vault with the entire shipped `prefs_ui::` suite green (41 passed).
+    /// Both halves are asserted now, and the dismissal claim is kept alongside
+    /// them rather than instead of them.
+    ///
+    /// **The margin is the load-bearing half.** A click over the card is
+    /// blocked by the card's own area whether or not a scrim exists, so it is
+    /// asserted here only as the near half of "no click anywhere reaches the
+    /// vault"; `a_click_over_the_card_never_reaches_the_vault_behind_it` is
+    /// that claim on its own.
     #[test]
     fn a_click_on_the_scrim_never_reaches_the_vault_behind_it() {
         let ctx = styled_context();
         let mut state = a_state();
-        // A stand-in control out in the margin, where the scrim alone covers.
-        let corner = Pos2::new(6.0, 6.0);
+        let card = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        // The stand-in control out in the margin, where the scrim alone covers.
+        // Clicked at its centre rather than at some nearby point, so the click
+        // is on the control and a failure cannot be a near miss.
+        let corner = BEHIND_IN_MARGIN.center();
         assert!(
-            !modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE)).contains(corner),
+            !card.contains(corner),
             "the fixture point is under the card, so this would not be testing the scrim"
         );
+        assert!(
+            BEHIND_IN_MARGIN.contains(corner),
+            "positive control: the click lands on the margin stand-in, not merely near it"
+        );
+
+        // Two warm-ups, as the card-click test takes: one for egui to create
+        // the scrim's `Area`, one for it to have a laid-out rect to hit-test.
         let _ = frame(&ctx, &mut state, &[], true);
-        let (_, action, _) = frame(&ctx, &mut state, &click(corner), true);
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, action, behind) = frame(&ctx, &mut state, &click(corner), true);
+        assert!(
+            !behind.in_margin,
+            "a click in the margin reached the vault control behind the scrim. The user \
+             believes they are editing preferences and is in fact driving the vault -- which \
+             is worse than having no modal at all, because it looks safe"
+        );
+
+        // The other end of the pane, past the card on both axes. A scrim that
+        // allocated the CARD's size rather than the screen's still covers the
+        // near corner, because both are anchored at `Pos2::ZERO`.
+        let far = BEHIND_IN_FAR_MARGIN.center();
+        assert!(
+            !card.contains(far) && BEHIND_IN_FAR_MARGIN.contains(far),
+            "positive control: the far click is outside the card and on its stand-in"
+        );
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, _, behind_far) = frame(&ctx, &mut state, &click(far), true);
+        assert!(
+            !behind_far.in_far_margin,
+            "a click in the far margin reached the vault control behind the scrim, so the \
+             scrim does not cover the whole pane -- only the part of it the card happens to \
+             sit over"
+        );
+
         assert_eq!(
             action,
             PrefsAction::None,
             "a scrim click dismissed the form -- neither `draw_folder_edit_modal` nor \
              `draw_launch_confirm_modal` does that, and this form commits as it is typed"
+        );
+
+        // The near half, in the same test and on its own frame: no click
+        // anywhere over this pane reaches the vault.
+        let _ = frame(&ctx, &mut state, &[], true);
+        let (_, _, behind) = frame(&ctx, &mut state, &click(BEHIND.center()), true);
+        assert!(
+            !behind.under_card,
+            "a click over the card reached the vault control underneath it"
         );
     }
 
