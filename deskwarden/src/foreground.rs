@@ -389,6 +389,86 @@ mod tests {
             .join("\n")
     }
 
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. The same shape `breach.rs` walks its own cut
+    /// with, deliberately exact rather than a `starts_with`: a whole module
+    /// written on one line is not a module opener as far as this walk is
+    /// concerned.
+    fn is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// **A module's source with its test modules cut out**, and how many were
+    /// cut.
+    ///
+    /// The reason every cross-file needle below is counted over this rather
+    /// than over the raw `include_str!` bytes. An exact-count pin -- and the
+    /// raise guard pins `raise_window(WINDOW_TITLE)` at exactly ONE occurrence
+    /// in each of six other files -- **false-fires the day a fixture in one of
+    /// those files spells the needle**, which none of those files' owners has
+    /// any reason to expect. A guard that fires for a reason unrelated to what
+    /// it guards gets deleted rather than obeyed, and a deleted guard is how
+    /// the original window-behind-everything bug survived in the first place.
+    ///
+    /// Not "everything above the first `#[cfg(test)]`", which is what
+    /// `settings.rs` and `breach.rs` can do for themselves: these six files
+    /// **interleave** production and test modules -- `app_window.rs` has a test
+    /// module at line 790 and a `raise_window` call at 1814 -- so a
+    /// split-at-the-first-gate would truncate the very lines being pinned. It
+    /// would fail loudly rather than silently, the count going to zero, but it
+    /// would not work at all.
+    ///
+    /// So each gated module is skipped instead: a line that is exactly
+    /// `#[cfg(test)]` followed immediately by a column-0 module opener starts a
+    /// skip that runs to the next column-0 `}`. Inside a module every item is
+    /// indented, so that brace is the module's own.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here is against the line's real
+    /// text on a CRLF working tree and on an LF one alike. This repository
+    /// stores LF blobs and only `core.autocrlf=true` makes the working tree
+    /// CRLF, so a needle written with a carriage return in it would match
+    /// nothing on a plain checkout -- green, and reading nothing.
+    fn production_half(source: &str) -> (String, usize) {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut cut = 0usize;
+        let mut gated = false;
+        let mut skipping = false;
+        for line in source.lines() {
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            if gated && is_module_opener(line) {
+                // The `#[cfg(test)]` line itself was pushed on the previous
+                // turn; it belongs to the module being cut.
+                kept.pop();
+                skipping = true;
+                cut += 1;
+                gated = false;
+                continue;
+            }
+            gated = line.trim() == "#[cfg(test)]";
+            kept.push(line);
+        }
+        assert!(
+            !skipping,
+            "a test module was opened and never closed by a column-0 brace, so the rest of the \
+             file was dropped and every needle counted over this reads nothing"
+        );
+        (kept.join("\n"), cut)
+    }
+
     fn window(hwnd: isize, title: &str) -> OwnWindow {
         OwnWindow {
             hwnd,
@@ -675,6 +755,16 @@ mod tests {
     #[test]
     fn every_window_this_crate_opens_asks_to_be_brought_to_the_front() {
         for (name, source, title, opens) in RAISING_SITES {
+            // **The production half, not the whole file.** These are exact
+            // counts over six OTHER modules' sources, and an exact count over
+            // a whole file false-fires the day a fixture in one of them spells
+            // the needle -- see `production_half`.
+            let (source, cut) = production_half(source);
+            assert!(
+                cut > 0,
+                "no test module was cut out of `{name}`, so this is still counting over that \
+                 file's fixtures as well as its code"
+            );
             assert_eq!(
                 source.matches(&format!("run_ui_native({title},")).count(),
                 opens,
@@ -687,7 +777,8 @@ mod tests {
             );
         }
 
-        let picker = include_str!("picker_ui.rs");
+        let (picker, cut) = production_half(include_str!("picker_ui.rs"));
+        assert!(cut > 0, "no test module was cut out of `picker_ui`");
         assert_eq!(picker.matches("run_ui_native(ADD_APP_TITLE,").count(), 1);
         assert_eq!(picker.matches("raise_window(ADD_APP_TITLE)").count(), 1);
 
@@ -699,6 +790,45 @@ mod tests {
                 .matches("raise_window(WINDOW_TITLE)")
                 .count(),
             2
+        );
+
+        // **Positive control on the cut itself, which is the new thing here.**
+        // Two claims, and neither is provable from the counts above:
+        //
+        // 1. It removes a gated test module. Fed a file whose test module
+        //    spells the needle a second time, the raw count is 2 -- the false
+        //    fire this change exists to stop -- and the cut count is 1.
+        // 2. It removes ONLY that, and specifically not production that
+        //    happens to sit below a test module. That is the interleaving
+        //    every one of these six files has and the reason this is a walk
+        //    rather than a split at the first gate: a split would read 1 here
+        //    (the fixture's, having thrown the second real call away) and this
+        //    control would still pass on the count alone. So the tail is
+        //    asserted to have survived by name.
+        let interleaved = concat!(
+            "fn open() { run_ui_native(WINDOW_TITLE, ..); raise_window(WINDOW_TITLE); }\n",
+            "#[cfg(test)]\n",
+            "mod fixtures {\n",
+            "    const SAMPLE: &str = \"raise_window(WINDOW_TITLE)\";\n",
+            "}\n",
+            "fn open_later() { raise_window(WINDOW_TITLE); let _ = SURVIVOR; }\n"
+        );
+        assert_eq!(
+            interleaved.matches("raise_window(WINDOW_TITLE)").count(),
+            3,
+            "control: the fixture no longer spells the needle, so the cut below proves nothing"
+        );
+        let (cut_fixture, cuts) = production_half(interleaved);
+        assert_eq!(cuts, 1, "the walk did not find the gated test module");
+        assert_eq!(
+            cut_fixture.matches("raise_window(WINDOW_TITLE)").count(),
+            2,
+            "the walk did not remove the occurrence inside the test module"
+        );
+        assert!(
+            cut_fixture.contains("SURVIVOR"),
+            "the walk threw away production below the test module, which is exactly what a \
+             split at the first `#[cfg(test)]` would have done to these six files"
         );
     }
 
@@ -878,7 +1008,14 @@ mod tests {
             // as well as a call can. Stripping comments first means only a
             // real builder call satisfies this, and only a real call site
             // trips the `raise_window(` count below.
-            let source = code(source);
+            //
+            // **And over the production half, for the same reason the raise
+            // guard is**: this is an exact count over another module's file,
+            // so a fixture in `overlay_ui.rs`'s own test modules spelling
+            // `with_always_on_top(` would take it to 2 and false-fire.
+            let (production, cut) = production_half(source);
+            assert!(cut > 0, "no test module was cut out of `{module}`");
+            let source = code(&production);
             assert_eq!(
                 source.matches("with_always_on_top(").count(),
                 1,
