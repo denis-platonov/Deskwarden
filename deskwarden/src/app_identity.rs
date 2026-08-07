@@ -796,7 +796,8 @@ fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
 /// the flattening mutant `return`s when it finds no nested package. On CI, in a
 /// container, or on any box whose Store packages are all flat, flattening this
 /// join again left the whole suite green. `lookup` is `registered_roots` in
-/// production, pinned by `the_repair_asks_the_registry_through_the_one_seam`,
+/// production, pinned by
+/// `the_repair_asks_the_registry_through_the_one_seam_and_returns_its_answer`,
 /// and a fixture in the tests, which is what makes the join itself provable
 /// anywhere.
 fn relocate_store_path_with(
@@ -1454,13 +1455,98 @@ mod tests {
         assert_eq!(got.len(), 1, "control: the fixture produces no candidate for any path");
     }
 
-    /// **Production goes through the tested function, with the real registry.**
+    /// The brace-matched body of the function whose signature is `head`, with
+    /// comments removed and every whitespace character squeezed out.
+    ///
+    /// Whitespace goes so that no reformatting of a one-line body can turn the
+    /// pin below off; comments go so that documenting the body does not break
+    /// it. A STRING literal in the body would be mangled by the comment
+    /// stripping -- which fails the pin rather than passing it, and a body with
+    /// a string literal in it is not a bare delegation anyway.
+    fn compacted_body_of(production: &str, head: &str) -> String {
+        assert_eq!(
+            production.matches(head).count(),
+            1,
+            "{head:?} does not appear exactly once, so there is no one body to look at"
+        );
+        let at = production.find(head).expect("checked directly above");
+        let open = at + head.len() - 1;
+        assert!(
+            production[open..].starts_with('{'),
+            "{head:?} does not end at the brace that opens its body"
+        );
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, c) in production[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.unwrap_or_else(|| panic!("{head:?}'s body is never closed"));
+        let body = &production[open + 1..close];
+
+        let without_line_comments = body
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut code = String::new();
+        let mut rest = without_line_comments.as_str();
+        while let Some(start) = rest.find("/*") {
+            code.push_str(&rest[..start]);
+            let end = rest[start..].find("*/").map_or(rest.len(), |e| start + e + 2);
+            rest = &rest[end..];
+        }
+        code.push_str(rest);
+        code.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// **Production goes through the tested function, with the real registry --
+    /// and hands back what it got.**
     ///
     /// The seam is only worth anything if `relocate_store_path` is a delegation
     /// and not a second copy of the join that can drift from the one every test
-    /// above exercises.
+    /// above exercises. But "it still calls the seam" says nothing about what
+    /// it RETURNS. This survived the whole suite on a machine with no nested
+    /// Store package -- which is every CI box, every container, and the
+    /// condition the live tests below skip themselves under (measured, 1655 +
+    /// 142 green):
+    ///
+    /// ```text
+    /// fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
+    ///     relocate_store_path_with(path, registered_roots)
+    ///         .into_iter()
+    ///         .map(|(p, _)| (p, None))
+    ///         .collect()
+    /// }
+    /// ```
+    ///
+    /// Every candidate loses its registry `DisplayName` in production, which is
+    /// precisely the regression the DisplayName mutation was written to kill,
+    /// and all five tests of the seam call `relocate_store_path_with` directly
+    /// and cannot see it. A `truncate`, a `filter`, a `dedup` or a wrapper that
+    /// re-derives its own answer from the seam's are the same story.
+    ///
+    /// So the delegation is pinned as the WHOLE body: whitespace-squeezed and
+    /// comment-stripped, `relocate_store_path`'s body must be the call and
+    /// nothing else. A post-process of any shape is a different string.
+    ///
+    /// This is a source pin, and a behavioural one would be better -- but there
+    /// is nothing to route a pure test through. `relocate_store_path`'s only
+    /// distinction from the seam IS the real registry; a fixture cannot be
+    /// handed to it without becoming the seam again. Pinning the body is the
+    /// strongest machine-independent statement available, and it is deliberately
+    /// an EQUALITY rather than a containment.
     #[test]
-    fn the_repair_asks_the_registry_through_the_one_seam() {
+    fn the_repair_asks_the_registry_through_the_one_seam_and_returns_its_answer() {
         let source = include_str!("app_identity.rs");
         let production = source
             .split_once(concat!("mod te", "sts {"))
@@ -1482,6 +1568,66 @@ mod tests {
             1,
             "the `root`/`tail` join appears more than once in the production half, so one copy \
              of it is untested"
+        );
+
+        // The delegation is the ENTIRE body, not merely present in it.
+        let head = concat!(
+            "fn relocate_store_path",
+            "(path: &str) -> Vec<(String, Option<String>)> {"
+        );
+        let squeezed = concat!("relocate_store_path", "_with(path,registered_roots)");
+        assert_eq!(
+            compacted_body_of(production, head),
+            squeezed,
+            "`relocate_store_path` does something to the seam's answer before handing it back. \
+             Every test of the join calls `relocate_store_path_with` directly, so a `map`, a \
+             `filter`, a `truncate` or any other post-process out here is invisible to all of \
+             them -- and dropping the registry `DisplayName` on the way through is a shipped \
+             regression this suite has already had to kill once"
+        );
+
+        // Controls. First, the extractor really reads a body, comments and all.
+        let fixture = concat!(
+            "fn f(x: u8) -> u8 {",
+            "\n    // a line comment\n    let y = g(x); /* inline */\n    y // trailing\n}"
+        );
+        assert_eq!(
+            compacted_body_of(fixture, concat!("fn f", "(x: u8) -> u8 {")),
+            "lety=g(x);y",
+            "control: the body extractor cannot read a body with comments in it, so the \
+             assertion above is about something other than this function"
+        );
+        // Second -- and this is the one that matters -- the extractor DISAGREES
+        // with the survivor. Without this the equality above could be passing
+        // against an extractor that returns the same string for everything.
+        let survivor = concat!(
+            "fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {\n",
+            "    relocate_store_path_with(path, registered_roots)\n",
+            "        .into_iter()\n",
+            "        .map(|(p, _)| (p, None))\n",
+            "        .collect()\n}"
+        );
+        assert_ne!(
+            compacted_body_of(survivor, head),
+            squeezed,
+            "control: the body pin cannot tell the measured survivor from the real delegation, \
+             so it is not what stands between this crate and it"
+        );
+        assert!(
+            compacted_body_of(survivor, head).starts_with(squeezed),
+            "control: the survivor fixture is not the delegation plus a post-process, so it is \
+             not the mutation this test claims to kill"
+        );
+        // Third, whitespace really is squeezed, so no reformatting turns this off.
+        let reformatted = concat!(
+            "fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {\n\n",
+            "    relocate_store_path_with(\n        path,\n        registered_roots,\n    )\n}"
+        );
+        assert_eq!(
+            compacted_body_of(reformatted, head),
+            concat!("relocate_store_path", "_with(path,registered_roots,)"),
+            "control: the squeeze does not survive a line break, so this pin is a formatting \
+             assertion wearing a behavioural one's clothes"
         );
     }
 
