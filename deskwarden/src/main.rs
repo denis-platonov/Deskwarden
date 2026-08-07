@@ -1677,12 +1677,25 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
+                    // **`FillChoice::Saved` is the choice that preserves what
+                    // the hotkey has always done**, and the only one that
+                    // does. `fill_action`'s pre-choice body was
+                    // `sequence_for(item)` with an empty-sequence fallback to
+                    // `FillAction::Default`, which is `Saved` exactly;
+                    // `FillChoice::UserTabPass` would be `Default` even for an
+                    // item that stores a sequence, quietly retiring every
+                    // stored sequence on this path. The hotkey has no overlay
+                    // and so no answer of its own to forward -- only
+                    // `handle_match` does -- so it names the preserving choice
+                    // here. `app::every_fill_call_site_passes_the_preserving
+                    // _choice` is what keeps that true.
                     fill_from_vault(
                         &estate.cache,
                         &injector,
                         &fill_stats,
                         &item_id,
                         hwnd,
+                        deskwarden::app::FillChoice::Saved,
                         &deskwarden::injector::sequence::REAL_NOTIFIER,
                     );
                 } else {

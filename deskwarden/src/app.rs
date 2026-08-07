@@ -196,6 +196,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
     hwnd: isize,
+    choice: FillChoice,
     notifier: &dyn sequence::Notifier,
 ) {
     let item = cache
@@ -216,7 +217,12 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
             // request on the path this app deliberately serves from the
             // in-memory cache so that autofill works with the backend
             // stopped.
-            let totp = if sequence_needs_a_one_time_code(&item) {
+            // Asked of the **choice**, not of the stored sequence.
+            // `sequence_needs_a_one_time_code` inspects only the sequence, so
+            // on `Just(Totp)` for an item that stores no `{TOTP}` it answers
+            // `false`, no code is fetched, and the one-time-code row refuses
+            // with `Unresolved` one hundred percent of the time.
+            let totp = if needs_a_one_time_code(&item, &choice) {
                 match cache.bridge().get_totp(item_id) {
                     Ok(code) => code,
                     Err(e) => {
@@ -228,7 +234,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
                 None
             };
 
-            match fill_action(&item, totp.as_deref()) {
+            match fill_action(&item, totp.as_deref(), &choice) {
                 Ok(FillAction::Default) => {
                     let (username, password) = credentials_for(&item);
                     // **The one plaintext password on this arm's stack, and
@@ -534,11 +540,41 @@ pub enum FillAction {
 /// window -- so every branch is reachable from a unit test. The alternative,
 /// which this crate has been bitten by ten commits running, is a decision made
 /// inside [`fill_from_vault`], which nothing can call.
+/// **`choice` is what the user asked for, and it is not a hint.**
+/// [`FillChoice::UserTabPass`] answers [`FillAction::Default`], and answers it
+/// *before* anything is parsed or planned. It is emphatically **not**
+/// `plan(parse(DEFAULT_SEQUENCE))`, even though [`key_sequence::DEFAULT_SEQUENCE`]
+/// spells out what the fallback types: `FillAction::Default` tries UI
+/// Automation's named-field fill first and only then falls back to `SendInput`,
+/// while a plan types at whatever happens to have focus. Collapsing the two
+/// reads as a simplification and would silently delete the UI Automation path
+/// for every item in every existing vault. See [`FillAction::Default`]'s own
+/// doc and [`crate::injector::Injector::fill_sequence`].
+///
+/// [`FillChoice::Just`] goes through the *same* runner as a stored sequence --
+/// [`key_sequence::render`] of that one field, then [`key_sequence::parse`],
+/// then [`sequence::plan`] -- rather than constructing a [`sequence::Plan`] by
+/// hand. A hand-built plan would not get the runner's rate, its literal
+/// escaping or its `Unresolved` refusal, so a field that cannot resolve would
+/// type nothing where it should have refused.
+///
+/// [`FillChoice::Saved`] is exactly what this function did before it took a
+/// choice at all, the empty-sequence fallback to `Default` included. That is
+/// what makes threading the choice through a behaviour-preserving step: every
+/// call site passes `Saved`.
 pub fn fill_action(
     item: &VaultItem,
     totp: Option<&str>,
+    choice: &FillChoice,
 ) -> Result<FillAction, sequence::Refusal> {
-    let stored = sequence_for(item);
+    let stored = match choice {
+        // Returns before the parse, deliberately. See the doc above.
+        FillChoice::UserTabPass => return Ok(FillAction::Default),
+        FillChoice::Just(field) => {
+            key_sequence::render(&[key_sequence::Token::Field(field.clone())])
+        }
+        FillChoice::Saved => sequence_for(item),
+    };
     if stored.is_empty() {
         return Ok(FillAction::Default);
     }
@@ -716,20 +752,17 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // one no test can reach, and an argument written here is an
             // argument nothing can check (review 32's Important 1).
             if let Some(choice) = prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
-                // `choice` is the user's answer, and the fill must be OF it.
-                // `fill_from_vault` cannot be told which choice to run until
-                // step 2 threads one through it; until then the overlay
-                // offers exactly one row (`prompt_choices`), so the only
-                // answer reachable here is the fill this has always done.
-                // The assertion is how that stays true: step 5 widening
-                // `prompt_choices` without step 2 landing first fails here
-                // rather than silently typing the wrong field.
-                debug_assert_eq!(
-                    choice,
-                    FillChoice::Saved,
-                    "the overlay answered a choice this fill cannot honour yet"
-                );
-                fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
+                // `choice` is the user's answer, and the fill is OF it. The
+                // `debug_assert_eq!(choice, FillChoice::Saved)` that stood
+                // here is gone because the thing it was standing in for has
+                // landed: `fill_from_vault` can now be told which choice to
+                // run, so the answer is forwarded instead of being asserted
+                // away. Behaviour is unchanged in this step only because
+                // `prompt_choices` still offers exactly one row, so `Saved`
+                // is still the only answer reachable here -- widening it is
+                // step 5's job, and when it does, this line already carries
+                // the right value rather than needing to be found again.
+                fill_from_vault(cache, injector, fill_stats, item_id, hwnd, choice, notifier);
             }
         }
     }
@@ -1726,6 +1759,210 @@ mod prompt_wiring_tests {
     }
 }
 
+/// **Every call site of the fill passes the choice that preserves what the
+/// fill has always done, in BOTH files that have one.**
+///
+/// This step gave `fill_from_vault` a `choice` parameter and changed nothing
+/// else, and that second half is a claim about the *call sites*, which no
+/// behavioural test in this crate can reach: `handle_match`'s call needs a real
+/// overlay and `main`'s needs a real hotkey. A call site switched to
+/// `FillChoice::UserTabPass` compiles, and it retires the stored auto-type
+/// sequence of every item in every existing vault -- while still typing a
+/// username and a password, so every "was something typed" assertion here
+/// stays green.
+///
+/// The two accepted forms are `FillChoice::Saved` (named at a call site that
+/// has no overlay answer of its own) and a forwarded binding called `choice`
+/// (`handle_match`, which does). `FillChoice::Saved` is what `fill_action`'s
+/// body was before it took a choice, empty-sequence fallback included, so
+/// those two are the preserving set and nothing else is.
+///
+/// Scanned rather than pinned as a whole-call needle, so that reformatting,
+/// renaming a local or adding a call cannot silently stop it pinning: it finds
+/// EVERY production call and checks EVERY one, and asserts it found the number
+/// it expects.
+///
+/// **Gated test modules are cut out first, and that is not tidiness.** The
+/// tests in this file deliberately drive `FillChoice::UserTabPass` and
+/// `FillChoice::Just(..)` through `fill_from_vault` -- that is what proves the
+/// new choices reach the two arms at all -- so a scan of the whole file would
+/// find them and either fail forever or have to be weakened until it accepted
+/// them, and a scan weakened to accept a test's `UserTabPass` would accept
+/// production's too. What is being claimed is about what SHIPS.
+#[cfg(test)]
+mod fill_call_site_tests {
+    // Split across two literals so `include_str!` of this very file does not
+    // match this declaration, in this crate's established idiom. No needle
+    // here contains a newline: a `\r\n` needle is vacuous on an LF checkout
+    // and vice versa, and this repo has no `.gitattributes`.
+    const CALL: &str = concat!("fill_from_vault", "(");
+    const PRESERVING: [&str; 2] = [concat!("FillChoice", "::Saved"), ", choice,"];
+
+    /// The number of calls in each file, so that a call site DELETED (rather
+    /// than changed) cannot pass this by leaving nothing to check.
+    const EXPECTED: [(&str, usize); 2] = [("app.rs", 1), ("main.rs", 1)];
+
+    fn sources() -> [(&'static str, &'static str); 2] {
+        [("app.rs", include_str!("app.rs")), ("main.rs", include_str!("main.rs"))]
+    }
+
+    /// `source` with every top-level `#[cfg(test)]` module removed.
+    ///
+    /// Line-based and anchored at column zero: a `#[cfg(test)]` on its own
+    /// line with no indentation, up to and including the next `}` on its own
+    /// line with no indentation. Every gated module in these two files has
+    /// that shape, and `the_cut_really_removes_the_tests` is what checks that
+    /// claim rather than assuming it.
+    ///
+    /// **`trim_end`, not a bare comparison.** `str::lines` strips the `\n` and
+    /// leaves the `\r`, so on this repo's CRLF working tree every line would
+    /// end in a carriage return, nothing would ever equal `"#[cfg(test)]"`,
+    /// the cut would silently do nothing and this whole module would go back
+    /// to scanning the tests it exists to exclude -- passing, because the
+    /// counts would then be whatever they are. Writing `"#[cfg(test)]\r\n"`
+    /// into a needle is the opposite trap: vacuous on an LF checkout.
+    fn production_only(source: &str) -> String {
+        let mut out = String::new();
+        let mut skipping = false;
+        for line in source.lines() {
+            let flat = line.trim_end();
+            if !skipping && flat == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if flat == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            out.push_str(flat);
+            out.push('\n');
+        }
+        assert!(!skipping, "a gated module never closed at column zero; the cut is unreliable");
+        out
+    }
+
+    /// The argument list of every call to the fill in `source`, as the
+    /// text between the opening paren and the first `);` after it.
+    fn argument_lists(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(CALL) {
+            let after = &rest[at + CALL.len()..];
+            let end = after.find(");").expect("a call that never closes");
+            out.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn the_scanner_finds_calls_and_can_tell_the_two_forms_apart() {
+        let planted = concat!(
+            "fill_from_vault", "(cache, injector, fill_stats, item_id, hwnd, choice, notifier);\n",
+            "fill_from_vault", "(&cache, &stats, 4242, FillChoice", "::UserTabPass, &notifier);"
+        );
+        let args = argument_lists(planted);
+        assert_eq!(args.len(), 2, "the scanner did not find both planted calls: {args:?}");
+        assert!(PRESERVING.iter().any(|p| args[0].contains(p)), "{}", args[0]);
+        assert!(
+            !PRESERVING.iter().any(|p| args[1].contains(p)),
+            "the scanner accepts a call site that does NOT preserve behaviour: {}",
+            args[1]
+        );
+        assert_eq!(argument_lists("nothing here").len(), 0);
+    }
+
+    /// **The cut is a real cut**, in both directions: it removes the gated
+    /// modules and keeps the production body. A `production_only` that
+    /// returned its input unchanged -- which is exactly what a `\r`-blind
+    /// comparison produces -- passes nothing here.
+    #[test]
+    fn the_cut_really_removes_the_tests() {
+        let mut kept_something = 0;
+        for (name, source) in sources() {
+            let cut = production_only(source);
+            assert!(cut.len() < source.len(), "{name}: the cut removed nothing at all");
+            // A LINE equal to the attribute, for the reason given below: both
+            // files name it in production prose.
+            let attrs = |s: &str| {
+                s.lines().filter(|l| l.trim() == concat!("#[", "test]")).count()
+            };
+            assert_eq!(
+                attrs(&cut),
+                0,
+                "{name}: a test survived the cut, so this module is scanning tests"
+            );
+            // A LINE equal to the gate, not the string anywhere: production
+            // doc comments in this file name the attribute in prose, and a
+            // guard that fires on prose is a guard that gets deleted.
+            assert_eq!(
+                cut.lines().filter(|l| l.trim_end() == concat!("#[cfg", "(test)]")).count(),
+                0,
+                "{name}: a gated module survived the cut"
+            );
+            assert!(attrs(source) > 0, "{name}: has no tests, so removing them proves nothing");
+            kept_something += 1;
+        }
+        assert_eq!(kept_something, 2, "a source was skipped");
+        // And the production body really is still there: the two call sites
+        // this module exists to check survive the cut.
+        assert!(production_only(include_str!("app.rs")).contains(concat!("fn handle", "_match")));
+        assert!(production_only(include_str!("main.rs"))
+            .contains(concat!("fill_hotkey", "_pressed")));
+    }
+
+    #[test]
+    fn every_fill_call_site_passes_the_preserving_choice() {
+        let mut checked = 0;
+        for (name, source) in sources() {
+            let args = argument_lists(&production_only(source));
+            let expected = EXPECTED
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, c)| *c)
+                .expect("every scanned file has an expected count");
+            assert_eq!(
+                args.len(),
+                expected,
+                "{name} has {} production calls to the fill, not {expected}; a call site was \
+                 added or deleted, so update EXPECTED deliberately rather than letting this drift",
+                args.len()
+            );
+            assert!(expected > 0, "{name} is scanned but has no call to check");
+            for arg in &args {
+                assert!(
+                    PRESERVING.iter().any(|p| arg.contains(p)),
+                    "a fill in {name} does not pass the behaviour-preserving choice, so this \
+                     step is not behaviour-preserving; its arguments are ({arg})"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            EXPECTED.iter().map(|(_, c)| c).sum::<usize>(),
+            "the loop did not check every call it found"
+        );
+    }
+
+    /// The production call in `handle_match` forwards the overlay's OWN
+    /// answer. `FillChoice::Saved` written there instead would satisfy the
+    /// scan above forever -- and would be the step-5 bug in advance: the user
+    /// clicks the one-time-code row and their password is typed.
+    #[test]
+    fn the_prompt_path_forwards_the_answer_it_was_given_rather_than_naming_one() {
+        let needle =
+            concat!("fill_from_vault", "(cache, injector, fill_stats, item_id, hwnd, choice, ");
+        assert_eq!(
+            production_only(include_str!("app.rs")).matches(needle).count(),
+            1,
+            "handle_match no longer hands the overlay's own answer to the fill"
+        );
+    }
+}
+
 /// **The wiring**: that a stored sequence actually reaches the typing path,
 /// and that an item without one still takes the fill it always took.
 ///
@@ -1790,20 +2027,23 @@ mod fill_dispatch_tests {
     fn an_item_with_no_sequence_takes_the_default_fill() {
         // Not a plan of DEFAULT_SEQUENCE: UI Automation fills named fields
         // and a sequence types at focus, and those are different acts.
-        assert!(matches!(fill_action(&item_with(""), None), Ok(FillAction::Default)));
+        assert!(matches!(
+            fill_action(&item_with(""), None, &FillChoice::Saved),
+            Ok(FillAction::Default)
+        ));
     }
 
     #[test]
     fn an_item_with_no_app_match_at_all_takes_the_default_fill() {
         let mut item = item_with("");
         item.fields.clear();
-        assert!(matches!(fill_action(&item, None), Ok(FillAction::Default)));
+        assert!(matches!(fill_action(&item, None, &FillChoice::Saved), Ok(FillAction::Default)));
     }
 
     #[test]
     fn a_stored_sequence_is_planned_from_the_items_own_values() {
         let item = item_with("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{S:PIN}");
-        let Ok(FillAction::Sequence(plan)) = fill_action(&item, None) else {
+        let Ok(FillAction::Sequence(plan)) = fill_action(&item, None, &FillChoice::Saved) else {
             panic!("a stored sequence must plan");
         };
         let typed: Vec<String> = plan
@@ -1825,13 +2065,18 @@ mod fill_dispatch_tests {
         // Silently degrading to username-Tab-password would type a password
         // into a screen that is asking for an email address.
         let item = item_with("{S:NOPE}");
-        assert!(matches!(fill_action(&item, None), Err(sequence::Refusal::Unresolved(_))));
+        assert!(matches!(
+            fill_action(&item, None, &FillChoice::Saved),
+            Err(sequence::Refusal::Unresolved(_))
+        ));
     }
 
     #[test]
     fn the_one_time_code_is_handed_to_the_plan() {
         let item = item_with("{TOTP}");
-        let Ok(FillAction::Sequence(plan)) = fill_action(&item, Some("246813")) else {
+        let Ok(FillAction::Sequence(plan)) =
+            fill_action(&item, Some("246813"), &FillChoice::Saved)
+        else {
             panic!("plans with a code");
         };
         assert_eq!(
@@ -1839,7 +2084,7 @@ mod fill_dispatch_tests {
             [Step::Text { text: "246813".into(), rate: sequence::DEFAULT_RATE }]
         );
         // Positive control: without the code, the same sequence refuses.
-        assert!(fill_action(&item_with("{TOTP}"), None).is_err());
+        assert!(fill_action(&item_with("{TOTP}"), None, &FillChoice::Saved).is_err());
     }
 
     #[test]
@@ -1849,6 +2094,149 @@ mod fill_dispatch_tests {
         assert!(sequence_needs_a_one_time_code(&item_with("{USERNAME}{TAB}{TOTP}")));
         assert!(!sequence_needs_a_one_time_code(&item_with("{USERNAME}{TAB}{PASSWORD}")));
         assert!(!sequence_needs_a_one_time_code(&item_with("")));
+    }
+
+    // -- fill_action, the choice ------------------------------------------
+
+    /// **The guard against the one damaging edit available in this step.**
+    ///
+    /// `FillChoice::UserTabPass` must answer `FillAction::Default` -- UI
+    /// Automation's named-field fill first, `SendInput` second -- and NOT
+    /// `plan(parse(DEFAULT_SEQUENCE))`. The two look interchangeable because
+    /// `DEFAULT_SEQUENCE` spells out what the fallback types, and collapsing
+    /// them reads as a simplification. It would delete the UI Automation path
+    /// for every item in every existing vault, silently: every behavioural
+    /// test that only asks "was something typed" would stay green.
+    #[test]
+    fn the_default_choice_is_still_the_default_fill_and_not_a_planned_sequence() {
+        assert!(matches!(
+            fill_action(&item_with(""), None, &FillChoice::UserTabPass),
+            Ok(FillAction::Default)
+        ));
+        // **And on an item that DOES store a sequence.** Without this the
+        // collapse is only tested where `Saved` also answers `Default`, so a
+        // `UserTabPass` arm that fell through to the stored-sequence body
+        // would pass. The fixture is asserted to disagree first, so the claim
+        // above is not being made against an item that plans nothing.
+        let stored = item_with("{USERNAME}{TAB}{PASSWORD}");
+        assert!(
+            matches!(fill_action(&stored, None, &FillChoice::Saved), Ok(FillAction::Sequence(_))),
+            "the fixture stores no sequence, so it cannot tell the two choices apart"
+        );
+        assert!(matches!(
+            fill_action(&stored, None, &FillChoice::UserTabPass),
+            Ok(FillAction::Default)
+        ));
+    }
+
+    /// **Each narrow row types its own field and nothing else.**
+    ///
+    /// Asserted on the typed TEXT, not on the step count: `Just(Username)` and
+    /// `Just(Password)` produce the same *shape* -- one `Step::Text` -- so a
+    /// mapping with the two swapped types a password into a username box and
+    /// every shape-only assertion stays green. The four expected values are
+    /// pairwise distinct by construction (see `USER`/`PASS`), which is what
+    /// makes the text assertion able to fail.
+    #[test]
+    fn each_narrow_choice_plans_only_the_field_it_names() {
+        use key_sequence::FieldRef;
+        // No stored sequence: so a plan here can only have come from the
+        // choice. `Saved` on this same item answers `Default`, asserted below.
+        let item = item_with("");
+        let code = "135790";
+        let cases = [
+            (FieldRef::Username, USER.to_string()),
+            (FieldRef::Password, PASS.to_string()),
+            (FieldRef::Totp, code.to_string()),
+            (FieldRef::Custom("PIN".to_string()), "4821".to_string()),
+        ];
+
+        // The choices under test are pairwise distinct, and so are the values
+        // they must type. Either collapsing would make the loop below assert
+        // one thing four times.
+        for (i, (a, _)) in cases.iter().enumerate() {
+            for (b, _) in cases.iter().skip(i + 1) {
+                assert_ne!(a, b, "two cases name the same field");
+            }
+        }
+        for (i, (_, a)) in cases.iter().enumerate() {
+            for (_, b) in cases.iter().skip(i + 1) {
+                assert_ne!(a, b, "two cases expect the same text: {a}");
+            }
+        }
+        assert!(
+            matches!(fill_action(&item, Some(code), &FillChoice::Saved), Ok(FillAction::Default)),
+            "the fixture stores a sequence, so a plan below need not have come from the choice"
+        );
+
+        let mut checked = 0;
+        for (field, expected) in &cases {
+            let choice = FillChoice::Just(field.clone());
+            let Ok(FillAction::Sequence(plan)) = fill_action(&item, Some(code), &choice) else {
+                panic!("{choice:?} must plan through the sequence runner");
+            };
+            assert_eq!(
+                plan.steps(),
+                [Step::Text { text: expected.clone(), rate: sequence::DEFAULT_RATE }],
+                "{choice:?} typed the wrong thing"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, cases.len(), "the loop skipped a choice");
+    }
+
+    /// A narrow row whose field is not on the item **refuses**, exactly as a
+    /// stored sequence naming a missing field does -- it does not silently
+    /// degrade to the default fill, which would type a password into a screen
+    /// asking for something else.
+    #[test]
+    fn a_narrow_choice_for_a_field_the_item_lacks_refuses() {
+        let choice = FillChoice::Just(key_sequence::FieldRef::Custom("NOPE".to_string()));
+        assert!(matches!(
+            fill_action(&item_with(""), None, &choice),
+            Err(sequence::Refusal::Unresolved(_))
+        ));
+    }
+
+    /// `Saved` is what `fill_action` did before it took a choice at all --
+    /// stored sequence, empty-sequence fallback to `Default` included. This is
+    /// the claim the whole step's behaviour-preservation rests on.
+    #[test]
+    fn the_saved_choice_still_plans_the_items_stored_sequence() {
+        let item = item_with("{USERNAME}{ENTER}{DELAY 2000}{PASSWORD}{S:PIN}");
+        let Ok(FillAction::Sequence(plan)) = fill_action(&item, None, &FillChoice::Saved) else {
+            panic!("a stored sequence must plan");
+        };
+        let typed: Vec<String> = plan
+            .steps()
+            .iter()
+            .filter_map(|s| match s {
+                Step::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(typed, vec![USER.to_string(), format!("{PASS}4821")]);
+        // And the other half of the old body: no stored sequence is still the
+        // default fill, not a refusal and not an empty plan.
+        assert!(matches!(
+            fill_action(&item_with(""), None, &FillChoice::Saved),
+            Ok(FillAction::Default)
+        ));
+    }
+
+    /// The choice, not the stored sequence, is what is asked about the code.
+    #[test]
+    fn only_a_choice_that_uses_a_one_time_code_asks_for_one() {
+        let plain = item_with("");
+        assert!(needs_a_one_time_code(&plain, &FillChoice::Just(key_sequence::FieldRef::Totp)));
+        let password = FillChoice::Just(key_sequence::FieldRef::Password);
+        assert!(!needs_a_one_time_code(&plain, &password));
+        assert!(!needs_a_one_time_code(&plain, &FillChoice::UserTabPass));
+        assert!(!needs_a_one_time_code(&plain, &FillChoice::Saved));
+        // The stored-sequence answer is unchanged, and disagrees with the
+        // line above on the SAME choice for a different item -- so the
+        // predicate is reading the item too.
+        assert!(needs_a_one_time_code(&item_with("{TOTP}"), &FillChoice::Saved));
     }
 
     #[test]
@@ -2213,7 +2601,15 @@ mod fill_dispatch_tests {
         };
         let stats = scratch_stats("dispatch");
         let notifier = sequence::RecordingNotifier::default();
-        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242, &notifier);
+        fill_from_vault(
+            &cache_with(item),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Saved,
+            &notifier,
+        );
         (rec, stats, notifier.take())
     }
 
@@ -2495,6 +2891,7 @@ mod fill_dispatch_tests {
             &stats,
             "item-1",
             4242,
+            FillChoice::Saved,
             &sequence::RecordingNotifier::default(),
         );
 
@@ -2545,11 +2942,151 @@ mod fill_dispatch_tests {
             &stats,
             "item-1",
             4242,
+            FillChoice::Saved,
             &sequence::RecordingNotifier::default(),
         );
 
         assert_eq!(rec.sequences.lock().unwrap().len(), 1);
         totp.expect(0).assert();
+    }
+
+    /// **The CHOICE is what makes the fill fetch a code.**
+    ///
+    /// The item here stores no sequence at all, so
+    /// `sequence_needs_a_one_time_code` answers `false` about it. Gating the
+    /// fetch on that older, sequence-only question -- which is what
+    /// `fill_from_vault` did before this step -- leaves `Just(Totp)` with
+    /// `totp: None`, and the one-time-code row then refuses with `Unresolved`
+    /// one hundred percent of the time while every test of `fill_action` and
+    /// of the predicate stays green. Only the act catches it.
+    #[test]
+    fn a_choice_that_needs_a_code_is_what_makes_the_fill_fetch_one() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let totp = server
+            .mock("GET", "/object/totp/item-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":"907142"}}"#)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        // Deliberately no stored sequence -- see the doc above.
+        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+        assert!(
+            !sequence_needs_a_one_time_code(&item_with("")),
+            "the fixture stores a {{TOTP}}, so the old gate would have fetched anyway and this \
+             test would prove nothing"
+        );
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("choice-totp");
+        fill_from_vault(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Just(key_sequence::FieldRef::Totp),
+            &sequence::RecordingNotifier::default(),
+        );
+
+        totp.assert();
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the sequence path was not reached");
+        assert_eq!(
+            sequences[0].1,
+            [Step::Text { text: "907142".to_string(), rate: sequence::DEFAULT_RATE }],
+            "the fetched code is not what was typed"
+        );
+    }
+
+    /// The negative control for the test above, on the **same item**: a choice
+    /// that needs no code pays for no round trip. Without this, "the fetch
+    /// happens" is also what a `fill_from_vault` that fetches unconditionally
+    /// reports -- and that version would put an HTTP request on the path this
+    /// app deliberately serves from the in-memory cache.
+    #[test]
+    fn a_choice_that_needs_no_code_makes_no_totp_request() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let mut server = mockito::Server::new();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+        let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let _ = cache.populate_with(vec![item_with("")], cache.epoch()).expect("seeds");
+
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("choice-nototp");
+        fill_from_vault(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            &sequence::RecordingNotifier::default(),
+        );
+
+        // Positive control: the fill really ran and really typed, so
+        // "no request" cannot mean "nothing happened".
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the fill never reached the sequence path");
+        assert_eq!(
+            sequences[0].1,
+            [Step::Text { text: PASS.to_string(), rate: sequence::DEFAULT_RATE }]
+        );
+        totp.expect(0).assert();
+    }
+
+    /// **`UserTabPass` reaches the UI-Automation-first path, not the runner.**
+    ///
+    /// `fill_action`'s unit test says `Ok(FillAction::Default)`; this says the
+    /// fill ACTED on it. A `fill_from_vault` that mapped the default choice
+    /// through the sequence runner would still type a username and a password
+    /// into the window, so every "was something typed" assertion in this
+    /// module stays green -- what changes is that it arrives as keystrokes at
+    /// whatever has focus instead of through named UIA fields.
+    #[test]
+    fn the_default_choice_reaches_the_default_fill_and_not_the_runner() {
+        let _serialised = crate::injector::sequence_test_lock();
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let stats = scratch_stats("choice-default");
+        // A stored sequence, so `Saved` here would take the OTHER arm: the
+        // fixture disagrees with itself between the two choices.
+        let item = item_with("{USERNAME}{TAB}{PASSWORD}");
+        fill_from_vault(
+            &cache_with(item),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::UserTabPass,
+            &sequence::RecordingNotifier::default(),
+        );
+        assert_eq!(
+            *rec.default_fills.lock().unwrap(),
+            vec![(4242, USER.to_string(), PASS.to_string())],
+            "the default choice did not go through the default fill"
+        );
+        assert!(
+            rec.sequences.lock().unwrap().is_empty(),
+            "the default choice was planned as a sequence, which deletes the UI Automation path"
+        );
     }
 
     /// A refused sequence types **nothing at all** -- not the sequence, and
@@ -2609,7 +3146,15 @@ mod fill_dispatch_tests {
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
         let stats = scratch_stats("refused-default");
         let notifier = sequence::RecordingNotifier::default();
-        fill_from_vault(&cache_with(item), &injector, &stats, "item-1", 4242, &notifier);
+        fill_from_vault(
+            &cache_with(item),
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Saved,
+            &notifier,
+        );
         drop(held);
         (rec, stats, notifier.take())
     }
@@ -2729,6 +3274,7 @@ mod fill_dispatch_tests {
             &stats,
             "item-1",
             4242,
+            FillChoice::Saved,
             &notifier,
         );
 
@@ -2836,7 +3382,15 @@ mod fill_dispatch_tests {
 
         let notifier = sequence::RecordingNotifier::default();
         let leaked = plaintext_reached_the_allocator(|| {
-            fill_from_vault(&cache, &injector, &stats, "item-1", 4242, &notifier);
+            fill_from_vault(
+                &cache,
+                &injector,
+                &stats,
+                "item-1",
+                4242,
+                FillChoice::Saved,
+                &notifier,
+            );
         });
 
         // Positive control: the fill really did take the default path and
