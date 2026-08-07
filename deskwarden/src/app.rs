@@ -741,27 +741,35 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // degrading every Prompt-mode overlay to the bare
             // "fill something?" this comment used to call unacceptable.
             //
-            // (`prompt_request` is where the password is deliberately never
+            // (`prompt_subject` is where the password is deliberately never
             // touched -- see its doc.)
-            let item = cache.items().into_iter().find(|i| i.id == item_id);
+            //
+            // **The item is not bound here any more.** It is the lookup
+            // closure's answer, reduced to a `PromptSubject` and dropped
+            // inside `prompt_arm_for` before the overlay opens -- a `let item`
+            // on this line would be alive for the whole time the modal card is
+            // on screen, which is however long the user takes to decide.
+            //
             // Every decision about the overlay -- what it says, and where it
-            // opens -- is made in `prompt_arm`, which a test drives with a
-            // recording presenter; this function only reads the cache and
-            // supplies the real presenter. **No value the overlay is given is
-            // computed on this line**, which is the point: this line is the
-            // one no test can reach, and an argument written here is an
-            // argument nothing can check (review 32's Important 1).
-            if let Some(choice) = prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
+            // opens -- is made in `prompt_arm_for`/`prompt_arm`, which a test
+            // drives with a recording presenter and a recording lookup; this
+            // function only names the cache read and supplies the real
+            // presenter. **No value the overlay is given is computed on this
+            // line**, which is the point: this line is the one no test can
+            // reach, and an argument written here is an argument nothing can
+            // check (review 32's Important 1).
+            let lookup = || cache.items().into_iter().find(|i| i.id == item_id);
+            if let Some(choice) = prompt_arm_for(&REAL_OVERLAY, window, lookup) {
                 // `choice` is the user's answer, and the fill is OF it. The
                 // `debug_assert_eq!(choice, FillChoice::Saved)` that stood
                 // here is gone because the thing it was standing in for has
                 // landed: `fill_from_vault` can now be told which choice to
                 // run, so the answer is forwarded instead of being asserted
-                // away. Behaviour is unchanged in this step only because
-                // `prompt_choices` still offers exactly one row, so `Saved`
-                // is still the only answer reachable here -- widening it is
-                // step 5's job, and when it does, this line already carries
-                // the right value rather than needing to be found again.
+                // away. As of step 5 this is no longer a distinction without
+                // a difference: `prompt_choices` offers the rows the item
+                // really supports, so `UserTabPass` and `Just(field)` are
+                // both reachable here and naming a literal `Saved` would type
+                // something other than the row the user clicked.
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd, choice, notifier);
             }
         }
@@ -787,20 +795,75 @@ pub struct PromptRequest<'a> {
     pub choices: Vec<FillChoice>,
 }
 
-/// The rows to offer for a Prompt-mode match.
+/// The rows to offer for a Prompt-mode match: **the rows this item actually
+/// supports**, from [`fill_choices`].
 ///
-/// **Deliberately one row, and deliberately not [`fill_choices`] yet.** The
-/// machinery from the overlay back to `handle_match` now carries *which* row
-/// the user picked, but offering the user more than one row is step 5's
-/// change, and until [`fill_action`]/[`fill_from_vault`] can be told which
-/// choice to run (step 2) a second row would be a row that types the wrong
-/// thing. [`FillChoice::Saved`] is what the fill has always done, so the
-/// overlay is byte-for-byte the card it was and the feature is invisible.
+/// This is the line the whole feature was built towards. Every step before it
+/// widened the machinery -- the overlay draws N rows, sizes itself for N,
+/// answers *which* row, and [`fill_from_vault`] runs the row it is told to --
+/// while this function kept production at the single [`FillChoice::Saved`] row
+/// the app has always shown, so that each step was provably invisible. It is
+/// no longer invisible: an item with a username and a password now offers
+/// `Username + Tab + Password` first and each field on its own beneath it, and
+/// an SSO screen's email-only item offers exactly the one row it can fill.
 ///
-/// Step 5 replaces the body with `item.map(fill_choices).unwrap_or_default()`;
-/// nothing else moves, which is the point of routing it through one function.
-pub fn prompt_choices(_item: Option<&VaultItem>) -> Vec<FillChoice> {
-    vec![FillChoice::Saved]
+/// **A cache miss stays fillable.** `None` (the item could not be read back)
+/// answers the empty list, and an empty list is not "no rows": both
+/// [`overlay_ui::draw_overlay_card_rows`] and [`overlay_ui::overlay_height`]
+/// treat it as the single matched-credential row the overlay has always
+/// painted, which answers [`FillChoice::Saved`] -- exactly the old behaviour,
+/// for exactly the case that used to be all of them. An item with no
+/// username, no password, no one-time code and no stored sequence takes the
+/// same path.
+///
+/// It stays a named function rather than being inlined into
+/// [`prompt_subject`] so that "what production offers" is a question a test
+/// can ask directly, without a presenter.
+pub fn prompt_choices(item: Option<&VaultItem>) -> Vec<FillChoice> {
+    item.map(fill_choices).unwrap_or_default()
+}
+
+/// Everything the overlay needs about the matched item, and **nothing else**.
+///
+/// The point of this type is what it does *not* contain. `handle_match` used
+/// to hold the whole cloned [`VaultItem`] -- login object, plaintext password
+/// and TOTP seed included -- for the entire lifetime of a modal overlay the
+/// user may leave on screen for minutes, and only drop it afterwards. The
+/// secrets are [`zeroize::Zeroizing`], so they were wiped on that drop rather
+/// than released in the clear, but "wiped eventually" and "not resident while
+/// a window is open" are different guarantees and only the second is the one
+/// worth having: the residency window was as long as the user was undecided.
+///
+/// So the item is now reduced to this the moment it is read and dropped
+/// before the overlay opens. Both fields are presence-or-label only: the
+/// display name and username are what the card already showed, and
+/// [`fill_choices`] asks only *whether* a value is there. The fill re-resolves
+/// the item from the cache after the choice, as it already did.
+pub struct PromptSubject {
+    /// What the card says it is offering; `None` on a cache miss.
+    pub matched: Option<overlay_ui::OverlayMatch>,
+    /// The rows to offer, in order; the first is the primary.
+    pub choices: Vec<FillChoice>,
+}
+
+/// Reduces a matched item to [`PromptSubject`] -- the only thing that crosses
+/// into the prompt.
+///
+/// The username is read straight off the login object rather than through
+/// [`credentials_for`]: that helper also clones the plaintext password into a
+/// `String` this path has no use for. The overlay never shows a password, so
+/// it should never hold one.
+pub fn prompt_subject(item: Option<&VaultItem>) -> PromptSubject {
+    PromptSubject {
+        matched: item.map(|item| {
+            let username = item.login.as_ref().and_then(|l| l.username.clone());
+            overlay_ui::OverlayMatch {
+                item_name: item.name.clone(),
+                username: username.filter(|u| !u.is_empty()),
+            }
+        }),
+        choices: prompt_choices(item),
+    }
 }
 
 /// **The whole of the Prompt decision, as a pure function** (review 31's
@@ -819,31 +882,25 @@ pub fn prompt_choices(_item: Option<&VaultItem>) -> Vec<FillChoice> {
 /// table belongs to a window whose `exe_name` is the frame host's, and that
 /// name means nothing to the user.
 ///
-/// `item` is passed in rather than looked up here, because the lookup is the
-/// one part that needs the cache; `position` likewise, because computing it
-/// needs Win32. What is left is the part that can be got wrong silently.
+/// The `subject` is passed in rather than looked up here, because the lookup
+/// is the one part that needs the cache; `position` likewise, because
+/// computing it needs Win32. What is left is the part that can be got wrong
+/// silently.
 ///
-/// The username is read straight off the login object rather than through
-/// [`credentials_for`]: that helper also clones the plaintext password into a
-/// `String` this path has no use for, and which would then be dropped without
-/// being zeroized. The overlay never shows a password, so it should never hold
-/// one.
+/// **It takes a [`PromptSubject`], not a `&VaultItem`.** That is the type-level
+/// half of the drop-early guarantee: this function, and everything downstream
+/// of it, cannot hold the item across the overlay because it is never handed
+/// one. [`prompt_arm_for`] is the behavioural half.
 pub fn prompt_request<'a>(
     window: &'a crate::window_watch::ForegroundEvent,
-    item: Option<&VaultItem>,
+    subject: PromptSubject,
     position: Option<(f32, f32)>,
 ) -> PromptRequest<'a> {
     PromptRequest {
         label: window_label(&window.exe_name, &window.title),
-        matched: item.map(|item| {
-            let username = item.login.as_ref().and_then(|l| l.username.clone());
-            overlay_ui::OverlayMatch {
-                item_name: item.name.clone(),
-                username: username.filter(|u| !u.is_empty()),
-            }
-        }),
+        matched: subject.matched,
         position,
-        choices: prompt_choices(item),
+        choices: subject.choices,
     }
 }
 
@@ -960,18 +1017,53 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
 pub fn prompt_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
-    item: Option<&VaultItem>,
+    subject: PromptSubject,
 ) -> Option<FillChoice> {
     // The placement is asked for BEFORE the request is built, because how
     // tall the window is -- and therefore how far down the work area its top
-    // may be -- is a function of the row count. Both the count asked about
-    // and the count shown come from `prompt_choices`, and
+    // may be -- is a function of the row count. The count asked about is the
+    // subject's OWN list, the same one that is shown a line later -- not a
+    // second call to `prompt_choices`, which would be two answers about one
+    // card and could disagree.
     // `the_placement_is_asked_about_the_number_of_rows_that_are_shown` holds
     // the two together.
-    let position = presenter.position(window.hwnd, prompt_choices(item).len());
+    let position = presenter.position(window.hwnd, subject.choices.len());
     let PromptRequest { label, matched, position, choices } =
-        prompt_request(window, item, position);
+        prompt_request(window, subject, position);
     presenter.show(label, matched.as_ref(), position, &choices)
+}
+
+/// [`prompt_arm`] with the vault lookup in front of it, so that **the item is
+/// dropped before the overlay opens**.
+///
+/// This exists to make an ordering claim executable. `handle_match` cannot be
+/// called by a test -- it needs a `VaultCache`, an `Injector` and a
+/// `FillStats`, and it opens a real window -- so "the item is reduced and let
+/// go before the modal card goes up" written inline there would be a comment,
+/// and the exact shape of defect this crate keeps finding is a correct
+/// statement at a place nothing can observe. Here, the lookup is a closure and
+/// the presenter is a parameter, so a test can hand in a value whose `Drop`
+/// records itself and a presenter that records itself, and read the order.
+///
+/// Generic over what the lookup answers (`I: Borrow<VaultItem>`) purely so
+/// that test value can exist; production instantiates it at `VaultItem` and
+/// the monomorphised body is the same three lines.
+///
+/// The item lives for exactly one statement. It is not bound to a `let` and
+/// then `drop`ped, because a binding is something a later edit can quietly
+/// move past the `prompt_arm` call; a temporary that never escapes its
+/// statement cannot outlive it however the lines beneath are rearranged.
+pub fn prompt_arm_for<P: PromptPresenter, I: std::borrow::Borrow<VaultItem>>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    lookup: impl FnOnce() -> Option<I>,
+) -> Option<FillChoice> {
+    // The item is a temporary of THIS statement: it is dropped -- and its
+    // `Zeroizing` password and TOTP seed wiped -- at the semicolon, which is
+    // before the presenter is touched at all, let alone before the card is on
+    // screen. `the_item_is_dropped_before_the_overlay_opens` reads that order.
+    let subject = prompt_subject(lookup().as_ref().map(|item| item.borrow()));
+    prompt_arm(presenter, window, subject)
 }
 
 /// What to call the app in a window a foreground event describes.
@@ -1138,7 +1230,7 @@ mod tests {
     #[test]
     fn a_title_matched_store_frame_is_prompted_for_under_its_own_title() {
         let w = window(HOST, "Speedtest");
-        let request = prompt_request(&w, None, None);
+        let request = prompt_request(&w, prompt_subject(None), None);
         assert_eq!(request.label, "Speedtest");
     }
 
@@ -1147,7 +1239,7 @@ mod tests {
         // The positive control: a `prompt_request` that always answered with
         // the title would pass the test above and fail this one.
         let w = window("Ledgerline.exe", "Ledgerline -- Invoices");
-        let request = prompt_request(&w, None, None);
+        let request = prompt_request(&w, prompt_subject(None), None);
         assert_eq!(request.label, "Ledgerline.exe");
     }
 
@@ -1155,7 +1247,7 @@ mod tests {
     fn the_prompt_names_the_credentials_it_is_offering() {
         let item = login_item("Ledgerline", "denis@example.com");
         let w = window("Ledgerline.exe", "Ledgerline");
-        let request = prompt_request(&w, Some(&item), None);
+        let request = prompt_request(&w, prompt_subject(Some(&item)), None);
 
         let matched = request.matched.expect("design 2a: never a bare \"fill something?\"");
         assert_eq!(matched.item_name, "Ledgerline");
@@ -1167,13 +1259,13 @@ mod tests {
         // An empty username is "no username", not a blank line in the overlay.
         let item = login_item("Ledgerline", "");
         let w = window("Ledgerline.exe", "Ledgerline");
-        let request = prompt_request(&w, Some(&item), None);
+        let request = prompt_request(&w, prompt_subject(Some(&item)), None);
         let matched = request.matched.expect("the item is still named");
         assert_eq!(matched.item_name, "Ledgerline");
         assert_eq!(matched.username, None);
 
         // And a cache miss is not fatal to the prompt at all.
-        let request = prompt_request(&w, None, None);
+        let request = prompt_request(&w, prompt_subject(None), None);
         assert!(request.matched.is_none());
     }
 
@@ -1183,9 +1275,9 @@ mod tests {
         // computed here; what CAN be got wrong is dropping it on the way
         // through, which lands the overlay wherever the OS likes.
         let w = window("a.exe", "A");
-        let request = prompt_request(&w, None, Some((120.0, 340.0)));
+        let request = prompt_request(&w, prompt_subject(None), Some((120.0, 340.0)));
         assert_eq!(request.position, Some((120.0, 340.0)));
-        let request = prompt_request(&w, None, None);
+        let request = prompt_request(&w, prompt_subject(None), None);
         assert_eq!(request.position, None);
     }
 
@@ -1337,7 +1429,7 @@ mod tests {
             ..Default::default()
         };
 
-        prompt_arm(&presenter, &w, Some(&item));
+        prompt_arm(&presenter, &w, prompt_subject(Some(&item)));
 
         // Asked about the window that matched, not about some other handle.
         assert_eq!(presenter.asked_about.get(), Some(w.hwnd));
@@ -1365,7 +1457,7 @@ mod tests {
         let w = window(HOST, "Speedtest");
         let presenter = RecordingPresenter::default();
 
-        prompt_arm(&presenter, &w, None);
+        prompt_arm(&presenter, &w, prompt_subject(None));
 
         let shown = presenter.shown.borrow();
         assert_eq!(shown.len(), 1);
@@ -1385,9 +1477,9 @@ mod tests {
             answer: Some(FillChoice::Saved),
             ..Default::default()
         };
-        assert!(prompt_arm(&filled, &w, None).is_some());
+        assert!(prompt_arm(&filled, &w, prompt_subject(None)).is_some());
         let dismissed = RecordingPresenter::default();
-        assert!(prompt_arm(&dismissed, &w, None).is_none());
+        assert!(prompt_arm(&dismissed, &w, prompt_subject(None)).is_none());
     }
 
     /// **The choice the overlay answered is the choice the caller receives.**
@@ -1406,7 +1498,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(prompt_arm(&presenter, &w, None), Some(answered.clone()));
+        assert_eq!(prompt_arm(&presenter, &w, prompt_subject(None)), Some(answered.clone()));
         // The control: the answer is not the one a collapse would produce, so
         // the assertion above cannot pass by accident.
         assert_ne!(answered, FillChoice::Saved);
@@ -1423,7 +1515,7 @@ mod tests {
             answer: None,
             ..Default::default()
         };
-        assert_eq!(prompt_arm(&presenter, &w, None), None);
+        assert_eq!(prompt_arm(&presenter, &w, prompt_subject(None)), None);
         // ... and it really did open the overlay, so `None` is the user's
         // answer and not a card that was never shown.
         assert_eq!(presenter.shown.borrow().len(), 1);
@@ -1439,7 +1531,7 @@ mod tests {
         let w = window("Ledgerline.exe", "Ledgerline");
         let presenter = RecordingPresenter::default();
 
-        prompt_arm(&presenter, &w, Some(&item));
+        prompt_arm(&presenter, &w, prompt_subject(Some(&item)));
 
         let offered = presenter.offered.borrow();
         assert_eq!(offered.len(), 1, "the overlay is offered rows exactly once");
@@ -1452,19 +1544,336 @@ mod tests {
         );
     }
 
-    /// Step 4 deliberately keeps production at one row -- the fill it has
-    /// always done -- because `fill_from_vault` cannot yet be told which
-    /// choice to run. This is that promise, written down where widening
-    /// `prompt_choices` (step 5) breaks it loudly.
+    // ---- Step 5: production offers the rows the item really supports ----
+
+    /// A password that appears nowhere else in this crate, so finding it
+    /// anywhere the overlay can see is unambiguous.
+    const PROMPT_SECRET: &str = "correct-horse-STAPLE-battery-42";
+
+    /// An item with both credentials and **no stored sequence**, so
+    /// [`fill_choices`] takes its presence branch rather than answering
+    /// `Saved`. `login_item`'s sibling: that one has a username and nothing
+    /// else, which is the SSO shape.
+    fn both_credentials_item(name: &str, username: &str) -> VaultItem {
+        VaultItem {
+            name: name.to_string(),
+            login: Some(crate::vault_bridge::LoginData {
+                username: Some(username.to_string()),
+                password: Some(PROMPT_SECRET.to_string().into()),
+                ..crate::vault_bridge::LoginData::default()
+            }),
+            ..item("1", None)
+        }
+    }
+
+    /// **The SSO screen the user described**: "mabl has two options -- user\\pass
+    /// and SSO where only email". An item that carries an email and no
+    /// password can fill exactly one thing, and the card must offer exactly
+    /// that -- not a `Username + Tab + Password` row that would type a Tab and
+    /// then nothing, and not a password row for a password that is not there.
+    ///
+    /// `assert_eq!` on the whole vector, not `contains`: the defect this
+    /// forbids is an EXTRA row, and `contains` cannot see one.
     #[test]
-    fn production_still_offers_exactly_the_one_row_it_always_has() {
-        let item = login_item("Ledgerline", "denis@example.com");
-        assert_eq!(prompt_choices(Some(&item)), vec![FillChoice::Saved]);
-        assert_eq!(prompt_choices(None), vec![FillChoice::Saved]);
-        let w = window("Ledgerline.exe", "Ledgerline");
+    fn an_sso_item_offers_exactly_one_row_in_production() {
+        let sso = login_item("Mabl SSO", "denis@example.com");
         assert_eq!(
-            prompt_request(&w, Some(&item), None).choices,
-            vec![FillChoice::Saved]
+            prompt_choices(Some(&sso)),
+            vec![FillChoice::Just(key_sequence::FieldRef::Username)]
+        );
+
+        // The fixture really is the SSO shape and not just an item nothing
+        // can be said about: the same function answers three rows for an item
+        // that does have a password, so the one row above is a fact about
+        // this item rather than a constant.
+        assert_eq!(
+            prompt_choices(Some(&both_credentials_item("Ledgerline", "denis@example.com"))).len(),
+            3
+        );
+    }
+
+    /// **The common case leads with the row Enter takes.** The overlay's
+    /// primary row is `choices[0]`, and Enter fills it without the user
+    /// looking; on a user+password screen that must be
+    /// `Username + Tab + Password`. Reordering the list is behaviour-identical
+    /// for every mouse click and wrong for every keyboard user.
+    ///
+    /// Driven through the **production** path -- `prompt_arm` with a recording
+    /// presenter -- rather than by calling `fill_choices` directly, so it also
+    /// fails if `prompt_choices` stops being what the overlay is handed.
+    #[test]
+    fn an_item_with_both_credentials_leads_with_username_tab_password() {
+        let item = both_credentials_item("Ledgerline", "denis@example.com");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let presenter = RecordingPresenter::default();
+
+        prompt_arm(&presenter, &w, prompt_subject(Some(&item)));
+
+        let offered = presenter.offered.borrow();
+        assert_eq!(offered.len(), 1, "the overlay is offered rows exactly once");
+        assert_eq!(
+            offered[0],
+            vec![
+                FillChoice::UserTabPass,
+                FillChoice::Just(key_sequence::FieldRef::Username),
+                FillChoice::Just(key_sequence::FieldRef::Password),
+            ]
+        );
+        // Said again as the property, not as the list: this is the assertion
+        // that a reordering has to break, and it is the one the doc names.
+        assert_eq!(offered[0][0], FillChoice::UserTabPass);
+        // ... and it is not the only row, or "first" would be vacuous.
+        assert!(offered[0].len() > 1);
+    }
+
+    /// **The card is placed and built for the rows production really gives
+    /// it.** `prompt_choices` widening from one row to three moves the window
+    /// the OS is asked for by 150pt; a placement or a viewport still computed
+    /// for one row is a frameless, unresizable, unscrollable card with its
+    /// bottom rows off the work area -- and every row-content assertion above
+    /// stays green, because the rows are all correctly *drawn*, just not all
+    /// on screen.
+    #[test]
+    fn the_overlay_is_sized_for_the_rows_production_actually_gives_it() {
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let sso = login_item("Mabl SSO", "denis@example.com");
+        let both = both_credentials_item("Ledgerline", "denis@example.com");
+
+        let mut heights = Vec::new();
+        let mut checked = 0;
+        for item in [&sso, &both] {
+            let presenter = RecordingPresenter::default();
+            prompt_arm(&presenter, &w, prompt_subject(Some(item)));
+
+            let offered = presenter.offered.borrow();
+            assert_eq!(offered.len(), 1);
+            let rows = offered[0].len();
+            assert_eq!(
+                presenter.asked_rows.get(),
+                Some(rows),
+                "the placement was computed for a card of a different height than the one \
+                 that is drawn"
+            );
+            // Observed out of the viewport production really asks the OS for,
+            // not recomputed from `overlay_height` here.
+            let requested = overlay_ui::overlay_options(&offered[0], None)
+                .viewport
+                .inner_size
+                .expect("the overlay viewport must request an inner size at all");
+            assert_eq!(requested.y, overlay_ui::overlay_height(rows));
+            heights.push(requested.y);
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "the loop must have visited both fixtures");
+        // The control: the two fixtures disagree, so a viewport pinned to one
+        // row -- the historical size, and the mutation that looks like a
+        // simplification -- cannot pass this test.
+        assert_ne!(heights[0], heights[1]);
+        assert_eq!(heights[0], overlay_ui::overlay_height(1));
+    }
+
+    /// A [`PromptPresenter`] that keeps **every `&str` it is handed**, from
+    /// every argument that carries one.
+    #[derive(Default)]
+    struct StringSpy {
+        seen: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl PromptPresenter for StringSpy {
+        fn position(&self, _hwnd: isize, _rows: usize) -> Option<(f32, f32)> {
+            None
+        }
+
+        fn show(
+            &self,
+            label: &str,
+            matched: Option<&overlay_ui::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            choices: &[FillChoice],
+        ) -> Option<FillChoice> {
+            let mut seen = self.seen.borrow_mut();
+            seen.push(label.to_string());
+            if let Some(m) = matched {
+                seen.push(m.item_name.clone());
+                seen.extend(m.username.clone());
+            }
+            // The labels are what the rows SAY, which is the other string
+            // surface the overlay renders.
+            seen.extend(choices.iter().map(|c| c.label()));
+            None
+        }
+    }
+
+    /// **Nothing plaintext-secret crosses the prompt.** The overlay is a
+    /// window on another app's screen, and the strings it is given end up in
+    /// egui's galley cache and in this process's memory for as long as the
+    /// card is up. `fill_choices` is presence-only and the card is handed
+    /// labels; this asserts that end-to-end rather than by reading the code.
+    #[test]
+    fn no_secret_value_is_handed_to_the_presenter() {
+        let item = both_credentials_item("Ledgerline", "denis@example.com");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let spy = StringSpy::default();
+
+        prompt_arm(&spy, &w, prompt_subject(Some(&item)));
+
+        let seen = spy.seen.borrow();
+        // Without this, a presenter that was handed nothing at all -- or a
+        // `show` that was never called -- would pass the loop below trivially.
+        // Deliberately "not empty" and not a row count: this test's claim is
+        // about what the strings CONTAIN, and coupling it to how many rows
+        // production offers would make it fail for reasons that are not
+        // leaks, which is how a security guard gets read as noise.
+        assert!(
+            !seen.is_empty(),
+            "the spy was handed no strings at all, so the loop below proves nothing"
+        );
+        // And it is the right strings: the fixture's own username is there,
+        // so the spy is looking at the surface the overlay draws.
+        assert!(seen.iter().any(|s| s == "denis@example.com"));
+        assert!(seen.iter().any(|s| s == "Ledgerline"));
+
+        // The fixture's password is a value nothing on this path has any use
+        // for. Substring, not equality: a label that embedded it, or a
+        // `format!` that pasted it into the secondary line, must fail too.
+        for s in seen.iter() {
+            assert!(
+                !s.contains(PROMPT_SECRET),
+                "the overlay was handed {s:?}, which contains the item's plaintext password"
+            );
+        }
+        // The control for the check itself: it can fail.
+        assert!(format!("fills {PROMPT_SECRET}").contains(PROMPT_SECRET));
+    }
+
+    // ---- The item is let go before the card goes up ----
+
+    /// A `VaultItem` wrapper whose `Drop` writes into a shared log, so that
+    /// "the item was released" is an event with a position in a sequence
+    /// rather than an assertion about source text.
+    struct DropRecorder {
+        item: VaultItem,
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl std::borrow::Borrow<VaultItem> for DropRecorder {
+        fn borrow(&self) -> &VaultItem {
+            &self.item
+        }
+    }
+
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push("item released");
+        }
+    }
+
+    /// A presenter that writes its two calls into the same log.
+    struct OrderingPresenter {
+        log: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl PromptPresenter for OrderingPresenter {
+        fn position(&self, _hwnd: isize, _rows: usize) -> Option<(f32, f32)> {
+            self.log.borrow_mut().push("placement asked");
+            None
+        }
+
+        fn show(
+            &self,
+            _label: &str,
+            _matched: Option<&overlay_ui::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<FillChoice> {
+            self.log.borrow_mut().push("overlay shown");
+            None
+        }
+    }
+
+    /// **The security claim of this step, as behaviour.** `handle_match` used
+    /// to bind the whole cloned item -- login object, plaintext password and
+    /// TOTP seed -- and hold it for as long as the modal overlay was on
+    /// screen, which is as long as the user took to decide. It is now reduced
+    /// to a `PromptSubject` of labels and dropped before the card exists.
+    ///
+    /// Behavioural, not pinned: the item's `Drop` and the presenter's two
+    /// calls write into one log and the order is read off it.
+    #[test]
+    fn the_item_is_dropped_before_the_overlay_opens() {
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let presenter = OrderingPresenter { log: log.clone() };
+
+        let answer = prompt_arm_for(&presenter, &w, || {
+            Some(DropRecorder {
+                item: both_credentials_item("Ledgerline", "denis@example.com"),
+                log: log.clone(),
+            })
+        });
+        assert_eq!(answer, None, "the ordering presenter dismisses");
+
+        assert_eq!(
+            *log.borrow(),
+            vec!["item released", "placement asked", "overlay shown"],
+            "the matched item must be released BEFORE the overlay is placed or shown -- \
+             anything else leaves the plaintext password resident for the whole life of a \
+             modal window"
+        );
+    }
+
+    /// The positive control for the test above, and the regression it exists
+    /// for: an item held across the call logs its release last. Without this,
+    /// an assertion that merely found the three events in some order -- or a
+    /// `DropRecorder` that recorded at the wrong moment -- would look like
+    /// proof.
+    #[test]
+    fn an_item_held_across_the_prompt_is_visibly_released_last() {
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let presenter = OrderingPresenter { log: log.clone() };
+
+        let held = DropRecorder {
+            item: both_credentials_item("Ledgerline", "denis@example.com"),
+            log: log.clone(),
+        };
+        // `&VaultItem` also satisfies the lookup's bound, which is exactly how
+        // a caller keeps the item alive: the arm can only drop what it owns.
+        prompt_arm_for(&presenter, &w, || Some(&held.item));
+        assert_eq!(*log.borrow(), vec!["placement asked", "overlay shown"]);
+        drop(held);
+        assert_eq!(
+            *log.borrow(),
+            vec!["placement asked", "overlay shown", "item released"]
+        );
+    }
+
+    /// A cache miss must still raise a fillable card. `prompt_choices(None)`
+    /// is the empty list, and the empty list is not "no rows": the overlay
+    /// paints the single matched-credential row it always painted and answers
+    /// [`FillChoice::Saved`] for it, which is the pre-step-5 behaviour for the
+    /// case that used to be all of them.
+    #[test]
+    fn an_item_that_could_not_be_read_back_still_offers_the_row_it_always_did() {
+        assert_eq!(prompt_choices(None), Vec::new());
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let presenter = RecordingPresenter::default();
+        prompt_arm(&presenter, &w, prompt_subject(None));
+
+        let offered = presenter.offered.borrow();
+        assert_eq!(offered.len(), 1, "the overlay is still shown");
+        assert!(offered[0].is_empty());
+        // The empty list is one painted row, and one row's worth of window --
+        // read out of `overlay_ui`, whose own tests own that promise.
+        assert_eq!(
+            presenter.asked_rows.get(),
+            Some(0),
+            "the row count asked about is the list's length, not a fabricated 1"
+        );
+        assert_eq!(
+            overlay_ui::overlay_height(0),
+            overlay_ui::overlay_height(1),
+            "an empty list must still be sized for the one row it paints"
         );
     }
 
@@ -1576,7 +1985,16 @@ mod prompt_wiring_tests {
     // `include_str!` pulls this module in too, so a whole needle would match its
     // own declaration, and a needle containing a newline would pass on an LF
     // checkout and fail on a CRLF one (this repo has both).
-    const ARM_CALL: &str = concat!("prompt_arm", "(&REAL_OVERLAY, window, item.as_ref())");
+    const ARM_CALL: &str = concat!("prompt_arm_for", "(&REAL_OVERLAY, window, lookup)");
+    /// The cache read `handle_match` hands the arm, as a closure it does NOT
+    /// call itself. `|| cache.items()...` bound to a `let item` and passed as
+    /// `item.as_ref()` -- the shape this line had until step 5 -- keeps the
+    /// plaintext item alive for the whole time the overlay is on screen, and
+    /// every behavioural test in this file still passes, because the overlay
+    /// is told the same things either way. The difference is residency, and
+    /// residency has no observable effect at all from outside this line.
+    const LOOKUP: &str =
+        concat!("let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
     /// `handle_match` asks [`super::match_disposition`] the question, and asks
@@ -1612,7 +2030,7 @@ mod prompt_wiring_tests {
     /// catch -- discarding the answer, and substituting a hardcoded choice for
     /// it -- both stop containing it.
     const GUARDED_ARM: &str =
-        concat!("if let Some(choice) = prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+        concat!("if let Some(choice) = prompt_arm_for", "(&REAL_OVERLAY, window, lookup) {");
 
     fn source() -> &'static str {
         include_str!("app.rs")
@@ -1624,7 +2042,7 @@ mod prompt_wiring_tests {
 
     #[test]
     fn the_counter_finds_calls_that_are_really_there() {
-        let planted = concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+        let planted = concat!("if prompt_arm_for", "(&REAL_OVERLAY, window, lookup) {");
         assert_eq!(occurrences(planted, ARM_CALL), 1, "planted: {planted}");
         assert_eq!(occurrences("nothing here", ARM_CALL), 0);
 
@@ -1632,7 +2050,7 @@ mod prompt_wiring_tests {
         // is handed does not. Review 31's was the label, review 32's the
         // placement -- and the placement one is now unwritable at the call site
         // at all, so its modern form is a wrapper around the named function.
-        let mutated = concat!("if prompt_arm", "(&REAL_OVERLAY, window, None) {");
+        let mutated = concat!("if prompt_arm_for", "(&REAL_OVERLAY, window, || None) {");
         assert_eq!(occurrences(mutated, ARM_CALL), 0, "planted: {mutated}");
 
         // And the same for the retargeted `GUARDED_ARM`, whose whole job is to
@@ -1641,22 +2059,34 @@ mod prompt_wiring_tests {
         // the overlay and fills regardless, the second keeps the `if let` but
         // types a choice the user did not pick.
         let planted =
-            concat!("            if let Some(choice) = prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+            concat!("            if let Some(choice) = prompt_arm_for", "(&REAL_OVERLAY, window, lookup) {");
         assert_eq!(occurrences(planted, GUARDED_ARM), 1, "planted: {planted}");
-        let discarded = concat!("            prompt_arm", "(&REAL_OVERLAY, window, item.as_ref());");
+        let discarded = concat!("            prompt_arm_for", "(&REAL_OVERLAY, window, lookup);");
         assert_eq!(occurrences(discarded, GUARDED_ARM), 0, "planted: {discarded}");
         let hardcoded = concat!(
-            "            if prompt_arm",
-            "(&REAL_OVERLAY, window, item.as_ref()).is_some() { let choice = FillChoice::UserTabPass;"
+            "            if prompt_arm_for",
+            "(&REAL_OVERLAY, window, lookup).is_some() { let choice = FillChoice::UserTabPass;"
         );
         assert_eq!(occurrences(hardcoded, GUARDED_ARM), 0, "planted: {hardcoded}");
-        // The old needle, so a revert to it is not silently equivalent.
+        // The pre-step-5 arm shape, so a revert to it -- which is a revert to
+        // holding the item across the overlay -- is not silently equivalent.
         assert_eq!(
-            occurrences(source(), concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {")),
+            occurrences(source(), concat!("prompt_arm", "(&REAL_OVERLAY, window, item.as_ref())")),
             0,
-            "the pre-`FillChoice` arm shape is back in app.rs; `GUARDED_ARM` no longer \
-             describes the code it guards"
+            "the pre-step-5 arm shape is back in app.rs: the item is bound at `handle_match`'s \
+             unreachable line and held for the whole life of the overlay again, and \
+             `GUARDED_ARM` no longer describes the code it guards"
         );
+
+        // `LOOKUP`'s own controls. The regression it exists for keeps the
+        // arm call intact and only changes what is passed, so `ARM_CALL`
+        // above cannot see it -- but a `let item =` on that line can only be
+        // there in order to outlive the statement.
+        let planted =
+            concat!("            let lookup = || cache.items()", ".into_iter().find(|i| i.id == item_id);");
+        assert_eq!(occurrences(planted, LOOKUP), 1, "planted: {planted}");
+        let held = concat!("            let item = cache.items()", ".into_iter().find(|i| i.id == item_id);");
+        assert_eq!(occurrences(held, LOOKUP), 0, "planted: {held}");
 
         let planted = concat!("    position: ", "overlay_position,");
         assert_eq!(occurrences(planted, REAL_POSITION), 1, "planted: {planted}");
@@ -1708,6 +2138,25 @@ mod prompt_wiring_tests {
              is no longer the condition on the fill below it, so a matched window would type \
              the user's password whether they clicked Fill or Dismiss -- and, because the \
              fill falls back to blind SendInput, into whatever holds focus"
+        );
+    }
+
+    /// **The item is handed over as a lookup, not held.** The behavioural half
+    /// of this claim is
+    /// `prompt_wiring_tests`' sibling `the_item_is_dropped_before_the_overlay_opens`,
+    /// which drives `prompt_arm_for` with a recording lookup; what it cannot
+    /// reach is `handle_match` choosing to bind the item on its own line and
+    /// pass a closure that ignores it, which reinstates the residency this
+    /// step exists to close while leaving the arm's behaviour identical.
+    #[test]
+    fn handle_match_hands_the_prompt_a_lookup_rather_than_a_held_item() {
+        assert_eq!(
+            occurrences(source(), LOOKUP),
+            1,
+            "expected {LOOKUP:?} exactly once in app.rs -- `handle_match`'s cache read. Zero \
+             means the matched item is bound at that line again and therefore alive, \
+             plaintext password and TOTP seed included, for the whole time the modal overlay \
+             is on screen: as long as the user takes to decide"
         );
     }
 
