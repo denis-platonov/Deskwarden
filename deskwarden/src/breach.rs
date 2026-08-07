@@ -527,12 +527,32 @@ mod tests {
     /// **The privacy claim, as a test.**
     ///
     /// Read off the literal request head this crate put on a socket -- not off
-    /// a matcher, which can only tell you that something you named was
-    /// present. The whole head (request line and every header) must contain no
-    /// substring of the 35 secret characters longer than a few chars, and the
-    /// path must be exactly `/range/{PREFIX}`.
+    /// a mockito matcher, which can only tell you that something you already
+    /// named was present.
+    ///
+    /// The assertion is an **exact allowlist**, not a hunt for the secret. The
+    /// request line must be character-for-character
+    /// `GET /range/{PREFIX} HTTP/1.1` -- no query string, no fragment, no
+    /// extra path segment, no other method -- and every header must be one of
+    /// a fixed set, matched on its name *and* on its exact value, each exactly
+    /// once, with none missing.
+    ///
+    /// It **fails closed**: a header that is not on the list fails this test
+    /// even if it carries nothing secret at all. That is the whole point. The
+    /// previous version of this guard asked "does an 8-character run of the
+    /// suffix appear anywhere in the head?", and a leak of *seven* characters
+    /// in an invented header matched no 8-window and sailed through green --
+    /// prefix plus seven is twelve hex characters, 48 bits of the SHA-1, which
+    /// collapses the k-anonymity bucket from ~800 candidates to one. Narrowing
+    /// the window is not the fix (a 2-character window false-positives against
+    /// the prefix and against ordinary header text); enumerating what is
+    /// allowed is.
+    ///
+    /// Every header this crate sends is a thing that left the machine, so a
+    /// new one has to be added to this list deliberately, by someone reading
+    /// this comment -- not discovered afterwards.
     #[test]
-    fn no_part_of_the_hash_beyond_the_prefix_is_ever_sent() {
+    fn the_request_head_carries_nothing_beyond_the_allowlist() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
         let port = listener.local_addr().unwrap().port();
 
@@ -567,31 +587,86 @@ mod tests {
         assert_eq!(status, BreachStatus::Breached(PASSWORD_COUNT), "the mock did answer");
 
         let head = server.join().expect("server thread");
-        let upper = head.to_ascii_uppercase();
 
-        // Control: the head really was captured and really is a request head,
-        // otherwise every "does not contain" below is about an empty string.
+        // Controls first: the head really was captured, really is a request
+        // head, and really is complete -- otherwise every assertion below is
+        // about an empty or truncated string.
         assert!(head.starts_with("GET "), "captured head is not a request head: {head:?}");
-        assert!(upper.contains(&prefix), "the prefix should be in the head: {head:?}");
-
+        assert!(head.ends_with("\r\n\r\n"), "the captured head is truncated: {head:?}");
         assert!(
-            upper.contains(&format!("GET /RANGE/{prefix} ")),
-            "the request line is not exactly /range/{{PREFIX}}: {head:?}"
+            head.contains(&prefix),
+            "the prefix is not in the head, so this is not the request under test: {head:?}"
         );
+
+        let mut lines = head.trim_end_matches("\r\n\r\n").split("\r\n");
+
+        // 1. The request line, exactly. A query string, a second path
+        //    segment, a changed method or a changed version all land here.
+        let request_line = lines.next().expect("a request head has a request line");
+        assert_eq!(
+            request_line,
+            format!("GET /range/{prefix} HTTP/1.1"),
+            "the request line is not exactly `GET /range/{{PREFIX}} HTTP/1.1`"
+        );
+
+        // 2. The headers. Name -> the one value that name may carry. `Host`
+        //    is built from the port this test itself chose, so a rewritten or
+        //    redirected Host fails too.
+        let allowed: Vec<(&str, String)> = vec![
+            ("host", format!("127.0.0.1:{port}")),
+            ("accept", "*/*".to_string()),
+            ("user-agent", USER_AGENT.to_string()),
+            ("accept-encoding", "gzip".to_string()),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for line in lines {
+            assert!(!line.is_empty(), "a blank line inside the head: {head:?}");
+            let Some((name, value)) = line.split_once(':') else {
+                panic!("header line is not `Name: value`: {line:?}");
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let value = value.trim();
+            let Some((_, expected)) = allowed.iter().find(|(n, _)| *n == name) else {
+                panic!(
+                    "the request carried a header that is not on the allowlist: {line:?}\n\
+                     Full head: {head:?}\n\
+                     Everything this crate puts in a request head leaves the machine. If this \
+                     header is meant to be sent, add it to the allowlist above and say why."
+                );
+            };
+            assert_eq!(
+                value, expected,
+                "header {name:?} carried {value:?}, not the one value it is allowed to carry"
+            );
+            seen.push(name);
+        }
+
+        // The loop visited a non-zero, exact number of headers: every allowed
+        // name present, none twice, nothing else. A head with no headers at
+        // all, or one that smuggles a second copy of an allowed name, is not
+        // silently fine.
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "a header name was sent twice: {seen:?}");
+        let mut expected_names: Vec<String> =
+            allowed.iter().map(|(n, _)| (*n).to_string()).collect();
+        expected_names.sort();
+        assert_eq!(
+            sorted, expected_names,
+            "the set of headers sent is not the allowlist: {head:?}"
+        );
+
+        // 3. Redundant, and cheap: the whole suffix is not in the head under
+        //    either case. This cannot catch a partial leak -- that is what the
+        //    allowlist above is for -- but it costs nothing and it is the
+        //    claim in its bluntest form.
+        let upper = head.to_ascii_uppercase();
         assert!(
             !upper.contains(&*suffix.to_ascii_uppercase()),
             "the whole 35-char suffix went on the wire: {head:?}"
         );
-        // Nothing beyond the prefix, not merely "not the whole thing": every
-        // 8-character window of the suffix must be absent too, which catches a
-        // truncated or chunked leak the whole-string check would miss.
-        for window in suffix.as_bytes().windows(8) {
-            let piece = String::from_utf8(window.to_vec()).unwrap().to_ascii_uppercase();
-            assert!(
-                !upper.contains(&piece),
-                "a fragment of the secret suffix ({piece}) went on the wire: {head:?}"
-            );
-        }
     }
 
     #[test]
@@ -755,7 +830,9 @@ mod tests {
     }
 
     /// The control for [`this_module_production_code`]: prove the strip really
-    /// removed something, really kept the code, and really cut the tests off.
+    /// removed something, really kept the code, really cut the tests off, and
+    /// -- the part that is easy to forget -- that there is nothing *after* the
+    /// test module for it to have missed.
     fn assert_strip_worked(code: &str) {
         let full = this_module_source();
         assert!(code.len() < full.len(), "the strip removed nothing at all");
@@ -778,6 +855,25 @@ mod tests {
         assert!(
             !code.contains("The hex is never formatted into any"),
             "the strip left the module doc behind, so the guards can fire on prose"
+        );
+
+        // **Nothing lives below the cut.** The strip keeps everything above
+        // the first cfg(test) marker, so a production item placed *after* the
+        // test module would be invisible to every guard in this file --
+        // silently, and green. Inside `mod tests` every item is indented, so
+        // the only lines starting at column 0 below the cut are the marker,
+        // the module's opening line, and its closing brace. Anything else
+        // there is a top-level item that no guard is reading.
+        let cut = full.find(&format!("#[cfg({})]", "test")).expect("cfg(test) marker");
+        let below: Vec<&str> = full[cut..]
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with(char::is_whitespace))
+            .collect();
+        assert_eq!(
+            below,
+            vec![&format!("#[cfg({})]", "test")[..], "mod tests {", "}"],
+            "there is top-level source below the cfg(test) marker; the guards in this file do \
+             not read it"
         );
     }
 
@@ -946,63 +1042,77 @@ mod tests {
         );
     }
 
-    /// `BreachStatus` must not gain a `Default`. `unwrap_or_default()` on a
-    /// missing status would silently turn "we could not check" into a badge,
-    /// and that is the one failure mode this feature cannot afford.
+    /// `BreachStatus` must not gain a `Default` -- in **any** spelling.
     ///
-    /// Source-pinned because the type system cannot state the absence of an
-    /// impl. Positively controlled against a file that does derive `Default`,
-    /// so the needle spellings are known to match real code.
+    /// `unwrap_or_default()` on a missing status would silently turn "we could
+    /// not check" into `Safe`, a green badge on a password nobody looked at.
+    /// It is the single highest-consequence bug this feature can have.
+    ///
+    /// The guard is a **total, case-insensitive ban on the token**, not a
+    /// pattern match on one line. The previous version read exactly
+    /// `lines[decl - 1]` and looked for `derive` there. Rust permits more than
+    /// one `#[derive]` on an item, so a bare `#[derive(Default)]` stacked
+    /// *above* the real derive list was invisible and passed green -- as did
+    /// `impl std::default::Default for` and `impl Default  for` with two
+    /// spaces. Chasing spellings loses that race by construction.
+    ///
+    /// The token has no legitimate use anywhere in this module's production
+    /// code, and no spelling of the hazard omits it: the derive, the
+    /// hand-written impl at any path, the `#[default]` variant attribute and
+    /// `unwrap_or_default()` all contain `default` under an ASCII-lowercase
+    /// fold. So the guard is: it appears nowhere at all.
     #[test]
-    fn breach_status_has_no_default() {
-        const DERIVE: &str = concat!("Def", "ault");
-        let source = this_module_source();
+    fn breach_status_has_no_default_in_any_spelling() {
+        // Folded to lowercase, so one needle covers `Default`, `default` and
+        // any mixture. Split across `concat!` so it cannot match itself.
+        const DEFAULT: &str = concat!("def", "ault");
 
-        let elsewhere = crate_source_files()
-            .into_iter()
-            .filter(|(path, _)| path != "breach.rs")
-            .any(|(_, text)| text.contains(DERIVE));
-        assert!(elsewhere, "needle {DERIVE:?} matches nothing in this crate");
+        // Positive control 1: the needle matches every real spelling of the
+        // hazard, including the two-derive stack and the two-space impl that
+        // defeated the previous guard, and the lowercase forms an
+        // uppercase-only needle would miss.
+        for spelling in [
+            "#[derive(Default)]",
+            "#[derive(Debug, Default, Clone)]",
+            "#[derive(Default)]\r\n#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
+            "impl Default for BreachStatus {",
+            "impl Default  for BreachStatus {",
+            "impl std::default::Default for BreachStatus {",
+            "impl core::default::Default for BreachStatus {",
+            "impl ::std::default::Default for BreachStatus {",
+            "impl<'a> Default for BreachStatus {",
+            "    #[default]\r\n    Safe,",
+            "status.unwrap_or_default()",
+            "BreachStatus::default()",
+        ] {
+            assert!(
+                spelling.to_ascii_lowercase().contains(DEFAULT),
+                "the {DEFAULT:?} needle does not match {spelling:?}, which is a real spelling of \
+                 the hazard -- the needle has gone blind"
+            );
+        }
 
-        // The doc comment on `BreachStatus` spells the word out, so count
-        // occurrences in code rather than asserting outright absence: the
-        // enum's own derive list must not contain it.
-        let lines: Vec<&str> = source.lines().collect();
-        let decl = lines
+        // Positive control 2: the needle matches real code somewhere else in
+        // this crate, so asserting its absence here is not vacuous.
+        let files = crate_source_files();
+        assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
+        let elsewhere = files
             .iter()
-            .position(|l| l.contains("pub enum BreachStatus"))
-            .expect("BreachStatus is declared in this file");
-        assert!(decl > 0, "control: the declaration is not the first line of the file");
-        let derive_line = lines[decl - 1].to_string();
-        assert!(
-            derive_line.contains("derive"),
-            "control: the line above `pub enum BreachStatus` is not its derive list: \
-             {derive_line:?}"
-        );
-        assert!(
-            !derive_line.contains(DERIVE),
-            "BreachStatus derives Default: {derive_line:?}"
-        );
-
-        // The derive is only one of the two spellings. A hand-written `impl
-        // Default for BreachStatus` produces exactly the same
-        // `unwrap_or_default()` hazard and the line-above check cannot see it,
-        // so forbid it in the production code too.
-        const HAND_WRITTEN: &str = concat!("impl Def", "ault for");
-        let production = this_module_production_code();
-        assert_strip_worked(&production);
-        let elsewhere_impl = crate_source_files()
-            .into_iter()
             .filter(|(path, _)| path != "breach.rs")
-            .any(|(_, text)| text.contains(HAND_WRITTEN));
+            .any(|(_, text)| text.to_ascii_lowercase().contains(DEFAULT));
         assert!(
-            elsewhere_impl,
-            "needle {HAND_WRITTEN:?} matches nothing in this crate, so asserting its absence \
+            elsewhere,
+            "needle {DEFAULT:?} matches nothing else in this crate, so asserting its absence \
              here proves nothing"
         );
+
+        let production = this_module_production_code().to_ascii_lowercase();
+        assert_strip_worked(&this_module_production_code());
         assert!(
-            !production.contains(HAND_WRITTEN),
-            "breach.rs hand-writes a Default impl -- same hazard as the derive, different spelling"
+            !production.contains(DEFAULT),
+            "the token {DEFAULT:?} appears in breach.rs production code. Nothing here needs it, \
+             and every form it can take is a Default for BreachStatus -- which makes \
+             `unwrap_or_default()` read 'we could not check' as a green badge"
         );
     }
 }
