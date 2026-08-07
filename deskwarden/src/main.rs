@@ -227,7 +227,7 @@ fn main() {
     // -- and the preferences save below goes through `persist_preferences`
     // precisely so a stale copy of it can never be written back.
     let settings_path = config_dir.join("settings.json");
-    let mut settings = settings::Settings::load(&settings_path);
+    let settings = settings::Settings::load(&settings_path);
 
     // ------------------------------------------------------------------
     // Which account is this launch?
@@ -287,7 +287,7 @@ fn main() {
     // `mut`, both of them: an account switch re-points which account this
     // process is (`active_account`) and which account the switcher offers to
     // leave (`accounts_state`'s `active`). See `open_vault_window`.
-    let (mut active_account, mut accounts_state, first_run_account) = match &startup {
+    let (active_account, accounts_state, first_run_account) = match &startup {
         accounts::StartupAccounts::Ready {
             active,
             accounts,
@@ -389,7 +389,7 @@ fn main() {
     // `mut` for the same reason: `switch_to_account` re-points this at the
     // target account's own `session.bin` before it authenticates, so the token
     // the switch produces cannot land in the file of the account being left.
-    let mut store = session_store::SessionStore::new(session_path);
+    let store = session_store::SessionStore::new(session_path);
 
     // What every login window this process opens is scoped to. Built through
     // the one constructor, so no call site can quietly go back to passing
@@ -845,7 +845,7 @@ fn main() {
     // window even appeared. Polled non-blockingly below, same shape as
     // `update_rx`; `open_vault_window` still falls back to a synchronous
     // call itself if a click lands before this has reported back.
-    let mut cached_status_details: Option<login_ui::BwStatusDetails> = None;
+    let cached_status_details: Option<login_ui::BwStatusDetails> = None;
     // **Which account the prefetch is ABOUT, carried with its answer.** `bw
     // status` reports on whatever profile the CLI is pointed at when it runs,
     // and this one is spawned before the startup window's outcome is dispatched
@@ -976,7 +976,32 @@ fn main() {
     // (`BackendOpKind`) this is, so the wedge-deadline check can report a
     // stall in terms of what was actually requested (review Minor 4) instead
     // of always assuming a sync.
-    let mut backend_task_in_progress: Option<(Instant, BackendOpKind)> = None;
+    let backend_task_in_progress: Option<(Instant, BackendOpKind)> = None;
+
+    // **Everything a vault session mutates, moved into one value.** The ten
+    // locals above are MOVED here, not copied: from this line on there is no
+    // local of any of those names left for a later edit to read from or write
+    // to. A field read off the estate while a stale local of the same name is
+    // still being written -- or the reverse -- is the two-copies-silently-
+    // disagree failure this file has shipped before, and the move is what
+    // makes it unspellable rather than merely unlikely.
+    //
+    // Built HERE and not at the token, because `cached_status_details` and
+    // `backend_task_in_progress` are declared with their doc above and
+    // nothing before this line touches either; building earlier would have
+    // meant seeding two fields whose reasons live down here.
+    let mut estate = SessionEstate {
+        cache,
+        engine,
+        child: bw_serve_child,
+        token: session_token,
+        details: cached_status_details,
+        task_in_progress: backend_task_in_progress,
+        store,
+        active_account,
+        accounts: accounts_state,
+        settings,
+    };
     // Tray menu clicks that arrived while one of this app's blocking windows
     // was up and SURVIVED the sweep that runs when it closes -- i.e. requests
     // that window did not answer. Popped before the channel below, so they are
@@ -1009,30 +1034,21 @@ fn main() {
     // hotkey registration do not touch it.
     if startup_vault.is_some() {
         open_vault_window(
-            &cache,
+            &mut estate,
             &fill_stats,
-            &mut session_token,
-            &mut bw_serve_child,
             &job,
-            &mut store,
             &schedule,
-            &mut engine,
             &icon_cache_dir,
-            &mut cached_status_details,
             &config_dir,
-            &mut active_account,
-            &mut accounts_state,
             first_run_account.as_ref(),
-            &mut settings,
             &settings_path,
             &tray,
             &backend_op_tx,
             &backend_op_rx,
-            &mut backend_task_in_progress,
             // The one caller that hands an outcome in.
             startup_vault.take(),
         );
-        rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+        rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
         // The third door into the vault window, swept exactly like the other
         // two: a tray click made while the startup window was up is already
         // answered -- the window was open -- and must not reopen it.
@@ -1063,8 +1079,8 @@ fn main() {
                 // user asked to quit, even for the instant between here and
                 // `process::exit` actually tearing the process down.
                 log::info!("quit requested from tray; killing bw serve");
-                cache.clear();
-                if let Some(child) = bw_serve_child.as_mut() {
+                estate.cache.clear();
+                if let Some(child) = estate.child.as_mut() {
                     bw_serve::stop_bw_serve(child);
                 }
                 std::process::exit(0);
@@ -1072,31 +1088,22 @@ fn main() {
 
             if event.id == tray.open_vault_id {
                 open_vault_window(
-                    &cache,
+                    &mut estate,
                     &fill_stats,
-                    &mut session_token,
-                    &mut bw_serve_child,
                     &job,
-                    &mut store,
                     &schedule,
-                    &mut engine,
                     &icon_cache_dir,
-                    &mut cached_status_details,
                     &config_dir,
-                    &mut active_account,
-                    &mut accounts_state,
                     first_run_account.as_ref(),
-                    &mut settings,
                     &settings_path,
                     &tray,
                     &backend_op_tx,
                     &backend_op_rx,
-                    &mut backend_task_in_progress,
                     // This door opens its own window; there is no outcome to
                     // hand it.
                     None,
                 );
-                rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+                rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
                 // Everything the user clicked at the tray while the window was
                 // up is queued behind this line. Asking for the vault window
                 // again is already answered -- it was open, and raised -- so
@@ -1117,9 +1124,9 @@ fn main() {
                 // a bit further down only runs once this returns, so a
                 // changed `keep_backend_running` takes effect on the very
                 // next iteration rather than waiting for the next launch.
-                let edited = prefs_ui::run(settings.clone());
-                if edited != settings {
-                    settings = edited;
+                let edited = prefs_ui::run(estate.settings.clone());
+                if edited != estate.settings {
+                    estate.settings = edited;
                     // `persist_preferences`, never a whole-struct save: this
                     // binding's `vault_window` is whatever was on disk at
                     // startup, and `vault_window::run` has been writing a
@@ -1127,7 +1134,7 @@ fn main() {
                     // window closed. Saving the struct here wrote that stale
                     // value back and silently reverted the saved geometry;
                     // see `Settings::persist_preferences`.
-                    if let Err(e) = settings.persist_preferences(&settings_path) {
+                    if let Err(e) = estate.settings.persist_preferences(&settings_path) {
                         log::warn!("could not save settings: {e}");
                     }
                 }
@@ -1175,16 +1182,16 @@ fn main() {
                     let login = login_context(config_dir, Some(to), first_run_account.as_ref());
                     let mut declined = false;
                     let outcome = resettle_session(
-                        &cache,
-                        &mut engine,
-                        &mut bw_serve_child,
+                        &estate.cache,
+                        &mut estate.engine,
+                        &mut estate.child,
                         &job,
                         &schedule,
                         &tray,
                         &backend_op_rx,
-                        &mut backend_task_in_progress,
-                        &mut cached_status_details,
-                        &mut session_token,
+                        &mut estate.task_in_progress,
+                        &mut estate.details,
+                        &mut estate.token,
                         || {
                             let token = authenticate_for_switch(store, login);
                             declined = token.is_none();
@@ -1216,11 +1223,11 @@ fn main() {
                     // nothing and means a stale submenu -- one built before a
                     // state change and clicked after it -- cannot smuggle a
                     // target past the gate.
-                    let picked = accounts_state
+                    let picked = estate.accounts
                         .as_ref()
                         .and_then(|state| state.switchable().iter().find(|a| &a.id == target))
                         .cloned();
-                    match (picked, accounts_state.as_mut(), active_account.as_mut()) {
+                    match (picked, estate.accounts.as_mut(), estate.active_account.as_mut()) {
                         (Some(to), Some(state), Some(active)) => {
                             let from = active.clone();
                             let outcome = switch_to_account(
@@ -1228,7 +1235,7 @@ fn main() {
                                 &from,
                                 &to,
                                 active,
-                                &mut store,
+                                &mut estate.store,
                                 &mut resettle,
                             );
                             if outcome == SwitchOutcome::Switched {
@@ -1261,14 +1268,14 @@ fn main() {
                         }
                     }
                 } else if add_clicked {
-                    match (accounts_state.as_mut(), active_account.as_mut()) {
+                    match (estate.accounts.as_mut(), estate.active_account.as_mut()) {
                         (Some(state), Some(active)) => {
                             let outcome = add_account(
                                 &config_dir,
                                 &settings_path,
                                 state,
                                 active,
-                                &mut store,
+                                &mut estate.store,
                                 // The sign-in window, run against whatever
                                 // profile `add_account` has pointed the CLI at
                                 // -- which is the NEW account's directory, and
@@ -1295,7 +1302,7 @@ fn main() {
                         }
                     }
                 } else if remove_clicked {
-                    match (accounts_state.as_mut(), active_account.as_mut()) {
+                    match (estate.accounts.as_mut(), estate.active_account.as_mut()) {
                         (Some(state), Some(active)) => {
                             let doomed = state.active().id.clone();
                             let label = account_label(state.active()).to_string();
@@ -1306,7 +1313,7 @@ fn main() {
                                     state,
                                     &doomed,
                                     active,
-                                    &mut store,
+                                    &mut estate.store,
                                     &mut resettle,
                                     // **The directory form, never the
                                     // active-profile one.** That one acts on
@@ -1347,7 +1354,7 @@ fn main() {
             // submenu rebuilt only on success is one whose ids outlive the
             // state they name.
             if add_clicked || remove_clicked || switch_target.is_some() {
-                tray.rebuild_accounts_menu(accounts_state.as_ref());
+                tray.rebuild_accounts_menu(estate.accounts.as_ref());
                 last_dispatched_hwnd = None;
             }
 
@@ -1367,7 +1374,7 @@ fn main() {
                 // decides whether `run_picker` needs to wait for it at all
                 // (same `backend_already_running` exemption `open_vault_window`
                 // and `vault_window::run` already make).
-                let backend_already_running = backend_is_running(&mut bw_serve_child);
+                let backend_already_running = backend_is_running(&mut estate.child);
 
                 // Review 9's Important: in save-memory mode nothing here used
                 // to start `bw serve` at all, so a save always failed after
@@ -1375,8 +1382,8 @@ fn main() {
                 // Kick a start off now, the same non-blocking way
                 // `open_vault_window` does. `run_picker` itself waits for it
                 // to actually answer before letting Save fire.
-                if needs_backend_start(&backend_task_in_progress, backend_already_running) {
-                    backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+                if needs_backend_start(&estate.task_in_progress, backend_already_running) {
+                    estate.task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
                     // A Sync click landing while this start is in flight
                     // would otherwise be silently dropped by the
                     // `backend_task_in_progress` guard below with nothing to
@@ -1386,7 +1393,7 @@ fn main() {
                     // `apply_backend_op`'s `EnsureRunning` arms re-enable it
                     // once this completes.
                     tray::set_sync_busy_with_backend_op(&tray);
-                    spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
+                    spawn_backend_start(estate.token.clone(), job.clone(), backend_op_tx.clone());
                 }
 
                 // The vault session this "Add app..." belongs to is captured
@@ -1395,10 +1402,10 @@ fn main() {
                 // there, review 30's Minor 5 for why the capture is no longer
                 // a statement of its own that a later edit can slide below the
                 // window it guards.
-                if let Some((flow, item)) = AddAppFlow::begin(&cache) {
+                if let Some((flow, item)) = AddAppFlow::begin(&estate.cache) {
                     log::info!("adding an app match to vault item {}", item.id);
                     let target_item = item.clone();
-                    match picker_ui::run_picker(cache.clone(), item, last_active_pid, backend_already_running) {
+                    match picker_ui::run_picker(estate.cache.clone(), item, last_active_pid, backend_already_running) {
                         Some(saved) => {
                             log::info!(
                                 "saved app match for {} ({:?}, {:?})",
@@ -1461,7 +1468,7 @@ fn main() {
                                         "match engine refreshed: {} app match(es)",
                                         entries.len()
                                     );
-                                    engine.rebuild(&entries);
+                                    estate.engine.rebuild(&entries);
                                 }
                                 None => {
                                     // Not reachable from here today -- every
@@ -1551,24 +1558,24 @@ fn main() {
                 // window-open's own backend start) is in flight, but the
                 // click event is handled the same way regardless of whether
                 // tray-icon's disabled state actually suppressed the click.
-                if backend_task_in_progress.is_some() {
+                if estate.task_in_progress.is_some() {
                     log::info!("sync requested from tray but a backend operation is already in \
                                  progress; ignoring");
                 } else {
                     log::info!("sync requested from tray");
                     tray::set_sync_in_progress(&tray);
-                    backend_task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+                    estate.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
 
                     // Whether `bw serve` needs to be started first is decided
                     // here, on the main thread (the only place that owns
                     // `bw_serve_child`), and handed to the background thread
                     // as a plain bool -- see `backend_is_running`'s doc for
                     // why a `Some` child isn't automatically "running".
-                    let currently_running = backend_is_running(&mut bw_serve_child);
+                    let currently_running = backend_is_running(&mut estate.child);
                     spawn_sync(
-                        session_token.clone(),
+                        estate.token.clone(),
                         job.clone(),
-                        cache.clone(),
+                        estate.cache.clone(),
                         currently_running,
                         backend_op_tx.clone(),
                     );
@@ -1626,31 +1633,22 @@ fn main() {
         // the menu's "Open Vault" item above -- just a different trigger.
         if tray::next_left_click() == Some(true) {
             open_vault_window(
-                &cache,
+                &mut estate,
                 &fill_stats,
-                &mut session_token,
-                &mut bw_serve_child,
                 &job,
-                &mut store,
                 &schedule,
-                &mut engine,
                 &icon_cache_dir,
-                &mut cached_status_details,
                 &config_dir,
-                &mut active_account,
-                &mut accounts_state,
                 first_run_account.as_ref(),
-                &mut settings,
                 &settings_path,
                 &tray,
                 &backend_op_tx,
                 &backend_op_rx,
-                &mut backend_task_in_progress,
                 // This door opens its own window; there is no outcome to hand
                 // it.
                 None,
             );
-            rebuild_after_vault_window(&mut tray, accounts_state.as_ref());
+            rebuild_after_vault_window(&mut tray, estate.accounts.as_ref());
             // The second door into the same window, swept the same way and
             // through the same name -- see the tray menu's "Open Vault"
             // handler above. This is the door the report was made through:
@@ -1674,7 +1672,7 @@ fn main() {
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
                     fill_from_vault(
-                        &cache,
+                        &estate.cache,
                         &injector,
                         &fill_stats,
                         &item_id,
@@ -1693,8 +1691,8 @@ fn main() {
         // where `backend_task_in_progress` is cleared, so the reconciliation
         // step right after it is never fighting a still-in-flight operation.
         if let Ok(op) = backend_op_rx.try_recv() {
-            backend_task_in_progress = None;
-            apply_backend_op(op, &mut bw_serve_child, &cache, &mut engine, &tray);
+            estate.task_in_progress = None;
+            apply_backend_op(op, &mut estate.child, &estate.cache, &mut estate.engine, &tray);
         }
 
         // A deadline on the FLAG itself, not just on any one `recv` -- see
@@ -1705,9 +1703,9 @@ fn main() {
         // legitimate backend operation can take before something is
         // genuinely wrong" for `open_vault_window`'s own bounded wait on this
         // same flag, and that reasoning applies here unchanged.
-        if let Some((started, kind)) = backend_task_in_progress {
+        if let Some((started, kind)) = estate.task_in_progress {
             if backend_task_is_wedged(started, BACKEND_OP_TIMEOUT) {
-                backend_task_in_progress = None;
+                estate.task_in_progress = None;
                 // Report -- and, on the tray, only claim to have synced --
                 // what actually stalled (review Minor 4). But *both* kinds
                 // must still re-enable the tray's "Sync" item here (review
@@ -1768,8 +1766,8 @@ fn main() {
         // throttling it) -- the three places that *do* need the backend
         // (startup, `open_vault_window`, the tray's Sync item) each ask for
         // it explicitly and this only ever tears it back down afterwards.
-        if backend_task_in_progress.is_none() {
-            stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
+        if estate.task_in_progress.is_none() {
+            stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
         }
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
@@ -1809,12 +1807,12 @@ fn main() {
             // account twice, and the answer cannot be used without binding it.
             if let Some(adopted) = adopt_startup_prefetch(
                 &settings_path,
-                &mut accounts_state,
-                &mut active_account,
+                &mut estate.accounts,
+                &mut estate.active_account,
                 about.as_ref(),
                 details,
             ) {
-                cached_status_details = Some(adopted);
+                estate.details = Some(adopted);
             }
         }
 
@@ -1844,8 +1842,8 @@ fn main() {
                     // contents sitting in this process's memory a moment
                     // longer than it takes to tear down.
                     log::info!("update installer launched; shutting down for update");
-                    cache.clear();
-                    if let Some(child) = bw_serve_child.as_mut() {
+                    estate.cache.clear();
+                    if let Some(child) = estate.child.as_mut() {
                         bw_serve::stop_bw_serve(child);
                     }
                     std::process::exit(0);
@@ -1869,11 +1867,11 @@ fn main() {
             }
             process_foreground_event(
                 &event,
-                &cache,
+                &estate.cache,
                 &injector,
                 &fill_stats,
-                &engine,
-                settings.prompt_on_match,
+                &estate.engine,
+                estate.settings.prompt_on_match,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
@@ -2878,40 +2876,47 @@ fn vault_follow_up(result: &vault_window::VaultWindowResult) -> VaultFollowUp {
     }
 }
 
+/// Everything a vault session mutates, in one place, so that a lock, a
+/// re-auth, a switch and a close can be run against a value instead of
+/// against `main`'s stack frame.
+///
+/// Every field is `Send`. That is not decoration: the queued in-window lock
+/// parks this behind `Arc<Mutex<_>>` and reads it back on the deadline, the
+/// panic and the happy path alike, which is the failure mode the ledger
+/// records at `progress.md:14240` -- a worker abandoned mid-teardown leaving
+/// `main` with an empty `MatchEngine` and a stranded `bw serve`.
+///
+/// **Moved into, never copied out.** `MatchEngine` is deliberately not
+/// `Clone`; a cloned engine compiles (it is two `HashMap`s) and silently
+/// divorces the armed autofill matches from the ones a resettle rebuilds. A
+/// `take`n `child` without a guaranteed write-back strands a real `bw serve`
+/// on `BW_SERVE_PORT` and every later start then fails `PortHeld`. Where a
+/// borrow conflict appears, destructure this -- do not clone or take.
+struct SessionEstate {
+    cache: Arc<VaultCache>,
+    engine: MatchEngine,
+    child: Option<Child>,
+    token: String,
+    details: Option<login_ui::BwStatusDetails>,
+    task_in_progress: Option<(Instant, BackendOpKind)>,
+    store: session_store::SessionStore,
+    active_account: Option<Account>,
+    accounts: Option<accounts::AccountsState>,
+    settings: settings::Settings,
+}
+
 fn open_vault_window(
-    cache: &Arc<VaultCache>,
+    // **The eight `&mut` parameters this used to take, as one value.** They
+    // were eight separate borrows off `main`'s stack frame, which is why the
+    // lock/re-auth recovery in the loop below can only ever run on this
+    // thread. See `SessionEstate`. The body destructures it on its first
+    // statement, so not one line inside the loop changed to accommodate the
+    // move.
+    estate: &mut SessionEstate,
     fill_stats: &deskwarden::fill_stats::FillStats,
-    session_token: &mut String,
-    bw_serve_child: &mut Option<Child>,
     job: &Arc<Option<job_object::KillOnCloseJob>>,
-    // `&mut` since Task 14: an account switch re-points this at the target
-    // account's `session.bin` (inside `switch_to_account`) before the login
-    // window it may raise produces a token to save.
-    store: &mut session_store::SessionStore,
     schedule: &[Duration],
-    engine: &mut MatchEngine,
     icon_cache_dir: &std::path::Path,
-    // Warmed by a background thread at startup (see `main`'s
-    // `status_details_rx`) and reused across opens, so the common case pays
-    // no `bw status` spawn at all here. `None` only on a genuine cache miss
-    // (a click landing before the prefetch reports back, or right after the
-    // invalidation below) -- that path still falls back to the same
-    // synchronous call this function always made, just no longer on every
-    // single open.
-    cached_status_details: &mut Option<login_ui::BwStatusDetails>,
-    // The live preferences, and where they are stored. Taken by `&mut` and
-    // as a path -- rather than the single pre-computed `auto_lock: Duration`
-    // this used to take -- because the titlebar's gear now opens the
-    // preferences window from *inside* a vault session (see
-    // `VaultWindowResult::open_preferences`). Serving that needs both: the
-    // struct, to hand to `prefs_ui::run` and to write back into so `main`'s
-    // own later reads (`settings.keep_backend_running` in its idle
-    // reconciliation) see the change, and the path to persist to.
-    //
-    // The auto-lock timeout is now derived per iteration of the loop below
-    // instead of being computed once by the caller, which is what lets a
-    // timeout edited in that window apply to the very next vault window
-    // rather than only to the next app launch.
     // What the lock/re-auth prompt this window can raise is scoped to: the
     // account this process is signed into. The pieces rather than a built
     // `LoginContext`, because this function can now CHANGE which account that
@@ -2921,19 +2926,16 @@ fn open_vault_window(
     // context here goes through the one `login_context` constructor, which is
     // what keeps "no window is opened without an account" a single decision.
     config_dir: &std::path::Path,
-    active_account: &mut Option<Account>,
-    // The one door for "may I switch, and to what" (Task 10), and `&mut`
-    // because a switch that lands moves its `active`.
-    accounts: &mut Option<accounts::AccountsState>,
     // Passed through to every `login_context` this function builds; see that
     // function.
     first_run_account: Option<&accounts::AccountId>,
-    settings: &mut settings::Settings,
+    // Where the preferences the estate carries are persisted to. A path and
+    // not the struct: the struct is `estate.settings`, and two copies of it
+    // is exactly what this move exists to prevent.
     settings_path: &std::path::Path,
     tray: &tray::AppTray,
     backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
-    backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
     // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
     // the loop below on its first pass instead of that pass opening a window.
     //
@@ -2947,6 +2949,52 @@ fn open_vault_window(
     // switch/add/remove wiring the tray's guards pin the only wiring there is.
     mut first_result: Option<vault_window::VaultWindowResult>,
 ) {
+    // **Destructured here, rather than reached through `estate.` at each of
+    // its sites.** Field-level borrow splitting is what lets the loop below go
+    // on holding eight simultaneous `&mut`s -- the resettle closure alone
+    // wants five of them at once -- and the destructure is what makes that
+    // splitting legal in one statement instead of at every call. It is also
+    // why the loop body has an empty diff: every name below is spelled exactly
+    // as the parameter it replaces was.
+    //
+    // Nothing here clones or `take`s. See `SessionEstate`.
+    let SessionEstate {
+        cache,
+        engine,
+        child: bw_serve_child,
+        token: session_token,
+        // Warmed by a background thread at startup (see `main`'s
+        // `status_details_rx`) and reused across opens, so the common case pays
+        // no `bw status` spawn at all here. `None` only on a genuine cache miss
+        // (a click landing before the prefetch reports back, or right after the
+        // invalidation below) -- that path still falls back to the same
+        // synchronous call this function always made, just no longer on every
+        // single open.
+        details: cached_status_details,
+        task_in_progress: backend_task_in_progress,
+        // Mutable since Task 14: an account switch re-points this at the target
+        // account's `session.bin` (inside `switch_to_account`) before the login
+        // window it may raise produces a token to save.
+        store,
+        active_account,
+        // The one door for "may I switch, and to what" (Task 10), and mutable
+        // because a switch that lands moves its `active`.
+        accounts,
+        // The live preferences. Mutable because the titlebar's gear opens the
+        // preferences window from *inside* a vault session (see
+        // `VaultWindowResult::open_preferences`), and the estate is how the
+        // edit reaches `main`'s own later reads (`settings.keep_backend_running`
+        // in its idle reconciliation) rather than a second copy of the struct.
+        //
+        // The auto-lock timeout is derived per iteration of the loop below
+        // instead of being computed once by the caller, which is what lets a
+        // timeout edited in that window apply to the very next vault window
+        // rather than only to the next app launch.
+        settings,
+    } = estate;
+    // Narrowed back to the shared borrow this body has always held: nothing
+    // below mutates the `Arc` itself, only the cache behind it.
+    let cache: &Arc<VaultCache> = cache;
     // Reopened, not merely opened once: the titlebar gear asks for the
     // preferences window, and `prefs_ui::run` is its own `eframe` window on
     // this same thread. eframe cannot nest one native event loop inside
@@ -8540,7 +8588,7 @@ mod tests {
                  guard is deciding about some other pair of accounts: {block:?}"
             );
             assert!(
-                !block.contains(concat!("active_account.as_ref().map(|a| &", "a.id)")),
+                !block.contains(concat!("estate.active_account.as_ref().map(|a| &", "a.id)")),
                 "the drain reads the active account's id itself instead of leaving that to the \
                  one function whose tests evaluate the comparison -- which is how the same id \
                  came to be passed as both sides of it: {block:?}"
@@ -8554,14 +8602,14 @@ mod tests {
                 "the drain persists the prefetch itself, outside the guarded function, so the \
                  guard's answer is not what decides whether it is written: {block:?}"
             );
-            let cache = concat!("cached_status_details = Some(", "adopted);");
+            let cache = concat!("estate.details = Some(", "adopted);");
             assert_eq!(
                 block.matches(cache).count(),
                 1,
                 "expected exactly one place the drain caches what it was handed back: {block:?}"
             );
             assert!(
-                !block.contains(concat!("cached_status_details = Some(", "details);")),
+                !block.contains(concat!("estate.details = Some(", "details);")),
                 "the RAW prefetch is cached rather than what the guarded function handed back, \
                  so a dropped answer is cached anyway: {block:?}"
             );
