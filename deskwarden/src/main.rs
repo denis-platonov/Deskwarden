@@ -7535,6 +7535,249 @@ mod tests {
                 "the sliced block is not the settings write-back: {block:?}"
             );
         }
+
+        /// The one line that decides what this pass's outcome means.
+        ///
+        /// `concat!`-split for this file's usual reason: an un-split literal
+        /// matches its own declaration in the test half, and
+        /// `production_half_of_this_file` is only half the protection -- the
+        /// habit is what keeps it true when a needle is later copied into a
+        /// test that reads the whole file.
+        fn follow_up_decision() -> String {
+            concat!("let follow_up = vault_follow", "_up(&result);").to_string()
+        }
+
+        /// The head of the branch that acts on `AccountAction`.
+        fn account_action_branch() -> String {
+            concat!("if follow_up == VaultFollow", "Up::AccountAction {").to_string()
+        }
+
+        /// The head of the branch that acts on `Resettle`.
+        fn resettle_branch() -> String {
+            concat!("if follow_up == VaultFollow", "Up::Resettle {").to_string()
+        }
+
+        /// Occurrences of `follow_up` being ASSIGNED -- `follow_up =` but not
+        /// `follow_up ==`, which is how both branches read it.
+        fn assignments_of_follow_up(source: &str) -> usize {
+            let needle = concat!("follow", "_up =");
+            source
+                .match_indices(needle)
+                .filter(|(at, _)| source[at + needle.len()..].starts_with(|c: char| c != '='))
+                .count()
+        }
+
+        /// **The loop acts on `vault_follow_up`'s answer, and on nothing it
+        /// decided for itself.**
+        ///
+        /// The pure function's own six tests cannot feel this. Every one of
+        /// them goes on passing against a loop that computes the right answer
+        /// and then overrides it --
+        ///
+        /// ```text
+        /// let follow_up = if result.edited_settings.is_some() {
+        ///     VaultFollowUp::Done
+        /// } else {
+        ///     vault_follow_up(&result)
+        /// };
+        /// ```
+        ///
+        /// -- which is the shipped defect's behaviour reached by a different
+        /// road. So the call is pinned as written, exactly once, above both
+        /// branches, and the binding is pinned as never reassigned afterwards.
+        #[test]
+        fn the_loop_asks_vault_follow_up_once_and_never_overrides_its_answer() {
+            let production = super::production_half_of_this_file();
+            let (decision, account, resettle) =
+                (follow_up_decision(), account_action_branch(), resettle_branch());
+
+            assert_eq!(
+                production.matches(&decision).count(),
+                1,
+                "{decision:?} does not appear exactly once in the production code. Either the \
+                 loop stopped asking the one function that knows what a finished vault session \
+                 means, or it now asks it under a condition -- and a conditional call is how the \
+                 shipped defect comes back with `vault_follow_up`'s own tests still green"
+            );
+            assert_eq!(
+                assignments_of_follow_up(production),
+                1,
+                "`follow_up` is assigned more than once in the production code, so the answer \
+                 the branches read is not necessarily the one `vault_follow_up` gave"
+            );
+            // Positive control: the counter can see an assignment that is not
+            // the `let`, and does not count either branch's `==`.
+            assert_eq!(
+                assignments_of_follow_up("let follow_up = f(); follow_up = Done; if follow_up == D"),
+                2,
+                "control: the assignment counter cannot tell an assignment from a comparison, so \
+                 the assertion above passes against a loop that overwrites the answer"
+            );
+
+            let decision_at = production
+                .find(&decision)
+                .expect("checked to occur once directly above");
+            for branch in [&account, &resettle] {
+                let at = production.find(branch.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "{branch:?} is not in the production code -- the loop no longer acts on \
+                         the follow-up it computed"
+                    )
+                });
+                assert!(
+                    decision_at < at,
+                    "{branch:?} is above the line that computes `follow_up`, so this ordering \
+                     guard is reading the wrong function"
+                );
+            }
+        }
+
+        /// The span between "this pass has a result" and the first branch that
+        /// acts on it, with whole-line `//` comments removed.
+        ///
+        /// Comments are stripped because this region's comments are the ONLY
+        /// record of why the `continue` must not come back, and they spell
+        /// `continue` (in backticks) several times. A scan that tripped over
+        /// its own documentation would be deleted by the next reader, which is
+        /// the worst possible outcome for the one guard on a critical defect.
+        fn code_between_the_result_and_the_first_branch() -> String {
+            let production = super::production_half_of_this_file();
+            let head = concat!("let result = match first_", "result.take() {");
+            assert_eq!(
+                production.matches(head).count(),
+                1,
+                "{head:?} is not where this guard expects the vault session's result to be \
+                 produced"
+            );
+            let branch = account_action_branch();
+            let from = production.find(head).expect("checked directly above");
+            let to = production.find(branch.as_str()).unwrap_or_else(|| {
+                panic!("{branch:?} is not in the production code -- nothing acts on the result")
+            });
+            assert!(
+                from < to,
+                "the first branch is above the result it acts on: this slice would be empty or \
+                 inverted and would assert nothing"
+            );
+
+            let region = &production[from..to];
+            let mut stripped = 0usize;
+            let code: Vec<&str> = region
+                .lines()
+                .filter(|line| {
+                    let comment = line.trim_start().starts_with("//");
+                    stripped += usize::from(comment);
+                    !comment
+                })
+                .collect();
+            // The stripping is load-bearing in both directions: it must have
+            // removed something (or the region is not the documented one), and
+            // what it removed must be what would otherwise trip the scan.
+            assert!(
+                stripped > 0,
+                "no comment line was stripped from the region, so this slice is not the \
+                 documented write-back span and the scan below is looking at something else"
+            );
+            assert!(
+                region.contains("`continue`"),
+                "the region no longer documents the `continue` that must not come back -- the \
+                 comment stripping above is now hiding nothing, which means the slice moved"
+            );
+            code.join("\n")
+        }
+
+        /// Which control-flow jumps appear in `code`, as whole words.
+        ///
+        /// Whole words, so `continued`, `broken_by` or a `return_value`
+        /// identifier is not a hit; the keywords themselves are what make the
+        /// branches below unreachable.
+        fn jumps_in(code: &str) -> Vec<&'static str> {
+            let is_word = |c: char| c.is_alphanumeric() || c == '_';
+            ["continue", "break", "return"]
+                .into_iter()
+                .filter(|kw| {
+                    code.match_indices(kw).any(|(at, _)| {
+                        let before_ok = at == 0 || !code[..at].ends_with(is_word);
+                        let after_ok = !code[at + kw.len()..].starts_with(is_word);
+                        before_ok && after_ok
+                    })
+                })
+                .collect()
+        }
+
+        /// **Nothing may jump between the vault session ending and the branches
+        /// that act on it -- anywhere, not just inside the write-back block.**
+        ///
+        /// `the_settings_write_back_cannot_skip_the_branches_beneath_it` above
+        /// is a POSITIONAL guard: it slices the write-back block and rejects a
+        /// jump *inside* it. That kills the historical mutation and nothing
+        /// else. The same `continue`, one line lower --
+        ///
+        /// ```text
+        /// }
+        /// if result.edited_settings.is_some() { continue; }
+        /// ```
+        ///
+        /// -- is the shipped defect verbatim, and it passed the whole suite.
+        /// So this guard is structural instead: it takes the entire span from
+        /// `let result = match first_result.take()` to the first branch and
+        /// rejects `continue`, `break` and `return` anywhere in it. Every early
+        /// exit inserted at any depth or any line in that span is a defect,
+        /// because `edited_settings` is `Some` for the rest of a window's life
+        /// after one gear click and the branches below decide whether the vault
+        /// locks.
+        #[test]
+        fn nothing_between_the_window_closing_and_the_branches_may_jump() {
+            let code = code_between_the_result_and_the_first_branch();
+            assert!(
+                code.len() > 500,
+                "the region is {} bytes, which is not the span between the result and the first \
+                 branch: a scan over it would pass against nothing",
+                code.len()
+            );
+            // Positive controls: the region really contains the two things that
+            // happen in it, so it is neither empty nor some other slice.
+            for (marker, what) in [
+                (concat!("persist_pre", "ferences("), "the settings write-back"),
+                (concat!("learn_active_account", "_details("), "the account-details refill"),
+            ] {
+                assert!(
+                    code.contains(marker),
+                    "{what} is not inside the sliced region, so this guard is not watching the \
+                     span it claims to: {code:?}"
+                );
+            }
+
+            let jumps = jumps_in(&code);
+            assert!(
+                jumps.is_empty(),
+                "the span between the vault window's result and the branches that act on it \
+                 contains {jumps:?}. `edited_settings` is `Some` for the rest of a window's life \
+                 once the gear has been clicked once, so ANY early exit here makes Lock, the 401 \
+                 recovery, every account request and the plain close unreachable -- the exact \
+                 defect that shipped in v0.5.0. Region:\n{code}"
+            );
+
+            // Control: the scanner can answer non-empty. Without this the
+            // assertion above passes against a `jumps_in` that always says
+            // "nothing", which is a guard that guards nothing.
+            assert_eq!(
+                jumps_in("if result.edited_settings.is_some() { continue; }"),
+                vec!["continue"],
+                "control: the jump scanner does not see the shipped defect, so it cannot be \
+                 what stands between this file and it"
+            );
+            assert_eq!(
+                jumps_in("let x = 1; return;"),
+                vec!["return"],
+                "control: the jump scanner does not see a bare `return`"
+            );
+            assert!(
+                jumps_in("let returned = continued_break_value + 1;").is_empty(),
+                "control: the jump scanner fires on identifiers that merely contain a keyword, \
+                 so it would be turned off by the first false positive"
+            );
+        }
     }
 
     /// **The switcher's production wiring**, which is where every previous
