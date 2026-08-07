@@ -730,7 +730,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 32] = [
+        const OPENS_NO_WINDOW: [&str; 33] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -738,6 +738,9 @@ mod tests {
             "app_identity",
             "app_match",
             "backend_policy",
+            // Hashes a password and talks to the Have I Been Pwned range
+            // API. Pure logic plus one HTTP call; it draws nothing.
+            "breach",
             "bw_path",
             "bw_serve",
             "dispatch",

@@ -87,6 +87,11 @@ semver = "1"
 # with AES-256-GCM under a key derived (SHA-256) from a Windows Hello
 # KeyCredential signature, then DPAPI-wrapped at rest.
 aes-gcm = "0.10"
+# Have I Been Pwned's range API is keyed on SHA-1(password) and nothing
+# else matches it (src/breach.rs). Not a security control -- an index.
+# `sha2` is already here, so `digest`/`block-buffer`/`cpufeatures` are
+# already in the tree: this adds one crate and no new transitive surface.
+sha1 = "0.10"
 sha2 = "0.10"
 getrandom = "0.2"
 # Decodes fetched favicons to RGBA (src/favicon.rs); also used by the
