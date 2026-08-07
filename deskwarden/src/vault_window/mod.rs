@@ -786,6 +786,29 @@ pub fn build_frame(
             .and_then(|path| crate::settings::Settings::load(path).vault_window),
         &crate::login_ui::monitor_work_areas(),
     );
+    // Whether the breach badge may ask about anything at all, as
+    // `settings.json` had it when this window opened. The preferences modal
+    // can turn it on or off while the window is up and nothing is written to
+    // disk until the window closes, so the per-frame value in the read arm
+    // prefers `edited_settings` and falls back to this. Off by default, and
+    // `detail::should_check` is the only thing that reads either.
+    let check_breaches_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).check_breaches)
+        .unwrap_or(false);
+    // **The window's one breach cache**, alive exactly as long as the window
+    // and holding nothing but five-character SHA-1 prefixes and counts.
+    //
+    // Built here rather than per frame because a cache rebuilt every frame is
+    // not a cache: every open pane would start a fresh worker every frame,
+    // against a free public endpoint.
+    //
+    // `BreachCache::live` is the production wiring and this is its only
+    // caller anywhere. It starts no thread and makes no request on
+    // construction -- the first worker is started by the first `status` call,
+    // which `detail::should_check` gates and which only ever happens for a
+    // login whose pane the user has opened.
+    let mut breaches = crate::breach::BreachCache::live();
     // The geometry to write back on close, updated every frame the window is
     // in an ordinary (neither maximized nor minimized) state. An
     // `Rc<RefCell<_>>` for the same reason `locked` and `needs_reauth` are:
@@ -2378,6 +2401,16 @@ pub fn build_frame(
                             // driven headlessly by a test. See that
                             // function's doc for why that is not a stylistic
                             // preference on this particular arm.
+                            // The live preference: whatever the preferences
+                            // modal is holding this session, or what was on
+                            // disk when the window opened. Nothing has been
+                            // written yet -- see `edited_settings` -- so
+                            // re-reading the file here would show the value
+                            // the user has already changed away from.
+                            let check_breaches = edited_settings_for_closure
+                                .borrow()
+                                .as_ref()
+                                .map_or(check_breaches_at_open, |s| s.check_breaches);
                             let action = draw_read_arm(
                                 ui,
                                 item,
@@ -2388,6 +2421,8 @@ pub fn build_frame(
                                 &mut reveal,
                                 icons.textures.get(item.id.as_str()),
                                 &mut app_identities,
+                                check_breaches,
+                                &mut breaches,
                             );
                             // `item` and `totp_code` already hold everything
                             // a copy action needs -- `draw_detail_read` only
@@ -3958,6 +3993,12 @@ fn draw_read_arm(
     // shows what the bound app is really CALLED, and that answer comes off a
     // worker thread and is cached per path for the life of the window.
     apps: &mut crate::app_identity::AppIdentityCache,
+    // `Settings::check_breaches` as this frame has it, and the window's one
+    // breach cache -- forwarded, not decided here. `detail::should_check`
+    // owns every condition; this arm's job is only to make sure the pane can
+    // be driven headlessly with both of them under a test's control.
+    check_breaches: bool,
+    breaches: &mut crate::breach::BreachCache,
 ) -> DetailAction {
     let action = draw_detail_read(
         ui,
@@ -3969,6 +4010,8 @@ fn draw_read_arm(
         reveal,
         icon,
         apps,
+        check_breaches,
+        breaches,
     );
     // **CTRL+SHIFT+F used to be read here, and is gone with the button it
     // was the keyboard equivalent of.** Its whole identity was "clicking
@@ -10372,6 +10415,13 @@ mod draw_read_arm_tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                // The badge off, and a cache whose check answers "could not
+                // be checked" rather than "safe" if anything ever reaches it.
+                // `BreachCache::live` is not named in this module.
+                false,
+                &mut crate::breach::BreachCache::new(std::sync::Arc::new(|_, _| {
+                    crate::breach::BreachStatus::Unavailable
+                })),
             );
         });
 

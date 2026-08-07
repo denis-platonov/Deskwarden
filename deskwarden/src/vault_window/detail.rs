@@ -26,6 +26,7 @@ use crate::app_match::AppMatch;
 /// [`TRIGGER_ORDER`] -- and so is the import it needs.
 #[cfg(test)]
 use crate::app_match::TriggerMode;
+use crate::breach::{breach_phrase, BreachCache, BreachStatus};
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
@@ -829,6 +830,102 @@ pub fn metadata_line_for(
     } else {
         updated_text(updated_days_ago)
     }
+}
+
+/// Whether this pane should ask the breach cache about this item at all.
+///
+/// Three conditions, all of them necessary: the preference is on, the kind
+/// has a password worth asking about ([`kind_offers_fill`] -- the same
+/// predicate the fill count and the strength are already gated on, so the
+/// strip cannot claim one kind of item in its first half and another in its
+/// second), and there is actually a password. An empty password has no
+/// prefix worth a request, and every passwordless item in the vault would
+/// share the same five hex characters -- one cache entry standing for a
+/// question nobody asked.
+///
+/// **This is the whole gate, and it runs LAZILY, once per opened pane.**
+/// There is no sweep over the vault: a 500-item vault would be 500 requests
+/// in a burst at a free public endpoint and 500 verdicts held in memory that
+/// the user never asked for. The list does not show a verdict for the same
+/// reason -- it would have to have one for every row.
+pub fn should_check(enabled: bool, kind: ItemKind, password: &str) -> bool {
+    enabled && kind_offers_fill(kind) && !password.is_empty()
+}
+
+/// The metadata strip's second half, for a status the pane actually has.
+///
+/// `None` => the strip is byte-identical to today: nothing is appended and
+/// the card paints the single `RichText` it always did. That is the answer
+/// [`breach_segment`] gives whenever [`should_check`] is false, which is
+/// every item in the vault until the user turns the preference on.
+///
+/// Reached only once a status exists, and every status there is says
+/// something out loud -- which is why each arm here is `Some`. A status with
+/// no segment would be a badge that silently disappears, and the one this
+/// would happen to first is `Unavailable`.
+///
+/// **`Unavailable` carries no reassurance.** It does not say "safe", it does
+/// not say "not in", and [`segment_color`] does not paint it as a verdict. A
+/// soothing badge on a request that failed is the worst outcome this whole
+/// feature has: it tells the user a password was checked and cleared when
+/// nothing was checked at all.
+pub fn strip_segment(status: BreachStatus) -> Option<String> {
+    Some(match status {
+        BreachStatus::Pending => "\u{b7} Breach check: checking\u{2026}".to_string(),
+        BreachStatus::Safe => "\u{b7} Not in any known breach".to_string(),
+        // `breach_phrase` owns this wording, including the rule that the
+        // advice never varies by count -- "seen 3 times" and "seen 40,000
+        // times" mean the same thing and get the same sentence. Reused, never
+        // restated: a second copy here would be a second place for the advice
+        // to soften.
+        BreachStatus::Breached(count) => format!("\u{b7} {}", breach_phrase(count)),
+        BreachStatus::Unavailable => "\u{b7} Breach check unavailable".to_string(),
+    })
+}
+
+/// Whether the segment is the one that must be RED.
+///
+/// Exactly one status is: a password on a public list, which is the only
+/// thing here the user has to act on. `Pending`, `Safe` and `Unavailable`
+/// are all reports on the check itself and none of them is an alarm.
+pub fn segment_is_urgent(status: BreachStatus) -> bool {
+    matches!(status, BreachStatus::Breached(_))
+}
+
+/// The colour the segment is painted in -- the palette's red for the one
+/// urgent status, and the same faint ink as the rest of the strip for the
+/// other three.
+///
+/// A function rather than an `if` at the paint site so the colour is a
+/// decision a test can reach; the test asserts the *painted* ink as well, so
+/// this and the renderer cannot disagree.
+pub fn segment_color(status: BreachStatus) -> egui::Color32 {
+    if segment_is_urgent(status) {
+        theme::ERROR
+    } else {
+        theme::TEXT_FAINT
+    }
+}
+
+/// The badge as the pane needs it: the text and the colour, or `None` for
+/// "this strip is what it always was".
+///
+/// The **only** place the cache is asked anything. Everything above it is
+/// pure; `BreachCache::status` answers from the map or starts one worker and
+/// says [`BreachStatus::Pending`], requesting a repaint so the answer lands
+/// on a later frame without the user touching anything.
+fn breach_segment(
+    ctx: &egui::Context,
+    enabled: bool,
+    kind: ItemKind,
+    password: &str,
+    breaches: &mut BreachCache,
+) -> Option<(String, egui::Color32)> {
+    if !should_check(enabled, kind, password) {
+        return None;
+    }
+    let status = breaches.status(ctx, password);
+    strip_segment(status).map(|text| (text, segment_color(status)))
 }
 
 /// What the detail pane says about an item that is in the Trash or the
@@ -1663,6 +1760,23 @@ pub fn draw_detail_read(
     // with the match it is about, and moving it into `vault_window::mod`
     // would put it where this file's tests cannot call it.
     apps: &mut crate::app_identity::AppIdentityCache,
+    // `Settings::check_breaches`, as the window has it THIS frame -- the
+    // preference is off by default and this pane is its first and only
+    // reader. A bool rather than the whole `Settings` because that is the
+    // entire question this pane is allowed to ask of it; see
+    // [`should_check`], which is the only thing that consumes it.
+    check_breaches: bool,
+    // The window's one `BreachCache`, threaded through for the same reason
+    // `apps` is: the answer comes off a worker thread, is keyed on the
+    // password's five-character prefix, and has to outlive the frame that
+    // asked for it. `&mut` because asking about a prefix it has not seen is
+    // what starts the worker.
+    //
+    // **Passed even when `check_breaches` is false.** The gate is
+    // [`should_check`] and it is read at exactly one place; a cache that is
+    // sometimes absent would put a second gate in the signature, and two
+    // gates is how "couldn't check" becomes "safe".
+    breaches: &mut BreachCache,
 ) -> DetailAction {
     let mut action = DetailAction::None;
     // **First, before anything is drawn or any chord is resolved.** A copy
@@ -2246,18 +2360,42 @@ pub fn draw_detail_read(
     // font-size: 12px; color: #7d7979`. It used to be a bare line of ghost text
     // on the pane's grey -- the one part of the body that sat on no surface at
     // all.
+    // **Before the frame, not inside it.** `breach_segment` needs `&mut` the
+    // cache and the closure below already borrows `ui`; asking here also
+    // keeps the one call that can start a worker out of a paint callback.
+    let segment = {
+        let ctx = ui.ctx().clone();
+        breach_segment(&ctx, check_breaches, kind, password, breaches)
+    };
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
         .stroke(Stroke::new(1.0, theme::HAIRLINE))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            card_text(
-                ui,
-                RichText::new(metadata_line_for(kind, updated_days_ago, fill_count, password))
-                    .size(ROW_LABEL_SIZE)
-                    .color(theme::TEXT_FAINT),
-            );
+            let strip = RichText::new(metadata_line_for(kind, updated_days_ago, fill_count, password))
+                .size(ROW_LABEL_SIZE)
+                .color(theme::TEXT_FAINT);
+            match segment {
+                // **The untouched path**, and deliberately the same call this
+                // card made before the badge existed rather than the pair
+                // below with one side empty: with the preference off the
+                // strip must be byte-identical AND pixel-identical, and the
+                // only way to be sure of that is to run the same code.
+                None => card_text(ui, strip),
+                Some((text, color)) => card_text_pair(
+                    ui,
+                    strip,
+                    // The leading space is the separator: `card_text_pair`
+                    // zeroes the layout's item spacing so the two runs read
+                    // as one sentence, and `strip_segment` owns the "\u{b7} "
+                    // that follows it exactly as `metadata_line` owns the two
+                    // before it.
+                    RichText::new(format!(" {text}"))
+                        .size(ROW_LABEL_SIZE)
+                        .color(color),
+                ),
+            }
         });
         });
     note_body_overflow(
@@ -4052,6 +4190,37 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
         });
 }
 
+/// [`card_text`] with a second run after the first: the same frame, the same
+/// margin, the same width. The metadata strip's breach badge is the only
+/// caller.
+///
+/// Two runs rather than one string because they are two colours -- a breached
+/// password's half is the palette's red and the strip's half stays faint, and
+/// one `RichText` cannot be both.
+///
+/// `horizontal_wrapped`, not `horizontal`: the breached segment is the
+/// longest string this strip has ever carried, and at the detail column's
+/// minimum width it does not fit on the line the strip is already using. A
+/// non-wrapping row would push it past the card's right edge, and egui culls
+/// shapes outside the screen rect entirely -- so the failure would not look
+/// like an overflowing badge, it would look like no badge at all.
+///
+/// Item spacing is zeroed because the caller's segment carries its own
+/// leading space; egui's default gap would put a wider hole before the
+/// separator than between the strip's own two.
+fn card_text_pair(ui: &mut egui::Ui, first: RichText, second: RichText) {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.label(first);
+                ui.label(second);
+            });
+        });
+}
+
 /// A plain value row. The whole tile copies; `hint`, when there is one, is
 /// the keyboard chord that copies the same value without the mouse, named in
 /// the tile's tooltip (see [`copy_row_tooltip`]).
@@ -4688,7 +4857,7 @@ mod tests {
     /// An item of a given kind, with nothing but a name -- the shape this
     /// pane has to survive, since a real card or note populates none of the
     /// login fields the pane used to assume were there.
-    fn an_item(item_type: Option<i64>) -> VaultItem {
+    pub(super) fn an_item(item_type: Option<i64>) -> VaultItem {
         VaultItem {
             id: "id-1".to_string(),
             name: "Sample".to_string(),
@@ -4707,7 +4876,7 @@ mod tests {
 
     /// The type number that produces each kind. `Unknown` needs a number
     /// Bitwarden has not shipped; 9 is arbitrary and deliberately not 5.
-    fn item_type_for(kind: ItemKind) -> Option<i64> {
+    pub(super) fn item_type_for(kind: ItemKind) -> Option<i64> {
         match kind {
             ItemKind::Login => Some(1),
             ItemKind::SecureNote => Some(2),
@@ -4718,7 +4887,7 @@ mod tests {
         }
     }
 
-    const EVERY_KIND: [ItemKind; 6] = [
+    pub(super) const EVERY_KIND: [ItemKind; 6] = [
         ItemKind::Login,
         ItemKind::SecureNote,
         ItemKind::Card,
@@ -4726,6 +4895,20 @@ mod tests {
         ItemKind::SshKey,
         ItemKind::Unknown(9),
     ];
+
+    /// The `BreachCache` every harness in this module passes, alongside
+    /// `check_breaches = false`.
+    ///
+    /// Its check answers `Unavailable` without touching anything, and
+    /// `should_check` returning false means no harness here ever reaches it
+    /// -- but if one ever did, the answer it would get is the one that says
+    /// "nothing was checked", never `Safe`. `BreachCache::live` is not named
+    /// anywhere in this file.
+    pub(super) fn inert_breach_cache() -> crate::breach::BreachCache {
+        crate::breach::BreachCache::new(std::sync::Arc::new(|_, _| {
+            crate::breach::BreachStatus::Unavailable
+        }))
+    }
 
     /// Every string `draw_detail_read` actually *painted*, gathered from the
     /// frame's own shape list.
@@ -4774,6 +4957,8 @@ mod tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                false,
+                &mut inert_breach_cache(),
             );
         });
 
@@ -5116,6 +5301,8 @@ mod tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                false,
+                &mut inert_breach_cache(),
             );
         })
         .shapes
@@ -5497,6 +5684,8 @@ mod tests {
                         &mut self.reveal,
                         None,
                         &mut self.apps,
+                        false,
+                        &mut inert_breach_cache(),
                     );
                 },
             );
@@ -12269,6 +12458,8 @@ mod read_pane_scroll_tests {
                         &mut self.reveal,
                         None,
                         &mut self.apps,
+                        false,
+                        &mut super::tests::inert_breach_cache(),
                     );
                 },
             );
@@ -13658,5 +13849,618 @@ mod read_pane_scroll_tests {
                 ink.height()
             );
         }
+    }
+}
+
+/// **The breach badge**: the metadata strip's second run.
+///
+/// Its own module rather than more tests in `tests` above, because every one
+/// of them has to drive `draw_detail_read` with the two new arguments under
+/// its own control, and the harnesses up there deliberately pass the feature
+/// off.
+///
+/// **Nothing here can reach the network.** `BreachCache::live` is not named
+/// anywhere in this module; every cache below is `BreachCache::new` around a
+/// closure that returns a constant. `no_breach_test_here_can_reach_the_real_
+/// api` checks that on this module's own source rather than on this sentence.
+#[cfg(test)]
+mod breach_badge_tests {
+    use super::shape_ink::glyph_ink;
+    use super::tests::{an_item, item_type_for, EVERY_KIND};
+    use super::*;
+    use crate::breach::{BreachCache, BreachStatus};
+    use crate::vault_bridge::{ItemKind, VaultItem};
+    use std::sync::Arc;
+
+    /// The width `tests::PANE` uses, so the numbers pinned below are about
+    /// the same pane every other geometry assertion in this file is about.
+    const PANE: f32 = 900.0;
+
+    /// The narrowest the detail column can ever be -- 900 - 212 - 390 =
+    /// 298pt -- spelled out of the three constants that produce it exactly as
+    /// `read_pane_scroll_tests::NARROW` is. The breached segment is the
+    /// longest string this strip has ever carried and this is the width it
+    /// has to survive.
+    const NARROW: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+        - crate::vault_window::SIDEBAR_WIDTH
+        - crate::vault_window::LIST_WIDTH;
+
+    const PASSWORD: &str = "hunter2-but-longer";
+
+    /// The strip these tests expect beside the badge: `fill_count` is 3 in
+    /// the harness below and the fixture carries no `revisionDate`, so
+    /// `metadata_line_for` is `metadata_line(None, 3, PASSWORD)`. Named
+    /// through the production function, never written out, so a reworded
+    /// strip moves this with it instead of failing here.
+    fn strip_text() -> String {
+        metadata_line(None, 3, PASSWORD)
+    }
+
+    /// An item of `kind` carrying a login block with `password` in it.
+    ///
+    /// **Every kind gets the login block**, including the four that are not
+    /// logins. That is the point: `draw_detail_read` reads the password out
+    /// of `item.login` whatever the kind is, so a card with a password in it
+    /// is exactly the item that would get a badge if the gate were the
+    /// password rather than the kind.
+    fn an_item_of(kind: ItemKind, password: Option<&str>) -> VaultItem {
+        let mut item = an_item(item_type_for(kind));
+        item.login = Some(crate::vault_bridge::LoginData {
+            username: Some("u".to_string()),
+            password: password.map(|p| p.to_string().into()),
+            totp: None,
+            uris: Vec::new(),
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    /// One painted string, with the ink a reader would actually see.
+    #[derive(Clone, Debug)]
+    struct Run {
+        /// The layout job's SOURCE string.
+        text: String,
+        /// The characters egui really placed glyphs for -- empty for a run
+        /// that was allocated and laid out nothing.
+        rendered: String,
+        /// The box the GLYPHS cover, not the box the layout was given. Inside
+        /// a `horizontal_wrapped` row the second is the whole wrap width; see
+        /// [`glyph_ink`], whose doc is the record of that mistake.
+        ink: egui::Rect,
+        /// One box per glyph actually laid out **that paints something**.
+        ///
+        /// Whitespace is dropped: a space is allocated and advances the
+        /// cursor but marks no pixel, so it cannot sit on top of anything.
+        /// Keeping it produced this test's second false positive -- the
+        /// segment's leading space overlapped the strip's last `g` by 0.7pt
+        /// of font bearing, which is two adjacent glyphs on one line and not
+        /// a collision.
+        ///
+        /// **`ink` is not good enough for a collision test.** It is the union
+        /// over every row of a run, and a wrapped run's union covers the gap
+        /// at the end of each row that the run never touches. The first
+        /// version of `the_breached_segment_stays_inside_the_card` failed on
+        /// exactly that: the strip wraps to two rows, the segment starts
+        /// beside the strip's second row, and the two unions overlapped while
+        /// no glyph of either was anywhere near a glyph of the other.
+        glyphs: Vec<egui::Rect>,
+        /// **The colour the tessellator will use**, resolved the way epaint
+        /// resolves it: an override wins, a `PLACEHOLDER` section falls back
+        /// to the shape's fallback colour, and the whole thing is scaled by
+        /// the shape's opacity factor. Reading `RichText`'s colour instead
+        /// would restate the argument this file passed in rather than measure
+        /// what it painted -- and a run at alpha 0 has a perfectly correct
+        /// rectangle.
+        color: egui::Color32,
+    }
+
+    fn collect_runs(shape: &egui::Shape, out: &mut Vec<Run>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let section = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| s.format.color)
+                    .unwrap_or(egui::Color32::PLACEHOLDER);
+                let base = text.override_text_color.unwrap_or(
+                    if section == egui::Color32::PLACEHOLDER {
+                        text.fallback_color
+                    } else {
+                        section
+                    },
+                );
+                let alpha = (f32::from(base.a()) * text.opacity_factor).round();
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    base.r(),
+                    base.g(),
+                    base.b(),
+                    alpha.clamp(0.0, 255.0) as u8,
+                );
+                let rendered: String = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                    .collect();
+                let glyphs = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| {
+                        row.glyphs
+                            .iter()
+                            .filter(|glyph| !glyph.chr.is_whitespace())
+                            .map(move |glyph| {
+                                egui::Rect::from_min_size(
+                                    text.pos + row.pos.to_vec2() + glyph.pos.to_vec2(),
+                                    glyph.size(),
+                                )
+                            })
+                    })
+                    .collect();
+                out.push(Run {
+                    text: text.galley.text().to_string(),
+                    rendered,
+                    ink: glyph_ink(text).unwrap_or(egui::Rect::NOTHING),
+                    glyphs,
+                    color,
+                });
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_runs(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_fills(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::Color32)>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push((rect.rect, rect.fill)),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_fills(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What one frame of the pane painted.
+    struct Painted {
+        runs: Vec<Run>,
+        fills: Vec<(egui::Rect, egui::Color32)>,
+    }
+
+    impl Painted {
+        /// Every run whose source text contains `needle`.
+        fn matching(&self, needle: &str) -> Vec<&Run> {
+            self.runs.iter().filter(|r| r.text.contains(needle)).collect()
+        }
+
+        /// The one run containing `needle`, and a named failure if there is
+        /// not exactly one. **This is the count assertion the brief asks for
+        /// and it comes first in every geometry test below**: egui culls
+        /// shapes that fall entirely outside the screen rect, so a badge
+        /// pushed past the pane's edge comes back as *nothing at all*, and
+        /// "everything I found fits" is green on a strip that lost it.
+        fn only(&self, needle: &str) -> &Run {
+            let hits = self.matching(needle);
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected exactly one painted run containing {needle:?}, found {}: {:?}",
+                hits.len(),
+                self.runs.iter().map(|r| &r.text).collect::<Vec<_>>()
+            );
+            hits[0]
+        }
+
+        /// The smallest CARD-filled rectangle that encloses `run` -- the tile
+        /// the run is supposed to be inside of.
+        fn card_around(&self, run: &Run) -> egui::Rect {
+            self.fills
+                .iter()
+                .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(run.ink))
+                .map(|(rect, _)| *rect)
+                .min_by(|a, b| a.area().partial_cmp(&b.area()).expect("a NaN card"))
+                .unwrap_or_else(|| {
+                    panic!("no CARD tile encloses {:?} at {:?}", run.text, run.ink)
+                })
+        }
+    }
+
+    /// Frames of `draw_detail_read` with the breach feature in a known state,
+    /// returning what the LAST one painted.
+    ///
+    /// `answer` is what the stub worker returns. `BreachCache::status` starts
+    /// that worker and says `Pending` on the frame that asks, so a test about
+    /// `Safe`, `Breached` or `Unavailable` has to run frames until the answer
+    /// has been promoted -- `settle` does that, and asserts rather than
+    /// silently returning the pending frame if it never arrives.
+    ///
+    /// The stub is a closure over a `Copy` status. It opens no socket, and
+    /// the cache's live constructor is never named here -- see
+    /// `no_breach_test_here_can_reach_the_real_api`, which is why that
+    /// sentence does not spell the name it is about.
+    fn painted(
+        item: &VaultItem,
+        enabled: bool,
+        answer: BreachStatus,
+        width: f32,
+        settle: bool,
+    ) -> Painted {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 900.0),
+            )),
+            ..Default::default()
+        };
+        // `theme::apply`'s font set only takes effect at the start of the
+        // next frame, so a throwaway one runs first -- the same two-step
+        // every other harness in this file does.
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let mut cache = BreachCache::new(Arc::new(move |_, _| answer));
+        let mut reveal = RevealState::default();
+        let mut apps = crate::app_identity::AppIdentityCache::default();
+        let want = strip_segment(answer).expect("every status has a segment");
+        let mut painted = Painted { runs: Vec::new(), fills: Vec::new() };
+        for _ in 0..600 {
+            let output = ctx.run_ui(input(), |ui| {
+                draw_detail_read(
+                    ui,
+                    item,
+                    None,
+                    3,
+                    &TotpState::NoSecret,
+                    false,
+                    &mut reveal,
+                    None,
+                    &mut apps,
+                    enabled,
+                    &mut cache,
+                );
+            });
+            painted.runs.clear();
+            painted.fills.clear();
+            for clipped in &output.shapes {
+                collect_runs(&clipped.shape, &mut painted.runs);
+                collect_fills(&clipped.shape, &mut painted.fills);
+            }
+            if !settle || painted.runs.iter().any(|r| r.text.contains(&want)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if settle {
+            assert!(
+                painted.runs.iter().any(|r| r.text.contains(&want)),
+                "the stub's {answer:?} never reached the strip; painted: {:?}",
+                painted.runs.iter().map(|r| &r.text).collect::<Vec<_>>()
+            );
+        }
+        painted
+    }
+
+    /// The metadata card's WIDTH and HEIGHT on the unchanged tree, measured
+    /// on `a506592` (the commit before this badge existed) for this exact
+    /// fixture: a login with `PASSWORD`, `fill_count` 3, no `revisionDate`,
+    /// on a 900pt pane. Card `[[24 371] - [876 412]]`.
+    ///
+    /// Absolute numbers taken from BEFORE the change, which is the only kind
+    /// that can prove the card did not move. A number measured afterwards
+    /// would be a photograph of whatever this commit happens to do.
+    const BASELINE_CARD: (f32, f32) = (852.0, 41.0);
+
+    /// The same, at the detail column's minimum width: `[[24 471] - [275 525]]`.
+    const BASELINE_CARD_NARROW: (f32, f32) = (251.0, 54.0);
+
+    /// **The "we broke nothing" test.** With the preference off -- which is
+    /// how it ships -- the strip is the string `metadata_line` produces and
+    /// the card is the size it was before any of this existed.
+    #[test]
+    fn the_strip_is_byte_identical_when_the_check_is_off() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        let off = painted(&item, false, BreachStatus::Safe, PANE, false);
+
+        // Byte-identical, compared against `metadata_line`'s own output --
+        // not against a copy of the wording written out here.
+        let strip = off.only(&strip_text());
+        assert_eq!(strip.text, metadata_line(None, 3, PASSWORD));
+        assert_eq!(strip.color, theme::TEXT_FAINT);
+        assert!(strip.color.a() > 0, "the strip is painted at alpha 0");
+
+        // And nothing else in the frame says anything about a breach, in any
+        // casing. A segment that leaked in with the feature off would be a
+        // request the user did not consent to as well as a string.
+        let lower: Vec<String> = off.runs.iter().map(|r| r.text.to_lowercase()).collect();
+        assert!(
+            !lower.iter().any(|t| t.contains("breach")),
+            "the feature is off and the pane painted a breach segment: {lower:?}"
+        );
+
+        // The card is the size it was on the unchanged tree.
+        let card = off.card_around(strip);
+        assert_eq!(
+            (card.width(), card.height()),
+            BASELINE_CARD,
+            "the metadata card moved with the feature off; it was {BASELINE_CARD:?}"
+        );
+
+        // **The guard against a vacuous absence.** The same fixture with the
+        // preference ON gains a run in the same frame, so the two assertions
+        // above are about the preference and not about a renderer that
+        // stopped drawing the strip's second half for everyone.
+        let on = painted(&item, true, BreachStatus::Safe, PANE, false);
+        assert!(
+            on.matching("Breach check").len() == 1,
+            "with the preference on the pane painted no segment, so the off case proves nothing"
+        );
+        // And the decision underneath agrees with the pixels.
+        assert!(!should_check(false, ItemKind::Login, PASSWORD));
+        assert!(should_check(true, ItemKind::Login, PASSWORD));
+    }
+
+    /// **The worst outcome this feature has**: a request that failed, shown
+    /// as a password that was checked and cleared.
+    #[test]
+    fn an_unavailable_check_never_says_safe() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        let frame = painted(&item, true, BreachStatus::Unavailable, PANE, true);
+        let seg = frame.only("Breach check unavailable");
+
+        let lower = seg.text.to_lowercase();
+        assert!(!lower.contains("not in"), "the unavailable badge reassures: {:?}", seg.text);
+        assert!(!lower.contains("safe"), "the unavailable badge reassures: {:?}", seg.text);
+        // Nor is it the Safe wording under another name.
+        assert_ne!(
+            strip_segment(BreachStatus::Unavailable),
+            strip_segment(BreachStatus::Safe)
+        );
+        // The pure decision says the same thing, so this is not only a fact
+        // about the one string the renderer happened to reach.
+        let text = strip_segment(BreachStatus::Unavailable).unwrap().to_lowercase();
+        assert!(!text.contains("not in") && !text.contains("safe"), "{text:?}");
+        // Painted, visible, and NOT the alarm colour -- "could not be
+        // checked" is not a verdict in either direction.
+        assert!(!seg.rendered.is_empty(), "the unavailable badge laid out no glyphs");
+        assert!(seg.color.a() > 0, "the unavailable badge is painted at alpha 0");
+        assert_eq!(seg.color, theme::TEXT_FAINT);
+        assert!(!segment_is_urgent(BreachStatus::Unavailable));
+    }
+
+    /// Only a login has a password, so only a login has anything to check.
+    #[test]
+    fn only_logins_get_a_breach_segment() {
+        // **The loop has to be worth running.** Without both of these it can
+        // pass on an empty list, or on a list of six logins.
+        assert!(!EVERY_KIND.is_empty());
+        assert!(
+            EVERY_KIND.iter().any(|k| kind_offers_fill(*k)),
+            "no kind in the loop offers a fill, so the true case is never taken"
+        );
+        assert!(
+            EVERY_KIND.iter().any(|k| !kind_offers_fill(*k)),
+            "every kind in the loop is a login, so this proves nothing"
+        );
+
+        let mut checked = 0;
+        for kind in EVERY_KIND {
+            let item = an_item_of(kind, Some(PASSWORD));
+            // One frame: the answer does not matter here, only whether the
+            // pane asked at all, and the frame that asks says "checking".
+            let frame = painted(&item, true, BreachStatus::Safe, PANE, false);
+            let has_segment = !frame.matching("Breach check").is_empty();
+            assert_eq!(
+                has_segment,
+                kind_offers_fill(kind),
+                "{kind:?}: painted {has_segment}, `kind_offers_fill` says {}",
+                kind_offers_fill(kind)
+            );
+            // The decision and the render, checked against each other rather
+            // than each against a copy of the rule.
+            assert_eq!(should_check(true, kind, PASSWORD), kind_offers_fill(kind), "{kind:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, EVERY_KIND.len());
+        assert!(checked >= 6, "only {checked} kinds were checked");
+    }
+
+    /// An item with no password has no prefix worth asking about, and every
+    /// one of them would share a cache entry.
+    #[test]
+    fn should_check_is_false_for_an_empty_password_even_when_enabled() {
+        assert!(!should_check(true, ItemKind::Login, ""));
+        // The other two conditions held, so the empty password is what did it.
+        assert!(should_check(true, ItemKind::Login, PASSWORD));
+
+        // And the pane obeys it, for both spellings of "no password": a login
+        // whose password field is absent, and one whose password is "".
+        for password in [None, Some("")] {
+            let item = an_item_of(ItemKind::Login, password);
+            let frame = painted(&item, true, BreachStatus::Safe, PANE, false);
+            assert!(
+                frame.matching("Breach check").is_empty(),
+                "a login with password {password:?} was checked anyway: {:?}",
+                frame.runs.iter().map(|r| &r.text).collect::<Vec<_>>()
+            );
+        }
+        // The same fixture WITH a password does get one, so the absence above
+        // is the empty password and not a broken harness.
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        assert_eq!(
+            painted(&item, true, BreachStatus::Safe, PANE, false)
+                .matching("Breach check")
+                .len(),
+            1
+        );
+    }
+
+    /// A red warning painted in faint grey is not a warning.
+    #[test]
+    fn a_breached_item_says_change_it_and_says_it_in_red() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        let frame = painted(&item, true, BreachStatus::Breached(3), PANE, true);
+        let want = strip_segment(BreachStatus::Breached(3)).unwrap();
+        let seg = frame.only(&want);
+
+        assert!(
+            seg.text.to_lowercase().contains("change this password"),
+            "the breached badge does not tell the user to change it: {:?}",
+            seg.text
+        );
+        assert!(seg.text.contains('3'), "the count is not in the badge: {:?}", seg.text);
+        assert!(!seg.rendered.is_empty(), "the breached badge laid out no glyphs");
+
+        // **THE COLOUR, off the shape the tessellator is handed** -- not off
+        // the `RichText` this file built.
+        assert_eq!(
+            seg.color,
+            theme::ERROR,
+            "the breach warning is not the palette's red; it is {:?}",
+            seg.color
+        );
+        assert_eq!(seg.color.a(), 255, "an alarm at alpha {} is not an alarm", seg.color.a());
+        assert_ne!(seg.color, theme::TEXT_FAINT);
+
+        // The strip beside it stays faint, so the assertion above is about
+        // the segment and not about a card that turned red wholesale.
+        let strip = frame.only(&strip_text());
+        assert_eq!(strip.color, theme::TEXT_FAINT);
+
+        // The advice does not soften for a small number and does not escalate
+        // for a large one -- `breach_phrase` owns that and this is the badge
+        // agreeing with it.
+        for count in [1_u64, 3, 40_000] {
+            let text = strip_segment(BreachStatus::Breached(count)).unwrap();
+            assert!(
+                text.to_lowercase().contains("change this password"),
+                "{count}: {text:?}"
+            );
+            assert!(segment_is_urgent(BreachStatus::Breached(count)));
+            assert_eq!(segment_color(BreachStatus::Breached(count)), theme::ERROR);
+        }
+    }
+
+    /// The longest string this strip has ever carried, at the narrowest the
+    /// detail column can be.
+    #[test]
+    fn the_breached_segment_stays_inside_the_card() {
+        let item = an_item_of(ItemKind::Login, Some(PASSWORD));
+        let frame = painted(&item, true, BreachStatus::Breached(40_000), NARROW, true);
+        let want = strip_segment(BreachStatus::Breached(40_000)).unwrap();
+
+        // **The count first.** egui culls shapes entirely outside the screen
+        // rect, so a segment shoved past the right edge would come back as
+        // nothing and every containment assertion below would pass vacuously.
+        let seg = frame.only(&want);
+        let strip = frame.only(&strip_text());
+
+        // Real ink: glyphs laid out, and a colour a reader can see.
+        assert!(!seg.rendered.is_empty(), "the segment laid out no glyphs");
+        assert!(seg.ink.is_positive(), "the segment covers no area: {:?}", seg.ink);
+        assert!(seg.color.a() > 0, "the segment is painted at alpha 0");
+
+        // Inside the pane at all -- the cull would have hidden this, which is
+        // why the count assertion had to come first.
+        assert!(
+            seg.ink.min.x >= 0.0 && seg.ink.max.x <= NARROW,
+            "the segment runs from {} to {} on a {NARROW}pt pane",
+            seg.ink.min.x,
+            seg.ink.max.x
+        );
+
+        // Inside the card the strip is in -- the same tile, not one of its
+        // own. Half a point of slack for the glyph boxes' subpixel edges.
+        let card = frame.card_around(strip);
+        assert!(
+            card.expand(0.5).contains_rect(seg.ink),
+            "the segment {:?} is outside its card {card:?}",
+            seg.ink
+        );
+
+        // **No neighbour's ink is under the badge's ink**, compared glyph box
+        // against glyph box rather than union against union -- see
+        // `Run::glyphs`. Half a point in each direction of real overlap is
+        // the threshold, so two glyphs that merely share an edge are not a
+        // collision.
+        let collides = |a: &egui::Rect, b: &egui::Rect| {
+            let hit = a.intersect(*b);
+            hit.width() > 0.5 && hit.height() > 0.5
+        };
+        let mut compared = 0_usize;
+        for other in &frame.runs {
+            if std::ptr::eq(other, seg) {
+                continue;
+            }
+            for theirs in &other.glyphs {
+                for ours in &seg.glyphs {
+                    compared += 1;
+                    assert!(
+                        !collides(ours, theirs),
+                        "the segment's glyph at {ours:?} sits on {:?}'s glyph at {theirs:?}",
+                        other.text
+                    );
+                }
+            }
+        }
+        // The strip is one of those neighbours, and it is the one the badge
+        // shares a line with -- so the loop above is not vacuous.
+        assert!(!strip.glyphs.is_empty(), "the strip laid out no glyphs to collide with");
+        assert!(
+            compared >= strip.glyphs.len() * seg.glyphs.len(),
+            "the overlap loop compared {compared} pairs, fewer than the strip alone has"
+        );
+
+        // The card grew downwards to hold it and not sideways: the width is
+        // the width the unchanged tree measured at this pane, and the height
+        // is greater than it was because there is now a second thing in it.
+        assert_eq!(card.width(), BASELINE_CARD_NARROW.0, "the card changed width");
+        assert!(
+            card.height() > BASELINE_CARD_NARROW.1,
+            "the card is {}pt tall against the {}pt it was with no segment, so the segment \
+             is being drawn in the space the strip already occupied",
+            card.height(),
+            BASELINE_CARD_NARROW.1
+        );
+    }
+
+    /// This module's own source, scanned to EOF: no test here builds the live
+    /// cache, and none of them names the production endpoint.
+    ///
+    /// Written as a probe of the region rather than as a claim about it --
+    /// the `#[cfg(test)]` guards elsewhere in this crate have been blind to
+    /// everything below the file's first test module, and this module is
+    /// below it. The needle is `concat!`-split so this test does not match
+    /// its own text.
+    #[test]
+    fn no_breach_test_here_can_reach_the_real_api() {
+        let source = include_str!("detail.rs");
+        let start = source
+            .find("mod breach_badge_tests {")
+            .expect("this module is not in its own file");
+        let mine = &source[start..];
+        assert!(
+            mine.contains("BreachCache::new(Arc::new(move |_, _| answer))"),
+            "the module this scans is not the one with the harness in it"
+        );
+        assert_eq!(
+            mine.matches(concat!("BreachCache::", "live")).count(),
+            0,
+            "a test in this module builds the live cache"
+        );
+        assert_eq!(
+            mine.matches(concat!("pwnedpasswords", ".com")).count(),
+            0,
+            "a test in this module names the production endpoint"
+        );
     }
 }
