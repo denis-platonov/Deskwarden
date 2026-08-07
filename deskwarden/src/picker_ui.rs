@@ -696,56 +696,21 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     chosen
 }
 
-/// One entry of the trigger-mode segmented control: label plus the sentence
-/// shown under the control while that mode is selected. The wording follows
-/// the design's per-app "On focus" column (3e): the overlay list, hotkey
-/// only, or filling straight away.
-const TRIGGER_CHOICES: &[(TriggerMode, &str, &str)] = &[
-    (
-        TriggerMode::Prompt,
-        "Prompt",
-        "Show the overlay when this app is focused.",
-    ),
-    (
-        TriggerMode::Hotkey,
-        "Hotkey",
-        "Fill only when the fill hotkey is pressed.",
-    ),
-    (
-        TriggerMode::Auto,
-        "Auto",
-        "Fill immediately when this app is focused.",
-    ),
-];
-
-/// The design's segmented pill group ("Below field | Above | At cursor"),
-/// used here for the trigger mode.
-fn trigger_segmented(ui: &mut egui::Ui, trigger: &mut TriggerMode) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (mode, label, _) in TRIGGER_CHOICES {
-            let selected = trigger == mode;
-            let button = egui::Button::new(theme::semibold(*label, 12.0).color(if selected {
-                egui::Color32::WHITE
-            } else {
-                theme::INK
-            }))
-            .fill(if selected { theme::BLUE } else { theme::CARD })
-            .stroke(if selected {
-                Stroke::NONE
-            } else {
-                Stroke::new(1.0, theme::BORDER_STRONG)
-            })
-            .corner_radius(CornerRadius::same(7));
-            if ui.add(button).clicked() {
-                *trigger = *mode;
-            }
-        }
-    });
-    if let Some((_, _, caption)) = TRIGGER_CHOICES.iter().find(|(m, _, _)| m == trigger) {
-        ui.label(RichText::new(*caption).size(11.0).color(theme::TEXT_FAINT));
-    }
-}
+/// The `trigger` a newly captured [`AppMatch`] is written with.
+///
+/// **A constant, not a choice.** This window used to draw a three-way
+/// segmented control under an on-focus field label, and the answer went to
+/// the vault. What a matched foreground window does is one global preference
+/// ([`crate::settings::Settings::prompt_on_match`]) and nothing in this build
+/// reads [`AppMatch::trigger`], so the control offered three behaviours the
+/// app does not have.
+///
+/// The key is still WRITTEN, and its value is deliberately the mode this
+/// window already opened on, so the bytes a fresh save produces are byte for
+/// byte what they were: v0.5.0's `trigger` has no `#[serde(default)]` and
+/// refuses to parse an `AppMatch` without the key. See
+/// [`crate::app_match::AppMatch::trigger`].
+const RETAINED_TRIGGER: TriggerMode = TriggerMode::Prompt;
 
 /// The picker's own view of whether `bw serve` can safely be written to
 /// right now -- computed in exactly one place (the readiness thread spawned
@@ -853,7 +818,7 @@ fn selected_window(windows: &[WindowInfo], selected: Option<isize>) -> Option<&W
 /// The flag is stored beside the title rather than being re-derived later,
 /// because it cannot be re-derived: `process` alone cannot say whether the
 /// window it came off was inside a frame.
-fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
+fn app_match_for(w: &WindowInfo) -> AppMatch {
     AppMatch {
         process: w.exe_name.clone(),
         title: if w.hosted { w.title.clone() } else { String::new() },
@@ -868,7 +833,10 @@ fn app_match_for(w: &WindowInfo, trigger: TriggerMode) -> AppMatch {
         // `vault_window::detail_edit`.
         args: String::new(),
         sequence: String::new(),
-        trigger,
+        // Not a parameter, because there is nothing to pass: see
+        // [`RETAINED_TRIGGER`]. Written all the same, so v0.5.0 can still
+        // parse what this window saves.
+        trigger: RETAINED_TRIGGER,
     }
 }
 
@@ -1121,7 +1089,6 @@ pub fn run_picker(
     // foreground event's pid and has no row of its own, so it is resolved to a
     // row once, here, and it is that row's handle the window carries.
     let mut selected_hwnd: Option<isize> = default_window.map(|w| w.hwnd);
-    let mut trigger = TriggerMode::Prompt;
     let mut styled = false;
 
     // Read once, before the loop: the match this item already carries, if it
@@ -1315,10 +1282,6 @@ pub fn run_picker(
                 );
 
                 ui.add_space(10.0);
-                theme::field_label(ui, "On focus");
-                trigger_segmented(ui, &mut trigger);
-
-                ui.add_space(10.0);
                 // Exhaustively matched (no catch-all), same discipline as
                 // `TotpState`'s render: `Ready` needs no caption of its own
                 // (the button's enabled state already says everything), so
@@ -1430,7 +1393,7 @@ pub fn run_picker(
                         // and means a future change to the gate can't turn
                         // this into a panic.
                         if let Some(w) = selected_window(&windows, selected_hwnd) {
-                            let m = app_match_for(w, trigger);
+                            let m = app_match_for(w);
                             match cache.set_app_match(&target_item, &m) {
                                 Ok(written) => {
                                     // Matched exhaustively rather than
@@ -1602,16 +1565,30 @@ mod tests {
         assert!(!item_matches_filter(&item("Rockstar Games"), "mabl"));
     }
 
+    /// **A saved match still carries the `trigger` key, with the value this
+    /// window always defaulted to.** Replaces
+    /// `every_trigger_mode_is_offered_in_the_segmented_control`, which pinned
+    /// that every mode was pickable here. None of them is now; what matters
+    /// instead is that the bytes on disk did not move, because v0.5.0's
+    /// `trigger` has no `#[serde(default)]` and a value without the key is one
+    /// it cannot parse at all.
     #[test]
-    fn every_trigger_mode_is_offered_in_the_segmented_control() {
-        // A TriggerMode added to the enum but not to TRIGGER_CHOICES would be
-        // silently un-pickable in the UI.
-        for mode in [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto] {
-            assert!(
-                TRIGGER_CHOICES.iter().any(|(m, _, _)| *m == mode),
-                "{mode:?} is missing from TRIGGER_CHOICES"
-            );
-        }
+    fn a_newly_captured_match_still_carries_the_retained_trigger_key() {
+        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline"));
+        assert_eq!(
+            m.trigger,
+            TriggerMode::Prompt,
+            "the on-disk default a fresh save writes moved; a v0.5.0 rollback would read a \
+             different mode than it wrote"
+        );
+        // The serialized form, not just the field: `trigger` is on neither the
+        // `skip_serializing_if` nor the `default` path, and this is what
+        // v0.5.0 actually parses.
+        assert!(
+            m.to_field_value().contains(r#""trigger":"prompt""#),
+            "a value this window writes has no `trigger` key: {}",
+            m.to_field_value()
+        );
     }
 
     use crate::vault_bridge::VaultBridge;
@@ -2145,13 +2122,16 @@ mod tests {
         // anything not copied here can never be recovered. Reverting
         // `app_match_for` to the `{ process, trigger }` it used to build gives
         //     left: ""  right: "KeepSolid"
-        let m = app_match_for(&hosted_row("KeepSolid.exe", "KeepSolid"), TriggerMode::Auto);
+        let m = app_match_for(&hosted_row("KeepSolid.exe", "KeepSolid"));
 
         assert_eq!(m.process, "KeepSolid.exe");
         assert_eq!(m.title, "KeepSolid");
         assert!(m.hosted, "the flag that makes the title matchable at all");
         assert_eq!(m.path, "C:\\Program Files\\Vendor\\KeepSolid.exe");
-        assert_eq!(m.trigger, TriggerMode::Auto);
+        // The retained key. There is no choice to pass in any more -- see
+        // `a_newly_captured_match_still_carries_the_retained_trigger_key`,
+        // which is where the on-disk default is pinned.
+        assert_eq!(m.trigger, RETAINED_TRIGGER);
     }
 
     /// **Review 31's Important 1.** An ordinary desktop app's title is not an
@@ -2162,7 +2142,7 @@ mod tests {
     fn an_ordinary_row_records_no_title_to_be_matched_by() {
         // Changing the title arm back to `w.title.clone()` gives
         //     left: "Ledgerline - Invoices"  right: ""
-        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline - Invoices"), TriggerMode::Auto);
+        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline - Invoices"));
 
         assert_eq!(m.title, "", "a desktop app's title must not become a needle");
         assert!(!m.hosted);
@@ -2171,7 +2151,7 @@ mod tests {
         // difference from the test above is which kind of row it was.
         assert_eq!(m.process, "Ledgerline.exe");
         assert_eq!(m.path, "C:\\Program Files\\Vendor\\Ledgerline.exe");
-        assert_eq!(m.trigger, TriggerMode::Auto);
+        assert_eq!(m.trigger, RETAINED_TRIGGER);
     }
 
     #[test]
@@ -2182,7 +2162,7 @@ mod tests {
         // satisfies the check by construction. Copying the path from a
         // different row -- or storing the window title in `path` -- gives
         //     "the picker wrote a path its own launch check rejects"
-        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline"), TriggerMode::Prompt);
+        let m = app_match_for(&app_row("Ledgerline.exe", "Ledgerline"));
 
         assert_eq!(
             m.launchable_path(),
@@ -2316,20 +2296,64 @@ mod save_gate_placement_tests {
     /// The capture. `app_match_for` is pure and directly tested above, but the
     /// only call to it is inside the same unreachable closure, and the
     /// mutation is a one-liner: `AppMatch::for_process(w.exe_name.clone(),
-    /// trigger)` compiles, saves, closes the window, and quietly writes a
-    /// match that records neither the title a suspended Store app is
+    /// TriggerMode::Prompt)` compiles, saves, closes the window, and quietly
+    /// writes a match that records neither the title a suspended Store app is
     /// recognised by nor the path the detail pane shows.
-    /// **The ARGUMENT is part of the needle** (review 31's Minor 4). The
-    /// previous spelling was `app_match_for(w,` and stopped at the comma, so
-    /// `app_match_for(w, TriggerMode::Prompt)` -- which silently discards the
-    /// trigger the user chose in this very window, on every save -- left the
-    /// whole suite green. Same shape as `window_title(` in the ledger and as
-    /// `MUT-6` in `app_window.rs`: pinning a call without its arguments pins
-    /// the wrong half.
-    const CAPTURE_CALL: &str = concat!("app_match_for", "(w, trigger)");
+    ///
+    /// **The whole call is the needle, argument list included** (review 31's
+    /// Minor 4). The spelling before that was `app_match_for(w,` and stopped
+    /// at the comma, so a call that discarded the second argument left the
+    /// whole suite green. There is no second argument any more -- the trigger
+    /// is [`RETAINED_TRIGGER`] -- but the closing paren stays in the needle
+    /// for the same reason: a call handed anything other than the whole
+    /// selected row must not match.
+    const CAPTURE_CALL: &str = concat!("app_match_for", "(w)");
 
     fn source() -> &'static str {
         include_str!("picker_ui.rs")
+    }
+
+    /// The retired trigger control, in the three spellings it had here. Split
+    /// with `concat!` for this module's standing reason: a needle spelled in
+    /// one piece matches the const that defines it and the `== 0` below could
+    /// never fail.
+    const SEGMENTED_FN: &str = concat!("fn trigger", "_segmented(");
+    const CHOICES_CONST: &str = concat!("TRIGGER", "_CHOICES");
+    const ON_FOCUS_LABEL: &str = concat!("\"On ", "focus\"");
+
+    /// **The picker offers no trigger control.**
+    ///
+    /// `Settings::prompt_on_match` decides what a matched foreground window
+    /// does; nothing reads `AppMatch::trigger`. A segmented control here let
+    /// the user choose between three behaviours this build does not have and
+    /// wrote the answer to the vault. A source pin rather than a driven test
+    /// because the control lived inside `run_picker`'s `eframe` closure, which
+    /// no test in this crate can enter.
+    #[test]
+    fn the_picker_offers_no_trigger_control() {
+        // POSITIVE CONTROLS. Each needle is shown matching the real text it
+        // is aimed at, so a `== 0` cannot pass because the needle was
+        // misspelled and matches nothing anywhere.
+        for (needle, planted) in [
+            (SEGMENTED_FN, concat!("fn trigger", "_segmented(ui: &mut egui::Ui, t: &mut T) {")),
+            (CHOICES_CONST, concat!("    for (mode, label, _) in TRIGGER", "_CHOICES {")),
+            (ON_FOCUS_LABEL, concat!("    theme::field_label(ui, \"On ", "focus\");")),
+        ] {
+            assert_eq!(planted.matches(needle).count(), 1, "planted: {planted}");
+            assert_eq!("nothing here".matches(needle).count(), 0);
+        }
+        for (needle, what) in [
+            (SEGMENTED_FN, "the segmented trigger control"),
+            (CHOICES_CONST, "the trigger control's label/caption table"),
+            (ON_FOCUS_LABEL, "the field label the control sat under"),
+        ] {
+            assert_eq!(
+                source().matches(needle).count(),
+                0,
+                "{what} is back in the picker ({needle:?}): it offers a choice between three \
+                 behaviours nothing in this build reads, and writes the answer to the vault"
+            );
+        }
     }
 
     #[test]
@@ -2350,13 +2374,13 @@ mod save_gate_placement_tests {
         // without it a needle that never matched anything would satisfy a
         // `== 0` assertion, and one that matched everything would satisfy any
         // other.
-        let planted = concat!("let m = app_match_for", "(w, trigger);");
+        let planted = concat!("let m = app_match_for", "(w);");
         assert_eq!(planted.matches(CAPTURE_CALL).count(), 1, "planted: {planted}");
         assert_eq!("nothing here".matches(CAPTURE_CALL).count(), 0);
-        // And the mutation the old needle could not see: the call is still
-        // there, the trigger is not.
-        let discarded = concat!("let m = app_match_for", "(w, TriggerMode::Prompt);");
-        assert_eq!(discarded.matches(CAPTURE_CALL).count(), 0, "planted: {discarded}");
+        // And the mutation the needle must still see: the call is there, the
+        // row is not.
+        let flattened = concat!("let m = app_match_for", "(&hosted_row(w));");
+        assert_eq!(flattened.matches(CAPTURE_CALL).count(), 0, "planted: {flattened}");
     }
 
     #[test]
@@ -2365,11 +2389,9 @@ mod save_gate_placement_tests {
             source().matches(CAPTURE_CALL).count(),
             1,
             "expected {CAPTURE_CALL:?} exactly once -- the value Save writes, built from the \
-             whole selected row AND the trigger the user chose. Zero means either the saved \
-             match went back to being built from the row's process name alone (so a Microsoft \
-             Store app records no title and can never be matched once Windows suspends it, and \
-             no item has a path to open), or the trigger argument stopped being `trigger` and \
-             every save now writes one fixed mode"
+             whole selected row. Zero means the saved match went back to being built from the \
+             row's process name alone, so a Microsoft Store app records no title and can never \
+             be matched once Windows suspends it, and no item has a path to open"
         );
     }
 

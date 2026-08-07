@@ -21,7 +21,11 @@
 //! it), and the read-mode file was already large enough on its own.
 
 use super::sidebar::OutOfVault;
-use crate::app_match::{AppMatch, TriggerMode};
+use crate::app_match::AppMatch;
+/// The trigger vocabulary this file still spells is test-only -- see
+/// [`TRIGGER_ORDER`] -- and so is the import it needs.
+#[cfg(test)]
+use crate::app_match::TriggerMode;
 use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
@@ -397,26 +401,6 @@ pub enum DetailAction {
     /// non-zeroizing home inside this enum. [`Self::CopyValue`]'s door is for
     /// non-secrets and this must not use it.
     CopyPasswordHistory(usize),
-    /// The `MATCHED APP` card's trigger control was set to a **new** mode,
-    /// carrying the mode the match should end up in.
-    ///
-    /// Carrying the target rather than "the control was clicked", for exactly
-    /// [`Self::ToggleFavorite`]'s reason: the pane already read the match's
-    /// current trigger to decide which pill is filled, so it is the one that
-    /// knows what the other state is.
-    ///
-    /// It carries **only the trigger**, not a whole [`AppMatch`]: the rest of
-    /// the match (`process`, `title`, `hosted`, `path`) is the picker's
-    /// capture off a live window, and a card that handed a rebuilt copy back
-    /// would be a second producer of those four fields. The caller reads the
-    /// current match off the item and changes one field --
-    /// [`app_match_with_trigger`] is that change, so the pane and the caller
-    /// cannot disagree about what "only the trigger" means.
-    ///
-    /// Reported only when the mode actually differs; see
-    /// [`app_trigger_click`], which is where that gate lives so a click on
-    /// the already-selected pill cannot cost a vault write.
-    SetAppTrigger(TriggerMode),
     /// The `MATCHED APP` card's Remove was clicked: the item should stop
     /// being bound to any app at all.
     ///
@@ -2590,9 +2574,9 @@ const APP_PATH_UNRECORDED: &str = "Not recorded";
 /// The card's rows, in order, for a match that exists.
 ///
 /// **The user asked for "name, path + keys", and this is that mapping made
-/// explicit.** `process` is the name, `path` is the path, `trigger` is the
-/// keys -- but the trigger is a control rather than a row of text, so it is
-/// not here; it is [`trigger_label`]'s three pills, drawn after these.
+/// explicit.** `process` is the name and `path` is the path. There is no third
+/// row for `trigger`: the field is still stored, but nothing reads it and no
+/// pane offers a choice about it (see [`TRIGGER_ORDER`]).
 ///
 ///  * **App** -- `name`: what the app is *called*, resolved from the
 ///    executable's version resource by [`AppIdentityCache`] and passed in.
@@ -3110,20 +3094,32 @@ fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
     notes
 }
 
-/// The three trigger modes, in the order they are offered.
+/// The three trigger modes, in the order they were offered, and the words the
+/// three retired controls painted.
 ///
-/// **The read-only MATCHED APP card no longer draws these**, because what a
-/// matched window does is one global preference now
-/// ([`crate::settings::Settings::prompt_on_match`]) rather than a per-item
-/// choice. The constant survives for its one remaining consumer,
-/// `detail_edit`'s edit form, which is a separate pass; see
-/// [`crate::app_match::AppMatch::trigger`] for why the field itself is kept
-/// and preserved rather than dropped.
-pub(crate) const TRIGGER_ORDER: [TriggerMode; 3] = [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
+/// **Test-only, and retired.** `d5d5d64` took the read-only MATCHED APP card's
+/// pills off; this pass took the edit form's and the app picker's off with
+/// them. What a matched foreground window does is one global preference
+/// ([`crate::settings::Settings::prompt_on_match`]) and nothing in this build
+/// reads [`crate::app_match::AppMatch::trigger`], so a per-item control was a
+/// choice that wrote a field nothing reads: persisted, superseding the item's
+/// `revisionDate` to record it, and changing nothing observable.
+///
+/// These survive as FIXTURES rather than as production code, because the pins
+/// that keep the controls gone have to name the exact words a reinstated one
+/// would paint. Defined here once, so the read pane's pins and the edit form's
+/// cannot drift on to different words and both pass against a live control.
+///
+/// The FIELD is a different question and is deliberately kept and preserved --
+/// see [`crate::app_match::AppMatch::trigger`].
+#[cfg(test)]
+pub(crate) const TRIGGER_ORDER: [TriggerMode; 3] =
+    [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
 
-/// A trigger mode's pill label. Exhaustive with no catch-all: a fourth
+/// A retired trigger pill's label. Exhaustive with no catch-all: a fourth
 /// [`TriggerMode`] must be a compile error here rather than silently
-/// inheriting a neighbour's name.
+/// inheriting a neighbour's name -- i.e. a mode no pin names cannot exist.
+#[cfg(test)]
 pub(crate) fn trigger_label(mode: TriggerMode) -> &'static str {
     match mode {
         TriggerMode::Prompt => "Prompt",
@@ -3132,8 +3128,9 @@ pub(crate) fn trigger_label(mode: TriggerMode) -> &'static str {
     }
 }
 
-/// The sentence under the pills, saying what the selected mode does.
-/// Exhaustive for [`trigger_label`]'s reason.
+/// The sentence a retired control drew under its pills, saying what the
+/// selected mode did. Exhaustive for [`trigger_label`]'s reason.
+#[cfg(test)]
 pub(crate) fn trigger_caption(mode: TriggerMode) -> &'static str {
     match mode {
         TriggerMode::Prompt => "Show the overlay when this app is focused.",
@@ -3142,20 +3139,8 @@ pub(crate) fn trigger_caption(mode: TriggerMode) -> &'static str {
     }
 }
 
-/// `m` with its trigger set to `to` and **every other field untouched**.
-///
-/// Public because the write lives in `vault_window::mod` -- the pane reports
-/// a [`DetailAction`] and never writes -- and both must agree that changing
-/// the trigger changes exactly one field. `process`, `title`, `hosted` and
-/// `path` are the picker's capture off a live window; a write arm that
-/// rebuilt them would be a second producer of four fields whose whole value
-/// is that they came off a real window once.
-pub fn app_match_with_trigger(m: &AppMatch, to: TriggerMode) -> AppMatch {
-    AppMatch { trigger: to, ..m.clone() }
-}
-
-/// The card's body: the rows, the trigger pills, the notes and Remove -- or,
-/// for an item bound to nothing, one sentence saying so.
+/// The card's body: the rows, the notes and Remove -- or, for an item bound to
+/// nothing, one sentence saying so.
 fn app_match_card(
     ui: &mut egui::Ui,
     app_match: Option<&AppMatch>,
@@ -3567,7 +3552,7 @@ fn app_card_footer(
     //
     // The obvious repair -- shrink the notes by the controls' width -- was
     // rejected: `app_card_notes` is never empty for any body this footer
-    // draws (a bound match always carries `trigger_caption`, and
+    // draws (a bound match always carries its behaviour note, and
     // `app_notice_with_remove` passes exactly one sentence), and every one of
     // those sentences is a paragraph that wants the whole column. Squeezing a
     // 200-character notice into 162 - 110 = 52pt to keep two buttons on its
@@ -6709,11 +6694,12 @@ mod tests {
         }
     }
 
-    /// The pills these three name are `detail_edit`'s form's now -- this card
-    /// draws none -- but the constants still live here and still have to be
-    /// distinct, so this stays where they are.
+    /// No pane draws these words any more. They are the fixtures the pins in
+    /// this file and in `detail_edit` use to say so, and a fixture in which
+    /// two modes share a word is a pin that cannot tell which control came
+    /// back -- so their distinctness is still worth asserting.
     #[test]
-    fn every_trigger_mode_is_a_pill_with_its_own_name_and_its_own_sentence() {
+    fn every_retired_trigger_mode_has_its_own_name_and_its_own_sentence() {
         // A fourth `TriggerMode` left out of `TRIGGER_ORDER` fails here; one
         // left out of `trigger_label`/`trigger_caption` fails to compile.
         for mode in [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto] {
@@ -6725,21 +6711,6 @@ mod tests {
             TRIGGER_ORDER.iter().map(|m| trigger_caption(*m)).collect();
         assert_eq!(labels.len(), 3, "two pills share a name: {labels:?}");
         assert_eq!(captions.len(), 3, "two modes share a sentence: {captions:?}");
-    }
-
-    #[test]
-    fn changing_the_trigger_changes_the_trigger_and_nothing_else() {
-        let before = a_store_match();
-        let after = app_match_with_trigger(&before, TriggerMode::Auto);
-        assert_eq!(after.trigger, TriggerMode::Auto);
-        // Each field named, not `..before`: the whole risk is that the write
-        // path rebuilds one of the four the picker captured off a live
-        // window.
-        assert_eq!(after.process, before.process);
-        assert_eq!(after.title, before.title);
-        assert_eq!(after.hosted, before.hosted);
-        assert_eq!(after.path, before.path);
-        assert_ne!(after.trigger, before.trigger, "the premise: it really did change");
     }
 
     // --- the wiring: does the pane actually draw and report any of this ---
@@ -6834,8 +6805,8 @@ mod tests {
     /// **The pills are gone from this card, and the setting is global.**
     ///
     /// This replaces `clicking_a_trigger_pill_reports_the_mode_it_names`,
-    /// which drove the three pills and asserted the `SetAppTrigger` each one
-    /// reported. What a matched window does is
+    /// which drove the three pills and asserted the action each one reported.
+    /// What a matched window does is
     /// `settings::Settings::prompt_on_match` now -- one switch in
     /// Preferences -- so a per-item control here would write a field nothing
     /// reads, supersede the item's `revisionDate` for it, and change nothing
@@ -6868,19 +6839,33 @@ mod tests {
             laid_out.strings()
         );
 
-        // And nothing on the card reports one either -- a pill drawn with a
-        // zero-size label would pass every assertion above.
-        for (name, at) in [
-            ("the note", laid_out.rect_of(APP_MATCH_BEHAVIOUR_NOTE)),
-            ("the App row", laid_out.rect_of("App")),
-        ] {
-            let clicked = pane.click(&item, &TotpState::NoSecret, at.center());
-            assert!(
-                !matches!(clicked.action, DetailAction::SetAppTrigger(_)),
-                "clicking {name} reported {:?}",
-                clicked.action
-            );
-        }
+        // And nothing on the card reports a trigger change either -- a pill
+        // drawn with a zero-size label would pass every assertion above.
+        //
+        // Spelled as "this is the action it DOES report" rather than as "it is
+        // not the trigger variant": that variant is gone from the enum, so a
+        // test naming it would not compile, and a negative would be satisfied
+        // by any wrong action at all.
+        let note = pane.click(
+            &item,
+            &TotpState::NoSecret,
+            laid_out.rect_of(APP_MATCH_BEHAVIOUR_NOTE).center(),
+        );
+        assert_eq!(
+            note.action,
+            DetailAction::None,
+            "clicking the behaviour note reported {:?}",
+            note.action
+        );
+        // The App row IS clickable -- it copies the process name -- so what is
+        // asserted about it is that copying is the WHOLE of what it does.
+        let row = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of("App").center());
+        assert_eq!(
+            row.action,
+            DetailAction::CopyValue(a_desktop_match().process),
+            "clicking the App row reported {:?}, which is not the copy it is there for",
+            row.action
+        );
     }
 
     /// Deleting `*action = DetailAction::RemoveAppMatch;` fails this.

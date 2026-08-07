@@ -183,6 +183,17 @@ pub struct AppMatchDraft {
     pub hosted: bool,
     pub path: String,
     pub args: String,
+    /// The stored autofill trigger, **carried and never offered**.
+    ///
+    /// No control in this form writes it: what a matched foreground window
+    /// does is one global preference (`settings::Settings::prompt_on_match`)
+    /// and nothing in this build reads this field. It is on the draft so that
+    /// [`Self::to_match`] can write back the value the item already had --
+    /// v0.5.0's `trigger` has no `#[serde(default)]`, so an edit that dropped
+    /// it, or that invented a value for it, would make the binding unreadable
+    /// or wrong to a build the user may roll back to. See
+    /// [`AppMatch::trigger`] and
+    /// `an_edit_carries_the_stored_trigger_through_untouched`.
     pub trigger: TriggerMode,
     /// Whether the running-window list is open.
     pub picking: bool,
@@ -321,7 +332,7 @@ impl AppMatchDraft {
     /// `msedge.exe` means "this item is for Edge now", and asking them to
     /// retype the executable name in a second box to confirm it is asking them
     /// to restate what they just said. Refusing the save would also make an
-    /// unrelated field (the arguments, the trigger) un-editable on any item
+    /// unrelated field (the arguments, the keystroke sequence) un-editable on any item
     /// whose stored path is already odd, which is the class of item most in
     /// need of editing.
     ///
@@ -397,8 +408,9 @@ pub fn app_path_row(hosted: bool) -> AppPathRow {
 ///
 /// **A warning, not a refusal.** A path this app would decline to launch is
 /// still a perfectly good *match*: matching is done on `process`, which is a
-/// name, and it keeps working. Withholding Save would make the trigger and the
-/// arguments un-editable on exactly the items whose path most needs correcting,
+/// name, and it keeps working. Withholding Save would make the arguments and
+/// the keystroke sequence un-editable on exactly the items whose path most
+/// needs correcting,
 /// and would do it over a decision the user can see and fix in the box directly
 /// above the message. What is NOT acceptable is storing it silently -- so the
 /// message says precisely which rule the path fails to meet.
@@ -1631,38 +1643,6 @@ pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<St
     Some(format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()))
 }
 
-/// The three trigger pills, bound to the draft rather than reporting a click.
-///
-/// The order, the words and the caption are `detail`'s -- the read pane's card
-/// and this block must offer the user the same three choices under the same
-/// three names, and a second copy of the vocabulary here is how they would
-/// drift.
-fn app_trigger_pills(ui: &mut egui::Ui, current: &mut TriggerMode) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for mode in detail::TRIGGER_ORDER {
-            let selected = mode == *current;
-            let button = egui::Button::new(
-                theme::semibold(detail::trigger_label(mode), 12.0).color(if selected {
-                    egui::Color32::WHITE
-                } else {
-                    theme::INK
-                }),
-            )
-            .fill(if selected { theme::BLUE } else { theme::CARD })
-            .stroke(if selected {
-                Stroke::NONE
-            } else {
-                Stroke::new(1.0, theme::BORDER_STRONG)
-            })
-            .corner_radius(CornerRadius::same(7));
-            if ui.add(button).clicked() {
-                *current = mode;
-            }
-        }
-    });
-}
-
 /// The running-window list, shown under the buttons while `picking`.
 ///
 /// **In the form, not a second window.** The tray's `picker_ui::run_picker`
@@ -2102,18 +2082,19 @@ fn app_block(
     ui.label(RichText::new(APP_ARGS_HINT).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(10.0);
 
-    theme::field_label(ui, "Autofill");
-    app_trigger_pills(ui, &mut app.trigger);
-    ui.add_space(4.0);
-    ui.label(
-        RichText::new(detail::trigger_caption(app.trigger))
-            .size(11.0)
-            .color(theme::TEXT_FAINT),
-    );
-    ui.add_space(10.0);
-
-    // After the trigger, because it answers the next question: *when* this
-    // item fills, and then *what it types*.
+    // **No autofill control here, deliberately.** What a matched foreground
+    // window does is one global preference -- `settings::Settings::
+    // prompt_on_match` -- and nothing in this build reads `AppMatch::trigger`.
+    // A per-item Auto / Prompt / Hotkey choice was a control that wrote a
+    // field nothing reads: it persisted, it superseded the item's
+    // `revisionDate` to record itself, and it changed nothing the user could
+    // observe. The FIELD is still carried through this form untouched (see
+    // `AppMatchDraft::trigger`), because v0.5.0 cannot parse an `AppMatch`
+    // that lacks it.
+    //
+    // The sequence block answers what the pills used to sit above: not *when*
+    // this item fills, which is no longer a per-item question, but what it
+    // types once it does.
     app_sequence_block(ui, app, palette, source);
 
     // Staged, not immediate: unlike the read pane's card -- which writes
@@ -2912,13 +2893,40 @@ mod tests {
         assert_eq!(stored.launchable_path(), Some(stored.path.as_str()));
     }
 
+    /// **`AppMatch::trigger` survives an edit untouched.**
+    ///
+    /// Replaces `saving_a_changed_trigger_reaches_the_item`, which asserted
+    /// that a trigger the user picked in this form reached the vault. There is
+    /// no such choice any more -- nothing in this build reads the field -- but
+    /// the field itself is not this pass's to drop or to re-default: v0.5.0's
+    /// `trigger` has no `#[serde(default)]`, so an item written without it, or
+    /// with a value this build invented, is a binding a rolled-back build
+    /// reads wrong or not at all. See `app_match::AppMatch::trigger`.
     #[test]
-    fn saving_a_changed_trigger_reaches_the_item() {
-        let item = bound_item(&chrome_match());
+    fn an_edit_carries_the_stored_trigger_through_untouched() {
+        // The fixture's mode is deliberately NOT the one a new binding is
+        // written with: a `Prompt` fixture could not tell "carried through"
+        // from "quietly reset to the default".
+        let original = store_match();
+        assert_ne!(
+            original.trigger,
+            TriggerMode::Prompt,
+            "the premise: the fixture's stored mode differs from the default a new binding gets, \
+             so `carried through` and `reset` give different answers here"
+        );
+        let item = bound_item(&original);
         let mut draft = EditDraft::from_item(&item);
-        draft.app.as_mut().unwrap().trigger = TriggerMode::Auto;
-        let stored = crate::vault_bridge::extract_app_match(&draft.apply_to(&item)).unwrap();
-        assert_eq!(stored.trigger, TriggerMode::Auto);
+        draft.name = "Renamed".to_string();
+        let saved = draft.apply_to(&item);
+        // The premise again, from the other end: the edit really happened, so
+        // the assertion below is not about an item nothing touched.
+        assert_eq!(saved.name, "Renamed");
+        let stored = crate::vault_bridge::extract_app_match(&saved).unwrap();
+        assert_eq!(
+            stored.trigger, original.trigger,
+            "an edit rewrote the stored trigger; v0.5.0 reads this key and this build must \
+             neither drop it nor invent a value for it"
+        );
     }
 
     #[test]
@@ -4657,27 +4665,63 @@ mod generator_row_tests {
         );
     }
 
+    /// **The edit form offers no autofill trigger control.**
+    ///
+    /// `d5d5d64` made what a matched foreground window does one global
+    /// preference (`crate::settings::Settings::prompt_on_match`) and stopped
+    /// anything reading [`AppMatch::trigger`]. The read-only card's pills went
+    /// with it; this form's did not, so the user could still pick Auto /
+    /// Prompt / Hotkey here, have the choice persisted, supersede the item's
+    /// `revisionDate` to record it, and observe no difference at all.
+    ///
+    /// **The stored field is still written**, untouched -- see
+    /// `an_edit_carries_the_stored_trigger_through_untouched`. It is the
+    /// CHOICE that is retired, not the byte on disk, which v0.5.0 requires.
+    ///
+    /// Driven at the form on a live binding -- exactly where the pills were
+    /// painted -- rather than asserted on `app_block`'s source, so a control
+    /// re-added anywhere in the block fails this.
     #[test]
-    fn clicking_a_trigger_pill_changes_the_trigger() {
-        // Mutation this catches: an inert pill row. `app_trigger_pills` writes
-        // straight into the draft, so nothing else in the crate would notice.
+    fn the_edit_form_offers_no_autofill_trigger_control() {
         let ctx = styled_context();
         let mut draft = app_draft(&chrome());
         let (_, painted) = frame(&ctx, &mut draft, &[]);
-        let auto = painted.rect_of(detail::trigger_label(TriggerMode::Auto));
+        let strings = painted.strings();
 
-        let _ = frame(&ctx, &mut draft, &click(auto.center()));
-        assert_eq!(
-            draft.app.as_ref().unwrap().trigger,
-            TriggerMode::Auto,
-            "clicking the Auto pill left the trigger where it was"
+        // The premise: the block IS drawn, so every absence below is about the
+        // control and not about a block that failed to appear at all.
+        assert!(
+            strings.contains(&APP_BLOCK_HEADING),
+            "the app block is not drawn, so this test asserts nothing: {strings:?}"
         );
+        assert!(
+            strings.contains(&"Remove app match"),
+            "the app block is not drawn, so this test asserts nothing: {strings:?}"
+        );
+
+        assert!(
+            !strings.contains(&"Autofill"),
+            "the row the pills sat in is still drawn, so the form still presents a per-item                  autofill setting: {strings:?}"
+        );
+        let mut checked = 0;
+        for mode in detail::TRIGGER_ORDER {
+            checked += 1;
+            assert!(
+                !strings.contains(&detail::trigger_label(mode)),
+                "the {mode:?} pill is still drawn in the edit form: {strings:?}"
+            );
+            assert!(
+                !strings.contains(&detail::trigger_caption(mode)),
+                "the {mode:?} caption is still drawn in the edit form: {strings:?}"
+            );
+        }
+        assert_eq!(checked, 3, "the loop visited no modes, so it asserted nothing");
     }
 
     #[test]
-    fn a_store_app_gets_a_read_only_path_row_and_keeps_its_trigger_and_remove() {
+    fn a_store_app_gets_a_read_only_path_row_and_keeps_its_remove() {
         // The user's own choice for this case: state the reason, disable the
-        // file picker, leave the trigger and Remove working.
+        // file picker, leave the rest of the block working.
         let ctx = styled_context();
         let mut draft = app_draft(&store());
         let (_, painted) = frame(&ctx, &mut draft, &[]);
@@ -4722,12 +4766,18 @@ mod generator_row_tests {
             "a Store binding offered a file dialog whose answer it could not use"
         );
 
-        // ...and the trigger still works, which is the half of the requirement a
+        // ...and Remove still works, which is the half of the requirement a
         // wholesale `add_enabled(false)` around the block would have broken.
+        // The trigger pills held this half until they were retired; Remove is
+        // the live control that is left, and it dies to exactly that mutation.
         let (_, painted) = frame(&ctx, &mut draft, &[]);
-        let auto = painted.rect_of(detail::trigger_label(TriggerMode::Auto));
-        let _ = frame(&ctx, &mut draft, &click(auto.center()));
-        assert_eq!(draft.app.as_ref().unwrap().trigger, TriggerMode::Auto);
+        assert!(draft.app.as_ref().unwrap().bound, "the premise: it starts bound");
+        let remove = painted.rect_of("Remove app match");
+        let _ = frame(&ctx, &mut draft, &click(remove.center()));
+        assert!(
+            !draft.app.as_ref().unwrap().bound,
+            "a Store binding's Remove is inert, so the block really was disabled wholesale"
+        );
     }
 
     #[test]
