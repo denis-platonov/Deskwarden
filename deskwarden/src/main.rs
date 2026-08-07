@@ -2941,69 +2941,263 @@ struct VaultDeps<'a> {
     backend_op_tx: &'a mpsc::Sender<BackendOp>,
 }
 
-fn open_vault_window(
-    // **The eight `&mut` parameters this used to take, as one value.** They
-    // were eight separate borrows off `main`'s stack frame, which is why the
-    // lock/re-auth recovery in the loop below can only ever run on this
-    // thread. See `SessionEstate`. The body destructures it on its first
-    // statement, so not one line inside the loop changed to accommodate the
-    // move.
-    estate: &mut SessionEstate,
-    // The immutable half. Separate from the estate and not merged into it
-    // because nothing here is ever written: a value that cannot be mutated
-    // cannot disagree with a second copy of itself, so it needs none of the
-    // single-owner discipline `SessionEstate` exists to enforce.
-    deps: VaultDeps<'_>,
-    // Out of both structs, deliberately. `AppTray` is not `Send` -- it owns a
-    // hidden Win32 window bound to the thread that built it -- so a struct it
-    // is a field of could never be parked behind an `Arc<Mutex<_>>` with the
-    // estate. The receiver stays out for the same reason the sender went in:
-    // only one place may drain it.
-    tray: &tray::AppTray,
-    backend_op_rx: &mpsc::Receiver<BackendOp>,
-    // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
-    // the loop below on its first pass instead of that pass opening a window.
-    //
-    // `Some` from exactly one caller: `main`, once, after the single startup
-    // window has drawn the sign-in card, the spinner and then the vault in one
-    // event loop and the user has closed it. That window can lock, ask for
-    // Preferences or switch account exactly as any other vault session can, and
-    // every one of those outcomes has a handler here already. Handing the
-    // result in rather than growing a second dispatch next to the startup code
-    // is what keeps `resettle_session` reached from one place and keeps the
-    // switch/add/remove wiring the tray's guards pin the only wiring there is.
-    mut first_result: Option<vault_window::VaultWindowResult>,
-) {
-    // **Destructured, both of them, rather than reached through `estate.` and
-    // `deps.` at each of their sites.** For `deps` that is presentation: every
-    // field is a shared borrow and `deps.job` would compile everywhere. For the
-    // estate it is load-bearing, and both are spelled the same way so the next
-    // reader is not invited to think the difference is arbitrary.
-    let VaultDeps {
-        fill_stats,
-        job,
-        schedule,
-        icon_cache_dir,
-        // What the lock/re-auth prompt this window can raise is scoped to: the
-        // account this process is signed into. The pieces rather than a built
-        // `LoginContext`, because this function can now CHANGE which account
-        // that is (the titlebar switcher below) and a context built by the
-        // caller would still name the account the user just left -- so the
-        // master-password prompt after a switch-then-lock would be for the wrong
-        // account. Every context here goes through the one `login_context`
-        // constructor, which is what keeps "no window is opened without an
-        // account" a single decision.
-        config_dir,
-        // Where the preferences the estate carries are persisted to. A path and
-        // not the struct: the struct is `estate.settings`, and two copies of it
-        // is exactly what the estate exists to prevent.
-        settings_path,
-        // Passed through to every `login_context` this function builds; see
-        // that function.
-        first_run_account,
-        backend_op_tx,
-    } = deps;
-    // **Destructured here, rather than reached through `estate.` at each of
+/// Which account action the titlebar's menu asked for.
+///
+/// A VALUE, and that is the whole point of it. The three requests used to be
+/// three fields of `VaultWindowResult` read by three chained `if`s inside a
+/// function no test can call, so "which one did this window ask for" was a
+/// question only a hand-written source lexer could answer -- and this file's
+/// ledger records six review rounds fought over exactly that class of
+/// question. As a value it is answered by [`account_request`], which is pure,
+/// total, and driven by tests over every shape a result can have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountRequest {
+    /// Switch to this account. The id is re-resolved through
+    /// `AccountsState::switchable()` on the far side rather than trusted.
+    SwitchTo(accounts::AccountId),
+    /// Mint a new account directory and sign into it.
+    Add,
+    /// Remove the ACTIVE account, after the one confirmation that defaults to
+    /// No.
+    Remove,
+}
+
+/// Which account action a finished vault session is asking for, if any.
+///
+/// Pure and total: every `VaultWindowResult` has exactly one answer, and the
+/// ranking is `switch`, then `add`, then `remove` -- the order the chained
+/// `if`s always had, so a window that somehow set two fields still takes the
+/// branch it always took.
+///
+/// **Paired with [`vault_follow_up`] by
+/// `the_two_readers_of_an_account_request_agree`**: for every result,
+/// `vault_follow_up` says `AccountAction` if and only if this says `Some`.
+/// Two readers of the same three fields that could disagree is how a menu
+/// click reaches a dispatch that then has nothing to dispatch.
+fn account_request(result: &vault_window::VaultWindowResult) -> Option<AccountRequest> {
+    if let Some(id) = result.switch_to.clone() {
+        Some(AccountRequest::SwitchTo(id))
+    } else if result.add_account {
+        Some(AccountRequest::Add)
+    } else if result.remove_account {
+        Some(AccountRequest::Remove)
+    } else {
+        None
+    }
+}
+
+/// What the vault loop does after one window's outcome has been handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopStep {
+    /// Go round again and open another window.
+    Reopen,
+    /// Leave `run_vault_loop`, and with it `open_vault_window`.
+    Return,
+}
+
+/// **The only place the reopen/return distinction is made.**
+///
+/// This is the function the v0.5.0 defect would have had to get past. That
+/// defect was a stale `continue;` left at the bottom of the settings
+/// write-back: `edited_settings` stays `Some` for the rest of a window's
+/// life once the gear has been clicked, so one visit to Settings made Lock,
+/// the 401 recovery, every account request and the plain close unreachable --
+/// the vault silently failed to lock. It survived a release because "did
+/// anything jump early" was a question about source text.
+///
+/// It is a question about a pure function now. `run_vault_loop` contains no
+/// `continue` at all; the loop goes round exactly when this says `Reopen`,
+/// and `Resettle` says `Return` because the recovery has already torn the
+/// session down and re-authenticated -- reopening on it is the vault not
+/// locking.
+fn loop_step(after: VaultFollowUp) -> LoopStep {
+    match after {
+        VaultFollowUp::AccountAction => LoopStep::Reopen,
+        VaultFollowUp::Resettle | VaultFollowUp::Done => LoopStep::Return,
+    }
+}
+
+/// **The three things the vault loop does that no test may do.**
+///
+/// Opening a real `eframe` window, running the one teardown-and-repopulate
+/// sequence against a real `bw serve` and a real Windows tray icon, and
+/// raising a real master-password dialog. Everything else the loop does --
+/// deciding what a result means, refilling the cache, writing preferences
+/// back, and deciding whether to reopen -- is on the other side of this
+/// trait, in `run_vault_loop`, which is therefore reachable from a test.
+///
+/// The real implementation is [`RealVaultOps`], whose three method bodies are
+/// the loop's own three regions, moved rather than rewritten.
+trait VaultOps {
+    /// Open a vault window and return what the user did with it.
+    fn open_window(
+        &mut self,
+        est: &mut SessionEstate,
+        deps: &VaultDeps<'_>,
+    ) -> vault_window::VaultWindowResult;
+
+    /// The lock / 401 recovery. `resettle_session` and nothing else.
+    fn resettle_after_lost_session(&mut self, est: &mut SessionEstate, deps: &VaultDeps<'_>);
+
+    /// Switch, add or remove -- the whole branch, including its ONE shared
+    /// resettle closure, its confirmations and its persists.
+    fn account_action(
+        &mut self,
+        est: &mut SessionEstate,
+        deps: &VaultDeps<'_>,
+        request: AccountRequest,
+    );
+}
+
+/// The production `VaultOps`: the two things that are neither `Send` nor
+/// shareable and so stayed out of both `SessionEstate` and `VaultDeps`.
+///
+/// `AppTray` owns a hidden Win32 window bound to the thread that built it;
+/// the receiver is the drain, and only one place may hold it.
+struct RealVaultOps<'a> {
+    tray: &'a tray::AppTray,
+    backend_op_rx: &'a mpsc::Receiver<BackendOp>,
+}
+
+impl VaultOps for RealVaultOps<'_> {
+    fn open_window(
+        &mut self,
+        est: &mut SessionEstate,
+        deps: &VaultDeps<'_>,
+    ) -> vault_window::VaultWindowResult {
+        // Opening this window is the app's slowest visible action and the one a
+        // user times with their own patience, so each stage of it says how long
+        // it took. Without this the only honest answer to "why did that take ten
+        // seconds" is a guess: the stages have very different costs (a `bw`
+        // spawn is seconds, a backend start is seconds, and eframe's own window
+        // and GPU setup is not free either), and which one dominates depends on
+        // what the backend was doing beforehand.
+        let opened_at = Instant::now();
+        // **Never waited for.** This used to be a `bw status` spawn on a miss
+        // -- 2.39s measured on the user's machine -- run BEFORE eframe was
+        // asked for a window, so the click produced nothing on screen at all
+        // for that long. What it fetches is the toolbar avatar's initials and
+        // the host favicons come from; the window opens without them and they
+        // fill in, exactly the way the item list already does.
+        //
+        // The cache is refilled from the RESULT now (just below the window),
+        // not here: on a miss there is nothing to refill it with yet, and the
+        // value the window ended up with is the one the next open should
+        // reuse. See `account_details_source`.
+        let details = account_details_source(est.details.take(), |tx| {
+            std::thread::spawn(move || {
+                let _ = tx.send(login_ui::check_bw_status_details());
+            });
+        });
+
+        // Read once, before the `if` below might short-circuit past it, and
+        // reused for `vault_window::run`'s own `backend_already_running`
+        // (review Minor 3): whether `bw serve` was already up at this exact
+        // moment -- before this function might kick off a start of its own --
+        // is also exactly the fact `spawn_vault_load` needs to know it can skip
+        // its readiness wait. Nothing between here and `vault_window::run`
+        // returning stops or restarts the backend out from under this snapshot
+        // (the only paths that do -- lock/reauth recovery -- close the window
+        // and return first), so it stays valid for the window's whole session.
+        let backend_already_running = backend_is_running(&mut est.child);
+
+        // Reads don't need `bw serve` at all (`vault_window::run` paints
+        // entirely from `cache`); writes and TOTP do. If save-memory mode tore
+        // the backend down after the last close (or it crashed -- review Minor
+        // 8: `backend_is_running` catches a `Some(dead child)` that a plain
+        // `.is_none()` check would miss), kick a start off in the background and
+        // move straight on to opening the window rather than waiting for it --
+        // see this function's doc for why waiting here used to be a real freeze.
+        if needs_backend_start(&est.task_in_progress, backend_already_running) {
+            est.task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
+            spawn_backend_start(est.token.clone(), deps.job.clone(), deps.backend_op_tx.clone());
+        }
+
+        // The last thing before the window exists. Everything after this is
+        // eframe's own startup -- creating the OS window, picking a graphics
+        // backend, building the font atlas -- which this app does not control
+        // and which is invisible to any timing inside the frame closure, since
+        // the first closure call happens after all of it.
+        //
+        // The account details are named here rather than timed: on a hit the
+        // toolbar has them on its first frame, and on a miss the fetch is
+        // running beside this window instead of in front of it, so the only
+        // honest number for it is the one the window itself logs when it
+        // arrives ("account details arrived ... after the window was handed
+        // to eframe").
+        log::info!(
+            "vault window: handing off to eframe after {:?} (backend was {}, account details \
+             were {})",
+            opened_at.elapsed(),
+            if backend_already_running { "already up" } else { "being started" },
+            match details {
+                vault_window::AccountDetails::Ready(_) => "prefetched",
+                vault_window::AccountDetails::Pending(_) =>
+                    "not prefetched; fetching alongside the window",
+            }
+        );
+        vault_window::run(
+            est.cache.clone(),
+            deps.fill_stats.clone(),
+            details,
+            est.token.clone(),
+            deps.icon_cache_dir.to_path_buf(),
+            // Read fresh on every pass, so a timeout changed in the preferences
+            // window below governs the window this loop is about to reopen.
+            est.settings.auto_lock(),
+            backend_already_running,
+            // Cloned per pass, not once outside the loop: a switch below replaces
+            // the state, and the window reopened after it has to offer the account
+            // the user just left rather than the one they are now on.
+            est.accounts.clone(),
+        )
+    }
+
+    fn resettle_after_lost_session(&mut self, est: &mut SessionEstate, deps: &VaultDeps<'_>) {
+        // The recovery itself is `resettle_session`, which a lock/re-auth and
+        // an account switch share whole rather than each spelling out (see
+        // its doc). The only thing this caller contributes is where the new
+        // session token comes from: the master-password prompt for the
+        // account this app is already signed into.
+        //
+        // `reauthenticate` never returns `None` -- it exits the process
+        // rather than hand back a failure -- so the `BackendNotStarted`
+        // outcome is reached from here only by a backend that would not
+        // start, which is why the outcome is not branched on. Both outcomes
+        // leave this method the same way -- by falling off the end of it, back
+        // to the loop, which then asks `loop_step` what to do next and is told
+        // `Return`. The `BackendNotStarted` arm used to be an early `return`
+        // from inside this block, which was only ever a jump to that same
+        // answer.
+        resettle_session(
+            &est.cache,
+            &mut est.engine,
+            &mut est.child,
+            deps.job,
+            deps.schedule,
+            self.tray,
+            self.backend_op_rx,
+            &mut est.task_in_progress,
+            &mut est.details,
+            &mut est.token,
+            // Built HERE rather than handed in, so it names whichever account
+            // this process is on at this moment -- which the switch above may
+            // have changed since the caller's own context was built.
+            || {
+                let login =
+                    login_context(deps.config_dir, est.active_account.as_ref(), deps.first_run_account);
+                Some(reauthenticate(&est.store, login))
+            },
+        );
+    }
+
+    fn account_action(
+        &mut self,
+        est: &mut SessionEstate,
+        deps: &VaultDeps<'_>,
+        request: AccountRequest,
+    ) {
+    // **Destructured here, rather than reached through `est.` at each of
     // its sites.** Field-level borrow splitting is what lets the loop below go
     // on holding eight simultaneous `&mut`s -- the resettle closure alone
     // wants five of them at once -- and the destructure is what makes that
@@ -3045,533 +3239,527 @@ fn open_vault_window(
         // timeout edited in that window apply to the very next vault window
         // rather than only to the next app launch.
         settings,
-    } = estate;
+    } = est;
     // Narrowed back to the shared borrow this body has always held: nothing
     // below mutates the `Arc` itself, only the cache behind it.
     let cache: &Arc<VaultCache> = cache;
-    // Reopened, not merely opened once: the titlebar gear asks for the
-    // preferences window, and `prefs_ui::run` is its own `eframe` window on
-    // this same thread. eframe cannot nest one native event loop inside
-    // another, so the vault window must be fully gone before that call and
-    // has to come back afterwards -- which is a loop, not a straight line.
-    // Every other outcome (closed, locked, needs re-auth) still leaves this
-    // function exactly once, on its first pass.
-    loop {
-    // Opening this window is the app's slowest visible action and the one a
-    // user times with their own patience, so each stage of it says how long
-    // it took. Without this the only honest answer to "why did that take ten
-    // seconds" is a guess: the stages have very different costs (a `bw`
-    // spawn is seconds, a backend start is seconds, and eframe's own window
-    // and GPU setup is not free either), and which one dominates depends on
-    // what the backend was doing beforehand.
-    // A vault session that ran SOMEWHERE ELSE: the single startup window drew
-    // the vault in its own event loop, and its outcome has to be acted on by
-    // THE CODE BELOW rather than by a second copy of it written next to the
-    // call. Lock, re-auth, Preferences and an account switch each mean the
-    // same thing however the window that reported them was opened, and the
-    // lock/re-auth arm in particular runs `resettle_session` -- the one
-    // hardened teardown-and-repopulate sequence in this app, which exists
-    // exactly once and must keep existing exactly once.
-    //
-    // `take`, so this is the FIRST PASS ONLY. Everything that reopens the
-    // window (Preferences, a switch) goes round the loop again and opens a
-    // real one -- which is what "the window closes and reopens" now means when
-    // the window that closed was the startup window: it closed, and the vault
-    // comes back in a window of its own.
-    let result = match first_result.take() {
-        Some(result) => {
-            log::info!(
-                "dispatching the outcome of the vault session the startup window already ran"
-            );
-            result
-        }
-        None => {
-        let opened_at = Instant::now();
-        // **Never waited for.** This used to be a `bw status` spawn on a miss
-        // -- 2.39s measured on the user's machine -- run BEFORE eframe was
-        // asked for a window, so the click produced nothing on screen at all
-        // for that long. What it fetches is the toolbar avatar's initials and
-        // the host favicons come from; the window opens without them and they
-        // fill in, exactly the way the item list already does.
-        //
-        // The cache is refilled from the RESULT now (just below the window),
-        // not here: on a miss there is nothing to refill it with yet, and the
-        // value the window ended up with is the one the next open should
-        // reuse. See `account_details_source`.
-        let details = account_details_source(cached_status_details.take(), |tx| {
-            std::thread::spawn(move || {
-                let _ = tx.send(login_ui::check_bw_status_details());
-            });
-        });
-
-        // Read once, before the `if` below might short-circuit past it, and
-        // reused for `vault_window::run`'s own `backend_already_running`
-        // (review Minor 3): whether `bw serve` was already up at this exact
-        // moment -- before this function might kick off a start of its own --
-        // is also exactly the fact `spawn_vault_load` needs to know it can skip
-        // its readiness wait. Nothing between here and `vault_window::run`
-        // returning stops or restarts the backend out from under this snapshot
-        // (the only paths that do -- lock/reauth recovery -- close the window
-        // and return first), so it stays valid for the window's whole session.
-        let backend_already_running = backend_is_running(bw_serve_child);
-
-        // Reads don't need `bw serve` at all (`vault_window::run` paints
-        // entirely from `cache`); writes and TOTP do. If save-memory mode tore
-        // the backend down after the last close (or it crashed -- review Minor
-        // 8: `backend_is_running` catches a `Some(dead child)` that a plain
-        // `.is_none()` check would miss), kick a start off in the background and
-        // move straight on to opening the window rather than waiting for it --
-        // see this function's doc for why waiting here used to be a real freeze.
-        if needs_backend_start(backend_task_in_progress, backend_already_running) {
-            *backend_task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
-            spawn_backend_start(session_token.clone(), job.clone(), backend_op_tx.clone());
-        }
-
-        // The last thing before the window exists. Everything after this is
-        // eframe's own startup -- creating the OS window, picking a graphics
-        // backend, building the font atlas -- which this app does not control
-        // and which is invisible to any timing inside the frame closure, since
-        // the first closure call happens after all of it.
-        //
-        // The account details are named here rather than timed: on a hit the
-        // toolbar has them on its first frame, and on a miss the fetch is
-        // running beside this window instead of in front of it, so the only
-        // honest number for it is the one the window itself logs when it
-        // arrives ("account details arrived ... after the window was handed
-        // to eframe").
-        log::info!(
-            "vault window: handing off to eframe after {:?} (backend was {}, account details \
-             were {})",
-            opened_at.elapsed(),
-            if backend_already_running { "already up" } else { "being started" },
-            match details {
-                vault_window::AccountDetails::Ready(_) => "prefetched",
-                vault_window::AccountDetails::Pending(_) =>
-                    "not prefetched; fetching alongside the window",
-            }
+    // The one estate field this branch does not read. Named rather than
+    // elided because the pattern must stay the COMPLETE one -- a `..`, or a
+    // field left out, is how a field comes to be reached through a second
+    // binding instead of this one (see `mod the_estate_is_the_only_copy`).
+    // Borrowed, not bound: this is a use, not a re-pointing.
+    let _ = &settings;
+    // **The injected resettle, and it calls the one
+    // teardown-and-repopulate sequence.** Nothing else may
+    // live in here: `a_switch_reimplements_none_of_the_
+    // sequence_it_is_supposed_to_reuse` pins that
+    // `switch_to_account` did not do the work itself, and
+    // `the_production_switch_resettles_through_the_one_
+    // sequence` pins that this closure -- the only thing that
+    // gets to decide what "resettle" means in production --
+    // did not either.
+    let mut resettle = |config_dir: &std::path::Path,
+                        to: &Account,
+                        store: &session_store::SessionStore|
+     -> ResettleReport {
+        // Built for the account being settled ONTO. A context
+        // for the account being left would put the master-password prompt
+        // up for the wrong account and seal the Hello blob
+        // under the wrong id.
+        let login = login_context(config_dir, Some(to), deps.first_run_account);
+        let mut declined = false;
+        let outcome = resettle_session(
+            cache,
+            engine,
+            bw_serve_child,
+            deps.job,
+            deps.schedule,
+            self.tray,
+            self.backend_op_rx,
+            backend_task_in_progress,
+            cached_status_details,
+            session_token,
+            || {
+                let token = authenticate_for_switch(store, login);
+                declined = token.is_none();
+                token
+            },
         );
-        vault_window::run(
-            cache.clone(),
-            fill_stats.clone(),
-            details,
-            session_token.clone(),
-            icon_cache_dir.to_path_buf(),
-            // Read fresh on every pass, so a timeout changed in the preferences
-            // window below governs the window this loop is about to reopen.
-            settings.auto_lock(),
-            backend_already_running,
-            // Cloned per pass, not once outside the loop: a switch below replaces
-            // the state, and the window reopened after it has to offer the account
-            // the user just left rather than the one they are now on.
-            accounts.clone(),
-        )
+        // The three-way answer `ResettleOutcome`'s two
+        // variants cannot give: only whoever built the
+        // `authenticate` closure can tell "the user closed the
+        // prompt" from "nothing came up to serve it", and a
+        // switch that reported a backend failure because the
+        // user pressed Cancel would be naming something that
+        // never happened.
+        match outcome {
+            ResettleOutcome::BackendStarted => ResettleReport::Settled,
+            ResettleOutcome::BackendNotStarted if declined => ResettleReport::Declined,
+            ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
         }
     };
-
-    // **What this window's outcome means, decided ONCE and before anything
-    // acts on it.** See [`VaultFollowUp`] for why this is a value rather than
-    // a chain of conditions spread over the branches below.
-    let follow_up = vault_follow_up(&result);
-
-    // **Refill the cache with what this window actually used, so the *next*
-    // open pays no `bw status` spawn.** This is the same guarantee the
-    // pre-fetch-or-block version made one line above the window; it moved
-    // here because nothing blocks any more, so on a miss the details do not
-    // exist until the window has drained them (see
-    // `VaultWindowResult::account_details`). `None` -- a window closed before
-    // its fetch reported back -- leaves the cache empty and the next open
-    // starts another one, which is exactly what a miss has always cost.
-    //
-    // BEFORE the branches below, and that ordering is the whole safety
-    // argument: an account switch and the lock/re-auth recovery both run
-    // `resettle_session`, which sets this to `None` deliberately, and both are
-    // reached from below this line -- so a switch still leaves the next window
-    // to re-fetch rather than showing the account the user just left. Above
-    // them, this would put a stale email in the toolbar of a window signed
-    // into somebody else.
-    if let Some(details) = result.account_details.clone() {
-        // **And the account learns its own address from the same answer**, here
-        // and for the same ordering reason. These details were fetched for the
-        // profile this window was pointed at, which is the active account
-        // *until one of the branches below changes it* -- so this is the last
-        // moment at which "the active account" and "who this describes" are
-        // provably the same account. Below the switch it would write one
-        // account's address into another's entry.
-        //
-        // This is what fills the email in for an account `resolve_startup`
-        // minted on a first install, which is why the account menu's identity
-        // block and the switcher's rows stop naming a 32-character directory.
-        learn_active_account_details(settings_path, accounts, active_account, &details);
-        *cached_status_details = Some(details);
-    }
-
-    // Handled before the lock/re-auth branch and with its own `continue`,
-    // never folded into it. `locked` and `needs_reauth` both mean the
-    // session is gone and both run the full recovery below -- clear the
-    // cache, stop `bw serve`, re-authenticate, restart, repopulate. Asking
-    // for Preferences means none of that: the vault was never locked and the
-    // backend is healthy, so reusing either flag would make a visit to the
-    // gear demand the master password and needlessly restart `bw serve`.
-    //
-    // On `keep_backend_running` (the setting most likely to be changed
-    // here): this deliberately does NOT call `stop_backend_if_idle` itself.
-    // That function's whole contract is "stop the backend if the policy says
-    // so AND no vault window is open", and this path is about to reopen the
-    // vault window immediately -- which needs the backend for writes and
-    // TOTP. `main`'s own loop reconciles the policy on its next idle
-    // iteration, which is reached as soon as this function finally returns,
-    // exactly as it is for the tray's preferences item. The change therefore
-    // takes effect when the vault session actually ends, which is the
-    // earliest moment at which it is meaningful. What DOES have to happen
-    // here is writing the new value into `*settings`, because that binding
-    // -- not the file -- is what that reconciliation reads.
-    //
-    // **No `continue`, and no window opened here any more.** The gear used to
-    // close this window so `prefs_ui::run` could have the thread's event loop;
-    // the form is now drawn as a modal over the vault window itself, so what
-    // comes back is the answer rather than the request. It therefore arrives
-    // alongside whatever actually ended the session -- an ordinary close, a
-    // lock, a switch -- and is applied first, before any of those branches,
-    // rather than instead of them.
-    //
-    // **THE `continue` THAT USED TO BE AT THE BOTTOM OF THIS BLOCK WAS A
-    // SECURITY DEFECT, and this comment is the only thing standing between the
-    // next reader and putting it back.** The commit that turned
-    // `open_preferences: bool` into `edited_settings: Option<Settings>` wrote
-    // the paragraph above and left the old branch's `continue` behind. Combined
-    // with the field's contract -- **`Some` means the gear was clicked at some
-    // point during this window's life, and it is never reset to `None` when the
-    // modal closes** (see `VaultWindowResult::edited_settings`, and the
-    // unconditional write at the end of `vault_window`'s frame closure) -- that
-    // made every branch below unreachable for the rest of the window's life
-    // after one visit to Settings. Open Settings, close it, press Lock: the
-    // vault did not lock. `resettle_session` never ran, the cache was never
-    // cleared, `bw serve` kept a live session, and nothing re-authenticated.
-    //
-    // The contract is deliberately KEPT as "opened at some point" rather than
-    // narrowed to "changed something": the comparison against `*settings` below
-    // is what decides whether anything changed, and it is meant to be the one
-    // place that decides it. Clearing the cell on dismissal would move that
-    // decision into the window and give a change made and then dismissed
-    // (Alt+F4 with the modal up writes the cell every frame precisely so such a
-    // change is not lost) a second chance to be discarded. What makes "opened
-    // at some point" safe is that this block cannot branch: `vault_follow_up`
-    // is what decides what happens next, and it does not read this field.
-    if let Some(edited) = result.edited_settings.clone() {
-        if edited != *settings {
-            *settings = edited;
-            // `persist_preferences`, never a whole-struct `save`. This
-            // struct's `vault_window` field is whatever was on disk when
-            // `main` loaded it at startup, and `vault_window::run` has just
-            // written a fresh geometry straight to the same file on its way
-            // out of the call above. A whole-struct write here would put
-            // that stale geometry back and silently revert the size and
-            // position the user just left the window at -- the identical
-            // trap the tray's preferences handler documents at its own call
-            // site. `persist_preferences` re-reads the file and overwrites
-            // only the two preference fields, so the geometry survives.
-            if let Err(e) = settings.persist_preferences(settings_path) {
-                log::warn!("could not save settings: {e}");
-            }
-        }
-    }
-
-    // **The three things the titlebar's account menu can ask for, before the
-    // lock/re-auth branch and with one `continue` between them.** None of them
-    // is a lost session: the recovery below re-authenticates against the
-    // account this process is ALREADY on, so any of them folded into it would
-    // prompt for the master password of the account the user asked to leave and
-    // then leave them on it. See `VaultWindowResult::switch_to`.
-    //
-    // **ONE resettle closure for all three**, exactly as the tray's Accounts
-    // submenu has one for its three -- three copies would be three chances to
-    // get the hardest sequence in this codebase subtly different, and
-    // `the_vault_windows_account_actions_settle_through_the_one_sequence` pins
-    // that what is in here is that sequence and not a fourth teardown path
-    // written inline. Scoped to this block so the lock branch below, which
-    // needs the same `&mut`s directly, still borrows them.
-    //
-    // **Asked of `vault_follow_up`, not re-derived on this line.** The three
-    // conditions used to be spelled out here and the lock's two on their own
-    // line below, which is precisely the shape that let a stray `continue`
-    // above them go unnoticed for a whole release: with the decision scattered
-    // over the branches, nothing outside this loop could state -- let alone
-    // test -- what a given result was supposed to make happen.
-    if follow_up == VaultFollowUp::AccountAction {
-        // **The injected resettle, and it calls the one
-        // teardown-and-repopulate sequence.** Nothing else may
-        // live in here: `a_switch_reimplements_none_of_the_
-        // sequence_it_is_supposed_to_reuse` pins that
-        // `switch_to_account` did not do the work itself, and
-        // `the_production_switch_resettles_through_the_one_
-        // sequence` pins that this closure -- the only thing that
-        // gets to decide what "resettle" means in production --
-        // did not either.
-        let mut resettle = |config_dir: &std::path::Path,
-                            to: &Account,
-                            store: &session_store::SessionStore|
-         -> ResettleReport {
-            // Built for the account being settled ONTO. A context
-            // for the account being left would put the master-password prompt
-            // up for the wrong account and seal the Hello blob
-            // under the wrong id.
-            let login = login_context(config_dir, Some(to), first_run_account);
-            let mut declined = false;
-            let outcome = resettle_session(
-                cache,
-                engine,
-                bw_serve_child,
-                job,
-                schedule,
-                tray,
-                backend_op_rx,
-                backend_task_in_progress,
-                cached_status_details,
-                session_token,
-                || {
-                    let token = authenticate_for_switch(store, login);
-                    declined = token.is_none();
-                    token
-                },
-            );
-            // The three-way answer `ResettleOutcome`'s two
-            // variants cannot give: only whoever built the
-            // `authenticate` closure can tell "the user closed the
-            // prompt" from "nothing came up to serve it", and a
-            // switch that reported a backend failure because the
-            // user pressed Cancel would be naming something that
-            // never happened.
-            match outcome {
-                ResettleOutcome::BackendStarted => ResettleReport::Settled,
-                ResettleOutcome::BackendNotStarted if declined => ResettleReport::Declined,
-                ResettleOutcome::BackendNotStarted => ResettleReport::NotStarted,
-            }
-        };
 
     // Everything the switch itself does is `switch_to_account`'s -- the data
     // directory, the token store, the teardown, the authentication, the
     // restart, the rollback. This block is the caller's three jobs and no
     // fourth: name the target through the one gate, report the outcome, and
-    // persist.
-    if let Some(target) = result.switch_to.clone() {
-        // **`switchable()`, not `all()`.** `all()` is every configured
-        // account -- the active one included, and duplicate ids included --
-        // and it is not emptied when switching is refused. Re-checking here
-        // rather than trusting the id the window sent back costs nothing and
-        // means the CLI-availability refusal is enforced on this side of the
-        // window too.
-        let picked = accounts
-            .as_ref()
-            .and_then(|state| state.switchable().iter().find(|a| a.id == target))
-            .cloned();
-        match (picked, accounts.as_mut(), active_account.as_mut()) {
-            (Some(to), Some(state), Some(active)) => {
-                let from = active.clone();
-                let outcome =
-                    switch_to_account(config_dir, &from, &to, active, store, &mut resettle);
-                match outcome {
-                    SwitchOutcome::Switched => {
-                        // `adopt`, which moves this state's `active` and
-                        // recomputes what it offers -- so the window reopened
-                        // below offers the account just left.
-                        state.adopt(to.clone());
-                        // **After the switch has landed, never before.** A
-                        // list written first and a switch that then failed
-                        // would leave `settings.json` naming an account this
-                        // process is not on, and the next launch would resume
-                        // the wrong one. Written here, a switch that does not
-                        // stick across a restart is impossible -- which
-                        // matters because "switching that appears to work and
-                        // then doesn't" is indistinguishable from the
-                        // `relativeDataDir` trap and sends whoever debugs it
-                        // down the wrong path entirely.
-                        if let Err(e) = settings::Settings::persist_accounts(
-                            settings_path,
-                            state.all(),
-                            Some(&to.id),
-                        ) {
-                            log::warn!("could not persist the active account after a switch: {e}");
+    // persist -- and WHICH of the three was asked for is a value the caller
+    // decided, not three fields re-read off the window's result here.
+    match request {
+        AccountRequest::SwitchTo(target) => {
+            // **`switchable()`, not `all()`.** `all()` is every configured
+            // account -- the active one included, and duplicate ids included --
+            // and it is not emptied when switching is refused. Re-checking here
+            // rather than trusting the id the window sent back costs nothing and
+            // means the CLI-availability refusal is enforced on this side of the
+            // window too.
+            let picked = accounts
+                .as_ref()
+                .and_then(|state| state.switchable().iter().find(|a| a.id == target))
+                .cloned();
+            match (picked, accounts.as_mut(), active_account.as_mut()) {
+                (Some(to), Some(state), Some(active)) => {
+                    let from = active.clone();
+                    let outcome =
+                        switch_to_account(deps.config_dir, &from, &to, active, store, &mut resettle);
+                    match outcome {
+                        SwitchOutcome::Switched => {
+                            // `adopt`, which moves this state's `active` and
+                            // recomputes what it offers -- so the window reopened
+                            // below offers the account just left.
+                            state.adopt(to.clone());
+                            // **After the switch has landed, never before.** A
+                            // list written first and a switch that then failed
+                            // would leave `settings.json` naming an account this
+                            // process is not on, and the next launch would resume
+                            // the wrong one. Written here, a switch that does not
+                            // stick across a restart is impossible -- which
+                            // matters because "switching that appears to work and
+                            // then doesn't" is indistinguishable from the
+                            // `relativeDataDir` trap and sends whoever debugs it
+                            // down the wrong path entirely.
+                            if let Err(e) = settings::Settings::persist_accounts(
+                                deps.settings_path,
+                                state.all(),
+                                Some(&to.id),
+                            ) {
+                                log::warn!("could not persist the active account after a switch: {e}");
+                            }
+                        }
+                        // Not an error and not reported as one: the user closed
+                        // the target account's master-password prompt and the
+                        // account they were on is back.
+                        SwitchOutcome::Declined => log::info!(
+                            "the switch to {} was declined; staying on {}",
+                            account_label(&to),
+                            account_label(&from)
+                        ),
+                        SwitchOutcome::RolledBack { reason } => {
+                            log::warn!("could not switch to {}: {reason}", account_label(&to));
+                            message_box(
+                                "Deskwarden",
+                                &format!(
+                                    "Could not switch to {}.\n\n{reason}\n\nYou are still signed \
+                                     in to {}.",
+                                    account_label(&to),
+                                    account_label(&from)
+                                ),
+                                MB_ICONERROR | MB_OK,
+                            );
+                        }
+                        // `stand_down_after_unlock`'s state, which this app
+                        // already ships and already tells the user to recover from
+                        // with the tray's "Sync". Logged rather than raised: the
+                        // stand-down has already said its piece.
+                        SwitchOutcome::StoodDown { reason } => {
+                            log::error!("the switch to {} stood autofill down: {reason}", account_label(&to))
                         }
                     }
-                    // Not an error and not reported as one: the user closed
-                    // the target account's master-password prompt and the
-                    // account they were on is back.
-                    SwitchOutcome::Declined => log::info!(
-                        "the switch to {} was declined; staying on {}",
-                        account_label(&to),
-                        account_label(&from)
-                    ),
-                    SwitchOutcome::RolledBack { reason } => {
-                        log::warn!("could not switch to {}: {reason}", account_label(&to));
-                        message_box(
-                            "Deskwarden",
-                            &format!(
-                                "Could not switch to {}.\n\n{reason}\n\nYou are still signed \
-                                 in to {}.",
-                                account_label(&to),
-                                account_label(&from)
-                            ),
-                            MB_ICONERROR | MB_OK,
-                        );
-                    }
-                    // `stand_down_after_unlock`'s state, which this app
-                    // already ships and already tells the user to recover from
-                    // with the tray's "Sync". Logged rather than raised: the
-                    // stand-down has already said its piece.
-                    SwitchOutcome::StoodDown { reason } => {
-                        log::error!("the switch to {} stood autofill down: {reason}", account_label(&to))
-                    }
                 }
+                // The window offered an account this side will not switch to. Not
+                // reachable through the switcher, which is built from the same
+                // `switchable()`; reachable if the two ever disagree, and silence
+                // there would be a click that does nothing forever.
+                _ => log::warn!(
+                    "the vault window asked to switch to an account that is not one this app may \
+                     switch to right now"
+                ),
             }
-            // The window offered an account this side will not switch to. Not
-            // reachable through the switcher, which is built from the same
-            // `switchable()`; reachable if the two ever disagree, and silence
-            // there would be a click that does nothing forever.
-            _ => log::warn!(
-                "the vault window asked to switch to an account that is not one this app may \
-                 switch to right now"
-            ),
         }
-    } else if result.add_account {
-        // **Everything the add does is `add_account`'s** -- minting the
-        // directory, running the sign-in inside it, asking `bw status` who
-        // signed in, the two persists, and the rollback that leaves nothing
-        // behind if any of it fails. This block is the caller's two jobs: hand
-        // it the two windows it cannot open for itself, and report the outcome
-        // through the same `SwitchOutcome` match the tray uses, so neither menu
-        // can quietly stop raising a failure the other one raises.
-        match (accounts.as_mut(), active_account.as_mut()) {
-            (Some(state), Some(active)) => {
-                let outcome = add_account(
-                    config_dir,
-                    settings_path,
-                    state,
-                    active,
-                    store,
-                    // The sign-in window, run against whatever profile
-                    // `add_account` has pointed the CLI at -- which is the NEW
-                    // account's directory, and is the whole reason this is
-                    // injected rather than called in there.
-                    |prepared| {
-                        let login = login_context(config_dir, Some(prepared), first_run_account);
-                        login_ui::run_login_flow_for(login.account, login.first_run)
-                    },
-                    // Asked of a NAMED directory. The active-profile form would
-                    // report the account being left.
-                    login_ui::check_bw_status_details_in,
-                    &mut resettle,
-                );
-                report_account_action("add an account", outcome);
-            }
-            _ => log::warn!("cannot add an account: this app has none to add one to"),
-        }
-    } else if result.remove_account {
-        // The active account, which is the one the menu's identity block names
-        // and the one its row says "this account" about. Re-asked of
-        // `can_remove_active` rather than trusted: the row is gated on it too,
-        // and a state that changed between the two would otherwise reach a
-        // removal that can only fail.
-        match (accounts.as_mut(), active_account.as_mut()) {
-            (Some(state), Some(active)) if state.can_remove_active() => {
-                let doomed = state.active().id.clone();
-                let label = account_label(state.active()).to_string();
-                // **The existing confirmation, not a second one.** It defaults
-                // to No and `the_removal_confirmation_defaults_to_no` pins that;
-                // a copy written beside this call site would not have it.
-                if confirm_account_removal(&label) {
-                    if let Err(reason) = remove_account(
-                        config_dir,
-                        settings_path,
+        AccountRequest::Add => {
+            // **Everything the add does is `add_account`'s** -- minting the
+            // directory, running the sign-in inside it, asking `bw status` who
+            // signed in, the two persists, and the rollback that leaves nothing
+            // behind if any of it fails. This block is the caller's two jobs: hand
+            // it the two windows it cannot open for itself, and report the outcome
+            // through the same `SwitchOutcome` match the tray uses, so neither menu
+            // can quietly stop raising a failure the other one raises.
+            match (accounts.as_mut(), active_account.as_mut()) {
+                (Some(state), Some(active)) => {
+                    let outcome = add_account(
+                        deps.config_dir,
+                        deps.settings_path,
                         state,
-                        &doomed,
                         active,
                         store,
+                        // The sign-in window, run against whatever profile
+                        // `add_account` has pointed the CLI at -- which is the NEW
+                        // account's directory, and is the whole reason this is
+                        // injected rather than called in there.
+                        |prepared| {
+                            let login = login_context(deps.config_dir, Some(prepared), deps.first_run_account);
+                            login_ui::run_login_flow_for(login.account, login.first_run)
+                        },
+                        // Asked of a NAMED directory. The active-profile form would
+                        // report the account being left.
+                        login_ui::check_bw_status_details_in,
                         &mut resettle,
-                        // **The directory form, never the active-profile one.**
-                        // That one acts on whatever this process is pointed at,
-                        // and by the time the logout runs the app has already
-                        // settled onto the SURVIVOR -- so it would sign out the
-                        // account the user is keeping and leave the doomed one
-                        // signed in on the server.
-                        login_ui::bw_logout_in,
-                    ) {
-                        log::warn!("could not remove {label}: {reason}");
-                        message_box("Deskwarden", &reason, MB_ICONERROR | MB_OK);
+                    );
+                    report_account_action("add an account", outcome);
+                }
+                _ => log::warn!("cannot add an account: this app has none to add one to"),
+            }
+        }
+        AccountRequest::Remove => {
+            // The active account, which is the one the menu's identity block names
+            // and the one its row says "this account" about. Re-asked of
+            // `can_remove_active` rather than trusted: the row is gated on it too,
+            // and a state that changed between the two would otherwise reach a
+            // removal that can only fail.
+            match (accounts.as_mut(), active_account.as_mut()) {
+                (Some(state), Some(active)) if state.can_remove_active() => {
+                    let doomed = state.active().id.clone();
+                    let label = account_label(state.active()).to_string();
+                    // **The existing confirmation, not a second one.** It defaults
+                    // to No and `the_removal_confirmation_defaults_to_no` pins that;
+                    // a copy written beside this call site would not have it.
+                    if confirm_account_removal(&label) {
+                        if let Err(reason) = remove_account(
+                            deps.config_dir,
+                            deps.settings_path,
+                            state,
+                            &doomed,
+                            active,
+                            store,
+                            &mut resettle,
+                            // **The directory form, never the active-profile one.**
+                            // That one acts on whatever this process is pointed at,
+                            // and by the time the logout runs the app has already
+                            // settled onto the SURVIVOR -- so it would sign out the
+                            // account the user is keeping and leave the doomed one
+                            // signed in on the server.
+                            login_ui::bw_logout_in,
+                        ) {
+                            log::warn!("could not remove {label}: {reason}");
+                            message_box("Deskwarden", &reason, MB_ICONERROR | MB_OK);
+                        }
                     }
                 }
+                _ => log::warn!(
+                    "the vault window asked to remove an account this app cannot remove right now"
+                ),
             }
-            _ => log::warn!(
-                "the vault window asked to remove an account this app cannot remove right now"
-            ),
         }
     }
-    continue;
     }
+}
 
-    if follow_up == VaultFollowUp::Resettle {
-        // Two different triggers land here, both needing the exact same
-        // recovery: the vault window locked itself (manual Lock button or
-        // its own auto-lock timer), or a write inside it hit `bw serve`
-        // returning 401 -- the session was invalidated out from under a
-        // still-running backend (`bw lock` elsewhere, a server-side vault
-        // timeout, a password change on another device). `backend_is_running`
-        // only checks whether the *process* is alive, so that case would
-        // otherwise go unnoticed forever: `bw serve` keeps answering, just
-        // with 401s, and nothing before this fix ever re-authenticated (see
-        // review Important 2). Both invalidate `bw serve`'s session exactly
-        // the same way a rejected cached session does at startup, so both
-        // get the same fix.
-        if result.needs_reauth {
-            log::warn!(
-                "vault window write failed with an unauthorized session; re-authenticating"
-            );
-        } else {
-            log::info!("vault window locked itself; re-authenticating");
-        }
+/// **The vault loop, with the windows, the teardown and the dialogs behind
+/// `ops`.**
+///
+/// This is the half of `open_vault_window` that decides things. It opens no
+/// window, starts no process and raises no dialog, so a fake `VaultOps` can
+/// drive it end to end.
+///
+/// **There is no `continue` in here, and that is the point of the step.** The
+/// two `if`s and the bare `continue;` / `return;` this replaced were the shape
+/// the v0.5.0 defect hid in: `edited_settings` is `Some` for the rest of a
+/// window's life once the gear has been clicked, so a jump anywhere above the
+/// branches made the vault silently fail to lock, and the only thing standing
+/// between the file and that was a hand-written lexer over its own source.
+/// Now the dispatch is a `match` over an enum the compiler makes exhaustive,
+/// and whether the loop goes round is [`loop_step`]'s answer.
+///
+/// The ordering is the one it has always had, and it is load-bearing: the
+/// cache refill / `learn_active_account_details` and the settings write-back
+/// both run ABOVE the dispatch, because a switch changes which account is
+/// active and would otherwise write one account's address into another's
+/// entry.
+fn run_vault_loop(
+    est: &mut SessionEstate,
+    deps: &VaultDeps<'_>,
+    ops: &mut impl VaultOps,
+    mut first_result: Option<vault_window::VaultWindowResult>,
+) {
+    // Reopened, not merely opened once: the titlebar gear asks for the
+    // preferences window, and an account action settles onto a different
+    // account and comes back. Every other outcome (closed, locked, needs
+    // re-auth) still leaves this function exactly once, on its first pass.
+    loop {
+            // A vault session that ran SOMEWHERE ELSE: the single startup window drew
+            // the vault in its own event loop, and its outcome has to be acted on by
+            // THE CODE BELOW rather than by a second copy of it written next to the
+            // call. Lock, re-auth, Preferences and an account switch each mean the
+            // same thing however the window that reported them was opened, and the
+            // lock/re-auth arm in particular runs `resettle_session` -- the one
+            // hardened teardown-and-repopulate sequence in this app, which exists
+            // exactly once and must keep existing exactly once.
+            //
+            // `take`, so this is the FIRST PASS ONLY. Everything that reopens the
+            // window (Preferences, a switch) goes round the loop again and opens a
+            // real one -- which is what "the window closes and reopens" now means when
+            // the window that closed was the startup window: it closed, and the vault
+            // comes back in a window of its own.
+        let result = match first_result.take() {
+            Some(result) => {
+                log::info!(
+                    "dispatching the outcome of the vault session the startup window already ran"
+                );
+                result
+            }
+            None => ops.open_window(est, deps),
+        };
 
-        // The recovery itself is `resettle_session`, which a lock/re-auth and
-        // an account switch share whole rather than each spelling out (see
-        // its doc). The only thing this caller contributes is where the new
-        // session token comes from: the master-password prompt for the
-        // account this app is already signed into.
+        // **What this window's outcome means, decided ONCE and before anything
+        // acts on it.** See [`VaultFollowUp`] for why this is a value rather than
+        // a chain of conditions spread over the branches below.
+        let follow_up = vault_follow_up(&result);
+
+        // **Refill the cache with what this window actually used, so the *next*
+        // open pays no `bw status` spawn.** This is the same guarantee the
+        // pre-fetch-or-block version made one line above the window; it moved
+        // here because nothing blocks any more, so on a miss the details do not
+        // exist until the window has drained them (see
+        // `VaultWindowResult::account_details`). `None` -- a window closed before
+        // its fetch reported back -- leaves the cache empty and the next open
+        // starts another one, which is exactly what a miss has always cost.
         //
-        // `reauthenticate` never returns `None` -- it exits the process
-        // rather than hand back a failure -- so the `BackendNotStarted`
-        // outcome is reached from here only by a backend that would not
-        // start, which is why the outcome is not branched on. Both outcomes
-        // leave this function the same way, through the `return` below; the
-        // `BackendNotStarted` arm used to be an early `return` from inside
-        // this block, which was only ever a jump to that same statement.
-        resettle_session(
-            cache,
-            engine,
-            bw_serve_child,
-            job,
-            schedule,
-            tray,
-            backend_op_rx,
-            backend_task_in_progress,
-            cached_status_details,
-            session_token,
-            // Built HERE rather than handed in, so it names whichever account
-            // this process is on at this moment -- which the switch above may
-            // have changed since the caller's own context was built.
-            || {
-                let login =
-                    login_context(config_dir, active_account.as_ref(), first_run_account);
-                Some(reauthenticate(store, login))
-            },
-        );
-    }
+        // BEFORE the branches below, and that ordering is the whole safety
+        // argument: an account switch and the lock/re-auth recovery both run
+        // `resettle_session`, which sets this to `None` deliberately, and both are
+        // reached from below this line -- so a switch still leaves the next window
+        // to re-fetch rather than showing the account the user just left. Above
+        // them, this would put a stale email in the toolbar of a window signed
+        // into somebody else.
+        if let Some(details) = result.account_details.clone() {
+            // **And the account learns its own address from the same answer**, here
+            // and for the same ordering reason. These details were fetched for the
+            // profile this window was pointed at, which is the active account
+            // *until one of the branches below changes it* -- so this is the last
+            // moment at which "the active account" and "who this describes" are
+            // provably the same account. Below the switch it would write one
+            // account's address into another's entry.
+            //
+            // This is what fills the email in for an account `resolve_startup`
+            // minted on a first install, which is why the account menu's identity
+            // block and the switcher's rows stop naming a 32-character directory.
+            learn_active_account_details(
+                deps.settings_path,
+                &mut est.accounts,
+                &mut est.active_account,
+                &details,
+            );
+            est.details = Some(details);
+        }
 
-    // The only way out that is not the `continue` above. Every non-
-    // preferences outcome -- a plain close, a lock, a re-auth, and a
-    // re-auth whose backend could not be restarted (which used to `return`
-    // from inside the block above and now simply falls through to here) --
-    // leaves the loop here, so this function still runs the window exactly
-    // once for all of them.
-    return;
+        // Handled before the lock/re-auth branch and with its own `continue`,
+        // never folded into it. `locked` and `needs_reauth` both mean the
+        // session is gone and both run the full recovery below -- clear the
+        // cache, stop `bw serve`, re-authenticate, restart, repopulate. Asking
+        // for Preferences means none of that: the vault was never locked and the
+        // backend is healthy, so reusing either flag would make a visit to the
+        // gear demand the master password and needlessly restart `bw serve`.
+        //
+        // On `keep_backend_running` (the setting most likely to be changed
+        // here): this deliberately does NOT call `stop_backend_if_idle` itself.
+        // That function's whole contract is "stop the backend if the policy says
+        // so AND no vault window is open", and this path is about to reopen the
+        // vault window immediately -- which needs the backend for writes and
+        // TOTP. `main`'s own loop reconciles the policy on its next idle
+        // iteration, which is reached as soon as this function finally returns,
+        // exactly as it is for the tray's preferences item. The change therefore
+        // takes effect when the vault session actually ends, which is the
+        // earliest moment at which it is meaningful. What DOES have to happen
+        // here is writing the new value into `*settings`, because that binding
+        // -- not the file -- is what that reconciliation reads.
+        //
+        // **No `continue`, and no window opened here any more.** The gear used to
+        // close this window so `prefs_ui::run` could have the thread's event loop;
+        // the form is now drawn as a modal over the vault window itself, so what
+        // comes back is the answer rather than the request. It therefore arrives
+        // alongside whatever actually ended the session -- an ordinary close, a
+        // lock, a switch -- and is applied first, before any of those branches,
+        // rather than instead of them.
+        //
+        // **THE `continue` THAT USED TO BE AT THE BOTTOM OF THIS BLOCK WAS A
+        // SECURITY DEFECT, and this comment is the only thing standing between the
+        // next reader and putting it back.** The commit that turned
+        // `open_preferences: bool` into `edited_settings: Option<Settings>` wrote
+        // the paragraph above and left the old branch's `continue` behind. Combined
+        // with the field's contract -- **`Some` means the gear was clicked at some
+        // point during this window's life, and it is never reset to `None` when the
+        // modal closes** (see `VaultWindowResult::edited_settings`, and the
+        // unconditional write at the end of `vault_window`'s frame closure) -- that
+        // made every branch below unreachable for the rest of the window's life
+        // after one visit to Settings. Open Settings, close it, press Lock: the
+        // vault did not lock. `resettle_session` never ran, the cache was never
+        // cleared, `bw serve` kept a live session, and nothing re-authenticated.
+        //
+        // The contract is deliberately KEPT as "opened at some point" rather than
+        // narrowed to "changed something": the comparison against `*settings` below
+        // is what decides whether anything changed, and it is meant to be the one
+        // place that decides it. Clearing the cell on dismissal would move that
+        // decision into the window and give a change made and then dismissed
+        // (Alt+F4 with the modal up writes the cell every frame precisely so such a
+        // change is not lost) a second chance to be discarded. What makes "opened
+        // at some point" safe is that this block cannot branch: `vault_follow_up`
+        // is what decides what happens next, and it does not read this field.
+        if let Some(edited) = result.edited_settings.clone() {
+            if edited != est.settings {
+                est.settings = edited;
+                // `persist_preferences`, never a whole-struct `save`. This
+                // struct's `vault_window` field is whatever was on disk when
+                // `main` loaded it at startup, and `vault_window::run` has just
+                // written a fresh geometry straight to the same file on its way
+                // out of the call above. A whole-struct write here would put
+                // that stale geometry back and silently revert the size and
+                // position the user just left the window at -- the identical
+                // trap the tray's preferences handler documents at its own call
+                // site. `persist_preferences` re-reads the file and overwrites
+                // only the two preference fields, so the geometry survives.
+                if let Err(e) = est.settings.persist_preferences(deps.settings_path) {
+                    log::warn!("could not save settings: {e}");
+                }
+            }
+        }
+
+        // **The three things the titlebar's account menu can ask for, ranked
+        // above the lock/re-auth recovery.** None of them
+        // is a lost session: the recovery below re-authenticates against the
+        // account this process is ALREADY on, so any of them folded into it would
+        // prompt for the master password of the account the user asked to leave and
+        // then leave them on it. See `VaultWindowResult::switch_to`.
+        //
+        // **ONE resettle closure for all three**, exactly as the tray's Accounts
+        // submenu has one for its three -- three copies would be three chances to
+        // get the hardest sequence in this codebase subtly different, and
+        // `the_vault_windows_account_actions_settle_through_the_one_sequence` pins
+        // that what is in there is that sequence and not a fourth teardown path
+        // written inline. It lives in `RealVaultOps::account_action` with the
+        // rest of the branch, which is also where the estate is destructured --
+        // the closure wants `&mut engine`, `&mut child` and `&mut token` while
+        // `switch_to_account` wants `&mut active_account` and `&mut store`, and
+        // field-level borrow splitting does not happen through a `&mut self`
+        // method on its own.
+        //
+        // **Asked of `vault_follow_up`, not re-derived on this line.** The three
+        // conditions used to be spelled out here and the lock's two on their own
+        // line below, which is precisely the shape that let a stray `continue`
+        // above them go unnoticed for a whole release: with the decision scattered
+        // over the branches, nothing outside this loop could state -- let alone
+        // test -- what a given result was supposed to make happen.
+        // **The dispatch, and it is exhaustive.** Three answers, three arms, and
+        // the compiler is what says none was forgotten -- which is the question
+        // six consecutive review rounds asked of a source-analysis test instead.
+        match follow_up {
+            VaultFollowUp::AccountAction => {
+                // `account_request` and `vault_follow_up` are two readers of the
+                // same three fields, and
+                // `the_two_readers_of_an_account_request_agree` pins that they
+                // agree for every shape a result can have. If they ever did not,
+                // this arm would be a menu click that dispatches nothing -- so it
+                // says so in the log rather than passing in silence.
+                match account_request(&result) {
+                    Some(request) => ops.account_action(est, deps, request),
+                    None => log::error!(
+                        "the vault window reported an account action with no account request in \
+                         it; nothing was done"
+                    ),
+                }
+            }
+            VaultFollowUp::Resettle => {
+                // Two different triggers land here, both needing the exact same
+                // recovery: the vault window locked itself (manual Lock button or
+                // its own auto-lock timer), or a write inside it hit `bw serve`
+                // returning 401 -- the session was invalidated out from under a
+                // still-running backend (`bw lock` elsewhere, a server-side vault
+                // timeout, a password change on another device). `backend_is_running`
+                // only checks whether the *process* is alive, so that case would
+                // otherwise go unnoticed forever: `bw serve` keeps answering, just
+                // with 401s, and nothing before this fix ever re-authenticated (see
+                // review Important 2). Both invalidate `bw serve`'s session exactly
+                // the same way a rejected cached session does at startup, so both
+                // get the same fix.
+                if result.needs_reauth {
+                    log::warn!(
+                        "vault window write failed with an unauthorized session; re-authenticating"
+                    );
+                } else {
+                    log::info!("vault window locked itself; re-authenticating");
+                }
+
+                // The recovery itself is `resettle_session`, which a lock/re-auth
+                // and an account switch share whole rather than each spelling out
+                // (see its doc). Everything in it needs a real tray icon, a real
+                // `bw serve` and a real master-password window, which is why it is
+                // behind `ops`.
+                ops.resettle_after_lost_session(est, deps);
+            }
+            // A plain close, or a window whose only news was a visit to the gear
+            // -- already applied above. Nothing left to do.
+            VaultFollowUp::Done => {}
+        }
+
+        // **The one place the reopen/return distinction is made, and it is a
+        // pure function.** There is no `continue` above this line and none below
+        // it: whether the loop goes round is `loop_step`'s answer to what this
+        // window's outcome meant, and nothing else in this function may jump.
+        match loop_step(follow_up) {
+            LoopStep::Reopen => {}
+            LoopStep::Return => return,
+        }
     }
+}
+
+fn open_vault_window(
+    // **The eight `&mut` parameters this used to take, as one value.** They
+    // were eight separate borrows off `main`'s stack frame, which is why the
+    // lock/re-auth recovery in the loop below can only ever run on this
+    // thread. See `SessionEstate`. The body destructures it on its first
+    // statement, so not one line inside the loop changed to accommodate the
+    // move.
+    estate: &mut SessionEstate,
+    // The immutable half. Separate from the estate and not merged into it
+    // because nothing here is ever written: a value that cannot be mutated
+    // cannot disagree with a second copy of itself, so it needs none of the
+    // single-owner discipline `SessionEstate` exists to enforce.
+    deps: VaultDeps<'_>,
+    // Out of both structs, deliberately. `AppTray` is not `Send` -- it owns a
+    // hidden Win32 window bound to the thread that built it -- so a struct it
+    // is a field of could never be parked behind an `Arc<Mutex<_>>` with the
+    // estate. The receiver stays out for the same reason the sender went in:
+    // only one place may drain it.
+    tray: &tray::AppTray,
+    backend_op_rx: &mpsc::Receiver<BackendOp>,
+    // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
+    // the loop below on its first pass instead of that pass opening a window.
+    //
+    // `Some` from exactly one caller: `main`, once, after the single startup
+    // window has drawn the sign-in card, the spinner and then the vault in one
+    // event loop and the user has closed it. That window can lock, ask for
+    // Preferences or switch account exactly as any other vault session can, and
+    // every one of those outcomes has a handler here already. Handing the
+    // result in rather than growing a second dispatch next to the startup code
+    // is what keeps `resettle_session` reached from one place and keeps the
+    // switch/add/remove wiring the tray's guards pin the only wiring there is.
+    first_result: Option<vault_window::VaultWindowResult>,
+) {
+    // A four-line constructor. Everything this function used to do is now
+    // either in `RealVaultOps` (the window, the teardown, the dialogs) or in
+    // `run_vault_loop` (every decision), and the split is what makes the
+    // second half reachable from a test at all.
+    let mut ops = RealVaultOps { tray, backend_op_rx };
+    run_vault_loop(estate, &deps, &mut ops, first_result);
 }
 
 /// What a resettle left the app in, for a caller that has to decide whether
@@ -7209,49 +7397,35 @@ mod tests {
             );
         }
 
-        /// `open_vault_window`'s own body, depth-counted from its signature to
-        /// its closing brace.
+        /// **`RealVaultOps::open_window`'s body** -- the window-open region,
+        /// which S3 lifted verbatim out of `open_vault_window`'s loop.
         ///
-        /// Sliced rather than checked against the whole file, because the
-        /// whole file legitimately contains other synchronous status calls --
-        /// the startup prefetch thread, and `StartupWork::produce`, which runs
-        /// on the worker `app_window` spawns. Neither is on the path a window
-        /// opens from; this function is.
-        fn open_vault_window_body() -> &'static str {
-            let production = production_half_of_this_file();
-            let at = production
-                .find(concat!("fn open_vault_", "window("))
-                .expect("no `open_vault_window` in this file -- the vault window's one door");
-            let after = &production[at..];
-            let open = after.find('{').expect("`open_vault_window` has no body to slice");
-            let after_open = &after[open + 1..];
-
-            let mut depth = 1usize;
-            for (offset, ch) in after_open.char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            let body = &after_open[..offset];
-                            assert!(
-                                body.contains("handing off to eframe"),
-                                "the sliced body is not `open_vault_window`: every assertion \
-                                 over it would be about the wrong code"
-                            );
-                            assert!(
-                                !body.contains(concat!("impl Startup", "Work {")),
-                                "the slice ran past the end of `open_vault_window` and swept \
-                                 up the startup worker, whose own status call is legitimately \
-                                 synchronous"
-                            );
-                            return body;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("`open_vault_window`'s body is never closed");
+        /// Re-pointed rather than deleted: this is the same code it always
+        /// was, and it is still the one place in this file that opens a vault
+        /// window, so it is still the one place a synchronous `bw status` may
+        /// not appear. Sliced rather than checked against the whole file,
+        /// because the whole file legitimately contains other synchronous
+        /// status calls -- the startup prefetch thread, and
+        /// `StartupWork::produce`, which runs on the worker `app_window`
+        /// spawns. Neither is on the path a window opens from; this is.
+        fn open_vault_window_body() -> String {
+            let body = super::vault_ops_method_body(production_half_of_this_file(), "open_window");
+            assert!(
+                body.contains("handing off to eframe"),
+                "the sliced body is not the window-open region: every assertion over it would \
+                 be about the wrong code"
+            );
+            assert!(
+                body.contains(concat!("vault_window::", "run(")),
+                "the sliced body does not open a window at all, so the assertion below would \
+                 pass against a region that cannot contain the defect it forbids"
+            );
+            assert!(
+                !body.contains(concat!("impl Startup", "Work {")),
+                "the slice ran past the end of `open_window` and swept up the startup worker, \
+                 whose own status call is legitimately synchronous"
+            );
+            body
         }
 
         /// Every synchronous `bw status` call left on the path a window opens
@@ -7292,6 +7466,7 @@ mod tests {
             let call = status_call();
 
             let sites: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
+            let body = body.as_str();
             assert_eq!(
                 sites.len(),
                 1,
@@ -7363,10 +7538,18 @@ mod tests {
             //
             // The branch asks `vault_follow_up` rather than re-deriving the two
             // conditions. Spelling the conditions out here would now match
-            // *that function's body*, which sits above `open_vault_window` --
-            // i.e. before the refill -- and this ordering assertion would fail
-            // while describing a file that is perfectly correct.
-            let lock = concat!("if follow_up == VaultFollow", "Up::Resettle {");
+            // *that function's body*, which sits above the loop -- i.e. before
+            // the refill -- and this ordering assertion would fail while
+            // describing a file that is perfectly correct.
+            //
+            // **Re-pointed by S3, not loosened.** The two `if`s the loop used
+            // to dispatch with are one exhaustive `match` on `VaultFollowUp`;
+            // this is that match's `Resettle` arm, in the same place in the
+            // same loop, and the mutation it exists to catch -- the refill
+            // moved below the branches -- still inverts these two offsets.
+            // `loop_step`'s own arm reads `VaultFollowUp::Resettle |`, so it
+            // is not what this finds.
+            let lock = concat!("VaultFollow", "Up::Resettle => {");
 
             let refill_at = production.find(refill).unwrap_or_else(|| {
                 panic!(
@@ -7405,6 +7588,67 @@ mod tests {
             "control: the split really cut the test module off the end"
         );
         production
+    }
+
+    /// The body of the item whose declaration starts with `head`, matched by
+    /// brace depth from the first `{` at or after it.
+    ///
+    /// `head` must occur exactly once in `source`, and the body must close --
+    /// a slice that silently ran to the end of the file is a HOLE, not a false
+    /// positive, so it panics.
+    fn body_of(source: &str, head: &str) -> String {
+        assert_eq!(
+            source.matches(head).count(),
+            1,
+            "{head:?} does not appear exactly once, so its body cannot be sliced and every \
+             assertion over it would be about the wrong text"
+        );
+        let at = source.find(head).expect("counted one, found none");
+        let rest = &source[at..];
+        let open = rest
+            .find('{')
+            .unwrap_or_else(|| panic!("{head:?} has no body to slice"));
+        let rest = &rest[open + 1..];
+        let mut depth = 1usize;
+        for (offset, ch) in rest.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest[..offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("{head:?}'s body is never closed -- the slice ran to the end of the source");
+    }
+
+    /// The body of one of `RealVaultOps`'s three `VaultOps` methods.
+    ///
+    /// **Sliced out of the impl block first**, deliberately: `trait VaultOps`
+    /// declares all three names too, with no body at all, and a `find` over
+    /// the whole file would land on the declaration and then brace-match into
+    /// whatever came next. Every method body reached by these guards goes
+    /// through here.
+    fn vault_ops_method_body(source: &str, name: &str) -> String {
+        let impl_body = body_of(source, concat!("impl VaultOps for Real", "VaultOps<'_> {"));
+        // Fenced by what the three regions DO rather than by a byte count,
+        // so the same helper serves a caller reading the raw production half
+        // and one reading `code_only`'s much shorter output.
+        for marker in [
+            concat!("vault_window::", "run("),
+            concat!("resettle_ses", "sion("),
+            concat!("switch_to", "_account("),
+        ] {
+            assert!(
+                impl_body.contains(marker),
+                "control: {marker:?} is not inside the `VaultOps` impl, so the slice is not \
+                 the three regions the vault loop used to hold inline"
+            );
+        }
+        body_of(&impl_body, &format!("fn {name}("))
     }
 
     /// **The seam `SessionEstate` created, and the three doc claims that
@@ -7707,58 +7951,89 @@ mod tests {
             pattern
         }
 
-        /// `open_vault_window`'s whole body, as code.
-        fn open_vault_window_code() -> String {
+        /// **Everywhere the estate is reachable by name, as code.**
+        ///
+        /// This used to be `open_vault_window`'s body, because the whole loop
+        /// was in it. S3 split that loop across five functions -- the three
+        /// `RealVaultOps` methods, `run_vault_loop`, and the four-line
+        /// constructor that is left -- and the destructure now lives in
+        /// `account_action`.
+        ///
+        /// **Re-pointed at all five, not at the one that holds the pattern.**
+        /// The divorce this module forbids can be written in any of them, and
+        /// the ledger records exactly that (mutation M10 of the S1+S2 review:
+        /// the destructure left untouched and the re-binding written inside
+        /// the loop, caught only by the depth-blind `let` scan). Scanning only
+        /// `account_action` would have retired M10 while looking like a
+        /// re-point.
+        fn vault_loop_region() -> String {
             let code = production_code();
-            let head = concat!("fn open_vault_", "window(");
-            assert_eq!(
-                code.matches(head).count(),
-                1,
-                "`open_vault_window` is not declared exactly once in the production code"
-            );
-            let at = code.find(head).expect("counted one, found none");
-            let after = &code[at..];
-            let open = after
-                .find('{')
-                .expect("`open_vault_window` has no body to slice");
-            let rest = &after[open + 1..];
-            let mut depth = 1usize;
-            for (offset, ch) in rest.char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            let body = &rest[..offset];
-                            assert!(
-                                (10_000..80_000).contains(&body.len()),
-                                "the sliced `open_vault_window` body is {} bytes, which is not \
-                                 the vault loop",
-                                body.len()
-                            );
-                            for marker in [
-                                concat!("let Session", "Estate {"),
-                                concat!("let Vault", "Deps {"),
-                                concat!("vault_follow", "_up("),
-                            ] {
-                                assert!(
-                                    body.contains(marker),
-                                    "control: {marker:?} is not in the sliced body, so this is \
-                                     not `open_vault_window`"
-                                );
-                            }
-                            assert!(
-                                !body.contains(concat!("fn ma", "in(")),
-                                "the slice ran past the end of `open_vault_window` and swept up \
-                                 `main`, whose own locals are not the estate's bindings"
-                            );
-                            return body.to_string();
-                        }
-                    }
-                    _ => {}
-                }
+            let mut region = String::new();
+            let mut seen = 0usize;
+            // Each with its own floor, measured. Five identical floors would
+            // be five chances for one slice to come back near-empty behind a
+            // bound low enough for the smallest of them, and `open_vault_window`
+            // is a four-line constructor now -- two orders of magnitude smaller
+            // than the branch it used to hold.
+            for (what, floor, body) in [
+                ("open_window", 1_500, super::vault_ops_method_body(&code, "open_window")),
+                (
+                    "account_action",
+                    4_000,
+                    super::vault_ops_method_body(&code, "account_action"),
+                ),
+                (
+                    "resettle_after_lost_session",
+                    300,
+                    super::vault_ops_method_body(&code, "resettle_after_lost_session"),
+                ),
+                (
+                    "run_vault_loop",
+                    800,
+                    super::body_of(&code, concat!("fn run_vault_", "loop(")),
+                ),
+                (
+                    "open_vault_window",
+                    100,
+                    super::body_of(&code, concat!("fn open_vault_", "window(")),
+                ),
+            ] {
+                assert!(
+                    body.len() > floor,
+                    "`{what}` sliced to {} bytes, under its floor of {floor}: a scan over it \
+                     would pass against nothing",
+                    body.len()
+                );
+                assert!(
+                    !body.contains(concat!("fn ma", "in(")),
+                    "the slice of `{what}` ran past its own function and swept up `main`, \
+                     whose locals are not the estate's bindings"
+                );
+                seen += 1;
+                region.push_str(&body);
+                region.push('\n');
             }
-            panic!("`open_vault_window`'s body is never closed");
+            assert_eq!(
+                seen, 5,
+                "control: the region is not the five places the vault loop now lives in"
+            );
+            for marker in [
+                concat!("let Session", "Estate {"),
+                concat!("vault_follow", "_up("),
+                concat!("Real", "VaultOps { tray"),
+                concat!("resettle_ses", "sion("),
+            ] {
+                assert!(
+                    region.contains(marker),
+                    "control: {marker:?} is not in the region, so this is not the vault loop"
+                );
+            }
+            assert!(
+                (10_000..80_000).contains(&region.len()),
+                "the vault-loop region is {} bytes, which is not the vault loop",
+                region.len()
+            );
+            region
         }
 
         /// Whether `code` gives the type declared at byte offset `at` a
@@ -7954,14 +8229,15 @@ mod tests {
         /// reborrow of `cache`, which is permitted by exact text.
         #[test]
         fn no_estate_binding_is_re_pointed_at_a_second_value() {
-            let body = open_vault_window_code();
+            let body = vault_loop_region();
             let pattern = estate_destructure();
 
             assert_eq!(
                 let_bindings_of(&body, "follow_up"),
                 1,
-                "control: the `let` scanner cannot see `let follow_up = ...`, which this body \
-                 certainly contains, so every count below is zero for the wrong reason"
+                "control: the `let` scanner cannot see `let follow_up = ...`, which \
+                 `run_vault_loop` certainly contains, so every count below is zero for the \
+                 wrong reason"
             );
 
             let narrowing = "let cache: &Arc<VaultCache> = cache;";
@@ -7988,7 +8264,7 @@ mod tests {
                     found,
                     allowed,
                     "`{binding}` (the estate's `{field}`) is `let`-bound {found} times inside \
-                     `open_vault_window`; {allowed} is the only count that keeps it the estate's. \
+                     the vault loop; {allowed} is the only count that keeps it the estate's. \
                      A second binding of this name divorces the loop from `main`: the window goes \
                      on editing a copy, the copy is dropped at the end of the call, and `main` \
                      reads the value it had before -- with every side effect the loop performed \
@@ -8441,6 +8717,278 @@ mod tests {
             );
         }
 
+        /// **The step the loop takes, and the two readers of an account
+        /// request.**
+        ///
+        /// Everything in here is a pure function with a value for an answer.
+        /// That is the whole trade S3 made: the reopen/return distinction and
+        /// "which action did the menu ask for" used to be facts about the text
+        /// of a function no test can call, and six consecutive review rounds
+        /// were fought over hand-written lexers trying to read them off.
+        mod the_step_the_loop_takes {
+            use super::{closed, visited_the_gear};
+            use crate::{account_request, loop_step, vault_follow_up};
+            use crate::{AccountRequest, LoopStep, VaultFollowUp};
+            use deskwarden::vault_window::VaultWindowResult;
+
+            /// The one account id these fixtures switch to.
+            fn target() -> deskwarden::accounts::AccountId {
+                deskwarden::accounts::AccountId::parse("0123456789abcdef0123456789abcdef")
+                    .expect("a 32-character hex id should parse")
+            }
+
+            /// Every shape a finished vault session can have, as far as these
+            /// two functions are concerned: the three account requests, the
+            /// two lost-session flags, the gear, and a plain close.
+            ///
+            /// Built on `visited_the_gear()` for the three account requests on
+            /// purpose -- `edited_settings` stays `Some` for the rest of a
+            /// window's life once the gear has been clicked, and that is the
+            /// exact field the shipped defect branched on.
+            fn every_shape() -> Vec<(&'static str, VaultWindowResult, Option<AccountRequest>)> {
+                vec![
+                    ("a plain close", closed(), None),
+                    ("a visit to the gear", visited_the_gear(), None),
+                    (
+                        "a lock",
+                        VaultWindowResult { locked: true, ..closed() },
+                        None,
+                    ),
+                    (
+                        "a 401",
+                        VaultWindowResult { needs_reauth: true, ..closed() },
+                        None,
+                    ),
+                    (
+                        "a lock after a visit to the gear",
+                        VaultWindowResult { locked: true, ..visited_the_gear() },
+                        None,
+                    ),
+                    (
+                        "a switch",
+                        VaultWindowResult { switch_to: Some(target()), ..closed() },
+                        Some(AccountRequest::SwitchTo(target())),
+                    ),
+                    (
+                        "a switch after a visit to the gear",
+                        VaultWindowResult { switch_to: Some(target()), ..visited_the_gear() },
+                        Some(AccountRequest::SwitchTo(target())),
+                    ),
+                    (
+                        "an add",
+                        VaultWindowResult { add_account: true, ..visited_the_gear() },
+                        Some(AccountRequest::Add),
+                    ),
+                    (
+                        "a remove",
+                        VaultWindowResult { remove_account: true, ..visited_the_gear() },
+                        Some(AccountRequest::Remove),
+                    ),
+                    (
+                        "a switch that also locked",
+                        VaultWindowResult { locked: true, switch_to: Some(target()), ..closed() },
+                        Some(AccountRequest::SwitchTo(target())),
+                    ),
+                    (
+                        "an add that also asked to switch",
+                        VaultWindowResult {
+                            add_account: true,
+                            switch_to: Some(target()),
+                            ..closed()
+                        },
+                        Some(AccountRequest::SwitchTo(target())),
+                    ),
+                    (
+                        "a remove that also asked to add",
+                        VaultWindowResult {
+                            add_account: true,
+                            remove_account: true,
+                            ..closed()
+                        },
+                        Some(AccountRequest::Add),
+                    ),
+                ]
+            }
+
+            /// **The whole of `loop_step`, over all three answers.**
+            ///
+            /// `Resettle` returning `Reopen` is the vault not locking: the
+            /// recovery has already torn the session down, cleared the cache
+            /// and re-authenticated, so going round again opens a second window
+            /// on a session the user asked to end.
+            #[test]
+            fn loop_step_reopens_for_an_account_action_and_returns_for_everything_else() {
+                let mut seen = 0;
+                for (answer, want, why) in [
+                    (
+                        VaultFollowUp::AccountAction,
+                        LoopStep::Reopen,
+                        "an account action settles onto a different account and the window has \
+                         to come back; returning here closes the vault for good on a click that \
+                         asked to stay in it",
+                    ),
+                    (
+                        VaultFollowUp::Resettle,
+                        LoopStep::Return,
+                        "the lock/401 recovery has already torn the session down and \
+                         re-authenticated -- reopening on it is the vault silently failing to \
+                         lock, which is what v0.5.0 shipped",
+                    ),
+                    (
+                        VaultFollowUp::Done,
+                        LoopStep::Return,
+                        "the window closed for good; reopening it is a close that cannot be \
+                         made to stick",
+                    ),
+                ] {
+                    seen += 1;
+                    assert_eq!(loop_step(answer), want, "{answer:?}: {why}");
+                }
+                assert_eq!(seen, 3, "control: the loop visited every `VaultFollowUp`");
+                // ...and the two answers really are different values, so a
+                // `loop_step` that returned a constant cannot satisfy the loop
+                // above.
+                assert_ne!(
+                    loop_step(VaultFollowUp::AccountAction),
+                    loop_step(VaultFollowUp::Resettle),
+                    "control: `loop_step` gives the same answer to an account action and to a \
+                     lost session, so it decides nothing"
+                );
+            }
+
+            /// **`account_request` over every result shape**, including the
+            /// ones where two fields are set at once.
+            #[test]
+            fn account_request_names_the_action_for_every_shape_a_result_can_have() {
+                let mut seen = 0;
+                for (what, result, want) in every_shape() {
+                    seen += 1;
+                    assert_eq!(
+                        account_request(&result),
+                        want,
+                        "{what}: `account_request` does not name the action the menu asked for"
+                    );
+                }
+                assert_eq!(seen, 12, "control: the loop visited every shape");
+                // Positive controls on the fixture set itself: it really does
+                // contain shapes on both sides of the answer, and really does
+                // contain all three requests. Without these the loop above is
+                // satisfied by an `account_request` that always says `None`.
+                let shapes = every_shape();
+                assert_eq!(
+                    shapes.iter().filter(|(_, _, want)| want.is_none()).count(),
+                    5,
+                    "control: the fixture set has no results that ask for nothing"
+                );
+                for wanted in [
+                    AccountRequest::SwitchTo(target()),
+                    AccountRequest::Add,
+                    AccountRequest::Remove,
+                ] {
+                    assert!(
+                        shapes.iter().any(|(_, _, want)| want.as_ref() == Some(&wanted)),
+                        "control: no fixture expects {wanted:?}, so that arm is never exercised"
+                    );
+                }
+            }
+
+            /// **The two readers of the same three fields agree, for every
+            /// shape.**
+            ///
+            /// `vault_follow_up` decides WHETHER the loop dispatches an account
+            /// action; `account_request` decides WHICH. If they could ever
+            /// disagree, the loop's `AccountAction` arm would be a menu click
+            /// that reaches a dispatch with nothing to dispatch -- exactly the
+            /// "complete, correct and unreachable" shape this crate's ledger is
+            /// full of. So they are held to each other rather than each to
+            /// itself.
+            #[test]
+            fn the_two_readers_of_an_account_request_agree() {
+                let mut seen = 0;
+                let mut asked = 0;
+                for (what, result, _) in every_shape() {
+                    seen += 1;
+                    let follow_up = vault_follow_up(&result);
+                    let request = account_request(&result);
+                    if request.is_some() {
+                        asked += 1;
+                    }
+                    assert_eq!(
+                        follow_up == VaultFollowUp::AccountAction,
+                        request.is_some(),
+                        "{what}: `vault_follow_up` says {follow_up:?} while `account_request` \
+                         says {request:?}. One of them would have the loop dispatch an account \
+                         action it cannot name, or drop one it can"
+                    );
+                }
+                assert_eq!(seen, 12, "control: the loop visited every shape");
+                assert_eq!(
+                    asked, 7,
+                    "control: {asked} of the shapes ask for an account action, which is not the \
+                     seven this fixture set was built with -- the agreement above would then be \
+                     mostly about results that ask for nothing"
+                );
+            }
+
+            /// **The dispatch sends each answer to its own `ops` method, and
+            /// the account arm dispatches what `account_request` named.**
+            ///
+            /// `run_vault_loop` is not runnable until S4 gives it a fake
+            /// `VaultOps`, so this is source analysis and says so. What it
+            /// forbids is the mutation that leaves the `match` exhaustive and
+            /// correct-looking while an arm stops calling the thing it exists
+            /// to call -- the arm's whole effect deleted, with the enum, the
+            /// pure functions and every guard above still green.
+            #[test]
+            fn each_answer_is_dispatched_to_its_own_op() {
+                let production = super::super::production_half_of_this_file();
+                let tail = super::the_whole_vault_loop_tail();
+                let mut seen = 0;
+                for (arm, call, why) in [
+                    (
+                        concat!("VaultFollow", "Up::AccountAction => {"),
+                        concat!("ops.account_", "action(est, deps, request)"),
+                        "the menu's switch, add and remove are dropped on the floor: the arm is \
+                         taken and nothing happens",
+                    ),
+                    (
+                        concat!("VaultFollow", "Up::Resettle => {"),
+                        concat!("ops.resettle_after_lost_", "session(est, deps)"),
+                        "a lock or a 401 never re-authenticates: the cache is not cleared, \
+                         `bw serve` keeps a live session, and the vault does not lock",
+                    ),
+                ] {
+                    seen += 1;
+                    let body = super::without_the_body_of(&tail, arm).1;
+                    assert!(
+                        body.len() > 100,
+                        "the `{arm}` arm sliced to {} bytes, which is not an arm body",
+                        body.len()
+                    );
+                    assert!(body.contains(call), "{why}: {body:?}");
+                }
+                assert_eq!(seen, 2, "control: the loop visited both acting arms");
+                // The account arm dispatches the REQUEST, not a constant. A
+                // literal here would send every menu click to the same action.
+                let dispatch = concat!("Some(request) => ops.account_action(est, deps, ", "request),");
+                assert_eq!(
+                    production.matches(dispatch).count(),
+                    1,
+                    "{dispatch:?} is not in the production code exactly once, so what the \
+                     account branch is handed is not what `account_request` named"
+                );
+                for constant in [
+                    concat!("ops.account_action(est, deps, AccountRequest::", "Add)"),
+                    concat!("ops.account_action(est, deps, AccountRequest::", "Remove)"),
+                ] {
+                    assert!(
+                        !production.contains(constant),
+                        "{constant:?} sends every account request to one action"
+                    );
+                }
+            }
+        }
+
         /// **The write-back may not branch, and this is the guard on the
         /// `continue` itself.**
         ///
@@ -8488,14 +9036,20 @@ mod tests {
             concat!("let follow_up = vault_follow", "_up(&result);").to_string()
         }
 
-        /// The head of the branch that acts on `AccountAction`.
+        /// The head of the arm that acts on `AccountAction`.
+        ///
+        /// **Re-pointed by S3.** The two `if`s these named are one exhaustive
+        /// `match follow_up` now, so "did the loop forget an answer" is the
+        /// compiler's question rather than this file's. What is left for these
+        /// needles is where the arms are and what may jump around them, which
+        /// is what the guards below have always been about.
         fn account_action_branch() -> String {
-            concat!("if follow_up == VaultFollow", "Up::AccountAction {").to_string()
+            concat!("VaultFollow", "Up::AccountAction => {").to_string()
         }
 
-        /// The head of the branch that acts on `Resettle`.
+        /// The head of the arm that acts on `Resettle`.
         fn resettle_branch() -> String {
-            concat!("if follow_up == VaultFollow", "Up::Resettle {").to_string()
+            concat!("VaultFollow", "Up::Resettle => {").to_string()
         }
 
         /// `source` with every comment, every string literal's contents and
@@ -9064,7 +9618,7 @@ mod tests {
 
             // Controls: the slice really is the whole tail, not a prefix of it.
             assert!(
-                tail.len() > 5_000,
+                tail.len() > 1_500,
                 "the tail is {} bytes, which is not the whole loop tail: a scan over it would \
                  pass against nothing",
                 tail.len()
@@ -9072,8 +9626,10 @@ mod tests {
             for marker in [
                 account.as_str(),
                 resettle.as_str(),
-                concat!("resettle_ses", "sion("),
+                concat!("ops.account_", "action("),
+                concat!("ops.resettle_after_lost_", "session("),
                 concat!("persist_pre", "ferences("),
+                concat!("loop_", "step("),
             ] {
                 assert!(
                     tail.contains(marker),
@@ -9094,37 +9650,35 @@ mod tests {
                  dropped"
             );
             assert!(
-                account_body.len() > 1_000 && resettle_body.len() > 500,
-                "a branch body came out at {} / {} bytes -- one of these cuts found the wrong \
+                account_body.len() > 100 && resettle_body.len() > 100,
+                "an arm body came out at {} / {} bytes -- one of these cuts found the wrong \
                  braces",
                 account_body.len(),
                 resettle_body.len()
             );
             assert!(
-                !rest.contains(concat!("resettle_ses", "sion(")),
-                "the recovery call survived both cuts, so a branch body was not actually removed"
+                !rest.contains(concat!("ops.resettle_after_lost_", "session(")),
+                "the recovery call survived both cuts, so an arm body was not actually removed"
             );
 
-            // The exemption, stated as an assertion rather than assumed: the
-            // account branch is allowed its ONE `continue` and nothing else,
-            // and the resettle branch is allowed nothing at all.
-            assert_eq!(
-                jumps_in(&account_body),
-                vec!["continue"],
-                "the account branch's jumps are not the single `continue` it is allowed. A \
-                 second early exit in here skips the reopen it exists to do:\n{account_body}"
-            );
-            assert_eq!(
-                count_word(&account_body, "continue"),
-                1,
-                "the account branch contains more than one `continue`, so one of them is a \
-                 skip rather than the reopen"
+            // **The exemption is GONE, and that is S3 tightening this guard
+            // rather than loosening it.** The account branch used to be allowed
+            // one `continue` -- the reopen. The reopen is `loop_step`'s answer
+            // now, so neither arm is allowed anything: each is one call to
+            // `ops` and neither has a thing to jump over.
+            assert!(
+                jumps_in(&account_body).is_empty(),
+                "the account arm jumps: {:?}. It dispatches one request and falls through to \
+                 `loop_step`, which is the only thing entitled to decide whether the loop goes \
+                 round -- so a jump in here is a reopen or a return written where no test can \
+                 reach it:\n{account_body}",
+                jumps_in(&account_body)
             );
             assert!(
                 jumps_in(&resettle_body).is_empty(),
-                "the lock/re-auth branch jumps: {:?}. It has nothing to jump over -- it falls \
-                 through to the one `return` below it -- so any jump in here is something \
-                 deciding not to re-authenticate:\n{resettle_body}",
+                "the lock/re-auth arm jumps: {:?}. It has nothing to jump over -- it falls \
+                 through to `loop_step` -- so any jump in here is something deciding not to \
+                 re-authenticate:\n{resettle_body}",
                 jumps_in(&resettle_body)
             );
 
@@ -9142,8 +9696,56 @@ mod tests {
             assert_eq!(
                 count_word(&rest, "return"),
                 1,
-                "there is more than one `return` outside the branch bodies, so one of them \
+                "there is more than one `return` outside the arm bodies, so one of them \
                  leaves the loop before the branches have run:\n{rest}"
+            );
+
+            // **There is no `continue` in this loop at all any more, and no
+            // `break` either.** That is what S3 bought: "did anything jump
+            // early", the question six consecutive review rounds were fought
+            // over and that v0.5.0 got wrong, is the compiler's now -- whether
+            // the loop goes round is `loop_step`'s answer and nothing else's.
+            // This is the line that keeps it that way.
+            assert_eq!(
+                count_word(&tail, "continue"),
+                0,
+                "the vault loop has a `continue` again. It is a second, untested decision in \
+                 the one loop this crate has shipped a silent lock failure from:\n{tail}"
+            );
+            assert_eq!(
+                count_word(&tail, "break"),
+                0,
+                "the vault loop breaks out of itself, which leaves `run_vault_loop` without \
+                 running `loop_step`:\n{tail}"
+            );
+            // Control: the counter can see these words when they ARE there, so
+            // the two zeroes above are not zero for the wrong reason.
+            assert_eq!(count_word("if x { continue; } else { break; }", "continue"), 1);
+            assert_eq!(count_word("if x { continue; } else { break; }", "break"), 1);
+
+            // **The three regions behind `ops` are not unguarded either.** Each
+            // is a branch body the loop lifted out whole, so an early exit in
+            // one skips the rest of the very work the loop dispatched it for --
+            // which is the same defect, one call frame further down.
+            let production_code = code_only(super::production_half_of_this_file());
+            let mut methods = 0usize;
+            for name in ["open_window", "resettle_after_lost_session", "account_action"] {
+                let body = super::vault_ops_method_body(&production_code, name);
+                assert!(
+                    body.len() > 150,
+                    "`{name}` sliced to {} bytes, which is not its body",
+                    body.len()
+                );
+                methods += 1;
+                assert!(
+                    jumps_in(&body).is_empty(),
+                    "`RealVaultOps::{name}` jumps with {:?}:\n{body}",
+                    jumps_in(&body)
+                );
+            }
+            assert_eq!(
+                methods, 3,
+                "control: the loop visited every `VaultOps` method"
             );
 
             // The second net. Every override of the decision, wherever it is
@@ -9199,25 +9801,36 @@ mod tests {
         /// every ordering assertion built on this needle would then be
         /// comparing positions in the wrong function.
         fn account_actions_request() -> String {
-            concat!("if follow_up == VaultFollow", "Up::AccountAction {").to_string()
+            concat!("VaultFollow", "Up::AccountAction => {").to_string()
         }
 
-        /// Where `open_vault_window` reads the switcher's answer.
+        /// Where the account branch reads which of the three was asked for.
+        ///
+        /// **Re-pointed by S3, and the re-point is the point.** These used to
+        /// read three separate fields off `VaultWindowResult` -- `switch_to`,
+        /// `add_account`, `remove_account` -- in a chain of `if`s. They are one
+        /// `match` on an `AccountRequest` now, decided by `account_request`,
+        /// which is pure, total, driven by its own tests, and checked against
+        /// `vault_follow_up` for every result shape. The old spellings still
+        /// exist -- inside `account_request` itself, ABOVE this branch -- so
+        /// leaving these needles alone would have sliced that function's body
+        /// instead of the branch, silently, and every ordering assertion built
+        /// on them would have been comparing positions in the wrong item.
         fn switch_request() -> String {
-            concat!("if let Some(target) = result.switch", "_to.clone()").to_string()
+            concat!("AccountRequest::SwitchTo(target)", " => {").to_string()
         }
 
         fn add_request() -> String {
-            concat!("} else if result.add", "_account {").to_string()
+            concat!("AccountRequest::", "Add => {").to_string()
         }
 
         fn remove_request() -> String {
-            concat!("} else if result.remove", "_account {").to_string()
+            concat!("AccountRequest::", "Remove => {").to_string()
         }
 
-        /// Likewise the lock/re-auth branch: `vault_follow_up`'s other answer.
+        /// Likewise the lock/re-auth arm: `vault_follow_up`'s other answer.
         fn lock_recovery() -> String {
-            concat!("if follow_up == VaultFollow", "Up::Resettle {").to_string()
+            concat!("VaultFollow", "Up::Resettle => {").to_string()
         }
 
         /// The body of `head`'s block, depth-counted to its closing brace.
@@ -9268,8 +9881,26 @@ mod tests {
             panic!("the block sliced from {head:?} is never closed");
         }
 
-        fn account_actions_block() -> &'static str {
-            block_after(&account_actions_request())
+        /// **`RealVaultOps::account_action`'s body** -- the switch/add/remove
+        /// branch, which S3 lifted out of the loop whole.
+        ///
+        /// Not the dispatch arm: that is one `match` on `account_request`'s
+        /// answer. Everything the guards below are about -- the one shared
+        /// resettle closure, the three actions it is handed to, the
+        /// confirmation, the persists -- is in the method.
+        fn account_actions_block() -> String {
+            let body = super::vault_ops_method_body(production_half_of_this_file(), "account_action");
+            assert!(
+                body.contains(concat!("let Session", "Estate {")),
+                "the sliced body does not destructure the estate, so it is not the account \
+                 branch: {body:?}"
+            );
+            assert!(
+                body.len() > 5_000,
+                "the account branch sliced to {} bytes, which is not the branch",
+                body.len()
+            );
+            body
         }
 
         fn switch_block() -> &'static str {
@@ -9309,10 +9940,19 @@ mod tests {
                  swallowed by a recovery for the wrong account"
             );
 
-            assert!(
-                account_actions_block().contains("continue;"),
-                "the account actions do not reopen the window, so asking to switch closes the \
-                 vault window for good and the user is left staring at the tray"
+            // **The reopen, re-pointed at the function that now decides it.**
+            // This used to read `continue;` out of the branch body. There is no
+            // `continue` in the loop at all any more -- whether it goes round is
+            // `loop_step`'s answer -- so what is pinned is that answer, in the
+            // source, beside `loop_step_reopens_for_an_account_action_and_returns_
+            // for_everything_else`, which drives the same claim as a value.
+            let reopen = concat!("VaultFollow", "Up::AccountAction => LoopStep::Reopen,");
+            assert_eq!(
+                source.matches(reopen).count(),
+                1,
+                "{reopen:?} is not in the production code exactly once: the account actions do \
+                 not reopen the window, so asking to switch closes the vault window for good \
+                 and the user is left staring at the tray"
             );
         }
 
