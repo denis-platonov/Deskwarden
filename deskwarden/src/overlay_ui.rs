@@ -306,54 +306,89 @@ fn keyboard_action(
     escape: EscapePressed,
     choices: &[FillChoice],
 ) -> OverlayAction {
-    if enter.0 {
+    if enter.pressed() {
         return OverlayAction::Fill(primary_choice(choices));
     }
-    if escape.0 {
+    if escape.pressed() {
         return OverlayAction::Dismiss;
     }
     OverlayAction::None
 }
 
-/// Whether **Enter** was pressed this frame.
+/// The two keyboard facts the overlay acts on, each in a type of its own —
+/// and each obtainable **only by reading its own key**.
 ///
-/// A newtype rather than a `bool`, and the reason is the whole of this
-/// module's second critical finding: `keyboard_action(enter: bool, escape:
-/// bool, ..)` could have its two arguments **swapped** at the one call site
-/// that matters, it would compile, and every test in the crate stayed green —
-/// because that call site lives in `OverlayApp::ui`, which needs an
-/// `eframe::Frame` and a real always-on-top window and can therefore never be
-/// executed here. A swapped pair means **Esc fills the user's password into
-/// the app they just refused.**
+/// This module exists for the whole of the overlay's second critical finding:
+/// `keyboard_action(enter: bool, escape: bool, ..)` could have its two
+/// arguments **swapped** at the one call site that matters, it would compile,
+/// and every test in the crate stayed green — because that call site lives in
+/// `OverlayApp::ui`, which needs an `eframe::Frame` and a real always-on-top
+/// window and can therefore never be executed here. A swapped pair means
+/// **Esc fills the user's password into the app they just refused.**
 ///
-/// [`EnterPressed`] and [`EscapePressed`] are distinct types, so the swap is
-/// now a **type error**: it does not compile, and no test needs to be relied
-/// on to catch it.
+/// Distinct types make `keyboard_action(escape, enter, ..)` a type error.
+/// That alone was not enough, and the review that followed said so: with a
+/// `pub` tuple field the identical bug was one level out and still compiled —
 ///
-/// [`EnterPressed::read`] is where the `egui::Key` literal lives, so the one
-/// remaining way to write the bug — constructing `EnterPressed` from the
-/// *Escape* key — is not at the call site either. It is in a one-line
-/// function that takes an `egui::Context`, which a test **can** build (a bare
-/// context opens no window), and
-/// `each_key_reader_reads_the_key_it_is_named_after` does exactly that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnterPressed(pub bool);
+/// ```text
+/// keyboard_action(EnterPressed(EscapePressed::read(&ctx).0), .., ..)
+/// ```
+///
+/// — so the fields are private to this module, and, because the call site is
+/// in the *parent* module, private is enough to stop it there. `breach.rs`'s
+/// `Prefix`/`BaseUrl` are the model: a newtype whose field anyone may fill is
+/// a door with the frame left out.
+///
+/// The last hole a private field alone leaves is a constructor that takes the
+/// bool anyway — `EnterPressed::new(EscapePressed::read(&ctx).pressed())`.
+/// So **there is no such constructor, not even a `cfg(test)` one.** The only
+/// way to make an `EnterPressed`, in production or in a test, is
+/// [`EnterPressed::read`], which reads `egui::Key::Enter` and nothing else.
+/// Reading one back out is unrestricted; it is *making* one that is closed.
+///
+/// What that leaves is `read` itself asking about the wrong key — one line,
+/// inside a function that takes a bare `egui::Context`, which a test **can**
+/// build without opening a window. `each_key_reader_reads_the_key_it_is_named_after`
+/// covers it, negatives included, and
+/// `the_key_newtypes_cannot_be_built_from_a_bare_bool` pins the shape of this
+/// module so the hole cannot be reopened silently.
+pub mod keys {
+    use eframe::egui;
 
-/// Whether **Escape** was pressed this frame. See [`EnterPressed`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EscapePressed(pub bool);
+    /// Whether **Enter** was pressed this frame. See the module note.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EnterPressed(bool);
 
-impl EnterPressed {
-    fn read(ctx: &egui::Context) -> Self {
-        Self(ctx.input(|i| i.key_pressed(egui::Key::Enter)))
+    /// Whether **Escape** was pressed this frame. See the module note.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EscapePressed(bool);
+
+    impl EnterPressed {
+        /// The only way to obtain one, anywhere in the crate.
+        pub fn read(ctx: &egui::Context) -> Self {
+            Self(ctx.input(|i| i.key_pressed(egui::Key::Enter)))
+        }
+
+        /// Whether Enter was down. Reading is unrestricted.
+        pub fn pressed(self) -> bool {
+            self.0
+        }
+    }
+
+    impl EscapePressed {
+        /// The only way to obtain one, anywhere in the crate.
+        pub fn read(ctx: &egui::Context) -> Self {
+            Self(ctx.input(|i| i.key_pressed(egui::Key::Escape)))
+        }
+
+        /// Whether Escape was down. Reading is unrestricted.
+        pub fn pressed(self) -> bool {
+            self.0
+        }
     }
 }
 
-impl EscapePressed {
-    fn read(ctx: &egui::Context) -> Self {
-        Self(ctx.input(|i| i.key_pressed(egui::Key::Escape)))
-    }
-}
+pub use keys::{EnterPressed, EscapePressed};
 
 /// What the user did to the overlay card on this frame.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -577,8 +612,22 @@ const CHIP_LANE: f32 = 56.0;
 /// **truncated to one line each** inside a text column of an explicit width
 /// ([`CHIP_LANE`]), which makes the row's height a function of the font and
 /// nothing else, and leaves the card at exactly the size it has always been
-/// for every string. `no_string_a_user_can_supply_makes_the_card_taller`
-/// holds that against adversarial fixtures.
+/// for every string.
+///
+/// **Both `.truncate()` calls are load-bearing, and on different paths.**
+/// `secondary` is user-controlled on every path. `primary` is not: with a
+/// non-empty choice list it is [`FillChoice::label`], one of four compile-time
+/// constants, and with an EMPTY one — which is what `draw_overlay_card` and
+/// therefore the whole of production draws today — it is `row_text`'s first
+/// value, i.e. the **username, or the item name when there is none**. That
+/// asymmetry is why the primary's `.truncate()` was inert under test for a
+/// while: every geometry fixture drove the choice-list path, so the top line
+/// was always a constant and removing its bound changed nothing measurable.
+/// The two halves are covered by two tests, deliberately:
+/// `no_string_a_user_can_supply_makes_the_card_taller` (choice rows, hostile
+/// secondary) and
+/// `the_no_choices_card_production_draws_today_bounds_its_user_controlled_top_line`
+/// (no choices, hostile primary).
 ///
 /// `avatar_of` is the text the initials tile is built from, which is NOT
 /// `primary` once a row is labelled by what it will type rather than by whose
@@ -885,11 +934,19 @@ mod geometry_tests {
     /// Wide glyphs: CJK is roughly twice the advance per character, so a name
     /// of unremarkable *length* is a line of unremarkable-looking text that
     /// does not fit.
+    ///
+    /// The `user` is long enough to wrap **on its own**, not merely once it has
+    /// been concatenated into the secondary line. That distinction is the whole
+    /// of the primary label's coverage: the username is what the top line paints
+    /// on the no-choices path production draws today, and an 18-glyph one fits a
+    /// 260pt column at 13pt, so it exercised nothing there. See
+    /// `the_no_choices_card_production_draws_today_bounds_its_user_controlled_top_line`,
+    /// whose control refuses a fixture that would not have wrapped.
     const CJK: Fixture = Fixture {
         name: "CJK",
         app: "銀行口座管理システム.exe",
         item: "銀行口座管理システム本番環境の管理者資格情報エントリ",
-        user: "管理者＠銀行口座管理システム本番環境",
+        user: "銀行口座管理システム本番環境管理者＠銀行口座管理システム.example.co.jp",
     };
 
     /// **Nothing to wrap at.** A word wrapper's escape hatch is a space; a
@@ -1391,14 +1448,14 @@ mod geometry_tests {
         // And through the keyboard, which is the path that actually reaches
         // the user: Enter, not a click, not the card.
         assert_eq!(
-            keyboard_action(EnterPressed(true), EscapePressed(false), &choices),
+            action(true, false, &choices),
             OverlayAction::Fill(FillChoice::Just(FieldRef::Password))
         );
         // And with no choices at all -- the card production still draws --
         // Enter is the fill it has always been.
         assert_eq!(primary_choice(&[]), FillChoice::Saved);
         assert_eq!(
-            keyboard_action(EnterPressed(true), EscapePressed(false), &[]),
+            action(true, false, &[]),
             OverlayAction::Fill(FillChoice::Saved)
         );
     }
@@ -1411,24 +1468,21 @@ mod geometry_tests {
     #[test]
     fn escape_dismisses_and_answers_no_choice() {
         let choices = four_choices();
-        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(true), &choices), OverlayAction::Dismiss);
-        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(true), &[]), OverlayAction::Dismiss);
+        assert_eq!(action(false, true, &choices), OverlayAction::Dismiss);
+        assert_eq!(action(false, true, &[]), OverlayAction::Dismiss);
         // Not a fill of anything, spelled out so a `Fill` variant added later
         // cannot slip past an equality against one particular value.
         assert!(!matches!(
-            keyboard_action(EnterPressed(false), EscapePressed(true), &choices),
+            action(false, true, &choices),
             OverlayAction::Fill(_)
         ));
         // The controls: the instrument does report fills, and reports nothing
         // when nothing was pressed.
-        assert!(matches!(
-            keyboard_action(EnterPressed(true), EscapePressed(false), &choices),
-            OverlayAction::Fill(_)
-        ));
-        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(false), &choices), OverlayAction::None);
+        assert!(matches!(action(true, false, &choices), OverlayAction::Fill(_)));
+        assert_eq!(action(false, false, &choices), OverlayAction::None);
         // Both at once: the fill wins, as it did when these were two `if`s.
         assert_eq!(
-            keyboard_action(EnterPressed(true), EscapePressed(true), &choices),
+            action(true, true, &choices),
             OverlayAction::Fill(choices[0].clone())
         );
     }
@@ -1450,57 +1504,96 @@ mod geometry_tests {
     /// positive-only test.
     #[test]
     fn each_key_reader_reads_the_key_it_is_named_after() {
-        fn frame(key: Option<egui::Key>) -> (EnterPressed, EscapePressed) {
-            let ctx = egui::Context::default();
-            let input = egui::RawInput {
-                events: key
-                    .map(|key| {
-                        vec![egui::Event::Key {
-                            key,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::default(),
-                        }]
-                    })
-                    .unwrap_or_default(),
-                ..sized(overlay_height(1))
-            };
-            let mut seen = (EnterPressed(false), EscapePressed(false));
-            let _ = ctx.run_ui(input, |ui| {
-                let ctx = ui.ctx().clone();
-                seen = (EnterPressed::read(&ctx), EscapePressed::read(&ctx));
-            });
-            seen
+        fn read(keys: &[egui::Key]) -> (bool, bool) {
+            let (enter, escape) = keys_down(keys);
+            (enter.pressed(), escape.pressed())
         }
 
         // Enter down: the Enter reader says yes, the Escape reader says no.
         assert_eq!(
-            frame(Some(egui::Key::Enter)),
-            (EnterPressed(true), EscapePressed(false)),
+            read(&[egui::Key::Enter]),
+            (true, false),
             "the Enter frame was not read as Enter-and-only-Enter; a reader that \
              answers for the other key puts `keyboard_action`'s swapped-argument bug \
              back one level in, where Esc fills the password"
         );
         // Escape down: exactly the mirror.
         assert_eq!(
-            frame(Some(egui::Key::Escape)),
-            (EnterPressed(false), EscapePressed(true)),
+            read(&[egui::Key::Escape]),
+            (false, true),
             "the Escape frame was not read as Escape-and-only-Escape"
         );
         // The control: a frame with no key at all is not read as either, so
         // neither reader can be a constant `true`.
         assert_eq!(
-            frame(None),
-            (EnterPressed(false), EscapePressed(false)),
+            read(&[]),
+            (false, false),
             "a frame carrying no key press was read as one"
         );
         // And a third key is neither, so neither reader can be "any key".
         assert_eq!(
-            frame(Some(egui::Key::Space)),
-            (EnterPressed(false), EscapePressed(false)),
+            read(&[egui::Key::Space]),
+            (false, false),
             "Space was read as Enter or Escape"
         );
+    }
+
+    /// The two key readers, run over one real frame carrying `keys`.
+    ///
+    /// **This is the only way a test can obtain either newtype**, and
+    /// deliberately so. The fields are private to `mod keys` and no
+    /// constructor takes a `bool` — not even a `cfg(test)` one — so a test
+    /// cannot manufacture an `EnterPressed(true)` that production has no way
+    /// to produce, and the re-expression of the key swap that the review
+    /// found (`EnterPressed(EscapePressed::read(&ctx).0)`) is unspellable in
+    /// the test module too. A bare `egui::Context` opens no window and needs
+    /// no `eframe::Frame`.
+    fn keys_down(keys: &[egui::Key]) -> (EnterPressed, EscapePressed) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            events: keys
+                .iter()
+                .map(|&key| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                })
+                .collect(),
+            ..sized(overlay_height(1))
+        };
+        let mut seen = None;
+        let _ = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            seen = Some((EnterPressed::read(&ctx), EscapePressed::read(&ctx)));
+        });
+        seen.expect("the frame body must have run")
+    }
+
+    /// `keyboard_action` driven from a real frame carrying (or not carrying)
+    /// each of the two keys.
+    ///
+    /// The `assert_eq!` is a precondition, not a duplicate of
+    /// `each_key_reader_reads_the_key_it_is_named_after`: without it a frame
+    /// that silently carried no key would make every caller below assert
+    /// against `(false, false)` and pass for the wrong reason.
+    fn action(enter: bool, escape: bool, choices: &[FillChoice]) -> OverlayAction {
+        let mut keys = Vec::new();
+        if enter {
+            keys.push(egui::Key::Enter);
+        }
+        if escape {
+            keys.push(egui::Key::Escape);
+        }
+        let (enter_read, escape_read) = keys_down(&keys);
+        assert_eq!(
+            (enter_read.pressed(), escape_read.pressed()),
+            (enter, escape),
+            "the frame built for enter={enter}, escape={escape} was not read back as that, \
+             so nothing below is testing the case it names"
+        );
+        keyboard_action(enter_read, escape_read, choices)
     }
 
     // ------------------------------------------- the window that is asked for
@@ -2229,5 +2322,306 @@ mod geometry_tests {
         assert!(row_tiles(&out).is_empty());
         solid_out.retain(|i| i.alpha > 0);
         assert_eq!(row_tiles(&solid_out).len(), 1);
+    }
+
+    /// **The top line is user-controlled too — on the path production
+    /// actually draws today — and its `.truncate()` was covered by nothing.**
+    ///
+    /// `no_string_a_user_can_supply_makes_the_card_taller` drives every
+    /// fixture through `four_choices()[..rows]`, and on THAT path
+    /// `credential_row`'s `primary` is `choice.label()`: one of four
+    /// compile-time constants. The user's own strings reached only the
+    /// *secondary* line. So removing `.truncate()` from the primary label
+    /// changed no measurement anywhere in this file, and the row's bound was
+    /// real for a reason other than the one the code claimed.
+    ///
+    /// The empty-choices path is the other one, and it is the one
+    /// `draw_overlay_card` takes — which is the whole of production until a
+    /// choice list is wired through — and the one `OverlayApp` takes whenever
+    /// `choices` is empty. There `primary` is `row_text(..).0`: the
+    /// **username, or the item name when there is no username**. Both
+    /// user-controlled, both on the top line, at 13pt semibold, in a
+    /// frameless always-on-top window with no scrollbar.
+    ///
+    /// Measured the same two ways as its sibling: the card's laid-out height
+    /// in a window far too big to cull or constrain anything, and the row
+    /// tile really painted into the window production asks the OS for --
+    /// counted BEFORE any geometry, because egui culls a shape that lands
+    /// entirely off the screen rect, so a clipped row comes back as nothing
+    /// at all rather than as a rect in the wrong place.
+    #[test]
+    fn the_no_choices_card_production_draws_today_bounds_its_user_controlled_top_line() {
+        /// Far taller than any card, so nothing is culled and no layout is
+        /// constrained -- an overflow is reported, not hidden.
+        const ROOMY: f32 = 900.0;
+        /// A no-choices card paints exactly one row, so it is the one-row
+        /// height, spelled out and not derived from `overlay_height`,
+        /// `CHROME_HEIGHT` or `MEASURED_CHROME`.
+        const NEEDED: f32 = 154.0;
+
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            // The precondition, and it is the half that makes the rest mean
+            // anything: on this path the top line really is the user's own
+            // string. A row that had stopped painting it would pass the
+            // heights below while proving nothing.
+            let (primary, _) = row_text(fixture.app, fixture.item, Some(fixture.user));
+            assert_eq!(
+                primary, fixture.user,
+                "the no-choices row's primary line is no longer the username, so this test \
+                 is no longer about a user-controlled string"
+            );
+
+            // How tall the card lays out, unconstrained.
+            let ctx = styled_ctx();
+            let mut needed = f32::NAN;
+            let _ = ctx.run_ui(sized(ROOMY), |ui| {
+                draw_overlay_card(ui, fixture.app, fixture.item, Some(fixture.user));
+                needed = ui.min_rect().bottom();
+            });
+            assert!(
+                needed.is_finite() && needed > 0.0,
+                "the card allocated no space at all for {:?}",
+                fixture.name
+            );
+            assert_eq!(
+                needed, NEEDED,
+                "the no-choices card drawn with the {:?} fixture needs {needed}pt, not \
+                 {NEEDED}pt. Its TOP line is content-sized again: the username grew the \
+                 row, and the window is a fixed {}pt with no scrollbar, no resize border \
+                 and no title bar, so the difference is gone for good.",
+                fixture.name,
+                overlay_height(1)
+            );
+
+            // ... and in the window production really asks the OS for, the row
+            // and the footer are painted and inside it. Row tiles are COUNTED
+            // first: a row pushed entirely below the screen rect is culled, and
+            // a culled row has no rect to be outside anything.
+            let height = requested_inner_size(1).y;
+            let ink = painted_as(fixture, &[], height);
+            let tiles = row_tiles(&ink);
+            assert_eq!(
+                tiles.len(),
+                1,
+                "the no-choices card ({:?}) in the {height}pt window production asks for \
+                 painted {} row tiles, not one -- the row was culled for being off the \
+                 window entirely",
+                fixture.name,
+                tiles.len()
+            );
+            assert!(
+                fits(tiles[0], window(height)),
+                "the no-choices row for {:?} has its clickable rect at {:?}, outside the \
+                 {height}pt window",
+                fixture.name,
+                tiles[0]
+            );
+            for text in ["Enter Fill", "Esc Dismiss"] {
+                let hits = ink
+                    .iter()
+                    .filter(|i| i.glyphs.as_deref() == Some(text))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "expected exactly one painted run reading {text:?} for {:?}; the footer \
+                     is off the bottom of a window with no scrollbar",
+                    fixture.name
+                );
+                assert!(fits(hits[0].rect, window(height)));
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, FIXTURES.len());
+
+        // THE CONTROL, and it is the load-bearing half -- the one the sibling
+        // test has for its secondary line and nothing had for the primary.
+        // These fixtures must really be strings a wrapping 13pt semibold label
+        // would have wrapped; otherwise four short names pass the loop above
+        // and prove nothing. Laid out at the width the row's text column really
+        // gets, in the font the label really uses, with wrapping ON -- which is
+        // what an untruncated `Label` does inside a `vertical` of a set width.
+        let ctx = styled_ctx();
+        let width = text_column_width();
+        let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        let mut wrapped = 0;
+        for fixture in FIXTURES.iter().filter(|f| f.name != SHORT.name) {
+            let (primary, _) = row_text(fixture.app, fixture.item, Some(fixture.user));
+            let rows_taken = ctx.fonts_mut(|fonts| {
+                fonts
+                    .layout(primary.clone(), font.clone(), theme::INK, width)
+                    .rows
+                    .len()
+            });
+            assert!(
+                rows_taken > 1,
+                "the {:?} fixture's PRIMARY line ({primary:?}) fits on one line at {width}pt \
+                 even when wrapped, so it is not an adversarial fixture for the top label and \
+                 the assertions above prove nothing about it",
+                fixture.name
+            );
+            wrapped += 1;
+        }
+        assert_eq!(wrapped, FIXTURES.len() - 1);
+
+        // ... and the short fixture is the other side of the control: its
+        // username does NOT wrap, which is exactly why measuring off it alone
+        // left the primary label's bound untested.
+        let (short_primary, _) = row_text(SHORT.app, SHORT.item, Some(SHORT.user));
+        assert_eq!(
+            ctx.fonts_mut(|fonts| fonts
+                .layout(short_primary, font, theme::INK, width)
+                .rows
+                .len()),
+            1
+        );
+    }
+
+    /// **The key newtypes cannot be built out of a bare `bool`, by anyone.**
+    ///
+    /// `breach.rs`'s `Prefix`/`BaseUrl` are pinned this way and these were
+    /// not, which is the whole of the second finding: `pub struct
+    /// EnterPressed(pub bool)` made the swap re-expressible one level out as
+    /// `EnterPressed(EscapePressed::read(&ctx).0)`, in the one function no
+    /// test may execute. The type error was real and the door still opened.
+    ///
+    /// Three independent facts, because each alone goes blind:
+    ///
+    /// 1. **The declarations**, spelled out. A `pub` on either tuple field
+    ///    reopens the hole exactly.
+    /// 2. **No `bool` goes IN.** `: bool` anywhere in `mod keys` is a
+    ///    constructor (or a setter) taking the thing the type exists to stop
+    ///    callers choosing -- `pub fn new(pressed: bool)` passes fact 1 and
+    ///    fact 3 and reopens the hole through the front door.
+    /// 3. **The module's whole inventory**: four functions, two `Self(..)`
+    ///    constructions. Anything else in here is something new that has not
+    ///    been argued for.
+    ///
+    /// Plus a whole-file count: the tuple-struct call syntax appears exactly
+    /// twice in the file, at the two declarations, so nothing anywhere --
+    /// production or test -- constructs one positionally.
+    #[test]
+    fn the_key_newtypes_cannot_be_built_from_a_bare_bool() {
+        let production = this_module_production_code();
+        let keys = keys_module_source();
+
+        for decl in [
+            concat!("pub struct EnterPres", "sed(bool);"),
+            concat!("pub struct EscapePres", "sed(bool);"),
+        ] {
+            assert!(
+                keys.contains(decl),
+                "the declaration is no longer {decl:?}. A `pub` on the tuple field lets any \
+                 call site build an EnterPressed out of the Escape key, which is the swap \
+                 this pair exists to forbid, spelled one level out"
+            );
+        }
+        assert!(
+            !keys.contains(": bool"),
+            "something in `mod keys` takes a `bool` argument. A constructor that accepts the \
+             flag is the private field handed back: `EnterPressed::new(EscapePressed::read(\
+             &ctx).pressed())` compiles and is the original bug"
+        );
+        assert_eq!(
+            keys.matches("fn ").count(),
+            4,
+            "`mod keys` no longer has exactly its four functions (two `read`, two \
+             `pressed`); its source is:\n{keys}"
+        );
+        assert_eq!(
+            keys.matches("Self(").count(),
+            2,
+            "`mod keys` constructs one of its newtypes somewhere other than the two \
+             `read` bodies"
+        );
+        // Positive controls: the needles match live text rather than nothing.
+        assert!(keys.contains("egui::Key::Enter"));
+        assert!(keys.contains("egui::Key::Escape"));
+        assert!(
+            production.contains(concat!("pub use keys::{EnterPres", "sed, EscapePressed};")),
+            "the two types are no longer re-exported from this module"
+        );
+
+        // And nothing, anywhere in the file, builds one positionally.
+        let whole = non_comment(&this_module_source());
+        for name in [
+            concat!("EnterPres", "sed("),
+            concat!("EscapePres", "sed("),
+        ] {
+            assert_eq!(
+                whole.matches(name).count(),
+                1,
+                "{name:?} occurs {} times in this file; the only expected occurrence is the \
+                 declaration. A construction anywhere else means the field is reachable",
+                whole.matches(name).count()
+            );
+        }
+    }
+
+    /// This module's own source, read off disk.
+    fn this_module_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/overlay_ui.rs"))
+            .expect("overlay_ui.rs is readable")
+    }
+
+    /// `source` with comment-only lines dropped.
+    ///
+    /// The doc comments in this file *spell out* the very constructions the
+    /// guards forbid, so a guard that scanned them would fire on its own
+    /// explanation.
+    fn non_comment(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !(t.starts_with("//") || t.starts_with("//!"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// This module's **production code**: everything above the first test
+    /// module, comment-only lines dropped.
+    ///
+    /// The cut is `mod tests {` rather than `#[cfg(test)]`, because `mod keys`
+    /// sits above it and a `cfg(test)` attribute added inside `keys` would
+    /// otherwise move the cut and hide the very thing being pinned.
+    fn this_module_production_code() -> String {
+        let source = this_module_source();
+        let end = source
+            .find("mod tests {")
+            .expect("overlay_ui.rs has a `mod tests`");
+        // Control: the cut kept the production items and dropped the tests.
+        let production = non_comment(&source[..end]);
+        assert!(
+            production.contains("fn credential_row("),
+            "the production slice lost `credential_row`, so the cut is in the wrong place"
+        );
+        assert!(
+            !production.contains("fn row_leads_with_the_username_when_known"),
+            "the production slice still contains test code"
+        );
+        // There is no production item below the test modules; if one is ever
+        // added, this guard would go blind to it, so say so out loud.
+        let tail = &source[end..];
+        assert!(
+            !tail.contains("\r\npub fn ") && !tail.contains("\r\npub const "),
+            "a production item was added BELOW the test modules, where every source guard \
+             in this file is blind to it"
+        );
+        production
+    }
+
+    /// The text of `mod keys`, comment-only lines dropped: from its `pub mod`
+    /// line to the first column-zero `}` after it.
+    fn keys_module_source() -> String {
+        let production = this_module_production_code();
+        let start = production
+            .find("pub mod keys {")
+            .expect("overlay_ui.rs has a `mod keys`");
+        let rest = &production[start..];
+        let end = rest.find("\n}").expect("`mod keys` is closed at column zero");
+        rest[..end].to_string()
     }
 }
