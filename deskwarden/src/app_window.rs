@@ -170,6 +170,17 @@ pub enum Event {
     /// `recover_from_failed_vault_wait`, which is why this is `Close` rather
     /// than a fourth stage that apologises.
     WorkFailed,
+    /// **The vault reported a lost session** -- the Lock button, CTRL+L, the
+    /// auto-lock timer, or a write that came back 401. The window does NOT go
+    /// away for it: it shows the spinner while the teardown runs, which is the
+    /// whole of the in-window lock. Caught as a refused close, because all
+    /// three lock routes ask for one themselves.
+    Locked,
+    /// **The teardown reached the point only this thread can pass**: the old
+    /// session is gone and the next step is a master password. The window
+    /// shows the sign-in card, in place, instead of `main::reauthenticate`
+    /// opening one of its own.
+    TeardownDone,
 }
 
 /// Where an event leaves the window.
@@ -197,6 +208,8 @@ pub fn advance(stage: Stage, event: Event) -> Next {
         (Stage::SignIn, Event::SignedIn) => Next::Show(Stage::Working),
         (Stage::Working, Event::WorkReady) => Next::Show(Stage::Vault),
         (Stage::Working, Event::WorkFailed) => Next::Close,
+        (Stage::Vault, Event::Locked) => Next::Show(Stage::Working),
+        (Stage::Working, Event::TeardownDone) => Next::Show(Stage::SignIn),
         (stage, _) => Next::Show(stage),
     }
 }
@@ -444,6 +457,48 @@ pub struct StartupOutcome<P> {
     pub stages: Vec<Stage>,
 }
 
+/// **The one place this module puts an OS window on the screen**, and the one
+/// place it asks for the foreground.
+///
+/// Both hosts go through it, and that is load-bearing rather than tidy.
+/// `foreground::tests::every_window_this_crate_opens_asks_to_be_brought_to_the_front`
+/// counts this file's eframe-launch sites and the raise calls beside them and
+/// requires them to be one apiece -- a claim worth making only while there
+/// really is one site. **Neither needle is spelled out in this doc**: that test
+/// counts over the raw source, so a comment naming what it looks for would
+/// inflate its count and it would be guarding its own prose.
+/// A second host with its own copy of this block would have been a second
+/// window-opening site, a second first-frame styling pass, and a second chance
+/// to forget the raise; `app_window` would have had to be relisted as opening
+/// two windows, which is the strictly weaker statement.
+///
+/// **The first frame draws nothing.** egui applies a new font set at the START
+/// of the next frame, not the one that calls `set_fonts` -- drawing
+/// Archivo-styled text in this same frame would look up a family that does not
+/// exist yet and panic. The OS window does exist by this first painted frame
+/// (the same hook `round_window_corners` uses), which is why the raise is here
+/// and why both sub-frames are built `pre_styled`: a vault frame raising the
+/// window again would yank forward a window the user may have deliberately
+/// sent behind something while `bw serve` started.
+fn run_the_one_window(
+    options: eframe::NativeOptions,
+    mut draw: impl FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static,
+) {
+    let mut styled = false;
+    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
+        if !styled {
+            theme::paint_window_background(ui);
+            theme::apply(ui.ctx());
+            login_ui::round_window_corners(WINDOW_TITLE);
+            let _ = foreground::raise_window(WINDOW_TITLE);
+            styled = true;
+            ui.ctx().request_repaint();
+            return;
+        }
+        draw(ui, frame);
+    });
+}
+
 /// Runs the single window. Blocks until it closes.
 ///
 /// `prepare` runs on a detached worker thread with the session token, and is
@@ -542,7 +597,6 @@ where
     let mut build_vault = Some(build_vault);
     let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
     let mut stage = Stage::SignIn;
-    let mut styled = false;
     // When sign-in was accepted. The span from here to the first vault frame is
     // the number this change is judged by -- everything the user experiences as
     // "and then it took a while" -- and it is not visible from either end
@@ -566,28 +620,7 @@ where
     // call. See the type's own doc.
     let mut closing = Closing::not_yet();
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
-        if !styled {
-            // egui applies a new font set at the *start* of the next frame, not
-            // the one that calls set_fonts -- drawing Archivo-styled text in
-            // this same frame would look up a family that doesn't exist yet and
-            // panic. Skip drawing this frame; the real UI starts on the next
-            // one, once the fonts are actually live.
-            theme::paint_window_background(ui);
-            theme::apply(ui.ctx());
-            login_ui::round_window_corners(WINDOW_TITLE);
-            // The OS window exists by this first painted frame (the same hook
-            // `round_window_corners` uses), and this is where it is brought to
-            // the front. Done ONCE, here, for all three stages -- which is why
-            // both sub-frames are built `pre_styled`: a vault frame raising the
-            // window again would yank forward a window the user may have
-            // deliberately sent behind something while `bw serve` started.
-            let _ = foreground::raise_window(WINDOW_TITLE);
-            styled = true;
-            ui.ctx().request_repaint();
-            return;
-        }
-
+    run_the_one_window(options, move |ui, frame| {
         // Recorded on the frame the stage is actually PAINTED, not on the frame
         // the transition is decided, and deduplicated so this is a list of
         // stages rather than a list of frames. See `StartupOutcome::stages`:
@@ -786,6 +819,377 @@ where
     StartupOutcome { token, prepared, vault, stages }
 }
 
+/// What the spinner says while a lock's teardown runs.
+///
+/// The file's voice: `main`'s `SETUP_MESSAGE` is "Setting up your vault...".
+/// The message the stage shows CHANGES mid-stage on this host -- the teardown
+/// and the post-sign-in repopulate are both `Stage::Working` -- which is why
+/// this host holds a `working_message` local rather than taking one
+/// `&'static str` parameter the way [`run`] does.
+pub const LOCK_MESSAGE: &str = "Locking your vault...";
+
+/// What a close arriving while the vault is up MEANS.
+///
+/// A value and a pure function rather than a condition inside the frame
+/// closure, because the ordinary close-to-tray gesture and the lock arrive by
+/// exactly the same route -- `ViewportCommand::Close` -- and the difference
+/// between them is one flag. Getting it backwards either strands the user in a
+/// window they cannot leave, or reinstates the blink this whole feature exists
+/// to remove, and neither is visible from a closure no test can call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultClose {
+    /// Nothing asked to close. The commonest answer by far -- it is what every
+    /// frame that is merely being drawn gets.
+    Ignore,
+    /// The vault reported a lost session, so this close IS the lock. The
+    /// window stays and the teardown starts behind a spinner.
+    Lock,
+    /// An ordinary close: the ✕, or a Preferences/switch outcome that closes
+    /// and is handled by the caller. It is honoured.
+    LetGo,
+}
+
+/// [`VaultClose`], whole.
+///
+/// `lost_session` is the vault frame's own `locked || needs_reauth` --
+/// [`vault_window::VaultFrameHandles::lost_session`] -- which is the same
+/// disjunction `main`'s `vault_follow_up` reads, so the 401 recovery shares
+/// this path by construction rather than by a second condition that could
+/// drift from it.
+pub fn vault_close(close_requested: bool, lost_session: bool) -> VaultClose {
+    match (close_requested, lost_session) {
+        (false, _) => VaultClose::Ignore,
+        (true, true) => VaultClose::Lock,
+        (true, false) => VaultClose::LetGo,
+    }
+}
+
+/// How far the teardown worker has got.
+///
+/// Two messages and not one, because the sequence has a hole in the middle
+/// that only this thread can fill: the old session is stopped and the cache is
+/// cleared BEFORE anything authenticates, and authenticating means a master
+/// password, and a master password means a window. The worker therefore stops
+/// and says so, the host shows the sign-in card in the window that is already
+/// open, and the token goes back down a channel. That round trip is what
+/// replaces `main::reauthenticate`'s own eframe window on this path -- which
+/// is the second half of "it should never reload different windows".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownStep {
+    /// The old session is gone and the worker is blocked on the token
+    /// channel. Show the card.
+    NeedsSignIn,
+    /// The whole sequence is over. Whatever state it left is the state the
+    /// caller reads back out of its own park.
+    Finished,
+}
+
+/// What one `run_from_vault` session produced.
+pub struct VaultSessionOutcome {
+    /// The outcome cells of whichever vault frame was up when the session
+    /// ended -- read through `finish`, so the geometry write happens exactly
+    /// as it does on every other vault path.
+    ///
+    /// **A lock's cells are read at the moment of the lock**, not at the end:
+    /// the frame that reported `locked` is torn down and replaced, and its
+    /// `edited_settings` (a visit to the gear earlier in the same session)
+    /// would otherwise be lost. `None` only if the window ended with no vault
+    /// frame at all, which is the failed-repopulate path.
+    pub result: Option<vault_window::VaultWindowResult>,
+    /// Every stage the window actually PAINTED, in order. Same evidence
+    /// [`StartupOutcome::stages`] is, and for the same reason: "the table is
+    /// right" and "the window ever got there" are different claims.
+    pub stages: Vec<Stage>,
+    /// Whether a lock was caught here and handled IN THIS WINDOW.
+    ///
+    /// The caller's dispatch turns on it: `true` means the teardown has
+    /// already run, so running the caller's own lock recovery on top would be
+    /// a second teardown of a session that no longer exists. `false` on an
+    /// ordinary close means the caller's dispatch is untouched.
+    pub relocked: bool,
+}
+
+/// **The second host: a vault session that survives its own lock.**
+///
+/// [`run`] is the STARTUP host -- sign-in, spinner, vault. This one starts at
+/// the vault and runs the same machine backwards: vault, spinner, sign-in
+/// card, spinner, vault again. One `advance`, two hosts; the alternative --
+/// a lock-specific state machine of its own -- is a second machine, and this
+/// crate's ledger is a list of what a second copy of a hardened sequence
+/// costs.
+///
+/// It lives in THIS module and not in `main` because the pieces it is built
+/// from are this module's: [`close_this_window`],
+/// [`refuse_close_while_working`], [`give_up_working`], [`poll_working`],
+/// [`WORKING_DEADLINE`] and `Closing` -- whose constructor is private
+/// precisely so a second host cannot start the working stage on "already
+/// decided" and ship a spinner that spins forever behind a ghosted ✕.
+///
+/// `teardown` runs on a detached worker thread and is everything the lock
+/// means: drain the in-flight backend operation, stop `bw serve`, clear the
+/// cache, authenticate, start a fresh backend, repopulate, rebuild the match
+/// engine. It gets the token channel's receiving end and a sender to report
+/// its two steps on; like [`run`]'s `prepare` it must be `Send + 'static`,
+/// which is why the caller lifts the tray out of it rather than passing one.
+///
+/// `build_sign_in` and `rebuild_vault` both run on THIS thread. They are
+/// closures rather than parameters because both are lazy on purpose:
+/// `login_ui::build_login_frame` spawns a `bw status` of its own, and a vault
+/// session that pays for one on every open -- when the overwhelmingly common
+/// outcome is an ordinary close -- would be a regression measured in seconds
+/// on every single click.
+pub fn run_from_vault<T, S, B>(
+    vault: (
+        eframe::NativeOptions,
+        vault_window::VaultFrameFn,
+        vault_window::VaultFrameHandles,
+    ),
+    after_sign_in_message: &'static str,
+    teardown: T,
+    build_sign_in: S,
+    rebuild_vault: B,
+) -> VaultSessionOutcome
+where
+    T: FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
+    S: FnOnce() -> (login_ui::LoginFrameFn, login_ui::LoginFrameHandles) + 'static,
+    B: FnOnce() -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)> + 'static,
+{
+    let (options, vault_frame, handles) = vault;
+
+    // Read back after the event loop returns, for the same reason every window
+    // in this crate uses `Rc<RefCell<_>>`: the update closure is
+    // `FnMut + 'static` and cannot hand anything back, and eframe runs it on
+    // this thread, which is blocked inside `run_ui_native` throughout.
+    let result: Rc<RefCell<Option<vault_window::VaultWindowResult>>> = Rc::new(RefCell::new(None));
+    let stages: Rc<RefCell<Vec<Stage>>> = Rc::new(RefCell::new(Vec::new()));
+    let relocked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+
+    let result_for_closure = result.clone();
+    let stages_for_closure = stages.clone();
+    let relocked_for_closure = relocked.clone();
+
+    // **The worker gets the only sender, exactly as `run`'s does.** Cloned
+    // into the thread instead, the closure would hold a sender that never
+    // sends and never drops, so a worker that panicked mid-teardown would
+    // answer `Empty` forever -- and the working stage refuses every close.
+    // `try_recv` says `Disconnected` only because this side keeps nothing.
+    let (step_tx, step_rx) = mpsc::channel::<TeardownStep>();
+    let mut step_tx = Some(step_tx);
+    // The other direction: the master password the card produces. Held in an
+    // `Option` so that LEAVING the sign-in card without a token drops it --
+    // the worker's own `recv` then fails, which is how a user who closes the
+    // window on the card reaches `resettle_session_with`'s declined arm
+    // instead of blocking a thread on a password that is never coming.
+    let (token_tx, token_rx) = mpsc::channel::<String>();
+    let mut token_tx = Some(token_tx);
+    let mut token_rx = Some(token_rx);
+
+    let mut teardown = Some(teardown);
+    let mut build_sign_in = Some(build_sign_in);
+    let mut rebuild_vault = Some(rebuild_vault);
+
+    let mut vault_fn: Option<vault_window::VaultFrameFn> = Some(vault_frame);
+    // The HANDLES, not the frame, in a cell: the frame is `FnMut` and stays
+    // owned by the closure, while `finish` -- the geometry write and the
+    // outcome read -- has to be callable out here, after the window is gone.
+    // Exactly the split [`run`] makes, and for the same reason.
+    let vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>> =
+        Rc::new(RefCell::new(Some(handles)));
+    let vault_handles_for_closure = vault_handles.clone();
+    let mut login: Option<(login_ui::LoginFrameFn, login_ui::LoginFrameHandles)> = None;
+
+    let mut stage = Stage::Vault;
+    // The message the spinner shows. A LOCAL and not a parameter, because it
+    // changes mid-stage: the teardown and the post-sign-in repopulate are the
+    // same `Stage::Working`. See [`LOCK_MESSAGE`].
+    let mut working_message: &'static str = LOCK_MESSAGE;
+    // Restarted on every ENTRY to the working stage, not once. The stage is
+    // entered twice on the lock path, and a stopwatch started at the first
+    // entry would charge the repopulate for however long the user spent typing
+    // their master password -- a deadline that fires while the backend is
+    // healthily coming up, which throws away the sign-in that just happened.
+    let mut working_since: Option<Instant> = None;
+    let mut closing = Closing::not_yet();
+
+    run_the_one_window(options, move |ui, frame| {
+        if stages_for_closure.borrow().last() != Some(&stage) {
+            stages_for_closure.borrow_mut().push(stage);
+            log::info!("vault window: showing {stage:?}");
+        }
+
+        match stage {
+            Stage::Vault => {
+                if let Some(vault_fn) = vault_fn.as_mut() {
+                    vault_fn(ui, frame);
+                }
+                // **The lock catch.** The vault frame asks for the close
+                // itself on all three lock routes (the account menu's Lock,
+                // CTRL+L, and the auto-lock timer), so the lock arrives here
+                // as a close with the flag already set -- which is why no lock
+                // site needed editing for this feature.
+                let lost = vault_handles_for_closure
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|h| h.lost_session());
+                match vault_close(ui.ctx().input(|i| i.viewport().close_requested()), lost) {
+                    // Nothing to do, and deliberately spelled out rather than
+                    // folded into a `_`: "no close" and "a close we honour"
+                    // are the two answers that must NOT keep the window, and a
+                    // wildcard here would swallow a fourth answer added later.
+                    VaultClose::Ignore | VaultClose::LetGo => {}
+                    VaultClose::Lock => {
+                        // The window's own exit, cancelled. Without this the
+                        // vault frame's `ViewportCommand::Close` is honoured
+                        // and the window goes -- which is the blink.
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        // **This vault session ends here**, the way every
+                        // vault session ends: `finish` persists the geometry
+                        // and reads the outcome cells. Read NOW, because the
+                        // frame that reported the lock is about to be dropped
+                        // and replaced -- and its `edited_settings` is a visit
+                        // to the gear that would otherwise be silently lost.
+                        let ended = vault_handles_for_closure.borrow_mut().take();
+                        if let Some(handles) = ended {
+                            *result_for_closure.borrow_mut() = Some(handles.finish());
+                        }
+                        vault_fn = None;
+                        *relocked_for_closure.borrow_mut() = true;
+                        // THE TEARDOWN GOES TO A THREAD, for the reason
+                        // `run`'s `prepare` does: it stops and restarts
+                        // `bw serve`, which is seconds at best, and run here
+                        // it would freeze the window on the very frame that is
+                        // supposed to start showing the spinner.
+                        if let (Some(teardown), Some(step_tx), Some(token_rx)) =
+                            (teardown.take(), step_tx.take(), token_rx.take())
+                        {
+                            std::thread::spawn(move || {
+                                let step_tx = step_tx;
+                                teardown(&step_tx, token_rx);
+                            });
+                        }
+                        if let Next::Show(next) = advance(stage, Event::Locked) {
+                            stage = next;
+                            if next == Stage::Working {
+                                working_message = LOCK_MESSAGE;
+                                working_since = Some(Instant::now());
+                            }
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+            Stage::SignIn => {
+                if login.is_none() {
+                    if let Some(build) = build_sign_in.take() {
+                        login = Some(build());
+                    }
+                }
+                if let Some((login_fn, login_handles)) = login.as_mut() {
+                    login_fn(ui, frame);
+                    if let Some(produced) = login_handles.take_token() {
+                        // Down the channel the worker is blocked on. It is the
+                        // worker that authenticates and starts the backend --
+                        // this thread only ever draws.
+                        if let Some(token_tx) = token_tx.as_ref() {
+                            let _ = token_tx.send(produced);
+                        }
+                        if let Next::Show(next) = advance(stage, Event::SignedIn) {
+                            stage = next;
+                            if next == Stage::Working {
+                                working_message = after_sign_in_message;
+                                working_since = Some(Instant::now());
+                            }
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+            Stage::Working => {
+                match loading_ui::draw_spinner_body(
+                    ui,
+                    working_message,
+                    login_ui::CloseControl::Disabled,
+                ) {
+                    login_ui::ChromeAction::Minimize => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    login_ui::ChromeAction::Close | login_ui::ChromeAction::None => {}
+                }
+
+                refuse_close_while_working(ui.ctx(), closing);
+
+                if !closing.decided() {
+                    match step_rx.try_recv() {
+                        Ok(TeardownStep::NeedsSignIn) => {
+                            log::info!(
+                                "the lock's teardown is done and the vault needs a master \
+                                 password; showing the sign-in card in the window that is \
+                                 already open"
+                            );
+                            if let Next::Show(next) = advance(stage, Event::TeardownDone) {
+                                stage = next;
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                        Ok(TeardownStep::Finished) => {
+                            // Dropped here rather than left alive for the rest
+                            // of the window: the worker is finished, and a
+                            // sender this side keeps would stop the channel
+                            // ever reporting `Disconnected` again.
+                            token_tx = None;
+                            let built = rebuild_vault.take().and_then(|build| build());
+                            let event = match built {
+                                Some((rebuilt, handles)) => {
+                                    vault_fn = Some(rebuilt);
+                                    *vault_handles_for_closure.borrow_mut() = Some(handles);
+                                    Event::WorkReady
+                                }
+                                None => Event::WorkFailed,
+                            };
+                            match advance(stage, event) {
+                                Next::Show(next) => stage = next,
+                                Next::Close => {
+                                    log::warn!(
+                                        "the lock's recovery produced no vault to show; \
+                                         closing so the caller's own recovery can run"
+                                    );
+                                    close_this_window(ui.ctx(), &mut closing);
+                                }
+                            }
+                            ui.ctx().request_repaint();
+                        }
+                        Err(err) => {
+                            let elapsed = working_since.map_or(Duration::ZERO, |at| at.elapsed());
+                            match poll_working(err, elapsed) {
+                                WorkPoll::KeepWaiting => {
+                                    ui.ctx().request_repaint_after(WORKING_POLL)
+                                }
+                                WorkPoll::Failed(why) => {
+                                    give_up_working(ui.ctx(), &mut closing, why, elapsed);
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // The vault frame that is still up when the window ends -- an ordinary
+    // close, or the one rebuilt after a lock -- ends the way every vault
+    // session ends. The lock's own `finish` above already wrote a result; this
+    // one overwrites it, which is right: it is the LATER session, and its
+    // geometry and its cells are the ones the user left behind.
+    if let Some(handles) = vault_handles.borrow().as_ref() {
+        *result.borrow_mut() = Some(handles.finish());
+    }
+    let stages = stages.borrow().clone();
+    let relocked = *relocked.borrow();
+    let result = result.borrow_mut().take();
+    VaultSessionOutcome { result, stages, relocked }
+}
+
 #[cfg(test)]
 mod transition_tests {
     use super::*;
@@ -845,34 +1249,16 @@ mod transition_tests {
         );
     }
 
-    /// The pairs that cannot happen are no-ops, not moves. Without this, a
-    /// stray `WorkReady` arriving while the card is up -- a worker from an
-    /// abandoned attempt, say -- would jump straight to a vault stage whose
-    /// frame was never built, and the `Vault` arm draws nothing at all in that
-    /// case: a blank window.
-    #[test]
-    fn an_event_that_does_not_belong_to_the_current_stage_moves_nothing() {
-        for (stage, event) in [
-            (Stage::SignIn, Event::WorkReady),
-            (Stage::SignIn, Event::WorkFailed),
-            (Stage::Working, Event::SignedIn),
-            (Stage::Vault, Event::SignedIn),
-            (Stage::Vault, Event::WorkReady),
-            (Stage::Vault, Event::WorkFailed),
-        ] {
-            assert_eq!(
-                advance(stage, event),
-                Next::Show(stage),
-                "{event:?} moved the window away from {stage:?}"
-            );
-        }
-        // Positive control on the same comparison: it can tell a move from a
-        // stay, so the six assertions above are not all trivially true.
-        assert_ne!(
-            advance(Stage::SignIn, Event::SignedIn),
-            Next::Show(Stage::SignIn)
-        );
-    }
+    // The hand-written list of refused pairs that used to be here is now the
+    // exhaustive walk in `lock_transition_tests::
+    // an_event_that_does_not_belong_to_the_current_stage_moves_nothing`. Two
+    // new events took it from six entries to ten, and a hand-written ten is a
+    // list the next event silently under-counts -- so it is derived from the
+    // two variant lists and the one list of moves instead, with a count
+    // control that fails if either variant list loses a member.
+    //
+    // The positive control that used to sit at the bottom of it -- that the
+    // comparison can tell a move from a stay -- moved with it.
 }
 
 /// The working stage's watchdog, decided away from the frame closure so it can
@@ -1443,7 +1829,7 @@ mod startup_window_tests {
     /// with a test module at all. The region below the cut is held instead by
     /// `nothing_but_gated_test_modules_lives_below_the_guards_cut`, which
     /// walks it in full and requires it to be test modules and nothing else.
-    fn production() -> &'static str {
+    pub(super) fn production() -> &'static str {
         let source = source();
         let end = source
             .find(concat!("#[cfg(", "test)]"))
@@ -1477,7 +1863,7 @@ mod startup_window_tests {
     /// negative guards entirely. Stripping first means a comment cannot be a
     /// bound at all, and the length checks below catch anything else that
     /// shortens one.
-    fn code(source: &str) -> String {
+    pub(super) fn code(source: &str) -> String {
         source
             .lines()
             .map(|line| match line.find("//") {
@@ -1492,13 +1878,30 @@ mod startup_window_tests {
     /// already stripped.
     fn closure() -> String {
         let production = code(production());
+        // **Anchored on the host, not on the eframe call.** Both hosts hand
+        // their closure to `run_the_one_window` now -- there is exactly one
+        // eframe-launch site in this file and it is in there -- so
+        // the old anchor would land in the shared opener and every guard below
+        // would be a statement about eight lines of styling. See
+        // `both_hosts_go_through_the_one_window_opener`, which is what now
+        // holds the fact the old anchor incidentally held.
         let at = production
-            .find(concat!("run_ui_", "native(WINDOW_TITLE, options, move |ui, frame|"))
+            .find(concat!("pub fn ", "run<P, W, V>("))
             .expect(
-                "no frame closure in this file -- if `run` stopped opening a window, the \
-                 single-window startup is gone entirely",
+                "no startup host in this file -- if `run` is gone, the single-window startup \
+                 is gone entirely",
             );
-        let closure = production[at..].to_string();
+        let rest = &production[at..];
+        // **Bounded forward at the second host**, not run to the end of
+        // production. `run_from_vault` has a `Stage::Working` arm of its own;
+        // left unbounded, `working_arm` below would still cut at THIS host's
+        // arms (they come first) but every `contains` here would be satisfied
+        // by either host -- so deleting the startup host's spinner call would
+        // leave this file green on the strength of the lock host's.
+        let closure = match rest.find(concat!("pub fn run_from_", "vault<")) {
+            Some(end) => rest[..end].to_string(),
+            None => rest.to_string(),
+        };
         assert!(
             closure.len() > 4_000,
             "the frame closure sliced down to {} bytes, which is not the whole of it -- the \
@@ -1919,7 +2322,7 @@ mod startup_window_tests {
         //    still reach the LAST production item in the file. If the marker
         //    were matched earlier than the real test modules, this anchor
         //    would fall below the cut instead of just above it.
-        const LAST_PRODUCTION_ITEM: &str = concat!("StartupOutcome { token, prepared, ", "vault, stages }");
+        const LAST_PRODUCTION_ITEM: &str = concat!("VaultSessionOutcome { result, ", "stages, relocked }");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,
@@ -2007,7 +2410,7 @@ mod startup_window_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 4,
+            modules, 6,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -2024,5 +2427,431 @@ mod startup_window_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+/// The lock catch, and the two events the in-window lock added to the table.
+///
+/// Every test here is about a window the user asked to LOCK. The failure this
+/// whole feature exists to remove is the window going away and coming back --
+/// the blink -- and the failure it must not introduce instead is a window that
+/// refuses an ordinary close, which is the same gesture arriving with one flag
+/// down.
+#[cfg(test)]
+mod lock_transition_tests {
+    use super::*;
+
+    /// Every stage, in the order the enum declares them. Written out rather
+    /// than derived, and held to that by `every_stage_and_event_is_in_the_walk`
+    /// below -- a `strum`-free crate has no way to iterate a `Copy` enum, and a
+    /// list that silently missed a variant would vacate the exhaustive table.
+    const ALL_STAGES: &[Stage] = &[Stage::SignIn, Stage::Working, Stage::Vault];
+
+    /// Every event, likewise.
+    const ALL_EVENTS: &[Event] = &[
+        Event::SignedIn,
+        Event::WorkReady,
+        Event::WorkFailed,
+        Event::Locked,
+        Event::TeardownDone,
+    ];
+
+    /// The pairs that MOVE, spelled out with what they move to, so a rewritten
+    /// `advance` cannot be checked against itself.
+    const LEGAL: &[(Stage, Event, Next)] = &[
+        (Stage::SignIn, Event::SignedIn, Next::Show(Stage::Working)),
+        (Stage::Working, Event::WorkReady, Next::Show(Stage::Vault)),
+        (Stage::Working, Event::WorkFailed, Next::Close),
+        (Stage::Vault, Event::Locked, Next::Show(Stage::Working)),
+        (Stage::Working, Event::TeardownDone, Next::Show(Stage::SignIn)),
+    ];
+
+    /// **The two new rows, as the behaviour they buy.**
+    ///
+    /// `(Vault, Locked)` is the whole feature: a lock that leaves the vault
+    /// stage for the spinner *in the same window*. Answering `Next::Close`
+    /// here is the shipped bug -- the window is torn down and `main` opens
+    /// another one, which is the blink the report is about.
+    ///
+    /// `(Working, TeardownDone)` is the half that makes the first one
+    /// survivable: without it the spinner has nowhere to go once the old
+    /// session is gone, and the stage sits there until `WORKING_DEADLINE`
+    /// gives up on a worker that is not late but waiting -- for a master
+    /// password nobody is being asked for.
+    #[test]
+    fn a_lock_moves_the_vault_to_the_spinner_and_the_teardown_moves_it_to_the_card() {
+        assert_eq!(
+            advance(Stage::Vault, Event::Locked),
+            Next::Show(Stage::Working),
+            "a lock does not move the vault stage to the spinner, so the window is torn down \
+             and reopened -- the blink this feature exists to remove"
+        );
+        assert_eq!(
+            advance(Stage::Working, Event::TeardownDone),
+            Next::Show(Stage::SignIn),
+            "the finished teardown does not reach the sign-in card, so the spinner waits out \
+             `WORKING_DEADLINE` for a master password nobody is asking for"
+        );
+    }
+
+    /// **The whole lock round trip, walked**, because "the two rows are right"
+    /// and "the window gets back to the vault" are different claims and this
+    /// crate has shipped the first without the second.
+    #[test]
+    fn the_lock_walk_leaves_the_vault_and_comes_back_to_it() {
+        let mut stage = Stage::Vault;
+        let mut seen = vec![stage];
+        let mut steps = 0;
+        for event in [
+            Event::Locked,
+            Event::TeardownDone,
+            Event::SignedIn,
+            Event::WorkReady,
+        ] {
+            steps += 1;
+            match advance(stage, event) {
+                Next::Show(next) => {
+                    if next != stage {
+                        stage = next;
+                        seen.push(stage);
+                    }
+                }
+                Next::Close => break,
+            }
+        }
+        assert_eq!(steps, 4, "control: the walk stopped early, so it proves less than it says");
+        assert_eq!(
+            seen,
+            vec![
+                Stage::Vault,
+                Stage::Working,
+                Stage::SignIn,
+                Stage::Working,
+                Stage::Vault
+            ],
+            "the lock's round trip does not return to the vault in one window"
+        );
+    }
+
+    /// **The table, exhaustively**: every one of the fifteen pairs is either a
+    /// listed move or a no-op, and nothing else.
+    ///
+    /// This replaces a hand-written list of refused pairs. Two new events
+    /// multiplied that list from six entries to ten, and a hand-written ten is
+    /// a list the next event will silently under-count -- which is how a stray
+    /// `Locked` arriving while the sign-in card is up could jump to a spinner
+    /// with no worker behind it, refusing every close with nothing to wait for.
+    #[test]
+    fn an_event_that_does_not_belong_to_the_current_stage_moves_nothing() {
+        let mut checked = 0;
+        let mut moved = 0;
+        for &stage in ALL_STAGES {
+            for &event in ALL_EVENTS {
+                checked += 1;
+                match LEGAL
+                    .iter()
+                    .find(|(s, e, _)| *s == stage && *e == event)
+                {
+                    Some((_, _, expected)) => {
+                        moved += 1;
+                        assert_eq!(
+                            advance(stage, event),
+                            *expected,
+                            "{event:?} on {stage:?} does not do what the table says"
+                        );
+                    }
+                    None => assert_eq!(
+                        advance(stage, event),
+                        Next::Show(stage),
+                        "{event:?} moved the window away from {stage:?}"
+                    ),
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            ALL_STAGES.len() * ALL_EVENTS.len(),
+            "control: the walk did not visit every pair"
+        );
+        assert_eq!(
+            checked, 15,
+            "control: three stages and five events is fifteen pairs; a different number means \
+             one of the two lists is missing a variant it was supposed to enumerate, and every \
+             pair it omits is unchecked"
+        );
+        assert_eq!(
+            moved,
+            LEGAL.len(),
+            "control: some listed move was never reached by the walk, so listing it asserted \
+             nothing"
+        );
+        assert_eq!(moved, 5, "control: the table has five moves, not {moved}");
+    }
+
+    /// **The ordinary close-to-tray gesture, and the lock, are the same
+    /// gesture.** They differ by one flag, and this is where the difference is
+    /// decided. Getting it backwards costs either the blink (a lock let go) or
+    /// a window the user cannot close (an ordinary close caught).
+    #[test]
+    fn only_a_close_that_carries_a_lost_session_is_a_lock() {
+        assert_eq!(
+            vault_close(true, true),
+            VaultClose::Lock,
+            "a lock is let go, so the window closes and reopens -- the blink"
+        );
+        assert_eq!(
+            vault_close(true, false),
+            VaultClose::LetGo,
+            "an ordinary close is caught as a lock: the ✕ starts a teardown of a session \
+             nobody asked to end, and the window will not go away"
+        );
+        assert_eq!(
+            vault_close(false, true),
+            VaultClose::Ignore,
+            "a vault frame that has ALREADY reported `locked` -- its own flag stays set for \
+             the rest of its life -- starts a second teardown on every later frame, twelve \
+             times a second, if the close is not what triggers this"
+        );
+        assert_eq!(vault_close(false, false), VaultClose::Ignore);
+    }
+
+    /// The three answers are three, and the two that keep the window are not
+    /// the same one. A `vault_close` collapsed to a `bool` is one token from
+    /// treating "nothing asked" as "let it go" -- which is inert here and
+    /// disastrous in a host that acts on `LetGo`.
+    #[test]
+    fn the_three_answers_stay_three() {
+        assert_ne!(VaultClose::Ignore, VaultClose::LetGo);
+        assert_ne!(VaultClose::Ignore, VaultClose::Lock);
+        assert_ne!(VaultClose::LetGo, VaultClose::Lock);
+    }
+}
+
+/// The vault host's own wiring, pinned by source position -- the same way
+/// `startup_window_tests` pins the startup host's, and for the same reason:
+/// `eframe::Frame` has no public constructor, so neither frame closure can be
+/// called by a test at all.
+#[cfg(test)]
+mod lock_host_tests {
+    use super::startup_window_tests::{code, production};
+
+    /// **One eframe launch, one raise, two hosts.**
+    ///
+    /// `foreground.rs` lists this module as opening exactly one window titled
+    /// `WINDOW_TITLE` and raising it exactly once, and that file is where the
+    /// count lives. This is the same fact asserted from the side that can
+    /// explain it: a second host that opened its own window would need that
+    /// list relaxed to two, which is the strictly weaker statement -- and it
+    /// would ship a second first-frame styling pass that can forget the raise
+    /// independently of the first.
+    ///
+    /// Counted over the COMMENT-STRIPPED production half, because the needles
+    /// are the sort a doc comment wants to name; this crate has shipped a
+    /// guard that matched its own prose before.
+    #[test]
+    fn both_hosts_go_through_the_one_window_opener() {
+        let production = code(production());
+        assert_eq!(
+            production.matches(concat!("run_ui_", "native(WINDOW_TITLE,")).count(),
+            1,
+            "this module opens its window somewhere other than `run_the_one_window`, or in \r
+             more than one place -- `foreground.rs` says it opens exactly one"
+        );
+        assert_eq!(
+            production.matches(concat!("raise_window(", "WINDOW_TITLE)")).count(),
+            1,
+            "this module asks for the foreground somewhere other than the one opener"
+        );
+        assert_eq!(
+            production.matches(concat!("run_the_one_", "window(options, move |ui, frame|")).count(),
+            2,
+            "the two hosts do not both hand their closure to the one opener, so one of them \r
+             either draws nothing or opens a window of its own"
+        );
+    }
+
+    /// `run_from_vault`'s frame closure, comments stripped, bounded forward by
+    /// the end of production code.
+    ///
+    /// Stripping first is not tidiness: the arm below is guarded on names --
+    /// `CancelClose`, `vault_close(`, `TeardownStep::` -- that this function's
+    /// own prose says out loud, and a guard that matched the raw source would
+    /// go on passing after the call itself was deleted. This crate has shipped
+    /// exactly that mistake before.
+    fn closure() -> String {
+        let production = code(production());
+        let at = production
+            .find(concat!("pub fn run_from_", "vault<T, S, B>("))
+            .expect(
+                "the vault host is gone entirely -- the lock is back to tearing the window \
+                 down and reopening it",
+            );
+        let closure = production[at..].to_string();
+        assert!(
+            closure.len() > 3_000,
+            "the vault host sliced down to {} bytes, which is not the whole of it -- every \
+             guard below would then be a statement about a region that stops short of the \
+             code it names",
+            closure.len()
+        );
+        closure
+    }
+
+    /// The `Stage::Vault` arm alone: the lock catch, and nothing else.
+    fn vault_arm() -> String {
+        let closure = closure();
+        let start = closure
+            .find(concat!("Stage::Vault ", "=>"))
+            .expect("the vault host has no vault stage at all");
+        let rest = &closure[start..];
+        let end = rest
+            .find(concat!("Stage::SignIn ", "=>"))
+            .expect("the vault arm is not followed by the sign-in arm");
+        let arm = rest[..end].to_string();
+        assert!(
+            arm.len() > 1_000,
+            "the vault arm sliced down to {} bytes, which is not the whole of it",
+            arm.len()
+        );
+        arm
+    }
+
+    /// **THE FEATURE, as a source guard.** The vault frame asks for the close
+    /// itself on all three lock routes; if this arm does not cancel it, the
+    /// window goes away and `main` opens another -- which is the blink, with
+    /// every behavioural test in this file still green, because none of them
+    /// can run a frame.
+    #[test]
+    fn the_lock_arm_keeps_the_window_instead_of_letting_it_close() {
+        let arm = vault_arm();
+        assert!(
+            arm.contains(concat!("ViewportCommand::", "CancelClose")),
+            "the lock arm does not cancel the vault frame's own close, so the window is torn \
+             down and reopened -- the blink this feature exists to remove: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("vault_", "close(ui.ctx().input(|i| i.viewport().close_requested())")),
+            "the lock arm no longer asks `vault_close` what the close meant, so the decision \
+             is back inside a closure no test can call: {arm}"
+        );
+        assert!(
+            !arm.contains(concat!("ViewportCommand::", "Close)")),
+            "the lock arm sends a plain Close of its own: {arm}"
+        );
+        // Positive control on the slice: it really is the vault arm.
+        assert!(
+            arm.contains(concat!("vault_fn(ui, ", "frame);")),
+            "control: the sliced region is not the arm that draws the vault: {arm}"
+        );
+    }
+
+    /// **The lock actually starts the teardown**, on a thread.
+    ///
+    /// The v0.5.0 defect in its new home: a lock that reaches the spinner and
+    /// never tears anything down leaves `bw serve` holding a live session with
+    /// the vault "locked" on screen. Run on this thread instead, it freezes the
+    /// window on the frame that is meant to start showing the spinner.
+    #[test]
+    fn the_lock_arm_starts_the_teardown_on_a_thread() {
+        let arm = vault_arm();
+        assert!(
+            arm.contains(concat!("std::thread::", "spawn(move || {")),
+            "the lock does not start its teardown on a worker thread: either nothing is torn \
+             down at all -- the vault says locked and `bw serve` still holds the session -- or \
+             it runs here and freezes the spinner it is meant to be showing: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("teardown(&step_tx, ", "token_rx);")),
+            "the spawned thread does not run the caller's teardown: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("handles.", "finish()")),
+            "the vault session that just locked is not ended through `finish`, so its geometry \
+             is never written and a visit to the gear earlier in the same session is lost: \
+             {arm}"
+        );
+    }
+
+    /// **The working stage is this module's working stage, not a second one.**
+    ///
+    /// A host that re-implemented the refusal, the watchdog or the closing flag
+    /// would be a second copy of the most heavily guarded sequence in this
+    /// crate -- which is the move the recorded design rejects by name.
+    #[test]
+    fn the_vault_host_reuses_the_one_working_stage_rather_than_writing_a_second() {
+        let closure = closure();
+        for (needle, why) in [
+            (
+                concat!("refuse_close_while_", "working(ui.ctx(), closing)"),
+                "the vault host's spinner refuses no close it did not draw the affordance for, \
+                 so an Alt+F4 mid-teardown leaves a half-stopped backend",
+            ),
+            (
+                concat!("poll_", "working(err, elapsed)"),
+                "the vault host's spinner has no watchdog: a teardown worker that panics or \
+                 hangs leaves a spinner that spins forever, refusing every close",
+            ),
+            (
+                concat!("give_up_", "working(ui.ctx(), &mut closing, why, elapsed)"),
+                "the vault host does not end its own stage the way the startup host does",
+            ),
+            (
+                concat!("Closing::", "not_yet()"),
+                "the vault host's working stage starts on something other than `not_yet`, and \
+                 started on `decided` it refuses nothing and drains nothing",
+            ),
+            (
+                concat!("CloseControl::", "Disabled"),
+                "the vault host's spinner draws a live ✕ over a stage that refuses every close",
+            ),
+        ] {
+            assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
+        }
+        // Positive control: the slice really is the vault host and not the
+        // whole production half, whose startup host contains all of the above
+        // too.
+        assert!(
+            !closure.contains(concat!("pub fn ", "advance(")),
+            "control: the sliced region reaches back above the vault host"
+        );
+        assert!(
+            closure.contains(concat!("TeardownStep::", "NeedsSignIn")),
+            "control: the sliced region is not the host that handles the teardown's steps"
+        );
+    }
+
+    /// **Both of the teardown's two steps are handled**, and they are handled
+    /// differently. Collapsed to one, either the card is never shown (the
+    /// spinner waits out the deadline for a password nobody is asked for) or
+    /// the vault is never rebuilt (the window closes and `main` reopens it --
+    /// the blink, one step later).
+    #[test]
+    fn the_host_answers_both_teardown_steps() {
+        let closure = closure();
+        for (needle, why) in [
+            (
+                concat!("Ok(TeardownStep::", "NeedsSignIn) =>"),
+                "the host never shows the card when the teardown asks for a password",
+            ),
+            (
+                concat!("Ok(TeardownStep::", "Finished) =>"),
+                "the host never notices the teardown finished, so the vault is never rebuilt",
+            ),
+            (
+                concat!("Event::", "TeardownDone"),
+                "the host does not take the `TeardownDone` transition",
+            ),
+            (
+                concat!("Event::", "Locked"),
+                "the host does not take the `Locked` transition, so the lock moves nothing",
+            ),
+        ] {
+            assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
+        }
+        assert!(
+            !closure.contains(concat!("Err(", "_) =>")),
+            "the vault host's poll arm treats every channel error alike, so a dead teardown \
+             worker is polled as a busy one -- a spinner that refuses every close, forever"
+        );
     }
 }

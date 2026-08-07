@@ -3056,6 +3056,25 @@ pub struct VaultFrameHandles {
 }
 
 impl VaultFrameHandles {
+    /// **Whether this vault session has lost its session**, read WITHOUT
+    /// ending it.
+    ///
+    /// `locked || needs_reauth` -- the same disjunction `main`'s
+    /// `vault_follow_up` reads out of a finished [`VaultWindowResult`], and
+    /// deliberately the same one rather than a second condition beside it: the
+    /// 401 recovery and the Lock button are one path, and a host that read only
+    /// `locked` would leave an invalidated session on screen with the window
+    /// behaving as though nothing had happened.
+    ///
+    /// It exists because a host that keeps the window has to ask this question
+    /// while the frame is still running -- `finish` is the END of a session and
+    /// writes the geometry, so it cannot be the question. See
+    /// `app_window::vault_close`, which is where the answer is turned into a
+    /// decision.
+    pub fn lost_session(&self) -> bool {
+        *self.locked.borrow() || *self.needs_reauth.borrow()
+    }
+
     /// Ends a vault session: persists the geometry and reads the four
     /// outcome cells. Call once, after the frame closure has stopped running.
     pub fn finish(&self) -> VaultWindowResult {
