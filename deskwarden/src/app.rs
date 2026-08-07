@@ -338,15 +338,120 @@ pub fn sequence_for(item: &VaultItem) -> String {
     extract_app_match(item).map(|m| m.sequence).unwrap_or_default()
 }
 
-/// Whether this item's sequence contains a `{TOTP}`, and so whether a fill has
-/// to go and fetch a code before it can plan.
+/// What the user asked to be typed. Never persisted; never leaves a fill.
+///
+/// One screen may want an email only (an SSO stop), the next a username and a
+/// password together, a third nothing but a one-time code. The overlay asks
+/// *what* to type rather than guessing, and this is the answer it carries.
+///
+/// **No `Email` row exists, deliberately.** Bitwarden's login object has no
+/// email field; the SSO case wants `login.username`, which *is* the address.
+/// Inventing a row for a field that is not on the wire would be a row that can
+/// never resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FillChoice {
+    /// The existing default fill: UI Automation's named-field fill first,
+    /// `SendInput` username-Tab-password second.
+    ///
+    /// **Not `parse(DEFAULT_SEQUENCE)`**, for exactly the reason
+    /// [`FillAction::Default`] is not: UI Automation fills named fields and a
+    /// sequence types at focus, and collapsing the two would delete the UI
+    /// Automation path for every item in every existing vault.
+    UserTabPass,
+    /// One field, alone, through the sequence runner.
+    Just(key_sequence::FieldRef),
+    /// The item's own stored auto-type sequence.
+    Saved,
+}
+
+impl FillChoice {
+    /// The overlay's row label.
+    ///
+    /// [`Self::Just`] defers to [`key_sequence::FieldRef::label`] rather than
+    /// restating it, so a field renamed there cannot end up named two
+    /// different things in two different parts of this UI.
+    pub fn label(&self) -> String {
+        match self {
+            Self::UserTabPass => "Username + Tab + Password".to_string(),
+            Self::Just(field) => field.label(),
+            Self::Saved => "Saved sequence".to_string(),
+        }
+    }
+}
+
+/// The rows to offer for **this item**, in the order they are shown.
+///
+/// Pure and presence-only: it asks whether a value is there, never what it is,
+/// so building the overlay's rows reads no secret. The presence question
+/// itself is [`key_sequence::field_palette`]'s, reused rather than restated --
+/// it already answers "what does this item have" and is already tested.
+///
+/// An item with a stored sequence offers that sequence and nothing else: the
+/// user wrote it precisely because the generic rows were not what that app
+/// wanted, so offering them back alongside it would be offering the thing they
+/// already rejected.
+///
+/// **Custom `{S:Field}` rows are deliberately absent.** An item may carry any
+/// number of custom fields, and an unbounded row count is a geometry hazard
+/// for a fixed-size overlay; the sequence builder already covers them. That
+/// cap is what makes this list at most four rows long, by construction.
+pub fn fill_choices(item: &VaultItem) -> Vec<FillChoice> {
+    if !sequence_for(item).is_empty() {
+        return vec![FillChoice::Saved];
+    }
+    let palette = key_sequence::field_palette(item);
+    let has = |field: key_sequence::FieldRef| palette.contains(&field);
+    let username = has(key_sequence::FieldRef::Username);
+    let password = has(key_sequence::FieldRef::Password);
+
+    let mut out = Vec::new();
+    if username && password {
+        // First, because it is what the overwhelming majority of screens
+        // want; the single-field rows below exist for the ones that do not.
+        out.push(FillChoice::UserTabPass);
+    }
+    if username {
+        out.push(FillChoice::Just(key_sequence::FieldRef::Username));
+    }
+    if password {
+        out.push(FillChoice::Just(key_sequence::FieldRef::Password));
+    }
+    if has(key_sequence::FieldRef::Totp) {
+        out.push(FillChoice::Just(key_sequence::FieldRef::Totp));
+    }
+    out
+}
+
+/// Whether **this choice** needs an HTTP round-trip for a one-time code.
 ///
 /// Separate from [`fill_action`] because it is the one question that cannot be
-/// answered purely: the answer decides whether an HTTP request happens.
+/// answered purely: the answer decides whether a request happens.
+///
+/// This takes the *choice*, not just the item, and that is the whole point of
+/// it. [`sequence_needs_a_one_time_code`] inspects only the **stored
+/// sequence**, so it answers `false` for [`FillChoice::Just`] of
+/// [`key_sequence::FieldRef::Totp`] on an item whose sequence has no
+/// `{TOTP}` -- and the one-time-code row would then be shown, be clickable,
+/// and refuse with `Refusal::Unresolved` every single time.
+pub fn needs_a_one_time_code(item: &VaultItem, choice: &FillChoice) -> bool {
+    match choice {
+        FillChoice::Just(key_sequence::FieldRef::Totp) => true,
+        FillChoice::Just(_) | FillChoice::UserTabPass => false,
+        FillChoice::Saved => key_sequence::parse(&sequence_for(item))
+            .iter()
+            .any(|t| matches!(t, key_sequence::Token::Field(key_sequence::FieldRef::Totp))),
+    }
+}
+
+/// Whether this item's sequence contains a `{TOTP}`, and so whether a fill of
+/// that stored sequence has to go and fetch a code before it can plan.
+///
+/// A thin wrapper over [`needs_a_one_time_code`] for the stored-sequence
+/// choice, kept so the existing stored-sequence callers do not move in this
+/// step. New code should ask [`needs_a_one_time_code`] about the choice the
+/// user actually made.
 pub fn sequence_needs_a_one_time_code(item: &VaultItem) -> bool {
-    key_sequence::parse(&sequence_for(item))
-        .iter()
-        .any(|t| matches!(t, key_sequence::Token::Field(key_sequence::FieldRef::Totp)))
+    needs_a_one_time_code(item, &FillChoice::Saved)
 }
 
 /// What a fill will actually do.
@@ -1418,6 +1523,235 @@ mod fill_dispatch_tests {
     fn the_sequence_is_read_off_the_items_own_app_match_field() {
         assert_eq!(sequence_for(&item_with("{TAB}")), "{TAB}");
         assert_eq!(sequence_for(&item_with("")), "");
+    }
+
+    // -- fill_choices, what the overlay offers -------------------------------
+
+    /// A one-time code seed, distinct from every other fixture value so a test
+    /// that reads the wrong field cannot accidentally pass.
+    const SEED: &str = "JBSWY3DPEHPK3PXP";
+
+    /// `item_with`, stripped down to exactly the credentials named. The
+    /// `deskwarden:app-match` field is kept (with `sequence`) so the
+    /// stored-sequence branch is reachable, and the `PIN` custom field is kept
+    /// so a test can prove custom fields do *not* become rows.
+    fn item_having(
+        sequence: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+        totp: Option<&str>,
+    ) -> VaultItem {
+        let mut item = item_with(sequence);
+        item.login = Some(LoginData {
+            username: username.map(|u| u.to_string()),
+            password: password.map(|p| p.to_string().into()),
+            totp: totp.map(|t| t.to_string().into()),
+            ..LoginData::default()
+        });
+        item
+    }
+
+    #[test]
+    fn an_item_with_both_credentials_leads_with_username_tab_password() {
+        let item = item_having("", Some(USER), Some(PASS), None);
+        // The fixture must actually disagree with itself: a "both" item whose
+        // password is absent (or equal to the username) proves nothing.
+        assert_ne!(USER, PASS);
+        assert_eq!(item.login.as_ref().unwrap().username.as_deref(), Some(USER));
+        assert_eq!(
+            item.login.as_ref().unwrap().password.as_deref().map(|p| p.as_str()),
+            Some(PASS)
+        );
+
+        let choices = fill_choices(&item);
+        // FIRST, not merely present: the primary row is the one the user's
+        // eye lands on, and `contains` would pass with it last.
+        assert_eq!(choices.first(), Some(&FillChoice::UserTabPass));
+        assert_eq!(
+            choices,
+            vec![
+                FillChoice::UserTabPass,
+                FillChoice::Just(key_sequence::FieldRef::Username),
+                FillChoice::Just(key_sequence::FieldRef::Password),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_sso_item_with_only_a_username_offers_exactly_one_row() {
+        // mabl's SSO screen wants the email address alone. There is no
+        // password on this item at all.
+        let item = item_having("", Some(USER), None, None);
+        assert!(item.login.as_ref().unwrap().password.is_none());
+
+        // `assert_eq!` on the whole vector, never `contains`: a `contains`
+        // assertion passes against a set that also offers a password row this
+        // item could only ever fail to fill.
+        assert_eq!(
+            fill_choices(&item),
+            vec![FillChoice::Just(key_sequence::FieldRef::Username)]
+        );
+    }
+
+    #[test]
+    fn an_item_with_only_a_password_offers_exactly_the_password_row() {
+        let item = item_having("", None, Some(PASS), None);
+        assert!(item.login.as_ref().unwrap().username.is_none());
+        assert_eq!(
+            fill_choices(&item),
+            vec![FillChoice::Just(key_sequence::FieldRef::Password)]
+        );
+    }
+
+    #[test]
+    fn an_item_with_a_totp_secret_is_offered_a_one_time_code_row() {
+        let item = item_having("", Some(USER), Some(PASS), Some(SEED));
+        assert_eq!(
+            item.login.as_ref().unwrap().totp.as_deref().map(|t| t.as_str()),
+            Some(SEED)
+        );
+        assert_eq!(
+            fill_choices(&item),
+            vec![
+                FillChoice::UserTabPass,
+                FillChoice::Just(key_sequence::FieldRef::Username),
+                FillChoice::Just(key_sequence::FieldRef::Password),
+                FillChoice::Just(key_sequence::FieldRef::Totp),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_item_with_no_totp_secret_is_never_offered_a_one_time_code() {
+        // Positive control first: with a seed, the row is there. Without one
+        // this assertion would be vacuous -- a `fill_choices` that never
+        // offered TOTP at all would pass the negative half.
+        assert!(fill_choices(&item_having("", Some(USER), Some(PASS), Some(SEED)))
+            .contains(&FillChoice::Just(key_sequence::FieldRef::Totp)));
+
+        for item in [
+            item_having("", Some(USER), Some(PASS), None),
+            item_having("", Some(USER), Some(PASS), Some("")),
+        ] {
+            assert!(!fill_choices(&item)
+                .contains(&FillChoice::Just(key_sequence::FieldRef::Totp)));
+        }
+    }
+
+    #[test]
+    fn an_item_with_a_stored_sequence_offers_only_the_saved_sequence() {
+        // The user wrote a sequence precisely because the generic rows were
+        // not what this app wanted; offering them back is offering the thing
+        // they already rejected.
+        let item = item_having("{USERNAME}{TAB}{PASSWORD}", Some(USER), Some(PASS), Some(SEED));
+        // The item has every credential, so the generic rows are all
+        // *available* -- which is what makes their absence meaningful.
+        assert_eq!(
+            fill_choices(&item_having("", Some(USER), Some(PASS), Some(SEED))).len(),
+            4
+        );
+        assert_eq!(fill_choices(&item), vec![FillChoice::Saved]);
+    }
+
+    #[test]
+    fn no_item_ever_offers_more_than_four_rows() {
+        let items = [
+            item_having("", None, None, None),
+            item_having("", Some(USER), None, None),
+            item_having("", None, Some(PASS), None),
+            item_having("", None, None, Some(SEED)),
+            item_having("", Some(USER), Some(PASS), Some(SEED)),
+            item_having("{USERNAME}", Some(USER), Some(PASS), Some(SEED)),
+        ];
+        let mut visited = 0;
+        for item in &items {
+            assert!(fill_choices(item).len() <= 4, "{:?}", fill_choices(item));
+            visited += 1;
+        }
+        // The loop above is worthless if it ran zero times.
+        assert_eq!(visited, items.len());
+        assert!(visited > 0);
+    }
+
+    #[test]
+    fn every_offered_row_has_a_label_no_other_row_shares() {
+        // Two rows reading the same thing is a UI the user cannot use.
+        let item = item_having("", Some(USER), Some(PASS), Some(SEED));
+        let choices = fill_choices(&item);
+        assert_eq!(choices.len(), 4, "the fixture must offer every generic row");
+        let mut labels: Vec<String> = choices.iter().map(|c| c.label()).collect();
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        labels.sort();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "duplicate label among {labels:?}");
+        // And the saved row, which is never shown beside them, is distinct too.
+        assert!(!labels.contains(&FillChoice::Saved.label()));
+        // `Just` defers to the field's own label rather than restating it.
+        assert_eq!(
+            FillChoice::Just(key_sequence::FieldRef::Totp).label(),
+            key_sequence::FieldRef::Totp.label()
+        );
+    }
+
+    // -- needs_a_one_time_code, the HTTP decision ---------------------------
+
+    #[test]
+    fn choosing_a_one_time_code_is_what_makes_the_fill_go_and_fetch_one() {
+        // A stored sequence that does NOT mention {TOTP}. This is the exact
+        // case the split exists for.
+        let item = item_having("{USERNAME}{TAB}{PASSWORD}", Some(USER), Some(PASS), Some(SEED));
+
+        // The new function looks at the choice: the user asked for a code.
+        assert!(needs_a_one_time_code(
+            &item,
+            &FillChoice::Just(key_sequence::FieldRef::Totp)
+        ));
+        // The old function looks only at the stored sequence and says no --
+        // asserted explicitly, so this test proves the new function is not
+        // the old one renamed. Were it a rename, the row would be shown,
+        // clicked, and refused as Unresolved 100% of the time.
+        assert!(!sequence_needs_a_one_time_code(&item));
+
+        // And the choices that plainly need no code still need none.
+        assert!(!needs_a_one_time_code(&item, &FillChoice::UserTabPass));
+        assert!(!needs_a_one_time_code(
+            &item,
+            &FillChoice::Just(key_sequence::FieldRef::Username)
+        ));
+        assert!(!needs_a_one_time_code(
+            &item,
+            &FillChoice::Just(key_sequence::FieldRef::Password)
+        ));
+    }
+
+    #[test]
+    fn the_saved_choice_asks_for_a_code_exactly_when_its_sequence_uses_one() {
+        let with = item_having("{USERNAME}{TAB}{TOTP}", Some(USER), Some(PASS), Some(SEED));
+        let without = item_having("{USERNAME}{TAB}{PASSWORD}", Some(USER), Some(PASS), Some(SEED));
+        assert!(needs_a_one_time_code(&with, &FillChoice::Saved));
+        assert!(!needs_a_one_time_code(&without, &FillChoice::Saved));
+        // The wrapper is exactly this question, so the two must agree.
+        assert_eq!(
+            needs_a_one_time_code(&with, &FillChoice::Saved),
+            sequence_needs_a_one_time_code(&with)
+        );
+        assert_eq!(
+            needs_a_one_time_code(&without, &FillChoice::Saved),
+            sequence_needs_a_one_time_code(&without)
+        );
+    }
+
+    #[test]
+    fn a_custom_field_never_becomes_a_row() {
+        // The fixture really does carry a custom field -- otherwise the
+        // absence below proves nothing.
+        let item = item_having("", Some(USER), Some(PASS), None);
+        assert!(key_sequence::field_palette(&item)
+            .contains(&key_sequence::FieldRef::Custom("PIN".into())));
+        assert!(!fill_choices(&item)
+            .iter()
+            .any(|c| matches!(c, FillChoice::Just(key_sequence::FieldRef::Custom(_)))));
     }
 
     // -- fill_from_vault, the two calls -------------------------------------
