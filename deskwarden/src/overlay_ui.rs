@@ -262,8 +262,8 @@ impl eframe::App for OverlayApp {
         // window -- and "Esc dismisses" is not a claim that may live only
         // where nothing can check it.
         let keys = keyboard_action(
-            ctx.input(|i| i.key_pressed(egui::Key::Enter)),
-            ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+            EnterPressed::read(&ctx),
+            EscapePressed::read(&ctx),
             &self.choices,
         );
 
@@ -301,14 +301,58 @@ impl eframe::App for OverlayApp {
 ///
 /// Enter outranks Esc when a frame somehow carries both, which is the
 /// behaviour this had when the two were separate `if`s.
-fn keyboard_action(enter: bool, escape: bool, choices: &[FillChoice]) -> OverlayAction {
-    if enter {
+fn keyboard_action(
+    enter: EnterPressed,
+    escape: EscapePressed,
+    choices: &[FillChoice],
+) -> OverlayAction {
+    if enter.0 {
         return OverlayAction::Fill(primary_choice(choices));
     }
-    if escape {
+    if escape.0 {
         return OverlayAction::Dismiss;
     }
     OverlayAction::None
+}
+
+/// Whether **Enter** was pressed this frame.
+///
+/// A newtype rather than a `bool`, and the reason is the whole of this
+/// module's second critical finding: `keyboard_action(enter: bool, escape:
+/// bool, ..)` could have its two arguments **swapped** at the one call site
+/// that matters, it would compile, and every test in the crate stayed green —
+/// because that call site lives in `OverlayApp::ui`, which needs an
+/// `eframe::Frame` and a real always-on-top window and can therefore never be
+/// executed here. A swapped pair means **Esc fills the user's password into
+/// the app they just refused.**
+///
+/// [`EnterPressed`] and [`EscapePressed`] are distinct types, so the swap is
+/// now a **type error**: it does not compile, and no test needs to be relied
+/// on to catch it.
+///
+/// [`EnterPressed::read`] is where the `egui::Key` literal lives, so the one
+/// remaining way to write the bug — constructing `EnterPressed` from the
+/// *Escape* key — is not at the call site either. It is in a one-line
+/// function that takes an `egui::Context`, which a test **can** build (a bare
+/// context opens no window), and
+/// `each_key_reader_reads_the_key_it_is_named_after` does exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnterPressed(pub bool);
+
+/// Whether **Escape** was pressed this frame. See [`EnterPressed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscapePressed(pub bool);
+
+impl EnterPressed {
+    fn read(ctx: &egui::Context) -> Self {
+        Self(ctx.input(|i| i.key_pressed(egui::Key::Enter)))
+    }
+}
+
+impl EscapePressed {
+    fn read(ctx: &egui::Context) -> Self {
+        Self(ctx.input(|i| i.key_pressed(egui::Key::Escape)))
+    }
 }
 
 /// What the user did to the overlay card on this frame.
@@ -395,7 +439,7 @@ pub fn draw_overlay_card_rows(
         egui::Frame::new()
             .inner_margin(Margin::symmetric(12, 9))
             .show(ui, |ui| {
-                if theme::card_header_with_close(ui, "1 match") {
+                if theme::card_header_with_close(ui, &match_count_label(choices.len().max(1))) {
                     action = OverlayAction::Dismiss;
                 }
             });
@@ -477,8 +521,64 @@ fn row_text(app_name: &str, item_name: &str, username: Option<&str>) -> (String,
 /// at all.
 const ROW_GAP: f32 = 4.0;
 
+/// The overlay header's match count, e.g. `"1 match"` / `"4 matches"`.
+///
+/// It was the literal `"1 match"` regardless of how many rows the card was
+/// about to draw — correct only for as long as the overlay showed exactly
+/// one, which is the thing the surrounding work exists to stop being true.
+/// `rows` is the row count the card really paints, which is
+/// `choices.len().max(1)` for the same reason `overlay_height` takes
+/// `rows.max(1)`: an empty slice still paints one row.
+fn match_count_label(rows: usize) -> String {
+    if rows == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{rows} matches")
+    }
+}
+
+/// The width kept clear at the right-hand end of every choice row for the
+/// selected row's `Enter` chip.
+///
+/// The text column is sized `available - CHIP_LANE` rather than being allowed
+/// to take the whole row, because truncation needs a bound and the bound must
+/// leave the chip somewhere to be: a text column that ate the full width
+/// would push the `Enter` chip off the right edge of a window with no
+/// horizontal scrolling either.
+///
+/// It is reserved on **both** treatments, selected and not, so the two rows
+/// truncate at exactly the same place — a row whose text lane changed width
+/// when it became selected would re-truncate under the mouse.
+///
+/// Checked against the chip that is really painted, not chosen and left
+/// alone: `the_enter_chip_has_a_lane_of_its_own_and_the_text_stops_short_of_it`
+/// measures the painted chip and the painted text and asserts the chip fits
+/// inside the lane and no glyph run reaches into it.
+const CHIP_LANE: f32 = 56.0;
+
 /// One choice row. `selected` renders the emphasized treatment (blue wash,
 /// blue avatar, Enter chip); otherwise the neutral one.
+///
+/// **A row cannot grow the card, whatever its text says.** This is the
+/// module's first critical finding. The row used to be content-sized: two
+/// plain `ui.label`s that wrapped, in a card whose height is a fixed
+/// `CHROME_HEIGHT + n * ROW_HEIGHT` and a window that is
+/// `with_decorations(false)`, always-on-top, unresizable and has no scroll
+/// area anywhere. `secondary` is `format!("{item_name} · fills {app_name}")`
+/// — **two user-controlled strings** — and the geometry was measured off one
+/// short fixture. Measured on the shipped code, a four-row card was 396pt
+/// tall against a 314pt window with realistic names (82pt gone), 444pt with a
+/// name that has no spaces to wrap at (130pt gone), and 348pt with CJK (34pt
+/// gone). Even a ONE-row card overflowed its 164pt window at 177/189pt; the
+/// 10pt of [`CHROME_SLACK`] had been absorbing the mild end of it.
+///
+/// Enlarging the window is not the fix — a vault item's name is arbitrarily
+/// long, so there is no worst case to size for. So the two lines are
+/// **truncated to one line each** inside a text column of an explicit width
+/// ([`CHIP_LANE`]), which makes the row's height a function of the font and
+/// nothing else, and leaves the card at exactly the size it has always been
+/// for every string. `no_string_a_user_can_supply_makes_the_card_taller`
+/// holds that against adversarial fixtures.
 ///
 /// `avatar_of` is the text the initials tile is built from, which is NOT
 /// `primary` once a row is labelled by what it will type rather than by whose
@@ -509,10 +609,23 @@ fn credential_row(
             ui.horizontal(|ui| {
                 theme::avatar(ui, &theme::initials(avatar_of), 28.0, selected);
                 ui.add_space(2.0);
+                // The text column is given an EXPLICIT width and its two
+                // labels TRUNCATE. Both halves are load-bearing; see
+                // [`CHIP_LANE`] and the module note above.
+                let text_width = (ui.available_width() - CHIP_LANE).max(1.0);
                 ui.vertical(|ui| {
+                    ui.set_width(text_width);
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(theme::semibold(primary, 13.0).color(theme::INK));
-                    ui.label(RichText::new(secondary).size(11.0).color(theme::TEXT_FAINT));
+                    ui.add(
+                        egui::Label::new(theme::semibold(primary, 13.0).color(theme::INK))
+                            .truncate(),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(secondary).size(11.0).color(theme::TEXT_FAINT),
+                        )
+                        .truncate(),
+                    );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if selected {
@@ -734,6 +847,64 @@ mod geometry_tests {
     const ITEM: &str = "Ledgerline";
     const USER: &str = "ada@example.com";
 
+    /// One set of strings the card can be asked to draw.
+    ///
+    /// The geometry above was measured off `APP`/`ITEM`/`USER` alone, and
+    /// that is how the card came to overflow its own window by up to 130
+    /// points: `item_name` and `app_name` are **user-controlled**, they are
+    /// concatenated into the secondary line, and a short fixture is the one
+    /// input for which a wrapping row happens not to wrap.
+    #[derive(Debug, Clone, Copy)]
+    struct Fixture {
+        name: &'static str,
+        app: &'static str,
+        item: &'static str,
+        user: &'static str,
+    }
+
+    /// The fixture the module's numbers were originally measured from. It
+    /// stays, as the control: whatever the adversarial ones do, the card the
+    /// overlay has always drawn must not move.
+    const SHORT: Fixture = Fixture {
+        name: "short",
+        app: APP,
+        item: ITEM,
+        user: USER,
+    };
+
+    /// Realistic, and long: a real vault item in a real organisation, and the
+    /// kind of address a corporate directory hands out. Nothing exotic — this
+    /// is the case the shipped card lost 82 points to.
+    const LONG: Fixture = Fixture {
+        name: "long realistic names",
+        app: "ledgerline-production-accounting-cluster-primary-host.exe",
+        item: "Ledgerline Production Accounting Cluster — Primary Vault Entry",
+        user: "ada.lovelace.administrator@ledgerline-production-accounting.example.com",
+    };
+
+    /// Wide glyphs: CJK is roughly twice the advance per character, so a name
+    /// of unremarkable *length* is a line of unremarkable-looking text that
+    /// does not fit.
+    const CJK: Fixture = Fixture {
+        name: "CJK",
+        app: "銀行口座管理システム.exe",
+        item: "銀行口座管理システム本番環境の管理者資格情報エントリ",
+        user: "管理者＠銀行口座管理システム本番環境",
+    };
+
+    /// **Nothing to wrap at.** A word wrapper's escape hatch is a space; a
+    /// single unbroken token has none, so this is the worst case for any fix
+    /// that relies on wrapping rather than on a bound.
+    const NO_SPACES: Fixture = Fixture {
+        name: "no spaces",
+        app: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.exe",
+        item: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        user: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    };
+
+    /// Every fixture the card must survive, the short one first.
+    const FIXTURES: [Fixture; 4] = [SHORT, LONG, CJK, NO_SPACES];
+
     /// The four rows `app::fill_choices` can produce, in its own order.
     fn four_choices() -> Vec<FillChoice> {
         vec![
@@ -752,9 +923,15 @@ mod geometry_tests {
     /// exactly like a card with no rows, because that is what it looks like to
     /// the user.
     fn painted(choices: &[FillChoice], height: f32) -> Vec<Ink> {
+        painted_as(SHORT, choices, height)
+    }
+
+    /// [`painted`], for a card drawn with `fixture`'s strings rather than the
+    /// short ones.
+    fn painted_as(fixture: Fixture, choices: &[FillChoice], height: f32) -> Vec<Ink> {
         let ctx = styled_ctx();
         let output = ctx.run_ui(sized(height), |ui| {
-            draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
+            draw_overlay_card_rows(ui, fixture.app, fixture.item, Some(fixture.user), choices);
         });
         let mut ink = Vec::new();
         for clipped in &output.shapes {
@@ -1214,14 +1391,14 @@ mod geometry_tests {
         // And through the keyboard, which is the path that actually reaches
         // the user: Enter, not a click, not the card.
         assert_eq!(
-            keyboard_action(true, false, &choices),
+            keyboard_action(EnterPressed(true), EscapePressed(false), &choices),
             OverlayAction::Fill(FillChoice::Just(FieldRef::Password))
         );
         // And with no choices at all -- the card production still draws --
         // Enter is the fill it has always been.
         assert_eq!(primary_choice(&[]), FillChoice::Saved);
         assert_eq!(
-            keyboard_action(true, false, &[]),
+            keyboard_action(EnterPressed(true), EscapePressed(false), &[]),
             OverlayAction::Fill(FillChoice::Saved)
         );
     }
@@ -1234,25 +1411,95 @@ mod geometry_tests {
     #[test]
     fn escape_dismisses_and_answers_no_choice() {
         let choices = four_choices();
-        assert_eq!(keyboard_action(false, true, &choices), OverlayAction::Dismiss);
-        assert_eq!(keyboard_action(false, true, &[]), OverlayAction::Dismiss);
+        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(true), &choices), OverlayAction::Dismiss);
+        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(true), &[]), OverlayAction::Dismiss);
         // Not a fill of anything, spelled out so a `Fill` variant added later
         // cannot slip past an equality against one particular value.
         assert!(!matches!(
-            keyboard_action(false, true, &choices),
+            keyboard_action(EnterPressed(false), EscapePressed(true), &choices),
             OverlayAction::Fill(_)
         ));
         // The controls: the instrument does report fills, and reports nothing
         // when nothing was pressed.
         assert!(matches!(
-            keyboard_action(true, false, &choices),
+            keyboard_action(EnterPressed(true), EscapePressed(false), &choices),
             OverlayAction::Fill(_)
         ));
-        assert_eq!(keyboard_action(false, false, &choices), OverlayAction::None);
+        assert_eq!(keyboard_action(EnterPressed(false), EscapePressed(false), &choices), OverlayAction::None);
         // Both at once: the fill wins, as it did when these were two `if`s.
         assert_eq!(
-            keyboard_action(true, true, &choices),
+            keyboard_action(EnterPressed(true), EscapePressed(true), &choices),
             OverlayAction::Fill(choices[0].clone())
+        );
+    }
+
+    /// **The residue of the swap, closed.**
+    ///
+    /// [`EnterPressed`] and [`EscapePressed`] being distinct types makes
+    /// `keyboard_action(escape, enter, ..)` a compile error, so the swap the
+    /// review found cannot be written at the call site any more. What it
+    /// leaves behind is one level further in: `EnterPressed::read` could ask
+    /// the context about `egui::Key::Escape`, which compiles and puts the
+    /// identical bug back — Esc filling the password.
+    ///
+    /// That is reachable, and this reaches it. A bare `egui::Context` opens
+    /// no window and needs no `eframe::Frame`, so each reader is run over a
+    /// real frame carrying a real key event, and asserted to answer for **its
+    /// own** key and not the other one. The negative halves are the load-
+    /// bearing ones: a reader that answered `true` for both keys would pass a
+    /// positive-only test.
+    #[test]
+    fn each_key_reader_reads_the_key_it_is_named_after() {
+        fn frame(key: Option<egui::Key>) -> (EnterPressed, EscapePressed) {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                events: key
+                    .map(|key| {
+                        vec![egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::default(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                ..sized(overlay_height(1))
+            };
+            let mut seen = (EnterPressed(false), EscapePressed(false));
+            let _ = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                seen = (EnterPressed::read(&ctx), EscapePressed::read(&ctx));
+            });
+            seen
+        }
+
+        // Enter down: the Enter reader says yes, the Escape reader says no.
+        assert_eq!(
+            frame(Some(egui::Key::Enter)),
+            (EnterPressed(true), EscapePressed(false)),
+            "the Enter frame was not read as Enter-and-only-Enter; a reader that \
+             answers for the other key puts `keyboard_action`'s swapped-argument bug \
+             back one level in, where Esc fills the password"
+        );
+        // Escape down: exactly the mirror.
+        assert_eq!(
+            frame(Some(egui::Key::Escape)),
+            (EnterPressed(false), EscapePressed(true)),
+            "the Escape frame was not read as Escape-and-only-Escape"
+        );
+        // The control: a frame with no key at all is not read as either, so
+        // neither reader can be a constant `true`.
+        assert_eq!(
+            frame(None),
+            (EnterPressed(false), EscapePressed(false)),
+            "a frame carrying no key press was read as one"
+        );
+        // And a third key is neither, so neither reader can be "any key".
+        assert_eq!(
+            frame(Some(egui::Key::Space)),
+            (EnterPressed(false), EscapePressed(false)),
+            "Space was read as Enter or Escape"
         );
     }
 
@@ -1289,14 +1536,20 @@ mod geometry_tests {
     /// back as *nothing at all*, and "every row I found is inside the window"
     /// is trivially true of a card that lost one.
     fn card_fits_in(rows: usize, height: f32) -> Result<(), String> {
+        card_fits_in_with(SHORT, rows, height)
+    }
+
+    /// [`card_fits_in`] for one particular fixture's strings.
+    fn card_fits_in_with(fixture: Fixture, rows: usize, height: f32) -> Result<(), String> {
         let choices = &four_choices()[..rows];
-        let ink = painted(choices, height);
+        let ink = painted_as(fixture, choices, height);
         let win = window(height);
         let tiles = row_tiles(&ink);
         if tiles.len() != rows {
             return Err(format!(
-                "a {rows}-row card in a {height}pt window painted {} row tiles; the missing \
-                 ones were culled for being off the window entirely",
+                "a {rows}-row card ({}) in a {height}pt window painted {} row tiles; the \
+                 missing ones were culled for being off the window entirely",
+                fixture.name,
                 tiles.len()
             ));
         }
@@ -1350,28 +1603,275 @@ mod geometry_tests {
     /// hands to `NativeOptions` — reads the size back out of it, and paints a
     /// real card into exactly that many points. The screen rect is the
     /// requested size; the requested size is not the screen rect's source.
+    /// Re-pointed at [`FIXTURES`], not just the short one. That is the second
+    /// half of the finding this test was written for: it was well built and
+    /// it proved the *fixture's* card fits, while the card the user's own
+    /// item name produces was 82 points too tall for the same window.
     #[test]
     fn the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw() {
         let mut checked = 0;
-        for rows in 1..=4usize {
-            let requested = requested_inner_size(rows);
-            assert_eq!(
-                requested.x, OVERLAY_WIDTH,
-                "the overlay asked for a {}pt-wide window",
-                requested.x
-            );
-            if let Err(why) = card_fits_in(rows, requested.y) {
-                panic!(
-                    "the window the overlay asks the OS for with {rows} choice(s) is \
-                     {}pt tall, and the card it then draws does not fit in it: {why}. \
-                     This window is frameless and always-on-top -- no title bar, no \
-                     resize border, no scroll area -- so whatever is outside it is gone.",
-                    requested.y
+        for fixture in FIXTURES {
+            for rows in 1..=4usize {
+                let requested = requested_inner_size(rows);
+                assert_eq!(
+                    requested.x, OVERLAY_WIDTH,
+                    "the overlay asked for a {}pt-wide window",
+                    requested.x
                 );
+                if let Err(why) = card_fits_in_with(fixture, rows, requested.y) {
+                    panic!(
+                        "the window the overlay asks the OS for with {rows} choice(s) is \
+                         {}pt tall, and the card it then draws for the {:?} fixture does \
+                         not fit in it: {why}. This window is frameless and always-on-top \
+                         -- no title bar, no resize border, no scroll area -- so whatever \
+                         is outside it is gone.",
+                        requested.y, fixture.name
+                    );
+                }
+                checked += 1;
             }
-            checked += 1;
         }
-        assert_eq!(checked, 4, "the loop must have covered 1, 2, 3 and 4 rows");
+        assert_eq!(
+            checked,
+            FIXTURES.len() * 4,
+            "the loop must have covered every fixture at 1, 2, 3 and 4 rows"
+        );
+    }
+
+    /// **A row cannot grow the card, whatever its text says.**
+    ///
+    /// `card_fits_in` above answers "did anything get clipped", which is the
+    /// user-visible question but a *derived* one: it can only ever see as far
+    /// as the window's edge. This asks the direct one — how tall is the card
+    /// egui lays out — in a window far too big to cull or constrain anything,
+    /// so an overflowing card is measured rather than truncated by the
+    /// instrument.
+    ///
+    /// The expected heights are the four spelled out in
+    /// `the_four_card_heights_the_chrome_was_measured_from`, and they are
+    /// **not** derived from `overlay_height`, `CHROME_HEIGHT` or
+    /// `MEASURED_CHROME`: an assertion built out of the constants it is
+    /// checking is arithmetic, not a measurement.
+    ///
+    /// On the shipped code this failed at every adversarial fixture: 396pt for
+    /// four realistic rows, 444 with no spaces, 348 with CJK, against a 314pt
+    /// window.
+    #[test]
+    fn no_string_a_user_can_supply_makes_the_card_taller() {
+        /// Far taller than any card, so nothing is culled and no layout is
+        /// constrained -- an overflow is reported, not hidden.
+        const ROOMY: f32 = 900.0;
+        /// What a 1/2/3/4-row card needs, measured, spelled out.
+        const NEEDED: [f32; 4] = [154.0, 204.0, 254.0, 304.0];
+
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            for rows in 1..=4usize {
+                let choices = &four_choices()[..rows];
+                let ctx = styled_ctx();
+                let mut needed = f32::NAN;
+                let _ = ctx.run_ui(sized(ROOMY), |ui| {
+                    draw_overlay_card_rows(
+                        ui,
+                        fixture.app,
+                        fixture.item,
+                        Some(fixture.user),
+                        choices,
+                    );
+                    needed = ui.min_rect().bottom();
+                });
+                assert!(
+                    needed.is_finite() && needed > 0.0,
+                    "the card allocated no space at all for {:?}",
+                    fixture.name
+                );
+                assert_eq!(
+                    needed, NEEDED[rows - 1],
+                    "a {rows}-row card drawn with the {:?} fixture needs {needed}pt, not \
+                     {}pt. The row is content-sized again: its text grew the card, and \
+                     the window is a fixed {}pt with no scrollbar, no resize border and \
+                     no title bar, so the difference is gone for good.",
+                    fixture.name,
+                    NEEDED[rows - 1],
+                    overlay_height(rows)
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, FIXTURES.len() * 4);
+
+        // THE CONTROL, and it is the load-bearing half: the fixtures must
+        // really be strings that a wrapping row would have wrapped. Without
+        // this, four short strings would pass the loop above and prove
+        // nothing at all. Laid out at the width the row's text column really
+        // gets, with wrapping ON -- which is what the row used to do.
+        let ctx = styled_ctx();
+        let width = text_column_width();
+        let mut wrapped = 0;
+        for fixture in FIXTURES.iter().filter(|f| f.name != SHORT.name) {
+            let (_, secondary) = row_text(fixture.app, fixture.item, Some(fixture.user));
+            let rows_taken = ctx.fonts_mut(|fonts| {
+                fonts
+                    .layout(
+                        secondary.clone(),
+                        egui::FontId::proportional(11.0),
+                        theme::TEXT_FAINT,
+                        width,
+                    )
+                    .rows
+                    .len()
+            });
+            assert!(
+                rows_taken > 1,
+                "the {:?} fixture's secondary line ({secondary:?}) fits on one line at \
+                 {width}pt even when wrapped, so it is not an adversarial fixture and the \
+                 assertions above prove nothing",
+                fixture.name
+            );
+            wrapped += 1;
+        }
+        assert_eq!(wrapped, FIXTURES.len() - 1);
+
+        // ...and the short fixture is the other side of the control: it does
+        // NOT wrap, which is exactly why measuring off it alone hid the bug.
+        let (_, short_secondary) = row_text(SHORT.app, SHORT.item, Some(SHORT.user));
+        assert_eq!(
+            ctx.fonts_mut(|fonts| fonts
+                .layout(
+                    short_secondary,
+                    egui::FontId::proportional(11.0),
+                    theme::TEXT_FAINT,
+                    width
+                )
+                .rows
+                .len()),
+            1
+        );
+    }
+
+    /// The width the row's text column really gets, computed the way
+    /// `credential_row` computes it, from the card's real geometry.
+    ///
+    /// Measured off the painted card rather than restated: the row tile's own
+    /// width, less the tile's 10pt horizontal inner margins, less the 28pt
+    /// avatar and the 2pt after it, less [`CHIP_LANE`].
+    fn text_column_width() -> f32 {
+        let tile = row_tiles(&painted(&four_choices()[..1], overlay_height(1)))[0];
+        tile.width() - 2.0 * 10.0 - 28.0 - 2.0 - CHIP_LANE
+    }
+
+    /// [`CHIP_LANE`] against the chip that is really painted.
+    ///
+    /// The row's text is bounded by being given an explicit width, and that
+    /// width is "everything except the chip's lane". If the lane were too
+    /// narrow the `Enter` chip would be pushed past the right-hand edge of a
+    /// window with no horizontal scrolling — trading a clipped row for a
+    /// clipped chip is not a fix. So the chip is measured where it lands, and
+    /// the text is asserted to stop before it.
+    ///
+    /// Both facts, and both are needed: a lane wide enough for the chip is
+    /// useless if the text is allowed to run underneath it.
+    #[test]
+    fn the_enter_chip_has_a_lane_of_its_own_and_the_text_stops_short_of_it() {
+        let mut checked = 0;
+        for fixture in FIXTURES {
+            let ink = painted_as(fixture, &four_choices()[..1], overlay_height(1));
+            let tile = row_tiles(&ink)[0];
+            let chip = ink
+                .iter()
+                .filter(|i| i.glyphs.as_deref() == Some("Enter"))
+                .map(|i| i.rect)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                chip.len(),
+                1,
+                "the selected row painted {} `Enter` chips for the {:?} fixture",
+                chip.len(),
+                fixture.name
+            );
+            let chip = chip[0];
+            assert!(
+                fits(chip, window(overlay_height(1))),
+                "the `Enter` chip paints at {chip:?} for the {:?} fixture, outside the \
+                 window; the text column took the lane",
+                fixture.name
+            );
+            // The lane really is a lane: the chip's ink starts within
+            // CHIP_LANE of the tile's right-hand inner edge.
+            assert!(
+                chip.left() >= tile.right() - CHIP_LANE - 0.5,
+                "the `Enter` chip starts at {} for the {:?} fixture, further left than the \
+                 {CHIP_LANE}pt lane reserved for it (tile right edge {})",
+                chip.left(),
+                fixture.name,
+                tile.right()
+            );
+            // And nothing else in the row reaches into it. The chip's own two
+            // runs are excluded by rect, not by glyphs, so a *label* that
+            // happened to read "Enter" is still caught.
+            for run in ink.iter().filter(|i| i.glyphs.is_some()) {
+                if run.rect == chip {
+                    continue;
+                }
+                if !tile.contains(run.rect.center()) {
+                    continue; // header and footer, not this row
+                }
+                assert!(
+                    run.rect.right() <= chip.left() + 0.5,
+                    "the row's text run {:?} for the {:?} fixture runs to {}, into the \
+                     `Enter` chip's lane which starts at {}",
+                    run.glyphs,
+                    fixture.name,
+                    run.rect.right(),
+                    chip.left()
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= FIXTURES.len() * 2,
+            "expected at least the two text lines of each fixture's row to have been \
+             checked against the chip; only {checked} runs were"
+        );
+    }
+
+    /// The header names the number of rows the card is really about to draw.
+    ///
+    /// It was the literal `"1 match"`, which was true only while the overlay
+    /// could show exactly one row. Both halves are checked against the
+    /// painted glyphs, not against the function: the string the user reads is
+    /// the claim.
+    #[test]
+    fn the_header_counts_the_rows_the_card_actually_draws() {
+        assert_eq!(match_count_label(1), "1 match");
+        assert_eq!(match_count_label(2), "2 matches");
+        assert_eq!(match_count_label(4), "4 matches");
+        // An empty slice still paints one row, so it is still one match.
+        assert_eq!(match_count_label(0.max(1)), "1 match");
+
+        // ...and on the card itself.
+        for (choices, expected) in [
+            (&four_choices()[..1], "1 match"),
+            (&four_choices()[..4], "4 matches"),
+        ] {
+            let ink = painted(choices, overlay_height(choices.len()));
+            glyph_run(&ink, expected);
+            let stale = if expected == "1 match" {
+                "4 matches"
+            } else {
+                "1 match"
+            };
+            assert_eq!(
+                ink.iter()
+                    .filter(|i| i.glyphs.as_deref() == Some(stale))
+                    .count(),
+                0,
+                "the header read {stale:?} on a {}-row card",
+                choices.len()
+            );
+        }
+        // The card production still draws with no choices at all.
+        glyph_run(&painted(&[], overlay_height(1)), "1 match");
     }
 
     /// POSITIVE CONTROL for the test above: `card_fits_in` can say no.

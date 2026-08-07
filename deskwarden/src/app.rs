@@ -18,18 +18,26 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
-/// The overlay's fixed width (must match `overlay_ui::show_prompt_overlay`'s
-/// `with_inner_size`) -- needed here to clamp its position on-screen before
-/// the window exists to measure.
+/// The overlay's fixed width -- needed here to clamp its position on-screen
+/// before the window exists to measure.
 ///
-/// **The height is deliberately NOT a constant here.** It was `164.0`, the
-/// one-row card's height, and the card now grows by `ROW_HEIGHT` per choice
+/// **Imported, not re-declared.** This was a second `const OVERLAY_WIDTH: f32
+/// = 396.0` carrying a "must match `overlay_ui`" comment, and a comment is
+/// not an enforcement: `overlay_position`'s own tests assert against *this*
+/// file's copy, so the pair were self-consistent and blind to each other
+/// drifting apart. It is precisely the duplication `adcb346` deleted
+/// `OVERLAY_HEIGHT` to be rid of, left standing on the width. There is now
+/// one definition, in the module that hands it to `with_inner_size`, and this
+/// name is an alias for it.
+///
+/// **The height is deliberately still not a constant here.** It was `164.0`,
+/// the one-row card's height, and the card grows by `ROW_HEIGHT` per choice
 /// row: a four-row card is 314pt, so clamping it as if it were 164pt leaves
 /// 150pt of a frameless, always-on-top, unscrollable window below the work
 /// area -- rows the user cannot see or click. The height comes from
 /// [`overlay_ui::overlay_height`] and the row count, from the one place that
 /// knows both.
-const OVERLAY_WIDTH: f32 = 396.0;
+use crate::overlay_ui::OVERLAY_WIDTH;
 /// Gap between the field/window edge and the overlay, so it doesn't sit
 /// flush against the thing it's about to fill.
 const OVERLAY_GAP: f32 = 10.0;
@@ -1190,7 +1198,14 @@ mod tests {
         // still the right number -- for a card that really has one row.
         let (x, y) = clamp_into_work_area(WORK, 5000.0, 1000.0, 1);
         assert_eq!(y, WORK.3 - 164.0);
-        assert_eq!(x, WORK.2 - OVERLAY_WIDTH);
+        // Fully qualified, deliberately: the point of the width being imported
+        // is that there is ONE of it, and a re-declared local `const
+        // OVERLAY_WIDTH` in this file would be picked up by a bare
+        // `OVERLAY_WIDTH` here just as it would by the clamp -- leaving the
+        // two agreeing with each other and blind to `overlay_ui`. Naming the
+        // module makes this an assertion about the width the WINDOW is built
+        // at, which is the only width that matters.
+        assert_eq!(x, WORK.2 - crate::overlay_ui::OVERLAY_WIDTH);
     }
 
     #[test]
