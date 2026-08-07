@@ -191,37 +191,61 @@ impl eframe::App for OverlayApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let mut done = false;
 
         // The overlay is keyboard-first (design 2a's footer: "↵ Fill · Esc
         // Dismiss"): Enter fills, Esc dismisses, no focus juggling needed.
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            *self.chosen.borrow_mut() = Some(primary_choice(&self.choices));
-            done = true;
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            done = true;
-        }
+        // The decision itself is `keyboard_action`, because this function
+        // cannot be called by a test -- it needs an `eframe::Frame` and a real
+        // window -- and "Esc dismisses" is not a claim that may live only
+        // where nothing can check it.
+        let keys = keyboard_action(
+            ctx.input(|i| i.key_pressed(egui::Key::Enter)),
+            ctx.input(|i| i.key_pressed(egui::Key::Escape)),
+            &self.choices,
+        );
 
-        match draw_overlay_card_rows(
+        let card = draw_overlay_card_rows(
             ui,
             &self.app_name,
             &self.item_name,
             self.username.as_deref(),
             &self.choices,
-        ) {
+        );
+
+        let done = match if keys == OverlayAction::None { card } else { keys } {
             OverlayAction::Fill(choice) => {
                 *self.chosen.borrow_mut() = Some(choice);
-                done = true;
+                true
             }
-            OverlayAction::Dismiss => done = true,
-            OverlayAction::None => {}
-        }
+            OverlayAction::Dismiss => true,
+            OverlayAction::None => false,
+        };
 
         if done {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
+}
+
+/// What the keyboard did to the card this frame.
+///
+/// **Esc answers [`OverlayAction::Dismiss`], never a fill.** It is the one
+/// control the user reaches for to say "no" to a window that appeared over the
+/// app they were typing in, and an Esc that answered `Some(primary)` would
+/// type their password into whatever has focus. That is a behavioural claim
+/// now rather than three statements inside `OverlayApp::ui`, which no test in
+/// this crate may execute.
+///
+/// Enter outranks Esc when a frame somehow carries both, which is the
+/// behaviour this had when the two were separate `if`s.
+fn keyboard_action(enter: bool, escape: bool, choices: &[FillChoice]) -> OverlayAction {
+    if enter {
+        return OverlayAction::Fill(primary_choice(choices));
+    }
+    if escape {
+        return OverlayAction::Dismiss;
+    }
+    OverlayAction::None
 }
 
 /// What the user did to the overlay card on this frame.
@@ -1121,9 +1145,49 @@ mod geometry_tests {
         assert_ne!(choices[0], *choices.last().unwrap());
 
         assert_eq!(primary_choice(&choices), FillChoice::Just(FieldRef::Password));
+        // And through the keyboard, which is the path that actually reaches
+        // the user: Enter, not a click, not the card.
+        assert_eq!(
+            keyboard_action(true, false, &choices),
+            OverlayAction::Fill(FillChoice::Just(FieldRef::Password))
+        );
         // And with no choices at all -- the card production still draws --
         // Enter is the fill it has always been.
         assert_eq!(primary_choice(&[]), FillChoice::Saved);
+        assert_eq!(
+            keyboard_action(true, false, &[]),
+            OverlayAction::Fill(FillChoice::Saved)
+        );
+    }
+
+    /// **Esc dismisses, and dismissing is not a fill.** An Esc that answered
+    /// `Some(primary)` -- one line, and the same shape as the Enter arm right
+    /// above it -- types the user's password into the app they just said no
+    /// to. Nothing else in this module could see it: `OverlayApp::ui` needs a
+    /// real window.
+    #[test]
+    fn escape_dismisses_and_answers_no_choice() {
+        let choices = four_choices();
+        assert_eq!(keyboard_action(false, true, &choices), OverlayAction::Dismiss);
+        assert_eq!(keyboard_action(false, true, &[]), OverlayAction::Dismiss);
+        // Not a fill of anything, spelled out so a `Fill` variant added later
+        // cannot slip past an equality against one particular value.
+        assert!(!matches!(
+            keyboard_action(false, true, &choices),
+            OverlayAction::Fill(_)
+        ));
+        // The controls: the instrument does report fills, and reports nothing
+        // when nothing was pressed.
+        assert!(matches!(
+            keyboard_action(true, false, &choices),
+            OverlayAction::Fill(_)
+        ));
+        assert_eq!(keyboard_action(false, false, &choices), OverlayAction::None);
+        // Both at once: the fill wins, as it did when these were two `if`s.
+        assert_eq!(
+            keyboard_action(true, true, &choices),
+            OverlayAction::Fill(choices[0].clone())
+        );
     }
 
     /// **The viewport is sized for the rows it was given.**
