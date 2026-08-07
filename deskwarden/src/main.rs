@@ -2911,6 +2911,18 @@ struct SessionEstate {
     settings: settings::Settings,
 }
 
+/// Compile-time proof of the `Send` claim above.
+///
+/// The doc says every field is `Send` and that it is not decoration: the
+/// queued in-window lock parks this behind an `Arc<Mutex<_>>` and reads it
+/// back on a deadline, the panic and the happy path alike. A field that stops
+/// being `Send` must fail the BUILD rather than a review, so the claim is
+/// written as a bound the compiler checks rather than as prose.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SessionEstate>();
+};
+
 /// The immutable half of what a vault session runs against: borrowed, never
 /// mutated, never in the estate.
 ///
@@ -7395,6 +7407,845 @@ mod tests {
         production
     }
 
+    /// **The seam `SessionEstate` created, and the three doc claims that
+    /// nothing else holds to.**
+    ///
+    /// `open_vault_window` takes `&mut SessionEstate` and destructures it on
+    /// its first statement into names spelled exactly as the eight `&mut`
+    /// parameters it replaced, which is why not one line inside its loop had
+    /// to change. That destructure is now the only thing standing between
+    /// `main`'s session state and a second copy of it -- and at the time it
+    /// was written nothing reached it. A two-line edit to the destructure,
+    ///
+    /// ```text
+    ///     settings: estate_settings,
+    /// } = estate;
+    /// let mut settings_copy = estate_settings.clone();
+    /// let settings = &mut settings_copy;
+    /// ```
+    ///
+    /// compiles, warns about nothing and passes every other test in this
+    /// file, while every preference edit is discarded from `main`'s view: the
+    /// auto-lock timeout and `keep_backend_running` silently revert on the
+    /// next vault window even though the disk write still happened, so the
+    /// running app disagrees with its own settings file. Before the estate
+    /// that parameter WAS `main`'s `&mut settings` and the divorce was not
+    /// spellable. The estate made it spellable; this module is what makes it
+    /// unspellable again.
+    ///
+    /// **The one narrowing that is allowed, and why it is safe.** A
+    /// destructure of `&mut SessionEstate` binds `cache` as `&mut Arc<_>`
+    /// while the body has always held `&Arc<_>`, so the destructure is
+    /// followed by `let cache: &Arc<VaultCache> = cache;`. That is a reborrow
+    /// of the same borrow, not a second value: it points at the estate's own
+    /// `Arc`, the estate keeps it, and nothing can be written through it, so
+    /// no edit can be stranded behind it. It is permitted by exact text, once,
+    /// and every other re-binding of every other name is refused.
+    ///
+    /// Every scan below runs over `code_only`'s output, so a `.clone()`
+    /// written in prose -- this doc comment contains several -- is not a
+    /// failure. `code_only` is a hand-written lexer and a bug in it that
+    /// SWALLOWED code would be a hole rather than a false positive, so every
+    /// span sliced here carries a size bound and a positive marker, the way
+    /// the neighbouring guards do, and every scanner has controls in both
+    /// directions.
+    mod the_estate_is_the_only_copy {
+        use super::production_half_of_this_file;
+        use super::what_a_finished_vault_session_means::code_only;
+
+        /// Whitespace runs collapsed to one space, so a needle survives
+        /// rustfmt moving a line break.
+        fn squeeze(source: &str) -> String {
+            source.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+
+        /// The production half with every comment, string body and character
+        /// literal blanked, so every scan below is about CODE.
+        fn production_code() -> String {
+            let raw = production_half_of_this_file();
+            let code = code_only(raw);
+            assert!(
+                code.len() < raw.len(),
+                "control: `code_only` stripped nothing at all from the production half, so \
+                 every scan below would be running over prose as well as code"
+            );
+            assert!(
+                raw.contains("do not clone or take"),
+                "control: the estate's own doc comment is not in the raw production half, so \
+                 this is not the file these guards think it is"
+            );
+            assert!(
+                !code.contains("do not clone or take"),
+                "control: `code_only` left a doc comment standing, so a `.clone()` written \
+                 only in prose could fail any guard below for no reason"
+            );
+            code
+        }
+
+        /// The text between the braces opened by `head`, matched by depth.
+        ///
+        /// `head` must end at its own `{`. The slice is fenced by the caller;
+        /// here it is fenced by existing exactly once and by being closed at
+        /// all -- a slice that silently ran to the end of the file panics.
+        fn braced_after(code: &str, head: &str, what: &str) -> String {
+            assert_eq!(
+                code.matches(head).count(),
+                1,
+                "{head:?} does not appear exactly once in the production code, so {what} \
+                 cannot be sliced and every assertion over it would be about nothing"
+            );
+            let at = code.find(head).expect("counted one, found none");
+            let open = at + head.len() - 1;
+            assert_eq!(
+                &code[open..=open],
+                "{",
+                "{head:?} does not end at its own opening brace, so {what} is being sliced \
+                 from the wrong offset"
+            );
+            let rest = &code[open + 1..];
+            let mut depth = 1usize;
+            for (offset, ch) in rest.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return rest[..offset].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{what} is never closed -- the slice ran to the end of the production half");
+        }
+
+        /// True when `src[i..]` is `word` with no identifier character on
+        /// either side of it.
+        fn word_at(src: &[char], i: usize, word: &str) -> bool {
+            let w: Vec<char> = word.chars().collect();
+            if i + w.len() > src.len() || src[i..i + w.len()] != w[..] {
+                return false;
+            }
+            let ident = |c: char| c.is_alphanumeric() || c == '_';
+            let before_ok = i == 0 || !ident(src[i - 1]);
+            let after_ok = src.get(i + w.len()).is_none_or(|c| !ident(*c));
+            before_ok && after_ok
+        }
+
+        /// How many `let` bindings in `code` bind the name `name`, at any
+        /// depth, with any whitespace, with or without `mut`, and including a
+        /// tuple or slice pattern that happens to contain the name.
+        ///
+        /// This is the scanner that decides whether a destructured estate
+        /// binding has been re-pointed at a second value. Its controls are
+        /// `the_let_scanner_sees_the_divorce_however_it_is_spelled`.
+        fn let_bindings_of(code: &str, name: &str) -> usize {
+            let src: Vec<char> = code.chars().collect();
+            let mut count = 0usize;
+            for i in 0..src.len() {
+                if !word_at(&src, i, "let") {
+                    continue;
+                }
+                let mut j = i + 3;
+                loop {
+                    while j < src.len() && src[j].is_whitespace() {
+                        j += 1;
+                    }
+                    if word_at(&src, j, "mut") {
+                        j += 3;
+                        continue;
+                    }
+                    break;
+                }
+                if word_at(&src, j, name) {
+                    count += 1;
+                    continue;
+                }
+                // A destructuring `let` -- `let (a, settings) = ...` re-points
+                // the name just as surely as a plain one does.
+                if src.get(j) == Some(&'(') || src.get(j) == Some(&'[') {
+                    let close = if src[j] == '(' { ')' } else { ']' };
+                    let open = src[j];
+                    let mut depth = 0usize;
+                    let mut k = j;
+                    while k < src.len() {
+                        if src[k] == open {
+                            depth += 1;
+                        } else if src[k] == close {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    if (j..k.min(src.len())).any(|p| word_at(&src, p, name)) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+
+        /// The name each of the estate's fields is bound to by
+        /// `open_vault_window`'s destructure -- pinned, not read off the
+        /// source.
+        ///
+        /// **This is the guard that a rename cannot walk around.** Checking only
+        /// that a field is bound to SOME plain name is not enough, and the first
+        /// draft of this module was not: the survivor binds `settings:
+        /// estate_settings` and then writes its own `let settings = &mut
+        /// settings_copy;`, so the name the loop below actually reads is a copy
+        /// while the name the pattern bound is untouched. A scan for re-bindings
+        /// of the PATTERN's names sees nothing, because `estate_settings` really
+        /// is never re-bound. The loop body was written against `main`'s eight
+        /// `&mut` locals and still spells them exactly as it did -- that is why
+        /// the refactor's diff has no hunk inside the loop -- so the mapping is
+        /// one-to-one and fixed, and changing it is a decision that should cost a
+        /// test edit.
+        ///
+        /// The field names are NOT scanned for re-binding: `token` and `details`
+        /// are ordinary local names elsewhere in this function (an authenticated
+        /// switch's token, the account details a window opens with) and banning
+        /// them would be noise. The canonical BOUND names are scanned instead,
+        /// and none of them is a plausible local.
+        const BINDINGS: [(&str, &str); 10] = [
+            ("cache", "cache"),
+            ("engine", "engine"),
+            ("child", "bw_serve_child"),
+            ("token", "session_token"),
+            ("details", "cached_status_details"),
+            ("task_in_progress", "backend_task_in_progress"),
+            ("store", "store"),
+            ("active_account", "active_account"),
+            ("accounts", "accounts"),
+            ("settings", "settings"),
+        ];
+
+        /// The names `SessionEstate` declares, read off the struct rather than
+        /// listed here, so a field added tomorrow is guarded today.
+        fn estate_fields() -> Vec<String> {
+            let code = production_code();
+            let body = braced_after(
+                &code,
+                concat!("struct Session", "Estate {"),
+                "the estate's field list",
+            );
+            assert!(
+                (60..4000).contains(&body.len()),
+                "the sliced `SessionEstate` field list is {} bytes, which is not a field list -- \
+                 the slice found the wrong brace",
+                body.len()
+            );
+            let mut names = Vec::new();
+            for line in body.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let (name, _) = line.split_once(':').unwrap_or_else(|| {
+                    panic!(
+                        "`{line}` in `SessionEstate`'s field list is not a `name: type` field, \
+                         so the field set these guards work from is incomplete"
+                    )
+                });
+                names.push(name.trim().to_string());
+            }
+            assert!(
+                names.len() >= 10,
+                "`SessionEstate` parsed as {} fields; it has had ten since it was introduced, so \
+                 the parse dropped some and every per-field guard below is partly vacuous",
+                names.len()
+            );
+            for expected in [
+                "cache",
+                "engine",
+                "child",
+                "token",
+                "details",
+                "task_in_progress",
+                "store",
+                "active_account",
+                "accounts",
+                "settings",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "control: `{expected}` is one of the ten session locals the estate was made \
+                     from and the field parser did not see it"
+                );
+            }
+            names
+        }
+
+        /// `open_vault_window`'s estate destructuring PATTERN -- the text
+        /// between `let SessionEstate {` and the `}` of `} = estate;`.
+        fn estate_destructure() -> String {
+            let code = production_code();
+            let pattern = braced_after(
+                &code,
+                concat!("let Session", "Estate {"),
+                "`open_vault_window`'s estate destructure",
+            );
+            assert!(
+                (60..4000).contains(&pattern.len()),
+                "the sliced estate destructure is {} bytes, which is not a ten-field pattern",
+                pattern.len()
+            );
+            assert!(
+                !pattern.contains(';'),
+                "the sliced estate destructure contains a `;`, so it is not a pattern: the slice \
+                 ran past `}} = estate;` and every assertion over it is about the wrong text"
+            );
+            for marker in ["cache", "settings", "engine"] {
+                assert!(
+                    pattern.contains(marker),
+                    "control: `{marker}` is not in the sliced destructure, so the slice is not \
+                     the estate's"
+                );
+            }
+            pattern
+        }
+
+        /// `open_vault_window`'s whole body, as code.
+        fn open_vault_window_code() -> String {
+            let code = production_code();
+            let head = concat!("fn open_vault_", "window(");
+            assert_eq!(
+                code.matches(head).count(),
+                1,
+                "`open_vault_window` is not declared exactly once in the production code"
+            );
+            let at = code.find(head).expect("counted one, found none");
+            let after = &code[at..];
+            let open = after
+                .find('{')
+                .expect("`open_vault_window` has no body to slice");
+            let rest = &after[open + 1..];
+            let mut depth = 1usize;
+            for (offset, ch) in rest.char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = &rest[..offset];
+                            assert!(
+                                (10_000..80_000).contains(&body.len()),
+                                "the sliced `open_vault_window` body is {} bytes, which is not \
+                                 the vault loop",
+                                body.len()
+                            );
+                            for marker in [
+                                concat!("let Session", "Estate {"),
+                                concat!("let Vault", "Deps {"),
+                                concat!("vault_follow", "_up("),
+                            ] {
+                                assert!(
+                                    body.contains(marker),
+                                    "control: {marker:?} is not in the sliced body, so this is \
+                                     not `open_vault_window`"
+                                );
+                            }
+                            assert!(
+                                !body.contains(concat!("fn ma", "in(")),
+                                "the slice ran past the end of `open_vault_window` and swept up \
+                                 `main`, whose own locals are not the estate's bindings"
+                            );
+                            return body.to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("`open_vault_window`'s body is never closed");
+        }
+
+        /// Whether `code` gives the type declared at byte offset `at` a
+        /// `Clone`, by a `derive` in the attribute region that immediately
+        /// precedes the declaration.
+        ///
+        /// The region runs back to the end of the previous item -- the last
+        /// line before the declaration whose code ends in `}` or `;`. Doc
+        /// comments are already blank by the time this sees them, so an
+        /// attribute written above the doc comment is inside the region too.
+        fn derives_clone_at(code: &str, at: usize) -> bool {
+            let head = &code[..at];
+            let mut region_start = 0usize;
+            let mut offset = 0usize;
+            let mut boundary_seen = false;
+            for line in head.split_inclusive('\n') {
+                let trimmed = line.trim();
+                if trimmed.ends_with('}') || trimmed.ends_with(';') {
+                    region_start = offset + line.len();
+                    boundary_seen = true;
+                }
+                offset += line.len();
+            }
+            assert!(
+                boundary_seen,
+                "control: nothing that ends an item precedes the declaration at byte {at}, so \
+                 the attribute region would be the whole file"
+            );
+            let region = &head[region_start..];
+            assert!(
+                region.len() < 2000,
+                "the attribute region before the declaration at byte {at} is {} bytes -- the \
+                 walk back over-ran and a `derive` on some other type would be read as this \
+                 one's",
+                region.len()
+            );
+            region.contains("derive") && region.contains("Clone")
+        }
+
+        /// Every `struct X` / `enum X` declaration in `code`, as `(name,
+        /// offset of the keyword)`.
+        fn type_declarations(code: &str) -> Vec<(String, usize)> {
+            let src: Vec<char> = code.chars().collect();
+            let mut byte_of: Vec<usize> = Vec::with_capacity(src.len());
+            let mut running = 0usize;
+            for ch in &src {
+                byte_of.push(running);
+                running += ch.len_utf8();
+            }
+            let mut out = Vec::new();
+            for (i, byte) in byte_of.iter().copied().enumerate() {
+                let keyword = if word_at(&src, i, "struct") {
+                    6
+                } else if word_at(&src, i, "enum") {
+                    4
+                } else {
+                    continue;
+                };
+                let mut j = i + keyword;
+                while j < src.len() && src[j].is_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < src.len() && (src[j].is_alphanumeric() || src[j] == '_') {
+                    j += 1;
+                }
+                if j > start {
+                    out.push((src[start..j].iter().collect::<String>(), byte));
+                }
+            }
+            out
+        }
+
+        // ---------------------------------------------------------------
+        // Finding 1: the destructure is the only way out of the estate.
+        // ---------------------------------------------------------------
+
+        /// Every field of the estate is bound STRAIGHT off the estate, by a
+        /// plain name, with nothing copied on the way out.
+        #[test]
+        fn every_estate_field_is_bound_straight_off_the_estate() {
+            let fields = estate_fields();
+            let pattern = estate_destructure();
+
+            for banned in [
+                ".clone()",
+                ".to_owned()",
+                ".to_vec()",
+                ".cloned()",
+                ".copied()",
+                "ref ",
+                "..",
+            ] {
+                assert!(
+                    !pattern.contains(banned),
+                    "`open_vault_window`'s estate destructure contains {banned:?}. A destructure \
+                     BINDS; anything that copies here hands the loop a second value, and every \
+                     edit the loop makes to it is discarded the moment this function returns -- \
+                     with the disk write already done, so the running app disagrees with its own \
+                     settings file"
+                );
+            }
+
+            let mut bound: Vec<(String, String)> = Vec::new();
+            for entry in pattern.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                let (field, binding) = match entry.split_once(':') {
+                    Some((f, b)) => (f.trim(), b.trim()),
+                    None => (entry, entry),
+                };
+                assert!(
+                    fields.iter().any(|f| f == field),
+                    "`{field}` is destructured out of the estate but is not one of its fields, \
+                     so this pattern is not being read correctly"
+                );
+                assert!(
+                    !binding.is_empty()
+                        && binding
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !binding.starts_with(|c: char| c.is_ascii_digit()),
+                    "the estate's `{field}` is bound as `{binding}`, which is not a plain name. \
+                     A destructure binds the estate's own field; anything else is a second value \
+                     and the loop's edits to `{field}` never reach `main`"
+                );
+                bound.push((field.to_string(), binding.to_string()));
+            }
+
+            assert!(
+                !bound.is_empty(),
+                "control: the destructure parsed as zero bindings, so every assertion in this \
+                 loop ran zero times"
+            );
+            assert_eq!(
+                bound.len(),
+                fields.len(),
+                "`SessionEstate` has {} fields but `open_vault_window` destructures {} of them. \
+                 A pattern that names fewer cannot compile without a `..`, and a `..` is how a \
+                 field gets reached through a second binding instead of this one",
+                fields.len(),
+                bound.len()
+            );
+            for field in &fields {
+                assert!(
+                    bound.iter().any(|(f, _)| f == field),
+                    "`{field}` is a field of `SessionEstate` that `open_vault_window` does not \
+                     destructure. Every field goes through this one pattern or the estate stops \
+                     being the single copy it exists to be"
+                );
+                assert!(
+                    BINDINGS.iter().any(|(f, _)| f == field),
+                    "`{field}` is a field of `SessionEstate` that `BINDINGS` does not name. A \
+                     new field is a new name the loop reads, and which name that is has to be \
+                     decided here rather than inferred from whatever the destructure happens \
+                     to say"
+                );
+            }
+            assert_eq!(
+                BINDINGS.len(),
+                fields.len(),
+                "`BINDINGS` names {} of `SessionEstate`'s {} fields",
+                BINDINGS.len(),
+                fields.len()
+            );
+            for (field, expected) in BINDINGS {
+                let actual = bound
+                    .iter()
+                    .find(|(f, _)| f == field)
+                    .map(|(_, b)| b.as_str())
+                    .unwrap_or_else(|| {
+                        panic!("`{field}` is not destructured out of the estate at all")
+                    });
+                assert_eq!(
+                    actual, expected,
+                    "the estate's `{field}` is bound as `{actual}`, not `{expected}`. That is \
+                     how the divorce is spelled: bind the field to a NEW name, then make a \
+                     `{expected}` of your own out of a clone, and the loop below goes on \
+                     reading `{expected}` while the estate's field is never touched again. \
+                     Every edit the window makes is dropped when this function returns, with \
+                     the side effects already committed -- a preference written to disk that \
+                     `main` never sees, an auto-lock timeout that reverts on the next window. \
+                     Nothing in the pattern's own shape can catch this, because the name the \
+                     pattern bound really is never re-bound"
+                );
+            }
+        }
+
+        /// None of the names the destructure binds is re-pointed at a second
+        /// value anywhere in the function -- except the one documented
+        /// reborrow of `cache`, which is permitted by exact text.
+        #[test]
+        fn no_estate_binding_is_re_pointed_at_a_second_value() {
+            let body = open_vault_window_code();
+            let pattern = estate_destructure();
+
+            assert_eq!(
+                let_bindings_of(&body, "follow_up"),
+                1,
+                "control: the `let` scanner cannot see `let follow_up = ...`, which this body \
+                 certainly contains, so every count below is zero for the wrong reason"
+            );
+
+            let narrowing = "let cache: &Arc<VaultCache> = cache;";
+            assert_eq!(
+                squeeze(&body).matches(&squeeze(narrowing)).count(),
+                1,
+                "the one permitted re-binding, {narrowing:?}, is not in `open_vault_window` \
+                 exactly once. It is a reborrow of the estate's own `Arc` down to the shared \
+                 borrow this body has always held -- nothing can be written through it, so \
+                 nothing can be stranded behind it. Any OTHER shape of `let cache` is a second \
+                 value and is refused below"
+            );
+
+            assert!(
+                !pattern.is_empty(),
+                "control: the destructure sliced empty, so nothing below is anchored to it"
+            );
+            let mut checked = 0usize;
+            for (field, binding) in BINDINGS {
+                checked += 1;
+                let found = let_bindings_of(&body, binding);
+                let allowed = usize::from(binding == "cache");
+                assert_eq!(
+                    found,
+                    allowed,
+                    "`{binding}` (the estate's `{field}`) is `let`-bound {found} times inside \
+                     `open_vault_window`; {allowed} is the only count that keeps it the estate's. \
+                     A second binding of this name divorces the loop from `main`: the window goes \
+                     on editing a copy, the copy is dropped at the end of the call, and `main` \
+                     reads the value it had before -- with every side effect the loop performed \
+                     already committed"
+                );
+            }
+            assert!(
+                checked >= 10,
+                "control: only {checked} bindings were checked, so this guard is mostly vacuous"
+            );
+        }
+
+        /// The `let` scanner's controls, in both directions.
+        #[test]
+        fn the_let_scanner_sees_the_divorce_however_it_is_spelled() {
+            for (source, want) in [
+                ("let settings = &mut copy;", 1),
+                ("let  mut   settings = copy;", 1),
+                ("let\n    settings\n        = copy;", 1),
+                ("let mut settings=copy;", 1),
+                ("let (spare, settings) = pair;", 1),
+                ("let [settings] = one;", 1),
+                ("{ let settings = c; }", 1),
+                ("let settings_copy = e;", 0),
+                ("let copy = settings;", 0),
+                ("letters = settings;", 0),
+                ("estate.settings = x;", 0),
+                ("outlet settings", 0),
+            ] {
+                assert_eq!(
+                    let_bindings_of(source, "settings"),
+                    want,
+                    "the `let` scanner answered wrongly for {source:?}; a scanner that cannot \
+                     see a re-binding, or that fires on something that is not one, makes the \
+                     guard above either a hole or noise"
+                );
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Finding 2: the three doc claims, held to.
+        // ---------------------------------------------------------------
+
+        /// The `Send` claim is a bound the compiler checks, and the check is
+        /// still in the file.
+        ///
+        /// The bound itself is `const _: fn() = ...` in the production half;
+        /// if a field stops being `Send` the BUILD fails and this test never
+        /// runs. This test exists for the other direction: deleting the bound
+        /// would otherwise be silent.
+        #[test]
+        fn the_estates_send_claim_is_checked_by_the_compiler() {
+            let code = production_code();
+            assert_eq!(
+                code.matches(concat!("assert_send::<Session", "Estate>()")).count(),
+                1,
+                "the compile-time `Send` bound on `SessionEstate` is gone. The struct's doc says \
+                 every field is `Send` and that it is not decoration -- the queued in-window lock \
+                 parks this behind an `Arc<Mutex<_>>` and reads it back on a deadline. Without \
+                 the bound, a field that stops being `Send` is caught by a review or by nothing"
+            );
+        }
+
+        /// `MatchEngine` is not `Clone`, and cannot quietly become so.
+        ///
+        /// A cloned engine compiles -- it is two `HashMap`s -- and silently
+        /// divorces the armed autofill matches from the ones a resettle
+        /// rebuilds, which is the recorded obstacle-5 failure. Nothing but
+        /// this stops a `#[derive(Clone)]` landing on it.
+        #[test]
+        fn the_match_engine_cannot_be_cloned() {
+            let source = include_str!("match_engine.rs");
+            let code = code_only(source);
+            assert!(
+                code.len() < source.len(),
+                "control: `code_only` stripped nothing from `match_engine.rs`"
+            );
+
+            assert!(
+                !squeeze(&code).contains(concat!("Clone for Match", "Engine")),
+                "`match_engine.rs` implements `Clone` for `MatchEngine`. A cloned engine divorces \
+                 the armed autofill matches from the ones a resettle rebuilds: autofill goes \
+                 stale and no test says so"
+            );
+
+            let declarations = type_declarations(&code);
+            assert!(
+                !declarations.is_empty(),
+                "control: the declaration scanner found no type at all in `match_engine.rs`, \
+                 which declares one, so it is not working and the derive scan below points \
+                 at nothing"
+            );
+            let engine: Vec<_> = declarations
+                .iter()
+                .filter(|(name, _)| name == concat!("Match", "Engine"))
+                .collect();
+            assert_eq!(
+                engine.len(),
+                1,
+                "`MatchEngine` is not declared exactly once in `match_engine.rs`, so the derive \
+                 scan below has nothing to point at"
+            );
+            assert!(
+                !derives_clone_at(&code, engine[0].1),
+                "`MatchEngine` derives `Clone`. It is deliberately not `Clone`: the estate is \
+                 moved into, never copied out, and a cloned engine is the recorded obstacle-5 \
+                 failure made spellable again with the suite green"
+            );
+        }
+
+        /// The derive scanner's controls: it fires on every spelling a
+        /// `Clone` derive is written in, and on none of the near misses.
+        #[test]
+        fn the_derive_scanner_sees_a_clone_that_is_really_there() {
+            let engine = concat!("Match", "Engine");
+            let fires = [
+                ("plain", format!("use a::b;\n#[derive(Clone)]\npub struct {engine} {{}}")),
+                (
+                    "in a list",
+                    format!("use a::b;\n#[derive(Debug, Clone, Default)]\nstruct {engine} {{}}"),
+                ),
+                (
+                    "line-broken",
+                    format!("fn a() {{}}\n#[derive(\n    Debug,\n    Clone,\n)]\nstruct {engine} {{}}"),
+                ),
+                (
+                    "above the doc comment",
+                    format!("fn a() {{}}\n#[derive(Clone)]\n/// what it is\npub struct {engine} {{}}"),
+                ),
+                (
+                    "on an enum",
+                    format!("fn a() {{}}\n#[derive(Clone)]\nenum {engine} {{}}"),
+                ),
+            ];
+            for (what, source) in &fires {
+                let code = code_only(source);
+                let found = type_declarations(&code);
+                let at = found
+                    .iter()
+                    .find(|(name, _)| name == engine)
+                    .unwrap_or_else(|| panic!("control ({what}): the declaration scanner did not \
+                                               find `{engine}` in its own fixture"))
+                    .1;
+                assert!(
+                    derives_clone_at(&code, at),
+                    "control ({what}): the derive scanner does not see a `Clone` that IS there, \
+                     so the guard over `match_engine.rs` proves nothing"
+                );
+            }
+
+            let quiet = [
+                (
+                    "some other type derives it",
+                    format!("#[derive(Clone)]\nstruct Other {{}}\n\npub struct {engine} {{}}"),
+                ),
+                (
+                    "derives without Clone",
+                    format!("fn a() {{}}\n#[derive(Debug, Default)]\nstruct {engine} {{}}"),
+                ),
+                (
+                    "the word Clone in prose only",
+                    format!("fn a() {{}}\n/// deliberately not Clone, see derive above\nstruct {engine} {{}}"),
+                ),
+            ];
+            for (what, source) in &quiet {
+                let code = code_only(source);
+                let found = type_declarations(&code);
+                let at = found
+                    .iter()
+                    .find(|(name, _)| name == engine)
+                    .unwrap_or_else(|| panic!("control ({what}): the declaration scanner did not \
+                                               find `{engine}` in its own fixture"))
+                    .1;
+                assert!(
+                    !derives_clone_at(&code, at),
+                    "control ({what}): the derive scanner fires on something that is not a \
+                     `Clone` derive on this type, so the guard over `match_engine.rs` is noise"
+                );
+            }
+
+            // The fixtures above are hand-written. This one is not: it is the
+            // real, rustfmt-formatted source of the vault window, and at least
+            // one type in it really does derive `Clone`. It names no type, so
+            // a rename cannot make it lie.
+            let real = code_only(include_str!("vault_window/mod.rs"));
+            let declarations = type_declarations(&real);
+            assert!(
+                declarations.len() > 5,
+                "control: only {} type declarations in `vault_window/mod.rs`",
+                declarations.len()
+            );
+            assert!(
+                declarations
+                    .iter()
+                    .any(|(_, at)| derives_clone_at(&real, *at)),
+                "control: not one type in `vault_window/mod.rs` reads as deriving `Clone`, and \
+                 several do. The scanner's needle does not match what rustfmt actually writes, \
+                 so the `match_engine.rs` guard passes for free"
+            );
+        }
+
+        /// `VaultDeps` is the read-only half and stays that way.
+        ///
+        /// A `&'a mut` field here reintroduces exactly the split the estate
+        /// exists to remove: two owners of one piece of session state, one of
+        /// them reached through the struct that promises it never writes.
+        #[test]
+        fn no_vault_deps_field_is_a_mutable_borrow() {
+            let code = production_code();
+            let fields = braced_after(
+                &code,
+                concat!("struct Vault", "Deps<'a> {"),
+                "the `VaultDeps` field list",
+            );
+            assert!(
+                (60..3000).contains(&fields.len()),
+                "the sliced `VaultDeps` field list is {} bytes, which is not a field list",
+                fields.len()
+            );
+            for marker in ["fill_stats", "settings_path", "backend_op_tx"] {
+                assert!(
+                    fields.contains(marker),
+                    "control: `{marker}` is not in the sliced `VaultDeps` field list, so the \
+                     slice is not `VaultDeps`'"
+                );
+            }
+
+            let mut counted = 0usize;
+            for line in fields.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                counted += 1;
+                assert!(
+                    !squeeze(line).contains("mut"),
+                    "`VaultDeps` field `{line}` is a mutable borrow. `VaultDeps` is the half \
+                     that is only ever read: a field that starts being written is a field that \
+                     has moved to the wrong struct, and it puts a second writer next to the \
+                     estate that the estate cannot see"
+                );
+            }
+            assert!(
+                counted >= 8,
+                "control: only {counted} `VaultDeps` fields were checked; it has had eight since \
+                 it was introduced, so this guard is mostly vacuous"
+            );
+
+            // Controls, both directions, on the same line test.
+            assert!(squeeze("job: &'a mut Arc<Option<Job>>,").contains("mut"));
+            assert!(squeeze("job: &'a  mut  Arc<Option<Job>>,").contains("mut"));
+            assert!(squeeze("job: &mut Arc<Option<Job>>,").contains("mut"));
+            assert!(!squeeze("job: &'a Arc<Option<Job>>,").contains("mut"));
+            assert!(!squeeze("schedule: &'a [Duration],").contains("mut"));
+        }
+    }
+
     /// **What a finished vault session means -- the decision that used to be
     /// scattered over `open_vault_window`'s branches, and the defect that
     /// scattering shipped.**
@@ -7661,7 +8512,7 @@ mod tests {
         ///
         /// Blanking rather than deleting: a string becomes `""` and a char
         /// literal `' '`, so the code around them still parses as code.
-        fn code_only(source: &str) -> String {
+        pub(super) fn code_only(source: &str) -> String {
             let src: Vec<char> = source.chars().collect();
             let at = |i: usize| src.get(i).copied();
             // `'x'`, `'\n'`, `'\''` -- but NOT a lifetime, which has no
@@ -8651,7 +9502,7 @@ mod tests {
                 "expected exactly one place the drain caches what it was handed back: {block:?}"
             );
             assert!(
-                !block.contains(concat!("estate.details = Some(", "details);")),
+                !block.contains(concat!("estate.details = Some(", "details")),
                 "the RAW prefetch is cached rather than what the guarded function handed back, \
                  so a dropped answer is cached anyway: {block:?}"
             );
