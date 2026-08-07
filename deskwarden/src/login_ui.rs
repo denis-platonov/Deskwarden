@@ -4809,6 +4809,8 @@ pub(crate) mod password_lifetime_tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
     use std::panic::AssertUnwindSafe;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     /// Long and distinctive: it must not occur by chance in an unrelated
     /// freed block, and it must be longer than a machine word so a partial
@@ -4816,9 +4818,48 @@ pub(crate) mod password_lifetime_tests {
     pub(crate) const PROBE: &str = "deskwarden-drop-probe-master-password";
 
     thread_local! {
+        /// Whether THIS thread has a watch armed. What [`SEEN`] is gated on.
         static WATCHING: Cell<bool> = const { Cell::new(false) };
+        /// Whether a probe-bearing block was freed **on this thread** while
+        /// this thread's watch was armed. The verdict
+        /// [`plaintext_reached_the_allocator`] returns.
         static SEEN: Cell<bool> = const { Cell::new(false) };
     }
+
+    /// How many threads currently have a watch armed. Non-zero is what makes
+    /// the allocator scan on **every** thread rather than only on armed ones.
+    ///
+    /// **This is the fix for the axis this instrument was blind on.** The
+    /// arming was thread-local and so was the check inside `dealloc`, so a
+    /// probe-bearing block freed on a thread the test did not itself arm -- a
+    /// worker spawned by the body, and several fill paths spawn workers --
+    /// went past the allocator with the watch reading clean. An instrument
+    /// that reports clean while blind is this codebase's signature failure;
+    /// the scan is now global and the *reporting* is what is split in two.
+    static ANY_WATCH: AtomicUsize = AtomicUsize::new(0);
+
+    /// Whether a probe-bearing block was freed on **any** thread while a watch
+    /// was armed anywhere. Read by
+    /// [`plaintext_reached_the_allocator_on_any_thread`], and cross-checked
+    /// against [`SEEN`] by [`plaintext_reached_the_allocator`].
+    static SEEN_ANYWHERE: AtomicBool = AtomicBool::new(false);
+
+    /// **Only one watch is armed in this process at a time.**
+    ///
+    /// [`SEEN_ANYWHERE`] is process-global, so two probes armed concurrently
+    /// would read each other's leaks. Both entry points take this for the
+    /// whole of their armed window, which makes the global flag unambiguous
+    /// and costs nothing outside those windows.
+    ///
+    /// **The limit that remains, precisely.** Serialising the *armed windows*
+    /// does not serialise the tests around them: a test that builds probe
+    /// plaintext, arms, disarms, and only then drops it can free that block
+    /// while a different test is armed, and the free would be attributed to
+    /// the wrong probe. Every call site in this crate keeps its probe data
+    /// inside the closure it passes, which is what makes that not happen; a
+    /// new one that does not would show up as a cross-thread report from a
+    /// test that spawned nothing.
+    static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
     struct Watcher;
 
@@ -4866,23 +4907,23 @@ pub(crate) mod password_lifetime_tests {
         /// the heap felt like doing.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             let carried = layout.size() >= PROBE.len()
-                && WATCHING.with(Cell::get)
+                && any_watch_is_armed()
                 && {
                     let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
                     block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes())
                 };
             let moved = unsafe { System.realloc(ptr, layout, new_size) };
             if carried && !moved.is_null() && moved != ptr {
-                SEEN.with(|seen| seen.set(true));
+                record_a_hit();
             }
             moved
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            if layout.size() >= PROBE.len() && WATCHING.with(Cell::get) {
+            if layout.size() >= PROBE.len() && any_watch_is_armed() {
                 let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
                 if block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()) {
-                    SEEN.with(|seen| seen.set(true));
+                    record_a_hit();
                 }
             }
             unsafe { System.dealloc(ptr, layout) }
@@ -4892,14 +4933,184 @@ pub(crate) mod password_lifetime_tests {
     #[global_allocator]
     static WATCHER: Watcher = Watcher;
 
-    /// Runs `body` with this thread's watch armed and answers whether the probe
-    /// string went past the allocator in the clear.
-    pub(crate) fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
+    /// Whether the scan should run at all. **Not this thread's flag.** The
+    /// freeing thread is not necessarily the arming one, and while this asked
+    /// only `WATCHING` the whole instrument was deaf to every other thread.
+    ///
+    /// Neither allocates, so it cannot re-enter the allocator.
+    fn any_watch_is_armed() -> bool {
+        ANY_WATCH.load(Ordering::Relaxed) > 0
+    }
+
+    /// Records a probe-bearing block going back to the allocator, on both
+    /// channels: the thread-local one the existing assertions read, and the
+    /// process-global one that is the only channel a leak on another thread
+    /// can appear on.
+    fn record_a_hit() {
+        if WATCHING.with(Cell::get) {
+            SEEN.with(|seen| seen.set(true));
+        }
+        SEEN_ANYWHERE.store(true, Ordering::Relaxed);
+    }
+
+    /// Arms the watch for `body` and clears both verdicts, holding
+    /// [`PROBE_LOCK`] for the whole armed window. Returns the guard so the
+    /// caller disarms after reading whichever verdict it wants.
+    fn armed<R>(body: impl FnOnce() -> R) -> R {
+        // `PROBE_LOCK` is poisoned by any probe test that panics deliberately
+        // -- `an_unwind_does_not_release_the_master_password_in_the_clear`
+        // does exactly that -- and a poisoned lock here would turn one
+        // deliberate panic into a cascade of unrelated failures. The data is
+        // `()`; there is no invariant to have been broken.
+        let _held = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         SEEN.with(|seen| seen.set(false));
+        SEEN_ANYWHERE.store(false, Ordering::Relaxed);
+
+        /// Disarming in `Drop`, not after the call: [`ANY_WATCH`] is global,
+        /// so a `body` that unwinds past a plain decrement would leave the
+        /// scan armed for the rest of the process -- every free on every
+        /// thread scanned, and the next probe's verdict decided by whatever
+        /// else was running. One of the tests here panics on purpose.
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                ANY_WATCH.fetch_sub(1, Ordering::Relaxed);
+                WATCHING.with(|watching| watching.set(false));
+            }
+        }
+
         WATCHING.with(|watching| watching.set(true));
-        body();
-        WATCHING.with(|watching| watching.set(false));
-        SEEN.with(Cell::get)
+        ANY_WATCH.fetch_add(1, Ordering::Relaxed);
+        let _disarm = Disarm;
+        body()
+    }
+
+    /// Runs `body` with the watch armed and answers whether the probe string
+    /// went past the allocator in the clear **on this thread**.
+    ///
+    /// **This is the thread-local verdict, and callers depend on it being
+    /// that.** A `!plaintext_reached_the_allocator(..)` assertion is a claim
+    /// about the calling thread. Every `Drop`, `zeroize` and take this crate
+    /// asserts on happens there, which is why the reading is the useful one --
+    /// but a body that spawns a worker and leaks inside it would once have
+    /// read clean, silently.
+    ///
+    /// It no longer can. The scan is global (see [`ANY_WATCH`]), so a leak on
+    /// any thread is *observed*; this function panics rather than returning
+    /// `false` when the global channel saw something this thread did not. A
+    /// body that means to leak elsewhere must say so by calling
+    /// [`plaintext_reached_the_allocator_on_any_thread`] instead.
+    pub(crate) fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
+        // Both verdicts are read INSIDE the armed window: `SEEN_ANYWHERE` is
+        // process-global and the next probe to arm clears it, so reading it
+        // after `armed` returns would be racing the lock this function just
+        // released.
+        let (here, anywhere) = armed(|| {
+            body();
+            (SEEN.with(Cell::get), SEEN_ANYWHERE.load(Ordering::Relaxed))
+        });
+        assert!(
+            here || !anywhere,
+            "the probe was freed in the clear on a DIFFERENT thread from the one that armed \
+             the watch. This function's verdict is about the calling thread only, so it would \
+             have answered `false` -- clean, while blind. If the body is meant to leak on a \
+             worker, assert with `plaintext_reached_the_allocator_on_any_thread`."
+        );
+        here
+    }
+
+    /// Runs `body` with the watch armed and answers whether the probe string
+    /// went past the allocator in the clear **on any thread of this process**.
+    ///
+    /// The verdict [`plaintext_reached_the_allocator`] cannot give: it reads
+    /// the process-global channel, so a worker spawned by `body` is covered.
+    /// `body` must join whatever it spawns -- a thread still running when the
+    /// watch disarms is outside the window and is not covered by this or by
+    /// anything else.
+    pub(crate) fn plaintext_reached_the_allocator_on_any_thread(body: impl FnOnce()) -> bool {
+        armed(|| {
+            body();
+            SEEN_ANYWHERE.load(Ordering::Relaxed)
+        })
+    }
+
+    /// **The axis this instrument was blind on, now demonstrated rather than
+    /// asserted.**
+    ///
+    /// The watch was armed per-thread and checked per-thread, so a probe-
+    /// bearing block freed on a worker the body spawned went past the
+    /// allocator with the verdict reading `false`: clean, while blind. Several
+    /// fill paths in this crate spawn workers, so this was not hypothetical.
+    ///
+    /// Three readings, and it is the combination that is the claim:
+    ///
+    /// 1. The cross-thread verdict SEES a leak on a thread it did not arm.
+    /// 2. Its own positive control: the same worker, wiping instead of
+    ///    leaking, is not reported -- so reading 1 is a leak and not a function
+    ///    that answers `true` to everything.
+    /// 3. The thread-local verdict does not silently answer `false` to
+    ///    reading 1's body: it panics, naming the channel it cannot see on.
+    ///    That is what stops the twenty existing call sites -- which all read
+    ///    the thread-local verdict -- from ever being quietly blind.
+    #[test]
+    fn a_leak_on_a_worker_thread_is_seen_by_the_cross_thread_watch_and_never_reported_clean() {
+        // 1. Seen.
+        assert!(
+            plaintext_reached_the_allocator_on_any_thread(|| {
+                let leaked = probe_password();
+                std::thread::spawn(move || drop(leaked)).join().expect("the worker ran");
+            }),
+            "a plaintext probe was freed on a worker thread and the cross-thread watch did not \
+             see it -- the watch is still per-thread and every fill path that spawns is \
+             unobserved"
+        );
+
+        // 2. Control on that verdict: a worker that wipes is not reported, so
+        //    reading 1 above is a leak rather than an instrument stuck on
+        //    `true`.
+        assert!(
+            !plaintext_reached_the_allocator_on_any_thread(|| {
+                let wiped = zeroize::Zeroizing::new(probe_password());
+                std::thread::spawn(move || drop(wiped)).join().expect("the worker ran");
+            }),
+            "control: the cross-thread watch reports a leak for a worker that wipes, so its \
+             `true` above means nothing"
+        );
+
+        // 3. The thread-local verdict refuses to answer `false` to the same
+        //    body. Before, it answered `false` and the caller believed it.
+        let blind = std::panic::catch_unwind(|| {
+            plaintext_reached_the_allocator(|| {
+                let leaked = probe_password();
+                std::thread::spawn(move || drop(leaked)).join().expect("the worker ran");
+            })
+        });
+        // The payload is a `&'static str`, because the assertion message is a
+        // literal with nothing interpolated into it. Both shapes are accepted
+        // so that adding a `{}` to that message does not turn this control
+        // into a second, confusing failure.
+        let payload = blind.expect_err(
+            "the thread-local verdict answered instead of panicking, so it is back to \
+             reporting clean about a thread it cannot see",
+        );
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("the panic carries its explanation");
+        assert!(
+            message.contains("DIFFERENT thread"),
+            "it panicked for some other reason: {message}"
+        );
+
+        // 4. And the ordinary same-thread reading still works afterwards --
+                //    3 must not have left the watch armed, the lock held, or the global
+        //    flag set.
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the instrument did not recover from an unwind out of an armed window"
+        );
     }
 
     /// A heap copy of [`PROBE`], built *before* any watch is armed so that the
