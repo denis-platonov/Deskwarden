@@ -2366,6 +2366,31 @@ const APP_MATCH_EMPTY_NOTICE: &str =
 const APP_HOSTED_NOTE: &str =
     "Matched by its window title, because this is a Microsoft Store app.";
 
+/// What the card says under the rows about a live binding: what focusing this
+/// app does.
+///
+/// **One sentence, and it replaces the three [`trigger_caption`]s**, which
+/// were the footer for the three pills this card no longer draws. Autofill is
+/// one global preference now, not a per-item choice, so a caption naming *this
+/// item's* stored mode was about to become the card's only remaining claim
+/// that the mode still decides something -- and for `Auto` ("Fill immediately
+/// when this app is focused.") a claim about behaviour that has been retired.
+///
+/// **Chosen to be true with the preference in EITHER state**, because this
+/// pane does not read `settings.json` and inventing a second reader of it for
+/// one sentence would be a second source of truth about what autofill does.
+/// The hotkey arms for every match either way, so naming it is always
+/// accurate; the prompt is described in Preferences, where it is set.
+///
+/// **Kept to two lines at the app's narrowest pane**, because this is a
+/// wrapped footer line and every extra line is card height: the first draft
+/// ran to four and pushed `MATCHED APP` itself off the top of a fully-scrolled
+/// 298pt pane, which is the third time this card has been made unreachable.
+/// `the_matched_app_card_is_reachable_on_the_shortest_window` is what caught
+/// it and is what any re-wording has to answer to.
+const APP_MATCH_BEHAVIOUR_NOTE: &str =
+    "Press CTRL+ALT+B while this app is focused to fill it. See Prompt on match in Preferences.";
+
 /// What the card says under the rows when the match exists but the engine
 /// will never act on it -- see [`app_match_is_dead`].
 ///
@@ -3060,19 +3085,19 @@ const OPEN_WEBSITE_LABEL: &str = "Open website";
 const OPEN_MENU_LABEL: &str = "Open";
 const OPEN_MENU_HOVER: &str = "Open this item\u{2019}s app or its website";
 
-/// The card's footer lines, under the rows: what the selected trigger means,
-/// and -- for a Store app -- why this match is keyed on a title.
+/// The card's footer lines, under the rows: what focusing this app does, and
+/// -- for a Store app -- why this match is keyed on a title.
 ///
 /// **A dead match gets [`APP_MATCH_DEAD_NOTICE`] and NOTHING else.** See that
-/// constant: the trigger caption is a claim about what focusing the app does,
-/// and there is no trigger on this binding that does anything at all. The
-/// hosted note goes with it, because "matched by its window title" is exactly
-/// what a dead match failed to be.
+/// constant: [`APP_MATCH_BEHAVIOUR_NOTE`] is a claim about what focusing the
+/// app does, and this binding does nothing at all. The hosted note goes with
+/// it, because "matched by its window title" is exactly what a dead match
+/// failed to be.
 fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
     if app_match_is_dead(m) {
         return vec![APP_MATCH_DEAD_NOTICE];
     }
-    let mut notes = vec![trigger_caption(m.trigger)];
+    let mut notes = vec![APP_MATCH_BEHAVIOUR_NOTE];
     if m.hosted {
         notes.push(APP_HOSTED_NOTE);
     }
@@ -3085,25 +3110,15 @@ fn app_card_notes(m: &AppMatch) -> Vec<&'static str> {
     notes
 }
 
-/// Whether the three trigger pills are drawn for `m`.
+/// The three trigger modes, in the order they are offered.
 ///
-/// **Not on a dead binding.** A pill is a control whose entire meaning is
-/// "when this match fires, do THIS"; offering three of them on a match that
-/// cannot fire invites a vault write (`SetAppTrigger` PUTs the item and
-/// supersedes its `revisionDate`) whose only possible effect is to change
-/// which of three things does not happen. Remove stays -- clearing the field
-/// is the one action on this binding that does what it says.
-fn app_card_offers_triggers(m: &AppMatch) -> bool {
-    !app_match_is_dead(m)
-}
-
-/// The three trigger pills, in the order they are drawn.
-///
-/// The same three the picker offers, in the same order, so the control a user
-/// met when they created the match is the control they meet when they change
-/// it. (The picker's own `TRIGGER_CHOICES` is private to `picker_ui`, and this
-/// pass does not own that file; the wording below is held to it by
-/// `the_trigger_pills_say_what_the_picker_says`.)
+/// **The read-only MATCHED APP card no longer draws these**, because what a
+/// matched window does is one global preference now
+/// ([`crate::settings::Settings::prompt_on_match`]) rather than a per-item
+/// choice. The constant survives for its one remaining consumer,
+/// `detail_edit`'s edit form, which is a separate pass; see
+/// [`crate::app_match::AppMatch::trigger`] for why the field itself is kept
+/// and preserved rather than dropped.
 pub(crate) const TRIGGER_ORDER: [TriggerMode; 3] = [TriggerMode::Prompt, TriggerMode::Hotkey, TriggerMode::Auto];
 
 /// A trigger mode's pill label. Exhaustive with no catch-all: a fourth
@@ -3125,18 +3140,6 @@ pub(crate) fn trigger_caption(mode: TriggerMode) -> &'static str {
         TriggerMode::Hotkey => "Fill only when the fill hotkey is pressed.",
         TriggerMode::Auto => "Fill immediately when this app is focused.",
     }
-}
-
-/// What a click on the `clicked` pill should report, given the mode the match
-/// is already on.
-///
-/// **`None` for the pill that is already selected**, and that is the whole of
-/// this function. A segmented control's selected segment still reports clicks,
-/// and every one of them would otherwise be a PUT to the user's vault that
-/// changes nothing -- each of which supersedes the item's `revisionDate` and
-/// so is a chance for the write to fail for no reason at all.
-fn app_trigger_click(current: TriggerMode, clicked: TriggerMode) -> Option<DetailAction> {
-    (current != clicked).then_some(DetailAction::SetAppTrigger(clicked))
 }
 
 /// `m` with its trigger set to `to` and **every other field untouched**.
@@ -3215,55 +3218,6 @@ fn app_match_card(
                 |_ui| {},
             );
         }
-    }
-
-    // Skipped entirely on a dead binding -- see `app_card_offers_triggers`.
-    // The row is not merely disabled: a greyed control still says "this is
-    // the setting for this binding", and the footer note says the binding has
-    // no settings because it has no behaviour.
-    if app_card_offers_triggers(m) {
-        let pill_width = app_card_value_width(ui);
-        theme::row_rule(ui);
-        // The trigger lives in the VALUE column, not the control group: it is
-        // this row's value -- what the match's `trigger` currently is -- and
-        // not an action performed on a value shown elsewhere.
-        row(
-            ui,
-            "Autofill",
-            |ui| {
-                // **Wrapped, and inside the column the rows above measure.**
-                // Three pills need about 200pt and the value column is 71pt
-                // at the app's minimum window size, so laid out in a plain
-                // horizontal row the third one was drawn past the pane's
-                // right edge -- the same way `Remove` was, and just as
-                // unclickable. See `app_card_value_width`.
-                ui.set_max_width(pill_width);
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for mode in TRIGGER_ORDER {
-                    let selected = mode == m.trigger;
-                    let button =
-                        egui::Button::new(theme::semibold(trigger_label(mode), 12.0).color(
-                            if selected { egui::Color32::WHITE } else { theme::INK },
-                        ))
-                        .fill(if selected { theme::BLUE } else { theme::CARD })
-                        .stroke(if selected {
-                            Stroke::NONE
-                        } else {
-                            Stroke::new(1.0, theme::BORDER_STRONG)
-                        })
-                        .corner_radius(CornerRadius::same(7));
-                    if ui.add(button).clicked() {
-                        if let Some(chosen) = app_trigger_click(m.trigger, mode) {
-                            *action = chosen;
-                        }
-                    }
-                }
-                });
-            },
-            |_ui| {},
-        );
     }
 
     theme::row_rule(ui);
@@ -6720,15 +6674,44 @@ mod tests {
             !notes.iter().any(|n| n.contains("hosted") || n.contains("FrameHost")),
             "the mechanism reached the screen: {notes:?}"
         );
-        // The caption for the SELECTED mode is there too, and it is the
-        // selected one -- Hotkey, not the first in the list.
-        assert!(notes.contains(&trigger_caption(TriggerMode::Hotkey)), "{notes:?}");
-        assert!(!notes.contains(&trigger_caption(TriggerMode::Prompt)), "{notes:?}");
-        // Control: an ordinary app gets the caption and NOT the Store note.
+        // The behaviour note is there too -- and it is the ONE note, not one
+        // of three captions chosen by the item's stored `trigger`.
+        assert!(notes.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{notes:?}");
+        for mode in TRIGGER_ORDER {
+            assert!(
+                !notes.contains(&trigger_caption(mode)),
+                "the card still reports a per-item trigger caption ({mode:?}), which is a                  claim that the item's own mode decides what focusing this app does: {notes:?}"
+            );
+        }
+        // Control: an ordinary app gets the note and NOT the Store note.
         let ordinary = app_card_notes(&a_desktop_match());
-        assert_eq!(ordinary, vec![trigger_caption(TriggerMode::Prompt)]);
+        assert_eq!(ordinary, vec![APP_MATCH_BEHAVIOUR_NOTE]);
     }
 
+    /// **The fixture that deliberately differs.** `a_store_match` and
+    /// `a_desktop_match` carry DIFFERENT stored triggers (`Hotkey` and
+    /// `Prompt`), and the note they produce is the same one -- which is the
+    /// whole of "the per-item mode no longer decides anything" as the card
+    /// sees it. A card that still read `m.trigger` would give these two
+    /// different sentences.
+    #[test]
+    fn the_behaviour_note_does_not_depend_on_the_items_stored_trigger() {
+        let store = a_store_match();
+        let desktop = a_desktop_match();
+        assert_ne!(store.trigger, desktop.trigger, "the premise: the two fixtures differ");
+        for mode in TRIGGER_ORDER {
+            let m = AppMatch { trigger: mode, ..a_desktop_match() };
+            assert_eq!(
+                app_card_notes(&m),
+                vec![APP_MATCH_BEHAVIOUR_NOTE],
+                "a stored {mode:?} changed what the card says about this binding"
+            );
+        }
+    }
+
+    /// The pills these three name are `detail_edit`'s form's now -- this card
+    /// draws none -- but the constants still live here and still have to be
+    /// distinct, so this stays where they are.
     #[test]
     fn every_trigger_mode_is_a_pill_with_its_own_name_and_its_own_sentence() {
         // A fourth `TriggerMode` left out of `TRIGGER_ORDER` fails here; one
@@ -6742,24 +6725,6 @@ mod tests {
             TRIGGER_ORDER.iter().map(|m| trigger_caption(*m)).collect();
         assert_eq!(labels.len(), 3, "two pills share a name: {labels:?}");
         assert_eq!(captions.len(), 3, "two modes share a sentence: {captions:?}");
-    }
-
-    #[test]
-    fn clicking_the_pill_that_is_already_selected_costs_no_vault_write() {
-        for mode in TRIGGER_ORDER {
-            assert_eq!(
-                app_trigger_click(mode, mode),
-                None,
-                "re-clicking {mode:?} would PUT the item for no change"
-            );
-            for other in TRIGGER_ORDER.iter().filter(|m| **m != mode) {
-                assert_eq!(
-                    app_trigger_click(mode, *other),
-                    Some(DetailAction::SetAppTrigger(*other)),
-                    "moving from {mode:?} to {other:?} reports the wrong thing"
-                );
-            }
-        }
     }
 
     #[test]
@@ -6794,11 +6759,8 @@ mod tests {
             "Speedtest",
             "Program file",
             r"C:\Program Files\WindowsApps\Speedtest\Speedtest.exe",
-            "Autofill",
-            "Prompt",
-            "Hotkey",
-            "Auto",
             "Remove",
+            APP_MATCH_BEHAVIOUR_NOTE,
             APP_HOSTED_NOTE,
         ] {
             assert!(
@@ -6869,35 +6831,56 @@ mod tests {
         );
     }
 
-    /// Deleting `*action = chosen;` in the pill loop fails this.
+    /// **The pills are gone from this card, and the setting is global.**
+    ///
+    /// This replaces `clicking_a_trigger_pill_reports_the_mode_it_names`,
+    /// which drove the three pills and asserted the `SetAppTrigger` each one
+    /// reported. What a matched window does is
+    /// `settings::Settings::prompt_on_match` now -- one switch in
+    /// Preferences -- so a per-item control here would write a field nothing
+    /// reads, supersede the item's `revisionDate` for it, and change nothing
+    /// the user can observe.
+    ///
+    /// Driven at the pane rather than asserted on `app_match_card`'s source,
+    /// and on a LIVE binding, because a live binding is precisely where all
+    /// three were painted before this change.
     #[test]
-    fn clicking_a_trigger_pill_reports_the_mode_it_names() {
-        // From Prompt, so both of the other two are a real change.
+    fn no_binding_gets_trigger_pills_because_the_setting_is_global() {
         let item = bound_to(&a_login(), &a_desktop_match());
-        for mode in [TriggerMode::Hotkey, TriggerMode::Auto] {
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&item, &TotpState::NoSecret);
-            let pill = laid_out.rect_of(trigger_label(mode));
-            let clicked = pane.click(&item, &TotpState::NoSecret, pill.center());
-            assert_eq!(
-                clicked.action,
-                DetailAction::SetAppTrigger(mode),
-                "clicking the {mode:?} pill reported {:?}",
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+
+        // The premise: this pane IS drawing the card, so the absences below
+        // are about the pills and not about a card that vanished.
+        assert!(laid_out.painted("MATCHED APP"), "{:?}", laid_out.strings());
+        assert!(laid_out.painted(APP_MATCH_BEHAVIOUR_NOTE), "{:?}", laid_out.strings());
+
+        for mode in TRIGGER_ORDER {
+            assert!(
+                !laid_out.painted(trigger_label(mode)),
+                "the {mode:?} pill is still drawn on the MATCHED APP card: {:?}",
+                laid_out.strings()
+            );
+        }
+        assert!(
+            !laid_out.painted("Autofill"),
+            "the row the pills sat in is still drawn, so the card still presents a per-item              autofill setting: {:?}",
+            laid_out.strings()
+        );
+
+        // And nothing on the card reports one either -- a pill drawn with a
+        // zero-size label would pass every assertion above.
+        for (name, at) in [
+            ("the note", laid_out.rect_of(APP_MATCH_BEHAVIOUR_NOTE)),
+            ("the App row", laid_out.rect_of("App")),
+        ] {
+            let clicked = pane.click(&item, &TotpState::NoSecret, at.center());
+            assert!(
+                !matches!(clicked.action, DetailAction::SetAppTrigger(_)),
+                "clicking {name} reported {:?}",
                 clicked.action
             );
         }
-        // The other half of `app_trigger_click`, at the pane: the pill that
-        // is already selected reports nothing at all.
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let pill = laid_out.rect_of(trigger_label(TriggerMode::Prompt));
-        let clicked = pane.click(&item, &TotpState::NoSecret, pill.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::None,
-            "re-clicking the selected pill reported {:?}, which is a vault write for no change",
-            clicked.action
-        );
     }
 
     /// Deleting `*action = DetailAction::RemoveAppMatch;` fails this.
@@ -7028,17 +7011,15 @@ mod tests {
             );
         }
         assert!(
-            !app_card_offers_triggers(&dead),
-            "a binding that cannot fire still offers three settings for how it fires"
+            !notes.contains(&APP_MATCH_BEHAVIOUR_NOTE),
+            "a dead binding still claims the fill hotkey does something for it: {notes:?}"
         );
-        // The controls, on a LIVE match: the caption is there and the dead
-        // notice is not, so neither assertion above is satisfied by a
+        // The controls, on a LIVE match: the behaviour note is there and the
+        // dead notice is not, so neither assertion above is satisfied by a
         // constant.
         let live = app_card_notes(&a_store_match());
-        assert!(live.contains(&trigger_caption(TriggerMode::Hotkey)), "{live:?}");
+        assert!(live.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{live:?}");
         assert!(!live.iter().any(|n| n.contains("ignoring")), "{live:?}");
-        assert!(app_card_offers_triggers(&a_store_match()));
-        assert!(app_card_offers_triggers(&a_desktop_match()));
     }
 
     /// **The wiring.** The reviewer's demonstration was that the pane painted
@@ -7079,15 +7060,18 @@ mod tests {
         let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
         assert_eq!(clicked.action, DetailAction::RemoveAppMatch);
 
-        // The control: the SAME pane on a LIVE match paints all three pills
-        // and the selected caption, so the absences above are about this
-        // binding and not about a card that stopped drawing anything.
+        // The control: the SAME pane on a LIVE match paints the behaviour
+        // note, so the absences above are about this binding and not about a
+        // card that stopped drawing anything.
+        //
+        // It does NOT paint the pills -- no binding does any more -- so the
+        // pill assertions above are held by
+        // `no_binding_gets_trigger_pills_because_the_setting_is_global`,
+        // which asserts their absence on a LIVE match where their presence
+        // was the previous behaviour.
         let live = bound_to(&a_login(), &a_store_match());
         let live_frame = pane.idle(&live, &TotpState::NoSecret);
-        for mode in TRIGGER_ORDER {
-            assert!(live_frame.painted(trigger_label(mode)), "{:?}", live_frame.strings());
-        }
-        assert!(live_frame.painted(trigger_caption(TriggerMode::Hotkey)));
+        assert!(live_frame.painted(APP_MATCH_BEHAVIOUR_NOTE));
         assert!(
             !live_frame.strings().iter().any(|t| t.contains("ignoring")),
             "a live binding is being called ignored: {:?}",
@@ -11097,8 +11081,8 @@ mod tests {
             notes.iter().any(|n| n.contains("no program file was recorded")),
             "the card offers no Open and does not say why: {notes:?}"
         );
-        // The trigger caption is still there: the binding still fires.
-        assert!(notes.contains(&trigger_caption(no_path.trigger)), "{notes:?}");
+        // The behaviour note is still there: the binding still fires.
+        assert!(notes.contains(&APP_MATCH_BEHAVIOUR_NOTE), "{notes:?}");
 
         // A Store app gets its own reason, not the "no program file" one.
         let store = app_card_notes(&a_store_match());
@@ -11903,7 +11887,7 @@ mod tests {
         for width in [MIN_PANE, PANE] {
             let mut pane = Pane::wide(width).knows_app(CHROME_PATH, CHROME_NAME);
             let frame = pane.idle(&item, &TotpState::NoSecret);
-            let note = frame.rect_of(trigger_caption(TriggerMode::Prompt));
+            let note = frame.rect_of(APP_MATCH_BEHAVIOUR_NOTE);
             for control in [APP_REMOVE_LABEL, OPEN_MENU_LABEL] {
                 let rect = frame.rect_of(control);
                 assert!(
@@ -11959,15 +11943,15 @@ mod tests {
             let mut pane = Pane::wide(width);
             let frame = pane.idle(&item, &TotpState::NoSecret);
             assert!(
-                frame.painted(trigger_caption(TriggerMode::Prompt)),
+                frame.painted(APP_MATCH_BEHAVIOUR_NOTE),
                 "no note on a {width}pt pane: {:?}",
                 frame.strings()
             );
             // The glyphs really laid, not the source: a note elided away
             // would still have a rect for the test above to miss.
             assert_eq!(
-                frame.rendered_glyphs(trigger_caption(TriggerMode::Prompt)),
-                trigger_caption(TriggerMode::Prompt),
+                frame.rendered_glyphs(APP_MATCH_BEHAVIOUR_NOTE),
+                APP_MATCH_BEHAVIOUR_NOTE,
                 "the note was elided on a {width}pt pane"
             );
         }
@@ -12553,21 +12537,14 @@ mod read_pane_scroll_tests {
         let after = pane.scroll_to_bottom(&item);
         for source in [
             APP_CARD_HEADING,
-            // The row the binding's behaviour is set on ...
-            "Autofill",
-            // ... and the control commit `a33b75e` added, which was the
-            // single least reachable thing on the pane.
+            // The control commit `a33b75e` added, which was the single least
+            // reachable thing on the pane.
             "Open Ledgerline.exe",
             // **The only way to undo an app binding from this pane**, and the
             // one this list did not name: it was not painted at all below
             // about 600pt of pane, and the vertical-only `assert_visible`
             // could not have said so if it had been named.
             "Remove",
-            // Every trigger pill, for the same reason: the third was drawn
-            // past the pane's right edge.
-            "Auto",
-            "Hotkey",
-            "Prompt",
             "App",
             "Program file",
             // **The VALUES, not only the labels.** Every label on this card
@@ -12583,16 +12560,34 @@ mod read_pane_scroll_tests {
             // test is worth re-running for this change at all.
             TALL_ITEM_APP_NAME,
             r"C:\Deskwarden Test\Ledgerline\Ledgerline.exe",
-            // The sentence the controls used to be drawn on top of.
-            trigger_caption(TriggerMode::Prompt),
+            // The sentence the controls used to be drawn on top of. It is
+            // the card's ONE behaviour note now, and it is markedly longer
+            // than the trigger caption it replaced -- more lines of wrapped
+            // text in the same column, which is more card height, which is
+            // exactly the direction that made this card unreachable twice.
+            // Removing the pill row took a row off; this put text back on.
+            APP_MATCH_BEHAVIOUR_NOTE,
         ] {
             assert_visible(&after, source, bounds);
+        }
+
+        // **The pills are gone.** Not merely absent from the list above --
+        // asserted absent, on the one pane and the one item where they were
+        // painted before this change. `painted` is an exact match on a
+        // rendered run, so this cannot be satisfied by the word "Prompt"
+        // inside the behaviour note.
+        for mode in TRIGGER_ORDER {
+            assert!(
+                after.rect_of(trigger_label(mode)).is_none(),
+                "the {mode:?} pill is still on the MATCHED APP card. Autofill is one global                  preference now, and a per-item control that writes a field nothing reads is                  a setting that does nothing: painted {:?}",
+                after.sources()
+            );
         }
 
         // **Nothing on the card is drawn on top of anything else on it.**
         // `assert_visible` says every control is on the pane; it cannot say
         // they are not stacked, which is exactly what the user reported.
-        let note = after.rect_of(trigger_caption(TriggerMode::Prompt)).expect("the note");
+        let note = after.rect_of(APP_MATCH_BEHAVIOUR_NOTE).expect("the note");
         for control in ["Open Ledgerline.exe", "Remove"] {
             let rect = after.rect_of(control).expect("the control");
             assert!(

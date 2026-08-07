@@ -936,6 +936,7 @@ fn main() {
             &injector,
             &fill_stats,
             &engine,
+            settings.prompt_on_match,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
             &deskwarden::injector::sequence::REAL_NOTIFIER,
@@ -1872,6 +1873,7 @@ fn main() {
                 &injector,
                 &fill_stats,
                 &engine,
+                settings.prompt_on_match,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
@@ -2315,6 +2317,11 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     injector: &Injector<A, B>,
     fill_stats: &fill_stats::FillStats,
     engine: &MatchEngine,
+    // `Settings::prompt_on_match`, read fresh from `run`'s live `settings` on
+    // every event rather than captured once: the preferences window writes
+    // straight back into that binding, so a user who turns the prompt off has
+    // it off for the very next window they focus.
+    prompt_on_match: bool,
     pending_hotkey_fill: &mut Option<(String, isize)>,
     last_dispatched_hwnd: &mut Option<isize>,
     notifier: &dyn Notifier,
@@ -2353,14 +2360,19 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     }
     *last_dispatched_hwnd = Some(event.hwnd);
 
-    if let Some((item_id, m)) = engine.lookup(event) {
+    // The match's own `AppMatch::trigger` is deliberately not read: what a
+    // matched window does is one global preference now, not a per-item
+    // choice. The field is still parsed and preserved -- see
+    // `AppMatch::trigger` -- so an item this build writes is still readable
+    // by v0.5.0.
+    if let Some((item_id, _m)) = engine.lookup(event) {
         log::info!(
-            "matched {} to vault item {item_id} (trigger {:?})",
+            "matched {} to vault item {item_id} ({:?})",
             deskwarden::app::window_label(&event.exe_name, &event.title),
-            m.trigger
+            deskwarden::app::match_disposition(prompt_on_match)
         );
         if let Some(armed) =
-            handle_match(cache, injector, fill_stats, item_id, m, event, notifier)
+            handle_match(cache, injector, fill_stats, item_id, prompt_on_match, event, notifier)
         {
             *pending_hotkey_fill = Some(armed);
         }
@@ -12279,30 +12291,66 @@ mod tests {
             );
         }
 
-        /// **Finding 1, for `TriggerMode::Auto`.** Deleting the `handle_match`
-        /// call leaves this with an empty `Filled`.
+        /// **The preference reaches the dispatch, on the two lines no test
+        /// can execute.**
+        ///
+        /// Every dispatching test below hands `process_foreground_event` a
+        /// literal `false`, because the `true` path opens a real overlay
+        /// window on the desktop of whoever ran `cargo test`. So what nothing
+        /// can observe is that *production* hands it the user's setting: a
+        /// literal `true` on those two lines turns the prompt back on for
+        /// everyone who switched it off, a literal `false` turns it off for
+        /// everyone who did not, and either leaves every test in this crate
+        /// green. Counted here for the same reason
+        /// `the_production_dispatch_uses_the_real_notifier` counts the
+        /// notifier, and bounded by the same syntax.
         #[test]
-        fn an_auto_trigger_match_is_filled_from_the_vault_into_the_window_that_matched() {
-            let mut server = mockito::Server::new();
-            // The cache is empty, so this goes down `fill_from_vault`'s
-            // documented bridge fallback rather than needing a populate.
-            let _item = server
-                .mock("GET", "/object/item/1")
-                .with_status(200)
-                .with_header("content-type", "application/json")
-                .with_body(
-                    r#"{"success":true,"data":{"id":"1","name":"Ledgerline","fields":[],
-                        "login":{"username":"denis@example.com","password":"hunter2","totp":null}}}"#,
-                )
-                .create();
+        fn the_production_dispatch_reads_the_users_prompt_setting() {
+            let source = include_str!("main.rs");
+            // Split so this test's own text is not one of the two.
+            let needle = concat!("settings.", "prompt_on_match,");
+            let boundary = source
+                .find(concat!("fn process_foreground", "_event<A:"))
+                .expect("`process_foreground_event`'s definition is gone from main.rs");
+            assert_eq!(
+                source[..boundary].matches(needle).count(),
+                2,
+                "expected the live setting to be passed exactly twice in `run` -- the seeding \
+                 dispatch and the event-loop one. Fewer means a matched window is dispatched \
+                 against a literal instead of the user's preference, so the Prompt on match \
+                 toggle does nothing on that path; more means a third production dispatch \
+                 appeared that nobody has thought about"
+            );
+            assert_eq!(
+                source[boundary..].matches(needle).count(),
+                0,
+                "a test reads the real settings. Nothing here may touch the user's \
+                 settings.json: pass a literal"
+            );
+        }
 
-            let cache = VaultCache::new(VaultBridge::new(server.url()));
+        /// **Finding 1, and the retirement of `Auto`, in one test.**
+        ///
+        /// The item's own `trigger` is `Auto` -- the mode that used to type
+        /// the password the instant this window took focus, through a
+        /// `SendInput` fallback that on a real desktop is *always* the path
+        /// taken. With the global prompt off, nothing may be typed: the match
+        /// arms the hotkey and stops. An empty `Filled` here is the whole
+        /// point of the change, and `pending_hotkey_fill` is what proves
+        /// `handle_match` was nonetheless called -- deleting that call leaves
+        /// this `None`.
+        ///
+        /// Nothing here may reach the network: no arm below `false` reads the
+        /// vault, and a bridge pointed at a closed port proves it.
+        #[test]
+        fn a_match_is_never_filled_on_focus_however_its_own_trigger_reads() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
             let engine = engine_with(&[(
                 "1",
                 AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto),
             )]);
             let filled = Filled::default();
-            let (stats, stats_path) = scratch_fill_stats();
+            let (stats, _path) = scratch_fill_stats();
             let mut pending_hotkey_fill = None;
             let mut last_dispatched_hwnd = None;
 
@@ -12312,68 +12360,78 @@ mod tests {
                 &recording_injector(&filled),
                 &stats,
                 &engine,
+                false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &recorder(),
             );
 
-            assert_eq!(
-                filled.seen(),
-                vec![(0x4321, "denis@example.com".to_string(), "hunter2".to_string())],
-                "an Auto-trigger match must be filled, with that item's credentials, into the \
-                 window that matched. An empty list means `handle_match` was never called at \
-                 all -- autofill switched off, which is this app's whole purpose"
+            assert!(
+                filled.seen().is_empty(),
+                "a stored `Auto` trigger filled on focus. That mode is retired: with the \
+                 global prompt off NOTHING is typed without the user pressing the fill hotkey, \
+                 and the fill falls back to blind SendInput into whatever holds focus"
             );
-            assert_eq!(stats.count("1"), 1, "a completed fill is counted for the detail pane");
-            assert_eq!(
-                pending_hotkey_fill, None,
-                "Auto fills now; there is nothing left for the fill hotkey to do"
-            );
-            assert_eq!(last_dispatched_hwnd, Some(0x4321));
-
-            let _ = std::fs::remove_file(stats_path);
-        }
-
-        /// **Finding 1, for `TriggerMode::Hotkey`** -- the arm whose entire
-        /// output is the value the mutation replaced with `None`.
-        #[test]
-        fn a_hotkey_trigger_match_arms_the_pending_fill_instead_of_filling_now() {
-            // Nothing here may reach the network: the Hotkey arm returns
-            // before any vault read, and a bridge pointed at a closed port
-            // proves it.
-            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
-            let engine = engine_with(&[(
-                "7",
-                AppMatch::for_process("Ledgerline.exe", TriggerMode::Hotkey),
-            )]);
-            let filled = Filled::default();
-            let (stats, _path) = scratch_fill_stats();
-            let mut pending_hotkey_fill = None;
-            let mut last_dispatched_hwnd = None;
-
-            process_foreground_event(
-                &window("Ledgerline.exe", "Ledgerline", 0x99),
-                &cache,
-                &recording_injector(&filled),
-                &stats,
-                &engine,
-                &mut pending_hotkey_fill,
-                &mut last_dispatched_hwnd,
-                &recorder(),
-            );
-
+            assert_eq!(stats.count("1"), 0, "nothing was filled, so nothing is counted");
             assert_eq!(
                 pending_hotkey_fill,
-                Some(("7".to_string(), 0x99)),
-                "a Hotkey match must arm (item, hwnd) for the loop's separate fill-hotkey check. \
-                 `None` means `handle_match`'s answer is being dropped, so Ctrl+Alt+B would \
-                 never fill anything again"
+                Some(("1".to_string(), 0x4321)),
+                "the match must still arm (item, hwnd) for the loop's separate fill-hotkey \
+                 check. `None` means `handle_match` was never called, or its answer is being \
+                 dropped -- either way Ctrl+Alt+B fills nothing and, with the prompt off, \
+                 autofill is switched off entirely"
+            );
+            assert_eq!(last_dispatched_hwnd, Some(0x4321));
+        }
+
+        /// **The differing half of the fixture above.** Same setting, a
+        /// different stored `trigger` -- and the same outcome, which is what
+        /// "the per-item mode no longer decides anything" actually means. A
+        /// `handle_match` that still branched on `m.trigger` would pass one of
+        /// these two tests and fail the other.
+        #[test]
+        fn a_stored_prompt_trigger_arms_exactly_like_a_stored_hotkey_one() {
+            let cache = VaultCache::new(VaultBridge::new("http://127.0.0.1:1".to_string()));
+            let filled = Filled::default();
+            let (stats, _path) = scratch_fill_stats();
+
+            let mut armed = Vec::new();
+            for (id, trigger) in
+                [("7", TriggerMode::Hotkey), ("8", TriggerMode::Prompt), ("9", TriggerMode::Auto)]
+            {
+                let engine =
+                    engine_with(&[(id, AppMatch::for_process("Ledgerline.exe", trigger))]);
+                let mut pending_hotkey_fill = None;
+                let mut last_dispatched_hwnd = None;
+                process_foreground_event(
+                    &window("Ledgerline.exe", "Ledgerline", 0x99),
+                    &cache,
+                    &recording_injector(&filled),
+                    &stats,
+                    &engine,
+                    false,
+                    &mut pending_hotkey_fill,
+                    &mut last_dispatched_hwnd,
+                    &recorder(),
+                );
+                armed.push(pending_hotkey_fill);
+            }
+
+            assert_eq!(
+                armed,
+                vec![
+                    Some(("7".to_string(), 0x99)),
+                    Some(("8".to_string(), 0x99)),
+                    Some(("9".to_string(), 0x99)),
+                ],
+                "every match arms the hotkey, whatever `trigger` the item happens to carry. A \
+                 `None` in this list is a vault item that Ctrl+Alt+B has silently stopped \
+                 filling"
             );
             assert!(
                 filled.seen().is_empty(),
-                "Hotkey must not fill until the user actually presses the hotkey"
+                "none of the three may type anything on focus"
             );
-            assert_eq!(last_dispatched_hwnd, Some(0x99));
         }
 
         /// The positive control for both tests above: they would also pass
@@ -12397,6 +12455,7 @@ mod tests {
                 &recording_injector(&filled),
                 &stats,
                 &engine,
+                false,
                 &mut pending_hotkey_fill,
                 &mut last_dispatched_hwnd,
                 &recorder(),
@@ -12430,6 +12489,7 @@ mod tests {
                     &recording_injector(&filled),
                     &stats,
                     &engine,
+                    false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &recorder(),
@@ -12473,6 +12533,7 @@ mod tests {
                     &recording_injector(&filled),
                     &stats,
                     &engine,
+                    false,
                     &mut pending_hotkey_fill,
                     &mut last_dispatched_hwnd,
                     &recorder(),

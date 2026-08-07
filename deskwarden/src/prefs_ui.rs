@@ -5,10 +5,12 @@
 //! app version pinned to the bottom of the nav. This file builds that shell,
 //! and populates it **only where a setting genuinely exists**.
 //!
-//! What exists today is three fields on [`Settings`]: `keep_backend_running`,
-//! `auto_lock_enabled` and `auto_lock_minutes`. All three live on General --
-//! the last two as a toggle and the number it governs, the number greyed out
-//! while the toggle is off. Every other section in 3e -- its
+//! What exists today is four fields on [`Settings`]: `keep_backend_running`,
+//! `prompt_on_match`, `auto_lock_enabled` and `auto_lock_minutes`. All four
+//! live on General -- the last two as a toggle and the number it governs, the
+//! number greyed out while the toggle is off. `prompt_on_match` is the whole
+//! of the automatic half of autofill, and is the one setting here that a
+//! section of 3e (Autofill) would otherwise have claimed. Every other section in 3e -- its
 //! five autofill toggles, the per-app table, Touch ID, the overlay-position
 //! segmented control -- has no backing behaviour anywhere in this crate, so
 //! those sections say so in one line rather than showing a switch that flips
@@ -117,6 +119,16 @@ const STEPPER_FIELD_ID: &str = "prefs-auto-lock-minutes";
 const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 const BACKEND_DESCRIPTION: &str = "Faster, and uses about 110 MB while idle. Off runs it only \
      while the vault window is open; autofill is unaffected either way.";
+
+const PROMPT_LABEL: &str = "Prompt on match";
+/// **Says what OFF does, because off is the state that changes what the app
+/// does on its own.** The user's own framing: "only shortcuts will work in
+/// that case". Naming the hotkey here is what stops the toggle reading as
+/// "switch autofill off" -- it never is; the hotkey arms for every match in
+/// both states (`app::match_arms_hotkey`).
+const PROMPT_DESCRIPTION: &str = "Offer to fill when an app you have matched comes to the front. \
+     Off means nothing happens on its own and CTRL+ALT+B is the only way to fill. Nothing is \
+     ever typed until you ask for it either way.";
 
 const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
@@ -722,6 +734,17 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.keep_backend_running,
         );
         row_separator(ui);
+        // The one switch that governs what a matched window does. It sits on
+        // General beside the other two rather than under Shortcuts, because
+        // it is not about a shortcut: `PROMPT_DESCRIPTION` names the hotkey
+        // only to say what is left when this is off.
+        state.settings.prompt_on_match = toggle_row(
+            ui,
+            PROMPT_LABEL,
+            PROMPT_DESCRIPTION,
+            state.settings.prompt_on_match,
+        );
+        row_separator(ui);
         // The toggle sits above the number it governs, in 3e's own 40x22
         // pill, and the number's row stays put below it -- greyed, not
         // removed. A row that vanished would reflow the card on every click
@@ -794,8 +817,8 @@ fn draw_not_yet(ui: &mut Ui, detail: &str) {
 /// actually changed and persists them; this function never touches disk itself.
 ///
 /// The returned `Settings` differs from the argument in at most
-/// `keep_backend_running`, `auto_lock_enabled` and `auto_lock_minutes` -- the
-/// three fields `Settings::persist_preferences` owns. `vault_window` is carried through
+/// `keep_backend_running`, `prompt_on_match`, `auto_lock_enabled` and
+/// `auto_lock_minutes` -- the four fields `Settings::persist_preferences` owns. `vault_window` is carried through
 /// untouched, which is what makes `main.rs`'s stale copy of it harmless.
 pub fn run(settings: Settings) -> Settings {
     let state = Rc::new(RefCell::new(PrefsState::new(settings)));
@@ -1330,6 +1353,12 @@ mod tests {
         // text column to nothing still paints its title, so asserting only on
         // titles would not notice.
         assert!(painted.contains(BACKEND_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(PROMPT_LABEL), "got {:?}", painted.strings());
+        assert!(painted.contains(PROMPT_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            PROMPT_DESCRIPTION.contains("CTRL+ALT+B"),
+            "the description has to say what is left when the prompt is off -- otherwise the              toggle reads as \"switch autofill off\", which it never is"
+        );
         assert!(painted.contains(AUTO_LOCK_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
             AUTO_LOCK_DESCRIPTION.contains("One minute is the shortest"),
@@ -1343,12 +1372,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_two_toggles_and_one_stepper() {
+    fn general_paints_exactly_three_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            2,
-            "two 40x22 pills: `keep_backend_running` and `auto_lock_enabled`, and nothing else"
+            3,
+            "three 40x22 pills: `keep_backend_running`, `prompt_on_match` and              `auto_lock_enabled`, and nothing else"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -1379,12 +1408,13 @@ mod tests {
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        // The first pill top-to-bottom is the backend row's; the auto-lock
-        // one is below it. Clicking one must not move the other, which is
-        // what the two `auto_lock_enabled` assertions here pin.
+        // The first pill top-to-bottom is the backend row's; the prompt and
+        // auto-lock ones are below it. Clicking one must not move either
+        // other, which is what the neighbouring assertions here pin.
         let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
 
         frame(&ctx, &mut state, &click(pill));
@@ -1392,19 +1422,65 @@ mod tests {
         assert!(state.settings.auto_lock_enabled);
     }
 
+    /// **The switch this whole change is about, driven at the pane.**
+    ///
+    /// The row exists, it is wired to `prompt_on_match`, and it is wired to
+    /// THAT field and not to a neighbour -- which is the defect this file has
+    /// three rows to make possible. The two neighbours are asserted unmoved
+    /// in both directions.
+    #[test]
+    fn clicking_the_prompt_toggle_turns_the_match_prompt_off_and_on_again() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(state.settings.prompt_on_match, "the default: a match prompts");
+
+        let first = frame(&ctx, &mut state, &[]);
+        // Second pill down, between the backend row and the auto-lock one.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            !state.settings.prompt_on_match,
+            "the prompt toggle did not turn off, so the one control that governs what a              matched window does is inert"
+        );
+        // What the toggle is FOR, asserted on the value the dispatch actually
+        // consumes rather than on the flag alone: a field that flips without
+        // reaching `match_disposition` is a switch that does nothing.
+        assert_eq!(
+            crate::app::match_disposition(state.settings.prompt_on_match),
+            crate::app::MatchDisposition::Nothing
+        );
+        // ... and the hotkey is still armed, which is the whole reason this
+        // is a prompt switch and not an autofill switch.
+        assert!(
+            crate::app::match_arms_hotkey(state.settings.prompt_on_match),
+            "turning the prompt off has turned autofill off entirely"
+        );
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(state.settings.prompt_on_match, "and back on again");
+        assert_eq!(
+            crate::app::match_disposition(state.settings.prompt_on_match),
+            crate::app::MatchDisposition::Prompt
+        );
+    }
+
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the second pill down is the one wired to it.
+        // the THIRD pill down is the one wired to it -- `prompt_on_match`
+        // sits between it and the backend row.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         // What the toggle is FOR, asserted on the value the vault window
         // actually consumes rather than on the flag: a field that flips
         // without reaching `auto_lock` is a switch that does nothing.

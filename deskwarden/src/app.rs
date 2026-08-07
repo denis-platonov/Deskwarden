@@ -2,7 +2,7 @@
 //! so they're reachable from examples and integration tests rather than being
 //! locked inside the binary target.
 
-use crate::app_match::{AppMatch, TriggerMode};
+use crate::app_match::AppMatch;
 use crate::injector::ui_automation;
 use crate::injector::sequence;
 use crate::injector::{Injector, SendInputFiller, UiAutomationFiller};
@@ -393,12 +393,122 @@ pub fn fill_action(
     sequence::plan(&key_sequence::parse(&stored), &values).map(FillAction::Sequence)
 }
 
-/// Dispatches a freshly foregrounded, matched window according to its
-/// trigger mode. `Auto` and `Prompt` fill immediately (`Prompt` only if the
-/// user clicks Fill on the overlay) and return `None`. `Hotkey` doesn't fill
-/// from this path at all -- per the spec, it arms `(item_id, hwnd)` and
-/// returns it so the main loop's separate `fill_hotkey_pressed` check can
-/// fill it later, once the user actually presses the fill hotkey.
+/// What focusing a matched window does, beyond arming the hotkey.
+///
+/// Two variants rather than a bare `bool` at the call site so the arm that
+/// *does nothing extra* is a named thing a test can assert on, and so adding a
+/// third behaviour later is a compile error at every match rather than a
+/// silently-taken `else`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchDisposition {
+    /// Raise the overlay. Nothing is typed unless the user clicks Fill on it.
+    Prompt,
+    /// Do nothing on focus. The armed hotkey is the only way in.
+    Nothing,
+}
+
+/// **The whole of the match-dispatch decision, as a pure function.**
+///
+/// Takes the one global preference ([`crate::settings::Settings::prompt_on_match`])
+/// and answers what focusing a matched window should do -- with no cache, no
+/// injector and no window, so both branches are reachable from a unit test.
+/// The alternative, which this crate has been bitten by repeatedly, is a
+/// decision made inside [`handle_match`], which nothing can call.
+///
+/// **The item's own `AppMatch::trigger` is deliberately not an input.** The
+/// user asked for one global switch, not a choice per item; see
+/// [`crate::app_match::AppMatch::trigger`] for why the field is still read and
+/// written but no longer consulted.
+///
+/// **Neither answer includes filling by itself.** There is no silent-fill
+/// disposition: `Prompt` types nothing until the user clicks Fill, and
+/// `Nothing` types nothing at all. That is the retirement of the old `Auto`
+/// mode, not a rename of it.
+pub fn match_disposition(prompt_on_match: bool) -> MatchDisposition {
+    if prompt_on_match {
+        MatchDisposition::Prompt
+    } else {
+        MatchDisposition::Nothing
+    }
+}
+
+/// **Whether a match arms the fill hotkey. Always.**
+///
+/// A function rather than a literal `Some(...)` inside [`handle_match`] so
+/// that "every match arms, in both settings" is a claim a test can make
+/// directly, and so substituting `prompt_on_match` for this fails that test.
+/// If arming ever became conditional on the preference, turning the prompt off
+/// would turn autofill off entirely rather than falling back to the hotkey --
+/// which is precisely the fallback the whole design rests on.
+pub fn match_arms_hotkey(_prompt_on_match: bool) -> bool {
+    true
+}
+
+/// **The decision, directly.** Both inputs are driven, and the two answers are
+/// asserted to *differ* -- a pair of fixtures that agreed would pass against a
+/// `match_disposition` that ignored its argument entirely, which is precisely
+/// the mutation that matters here.
+#[cfg(test)]
+mod match_disposition_tests {
+    use super::*;
+
+    #[test]
+    fn the_setting_on_prompts_and_the_setting_off_does_nothing() {
+        assert_eq!(match_disposition(true), MatchDisposition::Prompt);
+        assert_eq!(match_disposition(false), MatchDisposition::Nothing);
+        assert_ne!(
+            match_disposition(true),
+            match_disposition(false),
+            "the premise: the preference actually decides something. Equal answers mean \
+             `match_disposition` is ignoring its argument, and the switch in preferences does \
+             nothing at all"
+        );
+    }
+
+    /// **The one that would silently switch autofill off.** `false` means
+    /// "no prompt", never "no autofill": the hotkey is the fallback the user
+    /// is relying on, so it arms for a match in *either* setting. A
+    /// `match_arms_hotkey` that returned `prompt_on_match` would leave the
+    /// first assertion green and this one red.
+    #[test]
+    fn every_match_arms_the_hotkey_whatever_the_setting_says() {
+        assert!(match_arms_hotkey(true), "a prompted match still arms the hotkey");
+        assert!(
+            match_arms_hotkey(false),
+            "with the prompt off the hotkey is the ONLY way anything is typed. If a match \
+             stops arming here, Ctrl+Alt+B fills nothing and turning the prompt off has \
+             turned autofill off entirely"
+        );
+        assert_eq!(
+            match_arms_hotkey(true),
+            match_arms_hotkey(false),
+            "arming is deliberately NOT a function of the preference"
+        );
+    }
+
+    /// Neither disposition is a fill. Stated as a test because the retired
+    /// `Auto` mode was exactly a third variant here, and a future one added
+    /// without thinking is how it would come back.
+    #[test]
+    fn no_disposition_fills_by_itself() {
+        for on in [true, false] {
+            match match_disposition(on) {
+                // Raises the overlay; `handle_match` fills only if
+                // `prompt_arm` answers `true`, which is the user's click.
+                MatchDisposition::Prompt => {}
+                MatchDisposition::Nothing => {}
+            }
+        }
+    }
+}
+
+/// Dispatches a freshly foregrounded, matched window.
+///
+/// **Always arms `(item_id, hwnd)`** and returns it, so the main loop's
+/// separate `fill_hotkey_pressed` check can fill it later once the user
+/// actually presses the fill hotkey -- see [`match_arms_hotkey`]. On top of
+/// that, and only when [`match_disposition`] says so, it raises the overlay
+/// and fills if the user clicks Fill.
 ///
 /// **Takes the window as one `ForegroundEvent`**, not as a handle plus a name
 /// plus a title. Those three describe one window and are only correct
@@ -411,17 +521,14 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
     injector: &Injector<A, B>,
     fill_stats: &crate::fill_stats::FillStats,
     item_id: &str,
-    m: &AppMatch,
+    prompt_on_match: bool,
     window: &crate::window_watch::ForegroundEvent,
     notifier: &dyn sequence::Notifier,
 ) -> Option<(String, isize)> {
     let hwnd = window.hwnd;
-    match m.trigger {
-        TriggerMode::Auto => {
-            fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
-            None
-        }
-        TriggerMode::Prompt => {
+    match match_disposition(prompt_on_match) {
+        MatchDisposition::Nothing => {}
+        MatchDisposition::Prompt => {
             // Read the item back first so the overlay can say *which*
             // credentials it is offering (design 2a shows the username and
             // item name, never a bare "fill something?"). A miss here is not
@@ -450,10 +557,12 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             if prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
             }
-            None
         }
-        TriggerMode::Hotkey => Some((item_id.to_string(), hwnd)),
     }
+    // Unconditional, and outside the match: the hotkey is the fallback the
+    // whole design rests on, so it arms for a match the user was prompted
+    // about just as much as for one they were not.
+    match_arms_hotkey(prompt_on_match).then(|| (item_id.to_string(), hwnd))
 }
 
 /// Everything the autofill overlay is told about a Prompt-mode match: what to
@@ -1033,6 +1142,30 @@ mod prompt_wiring_tests {
     const ARM_CALL: &str = concat!("prompt_arm", "(&REAL_OVERLAY, window, item.as_ref())");
     const REAL_POSITION: &str = concat!("position: ", "overlay_position,");
     const REAL_SHOW: &str = concat!("show: ", "overlay_ui::show_prompt_overlay,");
+    /// `handle_match` asks [`super::match_disposition`] the question, and asks
+    /// it about the value it was HANDED. `match_disposition(true)` -- the
+    /// preference read out of the path, the prompt back on for everyone who
+    /// turned it off -- compiles, and every behavioural test of
+    /// `match_disposition` stays green, because that function is still
+    /// perfectly correct and is simply no longer being asked the right thing.
+    const DISPOSITION_CALL: &str = concat!("match_disposition", "(prompt_on_match)");
+    /// The same hazard for the arming half: `match_arms_hotkey(false)` (or a
+    /// literal `None`) switches the hotkey fallback off for every match.
+    const ARMS_CALL: &str = concat!("match_arms_hotkey", "(prompt_on_match).then");
+    /// **`prompt_arm`'s answer is the CONDITION, not a statement.**
+    ///
+    /// [`ARM_CALL`] is the bare call, so it still matches inside
+    /// `if { prompt_arm(..); true } {` -- the overlay opens, its answer is
+    /// thrown away, and the fill happens whether the user clicked Fill or
+    /// Dismiss. That mutant was run against this suite and survived it: 1646
+    /// lib and 133 bin tests green, with "nothing is typed without a user
+    /// action" broken. The module doc above called that shape "legible in any
+    /// diff", which is true and is not the same as caught.
+    ///
+    /// So the needle is the whole `if ... {`, and the mutant no longer
+    /// contains it.
+    const GUARDED_ARM: &str =
+        concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
 
     fn source() -> &'static str {
         include_str!("app.rs")
@@ -1064,6 +1197,59 @@ mod prompt_wiring_tests {
         assert_eq!(occurrences(planted, REAL_SHOW), 1, "planted: {planted}");
         let mutated = concat!("    show: ", "|_label, m, p| overlay_ui::show_prompt_overlay(\"\", m, p),");
         assert_eq!(occurrences(mutated, REAL_SHOW), 0, "planted: {mutated}");
+
+        let planted = concat!("match match_disposition", "(prompt_on_match) {");
+        assert_eq!(occurrences(planted, DISPOSITION_CALL), 1, "planted: {planted}");
+        let mutated = concat!("match match_disposition", "(true) {");
+        assert_eq!(occurrences(mutated, DISPOSITION_CALL), 0, "planted: {mutated}");
+
+        let planted = concat!("match_arms_hotkey", "(prompt_on_match).then(|| (item_id.to_string(), hwnd))");
+        assert_eq!(occurrences(planted, ARMS_CALL), 1, "planted: {planted}");
+        let mutated = concat!("match_arms_hotkey", "(false).then(|| (item_id.to_string(), hwnd))");
+        assert_eq!(occurrences(mutated, ARMS_CALL), 0, "planted: {mutated}");
+    }
+
+    /// **The preference reaches the decision, and the decision is the one
+    /// made.** `handle_match` needs a `VaultCache`, an `Injector` and a
+    /// `FillStats` and then opens a real overlay window, so nothing can call
+    /// it; these two lines are where a correct pure function gets asked the
+    /// wrong question, which is this crate's signature defect.
+    #[test]
+    fn handle_match_asks_the_disposition_about_the_value_it_was_handed() {
+        assert_eq!(
+            occurrences(source(), DISPOSITION_CALL),
+            1,
+            "expected {DISPOSITION_CALL:?} exactly once in app.rs -- `handle_match`'s one \
+             decision. Zero means the global prompt preference is no longer what decides \
+             whether a matched window raises the overlay: a literal in its place turns the \
+             prompt on for every user who switched it off, or off for every user who did not, \
+             with the whole suite green"
+        );
+    }
+
+    /// **The fill waits for the user's click.** See [`GUARDED_ARM`] for the
+    /// mutant this exists for and for why [`ARM_CALL`] alone did not catch it.
+    #[test]
+    fn the_prompt_arms_answer_is_what_gates_the_fill() {
+        assert_eq!(
+            occurrences(source(), GUARDED_ARM),
+            1,
+            "expected {GUARDED_ARM:?} exactly once in app.rs. Zero means the overlay's answer \
+             is no longer the condition on the fill below it, so a matched window would type \
+             the user's password whether they clicked Fill or Dismiss -- and, because the \
+             fill falls back to blind SendInput, into whatever holds focus"
+        );
+    }
+
+    #[test]
+    fn handle_match_arms_the_hotkey_through_the_function_that_says_it_always_does() {
+        assert_eq!(
+            occurrences(source(), ARMS_CALL),
+            1,
+            "expected {ARMS_CALL:?} exactly once in app.rs -- `handle_match`'s return. Zero \
+             means the arming is conditional again, and with the prompt switched off that is \
+             an app that fills nothing at all: Ctrl+Alt+B is the only remaining way in"
+        );
     }
 
     #[test]
@@ -1115,7 +1301,7 @@ mod prompt_wiring_tests {
 #[cfg(test)]
 mod fill_dispatch_tests {
     use super::*;
-    use crate::app_match::APP_MATCH_FIELD_NAME;
+    use crate::app_match::{TriggerMode, APP_MATCH_FIELD_NAME};
     use crate::injector::sequence::{Plan, Step};
     use crate::vault_bridge::{LoginData, VaultBridge, VaultField};
     use std::sync::{Arc, Mutex};

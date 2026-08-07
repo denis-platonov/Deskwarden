@@ -314,6 +314,31 @@ pub struct Settings {
     /// vault window is open; reads come from `VaultCache` either way, so
     /// autofill is unaffected.
     pub keep_backend_running: bool,
+    /// Whether focusing a matched window raises the autofill prompt.
+    ///
+    /// **This is the whole of the automatic half of autofill, and it is one
+    /// global switch rather than a choice per vault item.** `true` (the
+    /// default, and what an older `settings.json` without this field parses
+    /// as) means a window that matches an item raises the overlay, and
+    /// nothing is typed until the user clicks Fill on it. `false` means a
+    /// match does nothing at all on its own, and the fill hotkey
+    /// (`CTRL+ALT+B`) is the only way anything is typed.
+    ///
+    /// **Neither state fills silently**, which is the reason this replaced
+    /// the per-item `AppMatch::trigger`. That enum's `Auto` mode filled the
+    /// instant a matched window took focus, and the fill falls back to blind
+    /// `SendInput` whenever UI Automation reports no password field -- which
+    /// on a real desktop is every window probed so far. So `Auto` could type
+    /// a password into whatever happened to hold focus, and it is retired
+    /// rather than renamed. See [`crate::app::match_disposition`], the pure
+    /// function this field is the only input to.
+    ///
+    /// **The hotkey arms for every match either way.** Turning this off
+    /// removes the prompt, not the binding: `handle_match` still returns the
+    /// `(item_id, hwnd)` pair the main loop's `fill_hotkey_pressed` check
+    /// fills from. If it did not, `false` would mean autofill was off
+    /// entirely, which is the opposite of the fallback it is meant to be.
+    pub prompt_on_match: bool,
     /// Whether the vault window locks itself at all.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -412,6 +437,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             keep_backend_running: true,
+            prompt_on_match: true,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             vault_window: None,
@@ -531,6 +557,7 @@ impl Settings {
     pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
         let Settings {
             keep_backend_running,
+            prompt_on_match,
             auto_lock_enabled,
             auto_lock_minutes,
             vault_window: _,
@@ -543,6 +570,7 @@ impl Settings {
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
+        on_disk.prompt_on_match = *prompt_on_match;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.save(path)
@@ -714,6 +742,10 @@ mod tests {
         let path = temp_path("round-trip");
         let written = Settings {
             keep_backend_running: false,
+            // Deliberately the OPPOSITE of `keep_backend_running`: two `bool`s that
+            // agreed would round-trip identically through a writer that assigned
+            // one of them from the other.
+            prompt_on_match: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: None,
@@ -744,6 +776,20 @@ mod tests {
         let loaded = Settings::load(&path);
         assert!(!loaded.keep_backend_running);
         assert_eq!(loaded.auto_lock_minutes, DEFAULT_AUTO_LOCK_MINUTES);
+        // The field this pass added, named explicitly: a v0.5.0 `settings.json`
+        // has no `prompt_on_match` key, and an upgrading user must get the
+        // prompt rather than an app that silently stops offering to fill.
+        assert!(
+            loaded.prompt_on_match,
+            "an older settings.json read as prompt-off, so upgrading turns the automatic \
+             half of autofill off for everyone who had it"
+        );
+        // And the mechanism, stated as what it answers: this is a real file
+        // without the key, not a `Settings::default()` in disguise.
+        assert_eq!(
+            crate::app::match_disposition(loaded.prompt_on_match),
+            crate::app::MatchDisposition::Prompt
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -867,6 +913,7 @@ mod tests {
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
             keep_backend_running: true,
+            prompt_on_match: false,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             vault_window: None,
@@ -906,11 +953,55 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **The same hazard, for `prompt_on_match`.** Found by mutation, not by
+    /// inspection: deleting `on_disk.prompt_on_match = *prompt_on_match;` from
+    /// `persist_preferences` left all 1645 lib and 133 bin tests green. The
+    /// destructuring above it forces every field to be *named*, which is what
+    /// makes a new one impossible to forget entirely -- but naming it and
+    /// binding it to `_` compiles just as well as assigning it, and the test
+    /// above only ever exercised `auto_lock_enabled`.
+    ///
+    /// What that mutant shipped: the toggle moves, the app obeys it for the
+    /// rest of the session, and the next launch has it back on. A preference
+    /// that does not survive a restart is one the user has to set every time,
+    /// which is indistinguishable from a broken switch.
+    ///
+    /// Both directions, because `prompt_on_match` defaults to `true` and a
+    /// writer that always wrote the default would pass a one-way test.
+    #[test]
+    fn persisting_preferences_carries_the_prompt_setting_too() {
+        let path = temp_path("prefs-prompt");
+        Settings::default().save(&path).unwrap();
+        assert!(Settings::load(&path).prompt_on_match, "the premise: it starts on");
+
+        Settings { prompt_on_match: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            !loaded.prompt_on_match,
+            "the prompt setting was dropped by persist_preferences, so turning it off lasts \
+             only until the app is restarted"
+        );
+        // The neighbours it is destructured beside are untouched, so this is
+        // not satisfied by a writer that clobbers the file with defaults.
+        assert!(loaded.keep_backend_running);
+        assert!(loaded.auto_lock_enabled);
+
+        // ...and back on again, so "always writes false" fails too.
+        Settings { prompt_on_match: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(Settings::load(&path).prompt_on_match);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_geometry_round_trips_through_disk_with_the_rest_of_the_file() {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             keep_backend_running: false,
+            prompt_on_match: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),

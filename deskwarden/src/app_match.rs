@@ -147,6 +147,46 @@ pub struct AppMatch {
     /// exactly the bytes it has now.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sequence: String,
+    /// What focusing this app used to do. **Read, written and preserved --
+    /// and no longer consulted by anything that dispatches a match.**
+    ///
+    /// What a matched window does is one global preference now
+    /// ([`crate::settings::Settings::prompt_on_match`]), not a per-item
+    /// choice: the user asked for "one setting, globally", and the `Auto`
+    /// variant in particular is retired rather than renamed -- it filled the
+    /// instant a matched window took focus, through a `SendInput` fallback
+    /// that types into whatever holds focus whenever UI Automation reports no
+    /// password field, which on a real desktop is every window probed so far.
+    /// [`crate::app::match_disposition`] is the whole of the decision now, and
+    /// this field is not one of its inputs.
+    ///
+    /// **Why it stays in the struct rather than being deleted.** Removing it
+    /// would be safe in one direction and unsafe in the other, and the unsafe
+    /// direction is the one that matters:
+    ///
+    ///  * *Old JSON into a new build.* Serde ignores unknown keys, so a
+    ///    dropped field would still parse. Nothing is lost by deleting it --
+    ///    this direction is not the argument.
+    ///  * *New JSON into an old build.* This one is decisive. `trigger` has
+    ///    **no `#[serde(default)]`**: it is a REQUIRED key on the way in, and
+    ///    it always has been. A build that stopped writing it would produce
+    ///    field values that v0.5.0 cannot parse at all -- so a user who rolled
+    ///    back, or who runs two machines a release apart, would find every
+    ///    binding reported as an unreadable custom field
+    ///    ([`crate::vault_bridge::has_app_match_field`]) and autofill silently
+    ///    dead for every item. Silently dropping a field an older build wrote
+    ///    is one thing; writing a value an older build cannot read is another.
+    ///
+    /// Keeping it costs one `TriggerMode` per match on the wire and buys
+    /// interoperability in both directions, plus the option of per-item
+    /// control returning without a migration. The value is preserved exactly
+    /// as it arrived: nothing in this build rewrites it, so an item last
+    /// touched by v0.5.0 keeps whatever it said.
+    ///
+    /// It is still *editable* -- `detail_edit`'s form and the picker still
+    /// offer the three modes -- which is deliberately a separate pass; this
+    /// one removed the read-only card's copy of that control, which is what
+    /// the user pointed at.
     pub trigger: TriggerMode,
 }
 
@@ -402,6 +442,57 @@ mod tests {
         assert_eq!(parsed.title, "Ledgerline - Invoices", "the value is not rewritten");
         assert_eq!(parsed.path, r"C:\Apps\Ledgerline.exe");
         assert!(!parsed.hosted, "an absent `hosted` key must read as false");
+    }
+
+    /// **Both directions of the v0.5.0 interoperability [`AppMatch::trigger`]
+    /// argues for**, as literal bytes rather than as a claim in a doc comment.
+    ///
+    /// The forward direction is a v0.5.0 field value parsing here. The
+    /// backward one is the decisive one and cannot be run against a v0.5.0
+    /// binary, so it is spelled out as the property that makes it work: every
+    /// value this build writes carries a `"trigger"` key, because v0.5.0's
+    /// `trigger` has no `#[serde(default)]` and a value without that key is
+    /// one it refuses outright.
+    ///
+    /// Deleting the field, or adding `#[serde(skip_serializing)]` to it, fails
+    /// the second half. Adding `#[serde(default)]` to it -- which would look
+    /// like tidying, given nothing reads it -- fails nothing here and is why
+    /// the doc says plainly that its absence is load-bearing.
+    #[test]
+    fn the_trigger_key_survives_in_both_directions_so_v0_5_0_can_still_read_it() {
+        // Forward: the exact bytes v0.5.0 writes for a plain match.
+        let from_v0_5_0 = r#"{"process":"Ledgerline.exe","trigger":"auto"}"#;
+        let parsed =
+            AppMatch::from_field_value(from_v0_5_0).expect("a v0.5.0 field value must parse");
+        assert_eq!(parsed.process, "Ledgerline.exe");
+        assert_eq!(parsed.trigger, TriggerMode::Auto, "the stored value is not rewritten");
+
+        // ... and re-serializing it gives back the very same bytes, so an
+        // item this build touches is not silently migrated to a shape v0.5.0
+        // would refuse.
+        assert_eq!(parsed.to_field_value(), from_v0_5_0);
+
+        // Backward: EVERY shape this build writes carries the key. Both
+        // fixtures below are checked because they exercise the two
+        // `skip_serializing_if` paths, and `trigger` is on neither.
+        for written in [
+            AppMatch::for_process("Ledgerline.exe", TriggerMode::Hotkey).to_field_value(),
+            captured().to_field_value(),
+        ] {
+            assert!(
+                written.contains(r#""trigger":"#),
+                "a value this build writes has no `trigger` key: {written}. v0.5.0 requires \
+                 it, so every binding would read as an unreadable custom field there and \
+                 autofill would be silently dead for a user who rolled back"
+            );
+            // The value v0.5.0 would read back is a real variant, not `null`
+            // or an empty string, either of which it also refuses.
+            let round = AppMatch::from_field_value(&written).expect("our own output parses");
+            assert!(matches!(
+                round.trigger,
+                TriggerMode::Prompt | TriggerMode::Hotkey | TriggerMode::Auto
+            ));
+        }
     }
 
     #[test]
