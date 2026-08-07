@@ -1004,9 +1004,20 @@ pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAct
     let screen = ctx.content_rect();
     let card = modal_card_rect(screen);
 
+    // **`screen.min`, not `Pos2::ZERO`.** The area's stored rect is
+    // `fixed_pos + allocated size`, and that rect is what `layer_id_at`
+    // hit-tests; the *painted* rectangle just below is `screen`. Anchored at
+    // `Pos2::ZERO` the two agree only while `content_rect().min` is the origin,
+    // and where it is not, the scrim looks whole and blocks a `screen.size()`
+    // box starting at the wrong corner -- leaving a live strip along the far
+    // edges of the window. `content_rect().min` is the origin on every harness
+    // and on every window this app opens today, so this is hardening rather
+    // than a fix; the point is that the blocked region and the painted region
+    // are now derived from the same rectangle instead of agreeing by
+    // coincidence.
     egui::Area::new(egui::Id::new("prefs-modal-scrim"))
         .order(egui::Order::Foreground)
-        .fixed_pos(Pos2::ZERO)
+        .fixed_pos(screen.min)
         .show(ctx, |ui| {
             ui.allocate_response(screen.size(), Sense::click());
             ui.painter().rect_filled(

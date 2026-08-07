@@ -783,6 +783,26 @@ unsafe fn registry_string(key: HKEY, subkey: &str, value: &str) -> Option<String
 /// returns candidates; whether one of them is really there is the caller's
 /// question, because the caller is the one allowed to pay for a file system.
 fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
+    relocate_store_path_with(path, registered_roots)
+}
+
+/// [`relocate_store_path`] with the registry lifted out, so all of it can be
+/// tested without one.
+///
+/// **The seam exists because the join is the line that broke, and the only
+/// thing that could reach it was a live test.** `relocate_store_path` reads the
+/// per-user package repository, so every test of it depended on what happened
+/// to be installed on the machine running it -- and the one test that killed
+/// the flattening mutant `return`s when it finds no nested package. On CI, in a
+/// container, or on any box whose Store packages are all flat, flattening this
+/// join again left the whole suite green. `lookup` is `registered_roots` in
+/// production, pinned by `the_repair_asks_the_registry_through_the_one_seam`,
+/// and a fixture in the tests, which is what makes the join itself provable
+/// anywhere.
+fn relocate_store_path_with(
+    path: &str,
+    lookup: impl Fn(&str) -> Vec<(String, Option<String>)>,
+) -> Vec<(String, Option<String>)> {
     // **The TAIL, not the file name.** Keeping only `file_name_of(path)` and
     // re-joining it to the package root silently flattened every nested layout:
     // `...\PKG\exiftool_files\perl.exe` became `...\PKG\perl.exe`, which names
@@ -791,7 +811,7 @@ fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
     let Some((package, tail)) = windowsapps_package_and_tail(path) else {
         return Vec::new();
     };
-    registered_roots(package)
+    lookup(package)
         .into_iter()
         .map(|(root, name)| {
             let root = root.trim_end_matches(['\\', '/']);
@@ -1036,6 +1056,10 @@ mod tests {
         let ctx = ctx();
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         if std::fs::metadata(&system_root).is_err() {
+            skipped(
+                "a_path_that_turns_out_to_be_a_folder_is_not_named_after_the_folder",
+                "%SystemRoot% does not exist on this machine",
+            );
             return;
         }
         let mut cache = AppIdentityCache::default();
@@ -1278,6 +1302,189 @@ mod tests {
         assert!(relocate_store_path("").is_empty());
     }
 
+    /// A live test that found nothing to look at says so.
+    ///
+    /// **A silent `return` is indistinguishable from a pass.** The nested
+    /// relocation test below was, until the tests above it existed, the ONLY
+    /// thing that killed the flattening defect -- and on a machine with no
+    /// nested Store package it returned green having asserted nothing. Printed
+    /// rather than `ignored`, because whether there is anything to look at is
+    /// not known until the registry has been walked, which is after the test
+    /// has started. `cargo test -- --show-output` is where these appear.
+    fn skipped(test: &str, why: &str) {
+        println!("SKIPPED {test}: {why} -- this run asserted nothing about it");
+    }
+
+    /// A fixture `lookup` for [`relocate_store_path_with`], plus a counter, so
+    /// a test can prove the seam was consulted rather than quietly bypassed.
+    fn fixture_roots<'a>(
+        roots: &[(&str, Option<&str>)],
+        seen: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str) -> Vec<(String, Option<String>)> + 'a {
+        let owned: Vec<(String, Option<String>)> = roots
+            .iter()
+            .map(|(r, n)| (r.to_string(), n.map(str::to_string)))
+            .collect();
+        move |package: &str| {
+            seen.borrow_mut().push(package.to_string());
+            owned.clone()
+        }
+    }
+
+    /// **The join keeps the tail, proved without a registry and without a
+    /// particular machine's packages.**
+    ///
+    /// This is the line that shipped broken: `file_name_of(&tail)` instead of
+    /// the tail, so `...\PKG\exiftool_files\perl.exe` was "repaired" to
+    /// `...\PKG\perl.exe`, which names nothing. Its only killing test was live
+    /// and skipped itself where no nested package was installed, which is every
+    /// container and most machines.
+    #[test]
+    fn the_repair_keeps_everything_below_the_package_when_it_rejoins_the_root() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        // Two roots, because an update being staged really does register two,
+        // and a `map` that answered only the first would still pass a one-root
+        // fixture.
+        let roots = [
+            (r"C:\Program Files\WindowsApps\ShareX_21.0.0.0_x64__egrzcvs15399j", Some("ShareX")),
+            (r"D:\Apps\WindowsApps\ShareX_22.0.0.0_x64__egrzcvs15399j", None),
+        ];
+        let expired =
+            r"C:\Program Files\WindowsApps\ShareX_1.0.0.0_x64__egrzcvs15399j\exiftool_files\perl.exe";
+        let got = relocate_store_path_with(expired, fixture_roots(&roots, &seen));
+
+        assert_eq!(
+            seen.borrow().as_slice(),
+            [r"ShareX_1.0.0.0_x64__egrzcvs15399j".to_string()],
+            "the lookup was asked for something other than the expired path's own package, or \
+             was not asked at all -- in which case everything below asserts nothing"
+        );
+        assert_eq!(got.len(), roots.len(), "a staged second root was dropped: {got:?}");
+
+        for ((root, display), (path, name)) in roots.iter().zip(&got) {
+            let wanted = format!(r"{root}\exiftool_files\perl.exe");
+            let flattened = format!(r"{root}\perl.exe");
+            // The control the live test also carries: the two shapes really are
+            // different strings, so an assertion that the answer is one of them
+            // is an assertion about something.
+            assert_ne!(wanted, flattened, "control: the fixture is not nested");
+            assert_eq!(
+                path, &wanted,
+                "the repair dropped the subdirectory. `{flattened}` names nothing, so \
+                 `Probe::file` stays `None` and the card is left with no icon while the label \
+                 still reads right, because the label comes from the registry either way"
+            );
+            assert_eq!(
+                name.as_deref(),
+                *display,
+                "the package's DisplayName was not carried through the join"
+            );
+        }
+    }
+
+    #[test]
+    fn a_flat_layout_and_a_trailing_separator_are_both_rejoined_without_damage() {
+        // The other half of the same line: keeping the tail must not have
+        // broken the flat case the old code got right, and the registry's roots
+        // are not guaranteed to be free of a trailing `\`.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let roots = [(r"C:\Program Files\WindowsApps\iTunes_12_x64__nzyj5cx40ttqa\", None)];
+        let got = relocate_store_path_with(
+            &format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe"),
+            fixture_roots(&roots, &seen),
+        );
+        assert_eq!(seen.borrow().len(), 1, "the lookup was never consulted");
+        assert_eq!(
+            got.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            [r"C:\Program Files\WindowsApps\iTunes_12_x64__nzyj5cx40ttqa\iTunes.exe"],
+            "a flat relocation onto a root that ends in a separator came out malformed: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_forward_slashed_nested_path_is_rejoined_with_backslashes() {
+        // `windowsapps_package_and_tail` normalises the tail because the root
+        // out of the registry always uses `\`; this is that normalisation seen
+        // from the join, which is where a mixed separator would actually hurt.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let roots = [(r"C:\Program Files\WindowsApps\Led_2.0.0.0_x64__abcdefghijklm", None)];
+        let got = relocate_store_path_with(
+            "C:/Program Files/windowsapps/Led_1.0.0.0_x64__abcdefghijklm/bin/tools/led.exe",
+            fixture_roots(&roots, &seen),
+        );
+        assert_eq!(seen.borrow().len(), 1, "the lookup was never consulted");
+        assert_eq!(
+            got.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            [r"C:\Program Files\WindowsApps\Led_2.0.0.0_x64__abcdefghijklm\bin\tools\led.exe"],
+            "a nested Store path written with forward slashes was rejoined wrong: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_store_path_never_reaches_the_lookup_at_all() {
+        // `a_path_outside_windowsapps_never_reaches_the_registry` asserts the
+        // ANSWER is empty, which a function that walked the registry and then
+        // threw the result away would also satisfy. This asserts the walk did
+        // not happen -- the guarantee that a dead network share costs nothing.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let roots = [(r"C:\Program Files\WindowsApps\Led_2.0.0.0_x64__abcdefghijklm", None)];
+        for outside in [
+            r"C:\Program Files\Google\Chrome\chrome.exe",
+            r"\\dead-share\apps\Ledgerline.exe",
+            r"C:\My WindowsApps Backup\iTunes.exe",
+            r"C:\Program Files\WindowsApps\Led_1.0.0.0_x64__abcdefghijklm",
+            "",
+        ] {
+            let got = relocate_store_path_with(outside, fixture_roots(&roots, &seen));
+            assert!(got.is_empty(), "{outside} was relocated onto {got:?}");
+        }
+        assert!(
+            seen.borrow().is_empty(),
+            "a path that is not a Store path reached the registry lookup: {:?}",
+            seen.borrow()
+        );
+        // Positive control: the same fixture DOES get consulted for a real
+        // Store path, so `is_empty()` above is a fact about these paths and not
+        // about a lookup that is never called by anyone.
+        let got = relocate_store_path_with(
+            r"C:\Program Files\WindowsApps\Led_1.0.0.0_x64__abcdefghijklm\bin\led.exe",
+            fixture_roots(&roots, &seen),
+        );
+        assert_eq!(seen.borrow().len(), 1, "control: the fixture is never consulted at all");
+        assert_eq!(got.len(), 1, "control: the fixture produces no candidate for any path");
+    }
+
+    /// **Production goes through the tested function, with the real registry.**
+    ///
+    /// The seam is only worth anything if `relocate_store_path` is a delegation
+    /// and not a second copy of the join that can drift from the one every test
+    /// above exercises.
+    #[test]
+    fn the_repair_asks_the_registry_through_the_one_seam() {
+        let source = include_str!("app_identity.rs");
+        let production = source
+            .split_once(concat!("mod te", "sts {"))
+            .expect("app_identity.rs must still have its test module")
+            .0;
+        assert!(production.len() < source.len(), "control: the split cut the test module off");
+
+        let delegation = concat!("relocate_store_path", "_with(path, registered_roots)");
+        assert_eq!(
+            production.matches(delegation).count(),
+            1,
+            "{delegation:?} is not in the production half exactly once: `relocate_store_path` \
+             either stopped delegating -- so the join every test above proves is not the join \
+             production runs -- or it now calls the seam more than once"
+        );
+        // And the join lives in the tested function, not duplicated beside it.
+        assert_eq!(
+            production.matches(concat!("{root}", r"\{tail}")).count(),
+            1,
+            "the `root`/`tail` join appears more than once in the production half, so one copy \
+             of it is untested"
+        );
+    }
+
     /// An installed Store package that really has an executable in it, as
     /// `(package full name, install root, one .exe file name)`.
     ///
@@ -1378,6 +1585,10 @@ mod tests {
     #[test]
     fn an_expired_nested_store_path_is_relocated_with_its_subdirectory_intact() {
         let Some((full_name, root, tail)) = an_installed_store_app_in_a_subdirectory() else {
+            skipped(
+                "an_expired_nested_store_path_is_relocated_with_its_subdirectory_intact",
+                "no installed Store package on this machine has an executable in a subdirectory",
+            );
             return;
         };
         // The fixture really is nested, or this is the flat test again.
@@ -1436,6 +1647,10 @@ mod tests {
     #[test]
     fn an_expired_store_path_is_relocated_onto_the_installed_version() {
         let Some((full_name, root, exe)) = an_installed_store_app() else {
+            skipped(
+                "an_expired_store_path_is_relocated_onto_the_installed_version",
+                "no installed Store package on this machine has an executable with an icon in its root",
+            );
             return;
         };
         let expired = expired_path(&full_name, &exe);
@@ -1457,6 +1672,10 @@ mod tests {
         // calls: a Store path whose version has gone is what shows `iTunes.exe`
         // with no icon.
         let Some((full_name, _, exe)) = an_installed_store_app() else {
+            skipped(
+                "an_expired_store_path_shows_the_apps_name_and_icon_again",
+                "no installed Store package on this machine has an executable with an icon in its root",
+            );
             return;
         };
         let ctx = ctx();
@@ -1481,6 +1700,10 @@ mod tests {
         // it steps aside rather than asserting something machine-dependent.
         let path = format!(r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe");
         if !relocate_store_path(&path).is_empty() {
+            skipped(
+                "a_store_path_for_an_app_that_is_not_installed_still_degrades_quietly",
+                "Apple iTunes really is installed here, so the fixture path is not dead",
+            );
             return;
         }
         let ctx = ctx();
@@ -1533,6 +1756,10 @@ mod tests {
         let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         let notepad = format!(r"{system_root}\System32\notepad.exe");
         if std::fs::metadata(&notepad).is_err() {
+            skipped(
+                "a_path_that_is_a_real_file_is_still_named_after_the_file",
+                "notepad.exe is not where %SystemRoot% says it should be",
+            );
             return;
         }
         let mut cache = AppIdentityCache::default();
