@@ -7557,13 +7557,155 @@ mod tests {
             concat!("if follow_up == VaultFollow", "Up::Resettle {").to_string()
         }
 
-        /// Occurrences of `follow_up` being ASSIGNED -- `follow_up =` but not
-        /// `follow_up ==`, which is how both branches read it.
-        fn assignments_of_follow_up(source: &str) -> usize {
-            let needle = concat!("follow", "_up =");
+        /// `source` with every comment, every string literal's contents and
+        /// every character literal removed, so a scan over it sees CODE.
+        ///
+        /// Every guard in this module reads the production source as text, and
+        /// text is not code: a `/* */` block, a trailing `// ... continue ...`,
+        /// or a log message containing the word `return` would all make a
+        /// keyword scan fire on something that never executes. A guard that
+        /// cries wolf is a guard that gets deleted rather than obeyed, and a
+        /// deleted guard is how the v0.5.0 defect survived a release. It is
+        /// also load-bearing for brace matching: a `{` inside a string literal
+        /// would otherwise desynchronise every span this module slices.
+        ///
+        /// Blanking rather than deleting: a string becomes `""` and a char
+        /// literal `' '`, so the code around them still parses as code.
+        fn code_only(source: &str) -> String {
+            let src: Vec<char> = source.chars().collect();
+            let at = |i: usize| src.get(i).copied();
+            // `'x'`, `'\n'`, `'\''` -- but NOT a lifetime, which has no
+            // closing quote and must be left alone.
+            let char_literal_len = |i: usize| -> Option<usize> {
+                if at(i) != Some('\'') {
+                    return None;
+                }
+                let n = if at(i + 1) == Some('\\') { 4 } else { 3 };
+                (at(i + n - 1) == Some('\'')).then_some(n)
+            };
+            let mut out = String::new();
+            let mut i = 0;
+            while i < src.len() {
+                let c = src[i];
+                if c == '/' && at(i + 1) == Some('/') {
+                    while i < src.len() && src[i] != '\n' {
+                        i += 1;
+                    }
+                } else if c == '/' && at(i + 1) == Some('*') {
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < src.len() && depth > 0 {
+                        if src[i] == '/' && at(i + 1) == Some('*') {
+                            depth += 1;
+                            i += 2;
+                        } else if src[i] == '*' && at(i + 1) == Some('/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else if let Some(hashes) = raw_string_hashes(&src, i) {
+                    out.push_str("\"\"");
+                    i += hashes + 2;
+                    while i < src.len() {
+                        if src[i] == '"' && (0..hashes).all(|h| at(i + 1 + h) == Some('#')) {
+                            i += hashes + 1;
+                            break;
+                        }
+                        i += 1;
+                    }
+                } else if c == '"' {
+                    out.push_str("\"\"");
+                    i += 1;
+                    while i < src.len() {
+                        if src[i] == '\\' {
+                            i += 2;
+                        } else if src[i] == '"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else if let Some(n) = char_literal_len(i) {
+                    out.push_str("' '");
+                    i += n;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        /// A Rust identifier character, so a keyword scan can insist on whole
+        /// words.
+        fn is_word(c: char) -> bool {
+            c.is_alphanumeric() || c == '_'
+        }
+
+        /// `Some(hash count)` if a raw string literal starts at `i`.
+        ///
+        /// Raw strings have no escapes, so the ordinary string scanner would
+        /// run off the end of one containing a backslash -- and swallowing the
+        /// rest of the file is a HOLE, not a false positive.
+        fn raw_string_hashes(src: &[char], i: usize) -> Option<usize> {
+            if src.get(i) != Some(&'r') || (i > 0 && is_word(src[i - 1])) {
+                return None;
+            }
+            let mut k = i + 1;
+            while src.get(k) == Some(&'#') {
+                k += 1;
+            }
+            (src.get(k) == Some(&'"')).then_some(k - i - 1)
+        }
+
+        /// The byte offsets at which the whole word `follow_up` appears.
+        fn occurrences_of_follow_up(source: &str) -> Vec<usize> {
+            let needle = concat!("follow", "_up");
             source
                 .match_indices(needle)
-                .filter(|(at, _)| source[at + needle.len()..].starts_with(|c: char| c != '='))
+                .filter(|(at, _)| {
+                    !source[..*at].ends_with(is_word)
+                        && !source[at + needle.len()..].starts_with(is_word)
+                })
+                .map(|(at, _)| at)
+                .collect()
+        }
+
+        /// Occurrences of `follow_up` being ASSIGNED, **insensitive to every
+        /// spelling of the whitespace around the `=`**.
+        ///
+        /// The previous version of this counter looked for the literal
+        /// `follow_up =` -- one space. `follow_up=`, `follow_up  =` and a
+        /// line-broken `follow_up\n    =` were all invisible to it, and a
+        /// SHADOWING re-binding written any of those ways overrode the loop's
+        /// answer with the whole suite green (measured). So the identifier is
+        /// found as a whole word and whatever follows is skipped past all
+        /// whitespace before being asked whether it is a single `=`.
+        fn assignments_of_follow_up(source: &str) -> usize {
+            let needle = concat!("follow", "_up");
+            occurrences_of_follow_up(source)
+                .into_iter()
+                .filter(|at| {
+                    let rest = source[at + needle.len()..].trim_start();
+                    rest.starts_with('=') && !rest.starts_with("==")
+                })
+                .count()
+        }
+
+        /// Occurrences of `follow_up` preceded by the keyword `mut`, again
+        /// past any whitespace -- `let mut follow_up` and `&mut follow_up`.
+        ///
+        /// The counter above sees an override written with `=`. This one sees
+        /// the ones written without: `std::mem::replace(&mut follow_up, ..)`
+        /// and friends. `follow_up` is decided once and read twice; nothing
+        /// legitimate needs it mutable, so the honest count is zero.
+        fn mutable_bindings_of_follow_up(source: &str) -> usize {
+            occurrences_of_follow_up(source)
+                .into_iter()
+                .filter(|at| source[..*at].trim_end().ends_with("mut"))
                 .count()
         }
 
@@ -7599,19 +7741,87 @@ mod tests {
                  means, or it now asks it under a condition -- and a conditional call is how the \
                  shipped defect comes back with `vault_follow_up`'s own tests still green"
             );
+            // Comments first: this file documents the override it forbids, and
+            // the documentation is not an assignment.
+            let code = code_only(production);
             assert_eq!(
-                assignments_of_follow_up(production),
+                assignments_of_follow_up(&code),
                 1,
                 "`follow_up` is assigned more than once in the production code, so the answer \
-                 the branches read is not necessarily the one `vault_follow_up` gave"
+                 the branches read is not necessarily the one `vault_follow_up` gave. A SECOND \
+                 `let follow_up = ...` shadowing the first is the shipped defect reached by a \
+                 different road, and it may be spelled with any whitespace at all"
             );
-            // Positive control: the counter can see an assignment that is not
-            // the `let`, and does not count either branch's `==`.
+            assert_eq!(
+                mutable_bindings_of_follow_up(&code),
+                0,
+                "`follow_up` is bound or borrowed mutably in the production code. It is decided \
+                 once and read twice; a `mut` on it is an override the `=` counter above cannot \
+                 see, because it need not be written with an `=` at all"
+            );
+            // And exactly three mentions of the binding in the production code:
+            // the one decision, and the two branch heads that read it. A
+            // re-binding need not be spelled with an `=` after the name or with
+            // a `mut` at all -- `let (follow_up, _) = (VaultFollowUp::Done, 0);`
+            // is neither -- so the honest guard is that nothing ELSE in
+            // production names this value.
+            assert_eq!(
+                occurrences_of_follow_up(&code).len(),
+                3,
+                "`follow_up` is named {} times in the production code rather than the three \
+                 this loop has: the one decision and the two branch heads that read it. A \
+                 fourth mention is either a second binding shadowing the decision or a third \
+                 place acting on it, and either way the value the branches read is no longer \
+                 the one `vault_follow_up` returned",
+                occurrences_of_follow_up(&code).len()
+            );
+            // Control: the finder is whole-word, so `vault_follow_up`'s own name
+            // is not one of the three, and a longer identifier is not either.
+            assert_eq!(occurrences_of_follow_up("vault_follow_up(&r)").len(), 0);
+            assert_eq!(occurrences_of_follow_up("follow_up_x, follow_up").len(), 1);
+            // Positive controls: the counter sees an assignment that is not the
+            // `let`, does not count either branch's `==`, and -- the hole this
+            // replaced -- is blind to NO spelling of the whitespace.
             assert_eq!(
                 assignments_of_follow_up("let follow_up = f(); follow_up = Done; if follow_up == D"),
                 2,
                 "control: the assignment counter cannot tell an assignment from a comparison, so \
                  the assertion above passes against a loop that overwrites the answer"
+            );
+            for spelling in ["follow_up=D", "follow_up  =D", "follow_up\n        = D", "follow_up\t=D"] {
+                assert_eq!(
+                    assignments_of_follow_up(spelling),
+                    1,
+                    "control: {spelling:?} is not counted as an assignment, so an override \
+                     written that way overrides `vault_follow_up` unseen -- which is the exact \
+                     hole the single-space needle left open"
+                );
+            }
+            for not_one in ["if follow_up == D", "let vault_follow_up = f();", "follow_up_x = D"] {
+                assert_eq!(
+                    assignments_of_follow_up(not_one),
+                    0,
+                    "control: {not_one:?} is counted as an assignment to `follow_up`, so the \
+                     count above is not about this binding at all"
+                );
+            }
+            assert_eq!(mutable_bindings_of_follow_up("let mut follow_up = f();"), 1);
+            assert_eq!(mutable_bindings_of_follow_up("replace(&mut  follow_up, D)"), 1);
+            assert_eq!(
+                mutable_bindings_of_follow_up("let follow_up = f(); let mut other = 1;"),
+                0,
+                "control: the `mut` scanner fires on a `mut` that is not on this binding"
+            );
+            // Control: `code_only` really removed something, and what it removed
+            // is what the production half says about the override it forbids.
+            assert!(
+                code.len() < production.len(),
+                "control: `code_only` stripped nothing from the production half, so every scan \
+                 in this module is reading comments as if they were code"
+            );
+            assert!(
+                production.contains(concat!("VaultFollow", "Up::Done")),
+                "control: the production half no longer mentions the outcome this guard is about"
             );
 
             let decision_at = production
@@ -7661,29 +7871,36 @@ mod tests {
             );
 
             let region = &production[from..to];
-            let mut stripped = 0usize;
-            let code: Vec<&str> = region
-                .lines()
-                .filter(|line| {
-                    let comment = line.trim_start().starts_with("//");
-                    stripped += usize::from(comment);
-                    !comment
-                })
-                .collect();
+            // `code_only`, not "drop whole-line `//`". The line filter this
+            // replaced left a trailing `// ... continue ...`, a `/* */` block
+            // and any string literal containing a keyword in the region, every
+            // one of which would make the scan below fire on code that does not
+            // exist. That is not a hole -- it is worse in a different way: a
+            // guard that fails for a reason its reader cannot see gets deleted,
+            // and a deleted guard is how the v0.5.0 defect reached a release.
+            let code = code_only(region);
             // The stripping is load-bearing in both directions: it must have
             // removed something (or the region is not the documented one), and
             // what it removed must be what would otherwise trip the scan.
             assert!(
-                stripped > 0,
-                "no comment line was stripped from the region, so this slice is not the \
-                 documented write-back span and the scan below is looking at something else"
+                code.len() < region.len(),
+                "nothing was stripped from the region, so this slice is not the documented \
+                 write-back span and the scan below is looking at something else"
             );
             assert!(
                 region.contains("`continue`"),
                 "the region no longer documents the `continue` that must not come back -- the \
                  comment stripping above is now hiding nothing, which means the slice moved"
             );
-            code.join("\n")
+            // ...and the fixtures must DISAGREE: the documentation says
+            // `continue`, the code must not, or the scan below is passing only
+            // because the stripper is broken in the same direction as the test.
+            assert!(
+                !code.contains("`continue`"),
+                "the comment that spells `continue` survived the stripping, so the scan below \
+                 is about to fire on this region's own documentation"
+            );
+            code
         }
 
         /// Which control-flow jumps appear in `code`, as whole words.
@@ -7776,6 +7993,238 @@ mod tests {
                 jumps_in("let returned = continued_break_value + 1;").is_empty(),
                 "control: the jump scanner fires on identifiers that merely contain a keyword, \
                  so it would be turned off by the first false positive"
+            );
+        }
+
+        /// How many times `word` appears as a whole word in `code`.
+        fn count_word(code: &str, word: &str) -> usize {
+            code.match_indices(word)
+                .filter(|(at, _)| {
+                    !code[..*at].ends_with(is_word) && !code[at + word.len()..].starts_with(is_word)
+                })
+                .count()
+        }
+
+        /// The WHOLE tail of the vault loop: from the line that takes this
+        /// pass's result to the `}` that closes the loop body, comments and
+        /// string literals blanked.
+        ///
+        /// The end is found by brace matching rather than by a needle, so it
+        /// cannot silently stop early: it is wherever the depth this slice
+        /// starts at first goes negative, which is the loop's own closing
+        /// brace and nothing else.
+        fn the_whole_vault_loop_tail() -> String {
+            let production = super::production_half_of_this_file();
+            let head = concat!("let result = match first_", "result.take() {");
+            assert_eq!(
+                production.matches(head).count(),
+                1,
+                "{head:?} is not where this guard expects the vault session's result to be \
+                 produced"
+            );
+            let from = production.find(head).expect("checked directly above");
+            // Blank comments and strings BEFORE counting braces: a `{` inside a
+            // log message would otherwise move the end of this slice.
+            let code = code_only(&production[from..]);
+            let mut depth = 0i32;
+            let mut end = None;
+            for (at, c) in code.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth < 0 {
+                            end = Some(at);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.expect(
+                "the brace depth never went negative after the vault result, so this slice ran \
+                 to the end of the file: the loop it is supposed to bound is not there",
+            );
+            code[..end].to_string()
+        }
+
+        /// `span` with the brace-matched body of the block headed by `head`
+        /// cut out, as `(the rest, the body)`.
+        fn without_the_body_of(span: &str, head: &str) -> (String, String) {
+            assert_eq!(
+                span.matches(head).count(),
+                1,
+                "{head:?} does not appear exactly once in the span, so this cut is guessing"
+            );
+            let at = span.find(head).expect("checked directly above");
+            let open = at + head.len() - 1;
+            assert_eq!(
+                span[open..].chars().next(),
+                Some('{'),
+                "{head:?} does not end at the brace that opens its body"
+            );
+            let mut depth = 0i32;
+            let mut close = None;
+            for (i, c) in span[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let close = close.unwrap_or_else(|| panic!("{head:?}'s body is never closed"));
+            (format!("{}{}", &span[..at], &span[close + 1..]), span[at..=close].to_string())
+        }
+
+        /// **Nothing outside the two branch bodies may jump, and the settings
+        /// condition is never asked again after the decision.**
+        ///
+        /// `nothing_between_the_window_closing_and_the_branches_may_jump`
+        /// above is a SPAN guard, and its span stops at the first branch head.
+        /// The `AccountAction` body ends with its own legitimate `continue;`
+        /// and then the `Resettle` head begins -- and everything between those
+        /// two, and everything after the second body, was guarded by nothing.
+        /// This survived the whole suite (measured, 1655 + 142 green):
+        ///
+        /// ```text
+        ///     continue;
+        ///     }
+        ///
+        ///     if result.edited_settings.is_some() { continue; }
+        ///
+        ///     if follow_up == VaultFollowUp::Resettle {
+        /// ```
+        ///
+        /// `Resettle` is the ONLY path that calls `resettle_session`, so that
+        /// one line makes manual Lock and the 401 re-auth unreachable once the
+        /// gear has been clicked -- the shipped defect exactly.
+        ///
+        /// So this guard inverts the span: it takes the ENTIRE tail of the
+        /// loop, cuts out the two branch bodies (the only places a jump is
+        /// legitimate), and requires what is left to contain exactly one jump,
+        /// the loop's final `return`. The cut-out bodies are not unguarded
+        /// either -- each is pinned to the jumps it is allowed, so an early
+        /// exit smuggled INSIDE a branch is caught too.
+        ///
+        /// And a second, independent net over the same tail: `edited_settings`
+        /// may be read exactly once, in the write-back. Every member of this
+        /// defect family re-asks that question after `vault_follow_up` has
+        /// already answered it, whatever it then does with the answer.
+        #[test]
+        fn nothing_outside_the_two_branch_bodies_may_jump() {
+            let tail = the_whole_vault_loop_tail();
+            let (account, resettle) = (account_action_branch(), resettle_branch());
+
+            // Controls: the slice really is the whole tail, not a prefix of it.
+            assert!(
+                tail.len() > 5_000,
+                "the tail is {} bytes, which is not the whole loop tail: a scan over it would \
+                 pass against nothing",
+                tail.len()
+            );
+            for marker in [
+                account.as_str(),
+                resettle.as_str(),
+                concat!("resettle_ses", "sion("),
+                concat!("persist_pre", "ferences("),
+            ] {
+                assert!(
+                    tail.contains(marker),
+                    "{marker:?} is not in the sliced tail, so this guard is not watching the \
+                     span it claims to"
+                );
+            }
+
+            let (rest, account_body) = without_the_body_of(&tail, &account);
+            let (rest, resettle_body) = without_the_body_of(&rest, &resettle);
+            // The cut is exact and both bodies are real: without this, a
+            // `without_the_body_of` that quietly cut the whole tail would leave
+            // an empty `rest` that trivially contains no jump.
+            assert_eq!(
+                rest.len() + account_body.len() + resettle_body.len(),
+                tail.len(),
+                "the two cuts do not partition the tail, so something was counted twice or \
+                 dropped"
+            );
+            assert!(
+                account_body.len() > 1_000 && resettle_body.len() > 500,
+                "a branch body came out at {} / {} bytes -- one of these cuts found the wrong \
+                 braces",
+                account_body.len(),
+                resettle_body.len()
+            );
+            assert!(
+                !rest.contains(concat!("resettle_ses", "sion(")),
+                "the recovery call survived both cuts, so a branch body was not actually removed"
+            );
+
+            // The exemption, stated as an assertion rather than assumed: the
+            // account branch is allowed its ONE `continue` and nothing else,
+            // and the resettle branch is allowed nothing at all.
+            assert_eq!(
+                jumps_in(&account_body),
+                vec!["continue"],
+                "the account branch's jumps are not the single `continue` it is allowed. A \
+                 second early exit in here skips the reopen it exists to do:\n{account_body}"
+            );
+            assert_eq!(
+                count_word(&account_body, "continue"),
+                1,
+                "the account branch contains more than one `continue`, so one of them is a \
+                 skip rather than the reopen"
+            );
+            assert!(
+                jumps_in(&resettle_body).is_empty(),
+                "the lock/re-auth branch jumps: {:?}. It has nothing to jump over -- it falls \
+                 through to the one `return` below it -- so any jump in here is something \
+                 deciding not to re-authenticate:\n{resettle_body}",
+                jumps_in(&resettle_body)
+            );
+
+            // And everything else in the tail: exactly one jump, the loop's
+            // final `return`, below both branches.
+            assert_eq!(
+                jumps_in(&rest),
+                vec!["return"],
+                "outside the two branch bodies the loop tail jumps with {:?}. `edited_settings` \
+                 is `Some` for the rest of a window's life once the gear has been clicked, so \
+                 an early exit anywhere out here makes Lock and the 401 recovery unreachable -- \
+                 the exact defect that shipped in v0.5.0. Rest:\n{rest}",
+                jumps_in(&rest)
+            );
+            assert_eq!(
+                count_word(&rest, "return"),
+                1,
+                "there is more than one `return` outside the branch bodies, so one of them \
+                 leaves the loop before the branches have run:\n{rest}"
+            );
+
+            // The second net. Every override of the decision, wherever it is
+            // put and whatever it does, has to ask this question again.
+            assert_eq!(
+                count_word(&tail, concat!("edited_", "settings")),
+                1,
+                "the vault loop tail reads `edited_settings` more than once. It is read ONCE, \
+                 by the write-back; `vault_follow_up` has already decided what a visit to the \
+                 gear means, and anything down here asking again is re-deriving the decision \
+                 the loop is supposed to obey:\n{tail}"
+            );
+            // Control: the counter can see the field at all, and tells it from a
+            // longer identifier that merely contains it.
+            assert_eq!(count_word("result.edited_settings.is_some()", concat!("edited_", "settings")), 1);
+            assert_eq!(count_word("let edited_settings_seen = 1;", concat!("edited_", "settings")), 0);
+
+            // Control: `code_only` is what makes all of the above about code.
+            assert!(
+                !tail.contains("`continue`"),
+                "the tail still contains its own prose about `continue`, so `code_only` did not \
+                 run and every scan above is reading comments"
             );
         }
     }
