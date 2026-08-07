@@ -9772,6 +9772,986 @@ mod tests {
         }
     }
 
+    /// **The vault loop, driven end to end by a fake.**
+    ///
+    /// Every guard above this module is SOURCE ANALYSIS: a hand-written lexer
+    /// reading `main.rs`'s own text and asserting where words appear. That
+    /// class sprang a hole in six consecutive review rounds, and the hole it
+    /// sprang in v0.5.0 shipped -- a stale `continue;` at the bottom of the
+    /// settings write-back which, because `edited_settings` stays `Some` for
+    /// the rest of a window's life once the gear has been clicked, made every
+    /// branch beneath it unreachable. Open Settings, close it, press Lock: the
+    /// vault did not lock.
+    ///
+    /// S3 put the three acts no test may perform -- opening a real `eframe`
+    /// window, running the teardown against a real `bw serve` and a real tray,
+    /// raising a real master-password dialog -- behind [`VaultOps`]. This
+    /// module is what that was for. `run_vault_loop` is **called** here, with
+    /// a fake that opens nothing, spawns nothing and touches no path but a
+    /// throwaway settings file, and what comes back is an ORDERED LOG of what
+    /// the loop asked the outside world to do. The v0.5.0 defect is a
+    /// behavioural assertion below rather than a search for a keyword.
+    ///
+    /// **Nothing here retires a source pin.** Both classes run. Which pins the
+    /// behavioural tests make redundant is a separate decision, and making it
+    /// here would leave "does this actually kill the mutant" unmeasurable.
+    ///
+    /// **Four rules hold these to being non-vacuous**, because this repo's
+    /// signature defect is a change that is correct in isolation and does not
+    /// reach the behaviour it claims -- and its sharpest form here is a fake
+    /// whose script and whose expectation agree by construction:
+    ///
+    /// 1. Every fixture asserts its own premise, and every test pairs its
+    ///    fixture with a CONTROL differing in exactly one field that produces
+    ///    a DIFFERENT log.
+    /// 2. The log is asserted WHOLE, with `assert_eq!` on the `Vec`. Never
+    ///    `contains`: a `contains` passes for a loop that also did something
+    ///    else.
+    /// 3. The number of windows opened is asserted NUMERICALLY, so a fake that
+    ///    silently ran dry cannot pass as "returned correctly", and the script
+    ///    is asserted fully consumed.
+    /// 4. [`the_fake_can_fail`] drives the loop with a deliberately wrong
+    ///    expected log, so "the log matched" is known to be a real comparison
+    ///    over a non-empty `Vec` rather than two empties agreeing.
+    mod the_vault_loop_driven_end_to_end {
+        use super::*;
+        use deskwarden::settings::Settings;
+        use deskwarden::vault_window::VaultWindowResult;
+        use std::collections::VecDeque;
+        use std::path::PathBuf;
+
+        /// One act the loop asked of the outside world, in the order it asked.
+        ///
+        /// This is the whole observable. `run_vault_loop` returns nothing and
+        /// its side effects are on a `SessionEstate` and a settings file; what
+        /// it *decided* is exactly the sequence of `VaultOps` calls it made,
+        /// so that sequence is the thing every test below asserts.
+        #[derive(Debug, PartialEq, Eq)]
+        enum OpLog {
+            OpenedWindow,
+            Resettled,
+            AccountAction(AccountRequest),
+        }
+
+        /// The fake. Opens nothing, spawns nothing, raises nothing, touches no
+        /// path at all -- the only file any test here writes is the settings
+        /// file, and that is written by `run_vault_loop` itself, which is the
+        /// point of one of the assertions.
+        struct FakeVaultOps {
+            /// What each successive `open_window` hands back. Popped, never
+            /// re-read: a loop that opens more windows than the test scripted
+            /// is a loop that did not return when it should have.
+            scripted: VecDeque<VaultWindowResult>,
+            log: Vec<OpLog>,
+            /// **The runaway guard.** A `run_vault_loop` that re-dispatches
+            /// `first_result` instead of taking it once never opens a window
+            /// at all and never returns -- it would HANG the suite rather than
+            /// fail it, and a hung test is a test that gets ignored. Every op
+            /// is charged against this, so a non-terminating loop panics with
+            /// a sentence instead.
+            budget: usize,
+        }
+
+        impl FakeVaultOps {
+            fn new(scripted: Vec<VaultWindowResult>) -> Self {
+                Self { scripted: scripted.into(), log: Vec::new(), budget: 16 }
+            }
+
+            fn charge(&mut self) {
+                assert!(
+                    self.log.len() < self.budget,
+                    "`run_vault_loop` asked for more than {} operations without returning, so it \
+                     is not terminating. The log so far is {:?}",
+                    self.budget,
+                    self.log
+                );
+            }
+
+            /// Rule 3, as a number.
+            fn windows_opened(&self) -> usize {
+                self.log.iter().filter(|op| **op == OpLog::OpenedWindow).count()
+            }
+
+            /// Rule 3's other half: a script left half-eaten means the loop
+            /// returned earlier than the test thought it was testing.
+            fn assert_script_consumed(&self) {
+                assert!(
+                    self.scripted.is_empty(),
+                    "{} scripted window results were never asked for, so the loop returned \
+                     before the pass this test is about. The log is {:?}",
+                    self.scripted.len(),
+                    self.log
+                );
+            }
+        }
+
+        impl VaultOps for FakeVaultOps {
+            fn open_window(
+                &mut self,
+                _est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+            ) -> VaultWindowResult {
+                self.charge();
+                self.log.push(OpLog::OpenedWindow);
+                match self.scripted.pop_front() {
+                    Some(result) => result,
+                    None => panic!(
+                        "the loop opened more windows than this test scripted; the log is {:?}",
+                        self.log
+                    ),
+                }
+            }
+
+            fn resettle_after_lost_session(
+                &mut self,
+                _est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+            ) {
+                self.charge();
+                self.log.push(OpLog::Resettled);
+            }
+
+            fn account_action(
+                &mut self,
+                _est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+                request: AccountRequest,
+            ) {
+                self.charge();
+                self.log.push(OpLog::AccountAction(request));
+            }
+        }
+
+        /// Everything `run_vault_loop` needs that is not the fake, on a
+        /// throwaway directory that is deleted when the test ends.
+        ///
+        /// **No path here is a real one.** Not `%APPDATA%\Deskwarden`, not the
+        /// real `settings.json`, not the Hello enrolment, not the vault. The
+        /// bridge is pointed at `127.0.0.1:1` -- the unreachable-bridge idiom
+        /// this file already uses -- so a cache that somehow tried to reach a
+        /// backend would be refused rather than served, and nothing in this
+        /// module starts a `bw serve`.
+        struct Bench {
+            dir: PathBuf,
+            settings_path: PathBuf,
+            fill_stats: fill_stats::FillStats,
+            job: Arc<Option<job_object::KillOnCloseJob>>,
+            schedule: Vec<Duration>,
+            backend_op_tx: mpsc::Sender<BackendOp>,
+            /// Held so the channel stays open. Never drained: nothing here
+            /// sends on it, because nothing here starts a backend.
+            _backend_op_rx: mpsc::Receiver<BackendOp>,
+        }
+
+        impl Bench {
+            fn new(tag: &str) -> Self {
+                let dir = std::env::temp_dir().join(format!(
+                    "deskwarden-vault-loop-{tag}-{}-{:?}",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("a scratch directory");
+                let (backend_op_tx, _backend_op_rx) = mpsc::channel();
+                Self {
+                    settings_path: dir.join("settings.json"),
+                    fill_stats: fill_stats::FillStats::new(dir.join("fill-stats.json")),
+                    job: Arc::new(None),
+                    schedule: Vec::new(),
+                    backend_op_tx,
+                    _backend_op_rx,
+                    dir,
+                }
+            }
+
+            fn deps(&self) -> VaultDeps<'_> {
+                VaultDeps {
+                    fill_stats: &self.fill_stats,
+                    job: &self.job,
+                    schedule: &self.schedule,
+                    icon_cache_dir: &self.dir,
+                    config_dir: &self.dir,
+                    settings_path: &self.settings_path,
+                    first_run_account: None,
+                    backend_op_tx: &self.backend_op_tx,
+                }
+            }
+
+            fn estate(&self) -> SessionEstate {
+                SessionEstate {
+                    cache: Arc::new(VaultCache::new(VaultBridge::new(
+                        "http://127.0.0.1:1".to_string(),
+                    ))),
+                    engine: MatchEngine::new(),
+                    child: None,
+                    token: "not-a-real-session-token".to_string(),
+                    details: None,
+                    task_in_progress: None,
+                    store: session_store::SessionStore::new(self.dir.join("session.bin")),
+                    active_account: None,
+                    accounts: None,
+                    settings: Settings::default(),
+                }
+            }
+
+            /// What is on disk at the settings path right now: `None` if the
+            /// loop has not written it at all.
+            fn settings_bytes(&self) -> Option<Vec<u8>> {
+                std::fs::read(&self.settings_path).ok()
+            }
+        }
+
+        impl Drop for Bench {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// A window that closed with nothing asked of it. Every field is the
+        /// quiet value, so each fixture below turns on exactly what it names.
+        fn closed() -> VaultWindowResult {
+            VaultWindowResult {
+                locked: false,
+                needs_reauth: false,
+                edited_settings: None,
+                switch_to: None,
+                add_account: false,
+                remove_account: false,
+                account_details: None,
+            }
+        }
+
+        /// The preferences the gear's modal was left holding, DIFFERENT from
+        /// the estate's own copy -- which is the premise the write-back turns
+        /// on, and is asserted as one in
+        /// [`the_edited_settings_really_differ_from_the_estates`].
+        fn changed_settings() -> Settings {
+            Settings { keep_backend_running: false, ..Settings::default() }
+        }
+
+        /// The gear, clicked at some point during the window's life. **Never
+        /// reset to `None` when the modal closes**, so the fixture models the
+        /// field as production actually leaves it -- which is precisely what
+        /// made the v0.5.0 `continue` fatal rather than rare.
+        fn visited_the_gear() -> VaultWindowResult {
+            VaultWindowResult { edited_settings: Some(changed_settings()), ..closed() }
+        }
+
+        fn target() -> accounts::AccountId {
+            accounts::AccountId::parse("0123456789abcdef0123456789abcdef")
+                .expect("a 32-character hex id should parse")
+        }
+
+        fn some_details() -> login_ui::BwStatusDetails {
+            login_ui::BwStatusDetails {
+                status: login_ui::BwStatus::Unlocked,
+                user_email: Some("someone@example.com".to_string()),
+                server_url: Some("https://vault.example.com".to_string()),
+            }
+        }
+
+        /// Drives the real `run_vault_loop` against a fake and hands back the
+        /// estate it left behind. **This is the only way any test in this
+        /// module reaches the loop**, so there is no second, kinder copy of
+        /// the call for a test to pass against.
+        fn drive(
+            bench: &Bench,
+            ops: &mut FakeVaultOps,
+            first_result: Option<VaultWindowResult>,
+        ) -> SessionEstate {
+            let deps = bench.deps();
+            let mut est = bench.estate();
+            run_vault_loop(&mut est, &deps, ops, first_result);
+            est
+        }
+
+        // ---- Rule 1: the fixtures' own premises ----
+
+        /// Positive control on the fixtures, because this repo's signature
+        /// defect is a fixture whose two inputs silently agree. Everything
+        /// below depends on these two differing in exactly ONE field, and on
+        /// that field being the gear.
+        #[test]
+        fn the_two_fixtures_differ_only_in_whether_the_gear_was_visited() {
+            let (quiet, geared) = (closed(), visited_the_gear());
+            assert!(quiet.edited_settings.is_none());
+            assert!(
+                geared.edited_settings.is_some(),
+                "the geared fixture does not carry a settings answer, so every test below is \
+                 driving the quiet case twice"
+            );
+            for (a, b) in [
+                (quiet.locked, geared.locked),
+                (quiet.needs_reauth, geared.needs_reauth),
+                (quiet.add_account, geared.add_account),
+                (quiet.remove_account, geared.remove_account),
+                (quiet.switch_to.is_some(), geared.switch_to.is_some()),
+                (quiet.account_details.is_some(), geared.account_details.is_some()),
+            ] {
+                assert_eq!(a, b, "the fixtures disagree somewhere other than the gear");
+            }
+        }
+
+        /// The write-back only writes when the edit DIFFERS from the estate's
+        /// copy. A fixture carrying the defaults would make every "the file
+        /// changed" assertion below vacuous -- and would make them vacuous
+        /// silently, by taking the same `if` a broken loop takes.
+        #[test]
+        fn the_edited_settings_really_differ_from_the_estates() {
+            let bench = Bench::new("premise-settings");
+            assert_ne!(
+                changed_settings(),
+                bench.estate().settings,
+                "the geared fixture's settings equal the estate's, so the write-back would \
+                 correctly do nothing and every settings assertion below would pass on a loop \
+                 that never wrote anything"
+            );
+            assert!(
+                bench.settings_bytes().is_none(),
+                "the bench starts with a settings file already on disk, so `the file changed` \
+                 cannot distinguish a write from what was already there"
+            );
+        }
+
+        // ---- Rule 4: the comparison is real ----
+
+        /// **Proof that a matching log is a real comparison.**
+        ///
+        /// Every assertion in this module is `assert_eq!` on a `Vec<OpLog>`.
+        /// If the fake ever stopped recording -- a log left empty, a `push`
+        /// dropped in a refactor -- those assertions would compare two empty
+        /// vectors and pass forever. So one test drives the same loop through
+        /// the same helper and asserts a log it is KNOWN not to produce; if it
+        /// ever stops panicking, the fake has stopped observing.
+        #[test]
+        #[should_panic(expected = "the fake stopped observing")]
+        fn the_fake_can_fail() {
+            let bench = Bench::new("can-fail");
+            let mut ops = FakeVaultOps::new(vec![closed()]);
+            drive(&bench, &mut ops, None);
+            assert_eq!(
+                ops.log,
+                vec![OpLog::Resettled, OpLog::Resettled, OpLog::Resettled],
+                "the fake stopped observing"
+            );
+        }
+
+        // ---- The v0.5.0 defect, as behaviour ----
+
+        /// **THE REGRESSION, AS A BEHAVIOURAL TEST.**
+        ///
+        /// Settings were opened, and then the user pressed Lock (or Ctrl+L, or
+        /// the auto-lock timer fired). Against v0.5.0 the write-back's stale
+        /// `continue;` sent the loop round again: `resettle_session` never
+        /// ran, the cache kept the decrypted vault, `bw serve` kept a live
+        /// session, and nothing re-authenticated. The window came back as if
+        /// nothing had happened.
+        ///
+        /// The log here is the whole answer: the window opened once, the
+        /// recovery ran, the loop returned. A re-added `continue` produces
+        /// `[OpenedWindow, OpenedWindow, ...]` until the script runs dry, and
+        /// no source scan is involved in noticing.
+        #[test]
+        fn a_lock_after_the_gear_still_resettles() {
+            let bench = Bench::new("lock-after-gear");
+            let locked_after_gear = VaultWindowResult { locked: true, ..visited_the_gear() };
+            let mut ops = FakeVaultOps::new(vec![locked_after_gear]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::OpenedWindow, OpLog::Resettled],
+                "a window locked AFTER the gear had been clicked did not run the lock recovery. \
+                 `edited_settings` is `Some` for the rest of that window's life, so this is Lock \
+                 being a no-op for the rest of the session: the cache is not cleared, `bw serve` \
+                 keeps its session, and nothing re-authenticates"
+            );
+            assert_eq!(ops.windows_opened(), 1, "the loop reopened after locking");
+            ops.assert_script_consumed();
+
+            // And the gear's own effect really did land, on the way past --
+            // the write-back is a side effect applied whatever the follow-up
+            // says, not one of the answers.
+            let written = bench
+                .settings_bytes()
+                .expect("the edited preferences were never written to disk at all");
+            assert!(!written.is_empty(), "the settings file was written empty");
+            assert_eq!(
+                Settings::load(&bench.settings_path).keep_backend_running,
+                changed_settings().keep_backend_running,
+                "the preferences on disk are not the ones the gear's modal was left holding"
+            );
+
+            // CONTROL, differing in exactly one field, producing a different
+            // log: without the lock the same geared result is a plain close.
+            let control_bench = Bench::new("lock-after-gear-control");
+            let mut control = FakeVaultOps::new(vec![visited_the_gear()]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![OpLog::OpenedWindow],
+                "the control resettled without being locked, so the assertion above is not \
+                 about `locked` at all"
+            );
+            assert_eq!(control.windows_opened(), 1);
+            control.assert_script_consumed();
+            // The control wrote its settings too, which is what makes the one
+            // difference between the two runs `locked` and nothing else.
+            assert_eq!(
+                Settings::load(&control_bench.settings_path).keep_backend_running,
+                changed_settings().keep_backend_running,
+                "the control did not write its preferences, so the two runs differ in more than \
+                 the field this test names"
+            );
+        }
+
+        /// The same defect from the other side: after the gear, the account
+        /// menu's answer still has to reach the account action. Under the
+        /// v0.5.0 `continue` a switch clicked after a visit to Settings was
+        /// silently dropped and the window simply came back.
+        #[test]
+        fn an_account_action_after_the_gear_still_reaches_the_action() {
+            let bench = Bench::new("switch-after-gear");
+            let switch_after_gear =
+                VaultWindowResult { switch_to: Some(target()), ..visited_the_gear() };
+            // Two entries: an account action reopens, and the second window is
+            // the plain close that ends the session.
+            let mut ops = FakeVaultOps::new(vec![switch_after_gear, closed()]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![
+                    OpLog::OpenedWindow,
+                    OpLog::AccountAction(AccountRequest::SwitchTo(target())),
+                    OpLog::OpenedWindow,
+                ],
+                "the switch the account menu asked for after a visit to the gear never reached \
+                 the action"
+            );
+            assert_eq!(ops.windows_opened(), 2);
+            ops.assert_script_consumed();
+
+            // CONTROL, one field different, and the log differs with it.
+            let control_bench = Bench::new("switch-after-gear-control");
+            let mut control = FakeVaultOps::new(vec![visited_the_gear()]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![OpLog::OpenedWindow],
+                "the control took an account action without one being asked for"
+            );
+            assert_eq!(control.windows_opened(), 1);
+            control.assert_script_consumed();
+        }
+
+        /// A visit to the gear is not a reason a window closed. The loop
+        /// applies the edit and RETURNS -- it does not reopen.
+        #[test]
+        fn a_plain_close_after_the_gear_returns_without_reopening() {
+            let bench = Bench::new("close-after-gear");
+            let mut ops = FakeVaultOps::new(vec![visited_the_gear()]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::OpenedWindow],
+                "a window whose only news was a visit to the gear did not end the session"
+            );
+            assert_eq!(
+                ops.windows_opened(),
+                1,
+                "exactly one window: a visit to Settings reopening the vault is the \
+                 disappearing window this app went to some trouble to be rid of"
+            );
+            ops.assert_script_consumed();
+
+            // CONTROL, one field different, different log: the same geared
+            // result plus a lock runs the recovery before it returns.
+            let control_bench = Bench::new("close-after-gear-control");
+            let mut control =
+                FakeVaultOps::new(vec![VaultWindowResult { locked: true, ..visited_the_gear() }]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![OpLog::OpenedWindow, OpLog::Resettled],
+                "the control produced the same log as the fixture, so `[OpenedWindow]` is what \
+                 this loop yields for everything and the assertion above says nothing"
+            );
+        }
+
+        /// The reopen is bounded: an account action goes round exactly once
+        /// more, and the close that follows ends it. A `loop_step` that
+        /// answered `Reopen` for everything would spin here until the script
+        /// ran dry.
+        #[test]
+        fn an_account_action_reopens_exactly_once_then_a_close_returns() {
+            let bench = Bench::new("reopen-once");
+            let mut ops = FakeVaultOps::new(vec![
+                VaultWindowResult { add_account: true, ..closed() },
+                closed(),
+            ]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![
+                    OpLog::OpenedWindow,
+                    OpLog::AccountAction(AccountRequest::Add),
+                    OpLog::OpenedWindow,
+                ],
+                "an account action must reopen the vault exactly once and the close after it \
+                 must end the session"
+            );
+            assert_eq!(ops.windows_opened(), 2);
+            ops.assert_script_consumed();
+
+            // CONTROL, one field different: without the add, the very same
+            // close is a single pass.
+            let control_bench = Bench::new("reopen-once-control");
+            let mut control = FakeVaultOps::new(vec![closed()]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(control.log, vec![OpLog::OpenedWindow]);
+            assert_eq!(control.windows_opened(), 1);
+            control.assert_script_consumed();
+        }
+
+        /// **The account menu outranks the lock**, and the ranking is not
+        /// decoration. The recovery re-authenticates against the account this
+        /// process is ALREADY on, so a window that reported both and got the
+        /// recovery would prompt for the master password of the account the
+        /// user asked to leave and then leave them on it.
+        #[test]
+        fn an_account_request_outranks_a_lock() {
+            let bench = Bench::new("switch-outranks-lock");
+            let both = VaultWindowResult { switch_to: Some(target()), locked: true, ..closed() };
+            assert!(
+                both.switch_to.is_some() && both.locked,
+                "the fixture does not actually report both, so there is no ranking to test"
+            );
+            let mut ops = FakeVaultOps::new(vec![both, closed()]);
+
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![
+                    OpLog::OpenedWindow,
+                    OpLog::AccountAction(AccountRequest::SwitchTo(target())),
+                    OpLog::OpenedWindow,
+                ],
+                "a window that asked to switch AND reported a lock did not take the switch"
+            );
+            // Stated separately as well, because it is the specific harm. The
+            // whole-log assertion above already excludes it; this names it.
+            assert!(
+                !ops.log.contains(&OpLog::Resettled),
+                "the lock recovery ran for a window that asked to switch account: that prompts \
+                 for the master password of the account being left and then stays on it"
+            );
+            assert_eq!(ops.windows_opened(), 2);
+            ops.assert_script_consumed();
+
+            // CONTROL, one field different: drop the switch and the very same
+            // locked result takes the recovery.
+            let control_bench = Bench::new("switch-outranks-lock-control");
+            let mut control =
+                FakeVaultOps::new(vec![VaultWindowResult { locked: true, ..closed() }]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![OpLog::OpenedWindow, OpLog::Resettled],
+                "the control did not resettle on a plain lock, so the fixture's missing \
+                 `Resettled` above proves nothing about the ranking"
+            );
+            assert_eq!(control.windows_opened(), 1);
+            control.assert_script_consumed();
+        }
+
+        /// Which of the three the account menu asked for, as a table axis.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Ask {
+            Nothing,
+            Switch,
+            Add,
+            Remove,
+        }
+
+        /// **The whole cross-product**: every combination of `locked`,
+        /// `needs_reauth`, what the account menu asked for, and whether the
+        /// gear was visited -- 32 shapes -- driven through the real loop.
+        ///
+        /// The expectation is written TWICE and from two directions, because
+        /// "the script and the assertion agree by construction" is exactly the
+        /// defect this repo keeps finding. Each row's expected follow-up is
+        /// stated by a rule written here in the test; that statement is
+        /// checked against [`vault_follow_up`]; and the op log the loop
+        /// actually produced is checked against the log that follow-up
+        /// implies. A loop that dispatched the wrong arm fails the third
+        /// check, and a `vault_follow_up` that changed its mind fails the
+        /// second.
+        #[test]
+        fn the_loop_obeys_vault_follow_up_for_every_result_shape() {
+            let mut rows = 0usize;
+            let (mut actions, mut resettles, mut dones) = (0usize, 0usize, 0usize);
+
+            for locked in [false, true] {
+                for needs_reauth in [false, true] {
+                    for ask in [Ask::Nothing, Ask::Switch, Ask::Add, Ask::Remove] {
+                        for geared in [false, true] {
+                            rows += 1;
+                            let base = if geared { visited_the_gear() } else { closed() };
+                            let result = VaultWindowResult {
+                                locked,
+                                needs_reauth,
+                                switch_to: (ask == Ask::Switch).then(target),
+                                add_account: ask == Ask::Add,
+                                remove_account: ask == Ask::Remove,
+                                ..base
+                            };
+
+                            // Stated here, by hand, from the spec rather than
+                            // from the function: an account request outranks a
+                            // lost session, a lost session outranks nothing,
+                            // and the gear is never a reason.
+                            let want = if ask != Ask::Nothing {
+                                VaultFollowUp::AccountAction
+                            } else if locked || needs_reauth {
+                                VaultFollowUp::Resettle
+                            } else {
+                                VaultFollowUp::Done
+                            };
+                            assert_eq!(
+                                vault_follow_up(&result),
+                                want,
+                                "`vault_follow_up` disagrees with this table for \
+                                 locked={locked} needs_reauth={needs_reauth} ask={ask:?} \
+                                 geared={geared}"
+                            );
+
+                            // What that answer MEANS as a sequence of acts.
+                            let expected = match want {
+                                VaultFollowUp::AccountAction => {
+                                    actions += 1;
+                                    let request = account_request(&result).expect(
+                                        "an account action with no request in it: the two \
+                                         readers of these three fields have diverged",
+                                    );
+                                    vec![
+                                        OpLog::OpenedWindow,
+                                        OpLog::AccountAction(request),
+                                        OpLog::OpenedWindow,
+                                    ]
+                                }
+                                VaultFollowUp::Resettle => {
+                                    resettles += 1;
+                                    vec![OpLog::OpenedWindow, OpLog::Resettled]
+                                }
+                                VaultFollowUp::Done => {
+                                    dones += 1;
+                                    vec![OpLog::OpenedWindow]
+                                }
+                            };
+                            // An account action reopens, so it needs a second
+                            // window to close on; everything else returns on
+                            // its first pass.
+                            let mut script = vec![result];
+                            if want == VaultFollowUp::AccountAction {
+                                script.push(closed());
+                            }
+
+                            let bench = Bench::new(&format!("table-{rows}"));
+                            let mut ops = FakeVaultOps::new(script);
+                            drive(&bench, &mut ops, None);
+
+                            assert_eq!(
+                                ops.log, expected,
+                                "the loop did not do what `vault_follow_up` said for \
+                                 locked={locked} needs_reauth={needs_reauth} ask={ask:?} \
+                                 geared={geared}"
+                            );
+                            assert_eq!(
+                                ops.windows_opened(),
+                                expected.iter().filter(|o| **o == OpLog::OpenedWindow).count(),
+                                "window count for locked={locked} needs_reauth={needs_reauth} \
+                                 ask={ask:?} geared={geared}"
+                            );
+                            ops.assert_script_consumed();
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                rows, 32,
+                "the table is not the cross-product it claims to be; {rows} rows ran"
+            );
+            // All three answers, several times each. A table that only ever
+            // produced one of them would pass against a loop with one arm.
+            assert!(
+                actions >= 8 && resettles >= 4 && dones >= 2,
+                "the table is lopsided ({actions} account actions, {resettles} resettles, \
+                 {dones} dones), so it does not exercise all three arms"
+            );
+            assert_eq!(actions + resettles + dones, rows, "a row produced no answer at all");
+        }
+
+        // ---- The startup window's result, taken once ----
+
+        /// The outcome of the vault session `main`'s single startup window
+        /// already ran is dispatched by this loop rather than by a second copy
+        /// of it -- and it is **taken**, not re-read. A `first_result` the
+        /// loop kept re-dispatching would never open a window and never
+        /// return: an invisible infinite loop with nothing on screen.
+        ///
+        /// The absence of a leading `OpenedWindow` is the whole assertion.
+        #[test]
+        fn the_startup_windows_outcome_is_dispatched_once_and_the_next_pass_opens_a_window() {
+            let bench = Bench::new("first-result");
+            let mut ops = FakeVaultOps::new(vec![closed()]);
+
+            drive(&bench, &mut ops, Some(VaultWindowResult { add_account: true, ..closed() }));
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::AccountAction(AccountRequest::Add), OpLog::OpenedWindow],
+                "the startup window's outcome was not dispatched on the first pass without \
+                 opening a window of this loop's own"
+            );
+            assert_eq!(
+                ops.windows_opened(),
+                1,
+                "the first pass opened a window instead of dispatching the result it was \
+                 handed, or the result was re-dispatched on later passes"
+            );
+            ops.assert_script_consumed();
+
+            // CONTROL: the same result handed in the ORDINARY way instead --
+            // one argument of the call different -- and a window opens first.
+            let control_bench = Bench::new("first-result-control");
+            let mut control = FakeVaultOps::new(vec![
+                VaultWindowResult { add_account: true, ..closed() },
+                closed(),
+            ]);
+            drive(&control_bench, &mut control, None);
+            assert_eq!(
+                control.log,
+                vec![
+                    OpLog::OpenedWindow,
+                    OpLog::AccountAction(AccountRequest::Add),
+                    OpLog::OpenedWindow,
+                ],
+                "the control did not open a window first, so `first_result` is not what made \
+                 the difference above"
+            );
+            assert_eq!(control.windows_opened(), 2);
+            control.assert_script_consumed();
+        }
+
+        // ---- Ordering: the details land before any branch runs ----
+
+        /// A fake that asserts, at the moment each branch is entered, that the
+        /// window's account details are ALREADY in the estate -- and, for the
+        /// recovery, empties them again exactly as `resettle_session` does.
+        ///
+        /// This is the ordering the loop's own doc calls load-bearing: the
+        /// cache refill and `learn_active_account_details` run ABOVE the
+        /// dispatch, because a switch changes which account is active and
+        /// would otherwise write one account's address into another's entry.
+        /// Moved below the dispatch, the details are not there yet when a
+        /// branch runs, and this fake says so at the moment it happens.
+        struct DetailsOrderingOps {
+            scripted: VecDeque<VaultWindowResult>,
+            log: Vec<OpLog>,
+            budget: usize,
+        }
+
+        impl DetailsOrderingOps {
+            fn new(scripted: Vec<VaultWindowResult>) -> Self {
+                Self { scripted: scripted.into(), log: Vec::new(), budget: 16 }
+            }
+
+            fn charge(&mut self) {
+                assert!(
+                    self.log.len() < self.budget,
+                    "`run_vault_loop` did not terminate; the log so far is {:?}",
+                    self.log
+                );
+            }
+
+            fn demand_details(est: &SessionEstate, branch: &str) {
+                assert!(
+                    est.details.is_some(),
+                    "the `{branch}` branch ran BEFORE the window's account details were put \
+                     back into the estate. The refill and `learn_active_account_details` have \
+                     to run above the dispatch: below it, a switch has already changed which \
+                     account is active and one account's address is written into another's entry"
+                );
+            }
+        }
+
+        impl VaultOps for DetailsOrderingOps {
+            fn open_window(
+                &mut self,
+                _est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+            ) -> VaultWindowResult {
+                self.charge();
+                self.log.push(OpLog::OpenedWindow);
+                self.scripted
+                    .pop_front()
+                    .expect("the loop opened more windows than this test scripted")
+            }
+
+            fn resettle_after_lost_session(
+                &mut self,
+                est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+            ) {
+                self.charge();
+                Self::demand_details(est, "lock / re-auth recovery");
+                // Mirrors production: `resettle_session` clears the cached
+                // status details deliberately, so the next window re-fetches.
+                est.details = None;
+                self.log.push(OpLog::Resettled);
+            }
+
+            fn account_action(
+                &mut self,
+                est: &mut SessionEstate,
+                _deps: &VaultDeps<'_>,
+                request: AccountRequest,
+            ) {
+                self.charge();
+                Self::demand_details(est, "account action");
+                self.log.push(OpLog::AccountAction(request));
+            }
+        }
+
+        /// The estate starts with `details: None`, so the only thing that can
+        /// make them present when a branch runs is the refill above the
+        /// dispatch.
+        #[test]
+        fn the_details_land_in_the_estate_before_any_branch_runs() {
+            let mut ran = 0usize;
+            for (name, result, expected) in [
+                (
+                    "the lock recovery",
+                    VaultWindowResult {
+                        locked: true,
+                        account_details: Some(some_details()),
+                        ..closed()
+                    },
+                    vec![OpLog::OpenedWindow, OpLog::Resettled],
+                ),
+                (
+                    "an account action",
+                    VaultWindowResult {
+                        switch_to: Some(target()),
+                        account_details: Some(some_details()),
+                        ..closed()
+                    },
+                    vec![
+                        OpLog::OpenedWindow,
+                        OpLog::AccountAction(AccountRequest::SwitchTo(target())),
+                        OpLog::OpenedWindow,
+                    ],
+                ),
+            ] {
+                ran += 1;
+                let bench = Bench::new("details-order");
+                assert!(
+                    bench.estate().details.is_none(),
+                    "the estate starts holding details, so `{name}` would find them there \
+                     whatever the loop did"
+                );
+                assert!(
+                    result.account_details.is_some(),
+                    "the `{name}` fixture carries no details for the loop to land, so its \
+                     assertion could only ever fail"
+                );
+
+                let mut script = vec![result];
+                if expected.len() == 3 {
+                    script.push(VaultWindowResult {
+                        account_details: Some(some_details()),
+                        ..closed()
+                    });
+                }
+                let mut ops = DetailsOrderingOps::new(script);
+                let deps = bench.deps();
+                let mut est = bench.estate();
+                run_vault_loop(&mut est, &deps, &mut ops, None);
+
+                assert_eq!(ops.log, expected, "`{name}` did not run the branch it was meant to");
+                assert!(ops.scripted.is_empty(), "`{name}` left scripted windows unopened");
+            }
+            assert_eq!(ran, 2, "control: both branches were driven");
+        }
+
+        /// **The ordering fake really can fail**, which is what makes the test
+        /// above an assertion rather than a decoration. Drive it with a result
+        /// that carries NO details: nothing can land, and the branch's
+        /// precondition is violated at the moment it runs.
+        #[test]
+        #[should_panic(expected = "BEFORE the window's account details")]
+        fn the_details_ordering_fake_fails_when_nothing_lands() {
+            let bench = Bench::new("details-order-control");
+            let mut ops = DetailsOrderingOps::new(vec![VaultWindowResult {
+                locked: true,
+                account_details: None,
+                ..closed()
+            }]);
+            let deps = bench.deps();
+            let mut est = bench.estate();
+            run_vault_loop(&mut est, &deps, &mut ops, None);
+        }
+
+        /// The recovery's own effect on the estate, mirrored by the fake and
+        /// asserted afterwards: the details it was handed are gone again, so
+        /// the next window re-fetches rather than showing a stale address.
+        #[test]
+        fn the_recovery_leaves_the_details_empty_for_the_next_window() {
+            let bench = Bench::new("details-cleared");
+            let mut ops = DetailsOrderingOps::new(vec![VaultWindowResult {
+                locked: true,
+                account_details: Some(some_details()),
+                ..closed()
+            }]);
+            let deps = bench.deps();
+            let mut est = bench.estate();
+            run_vault_loop(&mut est, &deps, &mut ops, None);
+
+            assert_eq!(ops.log, vec![OpLog::OpenedWindow, OpLog::Resettled]);
+            assert!(
+                est.details.is_none(),
+                "the estate still holds the pre-lock account's details after the recovery"
+            );
+
+            // CONTROL, one field different: a window that did NOT lock leaves
+            // the details it fetched sitting in the estate for the next open.
+            let control_bench = Bench::new("details-cleared-control");
+            let mut control = DetailsOrderingOps::new(vec![VaultWindowResult {
+                locked: false,
+                account_details: Some(some_details()),
+                ..closed()
+            }]);
+            let control_deps = control_bench.deps();
+            let mut control_est = control_bench.estate();
+            run_vault_loop(&mut control_est, &control_deps, &mut control, None);
+            assert_eq!(control.log, vec![OpLog::OpenedWindow]);
+            assert!(
+                control_est.details.is_some(),
+                "a plain close threw the details away too, so the assertion above is not about \
+                 the recovery"
+            );
+        }
+    }
+
     /// **The switcher's production wiring**, which is where every previous
     /// task in this feature stopped.
     ///
