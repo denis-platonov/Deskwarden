@@ -8936,111 +8936,6 @@ mod tests {
                      mostly about results that ask for nothing"
                 );
             }
-
-            /// **The dispatch sends each answer to its own `ops` method, and
-            /// the account arm dispatches what `account_request` named.**
-            ///
-            /// `run_vault_loop` is not runnable until S4 gives it a fake
-            /// `VaultOps`, so this is source analysis and says so. What it
-            /// forbids is the mutation that leaves the `match` exhaustive and
-            /// correct-looking while an arm stops calling the thing it exists
-            /// to call -- the arm's whole effect deleted, with the enum, the
-            /// pure functions and every guard above still green.
-            #[test]
-            fn each_answer_is_dispatched_to_its_own_op() {
-                let production = super::super::production_half_of_this_file();
-                let tail = super::the_whole_vault_loop_tail();
-                let mut seen = 0;
-                for (arm, call, why) in [
-                    (
-                        concat!("VaultFollow", "Up::AccountAction => {"),
-                        concat!("ops.account_", "action(est, deps, request)"),
-                        "the menu's switch, add and remove are dropped on the floor: the arm is \
-                         taken and nothing happens",
-                    ),
-                    (
-                        concat!("VaultFollow", "Up::Resettle => {"),
-                        concat!("ops.resettle_after_lost_", "session(est, deps)"),
-                        "a lock or a 401 never re-authenticates: the cache is not cleared, \
-                         `bw serve` keeps a live session, and the vault does not lock",
-                    ),
-                ] {
-                    seen += 1;
-                    let body = super::without_the_body_of(&tail, arm).1;
-                    assert!(
-                        body.len() > 100,
-                        "the `{arm}` arm sliced to {} bytes, which is not an arm body",
-                        body.len()
-                    );
-                    assert!(body.contains(call), "{why}: {body:?}");
-                }
-                assert_eq!(seen, 2, "control: the loop visited both acting arms");
-                // The account arm dispatches the REQUEST, not a constant. A
-                // literal here would send every menu click to the same action.
-                let dispatch = concat!("Some(request) => ops.account_action(est, deps, ", "request),");
-                assert_eq!(
-                    production.matches(dispatch).count(),
-                    1,
-                    "{dispatch:?} is not in the production code exactly once, so what the \
-                     account branch is handed is not what `account_request` named"
-                );
-                for constant in [
-                    concat!("ops.account_action(est, deps, AccountRequest::", "Add)"),
-                    concat!("ops.account_action(est, deps, AccountRequest::", "Remove)"),
-                ] {
-                    assert!(
-                        !production.contains(constant),
-                        "{constant:?} sends every account request to one action"
-                    );
-                }
-            }
-        }
-
-        /// **The write-back may not branch, and this is the guard on the
-        /// `continue` itself.**
-        ///
-        /// The tests above state what every outcome means; this states that the
-        /// loop still gets to see them. Re-adding a `continue` (or a `return`,
-        /// or a `break`) anywhere inside the settings write-back turns this red
-        /// -- which is the mutation that shipped, and the only one the pure
-        /// function alone cannot feel.
-        #[test]
-        fn the_settings_write_back_cannot_skip_the_branches_beneath_it() {
-            let head = concat!("if let Some(edited) = result.edited_", "settings.clone() {");
-            let production = super::production_half_of_this_file();
-            assert_eq!(
-                production.matches(head).count(),
-                1,
-                "the settings write-back is not where this guard expects it"
-            );
-            let block = super::the_switch_the_vault_window_asks_for::block_after(head);
-            for jump in ["continue;", "return;", "break;"] {
-                assert!(
-                    !block.contains(jump),
-                    "the settings write-back contains `{jump}`, so it does not fall through to \
-                     the branches beneath it. `edited_settings` is `Some` for the rest of a \
-                     window's life once the gear has been clicked once, so this makes Lock, the \
-                     401 recovery, every account request and the plain close unreachable: \
-                     {block:?}"
-                );
-            }
-            // Positive control: the slice really is the write-back, not an
-            // empty string that trivially contains no jump.
-            assert!(
-                block.contains(concat!("persist_pre", "ferences(")),
-                "the sliced block is not the settings write-back: {block:?}"
-            );
-        }
-
-        /// The one line that decides what this pass's outcome means.
-        ///
-        /// `concat!`-split for this file's usual reason: an un-split literal
-        /// matches its own declaration in the test half, and
-        /// `production_half_of_this_file` is only half the protection -- the
-        /// habit is what keeps it true when a needle is later copied into a
-        /// test that reads the whole file.
-        fn follow_up_decision() -> String {
-            concat!("let follow_up = vault_follow", "_up(&result);").to_string()
         }
 
         /// The head of the arm that acts on `AccountAction`.
@@ -9163,187 +9058,6 @@ mod tests {
             (src.get(k) == Some(&'"')).then_some(k - i - 1)
         }
 
-        /// The byte offsets at which the whole word `follow_up` appears.
-        fn occurrences_of_follow_up(source: &str) -> Vec<usize> {
-            let needle = concat!("follow", "_up");
-            source
-                .match_indices(needle)
-                .filter(|(at, _)| {
-                    !source[..*at].ends_with(is_word)
-                        && !source[at + needle.len()..].starts_with(is_word)
-                })
-                .map(|(at, _)| at)
-                .collect()
-        }
-
-        /// Occurrences of `follow_up` being ASSIGNED, **insensitive to every
-        /// spelling of the whitespace around the `=`**.
-        ///
-        /// The previous version of this counter looked for the literal
-        /// `follow_up =` -- one space. `follow_up=`, `follow_up  =` and a
-        /// line-broken `follow_up\n    =` were all invisible to it, and a
-        /// SHADOWING re-binding written any of those ways overrode the loop's
-        /// answer with the whole suite green (measured). So the identifier is
-        /// found as a whole word and whatever follows is skipped past all
-        /// whitespace before being asked whether it is a single `=`.
-        fn assignments_of_follow_up(source: &str) -> usize {
-            let needle = concat!("follow", "_up");
-            occurrences_of_follow_up(source)
-                .into_iter()
-                .filter(|at| {
-                    let rest = source[at + needle.len()..].trim_start();
-                    rest.starts_with('=') && !rest.starts_with("==")
-                })
-                .count()
-        }
-
-        /// Occurrences of `follow_up` preceded by the keyword `mut`, again
-        /// past any whitespace -- `let mut follow_up` and `&mut follow_up`.
-        ///
-        /// The counter above sees an override written with `=`. This one sees
-        /// the ones written without: `std::mem::replace(&mut follow_up, ..)`
-        /// and friends. `follow_up` is decided once and read twice; nothing
-        /// legitimate needs it mutable, so the honest count is zero.
-        fn mutable_bindings_of_follow_up(source: &str) -> usize {
-            occurrences_of_follow_up(source)
-                .into_iter()
-                .filter(|at| source[..*at].trim_end().ends_with("mut"))
-                .count()
-        }
-
-        /// **The loop acts on `vault_follow_up`'s answer, and on nothing it
-        /// decided for itself.**
-        ///
-        /// The pure function's own six tests cannot feel this. Every one of
-        /// them goes on passing against a loop that computes the right answer
-        /// and then overrides it --
-        ///
-        /// ```text
-        /// let follow_up = if result.edited_settings.is_some() {
-        ///     VaultFollowUp::Done
-        /// } else {
-        ///     vault_follow_up(&result)
-        /// };
-        /// ```
-        ///
-        /// -- which is the shipped defect's behaviour reached by a different
-        /// road. So the call is pinned as written, exactly once, above both
-        /// branches, and the binding is pinned as never reassigned afterwards.
-        #[test]
-        fn the_loop_asks_vault_follow_up_once_and_never_overrides_its_answer() {
-            let production = super::production_half_of_this_file();
-            let (decision, account, resettle) =
-                (follow_up_decision(), account_action_branch(), resettle_branch());
-
-            assert_eq!(
-                production.matches(&decision).count(),
-                1,
-                "{decision:?} does not appear exactly once in the production code. Either the \
-                 loop stopped asking the one function that knows what a finished vault session \
-                 means, or it now asks it under a condition -- and a conditional call is how the \
-                 shipped defect comes back with `vault_follow_up`'s own tests still green"
-            );
-            // Comments first: this file documents the override it forbids, and
-            // the documentation is not an assignment.
-            let code = code_only(production);
-            assert_eq!(
-                assignments_of_follow_up(&code),
-                1,
-                "`follow_up` is assigned more than once in the production code, so the answer \
-                 the branches read is not necessarily the one `vault_follow_up` gave. A SECOND \
-                 `let follow_up = ...` shadowing the first is the shipped defect reached by a \
-                 different road, and it may be spelled with any whitespace at all"
-            );
-            assert_eq!(
-                mutable_bindings_of_follow_up(&code),
-                0,
-                "`follow_up` is bound or borrowed mutably in the production code. It is decided \
-                 once and read twice; a `mut` on it is an override the `=` counter above cannot \
-                 see, because it need not be written with an `=` at all"
-            );
-            // And exactly three mentions of the binding in the production code:
-            // the one decision, and the two branch heads that read it. A
-            // re-binding need not be spelled with an `=` after the name or with
-            // a `mut` at all -- `let (follow_up, _) = (VaultFollowUp::Done, 0);`
-            // is neither -- so the honest guard is that nothing ELSE in
-            // production names this value.
-            assert_eq!(
-                occurrences_of_follow_up(&code).len(),
-                3,
-                "`follow_up` is named {} times in the production code rather than the three \
-                 this loop has: the one decision and the two branch heads that read it. A \
-                 fourth mention is either a second binding shadowing the decision or a third \
-                 place acting on it, and either way the value the branches read is no longer \
-                 the one `vault_follow_up` returned",
-                occurrences_of_follow_up(&code).len()
-            );
-            // Control: the finder is whole-word, so `vault_follow_up`'s own name
-            // is not one of the three, and a longer identifier is not either.
-            assert_eq!(occurrences_of_follow_up("vault_follow_up(&r)").len(), 0);
-            assert_eq!(occurrences_of_follow_up("follow_up_x, follow_up").len(), 1);
-            // Positive controls: the counter sees an assignment that is not the
-            // `let`, does not count either branch's `==`, and -- the hole this
-            // replaced -- is blind to NO spelling of the whitespace.
-            assert_eq!(
-                assignments_of_follow_up("let follow_up = f(); follow_up = Done; if follow_up == D"),
-                2,
-                "control: the assignment counter cannot tell an assignment from a comparison, so \
-                 the assertion above passes against a loop that overwrites the answer"
-            );
-            for spelling in ["follow_up=D", "follow_up  =D", "follow_up\n        = D", "follow_up\t=D"] {
-                assert_eq!(
-                    assignments_of_follow_up(spelling),
-                    1,
-                    "control: {spelling:?} is not counted as an assignment, so an override \
-                     written that way overrides `vault_follow_up` unseen -- which is the exact \
-                     hole the single-space needle left open"
-                );
-            }
-            for not_one in ["if follow_up == D", "let vault_follow_up = f();", "follow_up_x = D"] {
-                assert_eq!(
-                    assignments_of_follow_up(not_one),
-                    0,
-                    "control: {not_one:?} is counted as an assignment to `follow_up`, so the \
-                     count above is not about this binding at all"
-                );
-            }
-            assert_eq!(mutable_bindings_of_follow_up("let mut follow_up = f();"), 1);
-            assert_eq!(mutable_bindings_of_follow_up("replace(&mut  follow_up, D)"), 1);
-            assert_eq!(
-                mutable_bindings_of_follow_up("let follow_up = f(); let mut other = 1;"),
-                0,
-                "control: the `mut` scanner fires on a `mut` that is not on this binding"
-            );
-            // Control: `code_only` really removed something, and what it removed
-            // is what the production half says about the override it forbids.
-            assert!(
-                code.len() < production.len(),
-                "control: `code_only` stripped nothing from the production half, so every scan \
-                 in this module is reading comments as if they were code"
-            );
-            assert!(
-                production.contains(concat!("VaultFollow", "Up::Done")),
-                "control: the production half no longer mentions the outcome this guard is about"
-            );
-
-            let decision_at = production
-                .find(&decision)
-                .expect("checked to occur once directly above");
-            for branch in [&account, &resettle] {
-                let at = production.find(branch.as_str()).unwrap_or_else(|| {
-                    panic!(
-                        "{branch:?} is not in the production code -- the loop no longer acts on \
-                         the follow-up it computed"
-                    )
-                });
-                assert!(
-                    decision_at < at,
-                    "{branch:?} is above the line that computes `follow_up`, so this ordering \
-                     guard is reading the wrong function"
-                );
-            }
-        }
-
         /// The span between "this pass has a result" and the first branch that
         /// acts on it, with whole-line `//` comments removed.
         ///
@@ -9427,10 +9141,15 @@ mod tests {
         /// **Nothing may jump between the vault session ending and the branches
         /// that act on it -- anywhere, not just inside the write-back block.**
         ///
-        /// `the_settings_write_back_cannot_skip_the_branches_beneath_it` above
-        /// is a POSITIONAL guard: it slices the write-back block and rejects a
-        /// jump *inside* it. That kills the historical mutation and nothing
-        /// else. The same `continue`, one line lower --
+        /// **S5 retired the POSITIONAL guard that used to sit above this one.**
+        /// `the_settings_write_back_cannot_skip_the_branches_beneath_it` sliced
+        /// the write-back block and rejected a jump *inside* it -- the
+        /// historical mutation and, measurably, nothing else: the same
+        /// `continue` one line lower passed it, while this guard, its structural
+        /// sibling below and four behavioural tests all killed both. The
+        /// mutation it was written for is killed here and by
+        /// `a_lock_after_the_gear_still_resettles`; the one it was blind to,
+        /// one line lower --
         ///
         /// ```text
         /// }
@@ -10898,11 +10617,32 @@ mod tests {
             run_vault_loop(&mut est, &deps, &mut ops, None);
         }
 
-        /// The recovery's own effect on the estate, mirrored by the fake and
-        /// asserted afterwards: the details it was handed are gone again, so
-        /// the next window re-fetches rather than showing a stale address.
+        /// **The loop does not put the details back after the recovery has
+        /// emptied them.**
+        ///
+        /// **Re-pointed and renamed by S5, on the review's Important.** Under
+        /// its old name -- `the_recovery_leaves_the_details_empty_for_the_next
+        /// _window` -- this read as a claim about what a SECOND window would
+        /// find, which it never drove: a `Resettle` returns from the loop, so
+        /// there is no next window on this path at all. The claim it can
+        /// honestly make is narrower and is stated here instead.
+        ///
+        /// It is NOT merely the fake's own write read back, which is the house
+        /// defect this file has been catching all week. `DetailsOrderingOps`
+        /// clears `est.details` because `resettle_session` does; what the
+        /// assertion below adds is that the LOOP does not refill them
+        /// afterwards -- and it cannot, because `est.details = Some(details)`
+        /// runs ABOVE the dispatch. Move that one statement below the dispatch
+        /// (S4's M6, re-run as S5's Z1) and the recovery's clear is undone on
+        /// the same pass: this test fails, and so do exactly two others. The
+        /// three retired source pins do not see it at all.
+        ///
+        /// The "what the next window observed" half of the old name lives in
+        /// `the_window_after_a_switch_is_opened_against_the_resettled_estate`,
+        /// which asserts `ops.seen[1].details_email` on the path that really
+        /// does reopen.
         #[test]
-        fn the_recovery_leaves_the_details_empty_for_the_next_window() {
+        fn the_recovery_empties_the_details_and_the_loop_does_not_put_them_back() {
             let bench = Bench::new("details-cleared");
             let mut ops = DetailsOrderingOps::new(vec![VaultWindowResult {
                 locked: true,
@@ -10916,7 +10656,10 @@ mod tests {
             assert_eq!(ops.log, vec![OpLog::OpenedWindow, OpLog::Resettled]);
             assert!(
                 est.details.is_none(),
-                "the estate still holds the pre-lock account's details after the recovery"
+                "the estate holds account details after the lock recovery cleared them, so the \
+                 loop put them back below the dispatch. `est.details = Some(details)` has to run \
+                 ABOVE it: below, a lock re-fills the cell the recovery deliberately emptied and \
+                 the next window opens showing the address of the session that was just torn down"
             );
 
             // CONTROL, one field different: a window that did NOT lock leaves
