@@ -47,11 +47,47 @@ pub const ROW_HEIGHT: f32 = 50.0;
 /// card stroke, the header strip, the two hairlines, the row container's own
 /// padding and the footer strip.
 ///
-/// Derived rather than measured directly, from the one number this module is
-/// not allowed to change: the overlay has always been 164.0 points tall with
-/// one row, so `CHROME_HEIGHT == 164.0 - ROW_HEIGHT`.
-/// `a_one_row_card_is_the_size_the_overlay_has_always_been` pins that.
+/// **Measured, like [`ROW_HEIGHT`], and no longer derived from 164.0.**
+/// `the_chrome_constant_is_the_chrome_the_card_actually_paints` lays real
+/// cards out at one, two, three and four rows and reads back what egui says
+/// each one needs (154, 204, 254, 304 points): the part that does not grow
+/// with `n` is exactly [`MEASURED_CHROME`], 104.0.
+///
+/// `CHROME_HEIGHT` is that measurement plus [`CHROME_SLACK`]. The sum is
+/// still 114.0, so the one-row window is still the 164.0 the overlay has
+/// always shipped at — but the two halves of that number are now separately
+/// checkable, and the half that describes the drawing is checked against the
+/// drawing.
 pub const CHROME_HEIGHT: f32 = 114.0;
+
+/// The chrome the card actually paints, in points: the distance from the
+/// window's top edge to the first row's top, plus the distance from the last
+/// row's bottom to the bottom of the space egui allocates for the card
+/// (footer strip, card stroke and the outer margin that holds the drop
+/// shadow), less one [`ROW_GAP`] — because the gap lives inside `ROW_HEIGHT`
+/// (see [`ROW_GAP`]) and would otherwise be counted twice.
+///
+/// This is the number a test can fail. It is asserted equal to the measured
+/// value at all four row counts the overlay can show, so a font, a margin or
+/// a header control changing size fails here rather than clipping a row off a
+/// window that has no scrollbar.
+pub const MEASURED_CHROME: f32 = 104.0;
+
+/// How much taller than it needs to be the overlay window is.
+///
+/// The overlay has shipped at 396x164 since it was written; a one-row card
+/// only needs 154. The 10 points are dead space at the bottom of the card.
+///
+/// They are kept, rather than reclaimed, because slack in this direction is
+/// the safe direction: a window taller than its card wastes ten points, a
+/// window shorter than its card loses a row off a frameless, always-on-top
+/// surface with no scrollbar and no resize border. Shrinking a shipped window
+/// is a visible change to every user and buys nothing this module needs.
+///
+/// It is asserted **exactly**, not as a `>= 0.0` bound: a one-sided bound
+/// cannot tell 10 points of deliberate slack from 30 points of a header that
+/// silently stopped being drawn.
+pub const CHROME_SLACK: f32 = 10.0;
 
 /// The overlay window's inner height for a card showing `rows` choice rows.
 ///
@@ -89,6 +125,50 @@ pub fn overlay_height(rows: usize) -> f32 {
 /// field actually is, so the overlay reads as "next to the field" rather
 /// than wherever the OS defaults a new window to. `None` falls back to
 /// whatever the OS picks.
+/// **The window `show_prompt_overlay` asks the OS for** in order to show
+/// `choices` at `anchor`.
+///
+/// Extracted from `show_prompt_overlay` for one reason: `show_prompt_overlay`
+/// calls `eframe::run_native`, which opens a real always-on-top window, so no
+/// test in this crate may execute it — and the size it asks for was therefore
+/// the one number in the overlay that nothing could observe. It could be a
+/// literal `100.0`, or `overlay_height(1)` for a four-row card, and every
+/// geometry test in this module stayed green, because those tests build their
+/// own window out of `overlay_height` and then check the card against it. The
+/// card was always fine. It was the *window* that was never looked at.
+///
+/// `NativeOptions` and `ViewportBuilder` are plain structs with public
+/// fields, so a test can read `overlay_options(choices, None).viewport
+/// .inner_size` and paint a real card into exactly that many points. That is
+/// what `the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw`
+/// does, and it is the only assertion in this module about the requested size
+/// that is not built out of the number it is checking.
+///
+/// **It takes `choices`, not a row count**, deliberately: handing it the wrong
+/// number is the whole bug, so the one caller is not given the opportunity.
+/// `show_prompt_overlay`'s remaining share of the decision is the single line
+/// that passes its own `choices` along.
+///
+/// Sized for the rows it was actually given, not for one: a window built for
+/// one row that paints four clips the last three off a frameless card the user
+/// cannot scroll. `overlay_height` floors at one row, so the empty and
+/// one-choice cases are still 164.0.
+pub fn overlay_options(choices: &[FillChoice], anchor: Option<(f32, f32)>) -> eframe::NativeOptions {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(choices.len())])
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_icon(theme::window_icon());
+    if let Some((x, y)) = anchor {
+        viewport = viewport.with_position([x, y]);
+    }
+    eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    }
+}
+
 pub fn show_prompt_overlay(
     app_name: &str,
     matched: Option<&OverlayMatch>,
@@ -117,24 +197,7 @@ pub fn show_prompt_overlay(
     let chosen: Rc<RefCell<Option<FillChoice>>> = Rc::new(RefCell::new(None));
     let choices = choices.to_vec();
 
-    let mut viewport = egui::ViewportBuilder::default()
-        // Sized for the rows it was actually given, not for one: a window
-        // built for one row that paints four clips the last three off a
-        // frameless card the user cannot scroll. `overlay_height` floors at
-        // one row, so the empty and one-choice cases are still 164.0.
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(choices.len())])
-        .with_decorations(false)
-        .with_transparent(true)
-        .with_always_on_top()
-        .with_icon(theme::window_icon());
-    if let Some((x, y)) = anchor {
-        viewport = viewport.with_position([x, y]);
-    }
-
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let options = overlay_options(&choices, anchor);
 
     let app = OverlayApp {
         app_name,
@@ -816,9 +879,12 @@ mod geometry_tests {
             "the overlay has shipped at 396x164 since it was written; a one-row card \
              must still be exactly that"
         );
-        // ... and the arithmetic that produces it is the arithmetic the
-        // constants describe, not a coincidence of two other numbers.
-        assert_eq!(CHROME_HEIGHT + ROW_HEIGHT, 164.0);
+        // NOT `assert_eq!(CHROME_HEIGHT + ROW_HEIGHT, 164.0)`, which was a
+        // tautology: `CHROME_HEIGHT` was *defined* as `164.0 - ROW_HEIGHT`, so
+        // the two constants could have been (40, 124) or (240, -76) and it
+        // would still have held. What 164.0 is made of is checked against the
+        // drawing instead, in
+        // `the_chrome_constant_is_the_chrome_the_card_actually_paints`.
         // A card with nothing to offer is not a shorter card. `rows.max(1)`.
         assert_eq!(overlay_height(0), 164.0);
         // Each further row costs exactly one row.
@@ -1190,49 +1256,401 @@ mod geometry_tests {
         );
     }
 
-    /// **The viewport is sized for the rows it was given.**
-    ///
-    /// `show_prompt_overlay` opens a real, always-on-top window and calls
-    /// `eframe::run_native`, so no test in this crate may execute it -- which
-    /// is exactly why the one number in it that can be silently wrong is
-    /// pinned by source position. `overlay_height(1)` in place of
-    /// `overlay_height(choices.len())` builds a 164pt window for a 314pt card:
-    /// three of four rows below the bottom edge of a frameless window with no
-    /// scrollbar, and every drawing test in this module still green, because
-    /// the CARD is fine and it is the WINDOW that is too small.
-    ///
-    /// The arithmetic itself is behavioural, and asserted here beside the pin.
-    #[test]
-    fn the_viewport_is_sized_for_the_rows_it_was_given() {
-        // Split across two literals so it cannot match its own declaration.
-        let needle = concat!("with_inner_size([OVERLAY_WIDTH, ", "overlay_height(choices.len())])");
-        let source = include_str!("overlay_ui.rs");
-        assert_eq!(
-            source.matches(needle).count(),
-            1,
-            "expected {needle:?} exactly once. Zero means the overlay window is no longer \
-             sized for the card it is about to draw, and the rows past the first are off \
-             the bottom of a window the user cannot scroll or resize"
-        );
-        // The counter's controls: it finds what is there, and does NOT find
-        // the mutation this pin exists for.
-        let stale = concat!("with_inner_size([OVERLAY_WIDTH, ", "overlay_height(1)])");
-        assert_eq!(source.matches(stale).count(), 0, "planted: {stale}");
-        assert_eq!(stale.matches(needle).count(), 0);
-        assert_eq!(needle.matches(needle).count(), 1);
+    // ------------------------------------------- the window that is asked for
 
-        // And what those two expressions actually differ by, for the card
-        // sizes the overlay can show.
+    /// The inner size `show_prompt_overlay` will hand `eframe::NativeOptions`
+    /// for a card of `rows` rows.
+    ///
+    /// **Observed, not recomputed.** Nothing on this path mentions
+    /// `overlay_height`: the number comes back out of the same
+    /// `ViewportBuilder` that production puts into `NativeOptions`, so it
+    /// changes when, and only when, the window the user gets changes.
+    fn requested_inner_size(rows: usize) -> egui::Vec2 {
+        overlay_options(&four_choices()[..rows.min(4)], None)
+            .viewport
+            .inner_size
+            .expect("the overlay viewport must request an inner size at all")
+    }
+
+    /// Paints a real `rows`-row card into a window of exactly `height` points
+    /// and reports what did not survive it, or `Ok(())`.
+    ///
+    /// The shared instrument behind both the load-bearing assertion and its
+    /// positive control, so the control really does exercise the check it is
+    /// controlling rather than a lookalike.
+    ///
+    /// Everything a user must be able to see and click is checked, not just
+    /// the rows: the dismiss ✕ and the footer hints live BELOW the last row,
+    /// so a window short by less than one row clips them while every row
+    /// still fits. That is the failure a row-only check waves through.
+    ///
+    /// The row COUNT is the first thing asserted because egui culls shapes
+    /// entirely outside the screen rect: a row pushed off the bottom comes
+    /// back as *nothing at all*, and "every row I found is inside the window"
+    /// is trivially true of a card that lost one.
+    fn card_fits_in(rows: usize, height: f32) -> Result<(), String> {
+        let choices = &four_choices()[..rows];
+        let ink = painted(choices, height);
+        let win = window(height);
+        let tiles = row_tiles(&ink);
+        if tiles.len() != rows {
+            return Err(format!(
+                "a {rows}-row card in a {height}pt window painted {} row tiles; the missing \
+                 ones were culled for being off the window entirely",
+                tiles.len()
+            ));
+        }
+        for (index, tile) in tiles.iter().enumerate() {
+            if !fits(*tile, win) {
+                return Err(format!(
+                    "row {index} of {rows} has its clickable rect at {tile:?}, outside the \
+                     {height}pt window"
+                ));
+            }
+        }
+        // The footer hints and the ✕: painted last, lowest in the card, and
+        // the only mouse-operable way out of a decorationless window.
+        // Each hint is laid out as one galley, key and label together --
+        // the same runs `the_chrome_costs_the_same_at_one_row_as_at_four`
+        // measures the footer by.
+        for text in ["Enter Fill", "Esc Dismiss"] {
+            let hits: Vec<&Ink> = ink
+                .iter()
+                .filter(|i| i.glyphs.as_deref() == Some(text))
+                .collect();
+            if hits.len() != 1 {
+                return Err(format!(
+                    "expected exactly one painted run reading {text:?} in a {height}pt window \
+                     for {rows} rows; found {} -- the footer is off the bottom of a window \
+                     with no scrollbar",
+                    hits.len()
+                ));
+            }
+            if !fits(hits[0].rect, win) {
+                return Err(format!(
+                    "the footer hint {text:?} paints at {:?}, outside the {height}pt window",
+                    hits[0].rect
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// **The load-bearing assertion about the window itself, and the one this
+    /// module did not have.**
+    ///
+    /// `show_prompt_overlay` calls `eframe::run_native`, so no test may run
+    /// it; every other geometry test in this module therefore builds its own
+    /// window out of `overlay_height` and checks the card against that. Set
+    /// the real `with_inner_size` height to a literal `100.0` and all of them
+    /// stay green, because the card is fine and the *window* is the thing
+    /// nobody was looking at.
+    ///
+    /// This one starts from `overlay_viewport` — the same builder production
+    /// hands to `NativeOptions` — reads the size back out of it, and paints a
+    /// real card into exactly that many points. The screen rect is the
+    /// requested size; the requested size is not the screen rect's source.
+    #[test]
+    fn the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw() {
         let mut checked = 0;
-        for rows in 2..=4 {
+        for rows in 1..=4usize {
+            let requested = requested_inner_size(rows);
+            assert_eq!(
+                requested.x, OVERLAY_WIDTH,
+                "the overlay asked for a {}pt-wide window",
+                requested.x
+            );
+            if let Err(why) = card_fits_in(rows, requested.y) {
+                panic!(
+                    "the window the overlay asks the OS for with {rows} choice(s) is \
+                     {}pt tall, and the card it then draws does not fit in it: {why}. \
+                     This window is frameless and always-on-top -- no title bar, no \
+                     resize border, no scroll area -- so whatever is outside it is gone.",
+                    requested.y
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have covered 1, 2, 3 and 4 rows");
+    }
+
+    /// POSITIVE CONTROL for the test above: `card_fits_in` can say no.
+    ///
+    /// Without this, a `card_fits_in` that returned `Ok(())` unconditionally
+    /// -- or one whose walker had gone blind -- would make the assertion above
+    /// green on any window size at all, which is precisely the shape of the
+    /// hole it was written to close.
+    ///
+    /// Both of the two ways a too-small window fails are exercised: 100pt is
+    /// tall enough for a single row and still loses the footer, and a
+    /// one-row-sized window loses three of four rows outright to culling.
+    #[test]
+    fn the_card_fit_check_can_actually_fail() {
+        let mutant = 100.0;
+        assert!(
+            mutant < requested_inner_size(1).y,
+            "the control window is not actually shorter than the real one"
+        );
+        let one_row_in_100 = card_fits_in(1, mutant);
+        assert!(
+            one_row_in_100.is_err(),
+            "a one-row card was declared to fit a {mutant}pt window; its footer is at the \
+             bottom of a 154pt card, so this check cannot fail and its passes mean nothing"
+        );
+        // ...and specifically for the reason claimed, not by accident.
+        assert!(
+            one_row_in_100.as_ref().unwrap_err().contains("Dismiss")
+                || one_row_in_100.as_ref().unwrap_err().contains("Fill"),
+            "expected the footer to be what did not fit; got {one_row_in_100:?}"
+        );
+
+        let four_rows_in_one = card_fits_in(4, overlay_height(1));
+        assert!(
+            four_rows_in_one.is_err(),
+            "four rows were declared to fit a one-row window"
+        );
+        assert!(
+            four_rows_in_one
+                .as_ref()
+                .unwrap_err()
+                .contains("painted 3 row tiles"),
+            "expected the fourth row to be culled and counted as missing; got \
+             {four_rows_in_one:?}"
+        );
+
+        // ... and the same instrument says yes to the window production
+        // really asks for, so it is discriminating on size and not simply
+        // always refusing.
+        assert_eq!(card_fits_in(4, requested_inner_size(4).y), Ok(()));
+    }
+
+    /// The requested window grows by exactly one row per row, measured off
+    /// the builder rather than off `overlay_height`.
+    ///
+    /// This is the half `the_window_..._fits_the_card_it_will_draw` cannot
+    /// catch on its own: a window 10pt too tall for every card still fits
+    /// every card. A window that stops growing does not.
+    #[test]
+    fn the_requested_window_grows_by_exactly_one_row_per_choice_row() {
+        let mut steps = 0;
+        for rows in 2..=4usize {
+            let step = requested_inner_size(rows).y - requested_inner_size(rows - 1).y;
             assert!(
-                overlay_height(rows) > overlay_height(1),
-                "a {rows}-row card is not taller than a one-row card, so the pin above is \
-                 pinning a distinction that does not exist"
+                (step - ROW_HEIGHT).abs() < 0.01,
+                "going from {} rows to {rows} rows changed the requested window by {step}pt, \
+                 not by one {ROW_HEIGHT}pt row",
+                rows - 1
+            );
+            steps += 1;
+        }
+        assert_eq!(steps, 3);
+        // The floor: no choices is not a shorter window.
+        assert_eq!(requested_inner_size(0).y, requested_inner_size(1).y);
+        // And the belt to the measurement's braces: the requested size is
+        // the shared arithmetic every other test and `app::clamp_into_work_area`
+        // use, so the position clamp and the window cannot disagree.
+        for rows in 0..=4usize {
+            assert_eq!(
+                requested_inner_size(rows),
+                egui::vec2(OVERLAY_WIDTH, overlay_height(rows))
+            );
+        }
+    }
+
+    /// The anchor survives the extraction. `overlay_position` computes where
+    /// the card goes; a builder that dropped it would open every overlay
+    /// wherever Windows felt like, and no drawing test would notice.
+    #[test]
+    fn the_requested_window_opens_where_the_caller_anchored_it() {
+        let one = &four_choices()[..1];
+        assert_eq!(
+            overlay_options(one, Some((640.0, 480.0))).viewport.position,
+            Some(egui::pos2(640.0, 480.0))
+        );
+        // `None` means "let the OS pick", and must not become 0,0.
+        assert_eq!(overlay_options(one, None).viewport.position, None);
+        // The rest of what makes this window the overlay's window, so an
+        // extraction that quietly dropped one is a failure and not a silent
+        // change to a frameless always-on-top card.
+        let v = overlay_options(one, None).viewport;
+        assert_eq!(v.decorations, Some(false));
+        assert_eq!(v.transparent, Some(true));
+        assert_eq!(v.window_level, Some(egui::WindowLevel::AlwaysOnTop));
+        assert!(v.icon.is_some());
+    }
+
+    /// Belt to the measurement's braces, covering the ONE line of the sizing
+    /// decision a measurement cannot reach.
+    ///
+    /// `overlay_options` is measured directly, so everything inside it is
+    /// observable. What is left over is `show_prompt_overlay`'s own body,
+    /// which calls `eframe::run_native` and therefore cannot be executed by
+    /// any test here: it could hand `overlay_options` an empty slice, or
+    /// override the size afterwards with a second `with_inner_size`, and
+    /// nothing measurable would move. That residue is exactly two source
+    /// facts, and they are what this counts.
+    ///
+    /// Deliberately the *second* guard and not the first -- a pin proves
+    /// where a string is, not what the program does. Its job here is only to
+    /// keep the seam that the measurement observes attached to the seam
+    /// production uses.
+    #[test]
+    fn nothing_but_overlay_options_sizes_the_overlay_window() {
+        let source = include_str!("overlay_ui.rs");
+        // Split across two literals so they cannot match their own declarations.
+        let sizer = concat!("with_inner_", "size(");
+        assert_eq!(
+            source.matches(sizer).count(),
+            1,
+            "expected exactly one {sizer:?} in this module -- `overlay_options`'s, which \
+             `the_window_the_overlay_actually_asks_for_fits_the_card_it_will_draw` \
+             measures. A second one is a window size no test can see"
+        );
+        let call = concat!("overlay_options(&choices", ", anchor);");
+        assert_eq!(
+            source.matches(call).count(),
+            1,
+            "expected `show_prompt_overlay` to get its options from {call:?} exactly once, \
+             passing the SAME `choices` it is about to draw; the measured size is only the \
+             shipped size while it does"
+        );
+        // The counter's own controls: each needle finds itself exactly once,
+        // and the mutations they exist for are absent.
+        assert_eq!(sizer.matches(sizer).count(), 1);
+        assert_eq!(call.matches(call).count(), 1);
+        assert_eq!(source.matches(concat!("overlay_", "options(&[], anchor)")).count(), 0);
+    }
+
+    // ------------------------------------------------- the chrome, measured
+
+    /// **[`CHROME_HEIGHT`] against the chrome the card actually paints.**
+    ///
+    /// It used to be derived from the number it was then asserted to produce:
+    /// `CHROME_HEIGHT == 164.0 - ROW_HEIGHT`, checked by
+    /// `assert_eq!(CHROME_HEIGHT + ROW_HEIGHT, 164.0)` -- pure arithmetic over
+    /// two constants, true of any consistent pair and false of none. It could
+    /// have been 40 or 240 and the suite would not have moved.
+    ///
+    /// So measure it, the way `ROW_HEIGHT` is measured: lay a real card out at
+    /// one, two, three and four rows in a window far too big to cull anything,
+    /// and ask egui how much space it took. The part that does not scale with
+    /// `n` is the chrome.
+    #[test]
+    fn the_chrome_constant_is_the_chrome_the_card_actually_paints() {
+        /// Comfortably taller than a four-row card, so nothing is culled and
+        /// the layout is the unconstrained one.
+        const ROOMY: f32 = 700.0;
+
+        let mut measurements = Vec::new();
+        for rows in 1..=4usize {
+            let choices = &four_choices()[..rows];
+
+            // What egui says the card needs: the bottom of the space
+            // `draw_overlay_card_rows` allocated, in a Ui that starts at y = 0
+            // exactly as `OverlayApp::ui`'s does.
+            let ctx = styled_ctx();
+            let mut needed = f32::NAN;
+            let _ = ctx.run_ui(sized(ROOMY), |ui| {
+                assert_eq!(ui.min_rect().top(), 0.0, "the card must start at the window's top");
+                draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
+                needed = ui.min_rect().bottom();
+            });
+            assert!(needed.is_finite() && needed > 0.0, "the card allocated no space");
+            assert!(needed < ROOMY, "the probe window was not roomy enough to be unconstrained");
+
+            // Where the rows landed inside it.
+            let tiles = row_tiles(&painted(choices, ROOMY));
+            assert_eq!(
+                tiles.len(),
+                rows,
+                "a {rows}-row card painted {} tiles in a {ROOMY}pt window, where nothing can \
+                 be culled -- the measurement below would be of the wrong card",
+                tiles.len()
+            );
+
+            // The chrome, as the brief defines it: everything above the first
+            // row plus everything below the last. Less one ROW_GAP, because
+            // `ROW_HEIGHT` already carries the gap (see `ROW_GAP`) and the
+            // region from the first row's top to the last row's bottom is
+            // `n * ROW_HEIGHT - ROW_GAP`, one gap short.
+            let above = tiles[0].top() - 0.0;
+            let below = needed - tiles[rows - 1].bottom();
+            assert!(above > 0.0, "there is no header above the first row");
+            assert!(below > 0.0, "there is no footer below the last row");
+            measurements.push((rows, needed, above + below - ROW_GAP));
+        }
+        assert_eq!(measurements.len(), 4, "the loop must have covered 1, 2, 3 and 4 rows");
+
+        // 1. The chrome does not depend on the row count. If it did,
+        //    `overlay_height` could not be `a + b*n` at all.
+        for (rows, _, chrome) in &measurements {
+            assert!(
+                (chrome - measurements[0].2).abs() < 0.01,
+                "the chrome measures {chrome}pt at {rows} rows but {}pt at 1 row",
+                measurements[0].2
+            );
+        }
+        let measured = measurements[0].2;
+
+        // 2. It is the number the constant claims.
+        assert!(
+            (measured - MEASURED_CHROME).abs() < 0.5,
+            "the card paints {measured}pt of chrome, but MEASURED_CHROME says \
+             {MEASURED_CHROME}. Whichever moved, `overlay_height` is now describing a card \
+             that is not the one being drawn"
+        );
+
+        // 3. ... and the height actually requested is that chrome plus a row
+        //    per row plus the stated slack -- no more, and CRUCIALLY no less.
+        //    A `>= 0.0` bound here (which is what this test used to be) cannot
+        //    tell 10pt of deliberate slack from 30pt of a header that stopped
+        //    being drawn.
+        //
+        //    Deliberately NOT `assert_eq!(CHROME_HEIGHT - MEASURED_CHROME,
+        //    CHROME_SLACK)`. That is arithmetic over three constants, true of
+        //    any consistent triple -- the same shape of tautology this test
+        //    replaced. Every number below is measured off a real frame.
+        let mut checked = 0;
+        for (rows, needed, _) in &measurements {
+            let requested = requested_inner_size(*rows).y;
+            assert!(
+                requested >= *needed,
+                "a {rows}-row card needs {needed}pt and the window asks for {requested}pt"
+            );
+            assert!(
+                (requested - needed - CHROME_SLACK).abs() < 0.5,
+                "a {rows}-row card needs {needed}pt, the window asks for {requested}pt, and \
+                 the difference is not the {CHROME_SLACK}pt of slack this module documents"
             );
             checked += 1;
         }
-        assert_eq!(checked, 3);
+        assert_eq!(checked, 4);
+    }
+
+    /// POSITIVE CONTROL for the measurement above.
+    ///
+    /// A `run_ui` whose `min_rect` came back unbounded, or a `sized()` that
+    /// ignored its argument, would make every "needs {n}pt" number above a
+    /// constant and the whole test a tautology in a new costume. These are the
+    /// four numbers it must have measured, spelled out: they are not derived
+    /// from `CHROME_HEIGHT`, `MEASURED_CHROME` or `overlay_height`, and if the
+    /// card's layout really does change, this is the test that says so out
+    /// loud rather than the one that quietly re-derives itself.
+    #[test]
+    fn the_four_card_heights_the_chrome_was_measured_from() {
+        let mut seen = Vec::new();
+        for rows in 1..=4usize {
+            let ctx = styled_ctx();
+            let mut needed = f32::NAN;
+            let _ = ctx.run_ui(sized(700.0), |ui| {
+                draw_overlay_card_rows(ui, APP, ITEM, Some(USER), &four_choices()[..rows]);
+                needed = ui.min_rect().bottom();
+            });
+            seen.push(needed);
+        }
+        assert_eq!(seen, vec![154.0, 204.0, 254.0, 304.0]);
+        // ... and the window really is taller than each of them by the slack.
+        assert_eq!(seen[0] + CHROME_SLACK, 164.0);
     }
 
     /// POSITIVE CONTROL for every "is inside the window" assertion above, and
