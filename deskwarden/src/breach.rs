@@ -60,7 +60,11 @@
 //! a path-only guard never sees it.
 
 use crate::http_agent::TotalBounded;
+use eframe::egui;
 use sha1::{Digest, Sha1};
+use std::collections::HashMap;
+use std::sync::mpsc;
+use std::sync::Arc;
 use std::fmt::Write as _;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -383,6 +387,195 @@ pub fn check_prefix(
         Ok(None) => BreachStatus::Safe,
         Err(_) => BreachStatus::Unavailable,
     }
+}
+
+/// The one call a [`BreachCache`] worker makes, injected rather than hard-wired.
+///
+/// It is a boxed closure rather than a bare `fn` pointer for one reason: a
+/// test's stub has to carry its own invocation counter and its own gate, and a
+/// `fn` pointer can capture nothing, so those would have to be statics --
+/// shared by every test in the binary, which run in parallel. With this shape
+/// each test owns its counter, and "exactly one worker was started" is a
+/// measurement rather than a hope.
+///
+/// The real one is [`live_check`] and it is wired in exactly one place,
+/// [`BreachCache::live`]. No test constructs it.
+pub type BreachCheck = Arc<dyn Fn(&Prefix, &Zeroizing<String>) -> BreachStatus + Send + Sync>;
+
+/// How long a caller should wait before drawing again while a lookup is out.
+///
+/// Named once, here, for the same reason `AppIdentityCache::POLL_INTERVAL` is:
+/// a channel is not egui input, so nothing about an answer arriving wakes the
+/// UI on its own.
+pub const BREACH_POLL_INTERVAL: Duration = Duration::from_millis(150);
+
+/// The production check: the real range API, over the real network.
+///
+/// Nothing in the test suite may reach this function. It is private, it is
+/// named at one call site ([`BreachCache::live`]), and every test builds its
+/// own [`BreachCheck`] instead.
+fn live_check(prefix: &Prefix, suffix: &Zeroizing<String>) -> BreachStatus {
+    check_prefix(HIBP_RANGE_BASE, prefix, suffix, &build_agent())
+}
+
+/// What the cache knows about one prefix.
+///
+/// `Ready` holds the **resolved [`BreachStatus`] and nothing else** -- never
+/// the range body, never the suffix list. A body is ~20 KB of public data that
+/// answers exactly one question, and once that question is answered it buys
+/// nothing; a second password sharing a prefix is a one-in-a-million event
+/// that may pay for a fresh request. Holding the list would also mean holding,
+/// in this process, a structure whose whole purpose is to be matched against
+/// the user's hashes.
+enum Entry {
+    /// A worker is out. **Holding this receiver IS the outstanding request:**
+    /// dropping the entry drops the channel, and the worker's answer then has
+    /// nowhere to land. See [`BreachCache::clear`].
+    Pending(mpsc::Receiver<BreachStatus>),
+    /// Answered.
+    Ready(BreachStatus),
+}
+
+/// One breach answer per hash prefix, for as long as the vault is unlocked.
+///
+/// # Nothing here is persisted, and nothing here has a TTL
+///
+/// The map dies with the window and [`Self::clear`] empties it on lock. That
+/// is not a simplification to be improved on later. "Item X is breached" is a
+/// claim about this user's vault and a target the moment it is on disk; a
+/// prefix-to-suffix cache on disk would be worse still, recording what the
+/// user's passwords hash to and narrowing every one of them by a factor of a
+/// million. There is no expiry because there is no lifetime long enough for
+/// one to matter: the longest an entry can live is one unlocked session.
+///
+/// # There is no `Default`, on purpose
+///
+/// A cache with no check function is a cache that cannot answer, and the
+/// obvious filler -- the live check -- is exactly what tests must never get by
+/// accident. [`Self::live`] and [`Self::new`] both name what they wire.
+pub struct BreachCache {
+    /// Keyed on the **prefix**, never on the whole hash. The whole hash is the
+    /// thing this module exists to keep off the wire and out of long-lived
+    /// storage; a map keyed on it would hold every password's complete SHA-1,
+    /// in memory, for the length of the session, to answer a question that is
+    /// only ever asked about the first five characters.
+    entries: HashMap<String, Entry>,
+    check: BreachCheck,
+}
+
+impl BreachCache {
+    /// The production cache: workers call the real Have I Been Pwned range API.
+    ///
+    /// The **only** place [`live_check`] is named.
+    pub fn live() -> Self {
+        Self::new(Arc::new(live_check))
+    }
+
+    /// A cache whose workers run `check`. Tests pass a stub; production calls
+    /// [`Self::live`].
+    pub fn new(check: BreachCheck) -> Self {
+        Self { entries: HashMap::new(), check }
+    }
+
+    /// The status of `password`, from cache if it is known, otherwise
+    /// [`BreachStatus::Pending`] with one worker started for its prefix.
+    ///
+    /// A pending entry is promoted to ready here, on the UI thread, by
+    /// `try_recv`; nothing else moves an answer into the map.
+    ///
+    /// Every arm that has no answer says `Pending`. None of them says `Safe` --
+    /// see [`BreachStatus`].
+    pub fn status(&mut self, ctx: &egui::Context, password: &str) -> BreachStatus {
+        // **Hashed here, on the UI thread, before any spawn.** The worker is
+        // handed the `(Prefix, Zeroizing<String>)` and never the password --
+        // see `spawn_check`, where the reason is spelled out at the boundary
+        // it protects.
+        let (prefix, suffix) = split_hash(password);
+        let key = prefix.as_str().to_string();
+
+        if !self.entries.contains_key(&key) {
+            // Two statements rather than `entry().or_insert_with()`: the
+            // closure would capture `self.check` while the map is already
+            // mutably borrowed, and spelling the insert out keeps the
+            // "spawn exactly once, and only on a miss" rule visible.
+            let rx = spawn_check(&self.check, prefix, suffix);
+            self.entries.insert(key, Entry::Pending(rx));
+            ctx.request_repaint_after(BREACH_POLL_INTERVAL);
+            return BreachStatus::Pending;
+        }
+
+        // Read the channel, then write the map: two steps, because the
+        // receiver is borrowed out of the very map the promotion writes to.
+        let answered = match self.entries.get(&key) {
+            Some(Entry::Pending(rx)) => rx.try_recv().ok(),
+            _ => None,
+        };
+        if let Some(answered) = answered {
+            // Whatever the worker said, stored verbatim. An `Unavailable`
+            // becomes a cached `Unavailable`; it must never be softened into
+            // `Safe` on the way in, which would paint a green badge for a
+            // lookup that did not happen.
+            self.entries.insert(key.clone(), Entry::Ready(answered));
+        }
+
+        match self.entries.get(&key) {
+            Some(Entry::Ready(answered)) => *answered,
+            // Still out. Keep the frames coming: a channel is not egui input,
+            // so without this the badge never appears until something else
+            // happens to cause a repaint.
+            Some(Entry::Pending(_)) => {
+                ctx.request_repaint_after(BREACH_POLL_INTERVAL);
+                BreachStatus::Pending
+            }
+            // Not reachable -- the key was present two lines ago and nothing
+            // removes entries here. `Pending` rather than a hard stop, because
+            // the one answer this must never invent is `Safe`.
+            None => BreachStatus::Pending,
+        }
+    }
+
+    /// Forget everything. Called on vault lock and on window close.
+    ///
+    /// **This drops pending entries as well as ready ones**, and that is the
+    /// security-relevant half. `HashMap::clear` drops every value, so each
+    /// `Entry::Pending` drops its receiver, and a worker that was still out at
+    /// lock time finds its `send` failing: its answer cannot land in the map a
+    /// later session goes on to read. Clearing only the answered entries would
+    /// leave a lookup started before the lock able to resolve after it.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Start one worker for one prefix, and hand back the channel its answer will
+/// arrive on.
+///
+/// # The password does not cross this boundary, and must not be made to
+///
+/// The hash is computed by the caller on the UI thread; only the `Prefix` and
+/// the already-`Zeroizing` suffix are moved in here. **Do not "simplify" this
+/// by moving `split_hash` into the closure.** A `&str` cannot be moved into a
+/// thread, so the version of that refactor which compiles is
+/// `password.to_string()` -- a plain `String` holding the plaintext, owned by
+/// a worker for the length of a network round trip, and freed *unwiped* onto a
+/// heap the allocator hands straight to the next caller. It would compile, it
+/// would pass, and it would be the one thing this module is for.
+///
+/// The channel is bounded at one and the send is allowed to fail: if the vault
+/// locked or the window closed while the worker was out, the receiver is gone
+/// and there is nobody to tell. Nothing is retried and nothing is joined.
+fn spawn_check(
+    check: &BreachCheck,
+    prefix: Prefix,
+    suffix: Zeroizing<String>,
+) -> mpsc::Receiver<BreachStatus> {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let check = Arc::clone(check);
+    std::thread::spawn(move || {
+        let answered = check(&prefix, &suffix);
+        let _ = tx.send(answered);
+    });
+    rx
 }
 
 #[cfg(test)]
@@ -1679,4 +1872,444 @@ mod tests {
              `unwrap_or_default()` read 'we could not check' as a green badge"
         );
     }
+    /// The cache's state machine, driven entirely by injected stubs.
+    ///
+    /// **No test in here reaches the network.** `BreachCache::live` -- the one
+    /// thing that names `live_check`, which is the one thing that names the
+    /// production endpoint constant outside the endpoint pin -- is never
+    /// constructed below; `no_cache_test_can_reach_the_real_api` is the guard
+    /// that says so out loud, on this module's own test source.
+    mod cache {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+        use std::time::Instant;
+
+        /// A context with no fonts and no frame. `status` paints nothing; it
+        /// only ever asks for a repaint.
+        fn ctx() -> egui::Context {
+            egui::Context::default()
+        }
+
+        /// A context that is **not** already asking to be repainted.
+        ///
+        /// A brand-new `Context` is: it has never run a pass, so it wants one.
+        /// Measured, not assumed -- the first version of the repaint test used
+        /// a fresh context and its own control caught that the assertion was
+        /// true before `status` was ever called, which would have made the
+        /// test green with the repaint request deleted.
+        ///
+        /// Empty passes settle it. Each one has no input, draws nothing, and
+        /// clears the outstanding request; the loop is bounded and the caller
+        /// asserts the result rather than trusting it.
+        fn idle_ctx() -> egui::Context {
+            let ctx = ctx();
+            for _ in 0..8 {
+                ctx.begin_pass(egui::RawInput::default());
+                let _ = ctx.end_pass();
+                if !ctx.has_requested_repaint() {
+                    break;
+                }
+            }
+            assert!(
+                !ctx.has_requested_repaint(),
+                "control: a context that has run eight empty passes still wants a repaint, so \
+                 `has_requested_repaint` cannot be used to observe one being asked for"
+            );
+            ctx
+        }
+
+        /// How long a test will wait for a worker thread before calling it a
+        /// hang. Generous, because it is only ever reached when something is
+        /// actually broken.
+        const PATIENCE: Duration = Duration::from_secs(10);
+
+        /// A stub check that counts its invocations and always answers
+        /// `answer`. The counter is per-test state, which is the whole reason
+        /// [`BreachCheck`] is a boxed closure and not a `fn` pointer.
+        fn counting_stub(answer: BreachStatus) -> (BreachCheck, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mine = Arc::clone(&calls);
+            let check: BreachCheck = Arc::new(move |_: &Prefix, _: &Zeroizing<String>| {
+                mine.fetch_add(1, Ordering::SeqCst);
+                answer
+            });
+            (check, calls)
+        }
+
+        /// A stub that counts its invocation, then **blocks until the gate is
+        /// opened**, then answers `Breached(n)` for the n-th invocation.
+        ///
+        /// Two properties the pending tests need and cannot get any other way:
+        /// a worker that is genuinely still out when the assertion runs, and
+        /// answers that are distinguishable *by which worker produced them* --
+        /// so "the first worker's answer landed after the clear" is a thing a
+        /// test can see rather than infer.
+        type Gate = Arc<(Mutex<bool>, Condvar)>;
+
+        fn gated_stub() -> (BreachCheck, Arc<AtomicUsize>, Gate) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let gate: Gate = Arc::new((Mutex::new(false), Condvar::new()));
+            let mine = Arc::clone(&calls);
+            let held = Arc::clone(&gate);
+            let check: BreachCheck = Arc::new(move |_: &Prefix, _: &Zeroizing<String>| {
+                let nth = mine.fetch_add(1, Ordering::SeqCst) + 1;
+                let (lock, cvar) = &*held;
+                let mut open = match lock.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                while !*open {
+                    open = match cvar.wait(open) {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                }
+                BreachStatus::Breached(nth as u64)
+            });
+            (check, calls, gate)
+        }
+
+        fn open(gate: &Gate) {
+            let (lock, cvar) = &**gate;
+            let mut open = match lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *open = true;
+            cvar.notify_all();
+        }
+
+        /// Wait until the stub has been entered exactly `n` times.
+        ///
+        /// A worker is a thread, so "one worker was started" is observable a
+        /// moment after `status` returns, not during it. This is the only
+        /// waiting any test here does, and it is bounded.
+        fn wait_for_calls(calls: &AtomicUsize, n: usize) {
+            let deadline = Instant::now() + PATIENCE;
+            while calls.load(Ordering::SeqCst) < n {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stub was entered {} times, not {n}: no worker was started",
+                    calls.load(Ordering::SeqCst)
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Poll `status` until it stops saying `Pending`, which is the
+        /// promotion path under test. Bounded; a hang is a failure, not a wait.
+        fn promote(cache: &mut BreachCache, ctx: &egui::Context, password: &str) -> BreachStatus {
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                let answered = cache.status(ctx, password);
+                if answered != BreachStatus::Pending {
+                    return answered;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the answer was never promoted out of Pending"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Whether the one entry for `password`'s prefix is pending.
+        fn is_pending(cache: &BreachCache, password: &str) -> bool {
+            let (prefix, _) = split_hash(password);
+            matches!(cache.entries.get(prefix.as_str()), Some(Entry::Pending(_)))
+        }
+
+        fn ready_status(cache: &BreachCache, password: &str) -> Option<BreachStatus> {
+            let (prefix, _) = split_hash(password);
+            match cache.entries.get(prefix.as_str()) {
+                Some(Entry::Ready(answered)) => Some(*answered),
+                _ => None,
+            }
+        }
+
+        const PW: &str = "password";
+        const OTHER: &str = "correct horse battery staple";
+
+        #[test]
+        fn a_first_lookup_answers_pending_and_starts_exactly_one_worker() {
+            let ctx = ctx();
+            let (check, calls) = counting_stub(BreachStatus::Safe);
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            wait_for_calls(&calls, 1);
+            // Give a second worker every chance to show up before asserting
+            // that none did.
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "one lookup started more than one worker"
+            );
+            assert_eq!(cache.entries.len(), 1, "one lookup made more than one entry");
+        }
+
+        #[test]
+        fn a_second_lookup_for_the_same_prefix_starts_no_second_worker() {
+            let ctx = ctx();
+            let (check, calls) = counting_stub(BreachStatus::Safe);
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            wait_for_calls(&calls, 1);
+            // Several more frames' worth of asking, exactly as a UI would.
+            for _ in 0..5 {
+                let _ = cache.status(&ctx, PW);
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "asking again started another worker: the cache is not being consulted"
+            );
+            assert_eq!(cache.entries.len(), 1);
+        }
+
+        #[test]
+        fn an_answer_is_promoted_to_ready_and_then_served_from_cache() {
+            let ctx = ctx();
+            let (check, calls) = counting_stub(BreachStatus::Breached(42));
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            assert!(is_pending(&cache, PW), "the miss did not leave a pending entry");
+
+            assert_eq!(promote(&mut cache, &ctx, PW), BreachStatus::Breached(42));
+            assert_eq!(
+                ready_status(&cache, PW),
+                Some(BreachStatus::Breached(42)),
+                "the promotion did not store the answer it just handed out"
+            );
+
+            for _ in 0..5 {
+                assert_eq!(cache.status(&ctx, PW), BreachStatus::Breached(42));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "a cache hit started a worker");
+        }
+
+        /// A lookup in flight when the vault locks must not be able to land.
+        ///
+        /// The two answers are told apart by *which worker* produced them --
+        /// the gated stub answers `Breached(n)` for its n-th call -- so a
+        /// receiver that survived `clear` shows up as `Breached(1)` where only
+        /// `Breached(2)` is correct. Asserting the map is empty would not catch
+        /// that on its own: an entry re-inserted from a stale channel is an
+        /// entry, and it would look exactly like a fresh one.
+        #[test]
+        fn clear_drops_pending_entries_too() {
+            let ctx = ctx();
+            let (check, calls, gate) = gated_stub();
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            wait_for_calls(&calls, 1);
+            assert!(
+                is_pending(&cache, PW),
+                "control: the entry under test is not pending, so this test proves nothing"
+            );
+            assert_eq!(ready_status(&cache, PW), None, "control: the entry is already ready");
+
+            cache.clear();
+            assert!(
+                cache.entries.is_empty(),
+                "clear left {} entries behind",
+                cache.entries.len()
+            );
+
+            // The first worker now finishes into a dropped receiver.
+            open(&gate);
+            std::thread::sleep(Duration::from_millis(20));
+            assert!(
+                cache.entries.is_empty(),
+                "an answer from before the clear landed in the cache after it"
+            );
+
+            // A fresh lookup must be a fresh worker, and must get the *second*
+            // worker's answer.
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            wait_for_calls(&calls, 2);
+            let answered = promote(&mut cache, &ctx, PW);
+            assert_eq!(
+                answered,
+                BreachStatus::Breached(2),
+                "the answer served after the lock came from the worker that was out *during* it"
+            );
+        }
+
+        #[test]
+        fn an_unavailable_answer_is_cached_as_unavailable_and_never_as_safe() {
+            let ctx = ctx();
+            let (check, calls) = counting_stub(BreachStatus::Unavailable);
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            let answered = promote(&mut cache, &ctx, PW);
+            assert_eq!(answered, BreachStatus::Unavailable);
+            assert_ne!(
+                answered,
+                BreachStatus::Safe,
+                "a lookup that could not be made was reported as a password nobody found"
+            );
+            assert_eq!(ready_status(&cache, PW), Some(BreachStatus::Unavailable));
+
+            for _ in 0..5 {
+                assert_eq!(cache.status(&ctx, PW), BreachStatus::Unavailable);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn two_different_prefixes_get_two_workers() {
+            // The control the count depends on. If these two passwords shared
+            // a prefix, "two workers" would be the defect, not the assertion.
+            let (a, _) = split_hash(PW);
+            let (b, _) = split_hash(OTHER);
+            assert_ne!(
+                a.as_str(),
+                b.as_str(),
+                "the two fixtures share a prefix, so this test cannot mean what it says"
+            );
+
+            let ctx = ctx();
+            let (check, calls) = counting_stub(BreachStatus::Safe);
+            let mut cache = BreachCache::new(check);
+
+            assert_eq!(cache.status(&ctx, PW), BreachStatus::Pending);
+            assert_eq!(cache.status(&ctx, OTHER), BreachStatus::Pending);
+            wait_for_calls(&calls, 2);
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            let mut keys: Vec<&str> = cache.entries.keys().map(|k| k.as_str()).collect();
+            keys.sort_unstable();
+            let mut expected = [a.as_str(), b.as_str()];
+            expected.sort_unstable();
+            assert_eq!(keys, expected.to_vec());
+        }
+
+        /// Without this the badge never appears: an answer arriving on a
+        /// channel is not egui input, so nothing wakes the UI to read it.
+        #[test]
+        fn a_pending_entry_asks_for_a_repaint() {
+            let (check, calls, gate) = gated_stub();
+            let mut cache = BreachCache::new(check);
+
+            // The miss.
+            let first = idle_ctx();
+            assert_eq!(cache.status(&first, PW), BreachStatus::Pending);
+            assert!(
+                first.has_requested_repaint(),
+                "the frame that started the lookup asked for no follow-up frame"
+            );
+            wait_for_calls(&calls, 1);
+
+            // A later frame, still pending: this arm needs the request just as
+            // much, and it is a different line of code.
+            let later = idle_ctx();
+            assert!(is_pending(&cache, PW), "control: the entry is no longer pending");
+            assert_eq!(cache.status(&later, PW), BreachStatus::Pending);
+            assert!(
+                later.has_requested_repaint(),
+                "a frame that found the lookup still out asked for no follow-up frame"
+            );
+
+            // A settled entry has nothing to wait for.
+            open(&gate);
+            let _ = promote(&mut cache, &ctx(), PW);
+            let settled = idle_ctx();
+            assert_ne!(cache.status(&settled, PW), BreachStatus::Pending);
+            assert!(
+                !settled.has_requested_repaint(),
+                "a cache hit is still asking for repaints, so the window never idles"
+            );
+        }
+
+        /// The map is keyed on the five characters that are allowed to leave
+        /// this machine, and on nothing longer.
+        ///
+        /// A map keyed on the whole hash keeps every password's complete SHA-1
+        /// alive, in a plain `String`, for the length of the session -- to
+        /// answer a question that is only ever asked about the first five
+        /// characters. It would also make the cache useless by construction:
+        /// no two lookups would ever share a key.
+        #[test]
+        fn the_cache_key_is_the_prefix_and_never_the_whole_hash() {
+            let ctx = ctx();
+            let (check, _) = counting_stub(BreachStatus::Safe);
+            let mut cache = BreachCache::new(check);
+            let _ = cache.status(&ctx, PW);
+
+            let (prefix, suffix) = split_hash(PW);
+            let hex = hex_digest(PW);
+            assert_eq!(suffix.len(), SUFFIX_LEN, "control: the fixture's suffix is the wrong size");
+
+            let keys: Vec<&str> = cache.entries.keys().map(|k| k.as_str()).collect();
+            assert_eq!(keys, vec![prefix.as_str()]);
+            for key in &keys {
+                assert_eq!(key.len(), PREFIX_LEN, "key {key:?} is not five characters");
+                assert!(
+                    !key.contains(&*suffix),
+                    "key {key:?} carries the 35 characters that must not leave this machine"
+                );
+                assert_ne!(*key, hex.as_str(), "the cache is keyed on the whole hash");
+            }
+        }
+
+        /// No test in this module can reach Have I Been Pwned.
+        ///
+        /// The live check is reachable from exactly one constructor, and a
+        /// test that called it would make a real request from the test suite.
+        /// This reads the file's own test source rather than trusting the list
+        /// above to stay complete, and is controlled twice: the needle must
+        /// match the one production site that legitimately uses it, and the
+        /// test text must be the text that really contains these tests.
+        #[test]
+        fn no_cache_test_can_reach_the_real_api() {
+            const LIVE: &str = concat!("BreachCache::li", "ve(");
+            const ENDPOINT: &str = concat!("HIBP_RANGE_", "BASE");
+
+            let full = this_module_source();
+            let cut = full
+                .find(&format!("#[cfg({})]", "test"))
+                .unwrap_or(full.len());
+            let (production, tests) = full.split_at(cut);
+
+            // Controls: both needles match live production code right now, so
+            // asserting their absence from the tests is not an assertion about
+            // a typo.
+            assert!(
+                production.contains(concat!("pub fn li", "ve() -> Self")),
+                "control: the live constructor has been renamed, so {LIVE:?} is blind"
+            );
+            assert!(
+                production.contains(ENDPOINT),
+                "control: {ENDPOINT:?} no longer names anything in production"
+            );
+            assert!(
+                tests.contains(concat!("fn clear_drops_pending_entries", "_too")),
+                "control: the split did not put the cache tests on the test side"
+            );
+
+            assert!(
+                !tests.contains(LIVE),
+                "a test constructs the live cache, whose workers call the real \
+                 api.pwnedpasswords.com"
+            );
+            // The endpoint constant is named in exactly one test: the pin,
+            // which only compares it to a string literal.
+            assert_eq!(
+                tests.matches(ENDPOINT).count(),
+                1,
+                "the production endpoint is named somewhere new in the tests. The one expected \
+                 use is `the_production_endpoint_is_the_https_range_api`, which only compares it \
+                 to a string literal and never calls anything with it"
+            );
+        }
+    }
+
 }
