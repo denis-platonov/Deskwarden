@@ -560,8 +560,24 @@ pub enum FillAction {
 ///
 /// [`FillChoice::Saved`] is exactly what this function did before it took a
 /// choice at all, the empty-sequence fallback to `Default` included. That is
-/// what makes threading the choice through a behaviour-preserving step: every
-/// call site passes `Saved`.
+/// why it is the choice `main.rs`'s hotkey path names: it has no overlay
+/// answer of its own to forward, so `Saved` is the only spelling there that
+/// preserves what the hotkey has always done. `handle_match` forwards the
+/// user's answer instead, which as of step 5 is deliberately not
+/// behaviour-preserving. `app::fill_call_site_tests` holds each file to its
+/// own rule.
+///
+/// **What is NOT pinned, stated plainly.** The `UserTabPass` arm returns
+/// before the parse, and that ordering is deliberate for the reason above --
+/// but nothing here can catch it being lost. Rewriting the arm as
+/// `FillChoice::UserTabPass => String::new(),` and letting it fall through to
+/// the `stored.is_empty()` fallback was measured to leave the whole suite
+/// green, because it is genuinely behaviour-identical: both routes answer
+/// `FillAction::Default`. Nothing ships broken by that spelling; it simply is
+/// not a distinction any test in this crate can see, so do not read the
+/// guards named above as pinning it. What they pin is that `UserTabPass`
+/// answers `Default` **and not a planned `DEFAULT_SEQUENCE`**, which is the
+/// difference that costs users the UI Automation path.
 pub fn fill_action(
     item: &VaultItem,
     totp: Option<&str>,
@@ -826,13 +842,22 @@ pub fn prompt_choices(item: Option<&VaultItem>) -> Vec<FillChoice> {
 /// Everything the overlay needs about the matched item, and **nothing else**.
 ///
 /// The point of this type is what it does *not* contain. `handle_match` used
-/// to hold the whole cloned [`VaultItem`] -- login object, plaintext password
-/// and TOTP seed included -- for the entire lifetime of a modal overlay the
-/// user may leave on screen for minutes, and only drop it afterwards. The
-/// secrets are [`zeroize::Zeroizing`], so they were wiped on that drop rather
-/// than released in the clear, but "wiped eventually" and "not resident while
-/// a window is open" are different guarantees and only the second is the one
-/// worth having: the residency window was as long as the user was undecided.
+/// to hold a SECOND copy of the matched item -- a whole cloned [`VaultItem`],
+/// login object, plaintext password and TOTP seed included -- for the entire
+/// lifetime of a modal overlay the user may leave on screen for minutes, and
+/// only drop it afterwards. The secrets are [`zeroize::Zeroizing`], so that
+/// copy was wiped on that drop rather than released in the clear, but the
+/// window in which a duplicate existed was as long as the user was undecided,
+/// which is the part worth removing.
+///
+/// **This is one copy fewer, not zero copies.** The [`VaultCache`] itself
+/// holds the whole `Vec<VaultItem>` -- plaintext `Zeroizing`
+/// passwords included -- for the entire unlocked session, and the fill's
+/// lookup below clones out of it. So the claim is narrow and deliberate: the
+/// prompt path no longer *adds* a copy, and the copy the fill makes lives for
+/// the length of a fill rather than the length of a decision. It is not "the
+/// password is not resident while a window is open"; while the vault is
+/// unlocked it is resident regardless.
 ///
 /// So the item is now reduced to this the moment it is read and dropped
 /// before the overlay opens. Both fields are presence-or-label only: the
@@ -2208,23 +2233,45 @@ mod prompt_wiring_tests {
     }
 }
 
-/// **Every call site of the fill passes the choice that preserves what the
-/// fill has always done, in BOTH files that have one.**
+/// **Every call site of the fill passes the choice ITS OWN FILE is entitled
+/// to pass, and the two files are not entitled to the same one.**
 ///
-/// This step gave `fill_from_vault` a `choice` parameter and changed nothing
-/// else, and that second half is a claim about the *call sites*, which no
-/// behavioural test in this crate can reach: `handle_match`'s call needs a real
-/// overlay and `main`'s needs a real hotkey. A call site switched to
-/// `FillChoice::UserTabPass` compiles, and it retires the stored auto-type
-/// sequence of every item in every existing vault -- while still typing a
-/// username and a password, so every "was something typed" assertion here
-/// stays green.
+/// The claim here is about the *call sites*, which no behavioural test in this
+/// crate can reach: `handle_match`'s call needs a real overlay and `main`'s
+/// needs a real hotkey. A call site switched to `FillChoice::UserTabPass`
+/// compiles, and it retires the stored auto-type sequence of every item in
+/// every existing vault -- while still typing a username and a password, so
+/// every "was something typed" assertion here stays green.
 ///
-/// The two accepted forms are `FillChoice::Saved` (named at a call site that
-/// has no overlay answer of its own) and a forwarded binding called `choice`
-/// (`handle_match`, which does). `FillChoice::Saved` is what `fill_action`'s
-/// body was before it took a choice, empty-sequence fallback included, so
-/// those two are the preserving set and nothing else is.
+/// **What is guaranteed is different in each file, so the rule is per file.**
+///
+/// * `main.rs`'s hotkey fill has no overlay and therefore no answer of its own
+///   to forward, so the only choice that preserves what the hotkey has always
+///   done is `FillChoice::Saved` *named there*: that is exactly what
+///   `fill_action`'s body was before it took a choice, empty-sequence fallback
+///   included. A binding is not accepted there, whatever it is called.
+/// * `app.rs`'s `handle_match` is the opposite: as of step 5 it is
+///   deliberately **not** behaviour-preserving. `prompt_choices` offers the
+///   rows the item really supports, so the guarantee is that the user's OWN
+///   answer is forwarded -- the binding `choice` -- and a literal
+///   `FillChoice::Saved` there is the step-5 bug (click the one-time-code row,
+///   get your password typed). A named literal is not accepted there.
+///
+/// This used to be one two-element disjunction applied to both files, and the
+/// `, choice,` half of it -- which exists only for `handle_match` -- was
+/// nothing but a spelling away from being accepted in `main.rs` too. A
+/// `let choice = FillChoice::UserTabPass;` on the hotkey path passed the guard
+/// with the whole suite green. `the_two_files_rules_are_not_interchangeable`
+/// is what stops the two rules being merged back together, and the per-file
+/// call COUNT is what stops a *new* call site in either file being quietly
+/// waved through by the other file's rule: a file's count is stated in the
+/// same table as its accepted form, and a file with no entry is a hard error
+/// rather than a skip.
+///
+/// Scanned rather than pinned as a whole-call needle, so that reformatting,
+/// renaming a local or adding a call cannot silently stop it pinning: it finds
+/// EVERY production call and checks EVERY one, and asserts it found the number
+/// it expects.
 ///
 /// Scanned rather than pinned as a whole-call needle, so that reformatting,
 /// renaming a local or adding a call cannot silently stop it pinning: it finds
@@ -2245,11 +2292,45 @@ mod fill_call_site_tests {
     // here contains a newline: a `\r\n` needle is vacuous on an LF checkout
     // and vice versa, and this repo has no `.gitattributes`.
     const CALL: &str = concat!("fill_from_vault", "(");
-    const PRESERVING: [&str; 2] = [concat!("FillChoice", "::Saved"), ", choice,"];
 
-    /// The number of calls in each file, so that a call site DELETED (rather
-    /// than changed) cannot pass this by leaving nothing to check.
-    const EXPECTED: [(&str, usize); 2] = [("app.rs", 1), ("main.rs", 1)];
+    /// The choice each file's production calls must pass, and how many calls
+    /// that file has -- **one row per file, and the two rows differ**.
+    ///
+    /// The form and the count live in the same row deliberately. A rule that
+    /// was global and a count that was per file is what let `main.rs` inherit
+    /// `app.rs`'s `, choice,`; keeping them together means a call site that
+    /// appears in either file has to be given a row's worth of thought, and
+    /// the count assertion below fires before anything is accepted.
+    ///
+    /// The count is also what stops a call site DELETED (rather than changed)
+    /// passing this by leaving nothing to check.
+    const RULES: [(&str, &str, usize); 2] = [
+        // Forwards the overlay's own answer; see the module doc.
+        ("app.rs", ", choice,", 1),
+        // Names the preserving choice; there is no answer to forward.
+        ("main.rs", concat!("FillChoice", "::Saved"), 1),
+    ];
+
+    /// The row for `name`, or a hard failure.
+    ///
+    /// **Not a skip and not a fallback.** A file scanned with no rule of its
+    /// own would otherwise be checked against nothing, or -- worse, and this
+    /// is the defect being closed -- against whatever rule happened to be
+    /// lying around for another file.
+    fn rule(name: &str) -> (&'static str, usize) {
+        RULES
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, form, count)| (*form, *count))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} is scanned but has no rule of its own. Add a row to RULES saying \
+                     what THAT file's call sites are entitled to pass -- do not reach for \
+                     another file's row, which is exactly how the hotkey path came to accept \
+                     a binding it has no business having"
+                )
+            })
+    }
 
     fn sources() -> [(&'static str, &'static str); 2] {
         [("app.rs", include_str!("app.rs")), ("main.rs", include_str!("main.rs"))]
@@ -2314,13 +2395,55 @@ mod fill_call_site_tests {
         );
         let args = argument_lists(planted);
         assert_eq!(args.len(), 2, "the scanner did not find both planted calls: {args:?}");
-        assert!(PRESERVING.iter().any(|p| args[0].contains(p)), "{}", args[0]);
+        let (app_form, _) = rule("app.rs");
+        assert!(args[0].contains(app_form), "{}", args[0]);
         assert!(
-            !PRESERVING.iter().any(|p| args[1].contains(p)),
-            "the scanner accepts a call site that does NOT preserve behaviour: {}",
+            !args[1].contains(app_form),
+            "the scanner accepts a call site that forwards nothing: {}",
             args[1]
         );
         assert_eq!(argument_lists("nothing here").len(), 0);
+    }
+
+    /// **The two files' rules are not interchangeable, in both directions.**
+    ///
+    /// This is the guard on the guard. The defect being closed was one rule
+    /// accepting either spelling everywhere, so the cheapest way to "fix" a
+    /// future failure of the test below is to widen a row until it accepts the
+    /// other file's form again -- and that would be silent. So the forms are
+    /// pinned as mutually rejecting: `main.rs`'s form must reject the shape
+    /// `app.rs` really passes, and `app.rs`'s form must reject the shape
+    /// `main.rs` really passes. Merge them and this fails.
+    ///
+    /// The two shapes are written the way the production call sites are
+    /// written, whitespace included, so this is a positive control for each
+    /// row as well as a negative one for the other.
+    #[test]
+    fn the_two_files_rules_are_not_interchangeable() {
+        let forwards = "item_id, hwnd, choice, notifier";
+        let names_it = concat!("hwnd,\ndeskwarden::app::FillChoice", "::Saved,\n&notifier,");
+        let (app_form, app_count) = rule("app.rs");
+        let (main_form, main_count) = rule("main.rs");
+
+        assert!(app_form != main_form, "the two rows have collapsed into one rule again");
+        assert!(app_count > 0 && main_count > 0, "a file is scanned but has nothing to check");
+
+        assert!(app_form.contains("choice"), "app.rs's rule stopped being about forwarding");
+        assert!(forwards.contains(app_form), "app.rs's rule rejects what app.rs really passes");
+        assert!(
+            !names_it.contains(app_form),
+            "app.rs's rule accepts a call that names a literal instead of forwarding"
+        );
+
+        assert!(names_it.contains(main_form), "main.rs's rule rejects what main.rs really passes");
+        assert!(
+            !forwards.contains(main_form),
+            "main.rs's rule accepts a forwarded binding. The hotkey has no answer to forward, \
+             so a binding there can hold ANY choice -- `let choice = FillChoice::UserTabPass;` \
+             is the whole regression, and it is one line"
+        );
+
+        assert_eq!(RULES.len(), sources().len(), "a file is scanned with no rule, or vice versa");
     }
 
     /// **The cut is a real cut**, in both directions: it removes the gated
@@ -2363,43 +2486,53 @@ mod fill_call_site_tests {
     }
 
     #[test]
-    fn every_fill_call_site_passes_the_preserving_choice() {
+    fn every_fill_call_site_passes_the_choice_its_own_file_is_entitled_to() {
         let mut checked = 0;
         for (name, source) in sources() {
             let args = argument_lists(&production_only(source));
-            let expected = EXPECTED
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, c)| *c)
-                .expect("every scanned file has an expected count");
+            let (form, expected) = rule(name);
             assert_eq!(
                 args.len(),
                 expected,
-                "{name} has {} production calls to the fill, not {expected}; a call site was \
-                 added or deleted, so update EXPECTED deliberately rather than letting this drift",
+                "{name} has {} production calls to the fill, not {expected}. A call site was \
+                 added or deleted: give it a row's worth of thought and update RULES \
+                 deliberately -- a new call site must not inherit the other file's rule",
                 args.len()
             );
             assert!(expected > 0, "{name} is scanned but has no call to check");
             for arg in &args {
                 assert!(
-                    PRESERVING.iter().any(|p| arg.contains(p)),
-                    "a fill in {name} does not pass the behaviour-preserving choice, so this \
-                     step is not behaviour-preserving; its arguments are ({arg})"
+                    arg.contains(form),
+                    "a fill in {name} does not pass {form:?}, which is the ONLY choice that \
+                     file's call sites are entitled to pass. In main.rs that means the hotkey \
+                     no longer names the choice that preserves what it has always done, and \
+                     every stored auto-type sequence in every existing vault is retired on \
+                     that path; in app.rs it means `handle_match` no longer forwards the \
+                     user's own answer, so the row they clicked is not the row that is typed. \
+                     Its arguments are ({arg})"
                 );
                 checked += 1;
             }
         }
         assert_eq!(
             checked,
-            EXPECTED.iter().map(|(_, c)| c).sum::<usize>(),
+            RULES.iter().map(|(_, _, c)| c).sum::<usize>(),
             "the loop did not check every call it found"
         );
+        assert!(checked > 0, "the loop visited nothing at all");
     }
 
     /// The production call in `handle_match` forwards the overlay's OWN
-    /// answer. `FillChoice::Saved` written there instead would satisfy the
-    /// scan above forever -- and would be the step-5 bug in advance: the user
-    /// clicks the one-time-code row and their password is typed.
+    /// answer, in the order it forwards it.
+    ///
+    /// The scan above now rejects a named literal in `app.rs` on its own, so
+    /// this is no longer the only thing standing between `handle_match` and
+    /// `FillChoice::Saved`; it is the stronger claim, and worth keeping as
+    /// one. The scan asks only that the text `, choice,` appear somewhere in
+    /// the argument list -- which a call that forwarded `choice` into the
+    /// *wrong* position would also satisfy -- and this pins the whole list.
+    /// Naming a literal there is the step-5 bug: the user clicks the
+    /// one-time-code row and their password is typed.
     #[test]
     fn the_prompt_path_forwards_the_answer_it_was_given_rather_than_naming_one() {
         let needle =
