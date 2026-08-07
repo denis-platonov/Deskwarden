@@ -130,6 +130,18 @@ const PROMPT_DESCRIPTION: &str = "Offer to fill when an app you have matched com
      Off means nothing happens on its own and CTRL+ALT+B is the only way to fill. Nothing is \
      ever typed until you ask for it either way.";
 
+const BREACH_LABEL: &str = "Check passwords against known breaches";
+/// **Says what leaves the machine, because something does.** Off by default is
+/// stated in the copy and not only in `Settings::default`: this is the one row
+/// on General whose ON state makes a network request keyed on a password, and
+/// a user reading the pane should not have to infer that from the pill.
+/// The k-anonymity bargain -- five hex characters out, thirty-five matched
+/// here -- is what makes the request safe to offer at all, so it is the
+/// description rather than a footnote.
+const BREACH_DESCRIPTION: &str = "Off by default. When on, Deskwarden sends the first 5 \
+     characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this \
+     machine. Your password, and the rest of its hash, never leave your PC.";
+
 const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
     "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
@@ -745,6 +757,17 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.prompt_on_match,
         );
         row_separator(ui);
+        // Directly under the prompt row, wired exactly as it is. Off by
+        // default and left that way here: this row is the only consent that
+        // exists for the range request, so it is set by a click on this pill
+        // and by nothing else.
+        state.settings.check_breaches = toggle_row(
+            ui,
+            BREACH_LABEL,
+            BREACH_DESCRIPTION,
+            state.settings.check_breaches,
+        );
+        row_separator(ui);
         // The toggle sits above the number it governs, in 3e's own 40x22
         // pill, and the number's row stays put below it -- greyed, not
         // removed. A row that vanished would reflow the card on every click
@@ -1142,7 +1165,23 @@ mod tests {
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, Rect)>,
+        ink: Vec<TextInk>,
         rects: Vec<RectShape>,
+    }
+
+    /// One painted text run, with everything a geometry assertion needs that a
+    /// `(String, Rect)` cannot carry: what egui actually laid out (an elided
+    /// string is not the string that was asked for), how many lines it wrapped
+    /// to, and the colour it was painted in. The colour is here because a
+    /// control painted at alpha 0 occupies a perfectly reasonable rectangle
+    /// and is not on screen, and a test reading only rectangles says so.
+    #[derive(Clone)]
+    struct TextInk {
+        source: String,
+        rendered: String,
+        rect: Rect,
+        rows: usize,
+        color: egui::Color32,
     }
 
     impl Painted {
@@ -1216,6 +1255,18 @@ mod tests {
             stroke.color
         }
 
+        /// The one painted run of exactly this text. Panics if it was never
+        /// painted, and if it was painted twice -- either way the caller's
+        /// "the" is wrong and a silent first-match would hide it.
+        fn ink_of(&self, needle: &str) -> TextInk {
+            let mut found = self.ink.iter().filter(|i| i.source == needle);
+            let first = found.next().unwrap_or_else(|| {
+                panic!("{needle:?} was never painted; got {:?}", self.strings())
+            });
+            assert!(found.next().is_none(), "{needle:?} was painted more than once");
+            first.clone()
+        }
+
         fn count_filled(&self, fill: egui::Color32) -> usize {
             self.rects.iter().filter(|r| r.fill == fill).count()
         }
@@ -1223,10 +1274,31 @@ mod tests {
 
     fn walk(shape: &egui::Shape, p: &mut Painted) {
         match shape {
-            egui::Shape::Text(text) => p.texts.push((
-                text.galley.text().to_string(),
-                Rect::from_min_size(text.pos, text.galley.size()),
-            )),
+            egui::Shape::Text(text) => {
+                let rect = Rect::from_min_size(text.pos, text.galley.size());
+                p.texts.push((text.galley.text().to_string(), rect));
+                p.ink.push(TextInk {
+                    source: text.galley.text().to_string(),
+                    // The glyphs actually placed, row by row -- text that was
+                    // elided to fit renders fewer of them than it was given.
+                    rendered: text
+                        .galley
+                        .rows
+                        .iter()
+                        .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
+                        .collect(),
+                    rect,
+                    rows: text.galley.rows.len(),
+                    color: text.override_text_color.unwrap_or_else(|| {
+                        text.galley
+                            .job
+                            .sections
+                            .first()
+                            .map(|section| section.format.color)
+                            .unwrap_or(egui::Color32::TRANSPARENT)
+                    }),
+                });
+            }
             egui::Shape::Rect(rect) => p.rects.push(rect.clone()),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -1293,6 +1365,31 @@ mod tests {
     /// One frame of a fresh window on `section`.
     fn paint(section: Section) -> Painted {
         paint_settings(section, Settings::default())
+    }
+
+    /// One frame of General on a pane of a given width. `frame` and its
+    /// `raw_input` are pinned to `BODY_SIZE`; the wrapping assertions need
+    /// more than one width, and a row that fits at 1000 points is not thereby
+    /// known to fit at 652.
+    fn paint_general_at(width: f32) -> Painted {
+        let size = Vec2::new(width, BODY_SIZE.y);
+        let input = |events: &[egui::Event]| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            events: events.to_vec(),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(input(&[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(&[]), |_ui| {});
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::General;
+        let output = ctx.run_ui(input(&[]), |ui| draw_prefs_body(ui, &mut state));
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
     }
 
     fn paint_settings(section: Section, settings: Settings) -> Painted {
@@ -1402,12 +1499,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_three_toggles_and_one_stepper() {
+    fn general_paints_exactly_four_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            3,
-            "three 40x22 pills: `keep_backend_running`, `prompt_on_match` and              `auto_lock_enabled`, and nothing else"
+            4,
+            "four 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches` and              `auto_lock_enabled`, and nothing else"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -1496,17 +1593,187 @@ mod tests {
         );
     }
 
+    /// **The breach switch, driven at the pane.**
+    ///
+    /// The counter-assertions are the test: a row wired to `prompt_on_match`
+    /// or to `keep_backend_running` would still flip *a* setting on this
+    /// click, and an assertion that only read `check_breaches` after the fact
+    /// would be satisfied by a row wired to nothing at all if the field
+    /// happened to move. All three neighbours start `true` and are asserted
+    /// so before the click, which is what makes "unmoved" a claim that can
+    /// fail.
+    #[test]
+    fn clicking_the_breach_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(
+            !state.settings.check_breaches,
+            "the default: nothing about a password leaves the machine until this is clicked"
+        );
+        assert!(state.settings.keep_backend_running, "the neighbour starts true");
+        assert!(state.settings.prompt_on_match, "the neighbour starts true");
+        assert!(state.settings.auto_lock_enabled, "the neighbour starts true");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 4, "the General card no longer paints four pills");
+        // Third pill down: backend, prompt, breaches, auto-lock.
+        let pill = pills[2].center();
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.check_breaches,
+            "the breach toggle did not turn on -- the row is painted but its value is never              written back, so the pill is decoration"
+        );
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.check_breaches, "and back off again");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+    }
+
+    /// Where the row is, read off the paint rather than off the source order:
+    /// `draw_general` could call the rows in any order and lay them out in
+    /// another, and "directly under the prompt row" is a claim about the
+    /// screen.
+    #[test]
+    fn the_breach_row_sits_under_the_prompt_row() {
+        let painted = paint(Section::General);
+        let prompt = painted.ink_of(PROMPT_LABEL).rect;
+        let breach = painted.ink_of(BREACH_LABEL).rect;
+        let auto_lock = painted.ink_of(AUTO_LOCK_ENABLED_LABEL).rect;
+        // The instrument first: three labels at three distinct, non-empty
+        // heights, so `top()` is telling them apart and not reading one
+        // number three times.
+        assert!(prompt.height() > 0.0 && breach.height() > 0.0 && auto_lock.height() > 0.0);
+        assert!(
+            prompt.top() < breach.top(),
+            "the breach row is not under the prompt row: prompt at {prompt:?}, breach at              {breach:?}"
+        );
+        assert!(
+            breach.top() < auto_lock.top(),
+            "the breach row is not above the auto-lock row, so it is not DIRECTLY under the              prompt row"
+        );
+        // The positive control: the two tops differ by a real amount, so the
+        // comparison above is telling two rows apart rather than comparing one
+        // number with itself -- which is what it would be doing if `rect_of`
+        // ever returned the same galley twice.
+        assert!(
+            breach.top() - prompt.top() > 1.0,
+            "the prompt and breach labels are painted at the same height, so the ordering              assertion above cannot fail: prompt {:?}, breach {:?}",
+            prompt.top(),
+            breach.top()
+        );
+
+        // ... and the pills follow the labels, so it is the row that moved
+        // and not just its text.
+        let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 4);
+        assert!(pills[1].top() < pills[2].top(), "the breach pill is not below the prompt pill");
+        assert!(pills[2].top() < pills[3].top(), "the breach pill is not above the auto-lock pill");
+        assert!(
+            pills[2].top() > prompt.bottom(),
+            "the breach pill is level with the prompt row's text, so the pills and the labels              disagree about which row is which"
+        );
+        assert!(
+            pills[2].bottom() < auto_lock.top(),
+            "the breach pill overhangs the auto-lock row"
+        );
+    }
+
+    /// **The long copy, at every width this module paints at.**
+    ///
+    /// `BREACH_DESCRIPTION` is longer than any other row's, so it is the one
+    /// that can wrap out of the card or into the row below. Asserted on the
+    /// painted galley -- its placed glyphs, its line count and its colour --
+    /// rather than on the layout rect the row was allocated, because a row
+    /// allocated 570 points and painted 900 wide has a perfectly correct
+    /// rect.
+    #[test]
+    fn the_breach_description_stays_inside_the_pane() {
+        assert!(
+            BREACH_DESCRIPTION.len() > 200,
+            "the copy under test is not the long one, so this test is measuring nothing: {}",
+            BREACH_DESCRIPTION.len()
+        );
+        // Every width the module already paints or measures at: the body's
+        // own, and the modal card at both pane sizes `modal_card_rect`'s
+        // tests use.
+        let widths = [
+            BODY_SIZE.x,
+            modal_card_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 820.0))).width(),
+            modal_card_rect(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 500.0))).width(),
+        ];
+        let mut visited = 0;
+        for width in widths {
+            let pane = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, BODY_SIZE.y));
+            // The positive control, per width: `contains_rect` has to be able
+            // to say no here, or every assertion below is vacuous.
+            assert!(
+                !pane.contains_rect(Rect::from_min_size(
+                    Pos2::new(pane.max.x - 1.0, 0.0),
+                    Vec2::new(50.0, 10.0)
+                )),
+                "`contains_rect` cannot fail at width {width}"
+            );
+
+            let painted = paint_general_at(width);
+            let ink = painted.ink_of(BREACH_DESCRIPTION);
+            assert_eq!(
+                ink.rendered.split_whitespace().collect::<Vec<_>>(),
+                BREACH_DESCRIPTION.split_whitespace().collect::<Vec<_>>(),
+                "the description was elided to fit at width {width}; egui laid {:?}",
+                ink.rendered
+            );
+            assert!(
+                ink.color.a() > 0,
+                "the description is painted at alpha 0 at width {width}, so every geometry                  assertion here is reading a shape that is not on screen"
+            );
+            assert!(
+                ink.rows >= 2,
+                "the long copy laid out in {} line(s) at width {width} -- either it did not                  wrap, or the copy under test is not the long one",
+                ink.rows
+            );
+            assert!(
+                pane.contains_rect(ink.rect),
+                "the description is painted at {:?}, outside the {width}-wide pane {pane:?}",
+                ink.rect
+            );
+            for neighbour in [
+                PROMPT_LABEL,
+                PROMPT_DESCRIPTION,
+                BREACH_LABEL,
+                AUTO_LOCK_ENABLED_LABEL,
+                AUTO_LOCK_ENABLED_DESCRIPTION,
+            ] {
+                let other = painted.ink_of(neighbour).rect;
+                assert!(
+                    !ink.rect.intersects(other),
+                    "the description at {:?} overlaps {neighbour:?} at {other:?} at width                      {width}",
+                    ink.rect
+                );
+            }
+            visited += 1;
+        }
+        assert_eq!(visited, widths.len(), "a width was skipped");
+        assert!(visited >= 3, "fewer widths than the module tests");
+    }
+
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the THIRD pill down is the one wired to it -- `prompt_on_match`
-        // sits between it and the backend row.
+        // the FOURTH pill down is the one wired to it -- `prompt_on_match`
+        // and `check_breaches` sit between it and the backend row.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[3].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
@@ -2463,10 +2730,13 @@ mod modal_tests {
     fn exactly_one_place_in_this_program_draws_the_settings_form() {
         let source = include_str!("prefs_ui.rs");
         let body_calls = concat!("draw_prefs_", "body(");
-        // The definition, `run`'s call, the modal's call, and `tests`' harness.
+        // The definition, `run`'s call, the modal's call, and `tests`' two
+        // harnesses -- `frame`, and `paint_general_at`, which is the same
+        // frame on a pane of a chosen width. Both are tests; the production
+        // callers are still the two shells.
         assert_eq!(
             source.match_indices(body_calls).count(),
-            4,
+            5,
             "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
              was added, confirm it is a shell and not a second form"
         );
