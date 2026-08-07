@@ -339,6 +339,20 @@ pub struct Settings {
     /// fills from. If it did not, `false` would mean autofill was off
     /// entirely, which is the opposite of the fallback it is meant to be.
     pub prompt_on_match: bool,
+    /// Whether saved passwords are checked against known breaches.
+    ///
+    /// `false` (the default, and what an older `settings.json` without this
+    /// field parses as) means nothing about a password ever leaves the
+    /// machine. `true` opts in to the Have I Been Pwned range API: the
+    /// first five characters of a SHA-1 of the password are sent, and the
+    /// remaining thirty-five are matched locally, so the service never
+    /// learns the password or which of its hashes matched.
+    ///
+    /// **Off by default rather than on**, unlike every other preference
+    /// here. The others describe how this app behaves on this machine;
+    /// this one is a network call keyed on the user's passwords, and
+    /// making it on their behalf is not ours to decide.
+    pub check_breaches: bool,
     /// Whether the vault window locks itself at all.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -438,6 +452,7 @@ impl Default for Settings {
         Self {
             keep_backend_running: true,
             prompt_on_match: true,
+            check_breaches: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             vault_window: None,
@@ -558,6 +573,7 @@ impl Settings {
         let Settings {
             keep_backend_running,
             prompt_on_match,
+            check_breaches,
             auto_lock_enabled,
             auto_lock_minutes,
             vault_window: _,
@@ -571,6 +587,7 @@ impl Settings {
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
         on_disk.prompt_on_match = *prompt_on_match;
+        on_disk.check_breaches = *check_breaches;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.save(path)
@@ -746,6 +763,10 @@ mod tests {
             // agreed would round-trip identically through a writer that assigned
             // one of them from the other.
             prompt_on_match: true,
+            // Deliberately the OPPOSITE of this field's own default
+            // (`false`), so a writer that dropped it would round-trip to
+            // the default and be indistinguishable from one that kept it.
+            check_breaches: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: None,
@@ -914,6 +935,7 @@ mod tests {
         let written = Settings {
             keep_backend_running: true,
             prompt_on_match: false,
+            check_breaches: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             vault_window: None,
@@ -996,12 +1018,108 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Breach checking is the one preference here that is off unless it is
+    /// turned on, so this is a statement about the default and not a
+    /// restatement of `Default`: enabling a network call keyed on the user's
+    /// passwords is theirs to decide, not ours to assume.
+    #[test]
+    fn breach_checking_is_off_by_default() {
+        assert!(!Settings::default().check_breaches);
+        // ...and not merely absent from the in-memory default: a fresh install
+        // has no file at all, and that path must land on `false` too.
+        assert!(!Settings::load(&temp_path("breach-absent")).check_breaches);
+    }
+
+    /// The upgrade path, which is the only way this field can be wrong in the
+    /// direction that matters: a `settings.json` written before it existed
+    /// must not read as opted in.
+    #[test]
+    fn an_older_settings_file_without_the_key_loads_as_off() {
+        let path = temp_path("breach-older-file");
+        let older = br#"{"keep_backend_running": false, "prompt_on_match": true, "auto_lock_minutes": 9}"#;
+        // The premise, asserted rather than assumed: a fixture that happened to
+        // carry the key would make the rest of this test vacuous.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("check_breaches"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // And the premise that the file was read at all, rather than falling
+        // back to `Settings::default()` wholesale -- two fields that disagree
+        // with the defaults.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 9);
+        assert!(
+            !loaded.check_breaches,
+            "upgrading opted the user into sending hashes of their passwords over the network"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard `persisting_preferences_carries_the_prompt_setting_too`
+    /// documents, for `check_breaches`.** `persist_preferences` destructures
+    /// exhaustively, so a new field cannot go unnamed -- but binding it and
+    /// never assigning `on_disk.check_breaches` compiles, and that mutant has
+    /// survived the whole suite in this repo before.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`false`) would pass a one-way test.
+    #[test]
+    fn the_breach_toggle_survives_persist_preferences() {
+        let path = temp_path("prefs-breach");
+        Settings::default().save(&path).unwrap();
+        assert!(!Settings::load(&path).check_breaches, "the premise: it starts off");
+
+        Settings { check_breaches: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            loaded.check_breaches,
+            "the breach setting was dropped by persist_preferences, so turning it on lasts \
+             only until the app is restarted"
+        );
+        // The neighbours it is destructured beside are untouched, so this is
+        // not satisfied by a writer that clobbers the file with something else.
+        assert!(loaded.keep_backend_running);
+        assert!(loaded.prompt_on_match);
+        assert!(loaded.auto_lock_enabled);
+
+        // ...and back off again, so "always writes true" fails too.
+        Settings { check_breaches: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(!Settings::load(&path).check_breaches);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The field reaches the file under its own name, the way
+    /// `both_auto_lock_fields_round_trip_through_settings_json` pins theirs.
+    /// `settings_round_trip_through_disk` compares whole structs, which a
+    /// field renamed on both sides at once would still satisfy.
+    #[test]
+    fn the_breach_toggle_round_trips_through_settings_json_under_its_own_name() {
+        let path = temp_path("breach-round-trip");
+        let written = Settings { check_breaches: true, ..Settings::default() };
+        // The value written disagrees with the default, so a reader that
+        // ignored the file entirely would fail here.
+        assert!(written.check_breaches != Settings::default().check_breaches);
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("check_breaches"), "not in the file at all: {text}");
+        assert_eq!(Settings::load(&path), written);
+        assert!(Settings::load(&path).check_breaches);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_geometry_round_trips_through_disk_with_the_rest_of_the_file() {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             keep_backend_running: false,
             prompt_on_match: true,
+            check_breaches: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
