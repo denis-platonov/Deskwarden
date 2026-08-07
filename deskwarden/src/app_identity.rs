@@ -1916,4 +1916,216 @@ mod tests {
         );
         assert!(!name.trim().is_empty());
     }
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half no source guard in this file
+    // reads.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and so it cannot be found by a guard
+    /// looking for the real attributes.
+    const BELOW_CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// The literal the source guards in this file cut the file at. Split for
+    /// the same reason: an unsplit copy would BE the first occurrence, and
+    /// every production slice in this file would come back empty.
+    const BELOW_CUT_MARKER: &str = concat!("mod te", "sts {");
+
+    /// Column-0 lines that live below the cut but are the CONTENTS OF A
+    /// STRING LITERAL rather than source. Each is controlled below: it must
+    /// still occur in this file exactly once, so a stale entry here cannot
+    /// quietly widen the hole this test exists to close.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Deliberately exact rather than a `starts_with`:
+    /// `mod x { fn escape() {} }` on one line is not a module opener as far
+    /// as this walk is concerned, and must fail it.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// **Below the cut there is nothing but test-only modules, and the cut is
+    /// where every guard in this file believes it is.**
+    ///
+    /// This file guards a great deal of behaviour by slicing its own source at
+    /// the first `mod tests` module opener and counting needles in the half ABOVE that cut.
+    /// Two things can silently empty those guards, and neither of them changes
+    /// a single guard's own text:
+    ///
+    /// 1. **Anything appended below the test modules is invisible to all of
+    ///    them.** It is not counted, not forbidden and not read. Confirmed by
+    ///    mutation, in this crate, tonight: a second production item appended
+    ///    under the test module of `main.rs` -- a duplicate startup handoff,
+    ///    the exact defect a guard pins at "exactly one" -- left the whole
+    ///    binary suite green with zero warnings. The bottom of a file is a
+    ///    natural place to add a helper, and until this test existed nothing
+    ///    stopped it.
+    /// 2. **The cut can move UPWARDS.** The slice is a `find` of a literal, so
+    ///    that literal appearing in a comment or a string above the real test
+    ///    modules truncates the production half and blinds every guard to
+    ///    everything after it. This file already contains that literal in prose
+    ///    elsewhere; the guards survive it today only because the marker they
+    ///    match is spelled to avoid it, which is an accident of spelling and
+    ///    not a check.
+    ///
+    /// So the whole region from the cut to EOF is walked and required to be a
+    /// sequence of `#[cfg(test)]`-gated, column-0 module blocks and nothing
+    /// else, and the cut itself is pinned against a production anchor that must
+    /// still be found (a positive control) immediately above it.
+    ///
+    /// This is a source-analysis test, which is the class that has failed in
+    /// this codebase repeatedly, so every part of it carries its own control:
+    /// the anchor's occurrence count, the module count, the close count, the
+    /// number of lines actually visited, and the string-literal exceptions.
+    /// A walk that visited nothing would fail on all five.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_guards_cut() {
+        let source = include_str!("app_identity.rs");
+
+        // 1. The cut lands where the guards think it does.
+        assert_eq!(
+            source.matches(BELOW_CUT_MARKER).count(),
+            1,
+            "{BELOW_CUT_MARKER:?} occurs more than once in this file. The guards here `find` \
+             the FIRST one, so a second copy in a comment or a string above the real test \
+             module moves the cut upwards and empties every one of them"
+        );
+        let cut = source.find(BELOW_CUT_MARKER).unwrap_or_else(|| {
+            panic!(
+                "{BELOW_CUT_MARKER:?} is not in this file at all -- every source guard here \
+                 slices at it, and a slice that cannot be made is a guard that reads nothing"
+            )
+        });
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the marker was matched inside a \
+             comment or a string literal rather than at a real declaration; that truncates \
+             the production half and blinds every source guard in this file to everything \
+             below the truncation point"
+        );
+        assert!(
+            source[..cut].trim_end().ends_with(BELOW_CUT_GATE),
+            "the module the cut lands on is not preceded by {BELOW_CUT_GATE:?}, so the region \
+             below the cut is not test-only to begin with"
+        );
+
+        // 2. Positive control on where the cut is: the production half must
+        //    still reach the LAST production item in the file. If the marker
+        //    were matched earlier than the real test modules, this anchor
+        //    would fall below the cut instead of just above it.
+        const LAST_PRODUCTION_ITEM: &str = concat!("fn relocate_store_path", "_with(");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: {LAST_PRODUCTION_ITEM:?} is not in this file exactly once, so it no \
+             longer pins anything -- repoint it at the last production item above the test \
+             modules"
+        );
+        let anchor = source.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, which means \
+             the cut moved up and the production half every guard in this file reads is \
+             truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk. `lines()` strips the `\r` of this file's CRLF endings,
+        //    so every comparison below is against the line's real text.
+        let mut depth = 0usize;
+        let mut gated = true;
+        let mut modules = 0usize;
+        let mut closes = 0usize;
+        let mut visited = 0usize;
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments,
+                // the gate and a module opener -- at any indentation, because
+                // an indented `fn` at file scope is still a top-level item.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == BELOW_CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. Every source guard in this file \
+                     slices at {BELOW_CUT_MARKER:?} and reads only what is above it, so an item \
+                     down here is read by none of them: it can duplicate a call site pinned at \
+                     exactly one, or reintroduce a construct banned by name, and the suite stays \
+                     green. Move it above the test modules."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not {BELOW_CUT_GATE:?}-gated, so it \
+                     ships -- and it ships in the half of the file no source guard here reads"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+
+        // 4. The walk is not vacuous, and it finished.
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a test \
+             module's worth -- the slice is empty or nearly so and this test proves nothing"
+        );
+        assert_eq!(
+            depth, 0,
+            "a test module below the cut is never closed by a column-0 `}}`, so the walk ran \
+             off the end of the file inside it and stopped inspecting top-level lines"
+        );
+        assert_eq!(
+            modules, 1,
+            "the number of top-level test modules below the cut changed. That is fine -- but \
+             this count is the control that proves the walk really visited them, so update it \
+             deliberately rather than loosening it"
+        );
+        assert_eq!(
+            closes, modules,
+            "control: every module the walk opened must also have been closed at column 0"
+        );
+        for known in BELOW_CUT_STRING_LINES {
+            assert_eq!(
+                source.matches(known).count(),
+                1,
+                "control: the string-literal exception {known:?} is not in this file exactly \
+                 once, so it is stale and is widening this check for nothing"
+            );
+        }
+    }
 }
