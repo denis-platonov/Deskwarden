@@ -1876,4 +1876,257 @@ mod clamp_window_geometry_tests {
         assert_eq!(placement.height, 600);
         assert_inside(placement, PRIMARY);
     }
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half no source guard here reads.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one. It is ALSO the literal this file's source
+    /// guard cuts at (`no_test_in_this_module_touches_the_real_settings_file`
+    /// splits the file on it), so it is the marker and the gate at once.
+    const BELOW_CUT_MARKER: &str = concat!("#[cfg(", "test)]");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Each is controlled below: it must still occur in
+    /// this file exactly once, so a stale entry cannot quietly widen the hole
+    /// this test exists to close.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Deliberately exact rather than a `starts_with`:
+    /// a whole module written on one line is not a module opener as far as
+    /// this walk is concerned, and must fail it.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk of everything from the cut to EOF, over whatever
+    /// text it is handed. Returns `(visited, modules, closes, depth)` so the
+    /// caller can control it for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here is against the line's real
+    /// text on a CRLF working tree and on an LF one alike. `overlay_ui.rs`
+    /// shipped the other kind -- a `contains` on needles that began with a
+    /// carriage return -- and the committed blob in this repository is LF, so
+    /// on any checkout without this machine's `core.autocrlf=true` it matched
+    /// nothing, ever. The caller runs this over a normalised copy as well and
+    /// requires the same answer.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = source
+            .find(BELOW_CUT_MARKER)
+            .expect("the cut marker is checked by the caller");
+        let mut depth = 0usize;
+        // Unlike the files whose marker is the module opener, the cut here
+        // lands ON the gate, so the gate for the first module is inside the
+        // region walked and must be seen rather than assumed.
+        let mut gated = false;
+        let mut modules = 0usize;
+        let mut closes = 0usize;
+        let mut visited = 0usize;
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments, the
+                // gate and a module opener -- at ANY indentation, because an
+                // indented `fn` at file scope is still a top-level item and a
+                // column-0-only filter would miss it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == BELOW_CUT_MARKER {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. The source guard in this file \
+                     slices at {BELOW_CUT_MARKER:?}, and `login_ui.rs` guards this file as \
+                     source too, so an item down here can carry a writer call or a \
+                     real-path resolver that neither of them is looking at. Move it above \
+                     the test modules."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not {BELOW_CUT_MARKER:?}-gated, so it \
+                     SHIPS -- and it ships in the half of the file the guard here cannot read"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    /// **Below the cut there is nothing but test-only modules, and the cut is
+    /// where the guard in this file believes it is.**
+    ///
+    /// The same walk `main.rs`, `app_identity.rs`, `app_window.rs`,
+    /// `login_ui.rs`, `vault_window/mod.rs` and `overlay_ui.rs` carry. This
+    /// file had the cut and no walk at all: its one source guard
+    /// (`no_test_in_this_module_touches_the_real_settings_file`) splits on the
+    /// first test gate and counts needles in the TAIL, and nothing anywhere
+    /// said what may live down there.
+    ///
+    /// Two things can empty a cut-based guard silently, and neither changes
+    /// the guard's own text:
+    ///
+    /// 1. **Anything below the test modules is read by nothing.** A production
+    ///    item appended at EOF here is invisible to every source guard that
+    ///    slices this file -- and it is not only this file's own: `login_ui.rs`
+    ///    reads `settings.rs` as source too.
+    /// 2. **The cut can move UP.** The guard takes the FIRST occurrence of the
+    ///    marker, so the marker in a comment or a string above the real test
+    ///    modules moves the boundary and changes which half every needle is
+    ///    counted in -- silently.
+    ///
+    /// The walk closes the first; the line-start and anchor controls close the
+    /// second.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_guards_cut() {
+        let source = include_str!("settings.rs");
+
+        // 1. The cut lands at the start of a line, so the marker was matched
+        //    at a real attribute and not inside a comment or a string.
+        let cut = source.find(BELOW_CUT_MARKER).unwrap_or_else(|| {
+            panic!(
+                "{BELOW_CUT_MARKER:?} is not in this file at all -- the source guard here \
+                 slices at it, and a slice that cannot be made is a guard that reads nothing"
+            )
+        });
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the marker was matched inside a \
+             comment or a string literal rather than at a real attribute; that moves the \
+             boundary the guard in this file counts needles either side of"
+        );
+
+        // 2. Positive control on WHERE the cut is: the last production item in
+        //    the file must still be above it, and close to it. Were the marker
+        //    matched earlier, this anchor would fall below the cut instead.
+        const LAST_PRODUCTION_ITEM: &str = concat!(
+            "auto_lock_policy(self.auto_lock_enabled, ",
+            "self.auto_lock_minutes)"
+        );
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: {LAST_PRODUCTION_ITEM:?} is not in this file exactly once, so it no \
+             longer pins anything -- repoint it at the last production item above the test \
+             modules"
+        );
+        let anchor = source
+            .find(LAST_PRODUCTION_ITEM)
+            .expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, which means \
+             the cut moved up and the halves the guard in this file counts in are not the \
+             halves it names"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, run over an LF copy of this file and a CRLF copy of the
+        //    same text, which must agree. Built BOTH ways rather than compared
+        //    against the bytes on disk on purpose: this repository stores LF
+        //    blobs and only `core.autocrlf=true` makes the working tree CRLF,
+        //    so a control that asserted "this file is CRLF" would itself be a
+        //    check that fires on one machine and fails on Linux CI -- which is
+        //    the defect being closed here, wearing the other hat.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        let as_lf = walk_below_the_cut(&lf);
+        let as_crlf = walk_below_the_cut(&crlf);
+        assert_eq!(
+            as_lf, as_crlf,
+            "the walk gives a different answer on an LF copy of this file than on a CRLF \
+             one, so something in it is sensitive to line endings. That is exactly how the \
+             check this replaced managed to be vacuous everywhere but on a checkout with \
+             `core.autocrlf=true`: its needles began with a carriage return and the \
+             committed blob is LF"
+        );
+        // And the file as it really is on disk, whichever of the two that is.
+        let as_on_disk = walk_below_the_cut(source);
+        assert!(
+            as_on_disk == as_lf || as_on_disk == as_crlf,
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = as_on_disk;
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a \
+             test module's worth -- the slice is empty or nearly so and this test proves \
+             nothing"
+        );
+        assert_eq!(
+            depth, 0,
+            "a test module below the cut is never closed by a column-0 `}}`, so the walk ran \
+             off the end of the file inside it and stopped inspecting top-level lines"
+        );
+        assert_eq!(
+            modules, 2,
+            "the number of top-level test modules below the cut changed. That is fine -- but \
+             this count is the control that proves the walk really visited them, so update it \
+             deliberately rather than loosening it"
+        );
+        assert_eq!(
+            closes, modules,
+            "control: every module the walk opened must also have been closed at column 0"
+        );
+        // Every test gate in the file is one of the gates the walk consumed.
+        // A gate the walk never saw is one at an indentation it skips, and
+        // that is a shape this walk does not reason about.
+        assert_eq!(
+            source.matches(BELOW_CUT_MARKER).count(),
+            modules,
+            "this file has {} test gates but the walk found {modules} gated top-level \
+             modules below the cut; one of them is somewhere the walk does not inspect",
+            source.matches(BELOW_CUT_MARKER).count()
+        );
+        for known in BELOW_CUT_STRING_LINES {
+            assert_eq!(
+                source.matches(known).count(),
+                1,
+                "control: the string-literal exception {known:?} is not in this file exactly \
+                 once, so it is stale and is widening this check for nothing"
+            );
+        }
+    }
 }

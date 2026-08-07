@@ -341,10 +341,24 @@ fn keyboard_action(
 ///
 /// The last hole a private field alone leaves is a constructor that takes the
 /// bool anyway — `EnterPressed::new(EscapePressed::read(&ctx).pressed())`.
-/// So **there is no such constructor, not even a `cfg(test)` one.** The only
-/// way to make an `EnterPressed`, in production or in a test, is
+/// So **there is no such constructor, not even a `cfg(test)` one.** In safe
+/// Rust the only way to make an `EnterPressed`, in production or in a test, is
 /// [`EnterPressed::read`], which reads `egui::Key::Enter` and nothing else.
 /// Reading one back out is unrestricted; it is *making* one that is closed.
+///
+/// **The limit of that, said out loud rather than left implied.** An earlier
+/// draft of this note claimed `read` was the only way to obtain either type
+/// *anywhere in the crate*, and that is more than is true. A
+/// `std::mem::transmute::<bool, EnterPressed>` written outside this module
+/// needs no field access, calls no constructor, and contains none of the
+/// strings the guard below counts. Closing it would take a crate-wide
+/// `forbid(unsafe_code)`, which this crate cannot have -- 82 `unsafe` sites,
+/// and they are how it talks to Win32 at all. So the guarantee is the
+/// **safe-Rust** one, and
+/// [`the_key_newtypes_cannot_be_built_from_a_bare_bool`] pins the safe-Rust
+/// surface exactly. That is the shape the bug had: the swap this pair exists
+/// to stop was a one-token slip in safe code. A `transmute` to either type
+/// would be a deliberate bypass and would read as one in review.
 ///
 /// What that leaves is `read` itself asking about the wrong key — one line,
 /// inside a function that takes a bare `egui::Context`, which a test **can**
@@ -986,9 +1000,25 @@ mod geometry_tests {
     /// [`painted`], for a card drawn with `fixture`'s strings rather than the
     /// short ones.
     fn painted_as(fixture: Fixture, choices: &[FillChoice], height: f32) -> Vec<Ink> {
+        painted_as_user(fixture, Some(fixture.user), choices, height)
+    }
+
+    /// [`painted_as`], with the username spelled out rather than assumed to be
+    /// present.
+    ///
+    /// `OverlayApp::ui` passes `self.username.as_deref()`, so `None` is a value
+    /// production ships, and on that arm the top line paints the ITEM NAME.
+    /// Every painting helper here hard-coded `Some(..)`, which is why the
+    /// fallback arm went unmeasured.
+    fn painted_as_user(
+        fixture: Fixture,
+        user: Option<&str>,
+        choices: &[FillChoice],
+        height: f32,
+    ) -> Vec<Ink> {
         let ctx = styled_ctx();
         let output = ctx.run_ui(sized(height), |ui| {
-            draw_overlay_card_rows(ui, fixture.app, fixture.item, Some(fixture.user), choices);
+            draw_overlay_card_rows(ui, fixture.app, fixture.item, user, choices);
         });
         let mut ink = Vec::new();
         for clipped in &output.shapes {
@@ -2360,33 +2390,45 @@ mod geometry_tests {
         const NEEDED: f32 = 154.0;
 
         let mut checked = 0;
-        for fixture in FIXTURES {
+        // BOTH arms of the branch, because both ship. `OverlayApp::ui` passes
+        // `self.username.as_deref()`, so `None` is a real value on this path,
+        // and `row_text` then puts the ITEM NAME on the top line -- just as
+        // user-controlled, just as unbounded, and the arm this test's own
+        // commit message names. Every fixture used to go in as `Some(..)`, so
+        // the fallback was never driven at all.
+        for (fixture, user) in FIXTURES
+            .iter()
+            .flat_map(|f| [(f, Some(f.user)), (f, None)])
+        {
             // The precondition, and it is the half that makes the rest mean
             // anything: on this path the top line really is the user's own
             // string. A row that had stopped painting it would pass the
             // heights below while proving nothing.
-            let (primary, _) = row_text(fixture.app, fixture.item, Some(fixture.user));
+            let expected = user.unwrap_or(fixture.item);
+            let (primary, _) = row_text(fixture.app, fixture.item, user);
             assert_eq!(
-                primary, fixture.user,
-                "the no-choices row's primary line is no longer the username, so this test \
-                 is no longer about a user-controlled string"
+                primary, expected,
+                "the no-choices row's primary line is no longer the user-controlled \
+                 string it is meant to be (user={user:?}), so this test is no longer \
+                 about one"
             );
 
             // How tall the card lays out, unconstrained.
             let ctx = styled_ctx();
             let mut needed = f32::NAN;
             let _ = ctx.run_ui(sized(ROOMY), |ui| {
-                draw_overlay_card(ui, fixture.app, fixture.item, Some(fixture.user));
+                draw_overlay_card(ui, fixture.app, fixture.item, user);
                 needed = ui.min_rect().bottom();
             });
             assert!(
                 needed.is_finite() && needed > 0.0,
-                "the card allocated no space at all for {:?}",
+                "the card allocated no space at all for {:?} (user={user:?})",
                 fixture.name
             );
             assert_eq!(
                 needed, NEEDED,
-                "the no-choices card drawn with the {:?} fixture needs {needed}pt, not \
+                "the no-choices card drawn with the {:?} fixture (user={user:?}) needs \
+                 {needed}pt, not \
                  {NEEDED}pt. Its TOP line is content-sized again: the username grew the \
                  row, and the window is a fixed {}pt with no scrollbar, no resize border \
                  and no title bar, so the difference is gone for good.",
@@ -2399,14 +2441,14 @@ mod geometry_tests {
             // first: a row pushed entirely below the screen rect is culled, and
             // a culled row has no rect to be outside anything.
             let height = requested_inner_size(1).y;
-            let ink = painted_as(fixture, &[], height);
+            let ink = painted_as_user(*fixture, user, &[], height);
             let tiles = row_tiles(&ink);
             assert_eq!(
                 tiles.len(),
                 1,
-                "the no-choices card ({:?}) in the {height}pt window production asks for \
-                 painted {} row tiles, not one -- the row was culled for being off the \
-                 window entirely",
+                "the no-choices card ({:?}, user={user:?}) in the {height}pt window \
+                 production asks for painted {} row tiles, not one -- the row was culled \
+                 for being off the window entirely",
                 fixture.name,
                 tiles.len()
             );
@@ -2425,15 +2467,21 @@ mod geometry_tests {
                 assert_eq!(
                     hits.len(),
                     1,
-                    "expected exactly one painted run reading {text:?} for {:?}; the footer \
-                     is off the bottom of a window with no scrollbar",
+                    "expected exactly one painted run reading {text:?} for {:?} \
+                     (user={user:?}); the footer is off the bottom of a window with no \
+                     scrollbar",
                     fixture.name
                 );
                 assert!(fits(hits[0].rect, window(height)));
             }
             checked += 1;
         }
-        assert_eq!(checked, FIXTURES.len());
+        assert_eq!(
+            checked,
+            FIXTURES.len() * 2,
+            "control: the loop above did not run BOTH the `Some` and the `None` arm of \
+             every fixture, so one half of the branch is unmeasured again"
+        );
 
         // THE CONTROL, and it is the load-bearing half -- the one the sibling
         // test has for its secondary line and nothing had for the primary.
@@ -2446,8 +2494,15 @@ mod geometry_tests {
         let width = text_column_width();
         let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
         let mut wrapped = 0;
-        for fixture in FIXTURES.iter().filter(|f| f.name != SHORT.name) {
-            let (primary, _) = row_text(fixture.app, fixture.item, Some(fixture.user));
+        // Both arms here too: a control that only ever measured the usernames
+        // would say nothing about the strings the `None` arm actually paints,
+        // which are the item names.
+        for (fixture, user) in FIXTURES
+            .iter()
+            .filter(|f| f.name != SHORT.name)
+            .flat_map(|f| [(f, Some(f.user)), (f, None)])
+        {
+            let (primary, _) = row_text(fixture.app, fixture.item, user);
             let rows_taken = ctx.fonts_mut(|fonts| {
                 fonts
                     .layout(primary.clone(), font.clone(), theme::INK, width)
@@ -2456,26 +2511,30 @@ mod geometry_tests {
             });
             assert!(
                 rows_taken > 1,
-                "the {:?} fixture's PRIMARY line ({primary:?}) fits on one line at {width}pt \
-                 even when wrapped, so it is not an adversarial fixture for the top label and \
-                 the assertions above prove nothing about it",
+                "the {:?} fixture's PRIMARY line ({primary:?}, user={user:?}) fits on one \
+                 line at {width}pt even when wrapped, so it is not an adversarial fixture \
+                 for the top label and the assertions above prove nothing about it",
                 fixture.name
             );
             wrapped += 1;
         }
-        assert_eq!(wrapped, FIXTURES.len() - 1);
+        assert_eq!(wrapped, (FIXTURES.len() - 1) * 2);
 
         // ... and the short fixture is the other side of the control: its
         // username does NOT wrap, which is exactly why measuring off it alone
         // left the primary label's bound untested.
-        let (short_primary, _) = row_text(SHORT.app, SHORT.item, Some(SHORT.user));
-        assert_eq!(
-            ctx.fonts_mut(|fonts| fonts
-                .layout(short_primary, font, theme::INK, width)
-                .rows
-                .len()),
-            1
-        );
+        for user in [Some(SHORT.user), None] {
+            let (short_primary, _) = row_text(SHORT.app, SHORT.item, user);
+            assert_eq!(
+                ctx.fonts_mut(|fonts| fonts
+                    .layout(short_primary, font.clone(), theme::INK, width)
+                    .rows
+                    .len()),
+                1,
+                "the short fixture's primary line (user={user:?}) wraps after all, so it \
+                 is no longer the other side of the control"
+            );
+        }
     }
 
     /// **The key newtypes cannot be built out of a bare `bool`, by anyone.**
@@ -2584,13 +2643,18 @@ mod geometry_tests {
     /// This module's **production code**: everything above the first test
     /// module, comment-only lines dropped.
     ///
-    /// The cut is `mod tests {` rather than `#[cfg(test)]`, because `mod keys`
-    /// sits above it and a `cfg(test)` attribute added inside `keys` would
-    /// otherwise move the cut and hide the very thing being pinned.
+    /// The cut is the `mod tests` opener rather than `#[cfg(test)]`, because
+    /// `mod keys` sits above it and a `cfg(test)` attribute added inside `keys`
+    /// would otherwise move the cut and hide the very thing being pinned.
+    ///
+    /// The literal is [`BELOW_CUT_MARKER`], `concat!`-split so that this file
+    /// contains it exactly ONCE -- the occurrence the cut lands on -- which is
+    /// what lets `nothing_but_gated_test_modules_lives_below_the_guards_cut`
+    /// assert that the cut cannot move up.
     fn this_module_production_code() -> String {
         let source = this_module_source();
         let end = source
-            .find("mod tests {")
+            .find(BELOW_CUT_MARKER)
             .expect("overlay_ui.rs has a `mod tests`");
         // Control: the cut kept the production items and dropped the tests.
         let production = non_comment(&source[..end]);
@@ -2602,14 +2666,23 @@ mod geometry_tests {
             !production.contains("fn row_leads_with_the_username_when_known"),
             "the production slice still contains test code"
         );
-        // There is no production item below the test modules; if one is ever
-        // added, this guard would go blind to it, so say so out loud.
-        let tail = &source[end..];
-        assert!(
-            !tail.contains("\r\npub fn ") && !tail.contains("\r\npub const "),
-            "a production item was added BELOW the test modules, where every source guard \
-             in this file is blind to it"
-        );
+        // What is below the cut -- the half this slice throws away, and so the
+        // half every source guard in this file is blind to -- is walked in full
+        // by `nothing_but_gated_test_modules_lives_below_the_guards_cut`, the
+        // same walk the four sibling files were given.
+        //
+        // It used to be checked here instead, by a two-item whitelist of `pub
+        // fn` and `pub const`, each needle prefixed with a carriage return and
+        // a newline. That was wrong twice over. A bare `fn`, a `pub(crate) fn`,
+        // a `pub struct`, `pub enum`, `pub trait`, `impl`, `static`, `mod`,
+        // `macro_rules!` or `pub use` all walked straight past it -- measured,
+        // green, no warnings. And the committed blob in this repository is LF:
+        // this working tree is CRLF only because this machine sets
+        // `core.autocrlf=true`, and there is no `.gitattributes`, so on Linux
+        // CI or any clone with `core.autocrlf=false` neither needle could ever
+        // match and the check was unconditionally vacuous. The walk uses
+        // `lines()`, and is asserted to give the identical answer on a
+        // normalised copy of this file.
         production
     }
 
@@ -2623,5 +2696,269 @@ mod geometry_tests {
         let rest = &production[start..];
         let end = rest.find("\n}").expect("`mod keys` is closed at column zero");
         rest[..end].to_string()
+    }
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half no source guard here reads.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a guard looking for
+    /// the real attributes.
+    const BELOW_CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// The literal every source guard in this file cuts the file at. Split for
+    /// the same reason, and for one more: unsplit it would be a SECOND
+    /// occurrence in this file, and the uniqueness control below could not be
+    /// written at all. It WAS unsplit until this test existed, and the cut
+    /// landed on the right occurrence only because that one comes first.
+    const BELOW_CUT_MARKER: &str = concat!("mod te", "sts {");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Each is controlled below: it must still occur in
+    /// this file exactly once, so a stale entry cannot quietly widen the hole
+    /// this test exists to close.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Deliberately exact rather than a `starts_with`:
+    /// a whole module written on one line is not a module opener as far as
+    /// this walk is concerned, and must fail it.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk of everything from the cut to EOF, over whatever
+    /// text it is handed. Returns `(visited, modules, closes, depth)` so the
+    /// caller can control it for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here is against the line's real
+    /// text on a CRLF working tree and on an LF one alike. What this replaced
+    /// was a `contains` on needles that began with one, and the committed blob
+    /// in this repository is LF -- so on any checkout without this machine's
+    /// `core.autocrlf=true` it matched nothing, ever. The caller runs this
+    /// over a normalised copy as well and requires the same answer.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = source
+            .find(BELOW_CUT_MARKER)
+            .expect("the cut marker is checked by the caller");
+        let mut depth = 0usize;
+        // The module the cut lands ON is gated by the attribute immediately
+        // above the cut, which is outside the region walked here. The caller
+        // asserts that attribute is there; this `true` is that assertion's
+        // other half.
+        let mut gated = true;
+        let mut modules = 0usize;
+        let mut closes = 0usize;
+        let mut visited = 0usize;
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments, the
+                // gate and a module opener -- at ANY indentation, because an
+                // indented `fn` at file scope is still a top-level item and a
+                // column-0-only filter would miss it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == BELOW_CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. Every source guard in this file \
+                     slices at {BELOW_CUT_MARKER:?} and reads only what is ABOVE it, so an item \
+                     down here is read by none of them: it can duplicate a call site pinned at \
+                     exactly one, reintroduce a construct banned by name, or add a second \
+                     positional construction of a key newtype that the whole-file count would \
+                     never see -- and the suite stays green. Move it above the test modules."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not {BELOW_CUT_GATE:?}-gated, so it \
+                     SHIPS -- and it ships in the half of the file no source guard here reads"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    /// **Below the cut there is nothing but test-only modules, and the cut is
+    /// where every guard in this file believes it is.**
+    ///
+    /// The walk the four sibling files were given, and the reason it is here
+    /// too: this file re-introduced the weak version of it one commit later.
+    /// [`this_module_production_code`] carried a two-item whitelist -- `pub
+    /// fn` and `pub const`, nothing else -- in place of a walk. Measured on
+    /// the commit it shipped in: `pub struct BelowTheCut(pub bool);` appended
+    /// at EOF gives 1770 lib + 172 bin, 0 failed, 0 warnings. So do a bare
+    /// `fn`, a `pub(crate) fn`, a `pub enum`, a `pub trait`, an `impl`, a
+    /// `static`, a `mod`, a `macro_rules!` and a `pub use`. It also had no
+    /// non-vacuity control of any kind: an empty tail passed it. And its two
+    /// needles both began with a carriage return, so on the LF blob this
+    /// repository actually stores it could not fire at all.
+    ///
+    /// Two things can silently empty every guard in this file, and neither
+    /// changes a single guard's own text:
+    ///
+    /// 1. **Anything appended below the test modules is invisible to all of
+    ///    them.** They read the half above the cut and nothing else.
+    /// 2. **The cut can move UP.** These helpers take the FIRST occurrence of
+    ///    the marker, so the marker appearing in a comment or a string above
+    ///    the real test modules truncates the production half and vacates
+    ///    every guard downstream of the truncation -- silently, because the
+    ///    guards whose needles still fall inside go on passing.
+    ///
+    /// The walk closes the first; the uniqueness and anchor controls close the
+    /// second.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_guards_cut() {
+        let source = this_module_source();
+        let source = source.as_str();
+
+        // 1. The cut lands where the guards think it does, and there is only
+        //    one place it could land.
+        assert_eq!(
+            source.matches(BELOW_CUT_MARKER).count(),
+            1,
+            "{BELOW_CUT_MARKER:?} occurs {} times in this file. Every guard here takes the \
+             FIRST one, so a second occurrence -- in a comment, in a string, in a doc \
+             example -- is a cut that can move up and truncate the production half all of \
+             them read",
+            source.matches(BELOW_CUT_MARKER).count()
+        );
+        let cut = source
+            .find(BELOW_CUT_MARKER)
+            .expect("counted exactly one just above");
+        assert!(
+            cut > 0 && source.as_bytes()[cut - 1] == b'\n',
+            "the cut landed in the MIDDLE of a line, so the marker was matched inside a \
+             comment or a string literal rather than at a real module opener"
+        );
+        assert!(
+            source[..cut].trim_end().ends_with(BELOW_CUT_GATE),
+            "the module the cut lands on is not preceded by {BELOW_CUT_GATE:?}, so the region \
+             below the cut opens with a module that SHIPS"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half must
+        //    still reach the last production item in the file. Were the marker
+        //    matched above the real test modules, this anchor would fall below
+        //    the cut instead of just above it.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("let response = row.response.", "interact(Sense::click());");
+        assert_eq!(
+            source.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: {LAST_PRODUCTION_ITEM:?} is not in this file exactly once, so it no \
+             longer pins anything -- repoint it at the last production item above the test \
+             modules"
+        );
+        let anchor = source
+            .find(LAST_PRODUCTION_ITEM)
+            .expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, which means \
+             the cut moved up and the production half every guard in this file reads is \
+             truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, run over an LF copy of this file and a CRLF copy of the
+        //    same text, which must agree. Built BOTH ways rather than compared
+        //    against the bytes on disk on purpose: this repository stores LF
+        //    blobs and only `core.autocrlf=true` makes the working tree CRLF,
+        //    so a control that asserted "this file is CRLF" would itself be a
+        //    check that fires on one machine and fails on Linux CI -- which is
+        //    the defect being closed here, wearing the other hat.
+        let lf = source.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        let as_lf = walk_below_the_cut(&lf);
+        let as_crlf = walk_below_the_cut(&crlf);
+        assert_eq!(
+            as_lf, as_crlf,
+            "the walk gives a different answer on an LF copy of this file than on a CRLF \
+             one, so something in it is sensitive to line endings. That is exactly how the \
+             check this replaced managed to be vacuous everywhere but on a checkout with \
+             `core.autocrlf=true`: its needles began with a carriage return and the \
+             committed blob is LF"
+        );
+        // And the file as it really is on disk, whichever of the two that is.
+        let as_on_disk = walk_below_the_cut(source);
+        assert!(
+            as_on_disk == as_lf || as_on_disk == as_crlf,
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = as_on_disk;
+        assert!(
+            visited > 100,
+            "control: the walk visited only {visited} lines below the cut, which is not a \
+             test module's worth -- the slice is empty or nearly so and this test proves \
+             nothing"
+        );
+        assert_eq!(
+            depth, 0,
+            "a test module below the cut is never closed by a column-0 `}}`, so the walk ran \
+             off the end of the file inside it and stopped inspecting top-level lines"
+        );
+        assert_eq!(
+            modules, 2,
+            "the number of top-level test modules below the cut changed. That is fine -- but \
+             this count is the control that proves the walk really visited them, so update it \
+             deliberately rather than loosening it"
+        );
+        assert_eq!(
+            closes, modules,
+            "control: every module the walk opened must also have been closed at column 0"
+        );
+        for known in BELOW_CUT_STRING_LINES {
+            assert_eq!(
+                source.matches(known).count(),
+                1,
+                "control: the string-literal exception {known:?} is not in this file exactly \
+                 once, so it is stale and is widening this check for nothing"
+            );
+        }
     }
 }
