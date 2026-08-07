@@ -2827,6 +2827,57 @@ fn drain_requests_queued_behind_a_window(pending: &mut VecDeque<MenuEvent>, sati
 /// reported back through `backend_op_tx`/`backend_op_rx` and applied by
 /// `main`'s own loop, same non-blocking shape as the update-download flow.
 #[allow(clippy::too_many_arguments)]
+/// What [`open_vault_window`]'s loop must do once a vault session has ended.
+///
+/// **The whole point is that this is a decision, not a chain of `if`s each
+/// carrying its own `continue`.** That shape is what shipped the defect this
+/// enum exists to make impossible: the settings write-back had inherited a
+/// `continue` from the days when the gear closed the window, so *once the gear
+/// had been clicked* -- and [`VaultWindowResult::edited_settings`] stays `Some`
+/// for the rest of that window's life -- every branch below it became
+/// unreachable. A Lock did not lock. A 401's `needs_reauth` was discarded. An
+/// account switch was dropped. A plain close reopened the window instead of
+/// returning.
+///
+/// So the answer is computed **once**, from the whole result, before anything
+/// acts on it, and the settings write-back is not one of the answers: it is a
+/// side-effect applied on the way past, whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultFollowUp {
+    /// The titlebar's account menu asked to switch, add or remove. The session
+    /// was never lost; the loop settles onto the target and reopens the window.
+    ///
+    /// **Ranked above [`Resettle`](Self::Resettle)** because that is the order
+    /// the branches have always been written in, and the order matters: the
+    /// lock recovery re-authenticates against the account this process is
+    /// *already* on, so running it for a switch would prompt for the master
+    /// password of the account the user asked to leave and then leave them on
+    /// it. A window that reported both took the account action.
+    AccountAction,
+    /// `locked` or `needs_reauth`: the session is gone and the full recovery
+    /// runs (clear the cache, stop `bw serve`, re-authenticate, restart,
+    /// repopulate). The two are one answer because they have always run the
+    /// same recovery.
+    Resettle,
+    /// Nothing is left to do; the window closed for good and the loop returns.
+    /// **A visit to the gear alone lands here** -- editing preferences is not a
+    /// reason a window closed.
+    Done,
+}
+
+/// The decision above, made from a whole [`VaultWindowResult`] and nothing
+/// else, so that "settings were edited AND the user then locked" is a case a
+/// unit test can state.
+fn vault_follow_up(result: &vault_window::VaultWindowResult) -> VaultFollowUp {
+    if result.switch_to.is_some() || result.add_account || result.remove_account {
+        VaultFollowUp::AccountAction
+    } else if result.locked || result.needs_reauth {
+        VaultFollowUp::Resettle
+    } else {
+        VaultFollowUp::Done
+    }
+}
+
 fn open_vault_window(
     cache: &Arc<VaultCache>,
     fill_stats: &deskwarden::fill_stats::FillStats,
@@ -3015,6 +3066,11 @@ fn open_vault_window(
         }
     };
 
+    // **What this window's outcome means, decided ONCE and before anything
+    // acts on it.** See [`VaultFollowUp`] for why this is a value rather than
+    // a chain of conditions spread over the branches below.
+    let follow_up = vault_follow_up(&result);
+
     // **Refill the cache with what this window actually used, so the *next*
     // open pays no `bw status` spawn.** This is the same guarantee the
     // pre-fetch-or-block version made one line above the window; it moved
@@ -3075,6 +3131,30 @@ fn open_vault_window(
     // alongside whatever actually ended the session -- an ordinary close, a
     // lock, a switch -- and is applied first, before any of those branches,
     // rather than instead of them.
+    //
+    // **THE `continue` THAT USED TO BE AT THE BOTTOM OF THIS BLOCK WAS A
+    // SECURITY DEFECT, and this comment is the only thing standing between the
+    // next reader and putting it back.** The commit that turned
+    // `open_preferences: bool` into `edited_settings: Option<Settings>` wrote
+    // the paragraph above and left the old branch's `continue` behind. Combined
+    // with the field's contract -- **`Some` means the gear was clicked at some
+    // point during this window's life, and it is never reset to `None` when the
+    // modal closes** (see `VaultWindowResult::edited_settings`, and the
+    // unconditional write at the end of `vault_window`'s frame closure) -- that
+    // made every branch below unreachable for the rest of the window's life
+    // after one visit to Settings. Open Settings, close it, press Lock: the
+    // vault did not lock. `resettle_session` never ran, the cache was never
+    // cleared, `bw serve` kept a live session, and nothing re-authenticated.
+    //
+    // The contract is deliberately KEPT as "opened at some point" rather than
+    // narrowed to "changed something": the comparison against `*settings` below
+    // is what decides whether anything changed, and it is meant to be the one
+    // place that decides it. Clearing the cell on dismissal would move that
+    // decision into the window and give a change made and then dismissed
+    // (Alt+F4 with the modal up writes the cell every frame precisely so such a
+    // change is not lost) a second chance to be discarded. What makes "opened
+    // at some point" safe is that this block cannot branch: `vault_follow_up`
+    // is what decides what happens next, and it does not read this field.
     if let Some(edited) = result.edited_settings.clone() {
         if edited != *settings {
             *settings = edited;
@@ -3092,7 +3172,6 @@ fn open_vault_window(
                 log::warn!("could not save settings: {e}");
             }
         }
-        continue;
     }
 
     // **The three things the titlebar's account menu can ask for, before the
@@ -3109,7 +3188,14 @@ fn open_vault_window(
     // that what is in here is that sequence and not a fourth teardown path
     // written inline. Scoped to this block so the lock branch below, which
     // needs the same `&mut`s directly, still borrows them.
-    if result.switch_to.is_some() || result.add_account || result.remove_account {
+    //
+    // **Asked of `vault_follow_up`, not re-derived on this line.** The three
+    // conditions used to be spelled out here and the lock's two on their own
+    // line below, which is precisely the shape that let a stray `continue`
+    // above them go unnoticed for a whole release: with the decision scattered
+    // over the branches, nothing outside this loop could state -- let alone
+    // test -- what a given result was supposed to make happen.
+    if follow_up == VaultFollowUp::AccountAction {
         // **The injected resettle, and it calls the one
         // teardown-and-repopulate sequence.** Nothing else may
         // live in here: `a_switch_reimplements_none_of_the_
@@ -3320,7 +3406,7 @@ fn open_vault_window(
     continue;
     }
 
-    if result.locked || result.needs_reauth {
+    if follow_up == VaultFollowUp::Resettle {
         // Two different triggers land here, both needing the exact same
         // recovery: the vault window locked itself (manual Lock button or
         // its own auto-lock timer), or a write inside it hit `bw serve`
@@ -7172,7 +7258,13 @@ mod tests {
             // `the_switch_the_vault_window_asks_for`: the same needle in two
             // modules is two chances to notice it moved, and a helper made
             // `pub(super)` for one caller is a wider door than this needs.
-            let lock = concat!("if result.locked ", "|| result.needs_reauth {");
+            //
+            // The branch asks `vault_follow_up` rather than re-deriving the two
+            // conditions. Spelling the conditions out here would now match
+            // *that function's body*, which sits above `open_vault_window` --
+            // i.e. before the refill -- and this ordering assertion would fail
+            // while describing a file that is perfectly correct.
+            let lock = concat!("if follow_up == VaultFollow", "Up::Resettle {");
 
             let refill_at = production.find(refill).unwrap_or_else(|| {
                 panic!(
@@ -7213,6 +7305,238 @@ mod tests {
         production
     }
 
+    /// **What a finished vault session means -- the decision that used to be
+    /// scattered over `open_vault_window`'s branches, and the defect that
+    /// scattering shipped.**
+    ///
+    /// The loop's settings write-back carried a `continue` inherited from the
+    /// days when the gear closed the window to serve Preferences.
+    /// `edited_settings` is `Some` for the rest of a window's life once the
+    /// gear has been clicked ONCE -- it is written every frame the modal is up
+    /// and never reset -- so that `continue` made every branch beneath it
+    /// unreachable. Open Settings, close it, press Lock: nothing locked. The
+    /// cache stayed warm, `bw serve` kept its session, nothing re-authenticated.
+    ///
+    /// No test could see it, because the only thing that knew the answer was a
+    /// loop body inside a function that opens a real eframe window. So the
+    /// answer is a value now, and these drive it directly.
+    mod what_a_finished_vault_session_means {
+        use super::super::{vault_follow_up, VaultFollowUp};
+        use deskwarden::vault_window::VaultWindowResult;
+
+        /// A window that closed with nothing asked of it. Every field is the
+        /// quiet value, so each test below turns on exactly the field it names.
+        fn closed() -> VaultWindowResult {
+            VaultWindowResult {
+                locked: false,
+                needs_reauth: false,
+                edited_settings: None,
+                switch_to: None,
+                add_account: false,
+                remove_account: false,
+                account_details: None,
+            }
+        }
+
+        /// The gear, clicked at some point during the window's life. **Never
+        /// reset to `None` when the modal closes**, which is the whole reason
+        /// this field is dangerous to branch on -- so the fixture models the
+        /// field as production actually leaves it, not as a "settings were just
+        /// changed" pulse.
+        fn visited_the_gear() -> VaultWindowResult {
+            VaultWindowResult {
+                edited_settings: Some(deskwarden::settings::Settings::default()),
+                ..closed()
+            }
+        }
+
+        /// Positive control on the fixtures themselves, because this repo's
+        /// signature defect is a fixture whose two inputs silently agree.
+        /// Everything below depends on these two differing in exactly one
+        /// field, and on that field being the one named.
+        #[test]
+        fn the_two_fixtures_differ_only_in_whether_the_gear_was_visited() {
+            let (quiet, geared) = (closed(), visited_the_gear());
+            assert!(quiet.edited_settings.is_none());
+            assert!(
+                geared.edited_settings.is_some(),
+                "the geared fixture does not carry a settings answer, so every test below is \
+                 driving the quiet case twice"
+            );
+            for (a, b) in [
+                (quiet.locked, geared.locked),
+                (quiet.needs_reauth, geared.needs_reauth),
+                (quiet.add_account, geared.add_account),
+                (quiet.remove_account, geared.remove_account),
+                (quiet.switch_to.is_some(), geared.switch_to.is_some()),
+                (
+                    quiet.account_details.is_some(),
+                    geared.account_details.is_some(),
+                ),
+            ] {
+                assert_eq!(a, b, "the fixtures disagree somewhere other than the gear");
+            }
+        }
+
+        /// **THE REGRESSION.** Settings were opened, then the user pressed Lock
+        /// (or Ctrl+L, or the auto-lock timer fired). The vault must lock.
+        ///
+        /// Against the unfixed loop this was `Done`-by-`continue`: the session
+        /// stayed alive with the vault's contents still decrypted in the cache.
+        #[test]
+        fn a_lock_after_a_visit_to_settings_still_runs_the_recovery() {
+            let after_gear_then_lock = VaultWindowResult {
+                locked: true,
+                ..visited_the_gear()
+            };
+            assert_eq!(
+                vault_follow_up(&after_gear_then_lock),
+                VaultFollowUp::Resettle,
+                "a window that was locked AFTER the gear had been clicked does not resettle, so \
+                 Lock is a no-op for the rest of that window's life: the cache is not cleared, \
+                 `bw serve` keeps its session, and nothing re-authenticates"
+            );
+            // Same result without the gear, to prove the assertion above is not
+            // passing for some reason unrelated to `locked`.
+            assert_eq!(
+                vault_follow_up(&VaultWindowResult {
+                    locked: true,
+                    ..closed()
+                }),
+                VaultFollowUp::Resettle,
+                "control: a plain lock resettles"
+            );
+        }
+
+        /// The 401 half of the same branch, swallowed the same way: the window
+        /// would reopen against a session `bw serve` is already rejecting.
+        #[test]
+        fn a_401_after_a_visit_to_settings_is_not_discarded() {
+            assert_eq!(
+                vault_follow_up(&VaultWindowResult {
+                    needs_reauth: true,
+                    ..visited_the_gear()
+                }),
+                VaultFollowUp::Resettle,
+                "`needs_reauth` is dropped once the gear has been visited, so the window reopens \
+                 against a dead session and every write in it keeps failing silently"
+            );
+        }
+
+        /// All three account-menu requests, each after a visit to the gear.
+        #[test]
+        fn an_account_request_after_a_visit_to_settings_is_not_dropped() {
+            let cases: [(&str, VaultWindowResult); 3] = [
+                (
+                    "switch",
+                    VaultWindowResult {
+                        switch_to: Some(
+                            deskwarden::accounts::AccountId::parse(&"a".repeat(32))
+                                .expect("32 lowercase hex characters is a valid id"),
+                        ),
+                        ..visited_the_gear()
+                    },
+                ),
+                (
+                    "add",
+                    VaultWindowResult {
+                        add_account: true,
+                        ..visited_the_gear()
+                    },
+                ),
+                (
+                    "remove",
+                    VaultWindowResult {
+                        remove_account: true,
+                        ..visited_the_gear()
+                    },
+                ),
+            ];
+            let mut seen = 0;
+            for (what, result) in cases {
+                seen += 1;
+                assert_eq!(
+                    vault_follow_up(&result),
+                    VaultFollowUp::AccountAction,
+                    "the account menu's {what} is dropped on the floor once the gear has been \
+                     visited"
+                );
+            }
+            assert_eq!(seen, 3, "control: the loop visited every case");
+        }
+
+        /// **A plain close after a visit to Settings ENDS the window.** Under
+        /// the old `continue` it restarted the loop instead of falling through
+        /// to the `return`, so closing the vault window reopened it.
+        #[test]
+        fn closing_the_window_after_a_visit_to_settings_does_not_reopen_it() {
+            assert_eq!(
+                vault_follow_up(&visited_the_gear()),
+                VaultFollowUp::Done,
+                "a window closed after the gear was clicked asks for something to happen next, \
+                 so it comes straight back up and cannot be dismissed"
+            );
+            assert_eq!(
+                vault_follow_up(&closed()),
+                VaultFollowUp::Done,
+                "control: a plain close ends the window"
+            );
+        }
+
+        /// The one ordering the branches have always had, now stated where it
+        /// can be read: an account request outranks the lock recovery, because
+        /// that recovery re-authenticates against the account being LEFT.
+        #[test]
+        fn an_account_request_outranks_the_lock_recovery() {
+            assert_eq!(
+                vault_follow_up(&VaultWindowResult {
+                    locked: true,
+                    add_account: true,
+                    ..closed()
+                }),
+                VaultFollowUp::AccountAction,
+                "a window that both locked and asked to add an account runs the lock recovery, \
+                 which prompts for the master password of the account being left"
+            );
+        }
+
+        /// **The write-back may not branch, and this is the guard on the
+        /// `continue` itself.**
+        ///
+        /// The tests above state what every outcome means; this states that the
+        /// loop still gets to see them. Re-adding a `continue` (or a `return`,
+        /// or a `break`) anywhere inside the settings write-back turns this red
+        /// -- which is the mutation that shipped, and the only one the pure
+        /// function alone cannot feel.
+        #[test]
+        fn the_settings_write_back_cannot_skip_the_branches_beneath_it() {
+            let head = concat!("if let Some(edited) = result.edited_", "settings.clone() {");
+            let production = super::production_half_of_this_file();
+            assert_eq!(
+                production.matches(head).count(),
+                1,
+                "the settings write-back is not where this guard expects it"
+            );
+            let block = super::the_switch_the_vault_window_asks_for::block_after(head);
+            for jump in ["continue;", "return;", "break;"] {
+                assert!(
+                    !block.contains(jump),
+                    "the settings write-back contains `{jump}`, so it does not fall through to \
+                     the branches beneath it. `edited_settings` is `Some` for the rest of a \
+                     window's life once the gear has been clicked once, so this makes Lock, the \
+                     401 recovery, every account request and the plain close unreachable: \
+                     {block:?}"
+                );
+            }
+            // Positive control: the slice really is the write-back, not an
+            // empty string that trivially contains no jump.
+            assert!(
+                block.contains(concat!("persist_pre", "ferences(")),
+                "the sliced block is not the settings write-back: {block:?}"
+            );
+        }
+    }
+
     /// **The switcher's production wiring**, which is where every previous
     /// task in this feature stopped.
     ///
@@ -7233,12 +7557,16 @@ mod tests {
         /// Where `open_vault_window` reads the account menu's answers: the one
         /// `if` that all three of switch, add and remove sit inside, and that
         /// holds the single `resettle` closure they share.
+        ///
+        /// **This is now the follow-up's answer, not the three conditions.**
+        /// Which of switch/add/remove was asked for is decided by
+        /// `vault_follow_up` -- a pure function with its own tests -- so
+        /// spelling the conditions out here would match that function's body
+        /// (which is *above* `open_vault_window`) instead of the branch, and
+        /// every ordering assertion built on this needle would then be
+        /// comparing positions in the wrong function.
         fn account_actions_request() -> String {
-            concat!(
-                "if result.switch_to.is_some() || result.add_account ",
-                "|| result.remove_account {"
-            )
-            .to_string()
+            concat!("if follow_up == VaultFollow", "Up::AccountAction {").to_string()
         }
 
         /// Where `open_vault_window` reads the switcher's answer.
@@ -7254,8 +7582,9 @@ mod tests {
             concat!("} else if result.remove", "_account {").to_string()
         }
 
+        /// Likewise the lock/re-auth branch: `vault_follow_up`'s other answer.
         fn lock_recovery() -> String {
-            concat!("if result.locked ", "|| result.needs_reauth {").to_string()
+            concat!("if follow_up == VaultFollow", "Up::Resettle {").to_string()
         }
 
         /// The body of `head`'s block, depth-counted to its closing brace.
@@ -7264,7 +7593,7 @@ mod tests {
         /// long enough to hold one branch is long enough to overrun into the
         /// next, and this file has already watched that let one branch satisfy
         /// another's assertion.
-        fn block_after(head: &str) -> &'static str {
+        pub(super) fn block_after(head: &str) -> &'static str {
             let production = production_half_of_this_file();
             let at = production.find(head).unwrap_or_else(|| {
                 panic!(
