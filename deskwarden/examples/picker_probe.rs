@@ -78,10 +78,10 @@ fn main() {
     };
 
     println!("Opening overlay window -- click the row (or press Enter) this time...");
-    let filled = show_prompt_overlay("Test App", Some(&matched), None);
-    println!("show_prompt_overlay returned: {filled}");
+    let filled = show_prompt_overlay("Test App", Some(&matched), None, &[]);
+    println!("show_prompt_overlay returned: {filled:?}");
 
     println!("Opening overlay window again -- press Esc this time...");
-    let filled_again = show_prompt_overlay("Test App", Some(&matched), None);
-    println!("show_prompt_overlay returned: {filled_again}");
+    let filled_again = show_prompt_overlay("Test App", Some(&matched), None, &[]);
+    println!("show_prompt_overlay returned: {filled_again:?}");
 }

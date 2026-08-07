@@ -72,9 +72,14 @@ pub fn overlay_height(rows: usize) -> f32 {
 /// always-on-top card (design 2a — "no chrome") with the Deskwarden header,
 /// the matched credential row, and a keyboard-hint footer.
 ///
-/// Returns `true` if the user chose to fill (clicked the row or pressed
-/// Enter), `false` if they dismissed it (the header's ✕, Esc, or closing the
-/// window).
+/// Returns `Some(choice)` — **which** row the user picked (clicked, or the
+/// first row if they pressed Enter) — and `None` if they dismissed it (the
+/// header's ✕, Esc, or closing the window).
+///
+/// `choices` are the rows to offer, in order; the **first** is the primary,
+/// the one Enter takes and the one drawn in the selected treatment. An empty
+/// slice paints the single matched-credential row the overlay has always
+/// painted and answers [`FillChoice::Saved`] for it.
 ///
 /// `matched` is `None` when the item couldn't be read back from the vault at
 /// prompt time; the overlay still shows, it just can't name the credentials.
@@ -88,13 +93,14 @@ pub fn show_prompt_overlay(
     app_name: &str,
     matched: Option<&OverlayMatch>,
     anchor: Option<(f32, f32)>,
-) -> bool {
+    choices: &[FillChoice],
+) -> Option<FillChoice> {
     if OVERLAY_OPEN.swap(true, Ordering::SeqCst) {
         log::warn!(
             "autofill overlay requested for {app_name} while one is already open in this \
              process; ignoring rather than stacking a second window"
         );
-        return false;
+        return None;
     }
 
     let app_name = app_name.to_string();
@@ -108,14 +114,15 @@ pub fn show_prompt_overlay(
     // local bool can't be read back after the blocking call returns. A clone
     // of the Rc is moved in; the original is read here once the blocking
     // call returns (safe: same thread, no cross-thread sharing).
-    let fill_clicked = Rc::new(RefCell::new(false));
+    let chosen: Rc<RefCell<Option<FillChoice>>> = Rc::new(RefCell::new(None));
+    let choices = choices.to_vec();
 
     let mut viewport = egui::ViewportBuilder::default()
-        // One row: `OverlayApp` calls `draw_overlay_card`, which paints the
-        // single matched-credential row. When step 5 hands the overlay a
-        // choice list this becomes `overlay_height(choices.len())`, and the
-        // window grows with the card instead of clipping it.
-        .with_inner_size([OVERLAY_WIDTH, overlay_height(1)])
+        // Sized for the rows it was actually given, not for one: a window
+        // built for one row that paints four clips the last three off a
+        // frameless card the user cannot scroll. `overlay_height` floors at
+        // one row, so the empty and one-choice cases are still 164.0.
+        .with_inner_size([OVERLAY_WIDTH, overlay_height(choices.len())])
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
@@ -133,7 +140,8 @@ pub fn show_prompt_overlay(
         app_name,
         item_name,
         username,
-        fill_clicked: fill_clicked.clone(),
+        choices,
+        chosen: chosen.clone(),
     };
 
     // `run_native` rather than `run_simple_native`, because the frameless
@@ -150,15 +158,27 @@ pub fn show_prompt_overlay(
 
     OVERLAY_OPEN.store(false, Ordering::SeqCst);
 
-    let clicked = *fill_clicked.borrow();
-    clicked
+    let answer = chosen.borrow().clone();
+    answer
 }
 
 struct OverlayApp {
     app_name: String,
     item_name: String,
     username: Option<String>,
-    fill_clicked: Rc<RefCell<bool>>,
+    choices: Vec<FillChoice>,
+    chosen: Rc<RefCell<Option<FillChoice>>>,
+}
+
+/// The row Enter takes: the **primary**, which is the first.
+///
+/// A free function rather than an expression inside `ui`, because `ui` needs a
+/// real egui context and nothing in the test suite may open a window — so the
+/// keyboard's half of "which choice did the user pick" would otherwise be the
+/// one half no test could reach. With no choices at all the overlay is the
+/// card it has always been, whose one row is the item's saved sequence.
+fn primary_choice(choices: &[FillChoice]) -> FillChoice {
+    choices.first().cloned().unwrap_or(FillChoice::Saved)
 }
 
 impl eframe::App for OverlayApp {
@@ -176,21 +196,22 @@ impl eframe::App for OverlayApp {
         // The overlay is keyboard-first (design 2a's footer: "↵ Fill · Esc
         // Dismiss"): Enter fills, Esc dismisses, no focus juggling needed.
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            *self.fill_clicked.borrow_mut() = true;
+            *self.chosen.borrow_mut() = Some(primary_choice(&self.choices));
             done = true;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             done = true;
         }
 
-        match draw_overlay_card(
+        match draw_overlay_card_rows(
             ui,
             &self.app_name,
             &self.item_name,
             self.username.as_deref(),
+            &self.choices,
         ) {
-            OverlayAction::Fill => {
-                *self.fill_clicked.borrow_mut() = true;
+            OverlayAction::Fill(choice) => {
+                *self.chosen.borrow_mut() = Some(choice);
                 done = true;
             }
             OverlayAction::Dismiss => done = true,
@@ -204,13 +225,15 @@ impl eframe::App for OverlayApp {
 }
 
 /// What the user did to the overlay card on this frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OverlayAction {
     /// Nothing yet; keep the overlay up.
     #[default]
     None,
-    /// Fill the matched credentials (the credential row was clicked).
-    Fill,
+    /// Fill — carrying **which** row was clicked, because "a fill happened"
+    /// and "this is what to type" are different facts and the caller needs
+    /// the second one.
+    Fill(FillChoice),
     /// Close without filling (the header's ✕ was clicked).
     Dismiss,
 }
@@ -299,7 +322,7 @@ pub fn draw_overlay_card_rows(
                 let (primary, secondary) = row_text(app_name, item_name, username);
                 if choices.is_empty() {
                     if credential_row(ui, &primary, &primary, &secondary, true) {
-                        action = OverlayAction::Fill;
+                        action = OverlayAction::Fill(FillChoice::Saved);
                     }
                 } else {
                     for (index, choice) in choices.iter().enumerate() {
@@ -314,8 +337,11 @@ pub fn draw_overlay_card_rows(
                         // what is being typed -- the label already says that,
                         // and initials of "Username + Tab + Password" would
                         // name nothing.
+                        // `choice.clone()`, not `choices[0]` and not the
+                        // index: the row that was clicked is the row that
+                        // answers, or four rows are four ways to do one thing.
                         if credential_row(ui, &primary, &choice.label(), &secondary, index == 0) {
-                            action = OverlayAction::Fill;
+                            action = OverlayAction::Fill(choice.clone());
                         }
                     }
                 }
@@ -651,6 +677,53 @@ mod geometry_tests {
         ink
     }
 
+    /// Clicks the point `at` on a card drawn with `choices`, and returns what
+    /// the card answered on the frame the button came back up.
+    ///
+    /// Two frames on ONE context, not one: egui decides a click on the release,
+    /// and a press and a release squeezed into a single frame is not the
+    /// gesture the user makes. The first frame is the press (whose answer is
+    /// asserted to be `None` -- a card that "filled" on mouse-down would fill
+    /// the row the user dragged off), the second the release.
+    fn click_on(choices: &[FillChoice], at: egui::Pos2) -> OverlayAction {
+        let height = overlay_height(choices.len());
+        let ctx = styled_ctx();
+        // Warm-up frame: the row Frames must have been laid out once before
+        // their rects can be interacted with.
+        let _ = ctx.run_ui(sized(height), |ui| {
+            draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
+        });
+
+        let press = |down: bool| egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(at),
+                egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: down,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..sized(height)
+        };
+
+        let mut on_press = OverlayAction::None;
+        let _ = ctx.run_ui(press(true), |ui| {
+            on_press = draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
+        });
+        assert_eq!(
+            on_press,
+            OverlayAction::None,
+            "the card answered on mouse-DOWN; a press the user drags away from is not a choice"
+        );
+
+        let mut on_release = OverlayAction::None;
+        let _ = ctx.run_ui(press(false), |ui| {
+            on_release = draw_overlay_card_rows(ui, APP, ITEM, Some(USER), choices);
+        });
+        on_release
+    }
+
     /// The clickable tiles of the choice rows, top to bottom.
     ///
     /// A row is a full-width, 8pt-radius filled rect in one of the two row
@@ -972,6 +1045,130 @@ mod geometry_tests {
             one_choice[0],
             tiles[0]
         );
+    }
+
+    // ------------------------------------------- which row answered, and how
+
+    /// **Click row `i`, get choice `i`.** The whole point of the step: four
+    /// rows that all answer `choices[0]` are four ways to do one thing, and
+    /// look exactly like four working rows to a test that only asks whether
+    /// a fill happened.
+    #[test]
+    fn each_row_answers_its_own_choice() {
+        let choices = four_choices();
+        let tiles = row_tiles(&painted(&choices, overlay_height(choices.len())));
+        assert_eq!(
+            tiles.len(),
+            choices.len(),
+            "the card lost a row before a single click was sent -- egui culls shapes that \
+             fall outside the screen rect, so a pushed-out row comes back as nothing"
+        );
+
+        let mut answers = Vec::new();
+        for (index, tile) in tiles.iter().enumerate() {
+            match click_on(&choices, tile.center()) {
+                OverlayAction::Fill(choice) => answers.push(choice),
+                other => panic!("row {index} at {tile:?} answered {other:?}, not a fill"),
+            }
+        }
+
+        assert_eq!(answers.len(), 4, "the loop must have clicked all four rows");
+        assert_eq!(
+            answers, choices,
+            "row i must answer choice i, in the order the rows are drawn"
+        );
+        // Pairwise distinct: a mapping that answers `choices[0]` for every row
+        // would satisfy a weaker per-row assertion against a fixture whose
+        // rows happened to repeat.
+        for (i, a) in answers.iter().enumerate() {
+            for b in &answers[i + 1..] {
+                assert_ne!(a, b, "two rows answered the same choice: {answers:?}");
+            }
+        }
+    }
+
+    /// Clicking nothing in particular answers nothing -- the control that
+    /// makes the test above about the ROWS rather than about clicking.
+    #[test]
+    fn a_click_that_lands_on_no_row_answers_nothing() {
+        let choices = four_choices();
+        let tiles = row_tiles(&painted(&choices, overlay_height(choices.len())));
+        assert_eq!(tiles.len(), 4);
+        // The footer strip, below every row.
+        let below = egui::pos2(OVERLAY_WIDTH / 2.0, tiles[3].bottom() + 12.0);
+        assert!(below.y < overlay_height(4), "the probe is inside the window");
+        assert_eq!(click_on(&choices, below), OverlayAction::None);
+    }
+
+    /// **Enter takes the PRIMARY row, which is the first one.**
+    ///
+    /// The fixture's first row is deliberately not the one any of the obvious
+    /// wrong implementations would reach for -- not `Saved` (the no-choices
+    /// fallback), not `UserTabPass` (the historical fill), and not the last
+    /// row -- so `enter fills the password field` is a claim about position
+    /// and not about which variant happens to be around.
+    #[test]
+    fn enter_takes_the_first_row() {
+        let choices = vec![
+            FillChoice::Just(FieldRef::Password),
+            FillChoice::UserTabPass,
+            FillChoice::Saved,
+        ];
+        // The fixture controls: the rows really do differ, so "the first" is a
+        // distinguishable answer.
+        assert_ne!(choices[0], choices[1]);
+        assert_ne!(choices[0], choices[2]);
+        assert_ne!(choices[0], *choices.last().unwrap());
+
+        assert_eq!(primary_choice(&choices), FillChoice::Just(FieldRef::Password));
+        // And with no choices at all -- the card production still draws --
+        // Enter is the fill it has always been.
+        assert_eq!(primary_choice(&[]), FillChoice::Saved);
+    }
+
+    /// **The viewport is sized for the rows it was given.**
+    ///
+    /// `show_prompt_overlay` opens a real, always-on-top window and calls
+    /// `eframe::run_native`, so no test in this crate may execute it -- which
+    /// is exactly why the one number in it that can be silently wrong is
+    /// pinned by source position. `overlay_height(1)` in place of
+    /// `overlay_height(choices.len())` builds a 164pt window for a 314pt card:
+    /// three of four rows below the bottom edge of a frameless window with no
+    /// scrollbar, and every drawing test in this module still green, because
+    /// the CARD is fine and it is the WINDOW that is too small.
+    ///
+    /// The arithmetic itself is behavioural, and asserted here beside the pin.
+    #[test]
+    fn the_viewport_is_sized_for_the_rows_it_was_given() {
+        // Split across two literals so it cannot match its own declaration.
+        let needle = concat!("with_inner_size([OVERLAY_WIDTH, ", "overlay_height(choices.len())])");
+        let source = include_str!("overlay_ui.rs");
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "expected {needle:?} exactly once. Zero means the overlay window is no longer \
+             sized for the card it is about to draw, and the rows past the first are off \
+             the bottom of a window the user cannot scroll or resize"
+        );
+        // The counter's controls: it finds what is there, and does NOT find
+        // the mutation this pin exists for.
+        let stale = concat!("with_inner_size([OVERLAY_WIDTH, ", "overlay_height(1)])");
+        assert_eq!(source.matches(stale).count(), 0, "planted: {stale}");
+        assert_eq!(stale.matches(needle).count(), 0);
+        assert_eq!(needle.matches(needle).count(), 1);
+
+        // And what those two expressions actually differ by, for the card
+        // sizes the overlay can show.
+        let mut checked = 0;
+        for rows in 2..=4 {
+            assert!(
+                overlay_height(rows) > overlay_height(1),
+                "a {rows}-row card is not taller than a one-row card, so the pin above is \
+                 pinning a distinction that does not exist"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
     }
 
     /// POSITIVE CONTROL for every "is inside the window" assertion above, and

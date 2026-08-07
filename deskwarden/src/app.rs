@@ -18,11 +18,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetWindowRect, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
 };
 
-/// The overlay's fixed size (must match `overlay_ui::show_prompt_overlay`'s
+/// The overlay's fixed width (must match `overlay_ui::show_prompt_overlay`'s
 /// `with_inner_size`) -- needed here to clamp its position on-screen before
 /// the window exists to measure.
+///
+/// **The height is deliberately NOT a constant here.** It was `164.0`, the
+/// one-row card's height, and the card now grows by `ROW_HEIGHT` per choice
+/// row: a four-row card is 314pt, so clamping it as if it were 164pt leaves
+/// 150pt of a frameless, always-on-top, unscrollable window below the work
+/// area -- rows the user cannot see or click. The height comes from
+/// [`overlay_ui::overlay_height`] and the row count, from the one place that
+/// knows both.
 const OVERLAY_WIDTH: f32 = 396.0;
-const OVERLAY_HEIGHT: f32 = 164.0;
 /// Gap between the field/window edge and the overlay, so it doesn't sit
 /// flush against the thing it's about to fill.
 const OVERLAY_GAP: f32 = 10.0;
@@ -32,7 +39,10 @@ const OVERLAY_GAP: f32 = 10.0;
 /// focused/matched field if UI Automation can find one, else just outside
 /// the matched window's own top-right corner. Clamped to the nearest
 /// monitor's work area so it can't land off-screen or under the taskbar.
-fn overlay_position(hwnd: isize) -> Option<(f32, f32)> {
+///
+/// `rows` is how many choice rows the card will show; it is what the clamp's
+/// idea of "how tall is this window" is computed from.
+fn overlay_position(hwnd: isize, rows: usize) -> Option<(f32, f32)> {
     let (x, y) = match ui_automation::field_anchor_rect(hwnd) {
         Ok(Some(rect)) => (rect.left as f32, rect.bottom as f32 + OVERLAY_GAP),
         _ => {
@@ -43,7 +53,7 @@ fn overlay_position(hwnd: isize) -> Option<(f32, f32)> {
             )
         }
     };
-    Some(clamp_to_monitor(hwnd, x, y))
+    Some(clamp_to_monitor(hwnd, x, y, rows))
 }
 
 fn window_rect(hwnd: isize) -> Option<RECT> {
@@ -52,7 +62,38 @@ fn window_rect(hwnd: isize) -> Option<RECT> {
     Some(rect)
 }
 
-fn clamp_to_monitor(hwnd: isize, x: f32, y: f32) -> (f32, f32) {
+/// The clamp itself, with the Win32 taken out: given a work area and a
+/// proposed top-left corner, where does a card of `rows` rows actually go?
+///
+/// **Pure, and a function of the row count** -- both deliberately. The old
+/// clamp was `work.bottom - 164.0`, a literal that was the whole card's
+/// height when the card had one row and is now the height of its top half. A
+/// four-row card anchored near the bottom of the work area was clamped to a
+/// position leaving 150pt of it below the taskbar; the window has no
+/// decorations, no scrollbar and cannot be moved, so those rows were simply
+/// unreachable. Nothing could catch that, because the only caller needs a
+/// monitor handle.
+///
+/// The work area is `(left, top, right, bottom)` in pixels, matching
+/// `MONITORINFO::rcWork`.
+///
+/// `.max(left)` / `.max(top)` after the `min` on purpose: on a work area
+/// narrower or shorter than the card, the top-left corner is what survives,
+/// because the card's header and its first row are worth more than its
+/// footer.
+pub fn clamp_into_work_area(
+    work: (f32, f32, f32, f32),
+    x: f32,
+    y: f32,
+    rows: usize,
+) -> (f32, f32) {
+    let (left, top, right, bottom) = work;
+    let clamped_x = x.min(right - OVERLAY_WIDTH).max(left);
+    let clamped_y = y.min(bottom - overlay_ui::overlay_height(rows)).max(top);
+    (clamped_x, clamped_y)
+}
+
+fn clamp_to_monitor(hwnd: isize, x: f32, y: f32, rows: usize) -> (f32, f32) {
     unsafe {
         let monitor =
             MonitorFromWindow(HWND(hwnd as *mut core::ffi::c_void), MONITOR_DEFAULTTONEAREST);
@@ -62,13 +103,20 @@ fn clamp_to_monitor(hwnd: isize, x: f32, y: f32) -> (f32, f32) {
         };
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
-            let clamped_x = x
-                .min(work.right as f32 - OVERLAY_WIDTH)
-                .max(work.left as f32);
-            let clamped_y = y
-                .min(work.bottom as f32 - OVERLAY_HEIGHT)
-                .max(work.top as f32);
-            return (clamped_x, clamped_y);
+            // Nothing is decided on this line: the arithmetic is
+            // `clamp_into_work_area`'s, which is directly tested. This reads
+            // the monitor and hands over four numbers.
+            return clamp_into_work_area(
+                (
+                    work.left as f32,
+                    work.top as f32,
+                    work.right as f32,
+                    work.bottom as f32,
+                ),
+                x,
+                y,
+                rows,
+            );
         }
     }
     (x, y)
@@ -659,7 +707,20 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
             // computed on this line**, which is the point: this line is the
             // one no test can reach, and an argument written here is an
             // argument nothing can check (review 32's Important 1).
-            if prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
+            if let Some(choice) = prompt_arm(&REAL_OVERLAY, window, item.as_ref()) {
+                // `choice` is the user's answer, and the fill must be OF it.
+                // `fill_from_vault` cannot be told which choice to run until
+                // step 2 threads one through it; until then the overlay
+                // offers exactly one row (`prompt_choices`), so the only
+                // answer reachable here is the fill this has always done.
+                // The assertion is how that stays true: step 5 widening
+                // `prompt_choices` without step 2 landing first fails here
+                // rather than silently typing the wrong field.
+                debug_assert_eq!(
+                    choice,
+                    FillChoice::Saved,
+                    "the overlay answered a choice this fill cannot honour yet"
+                );
                 fill_from_vault(cache, injector, fill_stats, item_id, hwnd, notifier);
             }
         }
@@ -680,6 +741,25 @@ pub struct PromptRequest<'a> {
     pub label: &'a str,
     pub matched: Option<overlay_ui::OverlayMatch>,
     pub position: Option<(f32, f32)>,
+    /// The rows the overlay offers, in order; the first is the primary, and
+    /// the one Enter takes.
+    pub choices: Vec<FillChoice>,
+}
+
+/// The rows to offer for a Prompt-mode match.
+///
+/// **Deliberately one row, and deliberately not [`fill_choices`] yet.** The
+/// machinery from the overlay back to `handle_match` now carries *which* row
+/// the user picked, but offering the user more than one row is step 5's
+/// change, and until [`fill_action`]/[`fill_from_vault`] can be told which
+/// choice to run (step 2) a second row would be a row that types the wrong
+/// thing. [`FillChoice::Saved`] is what the fill has always done, so the
+/// overlay is byte-for-byte the card it was and the feature is invisible.
+///
+/// Step 5 replaces the body with `item.map(fill_choices).unwrap_or_default()`;
+/// nothing else moves, which is the point of routing it through one function.
+pub fn prompt_choices(_item: Option<&VaultItem>) -> Vec<FillChoice> {
+    vec![FillChoice::Saved]
 }
 
 /// **The whole of the Prompt decision, as a pure function** (review 31's
@@ -722,6 +802,7 @@ pub fn prompt_request<'a>(
             }
         }),
         position,
+        choices: prompt_choices(item),
     }
 }
 
@@ -754,15 +835,18 @@ pub fn prompt_request<'a>(
 /// argument.
 pub trait PromptPresenter {
     /// Where to open the overlay for the window `hwnd`, or `None` to let the
-    /// OS choose.
-    fn position(&self, hwnd: isize) -> Option<(f32, f32)>;
-    /// Shows the overlay and returns whether the user chose to fill.
+    /// OS choose. `rows` is the card's row count, which is what its height --
+    /// and therefore the bottom clamp -- is computed from.
+    fn position(&self, hwnd: isize, rows: usize) -> Option<(f32, f32)>;
+    /// Shows the overlay and returns **which** row the user picked, or `None`
+    /// if they dismissed it.
     fn show(
         &self,
         label: &str,
         matched: Option<&overlay_ui::OverlayMatch>,
         position: Option<(f32, f32)>,
-    ) -> bool;
+        choices: &[FillChoice],
+    ) -> Option<FillChoice>;
 }
 
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
@@ -773,15 +857,20 @@ pub trait PromptPresenter {
 /// and unlike a Win32 body it is directly driven by
 /// `an_fn_presenter_forwards_to_the_two_functions_it_was_built_from`.
 pub struct FnPresenter {
-    /// Asked where the overlay for this window goes.
-    pub position: fn(isize) -> Option<(f32, f32)>,
-    /// Asked to put it on screen; answers whether the user chose to fill.
-    pub show: fn(&str, Option<&overlay_ui::OverlayMatch>, Option<(f32, f32)>) -> bool,
+    /// Asked where the overlay for this window, at this row count, goes.
+    pub position: fn(isize, usize) -> Option<(f32, f32)>,
+    /// Asked to put it on screen; answers which row the user picked.
+    pub show: fn(
+        &str,
+        Option<&overlay_ui::OverlayMatch>,
+        Option<(f32, f32)>,
+        &[FillChoice],
+    ) -> Option<FillChoice>,
 }
 
 impl PromptPresenter for FnPresenter {
-    fn position(&self, hwnd: isize) -> Option<(f32, f32)> {
-        (self.position)(hwnd)
+    fn position(&self, hwnd: isize, rows: usize) -> Option<(f32, f32)> {
+        (self.position)(hwnd, rows)
     }
 
     fn show(
@@ -789,8 +878,9 @@ impl PromptPresenter for FnPresenter {
         label: &str,
         matched: Option<&overlay_ui::OverlayMatch>,
         position: Option<(f32, f32)>,
-    ) -> bool {
-        (self.show)(label, matched, position)
+        choices: &[FillChoice],
+    ) -> Option<FillChoice> {
+        (self.show)(label, matched, position, choices)
     }
 }
 
@@ -810,7 +900,11 @@ const REAL_OVERLAY: FnPresenter = FnPresenter {
 
 /// The whole of the Prompt arm except the vault lookup and the fill: ask
 /// [`prompt_request`] what to show, ask the presenter where to show it, show
-/// it, and answer whether the user clicked Fill.
+/// it, and answer **which row** the user picked -- `None` if they dismissed it.
+///
+/// The choice, not a bare `true`: "a fill was authorized" and "this is what to
+/// type" are different facts, and the second is the one the caller needs once
+/// the card offers more than one row.
 ///
 /// Generic over the presenter so a test can drive this with a recorder and
 /// assert that **the overlay is opened at the placement that was answered for
@@ -826,10 +920,17 @@ pub fn prompt_arm<P: PromptPresenter>(
     presenter: &P,
     window: &crate::window_watch::ForegroundEvent,
     item: Option<&VaultItem>,
-) -> bool {
-    let PromptRequest { label, matched, position } =
-        prompt_request(window, item, presenter.position(window.hwnd));
-    presenter.show(label, matched.as_ref(), position)
+) -> Option<FillChoice> {
+    // The placement is asked for BEFORE the request is built, because how
+    // tall the window is -- and therefore how far down the work area its top
+    // may be -- is a function of the row count. Both the count asked about
+    // and the count shown come from `prompt_choices`, and
+    // `the_placement_is_asked_about_the_number_of_rows_that_are_shown` holds
+    // the two together.
+    let position = presenter.position(window.hwnd, prompt_choices(item).len());
+    let PromptRequest { label, matched, position, choices } =
+        prompt_request(window, item, position);
+    presenter.show(label, matched.as_ref(), position, &choices)
 }
 
 /// What to call the app in a window a foreground event describes.
@@ -1047,6 +1148,82 @@ mod tests {
         assert_eq!(request.position, None);
     }
 
+    // ---- Where a card of N rows is allowed to open ----
+
+    /// A 1920x1040 work area with the taskbar at the bottom, at the origin.
+    const WORK: (f32, f32, f32, f32) = (0.0, 0.0, 1920.0, 1040.0);
+
+    /// **The bug the row count exists to prevent.** With the clamp still
+    /// reading a literal `164.0`, a four-row card anchored near the bottom is
+    /// pinned at y = 876 and is 314pt tall, so it ends at 1190 -- 150pt below
+    /// the work area, on a frameless always-on-top window with no title bar,
+    /// no scrollbar and no way to move it. The bottom rows cannot be seen or
+    /// clicked.
+    #[test]
+    fn a_four_row_card_anchored_at_the_bottom_stays_inside_the_work_area() {
+        let height = overlay_ui::overlay_height(4);
+        assert_eq!(height, 314.0, "the fixture is a card that is really taller");
+
+        // Anchored well below where a card this tall can start.
+        let (_x, y) = clamp_into_work_area(WORK, 200.0, 1000.0, 4);
+        assert!(
+            y + height <= WORK.3,
+            "a 4-row card opened at y = {y} ends at {} , past the work area's {}",
+            y + height,
+            WORK.3
+        );
+        assert_eq!(y, WORK.3 - height);
+
+        // The positive control: the assertion above can fail. This is what
+        // the old, row-blind clamp answered for the same input.
+        let stale = 1000.0_f32.min(WORK.3 - 164.0).max(WORK.1);
+        assert!(
+            stale + height > WORK.3,
+            "the control is not a failing case, so the test above proves nothing"
+        );
+        assert_ne!(y, stale);
+    }
+
+    #[test]
+    fn a_one_row_card_is_clamped_exactly_where_it_always_was() {
+        // The other half: the historical geometry must not move. 164.0 is
+        // still the right number -- for a card that really has one row.
+        let (x, y) = clamp_into_work_area(WORK, 5000.0, 1000.0, 1);
+        assert_eq!(y, WORK.3 - 164.0);
+        assert_eq!(x, WORK.2 - OVERLAY_WIDTH);
+    }
+
+    #[test]
+    fn a_card_that_already_fits_is_not_moved() {
+        // Otherwise "clamped on screen" could be implemented as "always at the
+        // bottom-right", which passes the two tests above.
+        assert_eq!(clamp_into_work_area(WORK, 300.0, 400.0, 4), (300.0, 400.0));
+    }
+
+    #[test]
+    fn a_card_is_never_pushed_off_the_top_or_left_by_the_clamp() {
+        // A work area smaller than the card: the top-left corner wins, so the
+        // header and the FIRST row are what survive.
+        let tiny = (100.0, 200.0, 300.0, 260.0);
+        assert_eq!(clamp_into_work_area(tiny, 0.0, 0.0, 4), (100.0, 200.0));
+    }
+
+    /// Every row count the card can have (`fill_choices` caps at four) fits,
+    /// with the loop's own visit count asserted -- a loop that ran zero times
+    /// would otherwise pass green.
+    #[test]
+    fn no_card_the_overlay_can_show_is_clamped_off_the_bottom() {
+        let mut checked = 0;
+        for rows in 1..=4 {
+            let height = overlay_ui::overlay_height(rows);
+            let (_x, y) = clamp_into_work_area(WORK, 200.0, 9999.0, rows);
+            assert!(y + height <= WORK.3, "{rows} rows: {y} + {height}");
+            assert!(y >= WORK.1);
+            checked += 1;
+        }
+        assert_eq!(checked, 4, "the loop must have visited all four row counts");
+    }
+
     // ---- The Prompt arm's wiring (review 32's Important 1) ----
 
     /// What the overlay was told, in a form a test can compare:
@@ -1060,17 +1237,24 @@ mod tests {
     /// what it was asked and what it was shown.
     #[derive(Default)]
     struct RecordingPresenter {
-        /// What `show` returns -- the user clicking Fill, or not.
-        answer: bool,
+        /// What `show` returns -- WHICH row the user picked, or `None` for a
+        /// dismissal. Not a bool: the caller types what this says.
+        answer: Option<FillChoice>,
         /// What `position` answers, standing in for the Win32 calculation.
         placement: Option<(f32, f32)>,
         asked_about: std::cell::Cell<Option<isize>>,
+        /// The row count `position` was asked about, so a placement computed
+        /// for a card of the wrong height is visible to a test.
+        asked_rows: std::cell::Cell<Option<usize>>,
         shown: std::cell::RefCell<Vec<Shown>>,
+        /// The choice list each `show` was handed.
+        offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
     }
 
     impl PromptPresenter for RecordingPresenter {
-        fn position(&self, hwnd: isize) -> Option<(f32, f32)> {
+        fn position(&self, hwnd: isize, rows: usize) -> Option<(f32, f32)> {
             self.asked_about.set(Some(hwnd));
+            self.asked_rows.set(Some(rows));
             self.placement
         }
 
@@ -1079,13 +1263,15 @@ mod tests {
             label: &str,
             matched: Option<&overlay_ui::OverlayMatch>,
             position: Option<(f32, f32)>,
-        ) -> bool {
+            choices: &[FillChoice],
+        ) -> Option<FillChoice> {
             self.shown.borrow_mut().push((
                 label.to_string(),
                 matched.map(|m| (m.item_name.clone(), m.username.clone())),
                 position,
             ));
-            self.answer
+            self.offered.borrow_mut().push(choices.to_vec());
+            self.answer.clone()
         }
     }
 
@@ -1148,12 +1334,90 @@ mod tests {
         // window, so an inverted or constant answer fills on Dismiss.
         let w = window("Ledgerline.exe", "Ledgerline");
         let filled = RecordingPresenter {
-            answer: true,
+            answer: Some(FillChoice::Saved),
             ..Default::default()
         };
-        assert!(prompt_arm(&filled, &w, None));
+        assert!(prompt_arm(&filled, &w, None).is_some());
         let dismissed = RecordingPresenter::default();
-        assert!(!prompt_arm(&dismissed, &w, None));
+        assert!(prompt_arm(&dismissed, &w, None).is_none());
+    }
+
+    /// **The choice the overlay answered is the choice the caller receives.**
+    ///
+    /// Asserted on the choice, not on "a fill happened": a `prompt_arm` that
+    /// collapsed its answer to `Some(FillChoice::Saved)` -- the historical
+    /// behaviour, and therefore the mutation that looks harmless -- passes
+    /// every `is_some()` test in this file and types the user's password into
+    /// a field they asked for their username in.
+    #[test]
+    fn the_choice_the_overlay_answered_is_the_choice_the_caller_receives() {
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let answered = FillChoice::Just(key_sequence::FieldRef::Password);
+        let presenter = RecordingPresenter {
+            answer: Some(answered.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(prompt_arm(&presenter, &w, None), Some(answered.clone()));
+        // The control: the answer is not the one a collapse would produce, so
+        // the assertion above cannot pass by accident.
+        assert_ne!(answered, FillChoice::Saved);
+        assert_ne!(answered, FillChoice::UserTabPass);
+    }
+
+    #[test]
+    fn dismissing_the_overlay_answers_none() {
+        // The positive control for the test above: an arm that fabricated a
+        // choice when the user dismissed the card would pass that one and
+        // fill on Esc.
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let presenter = RecordingPresenter {
+            answer: None,
+            ..Default::default()
+        };
+        assert_eq!(prompt_arm(&presenter, &w, None), None);
+        // ... and it really did open the overlay, so `None` is the user's
+        // answer and not a card that was never shown.
+        assert_eq!(presenter.shown.borrow().len(), 1);
+    }
+
+    /// The overlay is offered the rows [`prompt_choices`] decides on, and is
+    /// *placed* for that same number of rows. Two counts that must agree: a
+    /// card placed as if it had one row and drawn with four hangs off the
+    /// bottom of the work area.
+    #[test]
+    fn the_placement_is_asked_about_the_number_of_rows_that_are_shown() {
+        let item = login_item("Ledgerline", "denis@example.com");
+        let w = window("Ledgerline.exe", "Ledgerline");
+        let presenter = RecordingPresenter::default();
+
+        prompt_arm(&presenter, &w, Some(&item));
+
+        let offered = presenter.offered.borrow();
+        assert_eq!(offered.len(), 1, "the overlay is offered rows exactly once");
+        assert!(!offered[0].is_empty(), "a card with no rows is not a card");
+        assert_eq!(
+            presenter.asked_rows.get(),
+            Some(offered[0].len()),
+            "the placement was computed for a card of a different height than the one \
+             that is drawn"
+        );
+    }
+
+    /// Step 4 deliberately keeps production at one row -- the fill it has
+    /// always done -- because `fill_from_vault` cannot yet be told which
+    /// choice to run. This is that promise, written down where widening
+    /// `prompt_choices` (step 5) breaks it loudly.
+    #[test]
+    fn production_still_offers_exactly_the_one_row_it_always_has() {
+        let item = login_item("Ledgerline", "denis@example.com");
+        assert_eq!(prompt_choices(Some(&item)), vec![FillChoice::Saved]);
+        assert_eq!(prompt_choices(None), vec![FillChoice::Saved]);
+        let w = window("Ledgerline.exe", "Ledgerline");
+        assert_eq!(
+            prompt_request(&w, Some(&item), None).choices,
+            vec![FillChoice::Saved]
+        );
     }
 
     // ---- and the adapter the production presenter is built out of ----
@@ -1165,8 +1429,12 @@ mod tests {
     static ASKED_HWND: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
     static FORWARDED: std::sync::Mutex<Vec<Shown>> = std::sync::Mutex::new(Vec::new());
 
-    fn recording_position(hwnd: isize) -> Option<(f32, f32)> {
+    static ASKED_ROWS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static OFFERED: std::sync::Mutex<Vec<Vec<FillChoice>>> = std::sync::Mutex::new(Vec::new());
+
+    fn recording_position(hwnd: isize, rows: usize) -> Option<(f32, f32)> {
         ASKED_HWND.lock().unwrap().push(hwnd);
+        ASKED_ROWS.lock().unwrap().push(rows);
         Some((11.0, 22.0))
     }
 
@@ -1174,13 +1442,15 @@ mod tests {
         label: &str,
         matched: Option<&overlay_ui::OverlayMatch>,
         position: Option<(f32, f32)>,
-    ) -> bool {
+        choices: &[FillChoice],
+    ) -> Option<FillChoice> {
         FORWARDED.lock().unwrap().push((
             label.to_string(),
             matched.map(|m| (m.item_name.clone(), m.username.clone())),
             position,
         ));
-        true
+        OFFERED.lock().unwrap().push(choices.to_vec());
+        Some(FillChoice::Just(key_sequence::FieldRef::Totp))
     }
 
     /// The forwarding is the only code between [`REAL_OVERLAY`]'s two named
@@ -1193,14 +1463,28 @@ mod tests {
             show: recording_show,
         };
 
-        assert_eq!(presenter.position(4242), Some((11.0, 22.0)));
+        assert_eq!(presenter.position(4242, 3), Some((11.0, 22.0)));
         assert_eq!(*ASKED_HWND.lock().unwrap(), vec![4242]);
+        assert_eq!(
+            *ASKED_ROWS.lock().unwrap(),
+            vec![3],
+            "the row count is forwarded, not replaced with a default"
+        );
 
         let matched = overlay_ui::OverlayMatch {
             item_name: "Ledgerline".to_string(),
             username: Some("denis@example.com".to_string()),
         };
-        assert!(presenter.show("Ledgerline.exe", Some(&matched), Some((3.0, 4.0))));
+        let offered = vec![
+            FillChoice::UserTabPass,
+            FillChoice::Just(key_sequence::FieldRef::Username),
+        ];
+        assert_eq!(
+            presenter.show("Ledgerline.exe", Some(&matched), Some((3.0, 4.0)), &offered),
+            Some(FillChoice::Just(key_sequence::FieldRef::Totp)),
+            "the answer is forwarded back unaltered -- not collapsed to the first row"
+        );
+        assert_eq!(*OFFERED.lock().unwrap(), vec![offered]);
 
         let forwarded = FORWARDED.lock().unwrap();
         assert_eq!(forwarded.len(), 1);
@@ -1269,8 +1553,18 @@ mod prompt_wiring_tests {
     ///
     /// So the needle is the whole `if ... {`, and the mutant no longer
     /// contains it.
+    ///
+    /// **Retargeted when `prompt_arm` began answering `Option<FillChoice>`.**
+    /// The arm is now `if let Some(choice) = prompt_arm(...) {`, and the old
+    /// needle -- `if prompt_arm(...) {` -- stopped matching anything. A stale
+    /// source pin does not fail: it just quietly stops pinning, and the
+    /// guarantee it exists for ("nothing is typed without a user action")
+    /// would have gone back to being unheld the moment the signature changed.
+    /// The needle binds the answer to a NAME, so the two mutants it must
+    /// catch -- discarding the answer, and substituting a hardcoded choice for
+    /// it -- both stop containing it.
     const GUARDED_ARM: &str =
-        concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+        concat!("if let Some(choice) = prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
 
     fn source() -> &'static str {
         include_str!("app.rs")
@@ -1292,6 +1586,29 @@ mod prompt_wiring_tests {
         // at all, so its modern form is a wrapper around the named function.
         let mutated = concat!("if prompt_arm", "(&REAL_OVERLAY, window, None) {");
         assert_eq!(occurrences(mutated, ARM_CALL), 0, "planted: {mutated}");
+
+        // And the same for the retargeted `GUARDED_ARM`, whose whole job is to
+        // stop matching when the user's answer stops gating the fill. Both
+        // mutants below were run for real (see the ledger): the first opens
+        // the overlay and fills regardless, the second keeps the `if let` but
+        // types a choice the user did not pick.
+        let planted =
+            concat!("            if let Some(choice) = prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {");
+        assert_eq!(occurrences(planted, GUARDED_ARM), 1, "planted: {planted}");
+        let discarded = concat!("            prompt_arm", "(&REAL_OVERLAY, window, item.as_ref());");
+        assert_eq!(occurrences(discarded, GUARDED_ARM), 0, "planted: {discarded}");
+        let hardcoded = concat!(
+            "            if prompt_arm",
+            "(&REAL_OVERLAY, window, item.as_ref()).is_some() { let choice = FillChoice::UserTabPass;"
+        );
+        assert_eq!(occurrences(hardcoded, GUARDED_ARM), 0, "planted: {hardcoded}");
+        // The old needle, so a revert to it is not silently equivalent.
+        assert_eq!(
+            occurrences(source(), concat!("if prompt_arm", "(&REAL_OVERLAY, window, item.as_ref()) {")),
+            0,
+            "the pre-`FillChoice` arm shape is back in app.rs; `GUARDED_ARM` no longer \
+             describes the code it guards"
+        );
 
         let planted = concat!("    position: ", "overlay_position,");
         assert_eq!(occurrences(planted, REAL_POSITION), 1, "planted: {planted}");
