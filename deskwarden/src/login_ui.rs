@@ -4225,7 +4225,23 @@ mod empty_app_behind_the_card_tests {
         // it, or the placement it merely borrowed -- would silently re-home the
         // vault window from a sign-in the user then abandoned. Nothing writes
         // it today; this is what keeps it that way.
-        let settings = include_str!("settings.rs");
+        // **`settings.rs`'s PRODUCTION half only.** Read whole -- which it was
+        // -- these controls could be satisfied by an occurrence in that file's
+        // own test module: production could rename or drop its writer and the
+        // needle would go on matching a fixture, leaving the absence
+        // assertions above facts about a string that names nothing shipping.
+        // The cut is the same one `settings.rs`'s own guards take, and what
+        // keeps it where it is lives over there, in
+        // `nothing_but_gated_test_modules_lives_below_the_guards_cut`.
+        let settings_source = include_str!("settings.rs");
+        let settings = settings_source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .map_or(settings_source, |(production, _)| production);
+        assert!(
+            settings.len() < settings_source.len(),
+            "control: the test gate was not found in settings.rs, so these controls are \
+             reading that whole file, fixtures included"
+        );
         for (needle, control, what) in [
             (
                 concat!("persist_vault_window_", "geometry("),
