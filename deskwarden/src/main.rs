@@ -1035,15 +1035,17 @@ fn main() {
     if startup_vault.is_some() {
         open_vault_window(
             &mut estate,
-            &fill_stats,
-            &job,
-            &schedule,
-            &icon_cache_dir,
-            &config_dir,
-            first_run_account.as_ref(),
-            &settings_path,
+            VaultDeps {
+                fill_stats: &fill_stats,
+                job: &job,
+                schedule: &schedule,
+                icon_cache_dir: &icon_cache_dir,
+                config_dir: &config_dir,
+                settings_path: &settings_path,
+                first_run_account: first_run_account.as_ref(),
+                backend_op_tx: &backend_op_tx,
+            },
             &tray,
-            &backend_op_tx,
             &backend_op_rx,
             // The one caller that hands an outcome in.
             startup_vault.take(),
@@ -1089,15 +1091,17 @@ fn main() {
             if event.id == tray.open_vault_id {
                 open_vault_window(
                     &mut estate,
-                    &fill_stats,
-                    &job,
-                    &schedule,
-                    &icon_cache_dir,
-                    &config_dir,
-                    first_run_account.as_ref(),
-                    &settings_path,
+                    VaultDeps {
+                        fill_stats: &fill_stats,
+                        job: &job,
+                        schedule: &schedule,
+                        icon_cache_dir: &icon_cache_dir,
+                        config_dir: &config_dir,
+                        settings_path: &settings_path,
+                        first_run_account: first_run_account.as_ref(),
+                        backend_op_tx: &backend_op_tx,
+                    },
                     &tray,
-                    &backend_op_tx,
                     &backend_op_rx,
                     // This door opens its own window; there is no outcome to
                     // hand it.
@@ -1634,15 +1638,17 @@ fn main() {
         if tray::next_left_click() == Some(true) {
             open_vault_window(
                 &mut estate,
-                &fill_stats,
-                &job,
-                &schedule,
-                &icon_cache_dir,
-                &config_dir,
-                first_run_account.as_ref(),
-                &settings_path,
+                VaultDeps {
+                    fill_stats: &fill_stats,
+                    job: &job,
+                    schedule: &schedule,
+                    icon_cache_dir: &icon_cache_dir,
+                    config_dir: &config_dir,
+                    settings_path: &settings_path,
+                    first_run_account: first_run_account.as_ref(),
+                    backend_op_tx: &backend_op_tx,
+                },
                 &tray,
-                &backend_op_tx,
                 &backend_op_rx,
                 // This door opens its own window; there is no outcome to hand
                 // it.
@@ -2905,6 +2911,24 @@ struct SessionEstate {
     settings: settings::Settings,
 }
 
+/// The immutable half of what a vault session runs against: borrowed, never
+/// mutated, never in the estate.
+///
+/// Eight parameters that only ever get read and handed on. They are grouped
+/// for the reader rather than for the borrow checker -- but the grouping is
+/// the line between the two halves, and a field that starts being written is
+/// a field that has moved to the wrong struct.
+struct VaultDeps<'a> {
+    fill_stats: &'a deskwarden::fill_stats::FillStats,
+    job: &'a Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &'a [Duration],
+    icon_cache_dir: &'a std::path::Path,
+    config_dir: &'a std::path::Path,
+    settings_path: &'a std::path::Path,
+    first_run_account: Option<&'a accounts::AccountId>,
+    backend_op_tx: &'a mpsc::Sender<BackendOp>,
+}
+
 fn open_vault_window(
     // **The eight `&mut` parameters this used to take, as one value.** They
     // were eight separate borrows off `main`'s stack frame, which is why the
@@ -2913,28 +2937,17 @@ fn open_vault_window(
     // statement, so not one line inside the loop changed to accommodate the
     // move.
     estate: &mut SessionEstate,
-    fill_stats: &deskwarden::fill_stats::FillStats,
-    job: &Arc<Option<job_object::KillOnCloseJob>>,
-    schedule: &[Duration],
-    icon_cache_dir: &std::path::Path,
-    // What the lock/re-auth prompt this window can raise is scoped to: the
-    // account this process is signed into. The pieces rather than a built
-    // `LoginContext`, because this function can now CHANGE which account that
-    // is (the titlebar switcher below) and a context built by the caller would
-    // still name the account the user just left -- so the master-password
-    // prompt after a switch-then-lock would be for the wrong account. Every
-    // context here goes through the one `login_context` constructor, which is
-    // what keeps "no window is opened without an account" a single decision.
-    config_dir: &std::path::Path,
-    // Passed through to every `login_context` this function builds; see that
-    // function.
-    first_run_account: Option<&accounts::AccountId>,
-    // Where the preferences the estate carries are persisted to. A path and
-    // not the struct: the struct is `estate.settings`, and two copies of it
-    // is exactly what this move exists to prevent.
-    settings_path: &std::path::Path,
+    // The immutable half. Separate from the estate and not merged into it
+    // because nothing here is ever written: a value that cannot be mutated
+    // cannot disagree with a second copy of itself, so it needs none of the
+    // single-owner discipline `SessionEstate` exists to enforce.
+    deps: VaultDeps<'_>,
+    // Out of both structs, deliberately. `AppTray` is not `Send` -- it owns a
+    // hidden Win32 window bound to the thread that built it -- so a struct it
+    // is a field of could never be parked behind an `Arc<Mutex<_>>` with the
+    // estate. The receiver stays out for the same reason the sender went in:
+    // only one place may drain it.
     tray: &tray::AppTray,
-    backend_op_tx: &mpsc::Sender<BackendOp>,
     backend_op_rx: &mpsc::Receiver<BackendOp>,
     // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
     // the loop below on its first pass instead of that pass opening a window.
@@ -2949,6 +2962,35 @@ fn open_vault_window(
     // switch/add/remove wiring the tray's guards pin the only wiring there is.
     mut first_result: Option<vault_window::VaultWindowResult>,
 ) {
+    // **Destructured, both of them, rather than reached through `estate.` and
+    // `deps.` at each of their sites.** For `deps` that is presentation: every
+    // field is a shared borrow and `deps.job` would compile everywhere. For the
+    // estate it is load-bearing, and both are spelled the same way so the next
+    // reader is not invited to think the difference is arbitrary.
+    let VaultDeps {
+        fill_stats,
+        job,
+        schedule,
+        icon_cache_dir,
+        // What the lock/re-auth prompt this window can raise is scoped to: the
+        // account this process is signed into. The pieces rather than a built
+        // `LoginContext`, because this function can now CHANGE which account
+        // that is (the titlebar switcher below) and a context built by the
+        // caller would still name the account the user just left -- so the
+        // master-password prompt after a switch-then-lock would be for the wrong
+        // account. Every context here goes through the one `login_context`
+        // constructor, which is what keeps "no window is opened without an
+        // account" a single decision.
+        config_dir,
+        // Where the preferences the estate carries are persisted to. A path and
+        // not the struct: the struct is `estate.settings`, and two copies of it
+        // is exactly what the estate exists to prevent.
+        settings_path,
+        // Passed through to every `login_context` this function builds; see
+        // that function.
+        first_run_account,
+        backend_op_tx,
+    } = deps;
     // **Destructured here, rather than reached through `estate.` at each of
     // its sites.** Field-level borrow splitting is what lets the loop below go
     // on holding eight simultaneous `&mut`s -- the resettle closure alone
