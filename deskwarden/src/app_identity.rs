@@ -567,11 +567,27 @@ unsafe fn version_string(block: &[u8], key: &str, name: &str) -> Option<String> 
 // registry key: no COM, no packaging API, and nothing that can block on a
 // volume.
 
-/// The `WindowsApps` directory a Store executable sits under, as a prefix test.
+/// The `WindowsApps` package a Store executable sits under, AND everything
+/// below it: `("AppleInc.iTunes_..._nzyj5cx40ttqa", r"bin\iTunes.exe")`.
 ///
-/// Compared case-insensitively and against a whole path component, so that
-/// `C:\My WindowsApps Backup\x.exe` is not mistaken for one.
-fn windowsapps_package_of(path: &str) -> Option<&str> {
+/// `WindowsApps` is compared case-insensitively and against a whole path
+/// component, so that `C:\My WindowsApps Backup\x.exe` is not mistaken for one.
+///
+/// **The tail is the half [`relocate_store_path`] used to throw away.** It kept
+/// only `file_name_of(path)` and re-joined that to the new package root, which
+/// is right for the flat layout and wrong for every nested one -- and MSIX
+/// permits nesting, packages commonly use it, and the test above this one has
+/// pinned `...\PKG\bin\iTunes.exe` as a shape this module recognises since the
+/// day it was written. Measured against a real installed package on the
+/// author's machine: `...\ShareX_21...\exiftool_files\perl.exe` relocated to
+/// `...\ShareX_21...\perl.exe`, which names nothing, so `Probe::file` stayed
+/// `None` and the card degraded to no icon. It *looked* repaired only because
+/// the label comes from the registry's `DisplayName` whether or not any
+/// candidate proved reachable.
+///
+/// Separators in the tail are normalised to `\`, because the root read out of
+/// the registry always uses `\` and the two halves are joined.
+fn windowsapps_package_and_tail(path: &str) -> Option<(&str, String)> {
     let normalised = path.replace('/', "\\");
     let lower = normalised.to_ascii_lowercase();
     let at = lower.find("\\windowsapps\\")? + r"\windowsapps\".len();
@@ -581,7 +597,12 @@ fn windowsapps_package_of(path: &str) -> Option<&str> {
     let cut = rest.find(['\\', '/'])?;
     let package = &rest[..cut];
     // ...and there must be a file name below it, not just a trailing slash.
-    (!package.is_empty() && file_name_of(rest).is_some()).then_some(package)
+    // That check is over `rest`, so it also rejects `PKG\sub\` -- which is
+    // what stops an empty tail being handed back here.
+    if package.is_empty() || file_name_of(rest).is_none() {
+        return None;
+    }
+    Some((package, rest[cut + 1..].replace('/', "\\")))
 }
 
 /// `(name, architecture, publisher id)` out of a `PackageFullName`.
@@ -762,17 +783,19 @@ unsafe fn registry_string(key: HKEY, subkey: &str, value: &str) -> Option<String
 /// returns candidates; whether one of them is really there is the caller's
 /// question, because the caller is the one allowed to pay for a file system.
 fn relocate_store_path(path: &str) -> Vec<(String, Option<String>)> {
-    let Some(package) = windowsapps_package_of(path) else {
-        return Vec::new();
-    };
-    let Some(file) = file_name_of(path) else {
+    // **The TAIL, not the file name.** Keeping only `file_name_of(path)` and
+    // re-joining it to the package root silently flattened every nested layout:
+    // `...\PKG\exiftool_files\perl.exe` became `...\PKG\perl.exe`, which names
+    // nothing at all, so nothing was relocated and the card lost its icon
+    // anyway. See `windowsapps_package_and_tail`.
+    let Some((package, tail)) = windowsapps_package_and_tail(path) else {
         return Vec::new();
     };
     registered_roots(package)
         .into_iter()
         .map(|(root, name)| {
             let root = root.trim_end_matches(['\\', '/']);
-            (format!(r"{root}\{file}"), name)
+            (format!(r"{root}\{tail}"), name)
         })
         .collect()
 }
@@ -1029,6 +1052,18 @@ mod tests {
     /// report.
     const ITUNES: &str = "AppleInc.iTunes_12139.10003.61011.0_x64__nzyj5cx40ttqa";
 
+    /// Just the package half of `windowsapps_package_and_tail`.
+    ///
+    /// This used to be a production function of its own, and became dead the
+    /// moment `relocate_store_path` started asking for the tail as well --
+    /// there is exactly one production caller and it needs both halves. Kept
+    /// here because the "is this a Store path at all" tests below are about a
+    /// question worth asking on its own, and pairing every one of them with a
+    /// tail they do not care about would bury what they are asserting.
+    fn windowsapps_package_of(path: &str) -> Option<&str> {
+        windowsapps_package_and_tail(path).map(|(package, _)| package)
+    }
+
     #[test]
     fn a_store_path_yields_the_package_directory_it_sits_in() {
         assert_eq!(
@@ -1049,6 +1084,80 @@ mod tests {
             )),
             Some(ITUNES)
         );
+    }
+
+    /// **The subdirectory a repair used to drop.**
+    ///
+    /// `relocate_store_path` kept only `file_name_of(path)`, so a nested
+    /// executable was re-joined straight to the package root and the repaired
+    /// path named nothing. The test above already pinned `...\PKG\bin\x.exe` as
+    /// a shape this module RECOGNISES -- it was recognised and then thrown
+    /// away one function later, and no test looked at the part that was thrown.
+    #[test]
+    fn a_store_path_keeps_everything_below_the_package_directory() {
+        assert_eq!(
+            windowsapps_package_and_tail(&format!(
+                r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe"
+            )),
+            Some((ITUNES, "iTunes.exe".to_string())),
+            "the flat case"
+        );
+        assert_eq!(
+            windowsapps_package_and_tail(&format!(
+                r"C:\Program Files\WindowsApps\{ITUNES}\bin\iTunes.exe"
+            )),
+            Some((ITUNES, r"bin\iTunes.exe".to_string())),
+            "one directory deep -- the shape MSIX permits and packages use, and the shape a \
+             repair that kept only the file name turned into a path naming nothing"
+        );
+        // Two deep, and the real one this was found on: ShareX ships
+        // `exiftool_files\perl.exe`.
+        assert_eq!(
+            windowsapps_package_and_tail(&format!(
+                r"C:\Program Files\WindowsApps\{ITUNES}\exiftool_files\perl\perl.exe"
+            )),
+            Some((ITUNES, r"exiftool_files\perl\perl.exe".to_string()))
+        );
+        // Forward slashes, which Windows accepts and a vault field may hold.
+        // The tail is joined to a registry root that always uses `\`, so it is
+        // normalised rather than passed through.
+        assert_eq!(
+            windowsapps_package_and_tail(&format!(
+                "D:/Program Files/windowsapps/{ITUNES}/bin/iTunes.exe"
+            )),
+            Some((ITUNES, r"bin\iTunes.exe".to_string()))
+        );
+        // Positive control on the fixtures: the flat and the nested answers
+        // must DIFFER, or an assertion satisfied by `file_name_of` alone would
+        // read as an assertion about the tail.
+        let flat = windowsapps_package_and_tail(&format!(
+            r"C:\Program Files\WindowsApps\{ITUNES}\iTunes.exe"
+        ))
+        .map(|(_, tail)| tail);
+        let nested = windowsapps_package_and_tail(&format!(
+            r"C:\Program Files\WindowsApps\{ITUNES}\bin\iTunes.exe"
+        ))
+        .map(|(_, tail)| tail);
+        assert_ne!(
+            flat, nested,
+            "the two fixtures produce the same tail, so this test cannot tell a repair that \
+             keeps the subdirectory from one that drops it"
+        );
+    }
+
+    /// Nothing the package rejects may come back with a tail: a `Some` here is
+    /// a path that will be joined to a registry root and probed.
+    #[test]
+    fn a_path_with_no_file_below_the_package_has_no_tail() {
+        for dead in [
+            format!(r"C:\Program Files\WindowsApps\{ITUNES}\"),
+            format!(r"C:\Program Files\WindowsApps\{ITUNES}\bin\"),
+            format!(r"C:\Program Files\WindowsApps\{ITUNES}"),
+            r"C:\Program Files\WindowsApps\".to_string(),
+            r"C:\Windows\System32\notepad.exe".to_string(),
+        ] {
+            assert_eq!(windowsapps_package_and_tail(&dead), None, "{dead}");
+        }
     }
 
     #[test]
@@ -1204,6 +1313,117 @@ mod tests {
             true
         });
         answer
+    }
+
+    /// An installed Store package with an executable in a SUBDIRECTORY, as
+    /// `(package full name, install root, tail relative to that root)`.
+    ///
+    /// `an_installed_store_app` only ever `read_dir`s the package root, which
+    /// is why nothing covered the nested layout at all. This one descends,
+    /// bounded to two levels below the root -- deep enough for the real cases
+    /// (`exiftool_files\perl.exe`) and shallow enough not to walk a large
+    /// package. No icon requirement: what the test below asserts is the shape
+    /// of the repaired path, and demanding an icon would make it skip itself on
+    /// machines where the only nested exe is a helper binary with none.
+    fn an_installed_store_app_in_a_subdirectory() -> Option<(String, String, String)> {
+        fn find(dir: &std::path::Path, prefix: &str, depth: usize) -> Option<String> {
+            let entries = std::fs::read_dir(dir).ok()?;
+            let mut dirs = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Ok(kind) = entry.file_type() else { continue };
+                if kind.is_dir() {
+                    dirs.push((entry.path(), format!("{prefix}{name}\\")));
+                } else if !prefix.is_empty() && name.to_ascii_lowercase().ends_with(".exe") {
+                    return Some(format!("{prefix}{name}"));
+                }
+            }
+            if depth == 0 {
+                return None;
+            }
+            dirs.into_iter()
+                .find_map(|(path, prefix)| find(&path, &prefix, depth - 1))
+        }
+
+        let mut answer = None;
+        for_each_registered_package(|full_name, key| {
+            if package_full_name_parts(full_name).is_none() {
+                return true;
+            }
+            // SAFETY: `key` is the repository key the walker holds open.
+            let Some(root) = (unsafe { registry_string(key, full_name, "PackageRootFolder") })
+            else {
+                return true;
+            };
+            match find(std::path::Path::new(&root), "", 2) {
+                Some(tail) => {
+                    answer = Some((full_name.to_string(), root, tail));
+                    false
+                }
+                None => true,
+            }
+        });
+        answer
+    }
+
+    /// **The repair keeps the subdirectory, against a real installed package.**
+    ///
+    /// The pure fixtures above state the shape; this states that the shape is
+    /// what a live registry root plus a live nested executable produce, and
+    /// that the result is a path that EXISTS. Before the fix this asserted
+    /// nothing because no test descended into a package at all: the repaired
+    /// path named `<root>\perl.exe`, `Probe::file` stayed `None`, and the card
+    /// degraded to no icon while the label still read "ShareX" -- because the
+    /// label comes from the registry regardless of whether anything was found.
+    #[test]
+    fn an_expired_nested_store_path_is_relocated_with_its_subdirectory_intact() {
+        let Some((full_name, root, tail)) = an_installed_store_app_in_a_subdirectory() else {
+            return;
+        };
+        // The fixture really is nested, or this is the flat test again.
+        assert!(
+            tail.contains('\\'),
+            "the fixture executable is not in a subdirectory: {tail}"
+        );
+        let expired = expired_path(&full_name, &tail);
+        assert!(
+            std::fs::metadata(&expired).is_err(),
+            "the fixture must really be dead, or it proves nothing: {expired}"
+        );
+
+        let relocated = relocate_store_path(&expired);
+        assert!(
+            !relocated.is_empty(),
+            "{expired}\n  relocated onto nothing at all"
+        );
+        let wanted = format!(r"{}\{tail}", root.trim_end_matches('\\'));
+        assert!(
+            relocated.iter().any(|(p, _)| p.eq_ignore_ascii_case(&wanted)),
+            "{expired}\n  did not relocate onto {wanted}\n  got {relocated:?}"
+        );
+        // And the repaired path is REACHABLE, which is the whole point: the
+        // flattened one named a file that does not exist, so the probe found
+        // nothing and the card had no icon.
+        assert!(
+            relocated
+                .iter()
+                .any(|(p, _)| std::fs::metadata(p).is_ok()),
+            "every relocated candidate names a file that is not there, so the probe finds \
+             nothing and the card is left with no icon: {relocated:?}"
+        );
+        // The flattened answer the old code produced must NOT be among them --
+        // the negative control, so this cannot pass against a function that
+        // returns both.
+        let flattened = format!(
+            r"{}\{}",
+            root.trim_end_matches('\\'),
+            file_name_of(&tail).expect("the tail names a file")
+        );
+        assert_ne!(
+            flattened.to_ascii_lowercase(),
+            wanted.to_ascii_lowercase(),
+            "control: the flattened path and the correct one are different strings"
+        );
     }
 
     /// The path the user's item would hold after the app updated: the right

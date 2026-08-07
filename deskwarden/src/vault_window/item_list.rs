@@ -872,9 +872,20 @@ pub fn draw_item_list(
             // behaviour and the best reading of the state a screenshot catches.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                // Required by `scrollbar_in_gutter`: the reserved lane is
-                // what keeps the tiles one width, and egui only reserves it
-                // for a bar it is actually showing.
+                // Required by `scrollbar_in_gutter`: egui lays a bar's gutter
+                // out only for a bar it is actually showing, so on
+                // `VisibleWhenNeeded` the offsets that function sets have
+                // nothing to apply to on a frame where the pointer is away.
+                //
+                // **It is NOT here to keep the tiles one width any more.**
+                // `41e2e2e` gave that constraint up deliberately: the bar is
+                // drawn inside the list's 10pt padding, so it costs no layout
+                // at all and the tiles are the same width bar or no bar. The
+                // comment that used to be here said otherwise, which would have
+                // sent the next reader looking for a width that no longer
+                // depends on this. What is still true is that egui has to
+                // reserve and handle the lane at all, which is what this asks
+                // for; the fade is left to egui (see just above).
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show_rows(ui, ROW_TILE_HEIGHT, filtered.len(), |ui, row_range| {
                     for row in row_range {
