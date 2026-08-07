@@ -983,5 +983,26 @@ mod tests {
             !derive_line.contains(DERIVE),
             "BreachStatus derives Default: {derive_line:?}"
         );
+
+        // The derive is only one of the two spellings. A hand-written `impl
+        // Default for BreachStatus` produces exactly the same
+        // `unwrap_or_default()` hazard and the line-above check cannot see it,
+        // so forbid it in the production code too.
+        const HAND_WRITTEN: &str = concat!("impl Def", "ault for");
+        let production = this_module_production_code();
+        assert_strip_worked(&production);
+        let elsewhere_impl = crate_source_files()
+            .into_iter()
+            .filter(|(path, _)| path != "breach.rs")
+            .any(|(_, text)| text.contains(HAND_WRITTEN));
+        assert!(
+            elsewhere_impl,
+            "needle {HAND_WRITTEN:?} matches nothing in this crate, so asserting its absence \
+             here proves nothing"
+        );
+        assert!(
+            !production.contains(HAND_WRITTEN),
+            "breach.rs hand-writes a Default impl -- same hazard as the derive, different spelling"
+        );
     }
 }
