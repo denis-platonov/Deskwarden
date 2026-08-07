@@ -5631,6 +5631,59 @@ fn webbrowser_open(url: &str) {
     }
 }
 
+/// [`VaultFrameHandles::lost_session`] -- the one question a host that KEEPS
+/// the window has to ask while the frame is still running.
+#[cfg(test)]
+mod lost_session_tests {
+    use super::VaultFrameHandles;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Built by hand rather than by `build_frame`, which needs a real cache, a
+    /// real bridge and an icon directory. The fields are this module's, so this
+    /// is the one place a bare pair of flags can be handed to the accessor at
+    /// all.
+    fn handles(locked: bool, needs_reauth: bool) -> VaultFrameHandles {
+        VaultFrameHandles {
+            locked: Rc::new(RefCell::new(locked)),
+            needs_reauth: Rc::new(RefCell::new(needs_reauth)),
+            edited_settings: Rc::new(RefCell::new(None)),
+            switch_to: Rc::new(RefCell::new(None)),
+            add_account: Rc::new(RefCell::new(false)),
+            remove_account: Rc::new(RefCell::new(false)),
+            account_details: Rc::new(RefCell::new(None)),
+            last_geometry: Rc::new(RefCell::new(None)),
+            settings_path: None,
+        }
+    }
+
+    /// **Both flags, and either one alone.** `main`'s `vault_follow_up` runs
+    /// the same recovery for `locked` and for `needs_reauth`, and a host that
+    /// read only the first would leave a session invalidated out from under a
+    /// still-running `bw serve` on screen with the window behaving as though
+    /// nothing had happened -- the 401 case silently losing the fix that was
+    /// written for it.
+    #[test]
+    fn a_lost_session_is_either_flag_and_neither_is_dropped() {
+        assert!(
+            !handles(false, false).lost_session(),
+            "an ordinary vault session reports a lost one, so every close is caught as a lock \
+             and the window can never be closed at all"
+        );
+        assert!(
+            handles(true, false).lost_session(),
+            "the Lock button, CTRL+L and the auto-lock timer set `locked` and nothing else; \
+             unread, the lock is let go and the window closes -- the blink"
+        );
+        assert!(
+            handles(false, true).lost_session(),
+            "a write that came back 401 sets `needs_reauth` and nothing else; unread, an \
+             invalidated session stays on screen and nothing re-authenticates"
+        );
+        assert!(handles(true, true).lost_session());
+    }
+}
+
 #[cfg(test)]
 mod flag_reauth_if_unauthorized_tests {
     use super::{egui, flag_reauth_if_unauthorized};
@@ -14115,7 +14168,7 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 49,
+            modules, 50,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

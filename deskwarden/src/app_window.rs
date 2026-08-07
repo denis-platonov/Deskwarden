@@ -932,6 +932,19 @@ pub struct VaultSessionOutcome {
 /// its two steps on; like [`run`]'s `prepare` it must be `Send + 'static`,
 /// which is why the caller lifts the tray out of it rather than passing one.
 ///
+/// **One lock per session, and what the second one costs.** `teardown`,
+/// `build_sign_in` and `rebuild_vault` are all `FnOnce`, so a vault that is
+/// locked, re-signed-into and then locked AGAIN in the same window finds
+/// nothing left to run. What happens then is not a hang and not a skipped
+/// teardown: the second lock still leaves the vault stage, the working stage
+/// finds the step channel `Disconnected` -- the first worker dropped the only
+/// sender when it finished -- and `poll_working` ends the stage on the spot, so
+/// the window closes and the caller runs the recovery it has always run. The
+/// second lock therefore still locks; it blinks. That is a deliberate floor
+/// rather than an oversight: making the closures `FnMut` would mean a teardown
+/// worker per lock with no bound on how many are in flight against one parked
+/// estate, which is the multiple-owner shape the estate exists to remove.
+///
 /// `build_sign_in` and `rebuild_vault` both run on THIS thread. They are
 /// closures rather than parameters because both are lazy on purpose:
 /// `login_ui::build_login_frame` spawns a `bw status` of its own, and a vault
