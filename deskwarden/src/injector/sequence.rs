@@ -134,6 +134,46 @@ pub const DEFAULT_RATE: Duration = Duration::from_millis(3);
 /// common case (one password, one burst) costs exactly one extra check.
 pub const MAX_BURST: Duration = Duration::from_millis(250);
 
+/// What one `SendInput` call costs, charged by [`Step::projected`] on top of
+/// the sleep, once per UTF-16 unit typed and once per key press.
+///
+/// **Why it exists.** `RealKeyboard::type_text` makes a `SendInput` call per
+/// `encode_utf16` unit and `press_key` makes one per chord. While this was
+/// charged nothing, the projection was not an estimate of real time but a sum
+/// of the *sleeps* -- so a run with a small `rate` was projected at a fraction
+/// of what it takes, and the [`MAX_BURST`] gap between two foreground checks
+/// really was longer than the constant says. A run of key presses, which
+/// sleeps nowhere at all, was projected at exactly zero: free, at any length,
+/// against [`MAX_SEQUENCE`].
+///
+/// # Where the number comes from
+///
+/// It is measured, at a floor, and then rounded up -- and the measurement is
+/// deliberately of the one thing that can be measured without injecting
+/// anything into the user's desktop. `SendInput(0, NULL, sizeof(INPUT))`
+/// performs the full user32 stub and kernel transition and injects **no**
+/// input; 200,000 such calls averaged 7.8us each, against 5.0us each for an
+/// equally-marshalled call to `GetTickCount` in the same harness. The
+/// difference, ~2.8us, is `SendInput`'s own cost with the injection work
+/// removed.
+///
+/// A real call does strictly more than that: it builds an input packet, walks
+/// whatever low-level keyboard hook chain is installed, and posts to the raw
+/// input thread. So 2.8us is a **lower bound**, and a lower bound is the
+/// unsafe direction to charge. Ten microseconds is that floor rounded up by
+/// ~3.5x, which is the direction that is safe to be wrong in: over-charging
+/// makes [`MAX_BURST`] chunks *smaller* (more foreground checks, never fewer)
+/// and makes [`MAX_SEQUENCE`] refuse *sooner*.
+///
+/// It is still an estimate and is not claimed to be otherwise. What changed is
+/// that the estimate is no longer of zero, and no longer describes a call the
+/// keyboard provably makes as costing nothing.
+///
+/// At [`DEFAULT_RATE`] this is 0.3% of a keystroke and at [`MIN_RATE`] 1%, so
+/// it does not meaningfully shrink an ordinary fill; its whole effect is on
+/// the two cases where the sleep was small or absent.
+pub const SEND_INPUT_COST: Duration = Duration::from_micros(10);
+
 /// The floor a `{DELAY=n}` typing rate is clamped to.
 ///
 /// **Without it, `{DELAY=0}` switched both bounds off.** It parses cleanly --
@@ -144,37 +184,32 @@ pub const MAX_BURST: Duration = Duration::from_millis(250);
 /// `ZERO`, so [`MAX_SEQUENCE`] saw nothing at all. Both defences evaporated on
 /// a sequence a user can write by hand.
 ///
-/// # Why a floor here, when a key press is charged nothing
+/// # Why a floor here at all, now that the syscall is charged
 ///
-/// [`MAX_SEQUENCE`]'s doc refuses to charge a key press an invented constant,
-/// and that refusal still stands. The cases are not the same, and the
-/// difference is the whole justification for this constant.
+/// A `Step::Text` is the one place [`run`] cannot look inside, so its
+/// projection is the only thing standing between the user and an unbounded
+/// gap between two foreground checks. Charging it zero costs exactly that
+/// guarantee.
 ///
-/// A key press really is one `SendInput` with no sleep in it, and [`run`]
-/// re-verifies foreground before **every single one** -- so charging it zero
-/// costs no safety, only the accuracy of one sentence. A `Step::Text` is the
-/// opposite: it is the one place `run` cannot look inside, so its projection is
-/// the *only* thing standing between the user and an unbounded gap. Charging it
-/// zero costs exactly the guarantee.
+/// One millisecond is a floor, not a measurement, and it is wrong in the safe
+/// direction for both consumers: over-charging a keystroke makes [`MAX_BURST`]
+/// chunks *smaller* (more foreground checks, never fewer) and makes
+/// [`MAX_SEQUENCE`] refuse *sooner*.
 ///
-/// One millisecond is a floor, not a measurement, and **on the axis it is a
-/// floor for** it is wrong in the safe direction for both consumers:
-/// over-charging a keystroke makes [`MAX_BURST`] chunks *smaller* (more
-/// foreground checks, never fewer) and makes [`MAX_SEQUENCE`] refuse *sooner*.
+/// **This used to be the only thing under a zero rate, and it was not enough.**
+/// [`Step::projected`] charged a text unit its `rate` and nothing for the
+/// `SendInput` call that accompanies every one of them, so at **any** rate the
+/// real elapsed time of a burst exceeded its projection by roughly
+/// `units x syscall cost` -- at the tightest chunk, a few percent over the
+/// [`MAX_BURST`] gap rather than under it. That is now charged:
+/// [`SEND_INPUT_COST`] is added per unit, so the projection is an estimate of
+/// real elapsed time rather than a sum of sleeps, and this floor is a floor
+/// under the *sleep* alone.
 ///
-/// It is not, however, the only axis, and the claim used to be made without
-/// that qualification. [`Step::projected`] charges a text unit its `rate` and
-/// nothing for the `SendInput` call that accompanies every one of them, so at
-/// **any** rate the real elapsed time of a burst exceeds its projection by
-/// roughly `units x syscall cost`. At the tightest chunk that is a few percent
-/// over the [`MAX_BURST`] gap rather than under it. The bound is therefore
-/// approximate in the unsafe direction by a small constant factor, not exact;
-/// it is stated here rather than papered over, because the alternative is
-/// putting a measured syscall cost into a projection that has to stay a pure
-/// function of the plan. A rate of zero is not a rate
-/// anyone can deliver anyway -- `RealKeyboard::type_text` still makes a
-/// `SendInput` call per UTF-16 unit -- so this is a floor under a cost that
-/// provably exists, not a fiction about one that does not.
+/// The two constants are not redundant. Drop this floor and `{DELAY=0}` still
+/// projects at `SEND_INPUT_COST` per unit -- a hundredfold looser bound, and
+/// [`chunk_units`](TextRun::chunk_units) would hand back 25,000-unit chunks.
+/// Drop [`SEND_INPUT_COST`] and a key press is free again.
 ///
 /// Clamping rather than refusing, because `{DELAY=0}` is a legible request
 /// ("as fast as you can") and refusing a sequence that parses, for a reason
@@ -189,28 +224,29 @@ pub const MIN_RATE: Duration = Duration::from_millis(1);
 /// Microsoft 365 case is about three -- and far less than the hour a
 /// `{DELAY 3600000}` would ask for. See the module doc.
 ///
-/// # What this does not bound
+/// # How loosely it bounds a key-only sequence
 ///
-/// Key presses are charged nothing by [`Step::projected`], so a sequence of
-/// nothing but `{TAB}` and `{ENTER}` passes this check at any length. The
-/// bound is on typing and delays, not on step count, and the doc used to
-/// claim more than that.
+/// A key press used to be charged nothing at all, so a sequence of nothing but
+/// `{TAB}` and `{ENTER}` passed this check at any length: the bound was on
+/// typing and delays, not on step count, and the doc claimed more than that.
 ///
-/// This is a wrong claim rather than a hole in the defence, and the
-/// distinction is worth being exact about. The thing [`MAX_SEQUENCE`] exists
-/// to stop is a fill that stays *armed* -- a plaintext password sitting in
-/// memory while a `{DELAY 3600000}` runs down, and a foreground check that
-/// will eventually pass on some unrelated window. A run of bare key presses
-/// arms nothing: it carries no password, it sleeps nowhere, and [`run`]
-/// re-verifies foreground before every single one of them, so the user
-/// switching away stops it at the next key. It is the user's own authored
-/// sequence typing navigation keys into the window they aimed it at, quickly.
-///
-/// Charging a key some invented per-press constant would make the sentence
-/// "bounded at 60s" literally true at the cost of putting a fiction into
+/// It is now charged [`SEND_INPUT_COST`], which is what such a press really
+/// costs, so this bound does apply to key presses -- but only at
+/// 60s / 10us = six million of them. That is a real bound and a very loose
+/// one, and the looseness is the honest answer rather than a shortfall:
+/// charging a key some larger invented constant would make the sentence
+/// "bounded at 60s" bite sooner at the cost of putting a fiction into
 /// [`Step::projected`], which [`MAX_BURST`] chunking also depends on being an
-/// honest projection of real time. Correcting the claim is the cheaper and
-/// more truthful of the two.
+/// honest projection of real time.
+///
+/// The looseness costs little, because a key-only run is not what this
+/// constant defends against. The thing [`MAX_SEQUENCE`] exists to stop is a
+/// fill that stays *armed* -- a plaintext password sitting in memory while a
+/// `{DELAY 3600000}` runs down, and a foreground check that will eventually
+/// pass on some unrelated window. A run of bare key presses arms nothing: it
+/// carries no password, it sleeps nowhere, and [`run`] re-verifies foreground
+/// before every single one of them, so the user switching away stops it at the
+/// next key.
 pub const MAX_SEQUENCE: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
@@ -294,17 +330,28 @@ impl Step {
     /// `encode_utf16` unit, so an astral-plane character (emoji, CJK
     /// extension B) costs two pauses and not one. Counting `chars` here made
     /// every projection of such text exactly half its real duration.
+    ///
+    /// **Every `SendInput` call is charged [`SEND_INPUT_COST`] on top of the
+    /// sleep.** It used to be charged nothing, which made this a sum of sleeps
+    /// rather than a projection of real time: a burst at a small rate ran
+    /// past the [`MAX_BURST`] gap it was chunked to fit, and a run of key
+    /// presses -- which sleeps nowhere -- was projected at exactly zero and
+    /// so was free at any length against [`MAX_SEQUENCE`]. The keyboard makes
+    /// one such call per UTF-16 unit typed and one per chord pressed, so this
+    /// is a cost that provably exists; see the constant for how it is derived
+    /// and why it is deliberately rounded up.
     pub fn projected(&self) -> Duration {
         match self {
-            Self::Text { text, rate } => *rate * text.encode_utf16().count() as u32,
-            // **A key press is charged nothing, and that is a real gap in
-            // [`MAX_SEQUENCE`]'s bound** -- see that constant's doc. It is
-            // charged nothing rather than a made-up constant because its real
-            // cost genuinely is one `SendInput` batch with no sleep anywhere
-            // in it (`RealKeyboard::press_key` sends the whole chord in a
-            // single call and returns), and inventing a number here would put
-            // a fiction into the same function `MAX_BURST` chunking trusts.
-            Self::Key { .. } => Duration::ZERO,
+            // Per unit, not per step: `RealKeyboard::type_text` calls
+            // `SendInput` once for each `encode_utf16` unit, the same thing it
+            // sleeps `rate` for.
+            Self::Text { text, rate } => {
+                (*rate + SEND_INPUT_COST) * text.encode_utf16().count() as u32
+            }
+            // One call for the whole chord: `RealKeyboard::press_key` sends
+            // the down-and-up batch in a single `SendInput` and returns, with
+            // no sleep anywhere in it.
+            Self::Key { .. } => SEND_INPUT_COST,
             Self::Wait(d) => *d,
         }
     }
@@ -558,9 +605,17 @@ impl TextRun {
     /// how a burst projected at 249ms came to sleep 498ms of astral-plane
     /// text -- a half-second hole between two foreground checks, from a
     /// counter that was right for every character in the BMP.
+    ///
+    /// **The per-unit cost budgeted here is the one [`Step::projected`]
+    /// charges**, sleep plus [`SEND_INPUT_COST`], and not the sleep alone. The
+    /// two must agree or the chunks this produces do not satisfy the bound the
+    /// projection is then checked against: with the syscall uncharged here, a
+    /// chunk sized to 250ms of *sleep* took 250ms plus one syscall per unit,
+    /// so the gap between two foreground checks ran past [`MAX_BURST`] by a
+    /// few percent at the tightest rate.
     fn chunk_units(&self) -> usize {
-        let rate = self.rate.max(Duration::from_nanos(1));
-        (MAX_BURST.as_nanos() / rate.as_nanos()).max(1) as usize
+        let per_unit = self.rate.max(Duration::from_nanos(1)) + SEND_INPUT_COST;
+        (MAX_BURST.as_nanos() / per_unit.as_nanos()).max(1) as usize
     }
 
     fn flush(&mut self, out: &mut Vec<Step>) {
@@ -1041,10 +1096,11 @@ mod plan_tests {
         for step in p.steps() {
             let Step::Text { text, rate } = step else { continue };
             // What `plan` believes a step costs is what `type_text` will
-            // really sleep -- not a `chars()` projection of it.
+            // really spend -- one sleep AND one `SendInput` per UTF-16 unit,
+            // not a `chars()` projection of either.
             assert_eq!(
                 step.projected(),
-                *rate * text.encode_utf16().count() as u32,
+                (*rate + SEND_INPUT_COST) * text.encode_utf16().count() as u32,
                 "a step's projection is not the time the keyboard will really take"
             );
             assert!(
@@ -1138,25 +1194,38 @@ mod plan_tests {
         assert!(matches!(p, Err(Refusal::TooLong(_))), "{p:?}");
     }
 
-    /// **What [`MAX_SEQUENCE`] does not bound, pinned so it stays a decision.**
+    /// **How loosely [`MAX_SEQUENCE`] bounds a key-only sequence, pinned so it
+    /// stays a decision.**
     ///
-    /// A key press is charged `Duration::ZERO`, so a run of `{TAB}` passes the
-    /// total-time check at any length. That is deliberate -- see
-    /// [`MAX_SEQUENCE`]'s doc for why charging an invented constant would be
-    /// worse -- but it was previously only true by accident, and the doc
-    /// claimed otherwise. This test is what makes changing it a choice rather
-    /// than a surprise.
+    /// A key press used to be charged `Duration::ZERO`, so a run of `{TAB}`
+    /// passed the total-time check at any length -- the bound simply did not
+    /// apply to it. It is now charged [`SEND_INPUT_COST`], the real cost of the
+    /// one `SendInput` it makes, so the bound does apply; at 10us a press it
+    /// takes six million of them to reach 60s, which is loose but is what such
+    /// a run really costs.
     ///
-    /// It also pins the half that *is* bounded, so a future "charge keys
-    /// something" change cannot quietly stop bounding delays.
+    /// Both halves are asserted here so neither can drift: keys are charged
+    /// something rather than nothing, and delays are still bounded.
     #[test]
-    fn keys_are_charged_nothing_against_the_total_bound_but_delays_are() {
-        // Twenty thousand tab presses: hours of real typing, no projected
-        // cost, and it plans.
+    fn keys_are_charged_their_syscall_against_the_total_bound_and_delays_too() {
+        // Twenty thousand tab presses: charged, and far from the bound.
         let many_keys = "{TAB}".repeat(20_000);
         let p = plan(&parse(&many_keys), &values()).expect("a key-only sequence is not refused");
         assert_eq!(p.len(), 20_000, "the keys did not all become steps");
-        assert_eq!(p.projected(), Duration::ZERO, "a key press is charged nothing");
+        assert_eq!(
+            p.projected(),
+            SEND_INPUT_COST * 20_000,
+            "a key press must be charged the one SendInput it makes"
+        );
+        assert_ne!(
+            p.projected(),
+            Duration::ZERO,
+            "a key-only run is projected as free again, so MAX_SEQUENCE does not apply to it"
+        );
+        assert!(
+            p.projected() < MAX_SEQUENCE,
+            "twenty thousand presses is meant to be well inside the bound; the cost is wrong"
+        );
 
         // The bounded half, in the same test so the two claims cannot drift:
         // one delay past the limit is still refused.
@@ -1164,6 +1233,63 @@ mod plan_tests {
         assert!(
             matches!(plan(&parse(&too_long), &values()), Err(Refusal::TooLong(_))),
             "the delay half of the bound stopped working"
+        );
+    }
+
+    /// **Nothing the keyboard actually calls is projected as free.**
+    ///
+    /// The bound [`run`] types under is computed from [`Step::projected`], and
+    /// while that charged the sleep and nothing else, a step with no sleep in
+    /// it -- a key press, or a `Step::Text` at `rate == 0` -- was projected at
+    /// `Duration::ZERO` however much of it there was. A fill could therefore
+    /// spend unbounded real time between two foreground checks while believing
+    /// it was inside its budget, which is the window changing under a fill that
+    /// thinks it still owns it.
+    ///
+    /// `Step::Text { rate: ZERO }` is constructed directly rather than parsed,
+    /// because [`MIN_RATE`] clamps `{DELAY=0}` on the way through [`plan`] and
+    /// would hide exactly the case this is about. The clamp is a second,
+    /// independent defence and has its own test; this one is about the
+    /// projection standing on its own.
+    #[test]
+    fn a_zero_delay_run_is_not_projected_as_free() {
+        // Positive control on the instrument: the sleep half is still counted,
+        // so a zero below is a fact about the syscall charge and not about a
+        // projection that returns zero for everything.
+        assert_eq!(
+            Step::Wait(Duration::from_secs(7)).projected(),
+            Duration::from_secs(7),
+            "control: projected() no longer counts a delay either"
+        );
+
+        let free_text = Step::Text { text: "a".repeat(100_000), rate: Duration::ZERO };
+        assert_eq!(
+            free_text.projected(),
+            SEND_INPUT_COST * 100_000,
+            "a hundred thousand zero-delay units must be charged a hundred thousand syscalls"
+        );
+        assert!(
+            free_text.projected() > MAX_BURST,
+            "a zero-delay run of 100,000 characters is projected at {:?}, inside the burst \
+             bound -- so `run` would type all of it between two foreground checks",
+            free_text.projected()
+        );
+
+        let free_key = Step::Key { key: enter_key().expect("ENTER is typable"), mods: ModSet::default() };
+        assert_eq!(free_key.projected(), SEND_INPUT_COST, "a key press is free again");
+
+        // And the whole-plan sum, which is what `MAX_SEQUENCE` reads, carries
+        // it: a `Plan` of nothing but zero-delay steps is not projected at
+        // zero. Built through `plan` so the sum really is the one production
+        // checks; `{DELAY=1}` is the fastest rate that survives the clamp.
+        let p = plan(&parse("{DELAY=1}{PASSWORD}{TAB}"), &values())
+            .expect("a one-millisecond rate plans");
+        let units = values().password.encode_utf16().count() as u32;
+        assert!(units > 0, "control: the fixture password is empty, so this counts nothing");
+        assert_eq!(
+            p.projected(),
+            (MIN_RATE + SEND_INPUT_COST) * units + SEND_INPUT_COST,
+            "the plan's sum must carry the syscall charge for both the text and the key"
         );
     }
 
@@ -1202,11 +1328,13 @@ mod plan_tests {
             );
         }
 
-        // Half two: the projection `MAX_SEQUENCE` reads is no longer zero.
+        // Half two: the projection `MAX_SEQUENCE` reads is no longer zero --
+        // the floor rate for the sleep, plus the syscall that happens whether
+        // or not there is a sleep.
         assert_eq!(
             p.projected(),
-            MIN_RATE * 5_000,
-            "the run must be charged at the floor rate, not at nothing"
+            (MIN_RATE + SEND_INPUT_COST) * 5_000,
+            "the run must be charged at the floor rate plus its syscalls, not at nothing"
         );
 
         // The clamp is about time, not about text: nothing was dropped,
