@@ -252,7 +252,80 @@ pub struct AppMatchDraft {
     pub sequence_open: bool,
 }
 
+/// The `trigger` a binding created in this form is born with.
+///
+/// **A constant, not a choice**, and the same constant `picker_ui`'s
+/// `RETAINED_TRIGGER` is, for its reasons: the three-way Auto / Prompt / Hotkey
+/// control was removed from both windows because nothing in this build reads
+/// [`AppMatch::trigger`] -- what a matched foreground window does is the one
+/// global `settings::Settings::prompt_on_match`. The KEY is still written,
+/// because v0.5.0 has no `#[serde(default)]` on it and cannot parse an
+/// `AppMatch` that lacks it, so a binding this build creates must carry a
+/// value or a rollback would find the item unreadable.
+///
+/// `Prompt` rather than `Auto` because it is the value the other creation path
+/// already writes, so a binding made here and a binding made from the tray
+/// picker are byte for byte the same shape.
+const NEW_BINDING_TRIGGER: TriggerMode = TriggerMode::Prompt;
+
 impl AppMatchDraft {
+    /// A brand-new, empty binding -- what the "Add an app" button hands to
+    /// [`app_block`].
+    ///
+    /// **`bound: true`, and it is deliberate.** `bound` is not "has this draft
+    /// got values in it": it is the Remove flag (see the field's doc), and a
+    /// draft created `false` would open on the "this app will stop filling"
+    /// notice and an Undo button, which is a sentence about a binding that
+    /// never existed. `true` is what draws the block the user came for -- the
+    /// path box, Browse, the running-app list, the arguments and the
+    /// keystrokes -- and it is the SAME block an existing binding gets, which
+    /// is the point: there is one app block in this form, not an add one and
+    /// an edit one.
+    ///
+    /// What stops a click on Add from writing an empty binding to the vault is
+    /// [`Self::is_blank`], read by [`app_match_edit`] -- not a second `bool`
+    /// here, because a second bool would be a state the block would then have
+    /// to render differently and the two paths would diverge again.
+    pub fn unbound() -> Self {
+        Self {
+            bound: true,
+            process: String::new(),
+            title: String::new(),
+            hosted: false,
+            path: String::new(),
+            args: String::new(),
+            trigger: NEW_BINDING_TRIGGER,
+            picking: false,
+            windows: Vec::new(),
+            window_filter: String::new(),
+            sequence: String::new(),
+            previewing: false,
+            literal_draft: String::new(),
+            wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
+            sequence_open: false,
+        }
+    }
+
+    /// Whether this draft names no app at all -- the state
+    /// [`Self::unbound`] starts in and stays in until the user picks
+    /// something.
+    ///
+    /// **`process` is the field that decides it**, with `title` beside it for
+    /// the Store-app case where the process is the frame host and the title is
+    /// the identity. A binding is *matched on* `process`, so a match without
+    /// one can never fire; `path` is not consulted because a path with no file
+    /// name leaves `process` alone (see [`Self::set_path`]) and a draft holding
+    /// only `C:\` is still nothing.
+    ///
+    /// **No control in this form can turn a real binding blank.**
+    /// [`Self::set_path`] only ever *writes* `process`, and
+    /// [`Self::choose_window`] copies one off the row -- so this answering
+    /// `true` means the draft was created by the Add button and never filled
+    /// in, which is exactly the case [`app_match_edit`] must not write.
+    pub fn is_blank(&self) -> bool {
+        self.process.is_empty() && self.title.is_empty()
+    }
+
     pub fn from_match(m: &AppMatch) -> Self {
         Self {
             bound: true,
@@ -463,6 +536,16 @@ pub fn app_match_edit(existing: Option<&AppMatch>, draft: Option<&AppMatchDraft>
             Some(_) => AppMatchEdit::Remove,
             None => AppMatchEdit::Leave,
         };
+    }
+    if draft.is_blank() {
+        // The Add button was clicked and nothing was chosen. Writing here would
+        // put `{"process":""}` in the user's vault -- a binding that can never
+        // match and can never be launched -- on a form the user may have opened
+        // to rename the item. `Leave` and not `Remove`, because a blank draft
+        // is never one this form read off an item: see `AppMatchDraft::is_blank`
+        // for why no control can blank a real binding, and
+        // `clicking_add_and_choosing_nothing_writes_no_binding`.
+        return AppMatchEdit::Leave;
     }
     let wanted = draft.to_match();
     if existing == Some(&wanted) {
@@ -1329,6 +1412,26 @@ const APP_ARGS_STORE_APP: &str = APP_PATH_STORE_APP;
 
 const APP_WINDOW_LABEL: &str = "Window title";
 
+/// The button that creates a binding on an item that has none.
+///
+/// **This is the control the form was missing.** Until it existed the app block
+/// was drawn only inside `if let Some(app) = draft.app.as_mut()`, so the one
+/// place a user goes to change what an item does -- Edit -- could edit a
+/// binding and could remove a binding but could not make one. The only way to
+/// bind an item was the tray's "Add app..." picker
+/// (`picker_ui::run_picker`), a different window that writes straight to the
+/// vault, so on the edit form the feature was simply absent.
+pub const APP_ADD_BUTTON: &str = "Add an app\u{2026}";
+
+/// What the block says while the item is bound to nothing.
+///
+/// Says what a binding IS rather than naming the mechanism, the same way
+/// [`AppPathRow`]'s Store-app row refuses the word "hosted": the user's
+/// question here is "what would this do for me", not "what field is unset".
+pub const APP_NONE_NOTICE: &str =
+    "Nothing is bound yet. Point this item at a program and Deskwarden can open it and type \
+     into it.";
+
 const APP_REMOVED_NOTICE: &str =
     "This app will stop filling from this item when you save. Undo, or Cancel the edit, to keep \
      it.";
@@ -1965,6 +2068,34 @@ fn palette_button(label: &str) -> egui::Button<'static> {
         .wrap()
 }
 
+/// The app block's other state: **the item is bound to nothing yet**.
+///
+/// Returns `true` on the frame the user asks for a binding. The caller then
+/// puts an [`AppMatchDraft::unbound`] on the draft and every later frame draws
+/// [`app_block`] -- the same block, with the same boxes, the same running-app
+/// list and the same Remove, because a binding made here has to be the same
+/// thing a binding read off an item is.
+///
+/// **Three widgets and no more.** The obvious alternative -- open the
+/// running-app list immediately, so Add is one click instead of two -- was
+/// rejected twice over: it would enumerate every top-level window on the
+/// desktop (an `EnumWindows` walk with four Win32 calls per window, see
+/// [`AppMatchDraft::windows`]) as a side effect of merely *drawing* a form the
+/// user opened to rename something, and it would put a 180pt scrolled list
+/// into the middle of a form whose scroll viewport is already the thing three
+/// separate commits in this file have pushed a control out of. The user clicks
+/// Add, and then chooses.
+fn app_add_block(ui: &mut egui::Ui) -> bool {
+    theme::hairline(ui);
+    ui.add_space(10.0);
+    theme::field_label(ui, APP_BLOCK_HEADING);
+    ui.label(RichText::new(APP_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
+    ui.add_space(6.0);
+    let asked = theme::secondary_button(ui, APP_ADD_BUTTON).clicked();
+    ui.add_space(10.0);
+    asked
+}
+
 /// The whole app block. Returns an [`EditAction`] when it needs the caller to
 /// do something the form cannot (open the file dialog).
 fn app_block(
@@ -2481,8 +2612,13 @@ pub fn draw_detail_edit(
             // item, which is the same argument that puts the read pane's
             // `MATCHED APP` card last among the body cards.
             //
-            // Drawn only for an item that HAS a binding -- see `EditDraft::app`
-            // and `AppMatchDraft`.
+            // **Drawn in both states.** An item that HAS a binding gets the
+            // block that edits it; an item that has none gets the heading, a
+            // line saying so, and the button that makes one -- because a form
+            // that can only edit what is already there cannot answer "add an
+            // app", which is what this form is for. The read pane is the other
+            // way round and deliberately so: it shows the MATCHED APP card only
+            // when there is one, since there is nothing to add from there.
             // Built here, immediately before the block that reads them, and
             // dropped immediately after: `source` borrows the draft's own
             // user-name and password boxes (never a copy of either), and
@@ -2490,12 +2626,23 @@ pub fn draw_detail_edit(
             // like this. See `sequence_source`.
             let palette = sequence_palette(draft, item);
             let source = sequence_source(&draft.username, &draft.password, item, totp);
-            if let Some(app) = draft.app.as_mut() {
-                if let Some(requested) = app_block(ui, app, apps, &palette, &source) {
-                    action = requested;
+            match draft.app.as_mut() {
+                Some(app) => {
+                    if let Some(requested) = app_block(ui, app, apps, &palette, &source) {
+                        action = requested;
+                    }
                 }
-                ui.add_space(4.0);
+                // One assignment, and the block above draws it from the next
+                // frame on. Nothing is written to the vault by this click: the
+                // draft is blank until the user picks a program, and
+                // `app_match_edit` leaves a blank draft alone.
+                None => {
+                    if app_add_block(ui) {
+                        draft.app = Some(AppMatchDraft::unbound());
+                    }
+                }
             }
+            ui.add_space(4.0);
 
             theme::field_label(ui, "Folder");
             // Both the label and the rows read the *assignable* list, not the
@@ -2644,9 +2791,16 @@ mod tests {
     }
 
     #[test]
-    fn an_item_with_no_binding_gives_the_form_no_block() {
+    fn an_item_with_no_binding_gives_the_draft_no_binding_either() {
         // The positive control for the test above: `app` must not be `Some` for
-        // every item, which is what a block drawn unconditionally would need.
+        // every item, which is what a `from_item` inventing a draft would give.
+        //
+        // **This is about the DRAFT, not about what is drawn.** The form does
+        // draw an app section for an item with no binding -- the heading, the
+        // notice and the Add button (see
+        // `a_form_with_no_binding_offers_the_control_that_makes_one`) -- and
+        // the draft staying `None` until the user asks is exactly what keeps
+        // `app_match_edit` from touching the field on a save that did not.
         assert!(EditDraft::from_item(&item()).app.is_none());
     }
 
@@ -2813,6 +2967,101 @@ mod tests {
                 "the mechanism is not the fact: {text:?}"
             );
         }
+    }
+
+    // -- making a binding from nothing --------------------------------------
+
+    #[test]
+    fn clicking_add_and_choosing_nothing_writes_no_binding() {
+        // The whole risk the Add button introduces: a draft exists now where
+        // there used to be `None`, and `app_match_edit`'s old reading of
+        // `bound: true` was "write it". That would put `{"process":""}` --
+        // a binding that can never match -- onto an item whose name the user
+        // came to fix.
+        let fresh = AppMatchDraft::unbound();
+        assert!(fresh.is_blank(), "a fresh draft is supposed to name nothing: {fresh:?}");
+        assert_eq!(app_match_edit(None, Some(&fresh)), AppMatchEdit::Leave);
+        // ... and it does not silently unbind an item that DID have one
+        // either, which `Remove` would.
+        assert_eq!(app_match_edit(Some(&chrome_match()), Some(&fresh)), AppMatchEdit::Leave);
+    }
+
+    #[test]
+    fn a_binding_made_from_an_empty_draft_writes_the_moment_it_names_an_app() {
+        // The positive control for the test above. Without it, an
+        // `app_match_edit` that answered `Leave` for every draft born unbound
+        // would pass -- and the Add button would be a control that changes
+        // nothing, which is this crate's standing defect stated exactly.
+        let mut fresh = AppMatchDraft::unbound();
+        fresh.choose_window(&window_row("chrome.exe", false));
+        assert!(!fresh.is_blank());
+        assert_eq!(
+            app_match_edit(None, Some(&fresh)),
+            AppMatchEdit::Write(AppMatch {
+                process: "chrome.exe".to_string(),
+                title: String::new(),
+                hosted: false,
+                path: r"C:\Apps\chrome.exe".to_string(),
+                args: String::new(),
+                sequence: String::new(),
+                trigger: NEW_BINDING_TRIGGER,
+            })
+        );
+    }
+
+    #[test]
+    fn binding_an_app_from_an_empty_draft_produces_the_same_shape_as_editing_one() {
+        // The two paths must converge on ONE shape, because there is one app
+        // block and one `to_match`. The mutation this exists for is a second,
+        // parallel construction for the add case -- one that forgets to derive
+        // `process` from the row, or that drops the title on a Store app, or
+        // that invents a different `trigger`. Every such divergence is
+        // invisible to the widget tests, which only look at what is painted.
+        //
+        // The item being re-pointed carries NOTHING of its own beyond the app
+        // it names, deliberately: a fixture whose old binding already held the
+        // new one's arguments or sequence could not tell a shape that was
+        // rebuilt from a shape that was merely left alone.
+        let previous = AppMatch::for_process("olditem.exe", NEW_BINDING_TRIGGER);
+        let mut checked = 0;
+        for row in [
+            window_row("chrome.exe", false),
+            window_row("Speedtest.exe", true),
+        ] {
+            checked += 1;
+
+            let mut made = AppMatchDraft::unbound();
+            made.choose_window(&row);
+
+            let mut edited = AppMatchDraft::from_match(&previous);
+            edited.choose_window(&row);
+
+            assert_eq!(
+                made.to_match(),
+                edited.to_match(),
+                "binding {row:?} from an empty draft and re-pointing an existing binding at \
+                 the same row produced two different bindings -- the add path is not the \
+                 edit path"
+            );
+            // ... and the shape really is the row's, not an empty default that
+            // both paths agree on by producing nothing.
+            assert_eq!(made.to_match().process, row.exe_name);
+            assert_eq!(made.to_match().hosted, row.hosted);
+        }
+        assert_eq!(checked, 2, "the loop visited no rows, so it asserted nothing");
+    }
+
+    #[test]
+    fn a_binding_this_form_makes_carries_the_key_v0_5_0_cannot_parse_without() {
+        // `AppMatch::trigger` has no `#[serde(default)]`. A binding created
+        // here that omitted it, or that invented a mode the other creation
+        // path does not write, would be a rollback the user cannot read --
+        // see `NEW_BINDING_TRIGGER`.
+        let mut fresh = AppMatchDraft::unbound();
+        fresh.choose_window(&window_row("chrome.exe", false));
+        let json = fresh.to_match().to_field_value();
+        assert!(json.contains("\"trigger\""), "a new binding serializes without a trigger: {json}");
+        assert_eq!(fresh.to_match().trigger, TriggerMode::Prompt);
     }
 
     // -- what a save does ---------------------------------------------------
@@ -4494,19 +4743,183 @@ mod generator_row_tests {
         );
     }
 
+    /// **Replaces `a_form_with_no_binding_draws_no_app_block`, which had come
+    /// to describe the bug.** That test asserted the form drew NO app section
+    /// at all for an unbound item, which is exactly why the edit form could
+    /// not create a binding: the only way to get one was the tray's separate
+    /// "Add app..." picker. It was written as the positive control for
+    /// `the_form_draws_an_app_block_for_a_bound_item` -- so that a block drawn
+    /// unconditionally could not satisfy that test -- and this keeps that job
+    /// by asserting the two states are DIFFERENT, rather than that one of them
+    /// is empty.
     #[test]
-    fn a_form_with_no_binding_draws_no_app_block() {
-        // The positive control for the test above: without it, a block drawn
-        // unconditionally would satisfy it.
+    fn a_form_with_no_binding_offers_the_control_that_makes_one() {
+        let ctx = styled_context();
+        let mut draft = EditDraft::empty();
+        draft.name = "Ledgerline".to_string();
+        // The premise, first: this fixture really has no binding, so
+        // everything below is about the empty case and not about a draft that
+        // quietly carried one.
+        assert!(draft.app.is_none(), "the fixture is not an unbound draft");
+
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let strings = painted.strings();
+        let mut checked = 0;
+        for needle in [APP_BLOCK_HEADING, APP_NONE_NOTICE, APP_ADD_BUTTON] {
+            checked += 1;
+            assert!(
+                strings.contains(&needle),
+                "an item with no binding is not offered {needle:?}, so there is no way to \
+                 make one from the edit form: {strings:?}"
+            );
+        }
+        assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
+
+        // ... and it is the ADD state, not the edit block drawn over an empty
+        // draft. This is what keeps `the_form_draws_an_app_block_for_a_bound_item`
+        // meaningful: a block drawn unconditionally fails here.
+        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, "Remove app match", "Browse\u{2026}"] {
+            assert!(
+                !strings.contains(&absent),
+                "the editing control {absent:?} is drawn for an item bound to nothing: \
+                 {strings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_add_an_app_opens_the_same_block_an_existing_binding_gets() {
+        // Mutation this catches: `app_add_block` drawn but wired to nothing --
+        // a button that paints, highlights on hover, and leaves `draft.app`
+        // `None` for ever. Every pure test of `unbound`, `is_blank` and
+        // `app_match_edit` keeps passing while the control does nothing, which
+        // is this crate's standing defect.
+        let ctx = styled_context();
+        let mut draft = EditDraft::empty();
+        draft.name = "Ledgerline".to_string();
+        let (_, before) = frame(&ctx, &mut draft, &[]);
+        let button = before.rect_of(APP_ADD_BUTTON);
+
+        // Two frames: the click lands during the first, which has already
+        // painted the add control by the time the button reports it. The
+        // block it opened is what the SECOND frame draws.
+        let _ = frame(&ctx, &mut draft, &click(button.center()));
+        let (_, after) = frame(&ctx, &mut draft, &[]);
+        let app = draft.app.as_ref().expect("clicking Add did not create a draft binding");
+        // Blank, so a click and a Save writes nothing -- the pure half of that
+        // is `clicking_add_and_choosing_nothing_writes_no_binding`.
+        assert!(app.is_blank(), "clicking Add invented a binding: {app:?}");
+        // ...and the running-app list was NOT enumerated as a side effect of
+        // the click. See `app_add_block`'s doc: that is an `EnumWindows` walk.
+        assert!(!app.picking, "Add opened the window picker by itself");
+        assert!(app.windows.is_empty(), "Add enumerated the desktop's windows");
+
+        let strings = after.strings();
+        let mut checked = 0;
+        for needle in [
+            APP_BLOCK_HEADING,
+            APP_PATH_LABEL,
+            APP_ARGS_LABEL,
+            "Browse\u{2026}",
+            "Choose a running app\u{2026}",
+            "Remove app match",
+        ] {
+            checked += 1;
+            assert!(
+                strings.contains(&needle),
+                "after clicking Add the form does not offer {needle:?} -- the add path is \
+                 not the edit block: {strings:?}"
+            );
+        }
+        assert_eq!(checked, 6, "the loop visited nothing, so it asserted nothing");
+        assert!(
+            !strings.contains(&APP_ADD_BUTTON),
+            "the Add button is still drawn beside the block it opened: {strings:?}"
+        );
+    }
+
+    #[test]
+    fn a_click_that_misses_add_an_app_binds_nothing() {
+        // The positive control for the test above: without it, a form that
+        // created a binding on EVERY frame -- or on any click anywhere --
+        // would satisfy it.
         let ctx = styled_context();
         let mut draft = EditDraft::empty();
         draft.name = "Ledgerline".to_string();
         let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let button = painted.rect_of(APP_ADD_BUTTON);
+        let miss = Pos2::new(button.center().x, button.bottom() + 60.0);
         assert!(
-            !painted.strings().contains(&APP_BLOCK_HEADING),
-            "an unbound item was offered an app block: {:?}",
-            painted.strings()
+            !button.contains(miss),
+            "the miss is inside the button, so this test asserts nothing"
         );
+        let _ = frame(&ctx, &mut draft, &click(miss));
+        assert!(draft.app.is_none(), "a click that missed Add bound the item anyway");
+    }
+
+    #[test]
+    fn the_trigger_modes_are_still_gone() {
+        // A guard, not a feature test. The three Auto / Prompt / Hotkey pills
+        // were deliberately removed from this form (nothing in this build
+        // reads `AppMatch::trigger`; the behaviour is the one global
+        // "Prompt on match" setting), and the risk a NEW app control brings is
+        // that they come back with it -- a fresh binding is the one case where
+        // "which mode should this be?" looks like a question worth asking.
+        //
+        // Both states, because `the_edit_form_offers_no_autofill_trigger_control`
+        // above only ever looks at a form drawn from an existing binding: the
+        // add path and the block it opens are two more places a pill could be
+        // painted.
+        let ctx = styled_context();
+        let mut unbound = EditDraft::empty();
+        unbound.name = "Ledgerline".to_string();
+        let (_, before_add) = frame(&ctx, &mut unbound, &[]);
+        let button = before_add.rect_of(APP_ADD_BUTTON);
+        // Two frames -- the block the click opened is drawn by the second.
+        let _ = frame(&ctx, &mut unbound, &click(button.center()));
+        let (_, after_add) = frame(&ctx, &mut unbound, &[]);
+        assert!(
+            unbound.app.is_some(),
+            "Add did not open the block, so the second state below is the first one again"
+        );
+        // ...and the state below really is the block, not the add control
+        // again, which would make this a second copy of the first state.
+        assert!(
+            after_add.strings().contains(&"Remove app match"),
+            "the second state is not the opened block: {:?}",
+            after_add.strings()
+        );
+
+        let mut states = 0;
+        for (what, painted) in [("the add control", &before_add), ("a new binding", &after_add)] {
+            states += 1;
+            let strings = painted.strings();
+            // The premise: the app section really is on screen in this state,
+            // so every absence below is about the pills.
+            assert!(
+                strings.contains(&APP_BLOCK_HEADING),
+                "{what} draws no app section at all, so this state asserts nothing: \
+                 {strings:?}"
+            );
+            assert!(
+                !strings.contains(&"Autofill"),
+                "{what} draws the row the pills sat in: {strings:?}"
+            );
+            let mut modes = 0;
+            for mode in detail::TRIGGER_ORDER {
+                modes += 1;
+                assert!(
+                    !strings.contains(&detail::trigger_label(mode)),
+                    "{what} draws the {mode:?} pill: {strings:?}"
+                );
+                assert!(
+                    !strings.contains(&detail::trigger_caption(mode)),
+                    "{what} draws the {mode:?} caption: {strings:?}"
+                );
+            }
+            assert_eq!(modes, 3, "the mode loop visited nothing for {what}");
+        }
+        assert_eq!(states, 2, "the state loop visited nothing, so it asserted nothing");
     }
 
     #[test]
@@ -7230,6 +7643,200 @@ mod edit_pane_layout_tests {
                 pane.x
             );
         }
+    }
+
+    /// Every control an **empty** draft of `kind` must be offered.
+    ///
+    /// Built from the same sources the form draws from where there is one
+    /// (`identity_rows`, the block's own consts), so a field that is modelled
+    /// and drafted and then never offered cannot pass by both lists being
+    /// edited to agree.
+    fn expected_controls(kind: ItemKind) -> Vec<&'static str> {
+        // The three every kind gets: its name, the app section -- which is the
+        // gap this list exists for -- and its folder.
+        let mut expected = vec!["Name", APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
+        match kind {
+            ItemKind::Login => expected.extend(["Username", "Password", "Generate"]),
+            ItemKind::Card => expected.extend([
+                "Cardholder name",
+                "Brand",
+                "Number",
+                "Expiry month",
+                "Expiry year",
+                "Security code",
+            ]),
+            ItemKind::Identity => {
+                // The form's own row list, not a copy of it.
+                expected.extend(identity_rows(&mut IdentityDraft::default()).into_iter().map(
+                    |(label, _)| label,
+                ));
+            }
+            ItemKind::SecureNote => expected.push("Note"),
+            ItemKind::SshKey => expected.extend(["Private key", "Public key", "Fingerprint"]),
+            ItemKind::Unknown(_) => unreachable!("CREATABLE_KINDS holds no unknown kind"),
+        }
+        expected
+    }
+
+    /// **The user's ask, as a test: on a form with nothing filled in, every
+    /// control the kind supports is there.**
+    ///
+    /// The recorded gap was the app block, drawn only inside
+    /// `if let Some(app) = draft.app.as_mut()` -- so an item bound to nothing
+    /// had no way to bind anything, and the edit form could edit and remove a
+    /// binding it could not create. This asserts the whole list rather than
+    /// that one control, because the question the user asked was about the
+    /// form and not about the app.
+    ///
+    /// Three things make it bite rather than pass green:
+    ///
+    /// * the fixture is asserted EMPTY first -- a draft that arrived carrying
+    ///   an app, or a name, would prove the populated case again;
+    /// * the loop's visit count is asserted, and so is each kind's control
+    ///   count, because egui CULLS a shape entirely outside the screen rect --
+    ///   a control pushed out of the form comes back as *nothing*, and a loop
+    ///   over what was painted would simply not visit it;
+    /// * every rect found is checked with [`within_pane`], because a control
+    ///   that is painted and unreachable is the same defect as one that is
+    ///   missing. The pane is `MIN_PANE_WIDTH` for that reason -- the width is
+    ///   the axis this form cannot scroll.
+    #[test]
+    fn every_control_the_kind_supports_is_offered_even_on_an_empty_draft() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut kinds = 0;
+        for kind in CREATABLE_KINDS {
+            kinds += 1;
+            let mut draft = EditDraft::empty_of(kind);
+
+            // The fixture really is empty. Without this the test proves
+            // nothing about the empty case at all.
+            assert!(draft.app.is_none(), "{kind:?}'s fixture already carries a binding");
+            assert!(draft.name.is_empty(), "{kind:?}'s fixture already carries a name");
+            assert_eq!(draft.kind(), kind);
+
+            // `creating: true` -- an SSH key's fields can be created and
+            // cannot be edited (see `form_body`), so this is the mode in which
+            // every kind offers everything it has.
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let painted = frame(&ctx, pane, &mut draft, true, &[]);
+            let strings = painted.strings();
+
+            let expected = expected_controls(kind);
+            assert!(
+                expected.len() >= 5,
+                "{kind:?} expects only {} controls -- the expectation itself is empty",
+                expected.len()
+            );
+            let mut controls = 0;
+            for label in &expected {
+                controls += 1;
+                assert!(
+                    strings.contains(label),
+                    "a new {kind:?} is not offered {label:?}. egui culls a shape outside the \
+                     screen rect entirely, so a control pushed out of the form is painted as \
+                     NOTHING and reads exactly like this. Painted: {strings:?}"
+                );
+                let rects = painted.rects_of(label);
+                assert!(!rects.is_empty(), "{label:?} was found as a string but has no rect");
+                for rect in rects {
+                    assert!(
+                        within_pane(rect, pane),
+                        "{kind:?}'s {label:?} is painted at x = {}..{} on a {}pt-wide pane -- \
+                         this pane does not scroll horizontally, so the control is on screen \
+                         and out of reach",
+                        rect.left(),
+                        rect.right(),
+                        pane.x
+                    );
+                }
+            }
+            assert_eq!(
+                controls,
+                expected.len(),
+                "the control loop for {kind:?} did not visit every expected control"
+            );
+        }
+        assert_eq!(
+            kinds,
+            CREATABLE_KINDS.len(),
+            "the kind loop visited {kinds} kinds, so it did not assert about the form"
+        );
+        assert_eq!(kinds, 5, "CREATABLE_KINDS changed size -- this test's expectations have not");
+    }
+
+    /// **The Add button is not merely painted: it can be reached and clicked
+    /// at the app's minimum window size.**
+    ///
+    /// The separate test from the one above, and the reason is this file's
+    /// own history: three times a text or layout change has pushed a control
+    /// out of a scrolled pane, and the form's viewport at the minimum size is
+    /// a few hundred points. The loop above runs on a 4000pt pane where
+    /// nothing is culled, which answers "is it drawn" and says nothing about
+    /// "can the user get to it". This scrolls the real form to the bottom and
+    /// asks [`assert_inside`] -- rect AND glyphs, so a button squeezed to an
+    /// ellipsis fails too.
+    #[test]
+    fn the_add_an_app_button_is_reachable_at_the_minimum_window_size() {
+        let mut heights = 0;
+        // Both heights, and the SHORT one is what carries the test. Measured:
+        // an unbound login being created is 517pt of form, so at the app's
+        // real minimum (600) the add control is already on screen without
+        // scrolling -- which is the answer this test wants but not a case that
+        // exercises the viewport at all. `TINY_PANE_HEIGHT` is shorter than
+        // anything the window can be resized to, so there the control starts
+        // culled and only scrolling brings it back.
+        for height in [TINY_PANE_HEIGHT, MIN_PANE_HEIGHT] {
+            heights += 1;
+            let pane = egui::vec2(MIN_PANE_WIDTH, height);
+            let ctx = styled_context(pane);
+            // The tallest form that still has NO binding: a login being
+            // created, which is the only body with a generator row. Its app
+            // section is the add control, so this is the worst case for
+            // reaching it.
+            let mut draft = EditDraft::empty_of(ItemKind::Login);
+            assert!(draft.app.is_none(), "the fixture already carries a binding");
+
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let before = frame(&ctx, pane, &mut draft, true, &[]);
+            let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+            if height == TINY_PANE_HEIGHT {
+                // The control on the control: without this the scroll below
+                // could be a no-op on a form that already fits, and the test
+                // would say nothing about the viewport. "Not visible" is
+                // checked with `rects_of` and not `rect_of`, because egui
+                // culls a shape outside the screen rect and paints NOTHING.
+                assert!(
+                    !before.rects_of(APP_ADD_BUTTON).iter().any(|r| bounds.contains_rect(*r)),
+                    "the unbound form already fits a {}x{} pane, so this height is not \
+                     exercising scrolling at all",
+                    pane.x,
+                    pane.y
+                );
+            }
+
+            let middle = Pos2::new(pane.x / 2.0, pane.y / 2.0);
+            let scroll = vec![
+                egui::Event::PointerMoved(middle),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -4000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ];
+            let _ = frame(&ctx, pane, &mut draft, true, &scroll);
+            let after = frame(&ctx, pane, &mut draft, true, &[]);
+
+            assert_inside("the Add an app button", APP_ADD_BUTTON, pane, &after);
+            // ...and the notice above it, which is the sentence that says what
+            // the button is for. A button alone, with its explanation scrolled
+            // off, is the state `aae9429` shipped.
+            assert_inside("the unbound notice", APP_NONE_NOTICE, pane, &after);
+            // The action strip did not come with it.
+            assert_inside("Save", SAVE, pane, &after);
+        }
+        assert_eq!(heights, 2, "the height loop visited nothing, so it asserted nothing");
     }
 
     /// Inside the pane **on the axis the user cannot scroll**.
