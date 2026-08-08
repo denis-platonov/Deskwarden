@@ -96,6 +96,184 @@ pub struct SshKeyDraft {
     pub reveal_private_key: bool,
 }
 
+/// What this form may do with one element of [`VaultItem::fields`].
+///
+/// Bitwarden's custom fields carry a `type`: `0` text, `1` hidden, `2`
+/// boolean, `3` linked. This form offers boxes for the first two only, and
+/// **the other two are carried through untouched rather than converted**. A
+/// boolean is a checkbox whose wire value is the strings `"true"`/`"false"`,
+/// and a linked field's `value` is `null` with the real payload in `linkedId`
+/// -- putting either in a text box would let a save rewrite it into something
+/// the type no longer describes. That is the exact failure
+/// `vault_bridge::VaultField`'s own doc records happening on a real 1656-item
+/// vault, and this enum is what keeps this form from being a second cause of
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldRole {
+    /// `type: 0`, or no `type` at all. An ordinary box.
+    Text,
+    /// `type: 1`. A **secret**, drawn with the same masked box and reveal
+    /// toggle as the password -- see [`FieldDraft::reveal`].
+    Hidden,
+    /// A type this form has no editor for (boolean, linked, or a `type` this
+    /// build has never seen), or a field with no `name` to label it by.
+    /// Listed, so the user can see it is there and that the form left it
+    /// alone, and written back byte for byte from [`FieldDraft::original`].
+    Preserved,
+    /// A `deskwarden:`-prefixed field: ours, not the user's.
+    ///
+    /// **Not drawn at all**, matching `key_sequence::field_palette`, which
+    /// skips the same prefix so the keystroke builder never offers to type
+    /// our own bookkeeping. `deskwarden:app-match` already has a dedicated
+    /// editor further down this very form, and a second, raw one beside it
+    /// would let the two disagree -- a hand-typed `process` there and a
+    /// picked one in the app block, with whichever ran last winning.
+    ///
+    /// It still occupies a slot in [`EditDraft::fields`], and that is the
+    /// point: `vault_bridge::with_app_match` replaces the app-match field
+    /// **in place** precisely so saving does not reshuffle the user's own
+    /// fields, and a draft that dropped the slot would move it to the end on
+    /// the next save.
+    Internal,
+}
+
+/// One element of [`VaultItem::fields`], as the edit form holds it.
+///
+/// **Everything the server sent that this form does not model rides
+/// [`Self::original`]**, and the write in [`Self::to_field`] rebuilds only
+/// `name` and `value` on top of the original's `other` map -- the same
+/// "clone then overwrite what is known" rule `EditDraft::apply_to` and
+/// `vault_bridge::with_app_match` both follow. `type` and `linkedId` are in
+/// that map, which is how a hidden field stays hidden through an edit.
+#[derive(Debug, Clone)]
+pub struct FieldDraft {
+    pub name: String,
+    pub value: String,
+    /// Persistent reveal state for a [`FieldRole::Hidden`] field, for the
+    /// same reason [`EditDraft::reveal_password`] exists: a frame-local
+    /// `bool` resets every frame. Never consulted for the other roles.
+    pub reveal: bool,
+    role: FieldRole,
+    /// What arrived, or `None` for a field this form created.
+    ///
+    /// Private, and read only by [`Self::to_field`]: it is the byte-identity
+    /// guarantee, and a caller that could swap it could swap a hidden
+    /// field's `type` for a text one's.
+    original: Option<crate::vault_bridge::VaultField>,
+}
+
+/// The prefix that marks a custom field as Deskwarden's own bookkeeping.
+///
+/// The same test `key_sequence::field_palette` applies. Stated here as a
+/// `const` rather than a literal so the two cannot drift apart in silence;
+/// `the_editor_hides_the_same_prefix_the_palette_hides` holds them together.
+const OURS_PREFIX: &str = "deskwarden:";
+
+impl FieldDraft {
+    /// Reads one field off an item, deciding by its `type` what this form may
+    /// do with it.
+    ///
+    /// A missing `type` reads as text, which is what `bw` itself does with
+    /// the field this app writes when it creates one (see
+    /// `an_app_match_field_added_to_a_fresh_item_carries_no_extra_keys`) --
+    /// and reading it as `Preserved` instead would make a freshly bound
+    /// item's own field uneditable for one sync.
+    fn from_field(field: &crate::vault_bridge::VaultField) -> Self {
+        let name = field.name.clone().unwrap_or_default();
+        let role = if field.name.is_none() {
+            FieldRole::Preserved
+        } else if name.starts_with(OURS_PREFIX) {
+            FieldRole::Internal
+        } else {
+            match field.other.get("type") {
+                None => FieldRole::Text,
+                Some(t) if t == &serde_json::json!(0) => FieldRole::Text,
+                Some(t) if t == &serde_json::json!(1) => FieldRole::Hidden,
+                Some(_) => FieldRole::Preserved,
+            }
+        };
+        Self {
+            name,
+            value: drafted(field.value.as_deref()),
+            reveal: false,
+            role,
+            original: Some(field.clone()),
+        }
+    }
+
+    /// A field the user just asked for, of one of the two roles this form can
+    /// make.
+    ///
+    /// The new field carries an explicit `type`, unlike the freshly created
+    /// app-match field, and the difference is deliberate rather than an
+    /// inconsistency: `type` is *what the user chose*. A hidden field written
+    /// without it is a text field, and the secret the user typed into a box
+    /// labelled hidden would be visible in every Bitwarden client. Nothing
+    /// else is invented -- `linkedId` is not written, because nobody asked
+    /// for a linked field and it is not observed on a field `bw` has not
+    /// normalised yet.
+    fn new_of(role: FieldRole) -> Self {
+        Self {
+            name: String::new(),
+            value: String::new(),
+            reveal: false,
+            role,
+            original: None,
+        }
+    }
+
+    pub fn role(&self) -> FieldRole {
+        self.role
+    }
+
+    /// Whether this form draws boxes for this field.
+    fn is_editable(&self) -> bool {
+        matches!(self.role, FieldRole::Text | FieldRole::Hidden)
+    }
+
+    /// This draft as one element of the item's `fields` array.
+    ///
+    /// `Preserved` and `Internal` answer with exactly what arrived, so the
+    /// two roles this form cannot edit cost nothing to carry.
+    ///
+    /// The editable roles go through [`edited`], the same blank rule the rest
+    /// of this form uses: a box left empty on a field that arrived with no
+    /// `value` key writes no `value` key, so an untouched save is byte for
+    /// byte what was read.
+    fn to_field(&self) -> crate::vault_bridge::VaultField {
+        // The uneditable roles: whatever arrived, unchanged. There is always
+        // an original -- `new_of` only ever makes the two editable roles --
+        // and the fallback is written out rather than `unwrap()`ed because a
+        // panic in a save path is a worse answer than an honest empty field.
+        if !self.is_editable() {
+            return self.original.clone().unwrap_or(crate::vault_bridge::VaultField {
+                name: Some(self.name.clone()),
+                value: None,
+                other: serde_json::Map::new(),
+            });
+        }
+        let other = match &self.original {
+            Some(o) => o.other.clone(),
+            None => {
+                let mut other = serde_json::Map::new();
+                other.insert(
+                    "type".to_string(),
+                    serde_json::json!(if self.role == FieldRole::Hidden { 1 } else { 0 }),
+                );
+                other
+            }
+        };
+        crate::vault_bridge::VaultField {
+            // Always `Some`. A field that arrived with no `name` key at all
+            // is `FieldRole::Preserved` (see `from_field`) and has already
+            // returned above, so this cannot inject a `"name": ""` onto one.
+            name: Some(self.name.clone()),
+            value: edited(self.original.as_ref().and_then(|o| o.value.as_deref()), &self.value),
+            other,
+        }
+    }
+}
+
 /// One running window, as the edit form's process picker shows it.
 ///
 /// A plain, owned, `Clone` copy of the fields of
@@ -620,6 +798,23 @@ pub struct EditDraft {
     /// [`app_match_edit`] to leave the field alone entirely. See
     /// [`AppMatchDraft`].
     pub app: Option<AppMatchDraft>,
+    /// The item's custom fields, **all of them, in the item's own order**.
+    ///
+    /// Item-level, like `name`, `folder_id` and `app`, and not cleared by
+    /// [`Self::set_kind`]: a custom field can sit on an item of any type.
+    ///
+    /// Order is load-bearing. Bitwarden preserves and displays custom-field
+    /// order, and `fields` is a JSON *array*, so a draft that reordered them
+    /// would show up as a diff on every save -- which is exactly what
+    /// `vault_bridge::with_app_match` replaces its field in place to avoid.
+    /// This vector is built by walking the item once and written back by
+    /// walking itself once; nothing sorts, filters or partitions it.
+    ///
+    /// It holds the roles this form does not draw as well as the two it does
+    /// -- see [`FieldRole`]. That is what makes the walk order-preserving:
+    /// a `deskwarden:app-match` in the middle of the user's fields keeps its
+    /// slot because it is still in this list.
+    pub fields: Vec<FieldDraft>,
 }
 
 /// The generator's own form state: which kind of secret to make, and how big.
@@ -687,6 +882,7 @@ impl Default for EditDraft {
             note_body: String::new(),
             generator: GeneratorDraft::default(),
             app: None,
+            fields: Vec::new(),
         }
     }
 }
@@ -838,6 +1034,10 @@ impl EditDraft {
             // is bound or to what.
             app: crate::vault_bridge::extract_app_match(item)
                 .map(|m| AppMatchDraft::from_match(&m)),
+            // One walk, in the item's order, keeping every element --
+            // including the ones this form will not draw. See
+            // [`Self::fields`].
+            fields: item.fields.iter().map(FieldDraft::from_field).collect(),
         }
     }
 
@@ -897,6 +1097,12 @@ impl EditDraft {
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
         self.note_body = String::new();
+        // `fields` is deliberately NOT cleared, for exactly the reason `app`
+        // below is not: a custom field can sit on an item of ANY type, so it
+        // is item-level data like the name and the folder, and clearing it
+        // here would make flicking the type menu silently delete the user's
+        // custom fields.
+        //
         // `app` is deliberately NOT cleared either, and for a different
         // reason from `generator`'s: it is not kind-specific data at all. A
         // `deskwarden:app-match` is a custom field on the ITEM, exactly as
@@ -1079,6 +1285,24 @@ impl EditDraft {
             // to it.
             ItemKind::SshKey | ItemKind::Unknown(_) => {}
         }
+
+        // The custom fields. Item-level, like the name and the folder -- a
+        // custom field belongs to no type object -- but written **here**,
+        // after the `self.kind != ItemKind::of(item)` gate above, and
+        // deliberately so: a draft that disagrees with the item about its
+        // type is a draft built from a *different item*, and its field list
+        // is that other item's. Writing it would not merely disturb the
+        // fields, it would replace them. The gate leaves them alone, which is
+        // the same answer the app binding below already gets in that state.
+        //
+        // **One walk, in the draft's own order.** Nothing sorts, partitions
+        // or filters, because `fields` is a JSON array whose order Bitwarden
+        // shows the user -- see [`Self::fields`]. The `deskwarden:app-match`
+        // element rides through untouched and is then replaced *in place* by
+        // `apply_app_match_to`, which is the order that keeps a bound item's
+        // own fields where the user put them.
+        updated.fields = self.fields.iter().map(FieldDraft::to_field).collect();
+
         self.apply_app_match_to(item, updated)
     }
 
@@ -1376,6 +1600,154 @@ pub enum EditAction {
 /// transition the CLI ignores.
 pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
     folders.iter().filter(|folder| !sidebar::is_virtual_folder(folder)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// The edit form's custom-fields block.
+//
+// Same rule as the app block below: every decision is a pure function or a
+// method on `FieldDraft`, and the drawing does nothing but obey it.
+// ---------------------------------------------------------------------------
+
+/// The block's heading. Sentence case, like [`APP_BLOCK_HEADING`].
+pub const FIELDS_BLOCK_HEADING: &str = "Custom fields";
+
+/// Shown when the item has no field this form draws a row for.
+///
+/// "no custom fields **of its own**", because an item can be carrying a
+/// `deskwarden:app-match` and still show this line -- ours are not the
+/// user's, and the app block above is where that one is edited.
+pub const FIELDS_NONE_NOTICE: &str =
+    "This item has no custom fields of its own yet. Add one to store anything Bitwarden has no \
+     box for \u{2014} a PIN, a recovery code, an account number.";
+
+/// The two Add buttons. Two, rather than one button and a type combo box,
+/// because the choice is what the field IS and the user makes it once: a
+/// combo box that defaults to text is a hidden field one forgotten click away
+/// from being a visible one, and this form cannot change a field's type after
+/// the fact (see [`FieldRole`]).
+pub const FIELD_ADD_TEXT_BUTTON: &str = "Add a field\u{2026}";
+pub const FIELD_ADD_HIDDEN_BUTTON: &str = "Add a hidden field\u{2026}";
+
+/// A row's two labels, and its remove.
+pub const FIELD_NAME_LABEL: &str = "Field name";
+pub const FIELD_VALUE_LABEL: &str = "Value";
+/// The hidden row's value label says so, because the masked box alone looks
+/// exactly like a text box the user happens not to be able to read.
+pub const FIELD_HIDDEN_VALUE_LABEL: &str = "Hidden value";
+pub const FIELD_REMOVE_BUTTON: &str = "Remove field";
+
+/// What a [`FieldRole::Preserved`] row says instead of offering boxes.
+///
+/// It is *listed*, not hidden: a field the form silently omitted would look
+/// deleted, and the next thing the user would do is add it back by hand -- as
+/// a text field, losing the type this notice exists to protect.
+pub const FIELD_PRESERVED_NOTICE: &str =
+    "Deskwarden cannot edit this kind of field and leaves it exactly as it is. Change it in the \
+     Bitwarden web vault or app.";
+
+/// What the block says while an item is being **created**.
+///
+/// `vault_bridge::NewItem` has no `fields` payload, so a field typed into a
+/// create form would be silently discarded on Save -- the same failure
+/// `form_body` withholds an SSH key's boxes on an *edit* to avoid, in the
+/// other direction. Saying so is the honest form of not offering it.
+pub const FIELDS_CREATE_NOTICE: &str =
+    "Custom fields can be added once this item has been saved.";
+
+/// The custom-fields block. Returns nothing: every effect it has is on
+/// `fields`, which it owns for the duration of the call.
+fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating: bool) {
+    theme::hairline(ui);
+    ui.add_space(10.0);
+    theme::field_label(ui, FIELDS_BLOCK_HEADING);
+
+    if creating {
+        ui.label(RichText::new(FIELDS_CREATE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
+        ui.add_space(10.0);
+        return;
+    }
+
+    // `FieldRole::Internal` rows are drawn by nothing -- see that variant --
+    // so "has no fields" is about the rows the user can see, not about the
+    // vector's length.
+    if !fields.iter().any(|f| f.role != FieldRole::Internal) {
+        ui.label(RichText::new(FIELDS_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
+        ui.add_space(6.0);
+    }
+
+    // Collected, not removed inside the loop: removing while iterating by
+    // index is the classic off-by-one, and a row's index is also its
+    // `id_salt`, so a shifted list would hand one row the next row's widget
+    // state for a frame.
+    let mut remove: Option<usize> = None;
+    for (i, field) in fields.iter_mut().enumerate() {
+        match field.role {
+            FieldRole::Internal => continue,
+            FieldRole::Preserved => {
+                // Named by whatever the field calls itself, so the row is
+                // identifiable; a nameless one says so rather than drawing a
+                // blank label.
+                theme::field_label(
+                    ui,
+                    if field.name.is_empty() { "(unnamed field)" } else { &field.name },
+                );
+                ui.label(
+                    RichText::new(FIELD_PRESERVED_NOTICE).size(11.0).color(theme::TEXT_FAINT),
+                );
+                ui.add_space(10.0);
+            }
+            FieldRole::Text | FieldRole::Hidden => {
+                let hidden = field.role == FieldRole::Hidden;
+                theme::field_label(ui, FIELD_NAME_LABEL);
+                // `push_id`, because every row draws the same widgets: two
+                // boxes and a button. Without it egui gives all of them one
+                // id and the focus jumps between rows as the user types.
+                ui.push_id(("custom-field", i), |ui| {
+                    theme::text_field(ui, &mut field.name, false);
+                    ui.add_space(4.0);
+                    theme::field_label(
+                        ui,
+                        if hidden { FIELD_HIDDEN_VALUE_LABEL } else { FIELD_VALUE_LABEL },
+                    );
+                    // A hidden field is a secret and gets the password box --
+                    // masked, with the same reveal toggle. Round-tripping it
+                    // through a plain box would put it on screen for anyone
+                    // standing behind the user, which is most of what "hidden"
+                    // buys them.
+                    if hidden {
+                        theme::password_field(ui, &mut field.value, &mut field.reveal);
+                    } else {
+                        theme::text_field(ui, &mut field.value, false);
+                    }
+                    ui.add_space(4.0);
+                    if theme::secondary_button(ui, FIELD_REMOVE_BUTTON).clicked() {
+                        remove = Some(i);
+                    }
+                });
+                ui.add_space(10.0);
+            }
+        }
+    }
+    if let Some(i) = remove {
+        fields.remove(i);
+    }
+
+    // **Wrapped, not `horizontal`.** The two captions plus their padding are
+    // wider than the card at the app's minimum window size, and an unwrapped
+    // row does not shrink to fit -- it pushes the card past the pane and
+    // inflates every `available_width()` measured after it. That is
+    // `aae9429`'s defect, and the generator row above carries the same fix
+    // for the same reason.
+    ui.horizontal_wrapped(|ui| {
+        if theme::secondary_button(ui, FIELD_ADD_TEXT_BUTTON).clicked() {
+            fields.push(FieldDraft::new_of(FieldRole::Text));
+        }
+        if theme::secondary_button(ui, FIELD_ADD_HIDDEN_BUTTON).clicked() {
+            fields.push(FieldDraft::new_of(FieldRole::Hidden));
+        }
+    });
+    ui.add_space(10.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2607,6 +2979,12 @@ pub fn draw_detail_edit(
                 }
             }
 
+            // Between the kind's own boxes and the app block: a custom field
+            // is the user's own extra data about the item, so it belongs with
+            // the item's contents and above the section that is about what
+            // Deskwarden does with the item.
+            custom_fields_block(ui, &mut draft.fields, creating);
+
             // Between the kind's own fields and the folder, because a
             // binding is neither: it is about what Deskwarden does with this
             // item, which is the same argument that puts the read pane's
@@ -3484,6 +3862,316 @@ mod tests {
             let after = serde_json::to_value(&saved).unwrap();
             assert_eq!(before, after, "an unchanged edit altered a {:?}", ItemKind::of(&item));
         }
+    }
+
+    /// Every custom-field shape this form has to survive, on one item:
+    /// text, hidden, one of ours, boolean, linked (whose `value` really is
+    /// `null` and whose payload is `linkedId`), and one with **no `type` key
+    /// at all** -- the shape a field this app created wears until `bw`
+    /// normalises it.
+    ///
+    /// Six elements, in an order nothing may change.
+    const LOGIN_WITH_EVERY_FIELD_TYPE: &str = r#"{
+        "object":"item","id":"77777777-7777-7777-7777-777777777777","name":"Everything",
+        "type":1,"favorite":false,"reprompt":0,"key":"ITEMKEY",
+        "creationDate":"2026-01-02T03:04:05.000Z","revisionDate":"2026-02-03T04:05:06.000Z",
+        "attachments":null,"collectionIds":[],"passwordHistory":null,
+        "fields":[
+            {"name":"Account number","value":"12345","type":0,"linkedId":null},
+            {"name":"Recovery code","value":"s3cret","type":1,"linkedId":null},
+            {"name":"deskwarden:reserved","value":"ours","type":0,"linkedId":null},
+            {"name":"Paid up","value":"true","type":2,"linkedId":null},
+            {"name":"Linked user","value":null,"type":3,"linkedId":100},
+            {"name":"Legacy","value":"no type key"}
+        ],
+        "login":{"username":"u","password":"p"}
+    }"#;
+
+    fn field_names(item: &VaultItem) -> Vec<Option<&str>> {
+        item.fields.iter().map(|f| f.name.as_deref()).collect()
+    }
+
+    /// **The regression this whole feature most risks.** Before it, `apply_to`
+    /// never touched `fields` at all and preservation was free; now the draft
+    /// owns them, so an untouched save is a full rewrite that has to land on
+    /// the same bytes.
+    #[test]
+    fn an_item_whose_fields_are_untouched_writes_them_back_unchanged() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        // The premise, asserted rather than assumed: an item with no fields
+        // cannot demonstrate that no field was lost, and this test would pass
+        // green on one.
+        assert_eq!(item.fields.len(), 6, "the fixture has nothing to preserve");
+        assert!(
+            item.fields.iter().any(|f| f.other.get("type") == Some(&serde_json::json!(1))),
+            "the fixture carries no hidden field"
+        );
+
+        let draft = EditDraft::from_item(&item);
+        assert_eq!(draft.fields.len(), 6, "from_item dropped a field on the way in");
+        let saved = draft.apply_to(&item);
+
+        let before: serde_json::Value = serde_json::from_str(LOGIN_WITH_EVERY_FIELD_TYPE).unwrap();
+        assert_eq!(
+            before,
+            serde_json::to_value(&saved).unwrap(),
+            "an untouched save rewrote the item's custom fields"
+        );
+        // ...and the array's ORDER specifically, which the whole-value
+        // comparison above does cover but does not name. Bitwarden shows the
+        // user this order.
+        assert_eq!(
+            field_names(&saved),
+            vec![
+                Some("Account number"),
+                Some("Recovery code"),
+                Some("deskwarden:reserved"),
+                Some("Paid up"),
+                Some("Linked user"),
+                Some("Legacy"),
+            ]
+        );
+    }
+
+    /// The same, with a real `deskwarden:app-match` **in the middle** -- so
+    /// the field-list rewrite and `with_app_match`'s replace-in-place have to
+    /// agree, not merely each be right alone.
+    #[test]
+    fn saving_a_bound_item_does_not_reshuffle_the_users_own_fields() {
+        let mut item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let m = chrome_match();
+        item.fields.insert(
+            2,
+            crate::vault_bridge::VaultField {
+                name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
+                value: Some(m.to_field_value()),
+                other: serde_json::Map::new(),
+            },
+        );
+        assert!(
+            crate::vault_bridge::extract_app_match(&item).is_some(),
+            "the fixture's binding does not parse, so this proves nothing about a BOUND item"
+        );
+
+        let draft = EditDraft::from_item(&item);
+        assert!(draft.app.is_some(), "from_item did not read the binding");
+        let saved = draft.apply_to(&item);
+
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+            "saving a bound item disturbed something"
+        );
+        assert_eq!(
+            field_names(&saved)[2],
+            Some(crate::app_match::APP_MATCH_FIELD_NAME),
+            "the app-match field moved out of its slot"
+        );
+    }
+
+    /// **The type-preservation claim.** A hidden field is a secret; an edit
+    /// that wrote it back as `type: 0` would publish it to every Bitwarden
+    /// client, silently, which is the failure `VaultField`'s own doc records
+    /// happening on a real vault.
+    #[test]
+    fn a_hidden_field_stays_hidden_through_an_edit() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let mut draft = EditDraft::from_item(&item);
+
+        // The row really is drafted as a hidden one, and by its `type` -- not
+        // by its name or its position.
+        let hidden = draft.fields.iter().position(|f| f.name == "Recovery code").unwrap();
+        assert_eq!(draft.fields[hidden].role(), FieldRole::Hidden);
+        // And the neighbouring text field is NOT, so the assertion above is
+        // about the type and not about `from_field` answering `Hidden` for
+        // everything.
+        let text = draft.fields.iter().position(|f| f.name == "Account number").unwrap();
+        assert_eq!(draft.fields[text].role(), FieldRole::Text);
+
+        // Edit it, which is the case a preserved-untouched implementation
+        // would still pass: this changes the value and must keep the type.
+        draft.fields[hidden].value = "n3wsecret".into();
+        draft.name = "Everything (renamed)".into();
+        let saved = draft.apply_to(&item);
+
+        let value = serde_json::to_value(&saved).unwrap();
+        let field = value["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == serde_json::json!("Recovery code"))
+            .expect("the hidden field vanished");
+        assert_eq!(
+            field,
+            &serde_json::json!({
+                "name":"Recovery code","value":"n3wsecret","type":1,"linkedId":null
+            }),
+            "an edited hidden field did not come back as a hidden field"
+        );
+    }
+
+    /// The two types this form has no editor for are listed, refused, and
+    /// written back byte for byte -- **not flattened into text boxes**.
+    #[test]
+    fn a_field_type_the_form_cannot_edit_is_preserved_and_never_offered() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let draft = EditDraft::from_item(&item);
+
+        let roles: Vec<(&str, FieldRole)> =
+            draft.fields.iter().map(|f| (f.name.as_str(), f.role())).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ("Account number", FieldRole::Text),
+                ("Recovery code", FieldRole::Hidden),
+                ("deskwarden:reserved", FieldRole::Internal),
+                ("Paid up", FieldRole::Preserved),
+                ("Linked user", FieldRole::Preserved),
+                // No `type` key at all reads as text, which is what `bw` does
+                // with the field this app writes.
+                ("Legacy", FieldRole::Text),
+            ]
+        );
+
+        // A `Preserved` row's write ignores whatever is in its draft strings,
+        // which is what makes it safe to list it at all.
+        let mut vandal = draft.clone();
+        for field in vandal.fields.iter_mut().filter(|f| f.role() == FieldRole::Preserved) {
+            field.name = "clobbered".into();
+            field.value = "clobbered".into();
+        }
+        let saved = vandal.apply_to(&item);
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap()["fields"],
+            serde_json::from_str::<serde_json::Value>(LOGIN_WITH_EVERY_FIELD_TYPE).unwrap()
+                ["fields"],
+            "a field this form cannot edit was rewritten anyway"
+        );
+    }
+
+    /// A field added through the form reaches the item, carries the type the
+    /// button promised, and changes **nothing else**.
+    ///
+    /// "Byte identically" is the whole item either side of the one addition:
+    /// the before-value with the new element pushed onto its `fields` array
+    /// must be exactly what is written.
+    #[test]
+    fn a_custom_field_added_in_the_form_round_trips_byte_identically() {
+        for (role, wire_type) in [(FieldRole::Text, 0), (FieldRole::Hidden, 1)] {
+            let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+            let mut draft = EditDraft::from_item(&item);
+            // What the Add button does, and nothing else -- see
+            // `custom_fields_block`.
+            draft.fields.push(FieldDraft::new_of(role));
+            draft.fields.last_mut().unwrap().name = "PIN".into();
+            draft.fields.last_mut().unwrap().value = "4321".into();
+
+            let saved = draft.apply_to(&item);
+            let mut expected: serde_json::Value =
+                serde_json::from_str(LOGIN_WITH_EVERY_FIELD_TYPE).unwrap();
+            expected["fields"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":"PIN","value":"4321","type":wire_type
+            }));
+            assert_eq!(
+                expected,
+                serde_json::to_value(&saved).unwrap(),
+                "adding a {role:?} field changed more than the field it added"
+            );
+        }
+    }
+
+    /// A field the user added and then left blank is **still a field**.
+    ///
+    /// Its `value` goes out as `null`, which is not an omission but the shape
+    /// `VaultField` deliberately produces (that struct's doc records why the
+    /// two modelled keys carry no `skip_serializing_if`), and it is the same
+    /// shape a real linked field arrives in. The blank rule [`edited`] answers
+    /// `None` here because there was no previous value -- what must not
+    /// happen is the whole *element* going missing.
+    #[test]
+    fn a_new_field_left_empty_still_writes_a_field() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let mut draft = EditDraft::from_item(&item);
+        draft.fields.push(FieldDraft::new_of(FieldRole::Text));
+        draft.fields.last_mut().unwrap().name = "Empty".into();
+        let saved = draft.apply_to(&item);
+        assert_eq!(saved.fields.len(), 7, "the new field was dropped");
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap()["fields"][6],
+            serde_json::json!({"name":"Empty","value":null,"type":0}),
+            "an empty new field wrote a shape nobody asked for"
+        );
+    }
+
+    /// Removing a row removes **that** row and leaves the rest in order.
+    #[test]
+    fn removing_a_field_removes_exactly_that_field() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let mut draft = EditDraft::from_item(&item);
+        let at = draft.fields.iter().position(|f| f.name == "Account number").unwrap();
+        draft.fields.remove(at);
+        let saved = draft.apply_to(&item);
+        assert_eq!(
+            field_names(&saved),
+            vec![
+                Some("Recovery code"),
+                Some("deskwarden:reserved"),
+                Some("Paid up"),
+                Some("Linked user"),
+                Some("Legacy"),
+            ]
+        );
+    }
+
+    /// The editor and the keystroke palette hide the same prefix.
+    ///
+    /// Two lists of what counts as ours is how one of them starts offering
+    /// `deskwarden:app-match` as a field to type -- or, here, as a raw text
+    /// box beside the app block that already edits it.
+    #[test]
+    fn the_editor_hides_the_same_prefix_the_palette_hides() {
+        let item = parse(LOGIN_WITH_EVERY_FIELD_TYPE);
+        let draft = EditDraft::from_item(&item);
+        let hidden_from_editor: Vec<&str> = draft
+            .fields
+            .iter()
+            .filter(|f| f.role() == FieldRole::Internal)
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(hidden_from_editor, vec!["deskwarden:reserved"]);
+
+        let offered: Vec<String> = crate::key_sequence::field_palette(&item)
+            .into_iter()
+            .filter_map(|f| match f {
+                FieldRef::Custom(name) => Some(name),
+                _ => None,
+            })
+            .collect();
+        for name in &hidden_from_editor {
+            assert!(
+                !offered.contains(&name.to_string()),
+                "{name} is hidden from the editor but offered by the palette"
+            );
+        }
+        // The control: a field that is NOT ours is offered by both.
+        assert!(offered.contains(&"Account number".to_string()), "{offered:?}");
+        assert!(
+            draft.fields.iter().any(|f| f.name == "Account number" && f.is_editable()),
+            "an ordinary custom field is not editable"
+        );
+        assert_eq!(
+            OURS_PREFIX, "deskwarden:",
+            "the prefix moved; `key_sequence::field_palette` has its own copy"
+        );
+    }
+
+    /// Custom fields are item-level, like the name, the folder and the app
+    /// binding -- flicking the type menu must not delete them.
+    #[test]
+    fn switching_kind_keeps_the_custom_fields() {
+        let mut draft = EditDraft::from_item(&parse(LOGIN_WITH_EVERY_FIELD_TYPE));
+        draft.set_kind(ItemKind::Card);
+        assert_eq!(draft.fields.len(), 6, "changing the type menu deleted the custom fields");
     }
 
     #[test]
@@ -7651,13 +8339,29 @@ mod edit_pane_layout_tests {
     /// (`identity_rows`, the block's own consts), so a field that is modelled
     /// and drafted and then never offered cannot pass by both lists being
     /// edited to agree.
-    fn expected_controls(kind: ItemKind) -> Vec<&'static str> {
-        // The three every kind gets: its name, the app section -- which is the
-        // gap this list exists for -- and its folder.
-        let mut expected = vec!["Name", APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
-        match kind {
-            ItemKind::Login => expected.extend(["Username", "Password", "Generate"]),
-            ItemKind::Card => expected.extend([
+    fn expected_controls(kind: ItemKind, creating: bool) -> Vec<&'static str> {
+        // What every kind gets in both states: its name, the custom-fields
+        // section, the app section -- the two gaps this list exists for --
+        // and its folder.
+        let mut expected =
+            vec!["Name", FIELDS_BLOCK_HEADING, APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
+        if creating {
+            // `NewItem` has no `fields` payload, so the block says so instead
+            // of offering boxes whose contents Save would discard. The notice
+            // is asserted, not merely the absence of the buttons: "it says
+            // why" is the behaviour, and a block that drew nothing at all
+            // would pass an absence check.
+            expected.push(FIELDS_CREATE_NOTICE);
+        } else {
+            expected.extend([FIELD_ADD_TEXT_BUTTON, FIELD_ADD_HIDDEN_BUTTON]);
+        }
+        // Keyed off the form's OWN decision function rather than off `kind`,
+        // so an SSH key -- whose boxes exist on a create and are withheld on
+        // an edit -- is expected to offer exactly what `form_body` says and
+        // this list cannot drift from it.
+        match form_body(kind, creating) {
+            FormBody::Login => expected.extend(["Username", "Password", "Generate"]),
+            FormBody::Card => expected.extend([
                 "Cardholder name",
                 "Brand",
                 "Number",
@@ -7665,15 +8369,16 @@ mod edit_pane_layout_tests {
                 "Expiry year",
                 "Security code",
             ]),
-            ItemKind::Identity => {
+            FormBody::Identity => {
                 // The form's own row list, not a copy of it.
                 expected.extend(identity_rows(&mut IdentityDraft::default()).into_iter().map(
                     |(label, _)| label,
                 ));
             }
-            ItemKind::SecureNote => expected.push("Note"),
-            ItemKind::SshKey => expected.extend(["Private key", "Public key", "Fingerprint"]),
-            ItemKind::Unknown(_) => unreachable!("CREATABLE_KINDS holds no unknown kind"),
+            FormBody::Note => expected.push("Note"),
+            FormBody::SshKey => expected.extend(["Private key", "Public key", "Fingerprint"]),
+            // Name and folder only, both already in the list above.
+            FormBody::UneditableNotice => {}
         }
         expected
     }
@@ -7705,64 +8410,379 @@ mod edit_pane_layout_tests {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
         let ctx = styled_context(pane);
         let mut kinds = 0;
-        for kind in CREATABLE_KINDS {
-            kinds += 1;
-            let mut draft = EditDraft::empty_of(kind);
+        let mut states = 0;
+        // **Both states.** `creating: true` is the mode in which an SSH key's
+        // boxes are offered at all (see `form_body`); `creating: false` is
+        // the mode the user's ask names -- "On Edit" -- and it is the only
+        // one in which the custom-field controls exist, because
+        // `vault_bridge::NewItem` has no `fields` payload to carry them.
+        // Running one state only was how the second half of that ask stayed
+        // unnoticed.
+        for creating in [true, false] {
+            states += 1;
+            for kind in CREATABLE_KINDS {
+                kinds += 1;
+                let mut draft = EditDraft::empty_of(kind);
 
-            // The fixture really is empty. Without this the test proves
-            // nothing about the empty case at all.
-            assert!(draft.app.is_none(), "{kind:?}'s fixture already carries a binding");
-            assert!(draft.name.is_empty(), "{kind:?}'s fixture already carries a name");
-            assert_eq!(draft.kind(), kind);
-
-            // `creating: true` -- an SSH key's fields can be created and
-            // cannot be edited (see `form_body`), so this is the mode in which
-            // every kind offers everything it has.
-            let _ = frame(&ctx, pane, &mut draft, true, &[]);
-            let painted = frame(&ctx, pane, &mut draft, true, &[]);
-            let strings = painted.strings();
-
-            let expected = expected_controls(kind);
-            assert!(
-                expected.len() >= 5,
-                "{kind:?} expects only {} controls -- the expectation itself is empty",
-                expected.len()
-            );
-            let mut controls = 0;
-            for label in &expected {
-                controls += 1;
+                // The fixture really is empty. Without this the test proves
+                // nothing about the empty case at all.
+                assert!(draft.app.is_none(), "{kind:?}'s fixture already carries a binding");
+                assert!(draft.name.is_empty(), "{kind:?}'s fixture already carries a name");
                 assert!(
-                    strings.contains(label),
-                    "a new {kind:?} is not offered {label:?}. egui culls a shape outside the \
-                     screen rect entirely, so a control pushed out of the form is painted as \
-                     NOTHING and reads exactly like this. Painted: {strings:?}"
+                    draft.fields.is_empty(),
+                    "{kind:?}'s fixture already carries custom fields, so the block below is \
+                     being asked about a populated form"
                 );
-                let rects = painted.rects_of(label);
-                assert!(!rects.is_empty(), "{label:?} was found as a string but has no rect");
-                for rect in rects {
+                assert_eq!(draft.kind(), kind);
+
+                let _ = frame(&ctx, pane, &mut draft, creating, &[]);
+                let painted = frame(&ctx, pane, &mut draft, creating, &[]);
+                let strings = painted.strings();
+
+                let expected = expected_controls(kind, creating);
+                assert!(
+                    expected.len() >= 6,
+                    "{kind:?} expects only {} controls -- the expectation itself is empty",
+                    expected.len()
+                );
+                let mut controls = 0;
+                for label in &expected {
+                    controls += 1;
                     assert!(
-                        within_pane(rect, pane),
-                        "{kind:?}'s {label:?} is painted at x = {}..{} on a {}pt-wide pane -- \
-                         this pane does not scroll horizontally, so the control is on screen \
-                         and out of reach",
-                        rect.left(),
-                        rect.right(),
-                        pane.x
+                        strings.contains(label),
+                        "a {kind:?} (creating: {creating}) is not offered {label:?}. egui culls \
+                         a shape outside the screen rect entirely, so a control pushed out of \
+                         the form is painted as NOTHING and reads exactly like this. Painted: \
+                         {strings:?}"
                     );
+                    let rects = painted.rects_of(label);
+                    assert!(!rects.is_empty(), "{label:?} was found as a string but has no rect");
+                    for rect in rects {
+                        assert!(
+                            within_pane(rect, pane),
+                            "{kind:?}'s {label:?} is painted at x = {}..{} on a {}pt-wide pane \
+                             -- this pane does not scroll horizontally, so the control is on \
+                             screen and out of reach",
+                            rect.left(),
+                            rect.right(),
+                            pane.x
+                        );
+                    }
                 }
+                assert_eq!(
+                    controls,
+                    expected.len(),
+                    "the control loop for {kind:?} did not visit every expected control"
+                );
             }
-            assert_eq!(
-                controls,
-                expected.len(),
-                "the control loop for {kind:?} did not visit every expected control"
-            );
         }
+        assert_eq!(states, 2, "the state loop visited {states} states");
         assert_eq!(
             kinds,
-            CREATABLE_KINDS.len(),
+            CREATABLE_KINDS.len() * 2,
             "the kind loop visited {kinds} kinds, so it did not assert about the form"
         );
-        assert_eq!(kinds, 5, "CREATABLE_KINDS changed size -- this test's expectations have not");
+        assert_eq!(
+            kinds, 10,
+            "CREATABLE_KINDS changed size -- this test's expectations have not"
+        );
+    }
+
+    /// **The Add buttons are wired to the draft, not merely painted.**
+    ///
+    /// `9dcee36` recorded the exact shape of the defect this catches: a
+    /// control drawn and connected to nothing passes every presence and
+    /// in-pane assertion above. This clicks each button on a real frame and
+    /// reads the draft.
+    #[test]
+    fn the_add_field_buttons_put_a_field_of_the_promised_type_on_the_draft() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut cases = 0;
+        for (button, expected) in
+            [(FIELD_ADD_TEXT_BUTTON, FieldRole::Text), (FIELD_ADD_HIDDEN_BUTTON, FieldRole::Hidden)]
+        {
+            cases += 1;
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::empty_of(ItemKind::Login);
+            assert!(draft.fields.is_empty(), "the fixture already carries a field");
+
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            let at = painted.rect_of(button).center();
+            let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+
+            assert_eq!(
+                draft.fields.len(),
+                1,
+                "clicking {button:?} did not reach the draft -- the control is painted and \
+                 connected to nothing"
+            );
+            assert_eq!(
+                draft.fields[0].role(),
+                expected,
+                "{button:?} made a field of the wrong type"
+            );
+        }
+        assert_eq!(cases, 2, "the button loop asserted about nothing");
+    }
+
+    /// **The remove control is wired too, and removes the row it is on.**
+    ///
+    /// Two rows, because a remove that always takes the last one -- or the
+    /// first -- passes a one-row test.
+    #[test]
+    fn removing_a_field_row_takes_that_row_and_no_other() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        for name in ["first", "second", "third"] {
+            let mut field = FieldDraft::new_of(FieldRole::Text);
+            field.name = name.to_string();
+            draft.fields.push(field);
+        }
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let removes = painted.rects_of(FIELD_REMOVE_BUTTON);
+        assert_eq!(removes.len(), 3, "three rows must draw three removes, found {removes:?}");
+        // The MIDDLE one, which is the only index a hardcoded first-or-last
+        // remove cannot get right by accident.
+        let at = removes[1].center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+
+        let names: Vec<&str> = draft.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["first", "third"], "the wrong row was removed");
+    }
+
+    /// Scrolls the form down in 20pt steps until `label` is drawn **wholly
+    /// inside** the pane, and answers with that frame.
+    ///
+    /// Steps rather than one large wheel event, because a control in the
+    /// MIDDLE of the form is passed by a scroll to the bottom -- and a
+    /// control that has been scrolled past is culled and paints nothing,
+    /// which reads exactly like a control that was never drawn. Twenty
+    /// points, so the frame returned is one where the label has only just
+    /// come into view and everything a row or two above it is in view too.
+    ///
+    /// Fails naming what WAS painted, rather than looping forever, if the
+    /// label never arrives -- which is the report when a control really has
+    /// been pushed out of reach.
+    fn scroll_to_reveal(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        label: &str,
+    ) -> Painted {
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        let middle = Pos2::new(pane.x / 2.0, pane.y / 2.0);
+        // Enough steps to cross a form far taller than any this app draws:
+        // 300 * 20pt = 6000pt.
+        for _ in 0..300 {
+            let painted = frame(ctx, pane, draft, false, &[]);
+            if painted.rects_of(label).iter().any(|r| bounds.contains_rect(*r)) {
+                return painted;
+            }
+            let _ = frame(
+                ctx,
+                pane,
+                draft,
+                false,
+                &[
+                    egui::Event::PointerMoved(middle),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -20.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ],
+            );
+        }
+        let painted = frame(ctx, pane, draft, false, &[]);
+        panic!(
+            "{label:?} never came into a {}x{} pane however far the form was scrolled -- it is \
+             out of reach. Painted at the bottom: {:?}",
+            pane.x,
+            pane.y,
+            painted.strings()
+        );
+    }
+
+    /// A full press-and-release, which is what egui needs before it will
+    /// report `Response::clicked` -- a press alone is not a click.
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// **The custom-field controls can be reached and clicked at the app's
+    /// minimum window size, and stay reachable as rows are added.**
+    ///
+    /// The same shape as `the_add_an_app_button_is_reachable_at_the_minimum_window_size`
+    /// and for the same recorded reason -- three times a layout change in
+    /// this file has pushed a control out of a scrolled pane. The second half
+    /// is what this block adds to that risk: the number of rows is not fixed,
+    /// so the Add buttons move down the form every time the user uses one.
+    ///
+    /// The short case asserts the buttons start CULLED, so the scroll below
+    /// cannot be a no-op on a form that already fits.
+    #[test]
+    fn the_custom_field_controls_are_reachable_at_the_minimum_window_size() {
+        let mut cases = 0;
+        for rows in [0usize, 6] {
+            for height in [TINY_PANE_HEIGHT, MIN_PANE_HEIGHT] {
+                cases += 1;
+                let pane = egui::vec2(MIN_PANE_WIDTH, height);
+                let ctx = styled_context(pane);
+                // A login being edited: the body with the most rows above the
+                // block, so this is the worst case for reaching it.
+                let mut draft = EditDraft::empty_of(ItemKind::Login);
+                for i in 0..rows {
+                    let mut field = FieldDraft::new_of(FieldRole::Text);
+                    field.name = format!("field {i}");
+                    draft.fields.push(field);
+                }
+                assert_eq!(draft.fields.len(), rows, "the fixture is not the size asked for");
+
+                let _ = frame(&ctx, pane, &mut draft, false, &[]);
+                let before = frame(&ctx, pane, &mut draft, false, &[]);
+                let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+                // The row count itself, asserted before anything else is read
+                // off the frame: egui culls a shape outside the screen rect
+                // and paints NOTHING, so a form whose rows were pushed off
+                // the pane reads as a form with no rows -- and every loop
+                // below would then be a loop over nothing.
+                if height == TINY_PANE_HEIGHT {
+                    assert!(
+                        !before
+                            .rects_of(FIELD_ADD_HIDDEN_BUTTON)
+                            .iter()
+                            .any(|r| bounds.contains_rect(*r)),
+                        "the form with {rows} custom fields already fits a {}x{} pane, so this \
+                         case is not exercising scrolling at all",
+                        pane.x,
+                        pane.y
+                    );
+                }
+
+                // Scrolled in steps, not slammed to the bottom: this block
+                // sits ABOVE the app block, so a single -8000 wheel event
+                // takes it straight off the TOP of the viewport and would
+                // report it unreachable when it is merely passed. The user
+                // scrolls in steps too.
+                let after = scroll_to_reveal(&ctx, pane, &mut draft, FIELD_ADD_HIDDEN_BUTTON);
+
+                assert_inside("the Add a field button", FIELD_ADD_TEXT_BUTTON, pane, &after);
+                assert_inside(
+                    "the Add a hidden field button",
+                    FIELD_ADD_HIDDEN_BUTTON,
+                    pane,
+                    &after,
+                );
+                // The action strip did not come with it.
+                assert_inside("Save", SAVE, pane, &after);
+            }
+        }
+        assert_eq!(cases, 4, "the case loop visited nothing, so it asserted nothing");
+    }
+
+    /// **A field row's own boxes are reachable at the minimum window size.**
+    ///
+    /// The buttons above are the bottom of the block and would still be
+    /// reachable if every row between them and the heading were painted off
+    /// the right-hand edge -- the axis this pane cannot scroll.
+    #[test]
+    fn a_custom_field_rows_boxes_are_reachable_at_the_minimum_window_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        let mut text = FieldDraft::new_of(FieldRole::Text);
+        text.name = "Account number".into();
+        let mut hidden = FieldDraft::new_of(FieldRole::Hidden);
+        hidden.name = "Recovery code".into();
+        draft.fields.push(text);
+        draft.fields.push(hidden);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        // The premise: two rows really were drawn. A culled row paints
+        // nothing, and the loop below would then be silent.
+        assert_eq!(
+            painted.rects_of(FIELD_NAME_LABEL).len(),
+            2,
+            "two rows did not draw two name labels: {:?}",
+            painted.strings()
+        );
+        assert_eq!(painted.rects_of(FIELD_VALUE_LABEL).len(), 1, "the text row's value label");
+        assert_eq!(
+            painted.rects_of(FIELD_HIDDEN_VALUE_LABEL).len(),
+            1,
+            "the hidden row must say it is hidden -- a masked box alone looks like a text box"
+        );
+
+        let mut checked = 0;
+        for label in [FIELD_NAME_LABEL, FIELD_VALUE_LABEL, FIELD_HIDDEN_VALUE_LABEL] {
+            for rect in painted.rects_of(label) {
+                checked += 1;
+                assert!(
+                    within_pane(rect, pane),
+                    "{label:?} is painted at x = {}..{} on a {}pt-wide pane",
+                    rect.left(),
+                    rect.right(),
+                    pane.x
+                );
+            }
+        }
+        assert_eq!(checked, 4, "the row loop visited {checked} labels");
+    }
+
+    /// **A hidden field's value is masked, and a text field's is not.**
+    ///
+    /// Both halves, because the first alone is satisfied by a form that
+    /// paints no values at all -- which is what a culled block looks like.
+    #[test]
+    fn a_hidden_fields_value_is_masked_and_a_text_fields_is_not() {
+        const SECRET: &str = "recovery-s3cret";
+        const PLAIN: &str = "account-12345";
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        let mut text = FieldDraft::new_of(FieldRole::Text);
+        text.name = "Account number".into();
+        text.value = PLAIN.into();
+        let mut hidden = FieldDraft::new_of(FieldRole::Hidden);
+        hidden.name = "Recovery code".into();
+        hidden.value = SECRET.into();
+        draft.fields.push(text);
+        draft.fields.push(hidden);
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        let strings = painted.strings();
+
+        assert!(
+            strings.iter().any(|s| s.contains(PLAIN)),
+            "the ordinary field's value is not on screen either, so the mask assertion below \
+             would pass on a block that painted nothing: {strings:?}"
+        );
+        assert!(
+            !strings.iter().any(|s| s.contains(SECRET)),
+            "a hidden custom field's value is painted in the clear: {strings:?}"
+        );
     }
 
     /// **The Add button is not merely painted: it can be reached and clicked
