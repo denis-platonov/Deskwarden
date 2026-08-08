@@ -7623,6 +7623,101 @@ mod tests {
         );
     }
 
+    /// **`masked_row` itself, called with nothing to hide, allocates nothing
+    /// at all.**
+    ///
+    /// This exists because deleting `masked_row`'s own guard left all 1828
+    /// tests green. Every caller gates the row on `masked_row_visible` too --
+    /// it has to, because the hairline above the row goes with the row -- so
+    /// no pane test can reach the function with an empty value, and the rule
+    /// inside it was unreachable code that a mutant could delete for free.
+    /// That is this file's standing defect exactly: a change correct in
+    /// isolation that does not reach the behaviour it claims.
+    ///
+    /// So the function is called DIRECTLY, on a bare `Ui`, with no caller to
+    /// have already decided. What is measured is the height the row took and
+    /// the strings it painted -- not a flag it returned.
+    #[test]
+    fn masked_row_lays_out_nothing_at_all_for_an_empty_value() {
+        // (value, expected rows painted) -- the negative and its control, in
+        // one loop over one harness, so neither can pass on a difference in
+        // how it was set up.
+        let mut checked = 0;
+        let mut heights = Vec::new();
+        for (value, should_draw) in [("", false), ("hunter2", true)] {
+            checked += 1;
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(PANE, PANE),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input.clone(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input.clone(), |_ui| {});
+
+            let mut taken = 0.0;
+            let mut revealed = false;
+            let mut action = DetailAction::None;
+            let output = ctx.run_ui(input, |ui| {
+                let before = ui.min_rect().height();
+                masked_row(
+                    ui,
+                    "Password",
+                    value,
+                    &mut revealed,
+                    &mut action,
+                    DetailAction::CopyPassword,
+                    Some(CopyShortcut::Password),
+                );
+                taken = ui.min_rect().height() - before;
+            });
+            let all =
+                egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+            let mut texts = Vec::new();
+            collect_text_rects(&all, &mut texts);
+            let strings: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+            let eyes = theme::icon_probe::eyes(&all);
+            heights.push(taken);
+
+            if should_draw {
+                assert!(
+                    strings.contains(&"Password"),
+                    "a real value drew no label: {strings:?}"
+                );
+                assert!(
+                    strings.contains(&"\u{2022}".repeat(MASKED_BULLETS).as_str()),
+                    "a real value drew no {MASKED_BULLETS}-bullet mask: {strings:?}"
+                );
+                assert_eq!(eyes.len(), 1, "a real value offers no reveal eye");
+                assert!(taken > 0.0, "a real value took no vertical space at all");
+            } else {
+                assert!(
+                    strings.is_empty(),
+                    "an empty value painted {strings:?} -- the row was drawn, not skipped"
+                );
+                assert_eq!(
+                    eyes.len(),
+                    0,
+                    "an empty value still offers an eye to reveal it"
+                );
+                assert_eq!(
+                    taken, 0.0,
+                    "an empty value took {taken}pt of vertical space, so it was hidden \
+                     rather than skipped"
+                );
+            }
+        }
+        assert_eq!(checked, 2, "the loop visited nothing");
+        assert!(
+            heights[1] > heights[0],
+            "both passes took the same {:?}pt, so the harness is measuring nothing",
+            heights
+        );
+    }
+
     /// The positive control for the rule above: a password that IS there still
     /// draws its whole row -- label, the full bullet run, and the reveal eye.
     /// Without it "hide an empty password" is satisfied by hiding every
