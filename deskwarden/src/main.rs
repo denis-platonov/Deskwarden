@@ -2964,7 +2964,6 @@ const _: fn() = || {
 /// there is no variant that means "the state is gone", because there is no
 /// path that loses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum EstateOutcome {
     /// The worker ran to the end and said so.
     Completed,
@@ -2998,23 +2997,39 @@ enum EstateOutcome {
 /// worker writes into nothing instead of racing the thread that now owns the
 /// state again.
 ///
-/// **Short critical sections, not one long one.** The worker must NOT hold
-/// this across a whole teardown. If it did, the deadline could not read the
-/// estate back -- it would block until the worker finished, which is the very
-/// thing the deadline exists to stop waiting for. The bound on how long
-/// `reclaim` can block is therefore the length of one `with`, and every
-/// caller owes that.
+/// **How long a `with` may be, and the one caller that holds it for a whole
+/// teardown.** The bound on how long `reclaim` can block is the length of the
+/// longest `with`, and a short one is what a caller should want: it is what
+/// lets a waiting thread that has given up take the estate back at once
+/// rather than waiting for the very worker it gave up on.
 ///
-/// The cost of the same choice: a worker abandoned between two `with` calls
-/// leaves the estate half-updated. That is deliberate. Half-updated is a
-/// state the app can log, look at and recover from; the alternative on
-/// offer -- an empty engine and a stranded backend -- is not.
-#[allow(dead_code)]
+/// `RealVaultOps::open_window`'s in-place lock does NOT honour that, and the
+/// departure is recorded here rather than left to be discovered. Its worker
+/// holds ONE `with` across the entire teardown, because
+/// `resettle_session_reporting_tray` needs `engine`, `child`, `token`,
+/// `details` and `task_in_progress` mutably and simultaneously for its whole
+/// length -- there is no shorter hold that is not the one hardened sequence
+/// split into phases, which is a second teardown path and the thing this
+/// crate refuses hardest.
+///
+/// What that costs, stated exactly: if the window ends while the teardown is
+/// still running -- `app_window::WORKING_DEADLINE` expiring is the only way,
+/// since the working stage refuses every other close -- the `reclaim` below
+/// blocks for the remainder of the sequence instead of returning at once.
+/// That remainder is bounded by the sequence's own timeouts (the backend
+/// start, and the readiness `schedule`), and it is time the app used to spend
+/// blocked with no window on screen at all, so it is not a regression. What
+/// is NOT paid is the thing this type exists for: the estate is in the slot
+/// for the whole hold, so it is never lost, whichever way the wait ended.
+///
+/// The cost of allowing short holds at all: a worker abandoned between two
+/// `with` calls leaves the estate half-updated. That is deliberate.
+/// Half-updated is a state the app can log, look at and recover from; the
+/// alternative on offer -- an empty engine and a stranded backend -- is not.
 struct EstatePark {
     slot: Arc<Mutex<Option<SessionEstate>>>,
 }
 
-#[allow(dead_code)]
 impl EstatePark {
     /// Parks `estate`. The value is now reachable only through this type.
     fn holding(estate: SessionEstate) -> Self {
@@ -3096,7 +3111,6 @@ impl EstatePark {
 /// The worker is not joined. On the deadline path it is still running by
 /// definition, and there is nothing to wait for: the reclaim has emptied the
 /// slot, so everything it does from here on is a `None` from `with`.
-#[allow(dead_code)]
 fn park_and_work(
     estate: SessionEstate,
     work: impl FnOnce(&EstatePark) + Send + 'static,
@@ -3277,7 +3291,7 @@ trait VaultOps {
         &mut self,
         est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> (SessionEstate, vault_window::VaultWindowResult);
+    ) -> (SessionEstate, VaultWindowSession);
 
     /// The lock / 401 recovery. `resettle_session` and nothing else.
     fn resettle_after_lost_session(
@@ -3309,12 +3323,51 @@ struct RealVaultOps<'a> {
     backend_op_rx: &'a Arc<Mutex<mpsc::Receiver<BackendOp>>>,
 }
 
+/// What one vault window session produced.
+///
+/// Two facts, not one, because the second one cannot be derived from the
+/// first: `result.locked` says the user asked for a lock, and `relocked` says
+/// whether THIS WINDOW already carried that lock out in place. The loop needs
+/// both -- it must still act on a lock that the window could not serve, and it
+/// must not run a second teardown of a session the window has already torn
+/// down and rebuilt. See [`app_window::VaultSessionOutcome::relocked`], which
+/// is where the flag is decided and where the rule that decides it lives.
+struct VaultWindowSession {
+    result: vault_window::VaultWindowResult,
+    /// **The session is torn down and NOT rebuilt.** `false` for every host
+    /// that cannot lock in place, which is the safe answer: the caller then
+    /// runs the recovery it has always run.
+    relocked: bool,
+}
+
+/// What the worker has to publish for the rebuilt vault frame to be built on
+/// the frame thread.
+///
+/// **Values, and only values the vault frame is built from anyway.** The
+/// alternative -- reaching into the parked estate from the frame thread --
+/// would mean a second handle on the park in a closure that runs while the
+/// worker may still hold it, which is a deadlock waiting for a slow teardown.
+/// Everything here is what `vault_window::build_frame` already takes by value:
+/// the `Arc` is the estate's own cache, so the frame paints the same cache the
+/// repopulate just filled rather than a copy of it.
+struct RebuiltVault {
+    /// `BackendNotStarted` means there is no vault to show: the sign-in was
+    /// declined or the backend would not come back, `stand_down_after_unlock`
+    /// has already run, and the window must close rather than ask for the
+    /// master password a second time.
+    outcome: ResettleOutcome,
+    cache: Arc<VaultCache>,
+    token: String,
+    auto_lock: settings::AutoLock,
+    accounts: Option<accounts::AccountsState>,
+}
+
 impl VaultOps for RealVaultOps<'_> {
     fn open_window(
         &mut self,
         mut est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> (SessionEstate, vault_window::VaultWindowResult) {
+    ) -> (SessionEstate, VaultWindowSession) {
         // Opening this window is the app's slowest visible action and the one a
         // user times with their own patience, so each stage of it says how long
         // it took. Without this the only honest answer to "why did that take ten
@@ -3341,17 +3394,18 @@ impl VaultOps for RealVaultOps<'_> {
         });
 
         // Read once, before the `if` below might short-circuit past it, and
-        // reused for `vault_window::run`'s own `backend_already_running`
+        // reused for the vault frame's own `backend_already_running`
         // (review Minor 3): whether `bw serve` was already up at this exact
         // moment -- before this function might kick off a start of its own --
         // is also exactly the fact `spawn_vault_load` needs to know it can skip
-        // its readiness wait. Nothing between here and `vault_window::run`
-        // returning stops or restarts the backend out from under this snapshot
-        // (the only paths that do -- lock/reauth recovery -- close the window
-        // and return first), so it stays valid for the window's whole session.
+        // its readiness wait. Nothing between here and the window returning
+        // stops or restarts the backend out from under this snapshot from
+        // another thread; the in-place lock below does stop and restart it,
+        // and that is exactly why the vault frame it rebuilds below is built
+        // with a fresh answer rather than with this one.
         let backend_already_running = backend_is_running(&mut est.child);
 
-        // Reads don't need `bw serve` at all (`vault_window::run` paints
+        // Reads don't need `bw serve` at all (the vault frame paints
         // entirely from `cache`); writes and TOTP do. If save-memory mode tore
         // the backend down after the last close (or it crashed -- review Minor
         // 8: `backend_is_running` catches a `Some(dead child)` that a plain
@@ -3386,7 +3440,12 @@ impl VaultOps for RealVaultOps<'_> {
                     "not prefetched; fetching alongside the window",
             }
         );
-        let result = vault_window::run(
+        // **The vault FRAME, not `vault_window::run`.** `run` owns an event
+        // loop, and an event loop is exactly what this window must not give up
+        // when the user locks: the whole feature is that the vault, the
+        // spinner and the sign-in card are one window. So the frame is built
+        // here and `app_window::run_from_vault` owns the loop around it.
+        let (options, vault_frame, handles) = vault_window::build_frame(
             est.cache.clone(),
             deps.fill_stats.clone(),
             details,
@@ -3400,11 +3459,282 @@ impl VaultOps for RealVaultOps<'_> {
             // the state, and the window reopened after it has to offer the account
             // the user just left rather than the one they are now on.
             est.accounts.clone(),
+            // This host owns its window, so its first frame installs the
+            // fonts, rounds the corners and raises it.
+            false,
         );
+
+        // **Everything the off-thread closures need, taken BEFORE the estate
+        // moves into the park.** A worker is `'static` and cannot borrow this
+        // frame. The estate itself is not copied anywhere -- it is parked, and
+        // the worker reaches it through the park.
+        let job_for_worker = deps.job.clone();
+        let drain_for_worker = Arc::clone(self.backend_op_rx);
+        let schedule_for_worker = deps.schedule.to_vec();
+        // Built through `login_context` -- the one place a `LoginContext` is
+        // built -- and then copied out as owned values, because the card is
+        // raised inside a `'static` closure long after these borrows are gone.
+        let login =
+            login_context(deps.config_dir, est.active_account.as_ref(), deps.first_run_account);
+        let sign_in_account: Option<(std::path::PathBuf, Account)> = login
+            .account
+            .map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
+        let sign_in_first_run = login.first_run;
+        let fill_stats_for_rebuild = deps.fill_stats.clone();
+        let icon_cache_dir_for_rebuild = deps.icon_cache_dir.to_path_buf();
+
+        // Where the lock hands the worker its two channel ends. **The worker
+        // is spawned by `park_and_work` before the window opens and blocks
+        // here**, because the estate has to be parked for the whole session: a
+        // park set up at the moment of the lock would need the estate at that
+        // moment, and at that moment it is inside eframe's frame closure. A
+        // window that never locks drops this sender when its closure is
+        // dropped, and the worker leaves without touching anything.
+        let (lock_tx, lock_rx) =
+            mpsc::channel::<(mpsc::Sender<app_window::TeardownStep>, mpsc::Receiver<String>)>();
+        // What the worker publishes for the rebuild, which runs on the frame
+        // thread and must not touch the park. `None` until the teardown ends.
+        let rebuilt: Arc<Mutex<Option<RebuiltVault>>> = Arc::new(Mutex::new(None));
+        let rebuilt_for_worker = Arc::clone(&rebuilt);
+
+        // Read back after the wait returns: `wait` is `FnOnce` and hands back
+        // only an `EstateOutcome`.
+        let mut session: Option<app_window::VaultSessionOutcome> = None;
+
+        let (est, outcome) = park_and_work(
+            est,
+            // ---- THE WORKER. Off the frame thread for the reason
+            // `app_window::run`'s `prepare` is: stopping and restarting
+            // `bw serve` is seconds at best, and run on the frame thread it
+            // would freeze the window on the very frame that is supposed to
+            // start showing the spinner.
+            move |park| {
+                // `if let`, not a `let ... else { return; }`: the three
+                // regions behind `ops` are held to having no early exit at
+                // all (see `nothing_outside_the_two_branch_bodies_may_jump`),
+                // and that rule is about the shape of the code rather than
+                // about which frame the jump leaves. An `Err` here is the
+                // window having ended without ever locking -- nothing was torn
+                // down and nothing has to be put back.
+                if let Ok((step_tx, token_rx)) = lock_rx.recv() {
+                // **ONE `with`, spanning the whole sequence, and a deliberate
+                // departure from `EstatePark`'s "short critical sections"
+                // note -- which names this caller and says what it costs.**
+                // `resettle_session_reporting_tray` needs `engine`, `child`,
+                // `token`, `details` and `task_in_progress` mutably and at the
+                // same time for its whole length; there is no shorter hold
+                // that is not a second teardown path spelled in phases. What
+                // is kept is the property obstacle 5 is about: the estate is
+                // in the slot the entire time, so it is never lost.
+                let published = park.with(|est| {
+                    let mut tray_effects = Vec::new();
+                    let outcome = resettle_session_reporting_tray(
+                        &est.cache,
+                        &mut est.engine,
+                        &mut est.child,
+                        &job_for_worker,
+                        &drain_for_worker,
+                        &mut est.task_in_progress,
+                        &mut est.details,
+                        &mut est.token,
+                        // **The authenticate round trip.** `reauthenticate`
+                        // opens an eframe window of its own, which is the
+                        // blink; here the card is a STAGE of the window that
+                        // is already up, so this side only asks for it and
+                        // waits for what it produced. A window closed on the
+                        // card drops the sender, this `recv` fails, and `None`
+                        // reaches `resettle_session_with`'s declined arm --
+                        // which stands autofill down rather than blocking a
+                        // thread on a password that is never coming.
+                        || {
+                            let _ = step_tx.send(app_window::TeardownStep::NeedsSignIn);
+                            let produced = token_rx.recv().ok()?;
+                            if let Err(e) = est.store.save(&produced) {
+                                log::error!("failed to persist session token: {e}");
+                            }
+                            Some(produced)
+                        },
+                        // **The spinner-less probe.** `resettle_session`'s own
+                        // probe is `wait_for_vault_ready_with_spinner`, which
+                        // opens an eframe window of its own; the spinner is
+                        // already on screen here -- it is this window's
+                        // `Working` stage -- and a worker thread may not open
+                        // one at all. Same wait, same schedule, no window.
+                        |_message| {
+                            match wait_for_vault_ready(
+                                est.cache.bridge(),
+                                &schedule_for_worker,
+                            ) {
+                                Ok(items) => VaultReadyOutcome::Ready(items),
+                                Err(e) => VaultReadyOutcome::Failed(e),
+                            }
+                        },
+                        &mut tray_effects,
+                    );
+                    // **The tray labels are dropped here, and that is not an
+                    // oversight.** `AppTray` owns a hidden Win32 window bound
+                    // to the thread that built it, so a worker cannot apply
+                    // them; `main`'s idle loop reconciles the Sync label as
+                    // soon as this window is gone. The lift exists so the body
+                    // is movable, and this is the caller that moves it.
+                    log::info!(
+                        "the in-window lock's teardown finished with {outcome:?}; {} tray label \
+                         update(s) were reported and are left to `main`'s reconciliation",
+                        tray_effects.len()
+                    );
+                    RebuiltVault {
+                        outcome,
+                        cache: Arc::clone(&est.cache),
+                        token: est.token.clone(),
+                        auto_lock: est.settings.auto_lock(),
+                        accounts: est.accounts.clone(),
+                    }
+                });
+                // `None` means the waiting thread has already reclaimed: the
+                // window gave up on this teardown, so there is nobody left to
+                // tell and nothing left to rebuild.
+                if let Some(published) = published {
+                    *rebuilt_for_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(published);
+                    let _ = step_tx.send(app_window::TeardownStep::Finished);
+                }
+                }
+            },
+            // ---- THE WAIT, AND ITS BODY IS THE EVENT LOOP. A blocking wait
+            // here runs on THIS thread, which is the one eframe needs in order
+            // to paint the spinner for the whole teardown -- so a
+            // `recv_timeout` here would be a frozen window, which is strictly
+            // worse than the blink this feature exists to remove.
+            |done_rx| {
+                let ended = app_window::run_from_vault(
+                    (options, vault_frame, handles),
+                    SETUP_AFTER_SIGN_IN_MESSAGE,
+                    // The lock's only job on the frame thread: hand the worker
+                    // the two channel ends and get out of the way. `clone`,
+                    // because this forwarding closure's own sender is dropped
+                    // as its thread ends -- leaving the worker holding the only
+                    // live one, which is what lets the working stage hear a
+                    // dead worker as `Disconnected`.
+                    move |step_tx, token_rx| {
+                        let _ = lock_tx.send((step_tx.clone(), token_rx));
+                    },
+                    // The sign-in card, in the window that is already open.
+                    // `close_on_success: false`: the card reports its token
+                    // and the window stays, because the spinner is the next
+                    // thing it has to show.
+                    move || {
+                        let (_options, frame, handles) = login_ui::build_login_frame(
+                            sign_in_account
+                                .as_ref()
+                                .map(|(config_dir, account)| (config_dir.as_path(), account)),
+                            sign_in_first_run,
+                            true,
+                            false,
+                        );
+                        (frame, handles)
+                    },
+                    // The vault, rebuilt in place. Reads only what the worker
+                    // published; it must not reach the park, which the worker
+                    // may still be holding.
+                    move || {
+                        // Expression-shaped, with no `?` and no early
+                        // `return`, for the reason the worker above is: this
+                        // whole method is held to having no jump in it.
+                        rebuilt
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                            .filter(|published| {
+                                // **The one thing that decides whether there is
+                                // a vault to come back to.** `BackendNotStarted`
+                                // is a declined sign-in or a backend that would
+                                // not come back: `stand_down_after_unlock` has
+                                // already run, so asking again would ask for the
+                                // master password the user just gave, to retry
+                                // the thing that just failed.
+                                let rebuildable =
+                                    published.outcome != ResettleOutcome::BackendNotStarted;
+                                if !rebuildable {
+                                    log::warn!(
+                                        "the lock's teardown produced no session, so there is \
+                                         no vault to rebuild; the window closes to the tray"
+                                    );
+                                }
+                                rebuildable
+                            })
+                            .map(|published| {
+                                // A fetch of its own, alongside the frame
+                                // rather than in front of it: the teardown
+                                // deliberately empties the cached details, so
+                                // there is nothing to reuse.
+                                let details = account_details_source(None, |tx| {
+                                    std::thread::spawn(move || {
+                                        let _ = tx.send(login_ui::check_bw_status_details());
+                                    });
+                                });
+                                let (_options, frame, handles) = vault_window::build_frame(
+                                    Arc::clone(&published.cache),
+                                    fill_stats_for_rebuild,
+                                    details,
+                                    published.token,
+                                    icon_cache_dir_for_rebuild,
+                                    published.auto_lock,
+                                    // The readiness probe has just answered, so
+                                    // this vault's own initial load may skip
+                                    // its wait.
+                                    true,
+                                    published.accounts,
+                                    // This window was styled and raised stages
+                                    // ago.
+                                    true,
+                                );
+                                (frame, handles)
+                            })
+                    },
+                );
+                session = Some(ended);
+                // How the parked work ended, read off the completion signal
+                // the worker sends last. `Empty` means the window is gone and
+                // the worker is not -- the reclaim below is what then takes
+                // the estate away from it.
+                match done_rx.try_recv() {
+                    Ok(()) => EstateOutcome::Completed,
+                    Err(mpsc::TryRecvError::Disconnected) => EstateOutcome::WorkerPanicked,
+                    Err(mpsc::TryRecvError::Empty) => EstateOutcome::DeadlineExpired,
+                }
+            },
+        );
+
+        let ended = session.expect(
+            "`run_from_vault` returned without leaving its outcome behind, which is impossible: \
+             the wait writes it on the one line below the call",
+        );
+        log::info!(
+            "vault window: the session ended after {:?}; the parked estate came back {outcome:?} \
+             and the session is {}",
+            opened_at.elapsed(),
+            if ended.relocked { "torn down by this window's own lock" } else { "as it was" }
+        );
+        let result = ended.result.unwrap_or_else(|| {
+            // Unreachable in this host: the lock arm reads the outcome cells
+            // at the moment of the lock and an ordinary close reads them at
+            // the end, so some frame always leaves one. Said out loud rather
+            // than unwrapped, because "the window produced nothing" must not
+            // silently become "ask for the master password again".
+            log::error!("the vault window ended with no outcome cells at all");
+            vault_window::VaultWindowResult {
+                locked: false,
+                needs_reauth: false,
+                edited_settings: None,
+                switch_to: None,
+                add_account: false,
+                remove_account: false,
+                account_details: None,
+            }
+        });
         // The estate goes home on the one path out of this method. Nothing
         // above may `return` without it, which is what stops a future arm
         // from being the one that keeps `main`'s session state.
-        (est, result)
+        (est, VaultWindowSession { result, relocked: ended.relocked })
     }
 
     fn resettle_after_lost_session(
@@ -3779,19 +4109,27 @@ fn run_vault_loop(
             // real one -- which is what "the window closes and reopens" now means when
             // the window that closed was the startup window: it closed, and the vault
             // comes back in a window of its own.
-        let result = match first_result.take() {
+        let session = match first_result.take() {
             Some(result) => {
                 log::info!(
                     "dispatching the outcome of the vault session the startup window already ran"
                 );
-                result
+                // **`relocked: false`, and it is the safe answer rather than
+                // an unknown one.** The startup window has no lock catch of
+                // its own -- it is `app_window::run`, not `run_from_vault` --
+                // so a lock reported by it has torn nothing down and the
+                // recovery below is the only one that lock will ever get.
+                VaultWindowSession { result, relocked: false }
             }
             None => {
-                let (returned, result) = ops.open_window(est, deps);
+                let (returned, session) = ops.open_window(est, deps);
                 est = returned;
-                result
+                session
             }
         };
+        // Split here, once, so that everything below reads the same two facts
+        // this window reported and nothing re-derives either of them.
+        let VaultWindowSession { result, relocked } = session;
 
         // **What this window's outcome means, decided ONCE and before anything
         // acts on it.** See [`VaultFollowUp`] for why this is a value rather than
@@ -3971,12 +4309,37 @@ fn run_vault_loop(
                     log::info!("vault window locked itself; re-authenticating");
                 }
 
+                // **The recovery runs if and only if this window did not
+                // already carry the lock out itself**, which is the whole use
+                // the caller has for `relocked` (see
+                // `app_window::VaultSessionOutcome::relocked`, where the rule
+                // that decides it lives).
+                //
+                // Run when the window DID tear the session down, this is a
+                // second teardown of a session that is already gone: it asks
+                // for the master password the user has just given, to restart
+                // a `bw serve` that is already up, and throws away the vault
+                // the window just repopulated.
+                //
+                // SKIPPED when the window did not, and that is the v0.5.0
+                // defect in its new home: the vault would say "locked" with
+                // its cache still full and `bw serve` still holding a live
+                // session. Which is why the flag is set from whether the
+                // teardown worker actually STARTED and not from a lock having
+                // been seen.
+                //
                 // The recovery itself is `resettle_session`, which a lock/re-auth
                 // and an account switch share whole rather than each spelling out
                 // (see its doc). Everything in it needs a real tray icon, a real
                 // `bw serve` and a real master-password window, which is why it is
                 // behind `ops`.
-                est = ops.resettle_after_lost_session(est, deps);
+                if relocked {
+                    log::info!(
+                        "the vault window tore this session down and rebuilt it in place, so                          the lock is already served and no second teardown runs"
+                    );
+                } else {
+                    est = ops.resettle_after_lost_session(est, deps);
+                }
             }
             // A plain close, or a window whose only news was a visit to the gear
             // -- already applied above. Nothing left to do.
@@ -7804,7 +8167,7 @@ mod tests {
                  be about the wrong code"
             );
             assert!(
-                body.contains(concat!("vault_window::", "run(")),
+                body.contains(concat!("app_window::run_from_", "vault(")),
                 "the sliced body does not open a window at all, so the assertion below would \
                  pass against a region that cannot contain the defect it forbids"
             );
@@ -7857,10 +8220,12 @@ mod tests {
             let body = body.as_str();
             assert_eq!(
                 sites.len(),
-                1,
-                "expected exactly the one on-open fetch to call {call:?} inside \
-                 `open_vault_window`; found {} -- none at all means the miss path stopped \
-                 fetching and the cache can never warm up again",
+                2,
+                "expected the two fetches this method makes to call {call:?} -- the one when \
+                 the window opens on a cache miss, and the one that warms the vault frame the \
+                 in-place lock REBUILDS, whose details the teardown deliberately emptied; \
+                 found {} -- none at all means a miss path stopped fetching and that cache can \
+                 never warm up again",
                 sites.len()
             );
             for at in sites {
@@ -8026,7 +8391,10 @@ mod tests {
         // so the same helper serves a caller reading the raw production half
         // and one reading `code_only`'s much shorter output.
         for marker in [
-            concat!("vault_window::", "run("),
+            // `run_from_vault`, not `vault_window::run`: the window opener is
+            // the second host now, because a window that gives up its event
+            // loop on a lock is the blink this feature removes.
+            concat!("app_window::run_from_", "vault("),
             concat!("resettle_ses", "sion("),
             concat!("switch_to", "_account("),
         ] {
@@ -8758,7 +9126,7 @@ mod tests {
                 "the resettle and the account branch no longer hand the estate back. A method                  that keeps it is a method that can be the one that loses it"
             );
             assert!(
-                squeezed.contains(concat!("-> (SessionEstate, vault_window::Vault", "WindowResult);")),
+                squeezed.contains(concat!("-> (SessionEstate, VaultWindow", "Session);")),
                 "`open_window` no longer hands the estate back alongside the result. The                  declaration is {squeezed:?}"
             );
         }
@@ -9210,6 +9578,151 @@ mod tests {
     /// a real config path: the estate is built over a scratch directory and a
     /// bridge pointed at a port nothing listens on, and it is never asked to
     /// speak to either.
+    /// **The in-window lock's production wiring, which no test in this crate
+    /// can call.**
+    ///
+    /// `RealVaultOps::open_window` opens a real `eframe` window, spawns a real
+    /// `bw serve` and raises a real master-password card, so every claim made
+    /// about it here is made by reading it. That is stated plainly rather than
+    /// left for a reader to work out, because a source scan is the weakest
+    /// thing in this file and the one most likely to be passing for free.
+    ///
+    /// Every scan runs over `code_only`'s output. This method's COMMENTS name
+    /// `vault_window::run`, `reauthenticate` and the spinner probe several
+    /// times each -- explaining why none of them is used -- so a scan over the
+    /// raw text would find all three and report the opposite of the truth.
+    mod the_in_window_lock_is_wired_to_the_one_sequence {
+        use super::production_half_of_this_file;
+        use super::vault_ops_method_body;
+        use super::what_a_finished_vault_session_means::code_only;
+
+        /// `open_window`'s body as CODE.
+        fn opener() -> String {
+            let raw = production_half_of_this_file();
+            let code = code_only(raw);
+            assert!(
+                code.len() < raw.len(),
+                "control: `code_only` stripped nothing, so every scan below runs over prose too"
+            );
+            let body = vault_ops_method_body(&code, "open_window");
+            assert!(
+                body.len() > 1500,
+                "control: `open_window` sliced to {} bytes, which is not this method",
+                body.len()
+            );
+            body
+        }
+
+        /// The comments really do name the three things the scans below say
+        /// are absent -- so "absent" is a fact about the code and not about a
+        /// method that never mentions them at all.
+        ///
+        /// Without this, deleting every explanatory comment would make the
+        /// three negative assertions pass for a completely different reason,
+        /// and the difference would be invisible.
+        #[test]
+        fn the_prose_names_what_the_code_must_not() {
+            let raw = vault_ops_method_body(production_half_of_this_file(), "open_window");
+            for named in [
+                concat!("vault_window::", "run"),
+                concat!("reauthen", "ticate"),
+                concat!("wait_for_vault_ready_with_", "spinner"),
+            ] {
+                assert!(
+                    raw.contains(named),
+                    "control: `open_window` does not mention {named:?} even in prose, so the \
+                     matching negative assertion below is not about anything"
+                );
+            }
+        }
+
+        /// **The window is never given up, and the estate is parked rather
+        /// than moved.**
+        #[test]
+        fn the_vault_is_hosted_by_the_second_host_over_a_parked_estate() {
+            let body = opener();
+            assert!(
+                body.contains(concat!("park_and_", "work(")),
+                "the vault window no longer runs over a parked estate. The teardown's worker is \
+                 `'static` and cannot borrow this frame, so without the park the estate has to \
+                 be moved into it -- and an abandoned worker then leaves `main` with an empty \
+                 match engine and a `bw serve` nobody owns holding the port"
+            );
+            assert!(
+                body.contains(concat!("app_window::run_from_", "vault(")),
+                "the vault window is not hosted by `run_from_vault` any more, so the lock has \
+                 nowhere to go but away: the window closes, the teardown runs with nothing on \
+                 screen, and a different window opens. That is the blink"
+            );
+            assert!(
+                !body.contains(concat!("vault_window::", "run(")),
+                "the vault window opens its OWN event loop again. `vault_window::run` returns \
+                 only once its window is gone, so a lock caught inside it cannot keep the \
+                 window -- which is the whole feature"
+            );
+        }
+
+        /// **The worker runs the ONE sequence, with the two things a worker
+        /// thread cannot have supplied as parameters.**
+        ///
+        /// `resettle_session` is the wrapper that owns the tray and names the
+        /// spinner probe; a worker may have neither. The lifted body is what
+        /// it calls, and the two arguments it supplies are what item 8 is.
+        #[test]
+        fn the_worker_runs_the_lifted_body_with_a_windowless_probe() {
+            let body = opener();
+            assert!(
+                body.contains(concat!("resettle_session_reporting_", "tray(")),
+                "the in-window lock no longer runs the one teardown-and-repopulate sequence. \
+                 Whatever it runs instead is a second one, and this crate has exactly one"
+            );
+            assert!(
+                !body.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
+                "the lock's worker probes with the SPINNER probe, which opens an `eframe` \
+                 window of its own -- from a worker thread, behind a window that is already \
+                 showing a spinner of its own"
+            );
+            assert!(
+                body.contains(concat!("wait_for_vault_", "ready(")),
+                "the lock's worker no longer waits for the vault to answer at all, so the \
+                 repopulate runs against a backend that may not be up yet"
+            );
+            assert!(
+                !body.contains("tray::"),
+                "the lock's worker touches the tray. `AppTray` owns a hidden Win32 window bound \
+                 to the thread that built it, and this code runs on neither that thread nor \
+                 with that tray in reach"
+            );
+        }
+
+        /// **The master password comes down the channel, not out of a second
+        /// window.**
+        #[test]
+        fn the_sign_in_is_a_round_trip_through_the_window_that_is_already_open() {
+            let body = opener();
+            assert!(
+                !body.contains(concat!("reauthen", "ticate(")),
+                "the lock's worker calls `reauthenticate`, which opens a whole new `eframe` \
+                 window -- from a worker thread, while this window is on screen. That is the \
+                 blink, moved rather than removed"
+            );
+            assert!(
+                body.contains(concat!("token_rx.", "recv()")),
+                "nothing waits for the token the sign-in card produces, so the teardown either \
+                 never authenticates or authenticates somewhere else"
+            );
+            assert!(
+                body.contains(concat!("TeardownStep::", "NeedsSignIn")),
+                "the worker never asks for the card, so the window sits on a spinner while the \
+                 worker blocks on a password it never requested"
+            );
+            assert!(
+                body.contains(concat!("login_ui::build_login_", "frame(")),
+                "the sign-in card is not built as a frame for the window that is already open"
+            );
+        }
+    }
+
     mod the_parked_estate_comes_home {
         use super::*;
 
@@ -10080,7 +10593,7 @@ mod tests {
         /// the worst possible outcome for the one guard on a critical defect.
         fn code_between_the_result_and_the_first_branch() -> String {
             let production = super::production_half_of_this_file();
-            let head = concat!("let result = match first_", "result.take() {");
+            let head = concat!("let session = match first_", "result.take() {");
             assert_eq!(
                 production.matches(head).count(),
                 1,
@@ -10248,7 +10761,7 @@ mod tests {
         /// brace and nothing else.
         fn the_whole_vault_loop_tail() -> String {
             let production = super::production_half_of_this_file();
-            let head = concat!("let result = match first_", "result.take() {");
+            let head = concat!("let session = match first_", "result.take() {");
             assert_eq!(
                 production.matches(head).count(),
                 1,
@@ -10721,7 +11234,7 @@ mod tests {
             /// What each successive `open_window` hands back. Popped, never
             /// re-read: a loop that opens more windows than the test scripted
             /// is a loop that did not return when it should have.
-            scripted: VecDeque<VaultWindowResult>,
+            scripted: VecDeque<VaultWindowSession>,
             log: Vec<OpLog>,
             /// **The runaway guard.** A `run_vault_loop` that re-dispatches
             /// `first_result` instead of taking it once never opens a window
@@ -10739,7 +11252,22 @@ mod tests {
         }
 
         impl FakeVaultOps {
+            /// Windows that report a lock this fake's host did NOT serve --
+            /// `relocked: false`, the answer every host that cannot lock in
+            /// place gives, and the answer under which the loop must run its
+            /// own recovery.
             fn new(scripted: Vec<VaultWindowResult>) -> Self {
+                Self::from_sessions(
+                    scripted
+                        .into_iter()
+                        .map(|result| VaultWindowSession { result, relocked: false })
+                        .collect(),
+                )
+            }
+
+            /// The other half of the same door: windows that say whether the
+            /// session was ALREADY torn down and rebuilt in place.
+            fn from_sessions(scripted: Vec<VaultWindowSession>) -> Self {
                 Self {
                     scripted: scripted.into(),
                     log: Vec::new(),
@@ -10781,7 +11309,7 @@ mod tests {
                 &mut self,
                 mut est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> (SessionEstate, VaultWindowResult) {
+            ) -> (SessionEstate, VaultWindowSession) {
                 self.charge();
                 // **Before anything else in this method.** What is recorded
                 // has to be the estate the LOOP handed over, not one this fake
@@ -10791,14 +11319,14 @@ mod tests {
                 // The estate is handed back on BOTH arms, including the panic
                 // arm's -- there is no arm here that keeps it, which is the
                 // fake modelling the trait's own "the whole value comes home".
-                let result = match self.scripted.pop_front() {
-                    Some(result) => result,
+                let session = match self.scripted.pop_front() {
+                    Some(session) => session,
                     None => panic!(
                         "the loop opened more windows than this test scripted; the log is {:?}",
                         self.log
                     ),
                 };
-                (est, result)
+                (est, session)
             }
 
             fn resettle_after_lost_session(
@@ -11525,14 +12053,16 @@ mod tests {
                 &mut self,
                 est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> (SessionEstate, VaultWindowResult) {
+            ) -> (SessionEstate, VaultWindowSession) {
                 self.charge();
                 self.log.push(OpLog::OpenedWindow);
                 let result = self
                     .scripted
                     .pop_front()
                     .expect("the loop opened more windows than this test scripted");
-                (est, result)
+                // This fake's host cannot lock in place either, so every
+                // window it reports leaves the recovery to the loop.
+                (est, VaultWindowSession { result, relocked: false })
             }
 
             fn resettle_after_lost_session(
@@ -11699,6 +12229,120 @@ mod tests {
                 "a plain close threw the details away too, so the assertion above is not about \
                  the recovery"
             );
+        }
+
+        // ---- The in-place lock's dispatch: whose teardown is it? ----
+
+        /// **A window that already tore the session down and rebuilt it does
+        /// NOT get a second teardown.**
+        ///
+        /// `RealVaultOps::open_window` hosts the vault through
+        /// `app_window::run_from_vault`, which catches the lock, keeps the
+        /// window, runs the teardown on a worker against the parked estate and
+        /// puts the vault back. By the time such a window reports `locked` the
+        /// recovery has already happened -- `relocked` is how it says so.
+        /// Running the loop's own recovery on top of that asks for the master
+        /// password the user has just given, to restart a `bw serve` that is
+        /// already up, and throws away the vault the window just repopulated.
+        #[test]
+        fn a_window_that_relocked_in_place_is_not_torn_down_a_second_time() {
+            let bench = Bench::new("relocked-in-place");
+            let mut ops = FakeVaultOps::from_sessions(vec![VaultWindowSession {
+                result: VaultWindowResult { locked: true, ..closed() },
+                relocked: true,
+            }]);
+            drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::OpenedWindow],
+                "the loop ran its own recovery on a session the window had already torn down \
+                 and rebuilt"
+            );
+            ops.assert_script_consumed();
+        }
+
+        /// **THE CONTROL, one field different, and it is the v0.5.0 defect in
+        /// its new home.**
+        ///
+        /// The very same locked result with `relocked: false` -- which is what
+        /// every host that cannot lock in place reports, and what the second
+        /// lock of one `run_from_vault` session reports because its `FnOnce`
+        /// teardown is already spent -- MUST still run the recovery. Skipped
+        /// there, the vault says "locked" with its cache still full and
+        /// `bw serve` still holding a live session.
+        #[test]
+        fn a_lock_the_window_did_not_serve_still_gets_the_recovery() {
+            let bench = Bench::new("relock-not-served");
+            let mut ops = FakeVaultOps::from_sessions(vec![VaultWindowSession {
+                result: VaultWindowResult { locked: true, ..closed() },
+                relocked: false,
+            }]);
+            let est = drive(&bench, &mut ops, None);
+
+            assert_eq!(
+                ops.log,
+                vec![OpLog::OpenedWindow, OpLog::Resettled],
+                "a lock the window did not serve was not recovered from: the vault reports \
+                 itself locked with the cache still full and `bw serve` still answering"
+            );
+            // Not just the log: the modelled teardown really reached the
+            // estate, so "Resettled" is a thing that happened rather than a
+            // thing that was recorded.
+            assert!(
+                est.details.is_none() && est.token == RESETTLED_TOKEN,
+                "the recovery was logged but did not touch the estate"
+            );
+            ops.assert_script_consumed();
+        }
+
+        /// The same rule at the OTHER trigger. `needs_reauth` and `locked`
+        /// both mean the session is gone and both reach the one arm, so a
+        /// dispatch that read only `locked` would leave a 401 recovery running
+        /// twice on a window that had already served it.
+        #[test]
+        fn the_relock_rule_covers_the_401_trigger_too() {
+            let bench = Bench::new("relocked-401");
+            let mut ops = FakeVaultOps::from_sessions(vec![VaultWindowSession {
+                result: VaultWindowResult { needs_reauth: true, ..closed() },
+                relocked: true,
+            }]);
+            drive(&bench, &mut ops, None);
+            assert_eq!(ops.log, vec![OpLog::OpenedWindow]);
+            ops.assert_script_consumed();
+        }
+
+        /// **`relocked` does not swallow anything else.** A window that
+        /// relocked in place and ALSO asked for an account action still gets
+        /// the account action: the flag is about the lock recovery and nothing
+        /// besides. Without this, a switch made in a session that had locked
+        /// earlier would be silently dropped.
+        #[test]
+        fn relocked_only_suppresses_the_lock_recovery() {
+            let bench = Bench::new("relocked-and-switch");
+            let mut ops = FakeVaultOps::from_sessions(vec![
+                VaultWindowSession {
+                    result: VaultWindowResult {
+                        switch_to: Some(account_b().id),
+                        locked: true,
+                        ..closed()
+                    },
+                    relocked: true,
+                },
+                VaultWindowSession { result: closed(), relocked: false },
+            ]);
+            drive(&bench, &mut ops, None);
+            assert_eq!(
+                ops.log,
+                vec![
+                    OpLog::OpenedWindow,
+                    OpLog::AccountAction(AccountRequest::SwitchTo(account_b().id)),
+                    OpLog::OpenedWindow,
+                ],
+                "an account action asked for by a window that had relocked in place was \
+                 dropped"
+            );
+            ops.assert_script_consumed();
         }
 
         // ---- The estate one pass carries into the next ----
