@@ -7584,7 +7584,37 @@ mod tests {
              taking its space, so it was hidden rather than skipped"
         );
 
-        // 3. AND EVERYTHING BELOW MOVED UP BY EXACTLY THAT MUCH -- no gap
+        // 3. AND NO HAIRLINE LEFT STANDING OVER THE GAP. A row rule is a 1pt
+        //    `theme::CANVAS` fill (see `theme::row_rule`), and the login card
+        //    has exactly one -- between Username and Password -- when both rows
+        //    are there and none at all when only Username is. A separator with
+        //    nothing on one side of it is the other way a removed row leaves a
+        //    trace, and it costs about a point, which the height check above is
+        //    too coarse to see.
+        let rules = |frame: &Frame, card: egui::Rect| {
+            frame
+                .rects
+                .iter()
+                .filter(|(rect, fill)| {
+                    *fill == theme::CANVAS
+                        && (rect.height() - 1.0).abs() < 0.5
+                        && card.contains_rect(*rect)
+                })
+                .count()
+        };
+        assert_eq!(
+            rules(&with, card_with),
+            1,
+            "the two-row login card does not draw one row rule, so counting them proves \r
+             nothing"
+        );
+        assert_eq!(
+            rules(&without, card_without),
+            0,
+            "a separator is still drawn where the password row was"
+        );
+
+        // 4. AND EVERYTHING BELOW MOVED UP BY EXACTLY THAT MUCH -- no gap
         // left behind, no separator standing over nothing.
         assert_eq!(
             with.rect_of("AUTOFILL TARGETS").top() - without.rect_of("AUTOFILL TARGETS").top(),
