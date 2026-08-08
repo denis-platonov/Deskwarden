@@ -1041,8 +1041,8 @@ fn main() {
     // Nothing in between can act on the session: the update-check thread and the
     // hotkey registration do not touch it.
     if startup_vault.is_some() {
-        open_vault_window(
-            &mut estate,
+        estate = open_vault_window(
+            estate,
             VaultDeps {
                 fill_stats: &fill_stats,
                 job: &job,
@@ -1097,8 +1097,8 @@ fn main() {
             }
 
             if event.id == tray.open_vault_id {
-                open_vault_window(
-                    &mut estate,
+                estate = open_vault_window(
+                    estate,
                     VaultDeps {
                         fill_stats: &fill_stats,
                         job: &job,
@@ -1644,8 +1644,8 @@ fn main() {
         // the two aren't the same action). Same event, same recovery path as
         // the menu's "Open Vault" item above -- just a different trigger.
         if tray::next_left_click() == Some(true) {
-            open_vault_window(
-                &mut estate,
+            estate = open_vault_window(
+                estate,
                 VaultDeps {
                     fill_stats: &fill_stats,
                     job: &job,
@@ -3255,25 +3255,45 @@ fn loop_step(after: VaultFollowUp) -> LoopStep {
 ///
 /// The real implementation is [`RealVaultOps`], whose three method bodies are
 /// the loop's own three regions, moved rather than rewritten.
+/// **The estate travels BY VALUE, and that is a requirement rather than a
+/// taste.** [`park_and_work`] takes a [`SessionEstate`] by value -- it has to,
+/// because the worker it hands it to is `'static` and a `&mut` borrowed from
+/// a caller's stack frame is not -- so the moment the lock's teardown runs
+/// through the park, every frame between `main` and the park has to be
+/// holding the estate rather than borrowing it. A `&mut` anywhere on that
+/// chain would force a `mem::take` or a `.clone()` to get past it, and both
+/// are exactly the losses [`SessionEstate`]'s own doc forbids: a taken
+/// `child` strands a real `bw serve` on `BW_SERVE_PORT`, a cloned `engine`
+/// divorces the armed autofill matches from the ones a resettle rebuilds.
+///
+/// So each method takes the estate and hands it back. There is no path that
+/// keeps it: a body that wants to return early must still name the estate on
+/// the way out, which is the compiler enforcing the same "the whole value
+/// comes home or nothing does" property `park_and_work`'s read-back has.
 trait VaultOps {
-    /// Open a vault window and return what the user did with it.
+    /// Open a vault window and return what the user did with it, and the
+    /// estate that session ran against.
     fn open_window(
         &mut self,
-        est: &mut SessionEstate,
+        est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> vault_window::VaultWindowResult;
+    ) -> (SessionEstate, vault_window::VaultWindowResult);
 
     /// The lock / 401 recovery. `resettle_session` and nothing else.
-    fn resettle_after_lost_session(&mut self, est: &mut SessionEstate, deps: &VaultDeps<'_>);
+    fn resettle_after_lost_session(
+        &mut self,
+        est: SessionEstate,
+        deps: &VaultDeps<'_>,
+    ) -> SessionEstate;
 
     /// Switch, add or remove -- the whole branch, including its ONE shared
     /// resettle closure, its confirmations and its persists.
     fn account_action(
         &mut self,
-        est: &mut SessionEstate,
+        est: SessionEstate,
         deps: &VaultDeps<'_>,
         request: AccountRequest,
-    );
+    ) -> SessionEstate;
 }
 
 /// The production `VaultOps`: the two things that are neither `Send` nor
@@ -3292,9 +3312,9 @@ struct RealVaultOps<'a> {
 impl VaultOps for RealVaultOps<'_> {
     fn open_window(
         &mut self,
-        est: &mut SessionEstate,
+        mut est: SessionEstate,
         deps: &VaultDeps<'_>,
-    ) -> vault_window::VaultWindowResult {
+    ) -> (SessionEstate, vault_window::VaultWindowResult) {
         // Opening this window is the app's slowest visible action and the one a
         // user times with their own patience, so each stage of it says how long
         // it took. Without this the only honest answer to "why did that take ten
@@ -3366,7 +3386,7 @@ impl VaultOps for RealVaultOps<'_> {
                     "not prefetched; fetching alongside the window",
             }
         );
-        vault_window::run(
+        let result = vault_window::run(
             est.cache.clone(),
             deps.fill_stats.clone(),
             details,
@@ -3380,10 +3400,18 @@ impl VaultOps for RealVaultOps<'_> {
             // the state, and the window reopened after it has to offer the account
             // the user just left rather than the one they are now on.
             est.accounts.clone(),
-        )
+        );
+        // The estate goes home on the one path out of this method. Nothing
+        // above may `return` without it, which is what stops a future arm
+        // from being the one that keeps `main`'s session state.
+        (est, result)
     }
 
-    fn resettle_after_lost_session(&mut self, est: &mut SessionEstate, deps: &VaultDeps<'_>) {
+    fn resettle_after_lost_session(
+        &mut self,
+        mut est: SessionEstate,
+        deps: &VaultDeps<'_>,
+    ) -> SessionEstate {
         // The recovery itself is `resettle_session`, which a lock/re-auth and
         // an account switch share whole rather than each spelling out (see
         // its doc). The only thing this caller contributes is where the new
@@ -3419,14 +3447,15 @@ impl VaultOps for RealVaultOps<'_> {
                 Some(reauthenticate(&est.store, login))
             },
         );
+        est
     }
 
     fn account_action(
         &mut self,
-        est: &mut SessionEstate,
+        mut est: SessionEstate,
         deps: &VaultDeps<'_>,
         request: AccountRequest,
-    ) {
+    ) -> SessionEstate {
     // **Destructured here, rather than reached through `est.` at each of
     // its sites.** Field-level borrow splitting is what lets the loop below go
     // on holding eight simultaneous `&mut`s -- the resettle closure alone
@@ -3435,7 +3464,10 @@ impl VaultOps for RealVaultOps<'_> {
     // why the loop body has an empty diff: every name below is spelled exactly
     // as the parameter it replaces was.
     //
-    // Nothing here clones or `take`s. See `SessionEstate`.
+    // Nothing here clones or `take`s. See `SessionEstate`. The estate now
+    // ARRIVES by value (see `VaultOps`), so the pattern is against `&mut est`
+    // -- the same reborrow it always was, spelled one word longer -- and the
+    // estate itself is handed back on the single path out of this method.
     let SessionEstate {
         cache,
         engine,
@@ -3469,7 +3501,7 @@ impl VaultOps for RealVaultOps<'_> {
         // timeout edited in that window apply to the very next vault window
         // rather than only to the next app launch.
         settings,
-    } = est;
+    } = &mut est;
     // Narrowed back to the shared borrow this body has always held: nothing
     // below mutates the `Arc` itself, only the cache behind it.
     let cache: &Arc<VaultCache> = cache;
@@ -3691,6 +3723,10 @@ impl VaultOps for RealVaultOps<'_> {
             }
         }
     }
+    // The one path out. Every arm above falls into it -- there is no `return`
+    // in this method -- so the estate the caller lent is the estate it gets
+    // back, whatever the switch, the add or the removal did to it.
+    est
     }
 }
 
@@ -3716,11 +3752,14 @@ impl VaultOps for RealVaultOps<'_> {
 /// active and would otherwise write one account's address into another's
 /// entry.
 fn run_vault_loop(
-    est: &mut SessionEstate,
+    // **By value, and handed back.** See [`VaultOps`]: the lock's teardown
+    // runs against a [`park_and_work`] that owns the estate, so no frame
+    // between `main` and the park may be merely borrowing it.
+    mut est: SessionEstate,
     deps: &VaultDeps<'_>,
     ops: &mut impl VaultOps,
     mut first_result: Option<vault_window::VaultWindowResult>,
-) {
+) -> SessionEstate {
     // Reopened, not merely opened once: the titlebar gear asks for the
     // preferences window, and an account action settles onto a different
     // account and comes back. Every other outcome (closed, locked, needs
@@ -3747,7 +3786,11 @@ fn run_vault_loop(
                 );
                 result
             }
-            None => ops.open_window(est, deps),
+            None => {
+                let (returned, result) = ops.open_window(est, deps);
+                est = returned;
+                result
+            }
         };
 
         // **What this window's outcome means, decided ONCE and before anything
@@ -3900,7 +3943,7 @@ fn run_vault_loop(
                 // this arm would be a menu click that dispatches nothing -- so it
                 // says so in the log rather than passing in silence.
                 match account_request(&result) {
-                    Some(request) => ops.account_action(est, deps, request),
+                    Some(request) => est = ops.account_action(est, deps, request),
                     None => log::error!(
                         "the vault window reported an account action with no account request in \
                          it; nothing was done"
@@ -3933,7 +3976,7 @@ fn run_vault_loop(
                 // (see its doc). Everything in it needs a real tray icon, a real
                 // `bw serve` and a real master-password window, which is why it is
                 // behind `ops`.
-                ops.resettle_after_lost_session(est, deps);
+                est = ops.resettle_after_lost_session(est, deps);
             }
             // A plain close, or a window whose only news was a visit to the gear
             // -- already applied above. Nothing left to do.
@@ -3946,7 +3989,7 @@ fn run_vault_loop(
         // window's outcome meant, and nothing else in this function may jump.
         match loop_step(follow_up) {
             LoopStep::Reopen => {}
-            LoopStep::Return => return,
+            LoopStep::Return => return est,
         }
     }
 }
@@ -3958,7 +4001,7 @@ fn open_vault_window(
     // thread. See `SessionEstate`. The body destructures it on its first
     // statement, so not one line inside the loop changed to accommodate the
     // move.
-    estate: &mut SessionEstate,
+    estate: SessionEstate,
     // The immutable half. Separate from the estate and not merged into it
     // because nothing here is ever written: a value that cannot be mutated
     // cannot disagree with a second copy of itself, so it needs none of the
@@ -3983,13 +4026,13 @@ fn open_vault_window(
     // is what keeps `resettle_session` reached from one place and keeps the
     // switch/add/remove wiring the tray's guards pin the only wiring there is.
     first_result: Option<vault_window::VaultWindowResult>,
-) {
+) -> SessionEstate {
     // A four-line constructor. Everything this function used to do is now
     // either in `RealVaultOps` (the window, the teardown, the dialogs) or in
     // `run_vault_loop` (every decision), and the split is what makes the
     // second half reachable from a test at all.
     let mut ops = RealVaultOps { tray, backend_op_rx };
-    run_vault_loop(estate, &deps, &mut ops, first_result);
+    run_vault_loop(estate, &deps, &mut ops, first_result)
 }
 
 /// What a resettle left the app in, for a caller that has to decide whether
@@ -8673,6 +8716,126 @@ mod tests {
             );
         }
 
+        /// **The estate ARRIVES by value at all three `VaultOps` methods and
+        /// LEAVES by value, and the three signatures are what says so.**
+        ///
+        /// This is not a style claim. `park_and_work` takes a
+        /// `SessionEstate` by value -- it must, because the worker it hands
+        /// it to is `'static` -- so the moment the lock's teardown runs
+        /// through the park, every frame between `main` and the park has to
+        /// OWN the estate. A single `&mut SessionEstate` put back on that
+        /// chain cannot be widened later without a `mem::take` or a
+        /// `.clone()` at the seam, and both are the losses `SessionEstate`'s
+        /// own doc names: a taken `child` strands a real `bw serve` on
+        /// `BW_SERVE_PORT`, a cloned `engine` divorces the armed autofill
+        /// matches from the ones a resettle rebuilds.
+        ///
+        /// So the shape is pinned here rather than left to be rediscovered:
+        /// each declaration says `est: SessionEstate` and each says
+        /// `SessionEstate` on its way out.
+        #[test]
+        fn the_three_vault_ops_methods_take_and_return_the_estate_by_value() {
+            let code = production_code();
+            let trait_body = super::body_of(&code, concat!("trait Vault", "Ops {"));
+            assert!(
+                (200..6000).contains(&trait_body.len()),
+                "the sliced `VaultOps` declaration is {} bytes, which is not three method                  signatures",
+                trait_body.len()
+            );
+            let squeezed = squeeze(&trait_body);
+            assert_eq!(
+                squeezed.matches(concat!("est: Session", "Estate,")).count(),
+                3,
+                "`VaultOps` no longer declares all three methods with the estate BY VALUE. The                  declaration is {squeezed:?}"
+            );
+            assert!(
+                !squeezed.contains(concat!("est: &mut Session", "Estate")),
+                "a `VaultOps` method takes the estate by `&mut` again. The lock's teardown runs                  against a `'static` worker through `park_and_work`, which owns the estate; a                  borrow anywhere on that chain has to be widened with a `mem::take` or a                  `.clone()`, and both lose exactly what `SessionEstate` exists to keep"
+            );
+            assert_eq!(
+                squeezed.matches(concat!("-> Session", "Estate;")).count(),
+                2,
+                "the resettle and the account branch no longer hand the estate back. A method                  that keeps it is a method that can be the one that loses it"
+            );
+            assert!(
+                squeezed.contains(concat!("-> (SessionEstate, vault_window::Vault", "WindowResult);")),
+                "`open_window` no longer hands the estate back alongside the result. The                  declaration is {squeezed:?}"
+            );
+        }
+
+        /// **None of the three production methods MINTS an estate**, which is
+        /// the one thing "hands it back" does not say on its own.
+        ///
+        /// By-value plumbing makes a new failure spellable that `&mut` did
+        /// not: a method can satisfy `-> SessionEstate` by building a fresh
+        /// one and dropping the caller's. That compiles, warns about nothing,
+        /// and silently discards the match engine, the `Child` and the
+        /// session token in one statement -- the same loss obstacle 5
+        /// describes, arrived at from the other side. A `SessionEstate {`
+        /// literal is the only way to spell it, so its absence from all three
+        /// bodies is the check, and
+        /// [`the_minted_estate_scanner_sees_one`] holds the scanner to it in
+        /// both directions.
+        #[test]
+        fn no_vault_ops_method_hands_back_an_estate_it_minted() {
+            let code = production_code();
+            let mut checked = 0usize;
+            for name in ["open_window", "resettle_after_lost_session", "account_action"] {
+                let body = super::vault_ops_method_body(&code, name);
+                assert!(
+                    body.len() > 200,
+                    "control: `{name}`'s sliced body is {} bytes, which is not a method body",
+                    body.len()
+                );
+                assert!(
+                    !mints_an_estate(&body),
+                    "`RealVaultOps::{name}` builds a `SessionEstate` of its own. Whatever it                      hands back is then not the estate `main` lent it: the match engine, the                      `bw serve` `Child` and the session token the caller had are dropped on                      the floor, autofill goes dead and the `bw serve` port stays held"
+                );
+                checked += 1;
+            }
+            assert_eq!(checked, 3, "control: fewer than three method bodies were scanned");
+        }
+
+        /// Whether `region` CONSTRUCTS a `SessionEstate`, as opposed to
+        /// destructuring one.
+        ///
+        /// Both are spelled `SessionEstate {`, and `account_action` really
+        /// does destructure -- so counting the bare spelling would fire on
+        /// the one body that is allowed to name it. The destructure is
+        /// `let SessionEstate {` and a construction never is, so the
+        /// difference of the two counts is the answer.
+        fn mints_an_estate(region: &str) -> bool {
+            let squeezed = squeeze(region);
+            let all = squeezed.matches(concat!("Session", "Estate {")).count();
+            let destructures = squeezed.matches(concat!("let Session", "Estate {")).count();
+            all > destructures
+        }
+
+        /// The scanner above fires on a minted estate and on neither of the
+        /// two things the real bodies do contain.
+        #[test]
+        fn the_minted_estate_scanner_sees_one() {
+            for (source, want) in [
+                ("let est = SessionEstate { cache, ..old };", true),
+                ("fn f() -> SessionEstate { SessionEstate { cache, engine } }", true),
+                // The destructure the account branch really contains, and a
+                // destructure followed by a mint -- so "allowed" is about the
+                // spelling and not about the body having one of them.
+                ("let SessionEstate { cache, engine } = &mut est;", false),
+                (
+                    "let SessionEstate { cache, engine } = &mut est; SessionEstate { cache }",
+                    true,
+                ),
+                ("let (est, result) = ops.open_window(est, deps);", false),
+            ] {
+                assert_eq!(
+                    mints_an_estate(source),
+                    want,
+                    "the minted-estate scanner answered the wrong thing for {source:?}"
+                );
+            }
+        }
+
         /// Every `.field` / `field:` mention of one of the estate's own fields
         /// in `region`, which is how a partial read-back has to be spelled.
         ///
@@ -10616,43 +10779,49 @@ mod tests {
         impl VaultOps for FakeVaultOps {
             fn open_window(
                 &mut self,
-                est: &mut SessionEstate,
+                mut est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> VaultWindowResult {
+            ) -> (SessionEstate, VaultWindowResult) {
                 self.charge();
                 // **Before anything else in this method.** What is recorded
                 // has to be the estate the LOOP handed over, not one this fake
                 // has already had a turn at.
-                self.seen.push(SeenEstate::of(est));
+                self.seen.push(SeenEstate::of(&mut est));
                 self.log.push(OpLog::OpenedWindow);
-                match self.scripted.pop_front() {
+                // The estate is handed back on BOTH arms, including the panic
+                // arm's -- there is no arm here that keeps it, which is the
+                // fake modelling the trait's own "the whole value comes home".
+                let result = match self.scripted.pop_front() {
                     Some(result) => result,
                     None => panic!(
                         "the loop opened more windows than this test scripted; the log is {:?}",
                         self.log
                     ),
-                }
+                };
+                (est, result)
             }
 
             fn resettle_after_lost_session(
                 &mut self,
-                est: &mut SessionEstate,
+                mut est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) {
+            ) -> SessionEstate {
                 self.charge();
-                apply_resettle_to(est);
+                apply_resettle_to(&mut est);
                 self.log.push(OpLog::Resettled);
+                est
             }
 
             fn account_action(
                 &mut self,
-                est: &mut SessionEstate,
+                mut est: SessionEstate,
                 deps: &VaultDeps<'_>,
                 request: AccountRequest,
-            ) {
+            ) -> SessionEstate {
                 self.charge();
-                apply_account_action_to(est, deps, &request);
+                apply_account_action_to(&mut est, deps, &request);
                 self.log.push(OpLog::AccountAction(request));
+                est
             }
         }
 
@@ -10815,9 +10984,11 @@ mod tests {
             first_result: Option<VaultWindowResult>,
         ) -> SessionEstate {
             let deps = bench.deps();
-            let mut est = bench.estate();
-            run_vault_loop(&mut est, &deps, ops, first_result);
-            est
+            // **The estate the loop hands back, not one this helper kept.**
+            // With the estate travelling by value there is no local left
+            // behind for a broken loop to be measured against: what every
+            // assertion below reads is what `run_vault_loop` returned.
+            run_vault_loop(bench.estate(), &deps, ops, first_result)
         }
 
         // ---- Rule 1: the fixtures' own premises ----
@@ -11352,38 +11523,42 @@ mod tests {
         impl VaultOps for DetailsOrderingOps {
             fn open_window(
                 &mut self,
-                _est: &mut SessionEstate,
+                est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) -> VaultWindowResult {
+            ) -> (SessionEstate, VaultWindowResult) {
                 self.charge();
                 self.log.push(OpLog::OpenedWindow);
-                self.scripted
+                let result = self
+                    .scripted
                     .pop_front()
-                    .expect("the loop opened more windows than this test scripted")
+                    .expect("the loop opened more windows than this test scripted");
+                (est, result)
             }
 
             fn resettle_after_lost_session(
                 &mut self,
-                est: &mut SessionEstate,
+                mut est: SessionEstate,
                 _deps: &VaultDeps<'_>,
-            ) {
+            ) -> SessionEstate {
                 self.charge();
-                Self::demand_details(est, "lock / re-auth recovery");
+                Self::demand_details(&est, "lock / re-auth recovery");
                 // Mirrors production: `resettle_session` clears the cached
                 // status details deliberately, so the next window re-fetches.
                 est.details = None;
                 self.log.push(OpLog::Resettled);
+                est
             }
 
             fn account_action(
                 &mut self,
-                est: &mut SessionEstate,
+                est: SessionEstate,
                 _deps: &VaultDeps<'_>,
                 request: AccountRequest,
-            ) {
+            ) -> SessionEstate {
                 self.charge();
-                Self::demand_details(est, "account action");
+                Self::demand_details(&est, "account action");
                 self.log.push(OpLog::AccountAction(request));
+                est
             }
         }
 
@@ -11439,8 +11614,7 @@ mod tests {
                 }
                 let mut ops = DetailsOrderingOps::new(script);
                 let deps = bench.deps();
-                let mut est = bench.estate();
-                run_vault_loop(&mut est, &deps, &mut ops, None);
+                let _est = run_vault_loop(bench.estate(), &deps, &mut ops, None);
 
                 assert_eq!(ops.log, expected, "`{name}` did not run the branch it was meant to");
                 assert!(ops.scripted.is_empty(), "`{name}` left scripted windows unopened");
@@ -11462,8 +11636,7 @@ mod tests {
                 ..closed()
             }]);
             let deps = bench.deps();
-            let mut est = bench.estate();
-            run_vault_loop(&mut est, &deps, &mut ops, None);
+            let _est = run_vault_loop(bench.estate(), &deps, &mut ops, None);
         }
 
         /// **The loop does not put the details back after the recovery has
@@ -11499,8 +11672,7 @@ mod tests {
                 ..closed()
             }]);
             let deps = bench.deps();
-            let mut est = bench.estate();
-            run_vault_loop(&mut est, &deps, &mut ops, None);
+            let est = run_vault_loop(bench.estate(), &deps, &mut ops, None);
 
             assert_eq!(ops.log, vec![OpLog::OpenedWindow, OpLog::Resettled]);
             assert!(
@@ -11520,8 +11692,7 @@ mod tests {
                 ..closed()
             }]);
             let control_deps = control_bench.deps();
-            let mut control_est = control_bench.estate();
-            run_vault_loop(&mut control_est, &control_deps, &mut control, None);
+            let control_est = run_vault_loop(control_bench.estate(), &control_deps, &mut control, None);
             assert_eq!(control.log, vec![OpLog::OpenedWindow]);
             assert!(
                 control_est.details.is_some(),
@@ -11653,8 +11824,7 @@ mod tests {
                 closed(),
             ]);
             let deps = bench.deps();
-            let mut est = bench.estate_with_accounts();
-            run_vault_loop(&mut est, &deps, &mut ops, None);
+            let _est = run_vault_loop(bench.estate_with_accounts(), &deps, &mut ops, None);
 
             assert_eq!(
                 ops.log,
@@ -11761,8 +11931,7 @@ mod tests {
                 closed(),
             ]);
             let deps = bench.deps();
-            let mut est = bench.estate_with_accounts();
-            run_vault_loop(&mut est, &deps, &mut ops, None);
+            let est = run_vault_loop(bench.estate_with_accounts(), &deps, &mut ops, None);
 
             assert_eq!(ops.seen.len(), 2, "control: the loop did not reopen, so there is no \
                  `next window` for this test to be about");
@@ -11801,7 +11970,7 @@ mod tests {
         fn fake_vault_ops_method_body(source: &str, name: &str) -> String {
             let impl_body = body_of(source, concat!("impl VaultOps for Fake", "VaultOps {"));
             assert!(
-                impl_body.contains(concat!("self.seen.", "push(SeenEstate::of(est))")),
+                impl_body.contains(concat!("self.seen.", "push(SeenEstate::of(&mut est))")),
                 "control: the slice is not the fake's own impl block"
             );
             body_of(&impl_body, &format!("fn {name}("))
@@ -11902,7 +12071,7 @@ mod tests {
             // proves about `apply_resettle_to` is a fact about both.
             assert!(
                 fake_vault_ops_method_body(source, "resettle_after_lost_session")
-                    .contains(concat!("apply_resettle", "_to(est)")),
+                    .contains(concat!("apply_resettle", "_to(&mut est)")),
                 "`FakeVaultOps::resettle_after_lost_session` does not run the modelled resettle"
             );
             assert!(
