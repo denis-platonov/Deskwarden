@@ -864,6 +864,50 @@ pub fn vault_close(close_requested: bool, lost_session: bool) -> VaultClose {
     }
 }
 
+/// The four things a lock session can do that change whether the session is
+/// torn down.
+///
+/// A value, so that [`session_torn_down`] can be a pure total function over
+/// them. The three that a frame closure would otherwise decide by assigning a
+/// `bool` in three different places are exactly the three that got it wrong
+/// (see [`VaultSessionOutcome::relocked`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockProgress {
+    /// The lock arm ran and the teardown worker STARTED. From here the old
+    /// session is being dismantled.
+    TeardownStarted,
+    /// The lock arm ran and found its `FnOnce` teardown already spent -- the
+    /// second lock of one session (see [`run_from_vault`]'s floor note).
+    /// **Nothing is being torn down**, so this lock still needs the caller's
+    /// own recovery.
+    TeardownAlreadySpent,
+    /// A vault was rebuilt behind the spinner. The session is LIVE again.
+    VaultRebuilt,
+    /// The recovery produced no vault. The session stays down, and the
+    /// teardown that took it down has already authenticated once.
+    RebuildFailed,
+}
+
+/// Whether the session is torn down and not rebuilt, after one more step.
+///
+/// **This is the rule [`VaultSessionOutcome::relocked`] carries out of the
+/// window, and getting it wrong is a vault that reports itself locked while
+/// `bw serve` still answers.** It is a pure function and not three
+/// assignments inside the frame closure for the reason [`vault_close`] is:
+/// the closure cannot be called by a test, so a rule written inside it is a
+/// rule nothing checks.
+///
+/// `current` is carried rather than ignored because two of the four steps
+/// deliberately change nothing: a lock with a spent teardown must not claim a
+/// teardown, and a failed rebuild must not retract the one that did run.
+pub fn session_torn_down(current: bool, step: LockProgress) -> bool {
+    match step {
+        LockProgress::TeardownStarted => true,
+        LockProgress::VaultRebuilt => false,
+        LockProgress::TeardownAlreadySpent | LockProgress::RebuildFailed => current,
+    }
+}
+
 /// How far the teardown worker has got.
 ///
 /// Two messages and not one, because the sequence has a hole in the middle
@@ -900,12 +944,26 @@ pub struct VaultSessionOutcome {
     /// [`StartupOutcome::stages`] is, and for the same reason: "the table is
     /// right" and "the window ever got there" are different claims.
     pub stages: Vec<Stage>,
-    /// Whether a lock was caught here and handled IN THIS WINDOW.
+    /// **Whether this window leaves the session TORN DOWN AND NOT REBUILT.**
     ///
-    /// The caller's dispatch turns on it: `true` means the teardown has
-    /// already run, so running the caller's own lock recovery on top would be
-    /// a second teardown of a session that no longer exists. `false` on an
-    /// ordinary close means the caller's dispatch is untouched.
+    /// Not "was a lock seen here" -- that is the question this field used to
+    /// answer, and it is the wrong one. The caller's only use for it is to
+    /// decide whether to run its own lock recovery, so it must be true
+    /// exactly when running that recovery would be a second teardown of a
+    /// session that is already gone:
+    ///
+    /// * a lock whose teardown worker actually STARTED sets it, because from
+    ///   that moment the old session is being dismantled;
+    /// * a rebuilt vault CLEARS it, because the session is live again and a
+    ///   later lock in the same window is a fresh one;
+    /// * a lock that started no worker -- the second lock of one session,
+    ///   whose `FnOnce` teardown is spent (see [`run_from_vault`]'s floor) --
+    ///   never sets it, so the caller still runs the recovery that lock needs.
+    ///
+    /// Set on merely reaching the lock arm, this field reports a teardown
+    /// that did not happen, the caller skips the recovery, and the vault says
+    /// "locked" with its cache full and `bw serve` still answering. That is
+    /// the v0.5.0 defect in a new place.
     pub relocked: bool,
 }
 
@@ -1066,20 +1124,40 @@ where
                             *result_for_closure.borrow_mut() = Some(handles.finish());
                         }
                         vault_fn = None;
-                        *relocked_for_closure.borrow_mut() = true;
                         // THE TEARDOWN GOES TO A THREAD, for the reason
                         // `run`'s `prepare` does: it stops and restarts
                         // `bw serve`, which is seconds at best, and run here
                         // it would freeze the window on the very frame that is
                         // supposed to start showing the spinner.
-                        if let (Some(teardown), Some(step_tx), Some(token_rx)) =
+                        //
+                        // **`relocked` is set from whether the worker ACTUALLY
+                        // STARTED, not from having reached this arm.** The
+                        // difference is the second lock of one session: the
+                        // closures are `FnOnce`, so `teardown.take()` answers
+                        // `None` there and nothing is torn down (see this
+                        // function's floor note). Set unconditionally, this
+                        // flag would tell the caller "the teardown has already
+                        // run" about a lock that tore nothing down, and the
+                        // caller -- whose whole use for it is to SKIP its own
+                        // recovery -- would skip the only teardown that lock
+                        // was ever going to get. The vault would report itself
+                        // locked with the cache still full and `bw serve`
+                        // still holding a live session, which is the v0.5.0
+                        // defect in a new place and invisible to every test
+                        // that does not drive this host.
+                        let progress = if let (Some(teardown), Some(step_tx), Some(token_rx)) =
                             (teardown.take(), step_tx.take(), token_rx.take())
                         {
                             std::thread::spawn(move || {
                                 let step_tx = step_tx;
                                 teardown(&step_tx, token_rx);
                             });
-                        }
+                            LockProgress::TeardownStarted
+                        } else {
+                            LockProgress::TeardownAlreadySpent
+                        };
+                        let was = *relocked_for_closure.borrow();
+                        *relocked_for_closure.borrow_mut() = session_torn_down(was, progress);
                         if let Next::Show(next) = advance(stage, Event::Locked) {
                             stage = next;
                             if next == Stage::Working {
@@ -1151,20 +1229,43 @@ where
                             // ever reporting `Disconnected` again.
                             token_tx = None;
                             let built = rebuild_vault.take().and_then(|build| build());
-                            let event = match built {
+                            // **The session is LIVE again on the `Some` arm,
+                            // so the teardown stops being outstanding there
+                            // and only there.** Left set through a rebuild, a
+                            // session that locked, signed back in and was then
+                            // locked AGAIN would tell the caller a teardown
+                            // had run when the second lock's `FnOnce` teardown
+                            // was already spent -- and that lock would be
+                            // honoured by nobody.
+                            let (event, progress) = match built {
                                 Some((rebuilt, handles)) => {
                                     vault_fn = Some(rebuilt);
                                     *vault_handles_for_closure.borrow_mut() = Some(handles);
-                                    Event::WorkReady
+                                    (Event::WorkReady, LockProgress::VaultRebuilt)
                                 }
-                                None => Event::WorkFailed,
+                                None => (Event::WorkFailed, LockProgress::RebuildFailed),
                             };
+                            let was = *relocked_for_closure.borrow();
+                            *relocked_for_closure.borrow_mut() = session_torn_down(was, progress);
                             match advance(stage, event) {
                                 Next::Show(next) => stage = next,
                                 Next::Close => {
+                                    // `relocked` stays SET here, so the caller
+                                    // does not re-run the recovery: this
+                                    // teardown already ran and already
+                                    // authenticated, and the reason there is
+                                    // no vault is that the backend would not
+                                    // come back -- which `resettle_session_
+                                    // with` has already answered by standing
+                                    // autofill down. A second pass would ask
+                                    // for the master password the user just
+                                    // gave, to retry the thing that just
+                                    // failed.
                                     log::warn!(
-                                        "the lock's recovery produced no vault to show; \
-                                         closing so the caller's own recovery can run"
+                                        "the lock's recovery produced no vault to show; the \
+                                         session is torn down and stays down, so the window \
+                                         closes to the tray rather than asking for the master \
+                                         password a second time"
                                     );
                                     close_this_window(ui.ctx(), &mut closing);
                                 }
@@ -2638,6 +2739,105 @@ mod lock_transition_tests {
         assert_ne!(VaultClose::Ignore, VaultClose::Lock);
         assert_ne!(VaultClose::LetGo, VaultClose::Lock);
     }
+
+    /// Every step, in the order the enum declares them. Written out rather
+    /// than derived, and held to that by the exhaustive walk below.
+    const ALL_PROGRESS: &[LockProgress] = &[
+        LockProgress::TeardownStarted,
+        LockProgress::TeardownAlreadySpent,
+        LockProgress::VaultRebuilt,
+        LockProgress::RebuildFailed,
+    ];
+
+    /// **The whole of [`session_torn_down`], spelled out rather than derived
+    /// from the function it checks**, and asserted to have visited every one
+    /// of the eight `(current, step)` pairs -- a table that silently stopped
+    /// covering a pair would be a rule nobody checks for that pair.
+    #[test]
+    fn the_torn_down_rule_is_a_table_and_every_pair_is_in_it() {
+        // (current, step, expected)
+        let expected: &[(bool, LockProgress, bool)] = &[
+            (false, LockProgress::TeardownStarted, true),
+            (true, LockProgress::TeardownStarted, true),
+            (false, LockProgress::TeardownAlreadySpent, false),
+            (true, LockProgress::TeardownAlreadySpent, true),
+            (false, LockProgress::VaultRebuilt, false),
+            (true, LockProgress::VaultRebuilt, false),
+            (false, LockProgress::RebuildFailed, false),
+            (true, LockProgress::RebuildFailed, true),
+        ];
+        let mut visited = 0usize;
+        for &(current, step, want) in expected {
+            assert_eq!(
+                session_torn_down(current, step),
+                want,
+                "session_torn_down({current}, {step:?}) is the wrong way round, and this rule \
+                 is what tells the caller whether to run its own lock recovery"
+            );
+            visited += 1;
+        }
+        assert_eq!(visited, 8, "the table stopped covering all eight pairs");
+        assert_eq!(
+            ALL_PROGRESS.len() * 2,
+            8,
+            "a `LockProgress` variant was added or removed, so the table above is no longer \
+             exhaustive -- add its two rows"
+        );
+        for step in ALL_PROGRESS {
+            assert!(
+                expected.iter().any(|(_, s, _)| s == step),
+                "{step:?} has no row in the table, so its rule is unchecked"
+            );
+        }
+    }
+
+    /// **The second lock of one session must still lock.**
+    ///
+    /// `teardown` is `FnOnce`, so the second lock in a window starts no
+    /// worker and tears nothing down; the caller's own recovery is the only
+    /// one that lock will ever get. This is the regression that the field
+    /// being set on merely REACHING the lock arm would have shipped: the
+    /// caller reads "a teardown has already run", skips its recovery, and the
+    /// vault reports itself locked with its cache full and `bw serve` still
+    /// answering with a live session.
+    #[test]
+    fn a_lock_that_started_no_teardown_never_claims_one() {
+        assert!(
+            !session_torn_down(false, LockProgress::TeardownAlreadySpent),
+            "a lock whose FnOnce teardown was already spent claimed a teardown it did not \
+             start, so the caller will skip the only recovery that lock can get and the vault \
+             will not actually lock"
+        );
+        // The whole walk, in order: lock, rebuild, lock again.
+        let after_first = session_torn_down(false, LockProgress::TeardownStarted);
+        let after_rebuild = session_torn_down(after_first, LockProgress::VaultRebuilt);
+        let after_second = session_torn_down(after_rebuild, LockProgress::TeardownAlreadySpent);
+        assert!(after_first, "the first lock's teardown is not reported at all");
+        assert!(
+            !after_rebuild,
+            "a rebuilt vault still reports the session as torn down, so every later lock in \
+             this window is silently disarmed"
+        );
+        assert!(
+            !after_second,
+            "the SECOND lock of one session reports a teardown that never happened -- the \
+             caller skips its recovery and the vault does not lock"
+        );
+    }
+
+    /// The other direction, which the same field is also the only guard for:
+    /// a teardown that DID run must not be retracted by the rebuild failing,
+    /// or the caller asks for the master password the user just gave, to
+    /// retry the backend start that just failed.
+    #[test]
+    fn a_failed_rebuild_does_not_retract_the_teardown_that_ran() {
+        let after_lock = session_torn_down(false, LockProgress::TeardownStarted);
+        assert!(
+            session_torn_down(after_lock, LockProgress::RebuildFailed),
+            "a teardown that ran and then failed to repopulate is reported as no teardown at \
+             all, so the caller runs the whole sequence again on a session that is already gone"
+        );
+    }
 }
 
 /// The vault host's own wiring, pinned by source position -- the same way
@@ -2756,6 +2956,53 @@ mod lock_host_tests {
             arm.contains(concat!("vault_fn(ui, ", "frame);")),
             "control: the sliced region is not the arm that draws the vault: {arm}"
         );
+    }
+
+    /// **Both writes of `relocked` go through [`session_torn_down`], and
+    /// neither is a literal.**
+    ///
+    /// The rule is unit-tested above, but a rule the closure does not call is
+    /// a rule that governs nothing -- and the shape it replaced was exactly
+    /// two literal assignments, one of which was wrong. A literal `= true` in
+    /// the lock arm claims a teardown for the second lock of a session, whose
+    /// `FnOnce` teardown is spent; the caller then skips the only recovery
+    /// that lock can get and the vault does not lock. Nothing behavioural in
+    /// this file can see that, because no test can call this closure.
+    #[test]
+    fn the_hosts_two_relocked_writes_both_go_through_the_rule() {
+        let closure = closure();
+        assert_eq!(
+            closure.matches(concat!("session_torn_", "down(was, ")).count(),
+            2,
+            "the vault host does not have exactly two writes of `relocked` routed through the \
+             rule -- one at the lock and one at the rebuild. A write that bypasses it is a \
+             `relocked` nothing checks: {closure}"
+        );
+        for literal in [
+            concat!("relocked_for_closure.borrow_mut() = ", "true"),
+            concat!("relocked_for_closure.borrow_mut() = ", "false"),
+        ] {
+            assert!(
+                !closure.contains(literal),
+                "the vault host assigns `relocked` the literal {literal:?} instead of asking \
+                 `session_torn_down`, which is the shape that shipped a lock claiming a \
+                 teardown it never started: {closure}"
+            );
+        }
+        // Positive controls: both of the rule's two decision points are really
+        // in this closure, so the count above is over the real sites.
+        for needle in [
+            concat!("LockProgress::", "TeardownStarted"),
+            concat!("LockProgress::", "TeardownAlreadySpent"),
+            concat!("LockProgress::", "VaultRebuilt"),
+            concat!("LockProgress::", "RebuildFailed"),
+        ] {
+            assert!(
+                closure.contains(needle),
+                "control: {needle:?} is not in the vault host, so one of the four steps the \
+                 rule is defined over is never actually reported by the window: {closure}"
+            );
+        }
     }
 
     /// **The lock actually starts the teardown**, on a thread.
