@@ -775,6 +775,26 @@ pub struct EditDraft {
     /// the draft (not a local in `draw_detail_edit`) so it survives across
     /// egui frames, matching `login_ui::LoginForm::reveal_password`.
     pub reveal_password: bool,
+    /// The login's TOTP **seed** -- `otpauth://` URI or bare base32 secret --
+    /// which is what `LoginData::totp` holds. Not a code: nothing in this
+    /// form generates one, and the read pane's `detail::TotpState` is the
+    /// only thing in this crate that does.
+    ///
+    /// **A secret**, and treated as one everywhere it is treated at all: the
+    /// box is `theme::password_field` (masked, with [`Self::reveal_totp`]),
+    /// the model side is `Zeroizing` and is written through [`edited_secret`]
+    /// exactly as the password is, and nothing here logs it.
+    ///
+    /// A plain `String` rather than a `Zeroizing<String>` for the same
+    /// recorded reason [`Self::password`] and [`CardDraft`]'s two secrets
+    /// are: egui's `TextEdit` buffer is a `String` and egui owns copies of it
+    /// in its galley cache regardless. This does not widen the zeroize
+    /// guarantee -- see `deskwarden/README.md`.
+    pub totp: String,
+    /// Persistent reveal state for the seed box. See
+    /// [`Self::reveal_password`]; the same rule applies, including that a
+    /// freshly opened form never starts revealed.
+    pub reveal_totp: bool,
     pub card: CardDraft,
     pub identity: IdentityDraft,
     pub ssh_key: SshKeyDraft,
@@ -876,6 +896,8 @@ impl Default for EditDraft {
             username: String::new(),
             password: String::new(),
             reveal_password: false,
+            totp: String::new(),
+            reveal_totp: false,
             card: CardDraft::default(),
             identity: IdentityDraft::default(),
             ssh_key: SshKeyDraft::default(),
@@ -989,6 +1011,8 @@ impl EditDraft {
             username: drafted(login.and_then(|l| l.username.as_deref())),
             password: drafted(login.and_then(|l| l.password.as_deref()).map(|p| p.as_str())),
             reveal_password: false,
+            totp: drafted(login.and_then(|l| l.totp.as_deref()).map(|t| t.as_str())),
+            reveal_totp: false,
             card: CardDraft {
                 cardholder_name: drafted(card.and_then(|c| c.cardholder_name.as_deref())),
                 brand: drafted(card.and_then(|c| c.brand.as_deref())),
@@ -1093,6 +1117,8 @@ impl EditDraft {
         self.username = String::new();
         self.password = String::new();
         self.reveal_password = false;
+        self.totp = String::new();
+        self.reveal_totp = false;
         self.card = CardDraft::default();
         self.identity = IdentityDraft::default();
         self.ssh_key = SshKeyDraft::default();
@@ -1247,6 +1273,14 @@ impl EditDraft {
                 login.username = edited(login.username.as_deref(), &self.username);
                 login.password =
                     edited_secret(login.password.as_deref().map(|p| p.as_str()), &self.password);
+                // Same rule, same helper, and therefore the same guarantee as
+                // the password: a seed the form never showed a box for (a
+                // CREATE -- see `TOTP_CREATE_NOTICE`) leaves `self.totp`
+                // empty, and `edited` on an item that HAS a seed would then
+                // read as "cleared". That is why the box is drawn on an edit
+                // in both directions -- populated by `from_item`, written
+                // back here -- and never half of the pair.
+                login.totp = edited_secret(login.totp.as_deref().map(|t| t.as_str()), &self.totp);
                 updated.login = Some(login);
             }
             ItemKind::Card => {
@@ -1601,6 +1635,28 @@ pub enum EditAction {
 pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
     folders.iter().filter(|folder| !sidebar::is_virtual_folder(folder)).collect()
 }
+
+/// The label above the login form's TOTP seed box.
+///
+/// It says **key**, not "code": the box holds the shared secret the
+/// authenticator is built from, and a user who pastes a six-digit code into a
+/// box labelled "TOTP" has broken their own two-factor login until they
+/// notice.
+pub const TOTP_LABEL: &str = "Authenticator key (TOTP)";
+
+/// What the box is for, in the words the user would have been given by the
+/// site they are setting up.
+pub const TOTP_HINT: &str =
+    "The secret behind the 6-digit codes \u{2014} an otpauth:// link, or the base32 key a site \
+     shows beside its QR code. Not a code.";
+
+/// What the row says while an item is being **created**.
+///
+/// `vault_bridge::NewItem::login` has no `totp`, so a seed typed into a
+/// create form would be silently discarded on Save. Same reason, same
+/// treatment and same wording pattern as [`FIELDS_CREATE_NOTICE`]; offering
+/// it needs a `vault_bridge` change.
+pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
 
 // ---------------------------------------------------------------------------
 // The edit form's custom-fields block.
@@ -2899,6 +2955,27 @@ pub fn draw_detail_edit(
                         }
                     });
                     ui.add_space(10.0);
+
+                    // Below the password and its generator, because that is
+                    // the order the user meets them in when setting an
+                    // account up, and because the seed is the one field on
+                    // this body the generator has nothing to do with.
+                    theme::field_label(ui, TOTP_LABEL);
+                    if creating {
+                        theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                    } else {
+                        // Masked, like the password above it and for the same
+                        // reason: it is a secret, and this form may be open
+                        // in front of other people. `password_field` is the
+                        // crate's one masked box -- reaching for a plain
+                        // `text_field` here is the mutation
+                        // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
+                        // exists to catch.
+                        theme::password_field(ui, &mut draft.totp, &mut draft.reveal_totp);
+                    }
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
+                    ui.add_space(10.0);
                 }
                 FormBody::Card => {
                     let card = &mut draft.card;
@@ -3715,14 +3792,27 @@ mod tests {
 
     #[test]
     fn apply_to_preserves_fields_the_form_never_touched() {
+        // **Built from the item**, not from `EditDraft::empty()`, and the
+        // difference is the subject of this test rather than a detail of it:
+        // this form now HAS boxes for the TOTP seed and the custom fields, so
+        // a draft that was never populated from the item says "the user
+        // cleared them", which is a different claim from "the form never
+        // touched them". The three overridden fields below are the edit; the
+        // assertions are about everything else.
+        let item = item();
         let draft = EditDraft {
             name: "Renamed".into(),
             username: "new@b.com".into(),
             password: "np".into(),
             folder_id: None,
-            ..EditDraft::empty()
+            // ...and the recorded original with it, so this stays the
+            // un-file case it has always been: `may_unfile` refuses a clear
+            // on an item that arrived filed, and `from_item` records that
+            // `item()` did.
+            original_folder_id: None,
+            ..EditDraft::from_item(&item)
         };
-        let updated = draft.apply_to(&item());
+        let updated = draft.apply_to(&item);
 
         assert_eq!(updated.name, "Renamed");
         assert_eq!(updated.folder_id, None);
@@ -4162,6 +4252,53 @@ mod tests {
         assert_eq!(
             OURS_PREFIX, "deskwarden:",
             "the prefix moved; `key_sequence::field_palette` has its own copy"
+        );
+    }
+
+    /// The seed is read out of the item, edited, and written back -- the
+    /// wiring pin for a box that was previously preserved and never offered.
+    #[test]
+    fn the_totp_seed_is_read_edited_and_written_back() {
+        let item = parse(LOGIN_WITH_EXTRAS);
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(draft.totp, "SEED", "from_item did not read the seed into the box");
+
+        draft.totp = "otpauth://totp/Ledgerline?secret=NEWSEED".into();
+        let saved = draft.apply_to(&item);
+        assert_eq!(
+            saved.login.as_ref().unwrap().totp.as_deref().map(|t| t.as_str()),
+            Some("otpauth://totp/Ledgerline?secret=NEWSEED"),
+            "the edited seed never reached the item"
+        );
+        // And nothing else in the login moved.
+        assert_eq!(saved.login.as_ref().unwrap().username.as_deref(), Some("a@b.com"));
+        assert_eq!(saved.login.as_ref().unwrap().uris.len(), 1);
+    }
+
+    /// Clearing the box removes the key, by the same blank rule every other
+    /// box on this form follows -- and an item that never had one does not
+    /// gain a `"totp": null`.
+    #[test]
+    fn clearing_the_totp_box_removes_the_seed_and_an_absent_one_is_not_invented() {
+        let item = parse(LOGIN_WITH_EXTRAS);
+        let mut draft = EditDraft::from_item(&item);
+        draft.totp = String::new();
+        let saved = draft.apply_to(&item);
+        assert!(saved.login.as_ref().unwrap().totp.is_none(), "clearing the box did nothing");
+
+        // The other half: an item with no seed, saved untouched, must not
+        // grow the key. `LoginData::totp` carries `skip_serializing_if`, and
+        // this is what holds it to that through the new box.
+        let bare = parse(
+            r#"{"object":"item","id":"9","name":"Bare","type":1,"favorite":false,
+                "fields":[],"login":{"username":"u","password":"p"}}"#,
+        );
+        let saved = EditDraft::from_item(&bare).apply_to(&bare);
+        let value = serde_json::to_value(&saved).unwrap();
+        assert_eq!(
+            value["login"].as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["password", "username"],
+            "an untouched login with no seed gained a totp key"
         );
     }
 
@@ -4970,10 +5107,12 @@ mod generator_row_tests {
     /// tests ask what the form *says*; the form scrolls, so a control below
     /// the fold is painted only if the harness pane is tall enough to hold the
     /// whole form. Raised from 900 when the app block gained the keystroke
-    /// summary. What the app can really be resized to is asserted separately
-    /// and deliberately, against `MIN_PANE_WIDTH`/`MIN_PANE_HEIGHT` in
-    /// `min_size_tests` -- those are the geometry pins and this is not one.
-    const BODY: egui::Vec2 = egui::vec2(560.0, 1100.0);
+    /// summary, and from 1100 when the login body gained the custom-fields
+    /// block and the TOTP seed row. What the app can really be resized to is
+    /// asserted separately and deliberately, against
+    /// `MIN_PANE_WIDTH`/`MIN_PANE_HEIGHT` in `min_size_tests` -- those are
+    /// the geometry pins and this is not one.
+    const BODY: egui::Vec2 = egui::vec2(560.0, 1400.0);
 
     #[derive(Default)]
     struct Painted {
@@ -8360,7 +8499,13 @@ mod edit_pane_layout_tests {
         // an edit -- is expected to offer exactly what `form_body` says and
         // this list cannot drift from it.
         match form_body(kind, creating) {
-            FormBody::Login => expected.extend(["Username", "Password", "Generate"]),
+            FormBody::Login => {
+                expected.extend(["Username", "Password", "Generate", TOTP_LABEL]);
+                // The seed box, like the custom-field boxes, cannot exist on
+                // a create (`NewItem::login` has no `totp`), so the row says
+                // why instead of taking input Save would drop.
+                expected.push(if creating { TOTP_CREATE_NOTICE } else { TOTP_HINT });
+            }
             FormBody::Card => expected.extend([
                 "Cardholder name",
                 "Brand",
@@ -8748,6 +8893,63 @@ mod edit_pane_layout_tests {
             }
         }
         assert_eq!(checked, 4, "the row loop visited {checked} labels");
+    }
+
+    /// **The TOTP seed is masked, and is never painted in the clear.**
+    ///
+    /// The seed is the whole of a second factor: anyone who reads it off the
+    /// screen can generate that account's codes forever. It gets the
+    /// password's treatment -- `theme::password_field` -- and the mutation
+    /// this exists to catch is one character wide (`text_field` in its
+    /// place), which is why it is asserted on the painted glyphs and not on
+    /// which function was called.
+    ///
+    /// Three states, because a mask that is really a culled block would pass
+    /// the first alone:
+    ///
+    /// * shut: the seed is not on screen anywhere, but the username beside it
+    ///   is -- so the form really was drawn;
+    /// * revealed: the seed IS on screen, so the assertion above is about the
+    ///   mask and not about the box being empty;
+    /// * a freshly opened form starts shut, so no form ever opens showing it.
+    #[test]
+    fn the_totp_seed_is_masked_and_never_painted_in_the_clear() {
+        const SEED: &str = "JBSWY3DPEHPK3PXP";
+        const USERNAME: &str = "ada@example.com";
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.username = USERNAME.into();
+        draft.totp = SEED.into();
+        assert!(!draft.reveal_totp, "a form opens with the seed already revealed");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let shut = frame(&ctx, pane, &mut draft, false, &[]);
+        let strings = shut.strings();
+        assert!(
+            strings.iter().any(|s| s.contains(USERNAME)),
+            "the username is not on screen either, so this frame is not showing the login \
+             body at all: {strings:?}"
+        );
+        assert!(
+            strings.iter().any(|s| *s == TOTP_LABEL),
+            "the seed row was not drawn: {strings:?}"
+        );
+        assert!(
+            !strings.iter().any(|s| s.contains(SEED)),
+            "the TOTP seed is painted in the clear: {strings:?}"
+        );
+
+        // The control on the control: revealed, it really is the seed in that
+        // box, so the check above is about masking.
+        draft.reveal_totp = true;
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let open = frame(&ctx, pane, &mut draft, false, &[]);
+        assert!(
+            open.strings().iter().any(|s| s.contains(SEED)),
+            "the box does not hold the seed at all, so the mask assertion proved nothing: {:?}",
+            open.strings()
+        );
     }
 
     /// **A hidden field's value is masked, and a text field's is not.**
