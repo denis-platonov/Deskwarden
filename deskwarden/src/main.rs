@@ -549,10 +549,11 @@ fn main() {
     //   card's in the other, where it does not exist until `app_window::run`
     //   has returned it. The note on `session_token` just above says why an
     //   empty string here must not be spellable.
-    // * `child` is `start_backend`'s in the cached-session arm and
-    //   `startup_child.claim()`'s in the other, where the claim happens after
+    // * `child` is `start_backend`'s in the cached-session arm and the startup
+    //   handoff's in the other, where the claim off that handoff happens after
     //   the window. A `None` seeded before that is the exact false belief
-    //   `StartupChildHandoff` exists to remove.
+    //   `StartupChildHandoff` exists to remove. The claim is spelled once, in
+    //   code, and a guard counts it -- so this note does not spell it again.
     //
     // Two of the ten are not decided by either arm and both seed `None`. That
     // is the value they have always held at this point in the launch, and the
