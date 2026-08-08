@@ -3044,30 +3044,41 @@ impl EstatePark {
     }
 }
 
-/// Hands `estate` to `work` on a worker thread, waits `deadline` for it, and
-/// gives the estate back whatever happened.
+/// Hands `estate` to `work` on a worker thread, waits for it **however the
+/// caller says to wait**, and gives the estate back whatever happened.
 ///
-/// The three ways the wait can end map one-to-one onto [`EstateOutcome`], and
-/// **the read-back is below the match, on the single path all three join** --
-/// deliberately, so that a future edit cannot give one outcome its own return
-/// that forgets it. This is the shape the ledger prescribes at
-/// `progress.md:14285`.
+/// **The wait is a parameter and not a `recv_timeout`, and that is the whole
+/// reason this function exists rather than [`work_on_the_parked_estate`].**
+/// A blocking wait here runs on the CALLING thread. On the in-window lock
+/// that thread is the one inside `eframe`'s event loop, which has to stay up
+/// and paint a spinner for the entire teardown -- so a `recv_timeout` there
+/// is a frozen window, which is strictly worse than the blink the whole
+/// feature exists to remove. The host therefore passes a `wait` whose body IS
+/// the event loop, and maps how the window ended onto [`EstateOutcome`];
+/// `work_on_the_parked_estate` passes the deadline-shaped one.
+///
+/// **The read-back is the one statement below `wait`, on the single path
+/// every outcome joins** -- deliberately, so that a future edit cannot give
+/// one outcome its own return that forgets it. It is held HERE rather than by
+/// each caller precisely so that a second caller cannot be the one that gets
+/// it wrong. This is the shape the ledger prescribes at `progress.md:14285`,
+/// with the correction at `progress.md:24513`.
 ///
 /// The panic path is detected by the sender being dropped as the worker
 /// unwinds: `work` is called before the send, so an unwind drops the sender
-/// without one and the wait ends `Disconnected`. The mutex guard `with` holds
-/// lives in a frame INSIDE `work`, so it is released earlier in the same
-/// unwind than the sender is dropped -- the reclaim below can never be racing
-/// a guard held by a thread that is already gone.
+/// without one and a waiting `recv` ends `Disconnected`. The mutex guard
+/// `with` holds lives in a frame INSIDE `work`, so it is released earlier in
+/// the same unwind than the sender is dropped -- the reclaim below can never
+/// be racing a guard held by a thread that is already gone.
 ///
 /// The worker is not joined. On the deadline path it is still running by
 /// definition, and there is nothing to wait for: the reclaim has emptied the
 /// slot, so everything it does from here on is a `None` from `with`.
 #[allow(dead_code)]
-fn work_on_the_parked_estate(
+fn park_and_work(
     estate: SessionEstate,
-    deadline: Duration,
     work: impl FnOnce(&EstatePark) + Send + 'static,
+    wait: impl FnOnce(&mpsc::Receiver<()>) -> EstateOutcome,
 ) -> (SessionEstate, EstateOutcome) {
     let park = EstatePark::holding(estate);
     let worker_view = park.handle();
@@ -3079,21 +3090,42 @@ fn work_on_the_parked_estate(
         let _ = signal.send(());
     });
 
-    let outcome = match done_rx.recv_timeout(deadline) {
-        Ok(()) => EstateOutcome::Completed,
-        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
-        Err(mpsc::RecvTimeoutError::Disconnected) => EstateOutcome::WorkerPanicked,
-    };
+    let outcome = wait(&done_rx);
 
-    // THE READ-BACK. One statement, below all three arms, naming no field --
-    // the whole value comes home or nothing does, and there is no partial
-    // spelling of this that compiles.
+    // THE READ-BACK. One statement, below every way the wait can have ended,
+    // naming no field -- the whole value comes home or nothing does, and
+    // there is no partial spelling of this that compiles.
     let recovered = park.reclaim().expect(
         "the parked session state was gone at the read-back. Only this line ever empties the \
          slot and it runs once, so this means a second reclaimer was added -- and the thread \
          that owns the session would be left with no session at all",
     );
     (recovered, outcome)
+}
+
+/// [`park_and_work`] with the deadline-shaped wait: block this thread on the
+/// worker's completion signal for at most `deadline`.
+///
+/// **`#[cfg(test)]`, and that is an honest label rather than a demotion.**
+/// The in-window lock's host waits by running its event loop, so it calls
+/// `park_and_work` directly and nothing in production wants this shape. What
+/// it still is, is the harness under which the three ways a stretch of parked
+/// work can end are *driven* -- a deadline that really expires and a worker
+/// that really panics are not states a test can produce through an `eframe`
+/// loop it cannot start. Left as production with no caller it would be dead
+/// code wearing an `#[allow]`; deleted, the three path tests below it would
+/// go with it and the read-back would be pinned by nothing but a source scan.
+#[cfg(test)]
+fn work_on_the_parked_estate(
+    estate: SessionEstate,
+    deadline: Duration,
+    work: impl FnOnce(&EstatePark) + Send + 'static,
+) -> (SessionEstate, EstateOutcome) {
+    park_and_work(estate, work, |done_rx| match done_rx.recv_timeout(deadline) {
+        Ok(()) => EstateOutcome::Completed,
+        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+        Err(mpsc::RecvTimeoutError::Disconnected) => EstateOutcome::WorkerPanicked,
+    })
 }
 
 /// The immutable half of what a vault session runs against: borrowed, never
@@ -8573,7 +8605,17 @@ mod tests {
             let code = production_code();
             let fields = estate_fields();
 
-            let driver = super::body_of(&code, concat!("fn work_on_the_parked_", "estate("));
+            // **THE DRIVER IS `park_and_work`, not the deadline wrapper.**
+            // The wait became a parameter (see that function's doc: a
+            // blocking wait on the in-window lock's calling thread is a
+            // frozen `eframe` window), and the read-back went with it. Left
+            // pointed at `work_on_the_parked_estate`, this guard would slice
+            // a three-line caller that contains no read-back at all and pass
+            // for free -- correct in isolation, reaching nothing, which is
+            // this file's house defect. The wrapper is sliced TOO, below, so
+            // a read-back smuggled back into it is caught as well.
+            let driver = super::body_of(&code, concat!("fn park_and", "_work("));
+            let wrapper = super::body_of(&code, concat!("fn work_on_the_parked_", "estate("));
             let taker = super::body_of(&code, concat!("fn recl", "aim(&self)"));
             assert!(
                 (200..4_000).contains(&driver.len()),
@@ -8581,12 +8623,18 @@ mod tests {
                 driver.len()
             );
             assert!(
+                (10..600).contains(&wrapper.len()),
+                "the sliced deadline wrapper is {} bytes, which is not that function",
+                wrapper.len()
+            );
+            assert!(
                 (10..600).contains(&taker.len()),
                 "the sliced `reclaim` is {} bytes, which is not that method",
                 taker.len()
             );
             for (what, body, marker) in [
-                ("the driver", &driver, "recv_timeout"),
+                ("the driver", &driver, "park.reclaim()"),
+                ("the wrapper", &wrapper, "recv_timeout"),
                 ("the taker", &taker, "take()"),
             ] {
                 assert!(
@@ -8595,8 +8643,25 @@ mod tests {
                      guard is about"
                 );
             }
+            // The read-back is BELOW the wait, on the one path every outcome
+            // joins. Hoisted above it -- step 1's M6 -- the worker's first
+            // `with` finds the slot already empty, and the three path tests
+            // catch that; this is the source-side statement of the same
+            // ordering, so the position is pinned from both directions.
+            let wait_at = driver
+                .find("wait(&done_rx)")
+                .expect("`park_and_work` must still hand the wait to the caller");
+            let read_back_at = driver
+                .find("park.reclaim()")
+                .expect("counted one, found none");
+            assert!(
+                wait_at < read_back_at,
+                "the read-back is ABOVE the wait, so the estate is taken out of the park \
+                 before the worker has run: every `with` the worker makes then finds an \
+                 empty slot and the teardown writes into nothing"
+            );
 
-            let region = format!("{driver}\n{taker}");
+            let region = format!("{driver}\n{wrapper}\n{taker}");
             let mentions = field_mentions(&region, &fields);
             assert!(
                 mentions.is_empty(),
@@ -9068,6 +9133,129 @@ mod tests {
                  the session is settled -- turns on the difference"
             );
             the_worker_reached_the_estate(&back, "the panic path");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The in-window lock's own shape: a wait that is not a
+        /// `recv_timeout`.**
+        ///
+        /// The three tests above all reach [`park_and_work`] through
+        /// `work_on_the_parked_estate`, whose wait blocks this thread. That
+        /// is exactly the wait the in-window lock may NOT use -- the calling
+        /// thread there is the one inside `eframe`'s event loop, and blocking
+        /// it is a frozen window. So the host passes a wait of its own, and
+        /// this test drives that arrangement rather than the deadline one:
+        /// the `wait` here loops on a side channel the way a frame closure
+        /// polls its step channel, and only then does the ONE short
+        /// `recv_timeout` on the done channel that turns "the window ended"
+        /// back into `Completed`.
+        ///
+        /// Without this, the `wait` parameter is a parameter only one caller
+        /// ever supplies, and the claim that a second shape of wait works is
+        /// checked by nothing.
+        #[test]
+        fn a_caller_supplied_wait_ends_the_stretch_and_the_estate_still_comes_home() {
+            let dir = scratch("caller-wait");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            // The worker's own "I am done drawing-relevant work" report --
+            // `TeardownStep::Finished`'s stand-in. It is a DIFFERENT channel
+            // from the completion signal `park_and_work` owns, which is the
+            // whole reason the trailing `recv_timeout` below is needed.
+            let (step_tx, step_rx) = mpsc::channel::<()>();
+            let mut polls = 0usize;
+
+            let (back, outcome) = park_and_work(
+                est,
+                move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                    let _ = step_tx.send(());
+                },
+                |done_rx| {
+                    // The event loop's stand-in: poll, never block on the
+                    // park's own channel.
+                    loop {
+                        polls += 1;
+                        match step_rx.try_recv() {
+                            Ok(()) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    // The beat between the worker's last report and its
+                    // return. Skipped, a completed stretch would be reported
+                    // as a deadline.
+                    match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    }
+                },
+            );
+
+            assert!(
+                polls > 0,
+                "control: the caller's wait never ran a single poll, so this test drove the \
+                 old blocking shape and proved nothing about a wait the caller supplies"
+            );
+            assert_eq!(
+                outcome,
+                EstateOutcome::Completed,
+                "the worker ran to the end, so the stretch completed -- reported as anything \
+                 else, the host would treat a finished teardown as an abandoned one"
+            );
+            the_worker_reached_the_estate(&back, "a caller-supplied wait");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The outcome is the wait's answer, not a guess made underneath
+        /// it -- and the estate comes home either way.**
+        ///
+        /// The host's wait is the event loop, so it is the ONLY thing that
+        /// knows how the window ended: a user who gave up on the spinner and
+        /// a teardown that finished a millisecond later are the same instant
+        /// from underneath. Here the worker really does complete and the wait
+        /// still answers `DeadlineExpired`; [`park_and_work`] must report
+        /// what it was told rather than substituting what it can observe,
+        /// and must still bring the estate home on that answer.
+        #[test]
+        fn the_outcome_is_the_waits_answer_and_not_a_guess_at_it() {
+            let dir = scratch("waits-answer");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (done_tx, done_seen_rx) = mpsc::channel::<()>();
+            let (back, outcome) = park_and_work(
+                est,
+                move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                    let _ = done_tx.send(());
+                },
+                |done_rx| {
+                    // Waited for, so the worker demonstrably DID finish --
+                    // the answer below is a decision and not a race.
+                    done_seen_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the worker must reach the end of its work");
+                    let _ = done_rx;
+                    EstateOutcome::DeadlineExpired
+                },
+            );
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::DeadlineExpired,
+                "the wait's answer was overridden from underneath it. The host's wait IS the \
+                 event loop and is the only thing that knows how the window ended; a \
+                 `park_and_work` that decides for itself would report a lock the user \
+                 abandoned as one that settled"
+            );
+            the_worker_reached_the_estate(&back, "an overriding wait");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
