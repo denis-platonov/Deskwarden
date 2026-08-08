@@ -959,7 +959,15 @@ fn main() {
     // problem, and it also means there is exactly one place -- not two -- a
     // lock event has to drain before it can safely stop/restart the backend
     // itself (see `open_vault_window`'s `locked` branch).
+    //
+    // Behind an `Arc<Mutex<_>>` rather than owned outright: the drain above
+    // is the one the teardown path performs before it stops and restarts
+    // `bw serve`, and that path is moving onto a worker thread. Sharing the
+    // receiver changes nothing about who drains it -- there is still exactly
+    // one consumer at any instant, because the lock says so -- it changes
+    // only whether that consumer has to be THIS thread.
     let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
+    let backend_op_rx = Arc::new(Mutex::new(backend_op_rx));
     // `Some((started, kind))` while a background backend operation is in
     // flight, the instant it was set recording when -- rather than a plain
     // `bool` -- so the main loop below can tell a merely-slow operation
@@ -1709,9 +1717,23 @@ fn main() {
         // tray-triggered Sync) reports back, apply its outcome. This is also
         // where `backend_task_in_progress` is cleared, so the reconciliation
         // step right after it is never fighting a still-in-flight operation.
-        if let Ok(op) = backend_op_rx.try_recv() {
+        let idle_op = backend_op_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .try_recv();
+        if let Ok(op) = idle_op {
             estate.task_in_progress = None;
-            apply_backend_op(op, &mut estate.child, &estate.cache, &mut estate.engine, &tray);
+            let mut tray_effects = Vec::new();
+            apply_backend_op(
+                op,
+                &mut estate.child,
+                &estate.cache,
+                &mut estate.engine,
+                &mut tray_effects,
+            );
+            for effect in tray_effects {
+                effect.apply(&tray);
+            }
         }
 
         // A deadline on the FLAG itself, not just on any one `recv` -- see
@@ -3258,10 +3280,13 @@ trait VaultOps {
 /// shareable and so stayed out of both `SessionEstate` and `VaultDeps`.
 ///
 /// `AppTray` owns a hidden Win32 window bound to the thread that built it;
-/// the receiver is the drain, and only one place may hold it.
+/// the receiver is the drain, and only one place may drain it at a time --
+/// which the `Mutex` is now what enforces, rather than sole ownership. The
+/// `Arc` is here so the teardown's drain can travel to a worker thread; the
+/// tray, which cannot, is what keeps this struct itself off one.
 struct RealVaultOps<'a> {
     tray: &'a tray::AppTray,
-    backend_op_rx: &'a mpsc::Receiver<BackendOp>,
+    backend_op_rx: &'a Arc<Mutex<mpsc::Receiver<BackendOp>>>,
 }
 
 impl VaultOps for RealVaultOps<'_> {
@@ -3945,7 +3970,7 @@ fn open_vault_window(
     // estate. The receiver stays out for the same reason the sender went in:
     // only one place may drain it.
     tray: &tray::AppTray,
-    backend_op_rx: &mpsc::Receiver<BackendOp>,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     // The outcome of a vault session THIS FUNCTION DID NOT OPEN, dispatched by
     // the loop below on its first pass instead of that pass opening a window.
     //
@@ -4021,11 +4046,70 @@ fn resettle_session(
     job: &Arc<Option<job_object::KillOnCloseJob>>,
     schedule: &[Duration],
     tray: &tray::AppTray,
-    backend_op_rx: &mpsc::Receiver<BackendOp>,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
     cached_status_details: &mut Option<login_ui::BwStatusDetails>,
     session_token: &mut String,
     authenticate: impl FnOnce() -> Option<String>,
+) -> ResettleOutcome {
+    // The two things this thread has that a worker thread could not be given:
+    // the tray (a hidden Win32 window bound to whoever built it) and a probe
+    // that opens a spinner window of its own. Both are supplied HERE and
+    // nowhere below, which is what leaves the body movable.
+    let mut tray_effects = Vec::new();
+    let outcome = resettle_session_reporting_tray(
+        cache,
+        engine,
+        bw_serve_child,
+        job,
+        backend_op_rx,
+        backend_task_in_progress,
+        cached_status_details,
+        session_token,
+        authenticate,
+        |message| wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message),
+        &mut tray_effects,
+    );
+    // Labels, applied on the thread that owns the tray. Nothing reads them
+    // back and nothing branches on them, which is the whole licence for
+    // having deferred them at all -- see [`TrayEffect`].
+    for effect in tray_effects {
+        effect.apply(tray);
+    }
+    outcome
+}
+
+/// `resettle_session`'s body with the two unmovable things taken out of it:
+/// the tray is a sink of [`TrayEffect`] values and the readiness probe is a
+/// parameter. Everything else -- the bounded in-flight drain, the stand-down
+/// on a give-up, and the one call to `resettle_session_with` -- is the code
+/// that was in `resettle_session`, unchanged and in the same order.
+///
+/// **Why the probe had to move at the same time as the tray.** A body that
+/// still named `wait_for_vault_ready_with_spinner` would be `Send` in its
+/// captures and a lie in its behaviour: that function opens an `eframe`
+/// window, and a worker thread may not. Lifting only the tray would produce
+/// a signature that compiles on a worker and deadlocks or panics the first
+/// time one is actually used. `probe` is injected exactly the way
+/// `resettle_session_with` already takes its own, so the in-window lock's
+/// windowless probe is a substitution here rather than a rewrite.
+///
+/// There is still exactly ONE teardown-and-repopulate sequence: this is not
+/// it. It is the wiring that reaches it, split in two so that the half a
+/// worker can run is separable from the half only the UI thread can.
+#[allow(clippy::too_many_arguments)]
+fn resettle_session_reporting_tray(
+    cache: &Arc<VaultCache>,
+    engine: &mut MatchEngine,
+    bw_serve_child: &mut Option<Child>,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    backend_task_in_progress: &mut Option<(Instant, BackendOpKind)>,
+    cached_status_details: &mut Option<login_ui::BwStatusDetails>,
+    session_token: &mut String,
+    authenticate: impl FnOnce() -> Option<String>,
+    probe: impl FnMut(&'static str) -> VaultReadyOutcome,
+    tray_effects: &mut Vec<TrayEffect>,
 ) -> ResettleOutcome {
     // A backend operation kicked off above (or a tray Sync click that
     // landed while the window was open) may still be in flight. Unlike
@@ -4048,8 +4132,19 @@ fn resettle_session(
     // `apply_backend_op`'s callers), not an unkillable app.
     if backend_task_in_progress.is_some() {
         log::info!("waiting for an in-flight backend operation before handling the lock");
-        match backend_op_rx.recv_timeout(BACKEND_OP_TIMEOUT) {
-            Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray),
+        // `unwrap_or_else(PoisonError::into_inner)` rather than `expect`: the
+        // receiver behind this mutex is a plain queue with no invariant a
+        // panicking holder could have broken, and refusing to drain here
+        // because some other thread died would strand an in-flight backend
+        // operation racing this one for port 8087 -- the exact failure the
+        // drain exists to prevent. Held only for the `recv_timeout` itself.
+        let drain = backend_op_rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let received = drain.recv_timeout(BACKEND_OP_TIMEOUT);
+        // Released before anything below runs: the teardown that follows can
+        // take seconds, and `main`'s own idle drain wants this same lock.
+        drop(drain);
+        match received {
+            Ok(op) => apply_backend_op(op, bw_serve_child, cache, engine, tray_effects),
             Err(_) => {
                 log::warn!(
                     "in-flight backend operation did not report back within \
@@ -4077,7 +4172,7 @@ fn resettle_session(
                 // names "Sync"; leaving the item saying "Syncing..."
                 // means the menu contains no item by that name, and the
                 // one that is there reads as busy.
-                tray::set_sync_idle(tray);
+                tray_effects.push(TrayEffect::SyncIdle);
             }
         }
         *backend_task_in_progress = None;
@@ -4091,7 +4186,7 @@ fn resettle_session(
         session_token,
         authenticate,
         |token| try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE_RESTART),
-        |message| wait_for_vault_ready_with_spinner(cache.bridge(), schedule, message),
+        probe,
     )
 }
 
@@ -4940,19 +5035,57 @@ enum SettledSync {
     Failed(String),
 }
 
+/// A tray label update, as a VALUE rather than as a call.
+///
+/// `tray::AppTray` owns a hidden Win32 window bound to the thread that built
+/// it, so it is neither `Send` nor shareable -- which is the whole reason the
+/// teardown sequence cannot be handed to a worker thread as it stands. Both
+/// touches the sequence makes are *labels*: nothing reads them back, nothing
+/// branches on them, and no ordering against anything else is observable. So
+/// they can be collected here and applied later, by whichever thread does own
+/// the tray, without changing what the user sees.
+///
+/// Deliberately not `apply`-ing itself anywhere near the sequence: the point
+/// of the lift is that the sequence names `tray::` not at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayEffect {
+    /// `tray::set_sync_idle` -- "Sync" enabled and back to its resting label.
+    SyncIdle,
+    /// `tray::set_sync_failed` -- "click to retry", the honest label for a
+    /// sync that refreshed nothing locally.
+    SyncFailed,
+}
+
+impl TrayEffect {
+    /// Performs the label update. Callable only where a real `AppTray` is in
+    /// hand, which is exactly the thread that built it.
+    fn apply(self, tray: &tray::AppTray) {
+        match self {
+            TrayEffect::SyncIdle => tray::set_sync_idle(tray),
+            TrayEffect::SyncFailed => tray::set_sync_failed(tray),
+        }
+    }
+}
+
 /// Applies a completed [`BackendOp`]: updates `bw_serve_child` and, for a
-/// `Sync`, rebuilds the match engine and reflects the outcome on the tray.
+/// `Sync`, rebuilds the match engine and reports the outcome as a
+/// [`TrayEffect`] for its caller to apply.
 ///
 /// Whether a sync's outcome is still applicable at all, and what to build the
 /// engine from if it is, are both decided by `settle_sync_outcome` -- see
 /// there for the contract. This function never reaches into `cache` itself
 /// for that data, so there is no second, unchecked route to it.
+///
+/// The tray arrives as a SINK, not as an `AppTray`: this body runs on the
+/// teardown path, which a worker thread is going to own, and the effects it
+/// pushes are drained by whoever holds the tray. `tray_effects` is appended
+/// to, never cleared -- a caller may batch several ops into one sink.
 fn apply_backend_op(
     op: BackendOp,
     bw_serve_child: &mut Option<Child>,
     cache: &VaultCache,
     engine: &mut MatchEngine,
-    tray: &tray::AppTray,
+    tray_effects: &mut Vec<TrayEffect>,
 ) {
     match op {
         BackendOp::EnsureRunning(Ok(child)) => {
@@ -4964,14 +5097,14 @@ fn apply_backend_op(
             // label alone, but this arm also runs for an `EnsureRunning`
             // that a lock recovery abandoned, by which point the label may
             // be a stale "Syncing..." from an earlier wedged sync.
-            tray::set_sync_idle(tray);
+            tray_effects.push(TrayEffect::SyncIdle);
         }
         BackendOp::EnsureRunning(Err(e)) => {
             log::error!(
                 "could not start bw serve for the vault window (writes and TOTP will fail until \
                  the next attempt; reads still work from the cache): {e}"
             );
-            tray::set_sync_idle(tray);
+            tray_effects.push(TrayEffect::SyncIdle);
         }
         BackendOp::Sync { child, outcome } => {
             match child {
@@ -4994,7 +5127,7 @@ fn apply_backend_op(
                         entries.len()
                     );
                     engine.rebuild(&entries);
-                    tray::set_sync_idle(tray);
+                    tray_effects.push(TrayEffect::SyncIdle);
                 }
                 SettledSync::NothingToApply => {
                     // Deliberately touches neither the engine nor the cache:
@@ -5011,11 +5144,11 @@ fn apply_backend_op(
                         "sync ran, but the vault was locked while its result was being applied; \
                          nothing local was refreshed"
                     );
-                    tray::set_sync_failed(tray);
+                    tray_effects.push(TrayEffect::SyncFailed);
                 }
                 SettledSync::Failed(e) => {
                     log::error!("sync failed: {e}");
-                    tray::set_sync_failed(tray);
+                    tray_effects.push(TrayEffect::SyncFailed);
                 }
             }
         }
@@ -12982,6 +13115,16 @@ mod tests {
     /// the sequence is actually GIVEN in production is pinned here instead --
     /// every test above injects stubs, and all three would go on passing
     /// against an app whose real wiring started nothing.
+    ///
+    /// **There are TWO production entries now**, since the wiring was split
+    /// into a wrapper that supplies the two unmovable things and a body that
+    /// names neither. Asserting only over the pair as a lump would let the
+    /// spinner sit in the wrapper and the tray in the body and still pass, so
+    /// each half carries its own claim -- and the body carries the two
+    /// NEGATIVE ones, which are the point of the split existing at all. This
+    /// is an addition to what the guard pinned before, not a relaxation: the
+    /// original three-needle claim over the whole region is still made below,
+    /// word for word.
     #[test]
     fn the_resettle_wiring_passes_the_real_backend_the_real_spinner_and_the_drain() {
         let production = production_half_of_this_file();
@@ -13012,6 +13155,237 @@ mod tests {
                 wiring.contains(needle),
                 "`resettle_session` no longer reaches `{needle}`: the sequence's tests all \
                  inject stubs, so nothing else would notice"
+            );
+        }
+
+        // The region is two functions; slice them apart and hold each to what
+        // only it may contain.
+        let name = concat!("resettle_session_", "reporting_tray(");
+        assert_eq!(
+            wiring.matches(name).count(),
+            2,
+            "expected exactly two mentions of the lifted body in the wiring -- its definition \
+             and the wrapper's one call to it. More than one caller here would be a second \
+             route into the teardown"
+        );
+        let (wrapper, body) = wiring
+            .split_once(&format!("fn {name}"))
+            .expect("the lifted body must still exist");
+        assert!(
+            !wrapper.is_empty() && !body.is_empty(),
+            "control: the sub-split produced two real regions"
+        );
+
+        // The wrapper is where the two unmovable things are supplied, and the
+        // only place the tray is touched at all.
+        assert!(
+            wrapper.contains(concat!("wait_for_vault_ready_", "with_spinner(")),
+            "the real spinner probe must be supplied by the wrapper -- it opens an eframe \
+             window, so it is exactly what the lifted body may not name"
+        );
+        assert!(
+            wrapper.contains(concat!("effect.", "apply(tray)")),
+            "the wrapper no longer applies the tray effects the body reports, so every label \
+             update the teardown makes is silently dropped"
+        );
+
+        // And the negatives, which are the split's whole claim. A body that
+        // names either of these is `Send` in its captures and a lie in its
+        // behaviour.
+        assert!(
+            !body.contains(concat!("wait_for_vault_ready_", "with_spinner(")),
+            "the lifted body names the spinner probe directly: it opens an eframe window, \
+             which the worker thread this body exists to be moved onto may not do. The \
+             `probe` parameter is then decoration"
+        );
+        assert!(
+            !body.contains("tray::"),
+            "the lifted body touches `tray::` directly. `AppTray` is not `Send`, so this body \
+             can no longer be moved to a worker -- the lift bought nothing"
+        );
+        assert!(
+            body.contains(concat!("try_start_", "backend(")),
+            "control: the backend start really is in the lifted body, so the negatives above \
+             are being asserted against the region that does the work"
+        );
+        assert!(
+            body.contains(concat!("apply_backend_", "op(")),
+            "control: the in-flight drain really is in the lifted body"
+        );
+        assert!(
+            body.contains("probe,"),
+            "the lifted body takes a `probe` parameter but never forwards it to the sequence"
+        );
+
+        // The drain reads the SHARED receiver -- the one `main`'s own idle
+        // drain reads -- and not a second one of its own. This cannot be
+        // driven from a test: the lifted body's `start` is `try_start_backend`,
+        // which spawns a real `bw` process, so no test in this crate may run
+        // it. A source pin is what there is, and it is claimed as such.
+        assert!(
+            body.contains(concat!("backend_op_rx", ".lock()")),
+            "the teardown's bounded drain no longer locks the shared receiver. A drain reading \
+             anything else leaves the in-flight operation it exists to wait for still running, \
+             racing this teardown for port 8087"
+        );
+        assert!(
+            !body.contains(concat!("mpsc::", "channel")),
+            "the lifted body makes a channel of its own. The whole point of the receiver being \
+             shared is that there is still exactly ONE consumer"
+        );
+    }
+
+    /// The lift's actual claim, checked by the compiler rather than by a
+    /// source scan: a closure that OWNS everything a worker thread would own
+    /// and calls `resettle_session_reporting_tray` is `Send`.
+    ///
+    /// The source guard above can say the body names no `tray::` and no
+    /// spinner; it cannot say that nothing else in the signature is
+    /// thread-bound. This can, and it is the assertion that would start
+    /// failing the moment a `!Send` parameter crept back in -- which is how
+    /// the tray got there in the first place.
+    ///
+    /// **The closure is constructed and never called.** Calling it would
+    /// start a real `bw serve` and clear the real cache; the type-check is
+    /// the entire point and it happens at compile time.
+    ///
+    /// **Every value is built OUTSIDE the closure and moved in, and that is
+    /// load-bearing rather than stylistic.** `Send` is a property of what a
+    /// closure CAPTURES. The first version of this test constructed its
+    /// arguments in the closure body, captured nothing, and was therefore
+    /// `Send` no matter what types the signature named -- it passed against a
+    /// deliberately reintroduced `Rc` parameter, which is exactly the "correct
+    /// in isolation, reaching nothing" shape it exists to catch. Anything
+    /// moved in here that stops being `Send` now fails to compile.
+    #[test]
+    fn the_lifted_resettle_body_can_be_moved_to_a_worker() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let cache = Arc::new(VaultCache::new(VaultBridge::new("http://127.0.0.1:0")));
+        let mut engine = MatchEngine::new();
+        let mut child: Option<Child> = None;
+        let job: Arc<Option<job_object::KillOnCloseJob>> = Arc::new(None);
+        let (_tx, rx) = mpsc::channel::<BackendOp>();
+        let rx = Arc::new(Mutex::new(rx));
+        let mut task: Option<(Instant, BackendOpKind)> = None;
+        let mut details: Option<login_ui::BwStatusDetails> = None;
+        let mut token = String::new();
+        let mut effects: Vec<TrayEffect> = Vec::new();
+
+        let closure = move || {
+            resettle_session_reporting_tray(
+                &cache,
+                &mut engine,
+                &mut child,
+                &job,
+                &rx,
+                &mut task,
+                &mut details,
+                &mut token,
+                || None,
+                // A windowless probe -- item 8's shape, standing in here for
+                // the real one. That this substitutes cleanly IS the lift.
+                |_message| VaultReadyOutcome::Ready(Vec::new()),
+                &mut effects,
+            )
+        };
+        assert_send(&closure);
+    }
+
+    /// What `apply_backend_op` REPORTS to the tray, driven for real.
+    ///
+    /// Before the lift these arms were unreachable from any test: the
+    /// function took a `tray::AppTray`, and `tray::build_tray` makes a real
+    /// Windows tray icon against a live message loop. Every label it set was
+    /// therefore pinned by nothing at all -- a `set_sync_idle` deleted from
+    /// any of the five arms would have been caught by no test in this crate.
+    /// Turning the tray into a sink of values is what made them observable,
+    /// so they are observed here rather than left to a source scan.
+    ///
+    /// No process is started, no port bound and no network used: the two
+    /// outcomes driven below are the ones that reach neither the cache's
+    /// contents nor a `Child`.
+    mod what_a_backend_op_reports_to_the_tray {
+        use super::*;
+
+        fn scratch_cache() -> VaultCache {
+            // A base URL string and nothing else -- `VaultBridge::new` opens
+            // no connection, and neither outcome below asks it for one.
+            VaultCache::new(VaultBridge::new("http://127.0.0.1:0"))
+        }
+
+        fn apply(op: BackendOp, sink: &mut Vec<TrayEffect>) -> Option<Child> {
+            let cache = scratch_cache();
+            let mut engine = MatchEngine::new();
+            let mut child: Option<Child> = None;
+            apply_backend_op(op, &mut child, &cache, &mut engine, sink);
+            child
+        }
+
+        /// The arm that runs for an `EnsureRunning` a lock recovery
+        /// abandoned. Its label is the one review 18's Minor is about: back
+        /// to idle, not merely re-enabled, because a wedged sync may have
+        /// left the item reading "Syncing...".
+        #[test]
+        fn a_backend_that_would_not_start_still_hands_the_sync_item_back() {
+            let mut sink = Vec::new();
+            let child = apply(
+                BackendOp::EnsureRunning(Err(BackendStartError::PortHeld(Duration::from_secs(1)))),
+                &mut sink,
+            );
+            assert_eq!(
+                sink,
+                vec![TrayEffect::SyncIdle],
+                "a failed start must still report the tray back to idle, or a hung sync \
+                 permanently kills the Sync item for the rest of the session"
+            );
+            assert!(child.is_none(), "a failed start adopts no child");
+        }
+
+        /// A sync that failed outright, and a sync whose result was discarded
+        /// because the vault locked underneath it, report the SAME label --
+        /// "click to retry" -- and it is deliberately not idle. Reporting
+        /// idle for either would tell the user a sync completed that
+        /// refreshed nothing locally.
+        #[test]
+        fn a_sync_that_refreshed_nothing_says_retry_rather_than_idle() {
+            for outcome in [
+                SyncOutcome::Failed("bw sync exploded".to_string()),
+                SyncOutcome::DiscardedStale,
+            ] {
+                let mut sink = Vec::new();
+                apply(
+                    BackendOp::Sync {
+                        child: None,
+                        outcome,
+                    },
+                    &mut sink,
+                );
+                assert_eq!(
+                    sink,
+                    vec![TrayEffect::SyncFailed],
+                    "a sync that refreshed nothing locally must not report idle"
+                );
+            }
+        }
+
+        /// The sink is APPENDED to, never cleared. `resettle_session`'s
+        /// bounded drain and the give-up arm below it can both push into the
+        /// same one, and a clear here would silently swallow whichever
+        /// happened first.
+        #[test]
+        fn the_sink_keeps_what_was_already_in_it() {
+            let mut sink = vec![TrayEffect::SyncFailed];
+            apply(
+                BackendOp::EnsureRunning(Err(BackendStartError::NoVerifiedCli(
+                    "no bw.exe on record".to_string(),
+                ))),
+                &mut sink,
+            );
+            assert_eq!(
+                sink,
+                vec![TrayEffect::SyncFailed, TrayEffect::SyncIdle],
+                "the earlier effect was dropped: this sink is a batch, not a slot"
             );
         }
     }
