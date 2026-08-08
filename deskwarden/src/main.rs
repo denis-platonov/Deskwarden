@@ -479,7 +479,10 @@ fn main() {
     // there calls `cache.clear()` today, so this is inert; it is written this
     // way so it stays correct if any of that moves onto a background thread.
     let startup_epoch = cache.epoch();
-    let mut engine = MatchEngine::new();
+    // Not `mut`: the rebuild below runs against `estate.engine`. Both arms of
+    // the branch below END with a `SessionEstate` now, and everything after
+    // them reads the estate rather than this local.
+    let engine = MatchEngine::new();
 
     // `bw serve` is a bundled Node binary: its cold start regularly takes
     // several seconds, far longer than the fixed 500ms sleep this replaces.
@@ -527,7 +530,55 @@ fn main() {
     // check that both paths produce one than a reviewer is.
     let mut session_token: String;
 
-    if let Some(token) = cached_session {
+    // **Both arms below END with a `SessionEstate`, and everything after the
+    // branch reads it.**
+    //
+    // The estate used to be assembled ~390 lines further down, out of ten
+    // locals that stayed live and readable the whole way. `SessionEstate`'s
+    // own doc says why that is the wrong shape -- "a field read off the estate
+    // while a stale local of the same name is still being written, or the
+    // reverse, is the two-copies-silently-disagree failure this file has
+    // shipped before" -- and the fix is to make the locals stop existing
+    // earlier, not to be more careful with them.
+    //
+    // **At the END of each arm rather than before the branch**, because that
+    // is the first point at which every field is decided, and nothing here is
+    // seeded to make it fit:
+    //
+    // * `token` is `store.load()`'s in the cached-session arm and the sign-in
+    //   card's in the other, where it does not exist until `app_window::run`
+    //   has returned it. The note on `session_token` just above says why an
+    //   empty string here must not be spellable.
+    // * `child` is `start_backend`'s in the cached-session arm and
+    //   `startup_child.claim()`'s in the other, where the claim happens after
+    //   the window. A `None` seeded before that is the exact false belief
+    //   `StartupChildHandoff` exists to remove.
+    //
+    // Two of the ten are not decided by either arm and both seed `None`. That
+    // is the value they have always held at this point in the launch, and the
+    // reasons are theirs rather than the arms':
+    //
+    // * `details` -- the account email and server URL the vault window's
+    //   toolbar wants. It is prefetched on a thread below and polled
+    //   non-blockingly from the main loop; nothing has answered yet.
+    // * `task_in_progress` -- `Some((started, kind))` while a background
+    //   backend operation is in flight, the instant it was set recording when
+    //   rather than a plain `bool`, so the main loop below can tell a
+    //   merely-slow operation apart from one that has been outstanding so long
+    //   it must be treated as wedged (see the `BACKEND_OP_TIMEOUT` check right
+    //   after the non-blocking drain). `run_bw_sync` (`Command::output()`, no
+    //   timeout of its own) and `try_start_backend` (which calls it) have no
+    //   bound on how long they can take, so without this a stalled `bw sync`
+    //   would leave the flag `Some` forever: `stop_backend_if_idle` refuses to
+    //   run while it is set (save-memory mode never reclaims the backend's
+    //   memory), `open_vault_window` refuses to start a fresh attempt while it
+    //   is set (writes and TOTP stay dead), and the tray item is stuck
+    //   disabled on "Syncing...". `kind` records which of the two operations
+    //   (`BackendOpKind`) this is, so the wedge-deadline check can report a
+    //   stall in terms of what was actually requested (review Minor 4) instead
+    //   of always assuming a sync. Nothing has started one here: the channel
+    //   it would be set beside does not exist until after the branch.
+    let mut estate = if let Some(token) = cached_session {
     session_token = token;
     bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
     let items = match wait_for_vault_ready_with_spinner(&vault, &schedule, SETUP_MESSAGE) {
@@ -585,6 +636,19 @@ fn main() {
 
     *startup_entries.borrow_mut() = match_entries(&items);
     seed_cache_at_startup(&cache, items, startup_epoch);
+
+    SessionEstate {
+        cache,
+        engine,
+        child: bw_serve_child,
+        token: session_token,
+        details: None,
+        task_in_progress: None,
+        store,
+        active_account,
+        accounts: accounts_state,
+        settings,
+    }
     } else {
     // **ONE WINDOW: the sign-in card, then the spinner, then the vault.**
     //
@@ -761,13 +825,26 @@ fn main() {
             seed_cache_at_startup(&cache, items, startup_epoch);
         }
     }
+
+    SessionEstate {
+        cache,
+        engine,
+        child: bw_serve_child,
+        token: session_token,
+        details: None,
+        task_in_progress: None,
+        store,
+        active_account,
+        accounts: accounts_state,
+        settings,
     }
+    };
 
     log::info!(
         "match engine loaded with {} app match(es)",
         startup_entries.borrow().len()
     );
-    engine.rebuild(&startup_entries.borrow());
+    estate.engine.rebuild(&startup_entries.borrow());
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
     // the cache once -> *then* obey the policy. The backend has had to be up
@@ -779,7 +856,7 @@ fn main() {
     // vault window opening, the tray's Sync item, another lock) restarts it
     // only for as long as it is actually needed and reconciles again
     // afterwards -- see `stop_backend_if_idle` and the main loop below.
-    stop_backend_if_idle(&mut bw_serve_child, settings.keep_backend_running);
+    stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
 
     // The tray icon and the global hotkey manager each create a hidden
     // Win32 window on the thread that builds them (here, the main thread)
@@ -801,7 +878,7 @@ fn main() {
     // and again after every account change below. `accounts_state` is `None`
     // for `StartupAccounts::NoAccountList` -- see `tray::accounts_menu_plan`,
     // which says so in the menu rather than leaving it empty.
-    tray.rebuild_accounts_menu(accounts_state.as_ref());
+    tray.rebuild_accounts_menu(estate.accounts.as_ref());
 
     let current_version =
         Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is not valid semver");
@@ -844,8 +921,9 @@ fn main() {
     // Vault" -- including the very first one -- waited that long before the
     // window even appeared. Polled non-blockingly below, same shape as
     // `update_rx`; `open_vault_window` still falls back to a synchronous
-    // call itself if a click lands before this has reported back.
-    let cached_status_details: Option<login_ui::BwStatusDetails> = None;
+    // call itself if a click lands before this has reported back. Its answer
+    // is drained into the estate's `details`, which both arms above seeded
+    // `None` because at neither of their ends had this thread been spawned.
     // **Which account the prefetch is ABOUT, carried with its answer.** `bw
     // status` reports on whatever profile the CLI is pointed at when it runs,
     // and this one is spawned before the startup window's outcome is dispatched
@@ -855,7 +933,7 @@ fn main() {
     // `learn_active_account_details` WRITES it into `settings.json`, and an
     // address learned into the wrong account is the hash bug with a worse
     // failure mode.
-    let prefetch_for = active_account.as_ref().map(|a| a.id.clone());
+    let prefetch_for = estate.active_account.as_ref().map(|a| a.id.clone());
     let (status_details_tx, status_details_rx) =
         mpsc::channel::<(Option<accounts::AccountId>, login_ui::BwStatusDetails)>();
     {
@@ -932,11 +1010,11 @@ fn main() {
         }
         process_foreground_event(
             &event,
-            &cache,
+            &estate.cache,
             &injector,
             &fill_stats,
-            &engine,
-            settings.prompt_on_match,
+            &estate.engine,
+            estate.settings.prompt_on_match,
             &mut pending_hotkey_fill,
             &mut last_dispatched_hwnd,
             &deskwarden::injector::sequence::REAL_NOTIFIER,
@@ -953,7 +1031,7 @@ fn main() {
     // for the whole wait -- see the fix note on `open_vault_window`.
     //
     // Both operations funnel through this one channel (rather than one each)
-    // so `backend_task_in_progress` below can guarantee at most one is ever
+    // so the estate's `task_in_progress` can guarantee at most one is ever
     // in flight: two `try_start_backend` calls racing to bind the same port
     // would make one fail for a reason that has nothing to do with a real
     // problem, and it also means there is exactly one place -- not two -- a
@@ -968,48 +1046,6 @@ fn main() {
     // only whether that consumer has to be THIS thread.
     let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
     let backend_op_rx = Arc::new(Mutex::new(backend_op_rx));
-    // `Some((started, kind))` while a background backend operation is in
-    // flight, the instant it was set recording when -- rather than a plain
-    // `bool` -- so the main loop below can tell a merely-slow operation
-    // apart from one that has been outstanding so long it must be treated as
-    // wedged (see the `BACKEND_OP_TIMEOUT` check right after the
-    // non-blocking drain). `run_bw_sync` (`Command::output()`, no timeout of
-    // its own) and `try_start_backend` (which calls it) have no bound on how
-    // long they can take, so without this a stalled `bw sync` would leave
-    // this flag `Some` forever: `stop_backend_if_idle` refuses to run while
-    // it's set (save-memory mode never reclaims the backend's memory),
-    // `open_vault_window` refuses to start a fresh attempt while it's set
-    // (writes and TOTP stay dead), and the tray item is stuck disabled on
-    // "Syncing...". `kind` records which of the two operations
-    // (`BackendOpKind`) this is, so the wedge-deadline check can report a
-    // stall in terms of what was actually requested (review Minor 4) instead
-    // of always assuming a sync.
-    let backend_task_in_progress: Option<(Instant, BackendOpKind)> = None;
-
-    // **Everything a vault session mutates, moved into one value.** The ten
-    // locals above are MOVED here, not copied: from this line on there is no
-    // local of any of those names left for a later edit to read from or write
-    // to. A field read off the estate while a stale local of the same name is
-    // still being written -- or the reverse -- is the two-copies-silently-
-    // disagree failure this file has shipped before, and the move is what
-    // makes it unspellable rather than merely unlikely.
-    //
-    // Built HERE and not at the token, because `cached_status_details` and
-    // `backend_task_in_progress` are declared with their doc above and
-    // nothing before this line touches either; building earlier would have
-    // meant seeding two fields whose reasons live down here.
-    let mut estate = SessionEstate {
-        cache,
-        engine,
-        child: bw_serve_child,
-        token: session_token,
-        details: cached_status_details,
-        task_in_progress: backend_task_in_progress,
-        store,
-        active_account,
-        accounts: accounts_state,
-        settings,
-    };
     // Tray menu clicks that arrived while one of this app's blocking windows
     // was up and SURVIVED the sweep that runs when it closes -- i.e. requests
     // that window did not answer. Popped before the channel below, so they are
@@ -18398,6 +18434,149 @@ mod startup_shape_tests {
             .find(OUTER_ELSE)
             .expect("the cached-session arm is never closed by an `} else {`");
         &rest[..end]
+    }
+
+    /// **The whole startup branch, from the `if let` that opens it to the log
+    /// line that follows it.** Both arms are inside; nothing after them is.
+    fn startup_branch() -> &'static str {
+        let production = production();
+        let head = concat!("let mut estate = if let Some(token) = cached_", "session {");
+        let at = production.find(head).unwrap_or_else(|| {
+            panic!(
+                "no {head:?} in main.rs -- the startup branch is no longer the expression \
+                 whose value is the estate, so the arms are free to end with anything and \
+                 the ten locals below it are live again"
+            )
+        });
+        let rest = &production[at..];
+        let end = rest
+            .find(concat!("match engine loaded with ", "{} app match(es)"))
+            .expect("the startup branch must still be followed by the engine log");
+        let region = &rest[..end];
+        assert!(
+            region.contains(OUTER_ELSE),
+            "control: the sliced branch does not contain its own `}} else {{`, so it is not \
+             the branch"
+        );
+        assert!(
+            (4_000..40_000).contains(&region.len()),
+            "the sliced startup branch is {} bytes, which is not the branch",
+            region.len()
+        );
+        region
+    }
+
+    /// The text between the braces opened by `head`, matched by depth.
+    fn braced_after(code: &str, head: &str) -> String {
+        let at = code.find(head).expect("the head must be present");
+        let open = at + head.len() - 1;
+        assert_eq!(&code[open..=open], "{", "the head must end at its own brace");
+        let rest = &code[open + 1..];
+        let mut depth = 1usize;
+        for (offset, ch) in rest.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest[..offset].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the braces opened by {head:?} are never closed");
+    }
+
+    /// **Both startup arms end with the SAME `SessionEstate`, built out of the
+    /// locals each arm decided.**
+    ///
+    /// This is the one property of the hoist that no compiler check reaches.
+    /// The move makes a *stale local* unspellable -- writing to `bw_serve_child`
+    /// after the arm has moved it into the estate does not build -- but nothing
+    /// stops one arm from constructing an estate that disagrees with the other's
+    /// while still consuming its own locals: `child: None` in the cached-session
+    /// arm compiles, drops a live `bw serve` on the floor, and leaves every one
+    /// of this crate's tests green, because `main` is the process entry point and
+    /// nothing can run it. Divergence between the arms is therefore checked here,
+    /// by text, against the two things that make the convergence real: there are
+    /// exactly two constructions, and they are the same construction.
+    ///
+    /// The per-field list is not redundant with the equality: two IDENTICAL
+    /// wrong arms satisfy the equality and nothing else. It names the eight
+    /// fields the arms decide, so a seeded `token: String::new()` or a seeded
+    /// `child: None` fails here rather than in a review -- both are values
+    /// `main.rs`'s own notes above the branch say must not be spellable.
+    #[test]
+    fn both_startup_arms_end_with_the_same_estate() {
+        let branch = startup_branch();
+        let head = concat!("Session", "Estate {");
+        assert_eq!(
+            branch.matches(head).count(),
+            2,
+            "the startup branch constructs {} estates, not one per arm. Fewer means an arm \
+             ends with something else -- and then the branch is not an expression both arms \
+             answer, so the ten locals it was built from are live below it again",
+            branch.matches(head).count()
+        );
+
+        let split = branch.find(OUTER_ELSE).expect("control: the branch has an `} else {`");
+        let cached = braced_after(&branch[..split], head);
+        let signing = braced_after(&branch[split..], head);
+
+        let squeeze = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            squeeze(&cached),
+            squeeze(&signing),
+            "the two arms end with DIFFERENT estates. Whatever the difference is, it is a \
+             field one launch shape carries and the other does not, decided in the one place \
+             no test in this crate can execute"
+        );
+
+        let mut checked = 0usize;
+        for field in [
+            "cache,",
+            "engine,",
+            "child: bw_serve_child,",
+            "token: session_token,",
+            "details: None,",
+            "task_in_progress: None,",
+            "store,",
+            "active_account,",
+            "accounts: accounts_state,",
+            "settings,",
+        ] {
+            checked += 1;
+            assert!(
+                squeeze(&cached).contains(field),
+                "the arms' estate does not carry `{field}`. The two fields that matter most \
+                 are `child` and `token`: a `child: None` throws away a `bw serve` this \
+                 process started and every later start then fails on the port it still \
+                 holds, and a seeded `token` authenticates nothing while compiling everywhere"
+            );
+        }
+        assert_eq!(checked, 10, "control: fewer than ten fields were checked");
+
+        // The estate is each arm's LAST expression -- not a value built early
+        // and then followed by more of the arm, which is how a field decided
+        // after the construction ends up written to a local instead.
+        for (what, arm, closer) in [
+            ("the cached-session arm", &branch[..split + OUTER_ELSE.len()], OUTER_ELSE),
+            ("the signing-in arm", &branch[split..], concat!("\n    }", ";")),
+        ] {
+            let at = arm.find(head).expect("control: this arm constructs an estate");
+            let after_body = at + head.len() + braced_after(arm, head).len();
+            let tail = &arm[after_body..];
+            let end = tail.find(closer).unwrap_or_else(|| {
+                panic!("{what} is not closed by {closer:?}, so its tail cannot be bounded")
+            });
+            let between = &tail[..end];
+            assert!(
+                between.trim_matches(|c: char| c.is_whitespace() || c == '}').is_empty(),
+                "{what} does more work after building its estate: {between:?}. Anything \
+                 decided there is decided in a local the estate will never see"
+            );
+        }
     }
 
     /// The arm taken when the launch has to sign in.
