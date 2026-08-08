@@ -1493,6 +1493,32 @@ fn row_offers_copy(value: &str) -> bool {
     !value.is_empty()
 }
 
+/// **Whether a [`masked_row`] draws AT ALL.**
+///
+/// The user's words: "if password is empty - show no mask (and no field at
+/// all)". A mask is a claim that there is a secret behind it, and ten bullets
+/// over `""` made every credential-less login look like it held a password
+/// this build had merely declined to show. [`row_offers_copy`] already
+/// withdrew the *copy* from such a row; it kept the label, the bullets and the
+/// reveal eye, which is an eye offering to reveal nothing.
+///
+/// **The row is SKIPPED, not painted invisibly.** A transparent or zero-height
+/// row is still a row: it still takes vertical space, it still sits between
+/// two hairlines, and it still answers `rect_of` in a test. So this predicate
+/// is consulted by the CALLERS too -- to decide whether the separator above
+/// the row is owed at all -- and `masked_row` returns before it lays anything
+/// out. Pinned by `an_empty_password_draws_no_row_at_all` (the label is absent
+/// from the painted frame and the card is shorter by the row's height) and by
+/// its positive control `a_non_empty_password_still_draws_its_whole_row`.
+///
+/// Deliberately the same rule as [`row_offers_copy`] rather than a second
+/// spelling of it: "nothing to copy" and "nothing to show" are the same fact
+/// about a secret, and two predicates could drift into a row that copies and
+/// is not drawn.
+fn masked_row_visible(value: &str) -> bool {
+    row_offers_copy(value)
+}
+
 /// A row's keyboard-shortcut hint, on the control line.
 ///
 /// Bare 10px monospace in ghost grey, matching the design's other shortcut
@@ -2208,8 +2234,18 @@ pub fn draw_detail_read(
                     &mut action,
                     DetailAction::CopyUsername,
                 );
-                theme::row_rule(ui);
-                password_row(ui, password, &mut reveal.password, &mut action);
+                // **The hairline is owed only if the row below it is drawn.**
+                // An empty password draws no row at all (see
+                // `masked_row_visible`), and a rule left standing over the
+                // gap would be a separator with nothing on one side of it --
+                // exactly the "leftover separator where the row used to be"
+                // this change exists to avoid. The Username row above is
+                // unconditional, so this rule is always correctly placed when
+                // it is drawn at all.
+                if masked_row_visible(password) {
+                    theme::row_rule(ui);
+                    password_row(ui, password, &mut reveal.password, &mut action);
+                }
                 // Whether there is a row at all is decided by `totp_row_for` and
                 // nowhere else (see its doc), so "this item looks like it has no
                 // 2FA" is a decision a unit test can call directly instead of one
@@ -2270,16 +2306,17 @@ pub fn draw_detail_read(
     // `notes_text` uses. An empty history draws nothing at all; a heading
     // over no rows would read as previous passwords that failed to load.
     let history = password_history(item);
-    if !history.is_empty() {
+    // **Any row that will actually be DRAWN**, not any entry: an entry whose
+    // password is empty draws nothing (see `masked_row_visible`), and a
+    // history of nothing but those would have put a PREVIOUS PASSWORDS
+    // heading over an empty box -- the same "heading over no rows" this gate
+    // already refuses for an absent history.
+    if history
+        .iter()
+        .any(|entry| masked_row_visible(entry.password.as_str()))
+    {
         card(ui, "PREVIOUS PASSWORDS", |ui| {
             history_rows(ui, &history, reveal, &mut action);
-        });
-        ui.add_space(CARD_GAP);
-    }
-
-    if let Some(notes) = notes_text(item) {
-        card(ui, "NOTES", |ui| {
-            card_text(ui, RichText::new(notes).size(ROW_VALUE_SIZE).color(theme::INK));
         });
         ui.add_space(CARD_GAP);
     }
@@ -2327,9 +2364,9 @@ pub fn draw_detail_read(
     }
 
     // **Directly under AUTOFILL TARGETS, and NOT inside it** -- see
-    // `APP_CARD_HEADING`. Last of the body cards, above the metadata strip:
-    // the cards above are the item's own contents, and this one is about what
-    // Deskwarden does with them.
+    // `APP_CARD_HEADING`. The cards above are the item's own contents, and
+    // this one is about what Deskwarden does with them. NOTES follows it (see
+    // below); the metadata strip closes the pane.
     //
     // `app_match` and `app_field_present` are derived at the top of this
     // function, beside `website` -- **the FIELD as well as the parsed match**,
@@ -2337,7 +2374,7 @@ pub fn draw_detail_read(
     // every other Bitwarden client and must be able to clear from here, and
     // asking `app_match.is_some()` filed it as "no field at all" and hid the
     // card outright on a non-fillable kind. See `app_card_body`.
-    if app_card_visible(app_field_present, kind) {
+    if app_card_visible(app_field_present) {
         card(ui, APP_CARD_HEADING, |ui| {
             app_match_card(
                 ui,
@@ -2347,6 +2384,29 @@ pub fn draw_detail_read(
                 ResolvedApp { name: &app_name, icon: app_icon.as_ref() },
                 &mut action,
             );
+        });
+        ui.add_space(CARD_GAP);
+    }
+
+    // **ALWAYS THE LAST CARD.** The user asked for it in those words, and
+    // "last" is asserted by PAINTED VERTICAL POSITION -- every other headed
+    // card on the pane ends above this one's top edge -- rather than by where
+    // this call sits in the source, by
+    // `notes_is_the_last_card_for_every_kind_that_shows_it`.
+    //
+    // It sits here, after MATCHED APP and before the metadata strip, because
+    // the strip is not a card: it has no heading, it is drawn as a bare
+    // `egui::Frame` rather than through `card`, and it is the pane's footer
+    // -- "updated N days ago", the strength word, the breach badge. Putting a
+    // note under it would move the footer into the middle of the item's
+    // contents, which is the one part of this the brief asked to leave alone.
+    //
+    // `DetailBody::NotesOnly` (a secure note) reaches this same call and no
+    // other: a secure note draws no body card of its own, so its NOTES card
+    // is last by the same rule as every other kind rather than by accident.
+    if let Some(notes) = notes_text(item) {
+        card(ui, "NOTES", |ui| {
+            notes_body(ui, notes, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -2647,23 +2707,34 @@ fn app_card_body(app_match: Option<&AppMatch>, field_present: bool) -> AppCardBo
     }
 }
 
-/// Whether the pane draws a [`APP_CARD_HEADING`] card at all.
+/// Whether the READ pane draws a [`APP_CARD_HEADING`] card at all.
 ///
-/// **Two reasons, and the first outranks the second.** An item that CARRIES
-/// the field always gets the card, whatever kind it is: a binding the pane
-/// refuses to draw is the defect being fixed, and an app match sitting on a
-/// secure note is exactly the case a user would most need to see in order to
-/// remove it. An item with no field gets the card only where a match would do
-/// something -- `kind_offers_fill`, the same predicate that gates the Fill
-/// button and the `AUTOFILL TARGETS` card, so a card, a note and a button
-/// cannot end up disagreeing about which kinds autofill.
+/// **A binding, or nothing.** The user's words: "Matched app - same, no show
+/// if not present, only if edit or add window called". An item with no app
+/// field gets no card, no heading and no placeholder tile -- not an invisible
+/// one, none: the `if` below the call site skips the `card` call outright, so
+/// the cards after it move up by the whole card and the pane gets shorter.
+/// Pinned by `an_item_with_no_app_binding_draws_no_matched_app_card`, which
+/// asserts the heading is absent AND that the pane shrank by the card's
+/// height, and by its positive control
+/// `an_item_with_an_app_binding_still_draws_it`.
+///
+/// This replaces a `has_field || kind_offers_fill(kind)`, which put an
+/// "unbound" placeholder on every login whether or not one had ever been
+/// bound. That card had a job -- it was the only thing in the app that said
+/// app matching existed -- and the job has moved: **the edit and add forms
+/// always offer the control**, because that is where a binding is created.
+/// See `detail_edit.rs`, which is untouched by this change and is where that
+/// promise is kept; `the_edit_form_offers_the_app_control_even_with_nothing_
+/// bound` asserts it rather than assuming it.
 ///
 /// **`has_field`, not "has a match this build could parse".** A secure note
-/// whose app-match field was corrupted by hand elsewhere had the whole card
-/// suppressed, which is the same invisibility one paragraph up, reached by a
-/// different route.
-fn app_card_visible(has_field: bool, kind: ItemKind) -> bool {
-    has_field || kind_offers_fill(kind)
+/// whose app-match field was corrupted by hand elsewhere would otherwise have
+/// the whole card suppressed -- an invisible binding the user cannot see or
+/// remove, which is the exact defect this card was added to end. An
+/// unreadable field IS a binding; only its text is lost.
+fn app_card_visible(has_field: bool) -> bool {
+    has_field
 }
 
 /// One row of the card: its label, the text in its value column, and whether
@@ -4190,6 +4261,128 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
         });
 }
 
+/// The NOTES card's body: **selectable text that also copies whole on a
+/// click.**
+///
+/// The user asked for the note to be "selectable\copiable text full (on click)
+/// or partially". Both halves at once, on the same pixels, which is the
+/// two-meanings-for-one-click problem this pane already solves for the website
+/// link -- and it is solved here the same way and with the same layering
+/// argument (see [`copy_row`]):
+///
+/// * **The tile is sensed on a `UiBuilder` BACKGROUND**, which egui registers
+///   when the `Ui` is created and therefore *before* its children. So the text
+///   is on top of it and wins any click that lands on the text; the tile keeps
+///   the padding around it.
+/// * **The text is a read-only [`egui::TextEdit`]**, not a `ui.label`. egui
+///   implements `TextBuffer` for `&str` with `is_mutable() == false`, which is
+///   the framework's own read-only idiom: the caret, click-drag range
+///   selection, double-click-a-word, Ctrl+A and the Ctrl+C that copies *that
+///   range* all come from egui rather than from a hand-rolled hit test. A
+///   `ui.label` -- what this card drew before -- has none of them.
+///
+/// **Click versus drag is the whole difficulty, and it is split by egui's own
+/// distinction rather than by a rect.** `Response::clicked()` is true only for
+/// a press and release that never passed the drag threshold; a press that
+/// moves is a drag, and a drag over a `TextEdit` is a selection. So:
+///
+/// * A plain click anywhere on the card -- on the text or on the padding --
+///   copies the WHOLE note. The text's own response is consulted for exactly
+///   this reason: if only the tile's `clicked()` were read, a click on the
+///   glyphs would be swallowed by the `TextEdit` and copy nothing, which is
+///   the "a plain click must not be swallowed by the text" half.
+/// * A click-drag across the glyphs selects a range and copies NOTHING. The
+///   tile cannot swallow it (the text is topmost), and the text's `clicked()`
+///   is false because it was a drag.
+///
+/// Both halves are pinned in one frame each, by
+/// `clicking_a_note_copies_all_of_it` and
+/// `a_note_can_be_selected_without_copying_the_whole_thing`, the way
+/// `clicking_the_website_link_opens_it_without_copying` pins the link's.
+///
+/// The frame, the margin and the width are [`card_text`]'s, so the note still
+/// sits on the same left edge as every row label on the pane.
+fn notes_body(ui: &mut egui::Ui, notes: &str, action: &mut DetailAction) {
+    let scope = ui.scope_builder(
+        egui::UiBuilder::new().sense(egui::Sense::click()),
+        |ui| {
+            // The hover tint's slot, reserved before anything paints into the
+            // tile -- `row_impl`'s reason, unchanged: the response that
+            // decides whether to fill it does not exist until the tile has
+            // been laid out, and a fill added then would cover the note.
+            let tint = ui.painter().add(egui::Shape::Noop);
+            let text = egui::Frame::new()
+                .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // `&str`, so the buffer is immutable: the caret and the
+                    // selection work, typing does nothing.
+                    let mut source = notes;
+                    egui::TextEdit::multiline(&mut source)
+                        .id(notes_text_id())
+                        // No box, no fill, no margin of its own: this must
+                        // look exactly like the paragraph it replaced, whose
+                        // left edge is the card's `CARD_PAD_X`.
+                        .frame(egui::Frame::NONE)
+                        .margin(Margin::ZERO)
+                        // egui's default is four, which would have put three
+                        // blank lines under a one-line note.
+                        .desired_rows(1)
+                        // Not `f32::INFINITY`: this pane is inside a
+                        // `ScrollArea`, whose available width is finite and
+                        // is the width the note must wrap at.
+                        .desired_width(ui.available_width())
+                        .font(egui::FontId::new(
+                            ROW_VALUE_SIZE,
+                            egui::FontFamily::Proportional,
+                        ))
+                        .text_color(theme::INK)
+                        .show(ui)
+                        .response
+                })
+                .inner;
+            (tint, text)
+        },
+    );
+    let (tint, text) = scope.inner;
+    let tile = scope.response;
+    // The same affordance every copy row has. Asked of BOTH responses because
+    // only one of them is hovered at a time: over the glyphs it is the text,
+    // over the padding it is the tile, and a tint that appeared over only the
+    // padding would advertise half a click target.
+    if tile.hovered() || text.hovered() {
+        ui.painter().set(
+            tint,
+            egui::Shape::rect_filled(tile.rect, CornerRadius::ZERO, theme::CARD_TINT),
+        );
+    }
+    // **`clicked()` on both, and `dragged()` on neither.** See the doc above:
+    // a drag is a selection and reports no click, so this is the click half
+    // and the selection half needs no code at all.
+    if tile.clicked() || text.clicked() {
+        *action = DetailAction::CopyValue(notes.to_string());
+        note_copied(ui.ctx(), NOTES_COPY_LABEL);
+    }
+}
+
+/// What the NOTES card's copy confirmation says. Named once so the toast and
+/// the test cannot disagree about it.
+const NOTES_COPY_LABEL: &str = "Notes";
+
+/// The note's `TextEdit` id.
+///
+/// **Fixed rather than left to egui's auto-id.** A selection lives in
+/// `TextEditState`, which is keyed on the widget's id, and an id derived
+/// from source position is one `a_note_can_be_selected_without_copying_the_
+/// whole_thing` cannot ask for -- so the selection half of this card would
+/// have had no assertion at all. It is also what keeps the caret where the
+/// user put it when the pane repaints.
+const NOTES_TEXT_ID_SALT: &str = "detail-notes-body";
+
+fn notes_text_id() -> egui::Id {
+    egui::Id::new(NOTES_TEXT_ID_SALT)
+}
+
 /// [`card_text`] with a second run after the first: the same frame, the same
 /// margin, the same width. The metadata strip's breach badge is the only
 /// caller.
@@ -4319,6 +4512,13 @@ fn masked_row(
     on_copy: DetailAction,
     hint: Option<CopyShortcut>,
 ) {
+    // **Nothing to hide, so nothing to draw** -- see [`masked_row_visible`].
+    // The return is BEFORE any allocation, so the row leaves no band, no
+    // hairline slot and no eye behind it; the callers gate their separators
+    // on the same predicate so the hairline above it goes with it.
+    if !masked_row_visible(value) {
+        return;
+    }
     let shown = if *revealed {
         value.to_string()
     } else {
@@ -4540,10 +4740,19 @@ fn history_rows(
     reveal: &mut RevealState,
     action: &mut DetailAction,
 ) {
+    // **`owed`, not `index > 0`.** An entry whose password is empty draws no
+    // row (see `masked_row_visible`), and counting positions rather than
+    // drawn rows would have put a hairline above the gap it left -- and, if
+    // the empty one came first, a hairline above the very first row.
+    let mut owed = false;
     for (index, entry) in history.iter().take(MAX_HISTORY_ROWS).enumerate() {
-        if index > 0 {
+        if !masked_row_visible(entry.password.as_str()) {
+            continue;
+        }
+        if owed {
             theme::row_rule(ui);
         }
+        owed = true;
         masked_row(
             ui,
             &history_label(entry.last_used_date.as_deref()),
@@ -4562,7 +4771,9 @@ fn history_rows(
     // if it were left to a comment.
     let hidden = history.len().saturating_sub(MAX_HISTORY_ROWS);
     if hidden > 0 {
-        theme::row_rule(ui);
+        if owed {
+            theme::row_rule(ui);
+        }
         empty_pane_note(
             ui,
             &format!(
@@ -4677,6 +4888,23 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
     }
 }
 
+/// The TOTP countdown, as the user asked for it: **"9s left - show just 9s"**.
+///
+/// A pure function rather than a `format!` inside the paint closure, for this
+/// file's standing reason -- a string reachable only through an `egui` closure
+/// is a string no test can call -- and because the wording is the whole of the
+/// change: `totp_countdown_reads_just_the_number_and_the_unit` calls this
+/// directly and `a_totp_countdown_paints_just_the_seconds` reads it off the
+/// painted frame, so reverting to `"{n}s left"` fails both.
+///
+/// The two ends read correctly with the short form and were checked rather
+/// than assumed: a full window is `30s` and an expiring one is `0s`, both of
+/// which are what a countdown says. `1s` is not pluralised because it is not a
+/// sentence -- there is no word left to agree with the number.
+fn totp_countdown_text(seconds_left: u8) -> String {
+    format!("{seconds_left}s")
+}
+
 fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
     copy_row(
         ui,
@@ -4709,7 +4937,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
                 .rect_filled(filled, CornerRadius::same(2), theme::BLUE);
             ui.add_space(TOTP_GAP);
             ui.label(
-                RichText::new(format!("{seconds_left}s left"))
+                RichText::new(totp_countdown_text(seconds_left))
                     .size(ROW_HINT_SIZE)
                     .color(theme::TEXT_FAINT),
             );
@@ -6726,29 +6954,46 @@ mod tests {
         crate::vault_bridge::with_app_match(item, m)
     }
 
+    /// **The read pane shows a binding and never an invitation.** The user:
+    /// "Matched app - same, no show if not present, only if edit or add
+    /// window called".
+    ///
+    /// This replaces `the_card_is_offered_wherever_a_match_would_do_something_
+    /// and_shown_wherever_one_exists`, which pinned the OLD rule
+    /// (`has_field || kind_offers_fill(kind)`) and would have passed for free
+    /// after the change if it had merely been deleted. The positive half is
+    /// unchanged and still bites; the negative half is inverted, and the last
+    /// assertion names the retired rule so a revert to it fails here.
     #[test]
-    fn the_card_is_offered_wherever_a_match_would_do_something_and_shown_wherever_one_exists() {
+    fn the_card_is_shown_wherever_a_binding_exists_and_nowhere_else() {
+        let mut visited = 0;
         for kind in EVERY_KIND {
+            visited += 1;
             // A binding is NEVER hidden, whatever the item is: an app match
             // on a secure note is precisely the one a user needs to find in
             // order to remove it.
             assert!(
-                app_card_visible(true, kind),
+                app_card_visible(true),
                 "a {kind:?} that IS bound to an app does not show that binding"
             );
-            // With no match, the card follows the same predicate the Fill
-            // button and AUTOFILL TARGETS follow, so the three cannot
-            // disagree about which kinds autofill.
-            assert_eq!(
-                app_card_visible(false, kind),
-                kind_offers_fill(kind),
-                "an unbound {kind:?} offers the card on different terms from Fill"
+            assert!(
+                !app_card_visible(false),
+                "an unbound {kind:?} still offers a MATCHED APP card in the read pane"
             );
         }
-        // The control: the two answers really are different for some kind,
-        // so the assertions above are not both satisfied by a constant.
-        assert!(!app_card_visible(false, ItemKind::SecureNote));
-        assert!(app_card_visible(false, ItemKind::Login));
+        assert_eq!(visited, EVERY_KIND.len(), "the loop visited nothing");
+        assert!(visited > 0, "the loop visited nothing, so it proved nothing");
+        // The control: the predicate really does answer differently, so
+        // neither half above is satisfied by a constant.
+        assert_ne!(app_card_visible(true), app_card_visible(false));
+        // And it is no longer the OLD rule. `kind_offers_fill(Login)` is
+        // true, so `has_field || kind_offers_fill(kind)` would put the card
+        // on every unbound login -- the empty placeholder this change
+        // removes.
+        assert!(
+            kind_offers_fill(ItemKind::Login) && !app_card_visible(false),
+            "the card is gated on `kind_offers_fill` again"
+        );
     }
 
     #[test]
@@ -6948,26 +7193,676 @@ mod tests {
         assert!(!bare.painted("Window title"), "{:?}", bare.strings());
     }
 
+    /// Every heading `card` is ever called with in this pane, so "is NOTES
+    /// below all the others" is asked of a list that cannot silently lose a
+    /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
+    /// in this file against it, so a ninth card fails the build's own suite
+    /// rather than quietly narrowing the ordering claim.
+    const EVERY_CARD_HEADING: [&str; 9] = [
+        "LOGIN CREDENTIALS",
+        "CARD DETAILS",
+        "IDENTITY",
+        "SSH KEY",
+        "UNSUPPORTED ITEM",
+        "PREVIOUS PASSWORDS",
+        "AUTOFILL TARGETS",
+        APP_CARD_HEADING,
+        "NOTES",
+    ];
+
+    /// The list above is the whole list. Counted off the source rather than
+    /// trusted: `EVERY_CARD_HEADING` is what
+    /// `notes_is_the_last_card_for_every_kind_that_shows_it` compares NOTES
+    /// against, and a card missing from it is a card NOTES is never checked
+    /// against -- an ordering claim that silently stops covering something.
     #[test]
-    fn the_pane_says_so_when_an_item_is_bound_to_nothing() {
+    fn the_card_heading_list_is_complete() {
+        let source = include_str!("detail.rs");
+        // Eight literal-heading cards plus `card(ui, pane.heading, ..)`, whose
+        // heading is `UNSUPPORTED ITEM` and is in the list under that name.
+        // Real call sites only: a doc comment naming `card(ui, ...)` is a
+        // mention, not a card, and three of them are in this file.
+        let calls = source
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.trim_start().starts_with("card(ui, "))
+            .count();
+        assert_eq!(
+            calls,
+            EVERY_CARD_HEADING.len(),
+            "this pane draws {calls} cards and EVERY_CARD_HEADING names {}; a card that is \
+             not in that list is a card NOTES is never asserted to be below",
+            EVERY_CARD_HEADING.len()
+        );
+    }
+
+    impl Frame {
+        /// Every card heading this frame painted, with its rect, top-down.
+        ///
+        /// **Painted, not expected**: egui culls shapes entirely outside the
+        /// screen rect, so a card pushed out of view comes back from here as
+        /// *nothing at all*. Every caller asserts the COUNT before it reads a
+        /// single coordinate.
+        fn card_headings(&self) -> Vec<(&str, egui::Rect)> {
+            let mut found: Vec<(&str, egui::Rect)> = EVERY_CARD_HEADING
+                .iter()
+                .filter_map(|heading| {
+                    let rects: Vec<egui::Rect> = self
+                        .texts
+                        .iter()
+                        .filter(|(t, _)| t == heading)
+                        .map(|(_, r)| *r)
+                        .collect();
+                    match rects.len() {
+                        0 => None,
+                        1 => Some((*heading, rects[0])),
+                        n => panic!("{heading:?} was painted {n} times"),
+                    }
+                })
+                .collect();
+            found.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+            found
+        }
+    }
+
+    /// **NOTES is the last card, for every kind that shows one, measured by
+    /// where it was PAINTED.**
+    ///
+    /// The user asked for "Notes should be always last section". It used to be
+    /// drawn between PREVIOUS PASSWORDS and AUTOFILL TARGETS, so on a login it
+    /// had two cards under it and on an app-bound item three.
+    ///
+    /// **Painted vertical position, not source order.** A test that read the
+    /// order of the `card(..)` calls would be a restatement of the change; this
+    /// one takes the top edge of every heading the frame really drew and
+    /// insists NOTES has the largest. And the count is asserted FIRST: egui
+    /// culls a card that has been pushed off the screen rect entirely, and a
+    /// pane that drew only NOTES would satisfy "NOTES is last" while having
+    /// lost every other card.
+    ///
+    /// **Run twice per kind: unbound, and bound to an app.** Removing the
+    /// MATCHED APP card from unbound items (see `app_card_visible`) changes
+    /// which card is last, so an ordering claim proved on one shape only is
+    /// half a claim. `DetailBody::NotesOnly` -- a secure note, whose only card
+    /// in the unbound pass IS its note -- is in the loop for the same reason:
+    /// it must hold by the rule and not by there being nothing to be last of.
+    #[test]
+    fn notes_is_the_last_card_for_every_kind_that_shows_it() {
+        let mut visited = 0;
+        for kind in EVERY_KIND {
+            for bound in [false, true] {
+                let base = a_noted_item(item_type_for(kind));
+                let item = if bound {
+                    bound_to(&base, &a_desktop_match())
+                } else {
+                    base
+                };
+                let mut pane = Pane::new();
+                let frame = pane.idle(&item, &TotpState::NoSecret);
+                let headings = frame.card_headings();
+
+                // THE COUNT, BEFORE ANY GEOMETRY. A culled card is no card.
+                let expected = expected_card_count(kind, bound);
+                assert_eq!(
+                    headings.len(),
+                    expected,
+                    "{kind:?} (bound: {bound}) painted {:?}, expected {expected} cards; the \
+                     whole pane painted {:?}",
+                    headings.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+                    frame.strings()
+                );
+                assert!(
+                    headings.iter().any(|(h, _)| *h == "NOTES"),
+                    "{kind:?} (bound: {bound}) drew no NOTES card at all"
+                );
+                if bound {
+                    // The control on the control: with a binding there really
+                    // IS another card, so "NOTES is last" is not being
+                    // satisfied by NOTES being alone.
+                    assert!(
+                        headings.len() >= 2,
+                        "{kind:?} bound to an app drew only {:?}",
+                        headings
+                    );
+                }
+
+                let (last, last_rect) = *headings.last().expect("no cards at all");
+                assert_eq!(
+                    last, "NOTES",
+                    "{kind:?} (bound: {bound}): the bottom-most card is {last:?} at y = {}, \
+                     not NOTES; cards top-down: {:?}",
+                    last_rect.top(),
+                    headings
+                );
+                visited += 1;
+            }
+        }
+        assert_eq!(
+            visited,
+            EVERY_KIND.len() * 2,
+            "the loop visited {visited} panes, not {}",
+            EVERY_KIND.len() * 2
+        );
+        assert!(visited > 0, "the loop visited nothing and passed green");
+    }
+
+    /// How many cards `an_item` of this kind draws. Written out rather than
+    /// derived from the pane, because a count read back off the thing being
+    /// measured agrees with itself whatever it does.
+    fn expected_card_count(kind: ItemKind, bound: bool) -> usize {
+        // NOTES, always -- `an_item` carries a note for every kind.
+        let body = match kind {
+            // A secure note's body IS its note: no body card of its own.
+            ItemKind::SecureNote => 0,
+            _ => 1,
+        };
+        body + 1 + usize::from(bound)
+    }
+
+    /// `an_item` of `kind` carrying a note, which is what a NOTES card needs
+    /// and what `an_item` does not supply on its own.
+    fn a_noted_item(item_type: Option<i64>) -> VaultItem {
+        let mut item = an_item(item_type);
+        item.notes = Some(A_NOTE.to_string().into());
+        item
+    }
+
+    /// Long enough that a drag across part of it is unambiguously partial.
+    const A_NOTE: &str = "Recovery codes are in the safe on the second floor.";
+
+    /// **A click on the note copies the whole note.** The user's "full (on
+    /// click)".
+    ///
+    /// Both halves in one frame, as `clicking_the_website_link_opens_it_
+    /// without_copying` does: the action reported, and -- on the next frame,
+    /// which is where a toast raised by a click is painted -- the
+    /// confirmation naming the field.
+    #[test]
+    fn clicking_a_note_copies_all_of_it() {
+        let item = a_noted_item(Some(1));
+        let notes = notes_text(&item)
+            .expect("the fixture has no note, so this proves nothing")
+            .to_string();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        // The glyphs themselves, not the padding around them: a click that
+        // landed on the card's margin would be answered by the tile and would
+        // never test whether the text swallows a plain click.
+        let text = laid_out.rect_of(&notes);
+        let clicked = pane.click(&item, &TotpState::NoSecret, text.center());
+        assert_eq!(
+            clicked.action,
+            DetailAction::CopyValue(notes.clone()),
+            "clicking the note's own glyphs reported {:?}; the note is {notes:?}",
+            clicked.action
+        );
+        let after = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            after.painted(&copy_toast_text(NOTES_COPY_LABEL)),
+            "the note copied without saying so; painted: {:?}",
+            after.strings()
+        );
+
+        // The other half of the tile: a click on the card's padding, beside
+        // the glyphs, copies too. Without this the change would pass while
+        // only the text were clickable, which is not what the surrounding
+        // rows do.
+        let card = laid_out.filled_box_around(text, theme::CARD);
+        let padding = egui::pos2(text.center().x, card.bottom() - 4.0);
+        assert!(
+            !text.contains(padding),
+            "the 'padding' point {padding:?} is inside the glyphs {text:?}"
+        );
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let padded = pane.click(&item, &TotpState::NoSecret, padding);
+        assert_eq!(
+            padded.action,
+            DetailAction::CopyValue(notes.clone()),
+            "clicking the note card beside its glyphs reported {:?}",
+            padded.action
+        );
+    }
+
+    /// **A drag across the note selects part of it and copies nothing.** The
+    /// user's "or partially".
+    ///
+    /// This is the half the tile could have swallowed. `copy_row`'s layering
+    /// gives the topmost widget the click, and the read-only `TextEdit` IS
+    /// topmost, so the drag reaches egui's own selection machinery; the tile
+    /// under it must not turn that gesture into a copy.
+    ///
+    /// Both halves in the frame the release lands in: a real character range
+    /// is selected, and no copy was reported.
+    #[test]
+    fn a_note_can_be_selected_without_copying_the_whole_thing() {
+        let item = a_noted_item(Some(1));
+        let notes = notes_text(&item).expect("the fixture has no note").to_string();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let text = laid_out.rect_of(&notes);
+        // A press near the start of the run and a release well along it --
+        // far enough that egui calls it a drag rather than a click.
+        let from = egui::pos2(text.left() + 2.0, text.center().y);
+        let to = egui::pos2(text.left() + text.width() * 0.6, text.center().y);
+        assert!(
+            (to.x - from.x) > 30.0,
+            "the drag is only {}pt long, which egui may still call a click",
+            to.x - from.x
+        );
+
+        let pressed = pane.frame(
+            &item,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(
+            pressed.action,
+            DetailAction::None,
+            "the press alone already copied"
+        );
+        let dragged = pane.frame(
+            &item,
+            &TotpState::NoSecret,
+            vec![egui::Event::PointerMoved(to)],
+        );
+        let released = pane.frame(
+            &item,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(to),
+                egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = dragged;
+
+        // HALF ONE: a real, PARTIAL selection exists.
+        let range = notes_selection(&pane.ctx)
+            .expect("the note carries no text cursor at all, so nothing can be selected");
+        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
+        assert!(
+            selected > 0,
+            "the drag selected nothing: the cursor sits at {range:?}"
+        );
+        assert!(
+            selected < notes.chars().count(),
+            "the drag selected the whole note ({selected} chars), so 'partially' is not \
+             distinguishable from 'fully'"
+        );
+
+        // HALF TWO: and it copied nothing.
+        assert_eq!(
+            released.action,
+            DetailAction::None,
+            "a selection drag across the note reported {:?} -- the copy tile swallowed it",
+            released.action
+        );
+        let after = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            !after.painted(&copy_toast_text(NOTES_COPY_LABEL)),
+            "a selection drag raised a copy confirmation; painted: {:?}",
+            after.strings()
+        );
+    }
+
+    /// The note's text cursor, straight out of egui's own `TextEdit` state --
+    /// which is the only place a selection exists, and the reason the widget
+    /// is given a stable id.
+    fn notes_selection(ctx: &egui::Context) -> Option<egui::text_selection::CCursorRange> {
+        egui::text_edit::TextEditState::load(ctx, notes_text_id())?.cursor.char_range()
+    }
+
+    /// **An empty password draws no row: no label, no bullets, no eye, and no
+    /// space where it was.** The user: "if password is empty - show no mask
+    /// (and no field at all)".
+    ///
+    /// Drawing it invisible is not the same as not drawing it, so this asserts
+    /// three separate things a transparent or zero-size row would each fail:
+    /// the label is absent from the painted frame, the card is SHORTER by at
+    /// least a whole row, and everything below the card moved up by exactly
+    /// that much.
+    #[test]
+    fn an_empty_password_draws_no_row_at_all() {
+        let label = copy_shortcut_label(CopyShortcut::Password);
+        let full = a_login();
+        let empty = a_login_with_no_credentials();
+
+        let mut pane = Pane::new();
+        let with = pane.idle(&full, &TotpState::NoSecret);
+        let mut pane = Pane::new();
+        let without = pane.idle(&empty, &TotpState::NoSecret);
+
+        // The premise: the pane really is drawing the card in both passes, so
+        // an absent label cannot be "the pane drew nothing".
+        for frame in [&with, &without] {
+            assert!(
+                frame.painted("LOGIN CREDENTIALS"),
+                "the login card was not drawn at all: {:?}",
+                frame.strings()
+            );
+            assert!(
+                frame.painted("Username"),
+                "the username row was not drawn either: {:?}",
+                frame.strings()
+            );
+        }
+
+        // 1. THE LABEL IS GONE -- not merely the bullets.
+        assert!(
+            !without.painted(label),
+            "an empty password still paints its {label:?} label: {:?}",
+            without.strings()
+        );
+        assert!(
+            !without.strings().iter().any(|t| t.starts_with('\u{2022}')),
+            "an empty password still paints a mask: {:?}",
+            without.strings()
+        );
+
+        // 2. THE CARD IS SHORTER BY A WHOLE ROW.
+        let card_with = with.filled_box_around(with.rect_of("LOGIN CREDENTIALS"), theme::CARD);
+        let card_without =
+            without.filled_box_around(without.rect_of("LOGIN CREDENTIALS"), theme::CARD);
+        let shrank = card_with.height() - card_without.height();
+        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
+        assert!(
+            shrank >= a_row,
+            "the card lost only {shrank}pt where a row is {a_row}pt -- the row is still \
+             taking its space, so it was hidden rather than skipped"
+        );
+
+        // 3. AND EVERYTHING BELOW MOVED UP BY EXACTLY THAT MUCH -- no gap
+        // left behind, no separator standing over nothing.
+        assert_eq!(
+            with.rect_of("AUTOFILL TARGETS").top() - without.rect_of("AUTOFILL TARGETS").top(),
+            shrank,
+            "the cards below the login card did not move up by the row's whole height"
+        );
+    }
+
+    /// The positive control for the rule above: a password that IS there still
+    /// draws its whole row -- label, the full bullet run, and the reveal eye.
+    /// Without it "hide an empty password" is satisfied by hiding every
+    /// password.
+    #[test]
+    fn a_non_empty_password_still_draws_its_whole_row() {
+        let label = copy_shortcut_label(CopyShortcut::Password);
         let mut pane = Pane::new();
         let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-        assert!(frame.painted("MATCHED APP"), "{:?}", frame.strings());
         assert!(
-            frame.strings().iter().any(|t| t.contains("Add app...")),
-            "the empty card does not name the way to create a match: {:?}",
+            frame.painted(label),
+            "a real password lost its {label:?} label: {:?}",
             frame.strings()
         );
         assert!(
-            !frame.painted("Remove"),
-            "an item bound to nothing offers to unbind it"
+            frame.painted(&"\u{2022}".repeat(MASKED_BULLETS)),
+            "a real password draws no {MASKED_BULLETS}-bullet mask: {:?}",
+            frame.strings()
         );
-        // Control: an item that IS bound does NOT show the empty notice.
-        let bound = pane.idle(&bound_to(&a_login(), &a_desktop_match()), &TotpState::NoSecret);
+        assert_eq!(
+            frame.eyes.len(),
+            1,
+            "a real password row offers {} reveal eyes, not one",
+            frame.eyes.len()
+        );
+    }
+
+    /// **The reveal eye is not offered for an empty value**, kept as its own
+    /// assertion even though the row's absence implies it: it is cheap, and it
+    /// fails loudly against the one wrong way to satisfy the rule -- drawing
+    /// the row transparent or zero-size, which leaves the eye in the shape
+    /// tree where `theme::icon_probe` finds it by geometry rather than by any
+    /// string.
+    #[test]
+    fn the_reveal_eye_is_not_offered_for_an_empty_value() {
+        let mut pane = Pane::new();
+        let frame = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
         assert!(
-            !bound.strings().iter().any(|t| t.contains("Add app...")),
-            "a bound item is told it has no match: {:?}",
-            bound.strings()
+            frame.painted("LOGIN CREDENTIALS"),
+            "the pane drew no card at all, so an absent eye proves nothing: {:?}",
+            frame.strings()
+        );
+        assert_eq!(
+            frame.eyes.len(),
+            0,
+            "an item with no password still offers {} eye(s) to reveal it",
+            frame.eyes.len()
+        );
+        // The control, on the same probe: an item that HAS one gets an eye,
+        // so zero above is a decision and not a probe that never finds any.
+        let mut pane = Pane::new();
+        let filled = pane.idle(&a_login(), &TotpState::NoSecret);
+        assert_eq!(filled.eyes.len(), 1, "the eye probe finds nothing at all");
+    }
+
+    /// **The read pane shows no MATCHED APP card when nothing is bound.**
+    /// The user: "Matched app - same, no show if not present".
+    ///
+    /// The heading's absence AND the height: an alpha-0 or zero-size card
+    /// would leave the pane exactly as tall, so the second half is what
+    /// separates "not drawn" from "drawn invisibly".
+    #[test]
+    fn an_item_with_no_app_binding_draws_no_matched_app_card() {
+        let mut unbound = a_login();
+        unbound.notes = Some(A_NOTE.to_string().into());
+        let bound = bound_to(&unbound, &a_desktop_match());
+        assert!(
+            !crate::vault_bridge::has_app_match_field(&unbound),
+            "the fixture already carries a binding"
+        );
+
+        let mut pane = Pane::new();
+        let without = pane.idle(&unbound, &TotpState::NoSecret);
+        let mut pane = Pane::new();
+        let with = pane.idle(&bound, &TotpState::NoSecret);
+
+        assert!(
+            !without.painted(APP_CARD_HEADING),
+            "an unbound item still draws the {APP_CARD_HEADING:?} card: {:?}",
+            without.strings()
+        );
+        // And none of its contents by another name.
+        for absent in ["App", "Program file", crate::vault_window::detail_edit::APP_ADD_BUTTON] {
+            assert!(
+                !without.painted(absent),
+                "an unbound item still draws the card's {absent:?}: {:?}",
+                without.strings()
+            );
+        }
+
+        // The height. NOTES is the last card on both panes, so where its
+        // heading sits is where the pane's contents end.
+        let gap = without.rect_of("NOTES").top() - with.rect_of("NOTES").top();
+        assert!(
+            gap < 0.0,
+            "the unbound pane is not shorter: NOTES sits at {} with a binding and {} \
+             without one, so the card is still taking its space",
+            with.rect_of("NOTES").top(),
+            without.rect_of("NOTES").top()
+        );
+        // What disappeared, MEASURED off the bound pane rather than computed
+        // from the constants: the card's own painted box, plus the gap between
+        // its bottom edge and the card that follows it. `CARD_GAP` is not that
+        // gap on its own -- the cards also carry the scroll area's item
+        // spacing -- which is why this is read and not stated.
+        let card = with.filled_box_around(with.rect_of(APP_CARD_HEADING), theme::CARD);
+        let next = with.filled_box_around(with.rect_of("NOTES"), theme::CARD);
+        let expected = card.height() + (next.top() - card.bottom());
+        assert!(
+            expected > card.height(),
+            "the cards are not separated at all, so this is not the measurement it says"
+        );
+        assert_eq!(
+            -gap, expected,
+            "the pane shrank by {}pt where the card and the gap after it are {expected}pt \
+             -- a hole was left where the card used to be",
+            -gap
+        );
+    }
+
+    /// The positive control: an item that IS bound still shows every part of
+    /// the card. Without it the hiding rule is satisfied by hiding the card
+    /// always.
+    #[test]
+    fn an_item_with_an_app_binding_still_draws_it() {
+        let bound = bound_to(&a_login(), &a_desktop_match());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&bound, &TotpState::NoSecret);
+        let mut checked = 0;
+        for needle in [APP_CARD_HEADING, "App", "Program file", "Remove"] {
+            checked += 1;
+            assert!(
+                frame.painted(needle),
+                "a bound item is missing the card's {needle:?}: {:?}",
+                frame.strings()
+            );
+        }
+        assert_eq!(checked, 4, "the loop asserted nothing");
+    }
+
+    /// **The exception, and exactly as much of it as this change owns.**
+    ///
+    /// The read pane stops offering the MATCHED APP card when nothing is
+    /// bound. The edit and add forms must go on offering their app control,
+    /// because that is the only place a binding is made -- and that control
+    /// lives in `detail_edit.rs`, which this change does not touch and which
+    /// another implementer holds. So what is asserted here is the half that
+    /// is mine: the read pane's gate has NOT reached the edit form.
+    ///
+    /// * The block is still drawn by the edit form, rendered rather than read
+    ///   off the source -- so a `draw_detail_edit` that had lost it fails
+    ///   here.
+    /// * And `app_card_visible` -- the predicate that hides the read card --
+    ///   is named nowhere in that file, which is the mutation this test
+    ///   exists for: gating the edit form on the read pane's rule would hide
+    ///   the one control that can create a binding, and the app would have no
+    ///   way to bind an app at all.
+    ///
+    /// The unbound half of the edit form -- an add affordance on a draft that
+    /// carries no binding -- is `detail_edit.rs`'s own to make and to guard;
+    /// see its `app_add_block`. It is deliberately NOT asserted from here,
+    /// because a test in this file that depended on a symbol that file has
+    /// not landed yet would be green for a reason outside this change.
+    #[test]
+    fn the_edit_form_offers_the_app_control_even_with_nothing_bound() {
+        use crate::vault_window::detail_edit;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(PANE, PANE),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input.clone(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input.clone(), |_ui| {});
+
+        let bound = bound_to(&a_login(), &a_desktop_match());
+        let mut draft = detail_edit::EditDraft::from_item(&bound);
+        // The premise: the form really was handed a binding to draw.
+        assert!(
+            draft.app.is_some(),
+            "the fixture gave the edit form no app draft, so this proves nothing"
+        );
+
+        let mut apps = crate::app_identity::AppIdentityCache::default();
+        let output = ctx.run_ui(input, |ui| {
+            let _ = detail_edit::draw_detail_edit(
+                ui,
+                &mut draft,
+                &[],
+                false,
+                &mut apps,
+                Some(&bound),
+                &TotpState::NoSecret,
+            );
+        });
+        let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
+        let mut texts = Vec::new();
+        collect_text_rects(&all, &mut texts);
+        let strings: Vec<&str> = texts.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            strings.contains(&detail_edit::APP_BLOCK_HEADING),
+            "the edit form no longer draws {:?}, so there is no app control there at \
+             all: {strings:?}",
+            detail_edit::APP_BLOCK_HEADING
+        );
+
+        // And the read pane's gate is not in that file.
+        let edit_source = include_str!("detail_edit.rs");
+        assert!(
+            !edit_source.contains("app_card_visible"),
+            "the read pane's `app_card_visible` has been wired into the edit form, which \
+             is where a binding is created"
+        );
+        // The control on that scan: it can find a name that IS there, so an
+        // absence above is an absence and not a scan that matches nothing.
+        assert!(edit_source.contains("APP_BLOCK_HEADING"));
+    }
+
+    /// **"9s left - show just 9s".** The decision, called directly.
+    #[test]
+    fn totp_countdown_reads_just_the_number_and_the_unit() {
+        assert_eq!(totp_countdown_text(9), "9s");
+        // The two ends, checked rather than assumed to read sensibly.
+        assert_eq!(totp_countdown_text(30), "30s");
+        assert_eq!(totp_countdown_text(0), "0s");
+        // ... and the wording it replaced is gone, from every value.
+        for n in 0..=30u8 {
+            let text = totp_countdown_text(n);
+            assert!(
+                !text.contains("left"),
+                "the countdown reads {text:?} at {n} seconds"
+            );
+            assert_eq!(text, format!("{n}s"));
+        }
+    }
+
+    /// The same, off the painted frame -- so the short string is what the row
+    /// really draws and not merely what a helper returns. The row's other two
+    /// parts are asserted alongside it: a countdown column that changed width
+    /// must not have pushed the code or the track out of the card.
+    #[test]
+    fn a_totp_countdown_paints_just_the_seconds() {
+        let (item, totp) = a_login_with_a_code();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &totp);
+        let seconds = match &totp {
+            TotpState::Code { seconds_left, .. } => *seconds_left,
+            other => panic!("the fixture is {other:?}, which draws no countdown"),
+        };
+        assert!(
+            frame.painted(&format!("{seconds}s")),
+            "the countdown does not read {seconds}s; painted: {:?}",
+            frame.strings()
+        );
+        assert!(
+            !frame.strings().iter().any(|t| t.contains("s left")),
+            "the countdown still says \"s left\": {:?}",
+            frame.strings()
+        );
+        // The layout, MEASURED: the whole row is still inside its card, and
+        // the code is still to the left of the countdown with the track
+        // between them.
+        let card = frame.filled_box_around(frame.rect_of("LOGIN CREDENTIALS"), theme::CARD);
+        let countdown = frame.rect_of(&format!("{seconds}s"));
+        assert!(
+            card.contains_rect(countdown),
+            "the countdown at {countdown:?} is outside its card {card:?}"
         );
     }
 
@@ -7304,11 +8199,11 @@ mod tests {
         // fill at all -- the case that used to suppress it entirely and so
         // left the field unclearable from this pane.
         assert!(
-            app_card_visible(true, ItemKind::SecureNote),
+            app_card_visible(true),
             "a secure note whose app-match field is corrupt cannot see it"
         );
         assert!(
-            !app_card_visible(false, ItemKind::SecureNote),
+            !app_card_visible(false),
             "the control: a secure note with NO field still gets no card"
         );
     }
@@ -7374,37 +8269,36 @@ mod tests {
         }
         }
 
-        // The control: an item with NO field paints the empty notice and
-        // offers no Remove, so the assertions above are about the corrupted
-        // field and not about a card that now always says both.
+        // The control: an item with NO field gets NO CARD AT ALL, so the
+        // assertions above are about the corrupted field and not about a card
+        // that now always says both. This used to read "the empty card names
+        // Add app..."; the empty card is gone (see `app_card_visible`), and the
+        // control is the stronger one that replaced it.
         //
-        // And its own control, on the kind that the substitution above turned
-        // invisible: a secure note with no field gets no card at all, so the
-        // secure-note half of the loop cannot be passing on a card that is
-        // simply always there.
-        let mut pane = Pane::new();
-        let bare_note = pane.idle(
-            &an_item(item_type_for(ItemKind::SecureNote)),
-            &TotpState::NoSecret,
-        );
-        assert!(
-            !bare_note.painted("MATCHED APP"),
-            "a secure note bound to nothing draws an app card: {:?}",
-            bare_note.strings()
-        );
-        let mut pane = Pane::new();
-        let bare = pane.idle(&a_login(), &TotpState::NoSecret);
-        assert!(
-            bare.strings().iter().any(|t| t.contains("No app is matched")),
-            "{:?}",
-            bare.strings()
-        );
-        assert!(!bare.painted("Remove"), "{:?}", bare.strings());
-        assert!(
-            !bare.strings().iter().any(|t| t.contains("cannot be read")),
-            "{:?}",
-            bare.strings()
-        );
+        // Two kinds, because the retired rule was `has_field ||
+        // kind_offers_fill(kind)`: a secure note failed it and a login passed
+        // it, so a control on the secure note alone would have gone on passing
+        // while every login still carried an empty card.
+        for kind in [ItemKind::SecureNote, ItemKind::Login] {
+            let mut pane = Pane::new();
+            let bare = pane.idle(&an_item(item_type_for(kind)), &TotpState::NoSecret);
+            assert!(
+                !bare.painted(APP_CARD_HEADING),
+                "a {kind:?} bound to nothing draws an app card: {:?}",
+                bare.strings()
+            );
+            assert!(
+                !bare.strings().iter().any(|t| t.contains("No app is matched")),
+                "{kind:?}: {:?}",
+                bare.strings()
+            );
+            assert!(!bare.painted("Remove"), "{kind:?}: {:?}", bare.strings());
+            assert!(
+                !bare.strings().iter().any(|t| t.contains("cannot be read")),
+                "{kind:?}: {:?}",
+                bare.strings()
+            );
+        }
     }
 
     /// A corrupted field is cleared by the arm the card reports into --
@@ -7558,7 +8452,23 @@ mod tests {
     /// and raised "Password copied" over an untouched clipboard.
     #[test]
     fn clicking_an_empty_credential_row_reports_nothing_and_raises_no_toast() {
-        for (label, toast) in [("Password", "Password copied"), ("Username", "Username copied")] {
+        // **`Username` only, and the missing `Password` is the point.** An
+        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
+        // which is a strictly stronger promise than the inert row this test
+        // was written for -- there is no rect to hover, click or hit. The
+        // Password case did not stop being guarded: it moved to
+        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
+        // biting here too.
+        {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
+            assert!(
+                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
+                "an empty password is back to drawing a row; painted: {:?}",
+                laid_out.strings()
+            );
+        }
+        for (label, toast) in [("Username", "Username copied")] {
             let empty = a_login_with_no_credentials();
             let mut pane = Pane::new();
             let laid_out = pane.idle(&empty, &TotpState::NoSecret);
@@ -7609,7 +8519,23 @@ mod tests {
     /// not enough.
     #[test]
     fn an_empty_credential_row_offers_no_hover_affordance() {
-        for label in ["Password", "Username"] {
+        // **`Username` only, and the missing `Password` is the point.** An
+        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
+        // which is a strictly stronger promise than the inert row this test
+        // was written for -- there is no rect to hover, click or hit. The
+        // Password case did not stop being guarded: it moved to
+        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
+        // biting here too.
+        {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
+            assert!(
+                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
+                "an empty password is back to drawing a row; painted: {:?}",
+                laid_out.strings()
+            );
+        }
+        for label in ["Username"] {
             let empty = a_login_with_no_credentials();
             let mut pane = Pane::new();
             let laid_out = pane.idle(&empty, &TotpState::NoSecret);
@@ -7653,10 +8579,23 @@ mod tests {
     /// holds it back half a second, so only a settled hover can see it.
     #[test]
     fn an_empty_credential_row_offers_no_click_to_copy_tooltip() {
-        for (label, tooltip) in [
-            ("Password", "Click to copy · CTRL+B"),
-            ("Username", "Click to copy · CTRL+U"),
-        ] {
+        // **`Username` only, and the missing `Password` is the point.** An
+        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
+        // which is a strictly stronger promise than the inert row this test
+        // was written for -- there is no rect to hover, click or hit. The
+        // Password case did not stop being guarded: it moved to
+        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
+        // biting here too.
+        {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
+            assert!(
+                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
+                "an empty password is back to drawing a row; painted: {:?}",
+                laid_out.strings()
+            );
+        }
+        for (label, tooltip) in [("Username", "Click to copy · CTRL+U")] {
             let empty = a_login_with_no_credentials();
             let mut pane = Pane::new();
             let laid_out = pane.idle(&empty, &TotpState::NoSecret);
@@ -12496,6 +13435,63 @@ mod read_pane_scroll_tests {
             }
             shot
         }
+
+        /// Scrolls the body to its bottom and then back UP, one wheel notch
+        /// at a time, until every one of `sources` is painted wholly inside
+        /// the pane -- or fails naming the one that never arrived.
+        ///
+        /// **This replaces `scroll_to_bottom` in the reachability tests, and
+        /// it is a stronger question, not a weaker one.** `scroll_to_bottom`
+        /// asked "is the card visible at ONE particular scroll offset", which
+        /// stopped being the right question the moment NOTES moved below the
+        /// MATCHED APP card: the card is still perfectly reachable, it is
+        /// simply no longer the last thing on the pane. What the user needs is
+        /// that SOME sequence of scrolls brings the whole control into view,
+        /// and that is what this looks for. A card that is culled, clipped or
+        /// laid out past the pane's right edge at every offset still fails.
+        fn scroll_until_all_visible(&mut self, item: &VaultItem, sources: &[&str]) -> Shot {
+            let bounds = self.bounds();
+            let all_in = |shot: &Shot| {
+                sources.iter().all(|source| {
+                    shot.rect_of(source)
+                        .is_some_and(|rect| bounds.contains_rect(rect))
+                })
+            };
+            let mut shot = self.scroll_to_bottom(item);
+            for _ in 0..120 {
+                if all_in(&shot) {
+                    return shot;
+                }
+                shot = self.frame(
+                    item,
+                    vec![
+                        egui::Event::PointerMoved(bounds.center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, 12.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+            }
+            let missing: Vec<&str> = sources
+                .iter()
+                .copied()
+                .filter(|source| {
+                    !shot
+                        .rect_of(source)
+                        .is_some_and(|rect| bounds.contains_rect(rect))
+                })
+                .collect();
+            panic!(
+                "no scroll offset puts {missing:?} wholly inside the {}x{}pt pane; the \
+                 last frame painted {:?}",
+                bounds.width(),
+                bounds.height(),
+                shot.sources()
+            );
+        }
     }
 
     /// The tallest item this app can really be asked to draw: an identity
@@ -12710,8 +13706,15 @@ mod read_pane_scroll_tests {
         // so "nothing is painted" cannot be what satisfies the line above.
         assert_visible(&before, "IDENTITY", bounds);
 
-        let after = pane.scroll_to_bottom(&item);
-        for source in [
+        // **Not `scroll_to_bottom` any more, and the reason is a change in
+        // what is at the bottom, not a weakening of the question.** NOTES is
+        // now the pane's last card, so the app card no longer happens to be
+        // flush with the end of the content -- it is still perfectly
+        // reachable, which is what this test is about. See
+        // `scroll_until_all_visible`: it demands that ONE offset shows every
+        // one of these at once, wholly inside the pane, which is strictly
+        // more than the old assertion asked at a fixed offset.
+        let sources = [
             APP_CARD_HEADING,
             // The control commit `a33b75e` added, which was the single least
             // reachable thing on the pane.
@@ -12743,7 +13746,9 @@ mod read_pane_scroll_tests {
             // exactly the direction that made this card unreachable twice.
             // Removing the pill row took a row off; this put text back on.
             APP_MATCH_BEHAVIOUR_NOTE,
-        ] {
+        ];
+        let after = pane.scroll_until_all_visible(&item, &sources);
+        for source in sources {
             assert_visible(&after, source, bounds);
         }
 
@@ -12804,7 +13809,7 @@ mod read_pane_scroll_tests {
         // The control on that: the BODY did move, so an equality that held
         // because nothing scrolled at all would not pass here.
         assert!(
-            after.rect_of(APP_CARD_HEADING).is_some(),
+            after.rect_of("NOTES").is_some(),
             "nothing scrolled, so the title standing still proves nothing"
         );
     }
@@ -12850,6 +13855,64 @@ mod read_pane_scroll_tests {
         assert_eq!(toast.bottom(), bounds.bottom() - COPY_TOAST_INSET);
     }
 
+    /// **The NOTES card at the app's minimum window size.** Three times a
+    /// text or layout change in this file has pushed a control out of the
+    /// scroll viewport, and this change did two of the things that do it: it
+    /// moved a card to the end of the pane, and it replaced a `ui.label`
+    /// with a `TextEdit`, whose wrap width is its own rather than the
+    /// layout's.
+    ///
+    /// So: the note's own glyphs, at 298x600, wholly inside the pane on BOTH
+    /// axes and not elided. `assert_visible` is the same check the MATCHED
+    /// APP controls get, for the same reason -- egui culls a run laid out
+    /// past the clip rect entirely, so an overflowing note would come back
+    /// as no note at all rather than as a note sticking out.
+    #[test]
+    fn the_note_fits_and_is_reachable_on_the_shortest_window() {
+        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
+        let item = the_tallest_item();
+        let note = item
+            .notes
+            .as_deref()
+            .expect("the tallest item has no note, so this proves nothing")
+            .to_string();
+        let bounds = pane.bounds();
+
+        // The premise: the note is NOT on the pane before scrolling, so what
+        // follows is about a card that had to be scrolled to.
+        let before = pane.idle(&item);
+        assert!(
+            before.rect_of("NOTES").is_none(),
+            "the tallest item already fits, so this exercises no scrolling: {:?}",
+            before.sources()
+        );
+        assert_visible(&before, "IDENTITY", bounds);
+
+        let after = pane.scroll_until_all_visible(&item, &["NOTES", &note]);
+        assert_visible(&after, "NOTES", bounds);
+        assert_visible(&after, &note, bounds);
+
+        // And it really is the LAST card at this width too -- the ordering
+        // claim is asserted on the wide pane by
+        // `notes_is_the_last_card_for_every_kind_that_shows_it`, and a card
+        // that reordered only when the pane got narrow would slip past it.
+        // A SECOND scroll offset, because at 298x600 the app card is 270pt
+        // tall and the frame that shows the note at the very bottom has
+        // already carried the app card's heading off the top. Asked for as
+        // one offset that shows both headings, which exists and is what an
+        // ordering comparison needs.
+        let both = pane.scroll_until_all_visible(&item, &["NOTES", APP_CARD_HEADING]);
+        let notes_top = both.rect_of("NOTES").expect("just asserted visible").top();
+        let app_top = both
+            .rect_of(APP_CARD_HEADING)
+            .expect("just asserted visible")
+            .top();
+        assert!(
+            notes_top > app_top,
+            "at {NARROW}pt NOTES sits at y = {notes_top} and MATCHED APP at {app_top}"
+        );
+    }
+
     /// No horizontal scrolling: the wheel moves the body up and down and
     /// NOTHING sideways. The rows already elide what they can, and a
     /// horizontal bar under them would be the regression rather than the fix.
@@ -12864,7 +13927,7 @@ mod read_pane_scroll_tests {
         let before = pane.idle(&item);
         let mut after = pane.scroll_to_bottom(&item);
         assert!(
-            after.rect_of(APP_CARD_HEADING).is_some(),
+            after.rect_of("NOTES").is_some(),
             "nothing scrolled, so an x that did not move proves nothing"
         );
         // And then asked, in as many words, to scroll sideways. Without this
