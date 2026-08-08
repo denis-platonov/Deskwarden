@@ -4491,6 +4491,176 @@ mod tests {
             .unwrap();
         m.assert();
     }
+
+    /// `generate` returns `Zeroizing<String>`, and **nothing proved it** --
+    /// this was the one secret-returning path in the crate with no allocator
+    /// probe beside it. The interesting stretch is not the return value but
+    /// the one before it: `into_json` deserialises through
+    /// `Envelope<GeneratedString>`, so serde builds an intermediate `String`
+    /// holding the generated secret and that intermediate is not `Zeroizing`.
+    /// Whether *it* goes back to the allocator with the plaintext still in it
+    /// is exactly what is measured here.
+    ///
+    /// **What was measured, and it is not what a `!leaked` around the whole
+    /// call would have claimed.** Arming the watch across the entire call
+    /// reports a leak, and the third reading below attributes it: a bare
+    /// `ureq` GET of the same body, with no serde, no `Envelope` and no code
+    /// from this file touching the bytes, leaks too. The plaintext is
+    /// released by `ureq`'s own body reading, upstream of anything
+    /// [`VaultBridge::generate`] allocates. That is not fixable here -- it is
+    /// the caveat `generate`'s own doc already states about `into_json`'s
+    /// buffer -- so it is recorded rather than asserted away.
+    ///
+    /// **Serde's intermediate is a different question and this test does NOT
+    /// answer it.** By reading the code it is safe: the final line of
+    /// [`VaultBridge::generate`] *moves* the `String` into the `Zeroizing`,
+    /// so the buffer serde filled becomes the `Zeroizing`'s buffer and is
+    /// wiped by it, with no second copy left behind. But that is a reading,
+    /// not a measurement, and the difference was checked rather than assumed:
+    /// making that line `.clone()` instead -- an extra copy of the plaintext
+    /// released un-wiped -- leaves this test **green**. It has to. The
+    /// intermediate lives and dies *inside* the call, and inside the call the
+    /// transport is already leaking, so a boolean probe has nothing left to
+    /// distinguish. Widening reading 4 cannot fix it; only a transport that
+    /// stops releasing the body would make that window readable.
+    ///
+    /// **What this covers.** Three things, and it is the combination that is
+    /// the claim: the probe sees a bare `String` (control); the transport
+    /// leaks and it is the transport's doing and not this file's (recorded
+    /// and attributed); and the value `generate` hands back, from the moment
+    /// the call returns to the moment it is dropped, does **not** go back to
+    /// the allocator in the clear.
+    ///
+    /// **What it does not.** Anything that happens *during* the call,
+    /// including serde's intermediate -- see above; that limit is not a
+    /// caveat but a measured one, with the mutant that proves it named.
+    /// The needle is the literal [`PROBE`] bytes and
+    /// nothing else -- a value that merely *derives* from the secret (a
+    /// percent-encoding, a hash, a substring shorter than the needle, a
+    /// UTF-16 widening) is invisible to this instrument, exactly as it is to
+    /// the crate's other probe tests. It says nothing about the transport
+    /// buffers beyond attributing them, nothing about blocks freed after the
+    /// last window closes, and nothing about the copy `mockito` holds, which
+    /// is the server's.
+    #[test]
+    fn generate_hands_back_a_password_that_does_not_reach_the_allocator_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // 1. THE CONTROL, FIRST. An instrument that reports clean while blind
+        //    is this codebase's signature failure, so before believing any
+        //    `false` below, prove this exact probe answers `true` for a bare
+        //    `String` holding the needle. Built before the watch is armed so
+        //    the temporaries of building it are not what is observed.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: the probe did not see a bare String carrying the needle go back to the \
+             allocator, so every verdict below means nothing"
+        );
+
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("GET", "/generate")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_generated_body(PROBE))
+            .expect(3)
+            .create();
+        let bridge = VaultBridge::new(server.url());
+
+        // 2. The whole call, armed. This LEAKS, and saying so is the point:
+        //    an assertion of `!leaked` here would be a claim this crate
+        //    cannot honour, and writing one would have meant weakening the
+        //    probe until it agreed.
+        let mut answered_the_needle = false;
+        let whole_call = plaintext_reached_the_allocator(|| {
+            let generated = bridge
+                .generate(&GenerateRequest::Password(PasswordRecipe::default()))
+                .expect("the mock answered a well-formed envelope");
+            // Read, not asserted, inside the armed window: a failing
+            // `assert_eq!` here would allocate its own formatted copy of the
+            // secret and the probe would report *that*.
+            answered_the_needle = generated.as_str() == PROBE;
+        });
+        // The window was not vacuous: the call really did carry the needle
+        // end to end. Without this a mock that 404'd, or a `generate` that
+        // returned the empty string, would produce a serene verdict about
+        // nothing.
+        assert!(
+            answered_the_needle,
+            "the bridge did not return the value the mock sent, so no window in this test ever \
+             held the secret and every verdict here is about nothing"
+        );
+        assert!(
+            whole_call,
+            "the whole call now reads clean. That is better than what was measured when this \
+             test was written, not a failure -- find out what changed, and if the transport no \
+             longer releases the body in the clear, widen reading 4 below to cover the call \
+             itself and delete reading 3"
+        );
+
+        // 3. ATTRIBUTION. The same body over the same client with no serde,
+        //    no `Envelope` and nothing this file wrote touching the bytes,
+        //    leaks as well -- so reading 2 is `ureq`'s body reading and not
+        //    something `generate` does. This is what stops reading 2 from
+        //    being read as an indictment of the bridge.
+        //
+        //    It goes through the bridge's OWN agent, not a fresh one. Building
+        //    a bare `ureq` agent here would be an untimed client in this file,
+        //    which `http_agent`'s guard forbids for good reason, and it would
+        //    also attribute reading 2's leak to a client that is not the one
+        //    reading 2 used.
+        let raw_url = format!("{}/generate", server.url());
+        let transport_alone = plaintext_reached_the_allocator(|| {
+            let mut sink = Zeroizing::new(Vec::with_capacity(8192));
+            std::io::copy(
+                &mut std::io::Read::take(
+                    bridge
+                        .read_agent
+                        .get(&raw_url)
+                        .call()
+                        .expect("the mock answered")
+                        .into_reader(),
+                    4096,
+                ),
+                &mut *sink,
+            )
+            .expect("the body was read");
+        });
+        assert!(
+            transport_alone,
+            "the transport on its own reads clean, so reading 2's leak is NOT the transport's \
+             and something between the socket and the `Zeroizing` is releasing the plaintext"
+        );
+
+        // 4. THE CLAIM. The value `generate` handed back, dropped inside its
+        //    own window with the call outside it. Every transport buffer from
+        //    reading 2 was freed before this window opened, so the only thing
+        //    in here carrying the needle is the `Zeroizing<String>` itself.
+        //    Drop the `Zeroizing` from the return type and this reads `true`;
+        //    that mutation was run and this is the reading that caught it.
+        //    It is the ONLY window in this test that can catch anything, and
+        //    it is about the returned value alone -- not the call.
+        let generated = bridge
+            .generate(&GenerateRequest::Password(PasswordRecipe::default()))
+            .expect("the mock answered a well-formed envelope");
+        assert_eq!(
+            generated.len(),
+            PROBE.len(),
+            "the second call did not return the secret, so the window below holds nothing"
+        );
+        let on_drop = plaintext_reached_the_allocator(move || drop(generated));
+        assert!(
+            !on_drop,
+            "the password `generate` returned went back to the allocator in the clear when it \
+             was dropped -- it is not wiping itself, so every caller that takes a copy leaves \
+             the plaintext on the heap"
+        );
+
+        _m.assert();
+    }
+
     // -----------------------------------------------------------------
     // The region BELOW the cut -- the half no source guard here reads.
     // -----------------------------------------------------------------
