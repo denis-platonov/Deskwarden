@@ -5207,6 +5207,74 @@ mod list_placeholder_paint_tests {
 
     const PANE_WIDTH: f32 = 390.0;
 
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. The same shape `foreground.rs` walks with,
+    /// deliberately exact rather than a `starts_with`: a whole module written
+    /// on one line is not a module opener as far as this walk is concerned.
+    fn is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// **`vault_window::mod`'s source with its gated test modules cut out**,
+    /// and how many were cut. A copy of `foreground.rs`'s walk (`ec74c74`);
+    /// there is no test-only module the two could share without adding a `mod`
+    /// declaration to a file this change has no business touching.
+    ///
+    /// A line that is exactly `#[cfg(test)]` followed immediately by a
+    /// column-0 module opener starts a skip that runs to the next column-0
+    /// `}` -- inside a module every item is indented, so that brace is the
+    /// module's own. A walk rather than a split at the first gate -- though
+    /// **measured, that makes no difference to `mod.rs` today**: below its
+    /// first gate (line 5636 of 14189) the 373 non-blank lines outside a
+    /// gated module are all doc comments belonging to those modules, because
+    /// `mod.rs`'s own `nothing_but_gated_test_modules_lives_below_the_guards_cut`
+    /// forbids anything else. This guard should not rest on that other
+    /// guard's continued existence, and this is the shape `foreground.rs` and
+    /// `settings.rs` already read other modules with.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here reads the same on this
+    /// repository's CRLF working tree and on an LF checkout of its LF blobs.
+    fn production_half(source: &str) -> (String, usize) {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut cut = 0usize;
+        let mut gated = false;
+        let mut skipping = false;
+        for line in source.lines() {
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            if gated && is_module_opener(line) {
+                // The `#[cfg(test)]` line itself was pushed on the previous
+                // turn; it belongs to the module being cut.
+                kept.pop();
+                skipping = true;
+                cut += 1;
+                gated = false;
+                continue;
+            }
+            gated = line.trim() == "#[cfg(test)]";
+            kept.push(line);
+        }
+        assert!(
+            !skipping,
+            "a test module was opened and never closed by a column-0 brace, so the rest of the \
+             file was dropped and every needle counted over this reads nothing"
+        );
+        (kept.join("\n"), cut)
+    }
+
     fn an_item(name: &str) -> VaultItem {
         VaultItem {
             id: name.to_string(),
@@ -5377,7 +5445,69 @@ mod list_placeholder_paint_tests {
     /// anything about whether this list's fetch is still running.
     #[test]
     fn the_window_passes_this_lists_own_failure_and_not_the_bands() {
-        let source = include_str!("mod.rs");
+        let raw = include_str!("mod.rs");
+
+        // **The presence pin reads the production half; the absence pin below
+        // reads the whole file.** Deliberately two different sources, because
+        // the two pins fail in opposite directions:
+        //
+        // * `contains(aux_error...)` is a PRESENCE pin, and over a whole file
+        //   that is the LOOSE side. `mod.rs` carries fifty gated test modules
+        //   (measured), any one of which could spell this needle in a fixture
+        //   and hold the guard green after `draw_item_list`'s real call site
+        //   had stopped passing the row's own error. That is the drift this
+        //   test exists for.
+        // * `!contains(notice...)` is a ZERO-count pin, and over a whole file
+        //   that is the STRICT side: a fixture spelling it SHOULD fire, since
+        //   here a false alarm is cheap and an escape is the defect. Same
+        //   judgement `foreground.rs`'s `only_one_window...` was left alone
+        //   on. So it is left raw, on purpose, not by omission.
+        let (source, cut) = production_half(raw);
+        assert!(
+            cut > 0,
+            "no gated test module was cut out of `vault_window::mod`, so the presence pin below \
+             is still satisfiable by a fixture in that file rather than by its code"
+        );
+
+        // Positive control on the cut itself -- neither `contains` below
+        // proves the walk did anything, and a walk that cut too much would
+        // make the presence pin fire for the wrong reason while a walk that
+        // cut nothing would leave it as loose as before.
+        let interleaved = concat!(
+            "fn draw() { list(aux_error", ".is_some(), ..); }\n",
+            "#[cfg(test)]\n",
+            "mod fixtures {\n",
+            "    const SAMPLE: &str = \"aux_error", ".is_some(),\";\n",
+            "}\n",
+            "fn draw_later() { let _ = SURVIVOR; }\n"
+        );
+        assert_eq!(
+            interleaved.matches(concat!("aux_error", ".is_some(),")).count(),
+            2,
+            "control: the fixture no longer spells the needle, so the cut below proves nothing"
+        );
+        let (cut_fixture, cuts) = production_half(interleaved);
+        assert_eq!(cuts, 1, "the walk did not find the gated test module");
+        assert_eq!(
+            cut_fixture.matches(concat!("aux_error", ".is_some(),")).count(),
+            1,
+            "the walk did not remove the occurrence inside the test module"
+        );
+        assert!(
+            cut_fixture.contains("SURVIVOR"),
+            "the walk threw away production below the test module, which is exactly what a \
+             split at the first test gate would have done"
+        );
+        // **Measured, so the shape is not oversold.** A split at `mod.rs`'s
+        // first gate would in fact read the same thing TODAY: that file's own
+        // `nothing_but_gated_test_modules_lives_below_the_guards_cut` already
+        // forbids production below its first gate, and planting some there to
+        // prove otherwise fires THAT guard rather than this one. The walk is
+        // used anyway because this guard should not be resting on another
+        // file's guard continuing to exist, and because it is the one shape
+        // `foreground.rs` and `settings.rs` already use -- `main.rs`, which
+        // has no such guard, really does interleave.
+
         let needle = concat!("aux_error", ".is_some(),");
         assert!(
             source.contains(needle),
@@ -5387,7 +5517,7 @@ mod list_placeholder_paint_tests {
              Generate failure suppresses a spinner for a fetch that really is running."
         );
         assert!(
-            !source.contains(concat!("notice", ".is_some(),")),
+            !raw.contains(concat!("notice", ".is_some(),")),
             "control: the band's own \"is anything on screen\" is not what is passed"
         );
     }

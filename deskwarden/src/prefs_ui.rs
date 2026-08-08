@@ -1989,7 +1989,23 @@ mod tests {
         // `hotkey::register_fill_hotkey`, so changing the registered chord
         // would otherwise leave this window confidently naming the old one.
         assert_eq!(FILL_HOTKEY, "CTRL+ALT+B");
+        // **Read whole, and that is checked, not assumed.** `settings.rs` and
+        // `item_list.rs` count their cross-file needles over the read file's
+        // production half, because a fixture in another module's test code
+        // can satisfy a presence pin that production has stopped satisfying.
+        // `hotkey.rs` has no test code at all -- 27 lines, no `cfg(test)`
+        // anywhere -- so there is no fixture here to be fooled by, and a walk
+        // that cut test modules out would cut nothing. The assertion below
+        // keeps that true: the day `hotkey.rs` grows a test module, this
+        // fires and these two pins should move to a production half.
         let hotkey_rs = include_str!("hotkey.rs");
+        assert_eq!(
+            hotkey_rs.matches(concat!("cfg(", "test)")).count(),
+            0,
+            "`hotkey.rs` has grown test code, so the two whole-file presence pins below can now \
+             be satisfied by a fixture instead of by the registration they guard -- read its \
+             production half, the way `settings.rs` reads `main.rs`"
+        );
         assert!(
             hotkey_rs.contains("Modifiers::CONTROL | Modifiers::ALT"),
             "hotkey.rs no longer registers Ctrl+Alt -- `FILL_HOTKEY` says it does"

@@ -1222,6 +1222,96 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. The same shape `foreground.rs` walks with,
+    /// deliberately exact rather than a `starts_with`: a whole module written
+    /// on one line is not a module opener as far as this walk is concerned.
+    fn is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// **Another module's source with its gated test modules cut out**, and
+    /// how many were cut. A copy of `foreground.rs`'s walk (`ec74c74`); this
+    /// crate has no test-only module the two could share without a `mod`
+    /// declaration in a file this change has no business touching.
+    ///
+    /// The reason the guard below reads this rather than the raw
+    /// `include_str!` bytes. That guard is a **presence** pin -- `main.rs`
+    /// must spell the `ProjectDirs` triple that `default_path` duplicates --
+    /// and for a presence pin the whole file is the LOOSE side, not the
+    /// strict one: a fixture in one of `main.rs`'s own test modules spelling
+    /// the triple would satisfy it after production had stopped spelling it,
+    /// and the guard would sit green over exactly the drift it exists to
+    /// catch. (That is the mirror image of the exact-count false fire
+    /// `ec74c74` fixed, and the opposite of a zero-count pin, where reading
+    /// raw-and-whole IS the strict side and must be left alone -- see
+    /// `item_list.rs`.)
+    ///
+    /// A walk that skips each gated module, rather than "everything above the
+    /// first `cfg(test)` gate" -- and the difference is **measured, not
+    /// assumed, because overselling it would be its own defect**. `main.rs`
+    /// today has two gated modules, at lines 6119 and 16984, and below the
+    /// first gate exactly six non-blank lines are outside a gated module: the
+    /// doc comment attached to the second one. So a split at the first gate
+    /// would read the same production, and both pins here sit at lines 132 and
+    /// 229 anyway. The walk is used regardless, for two reasons that do not
+    /// depend on today's layout: `main.rs` has no guard of its own forbidding
+    /// production below its first gate (`settings.rs` and `vault_window::mod`
+    /// both do, which is why THEY stay tidy), so the day a helper is added
+    /// after the tests a split would start silently discarding it; and it is
+    /// the shape `foreground.rs` already reads six files with.
+    ///
+    /// So each gated module is skipped instead: a line that is exactly
+    /// a `cfg(test)` gate followed immediately by a column-0 module opener starts
+    /// a skip that runs to the next column-0 `}`. Inside a module every item
+    /// is indented, so that brace is the module's own.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here is against the line's real
+    /// text on a CRLF working tree and on an LF checkout alike. This
+    /// repository stores LF blobs and only `core.autocrlf=true` makes the
+    /// working tree CRLF, so a needle carrying a carriage return would match
+    /// nothing on a plain checkout -- green, and reading nothing.
+    fn production_half(source: &str) -> (String, usize) {
+        let mut kept: Vec<&str> = Vec::new();
+        let mut cut = 0usize;
+        let mut gated = false;
+        let mut skipping = false;
+        for line in source.lines() {
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            if gated && is_module_opener(line) {
+                // The `cfg(test)` gate line itself was pushed on the previous
+                // turn; it belongs to the module being cut.
+                kept.pop();
+                skipping = true;
+                cut += 1;
+                gated = false;
+                continue;
+            }
+            gated = line.trim() == concat!("#[cfg(", "test)]");
+            kept.push(line);
+        }
+        assert!(
+            !skipping,
+            "a test module was opened and never closed by a column-0 brace, so the rest of the \
+             file was dropped and every needle counted over this reads nothing"
+        );
+        (kept.join("\n"), cut)
+    }
+
     #[test]
     fn the_config_path_still_matches_the_one_main_resolves() {
         // `default_path` duplicates `main.rs`'s `ProjectDirs` triple because
@@ -1230,7 +1320,51 @@ mod tests {
         // `main.rs` ever changes the triple or the file name, this crate
         // would start writing window geometry into a second settings file
         // that nothing reads, and every test here would stay green.
-        let main_rs = include_str!("main.rs");
+        //
+        // **Over `main.rs`'s production half, not its whole source.** These
+        // are presence pins over ANOTHER module's file, and the whole file is
+        // the loose side of that: see `production_half`.
+        let (main_rs, cut) = production_half(include_str!("main.rs"));
+        assert!(
+            cut > 0,
+            "no gated test module was cut out of `main.rs`, so this guard is still satisfiable \
+             by a fixture in one of that file's test modules rather than by its code"
+        );
+
+        // **Positive control on the cut, not only on the needles.** Two
+        // claims, and the two `contains` below prove neither: that the walk
+        // removes a gated test module, and that it removes ONLY that -- in
+        // particular not production sitting BELOW a test module, which is
+        // what a split at the first `cfg(test)` gate would do to `main.rs`. So
+        // the survivor is asserted by name, and the raw count is asserted
+        // first so that a fixture that stopped spelling the needle cannot
+        // make the cut look like it worked.
+        let interleaved = concat!(
+            "fn a() { let p = ProjectDirs::from(\"dev\", \"X\", \"X\"); }\n",
+            "#[cfg(", "test)]\n",
+            "mod fixtures {\n",
+            "    const SAMPLE: &str = \"ProjectDirs::from(\";\n",
+            "}\n",
+            "fn b() { let _ = SURVIVOR; }\n"
+        );
+        assert_eq!(
+            interleaved.matches("ProjectDirs::from(").count(),
+            2,
+            "control: the fixture no longer spells the needle, so the cut below proves nothing"
+        );
+        let (cut_fixture, cuts) = production_half(interleaved);
+        assert_eq!(cuts, 1, "the walk did not find the gated test module");
+        assert_eq!(
+            cut_fixture.matches("ProjectDirs::from(").count(),
+            1,
+            "the walk did not remove the occurrence inside the test module"
+        );
+        assert!(
+            cut_fixture.contains("SURVIVOR"),
+            "the walk threw away production below the test module, which is exactly what a \
+             split at the first `cfg(test)` gate would have done to `main.rs`"
+        );
+
         let triple = format!(
             "ProjectDirs::from({PROJECT_QUALIFIER:?}, {PROJECT_ORGANIZATION:?}, {PROJECT_APPLICATION:?})"
         );
