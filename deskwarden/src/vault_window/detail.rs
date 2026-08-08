@@ -7705,7 +7705,11 @@ mod tests {
             without.strings()
         );
         // And none of its contents by another name.
-        for absent in ["App", "Program file", crate::vault_window::detail_edit::APP_ADD_BUTTON] {
+        // The card's own row labels. Deliberately NOT a string out of
+        // `detail_edit.rs`: that file is another implementer's and is mid-edit,
+        // and a needle here that only exists in its working copy would make
+        // this test green for a reason outside this change.
+        for absent in ["App", "Program file"] {
             assert!(
                 !without.painted(absent),
                 "an unbound item still draws the card's {absent:?}: {:?}",
