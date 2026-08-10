@@ -2122,7 +2122,7 @@ mod tests {
             .iter()
             .find(|f| f.name.as_deref() == Some(crate::app_match::APP_MATCH_FIELD_NAME))
             .expect("app-match field missing after set_app_match");
-        assert_eq!(field.value.as_deref(), Some(m.to_field_value().as_str()));
+        assert_eq!(field.value.as_ref().map(|v| v.as_str()), Some(m.to_field_value().as_str()));
     }
 
     #[test]
@@ -4269,5 +4269,153 @@ mod tests {
 
         assert!(!cache.is_populated(), "a restore marked an empty cache populated");
         assert!(cache.items().is_empty(), "a restore seeded an unpopulated snapshot");
+    }
+
+    /// A cache seeded with one item carrying one custom field whose value is
+    /// the probe string, and a folder mock to satisfy `populate_with`.
+    ///
+    /// The item is built here rather than parsed from a body so the probe is
+    /// the value verbatim -- a JSON round trip would allocate and free several
+    /// intermediate copies of it, and those frees are exactly what the watch
+    /// would then report on.
+    fn cache_with_a_probe_custom_field(
+        server: &mut mockito::Server,
+        field_name: &str,
+        field_value: &str,
+    ) -> VaultCache {
+        let _f = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = cache_for(server.url());
+        let seeded = vec![VaultItem {
+            id: "1".to_string(),
+            name: "Alpha".to_string(),
+            fields: vec![crate::vault_bridge::VaultField {
+                name: Some(field_name.to_string()),
+                value: Some(zeroize::Zeroizing::new(field_value.to_string())),
+                other: serde_json::Map::new(),
+            }],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }];
+        assert_eq!(cache.populate_with(seeded, cache.epoch()).unwrap(), PopulateOutcome::Populated);
+        cache
+    }
+
+    /// **A custom field's value does not reach the allocator in the clear.**
+    ///
+    /// This watches copy **A** of the trace in [`crate::vault_bridge::VaultField::value`]'s
+    /// doc: `VaultCache::items` hands every caller a clone of the whole
+    /// snapshot, and the vault window holds one open while `fill_from_vault`
+    /// and `handle_match` make short-lived ones. Before the type change that
+    /// clone's `String` went back to the allocator holding a user-typed
+    /// secret -- a hidden (`type: 1`) field's PIN, recovery code or security
+    /// answer -- on every drop.
+    ///
+    /// **It is deliberately not the read-only detail pane.** `detail.rs` has
+    /// no non-test read of `item.fields` and `key_sequence::field_palette`
+    /// reads field *names* only, so a probe hung on the detail pane would
+    /// watch a path this value never travels and report clean while blind.
+    /// The snapshot clone is where the value actually goes.
+    ///
+    /// The cache, the server and the item are all built **before** the watch
+    /// is armed, so what the watch sees is only what `items()` itself
+    /// allocated and released.
+    #[test]
+    fn a_custom_field_value_does_not_reach_the_allocator_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // **The instrument is awake, in this thread and in this direction.**
+        // Without this line a probe that had gone deaf makes the assertion at
+        // the bottom pass by saying nothing -- a clean report from a blind
+        // instrument, which is this codebase's signature failure and the one
+        // shape the assertion cannot catch in itself.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe cannot see an unwiped custom-field value, so this test proves nothing"
+        );
+
+        let mut server = mockito::Server::new();
+        let cache = cache_with_a_probe_custom_field(&mut server, "PIN", PROBE);
+
+        // Read back through a borrow, not a clone, so the positive control
+        // below does not itself allocate a copy of the probe.
+        let mut carried = false;
+        let leaked = plaintext_reached_the_allocator(|| {
+            let snapshot = cache.items();
+            carried = snapshot
+                .iter()
+                .flat_map(|i| i.fields.iter())
+                .any(|f| f.value.as_ref().map(|v| v.as_str()) == Some(PROBE));
+            drop(snapshot);
+        });
+
+        // Positive control: the clone really did carry the secret, so a
+        // `false` above cannot mean "there was nothing there to leak".
+        assert!(carried, "the snapshot clone never held the probe value -- nothing was watched");
+        assert!(!leaked, "the snapshot clone freed a custom field's value in the clear");
+    }
+
+    /// **A custom field's NAME is still a plain `String`.**
+    ///
+    /// The guard against over-applying the change. A field name is not a
+    /// secret -- it is `PIN`, `Recovery code`, `deskwarden:app-match` -- and
+    /// wrapping it too would buy nothing while making every `.as_deref()`
+    /// read in the crate (including `main.rs`'s) pay for a wipe it does not
+    /// need.
+    ///
+    /// Two assertions, because either alone is weak. The binding pins the
+    /// *type*: `Option<String>` will not accept an `Option<Zeroizing<String>>`
+    /// and the test stops compiling if the name is wrapped. The probe pins the
+    /// *behaviour*: a name equal to the probe string goes back to the
+    /// allocator unwiped, which is only true while it is a plain `String`.
+    #[test]
+    fn a_custom_field_name_is_still_a_plain_string() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe is deaf, so neither assertion below means anything"
+        );
+
+        let mut server = mockito::Server::new();
+        let cache = cache_with_a_probe_custom_field(&mut server, PROBE, "4821");
+
+        let snapshot = cache.items();
+        // The type pin. Annotated on purpose: this is the assertion, and it
+        // is checked by the compiler rather than at run time.
+        let name: Option<String> = snapshot[0].fields[0].name.clone();
+        assert_eq!(name.as_deref(), Some(PROBE), "the fixture's field name is not the probe");
+        drop(name);
+        drop(snapshot);
+
+        let mut carried = false;
+        let leaked = plaintext_reached_the_allocator(|| {
+            let snapshot = cache.items();
+            carried = snapshot
+                .iter()
+                .flat_map(|i| i.fields.iter())
+                .any(|f| f.name.as_deref() == Some(PROBE));
+            drop(snapshot);
+        });
+
+        assert!(carried, "the snapshot clone never held the probe name -- nothing was watched");
+        assert!(
+            leaked,
+            "a custom field's NAME is being zeroized: the change over-applied, and every reader \
+             of `f.name` now pays for a wipe a field label does not need"
+        );
     }
 }

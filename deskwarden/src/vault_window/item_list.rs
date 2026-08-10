@@ -2045,10 +2045,10 @@ mod row_tile_tests {
     fn with_app_match(mut item: VaultItem) -> VaultItem {
         item.fields.push(VaultField {
             name: Some(APP_MATCH_FIELD_NAME.to_string()),
-            value: Some(
+            value: Some(zeroize::Zeroizing::new(
                 AppMatch::for_process("ledgerline.exe", TriggerMode::Prompt)
                 .to_field_value(),
-            ),
+            )),
             other: serde_json::Map::new(),
         });
         item

@@ -1568,7 +1568,7 @@ mod tests {
         let mut broken = item(Some(1), false, None);
         broken.fields = vec![VaultField {
             name: Some(APP_MATCH_FIELD_NAME.to_string()),
-            value: Some("not json".to_string()),
+            value: Some(zeroize::Zeroizing::new("not json".to_string())),
             other: serde_json::Map::new(),
         }];
         assert!(!SidebarFilter::Apps.scope_contains(&broken));

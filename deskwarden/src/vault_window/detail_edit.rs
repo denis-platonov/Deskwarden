@@ -235,7 +235,7 @@ impl FieldDraft {
         };
         Self {
             name,
-            value: drafted(field.value.as_deref()),
+            value: drafted(field.value.as_ref().map(|v| v.as_str())),
             reveal: false,
             role,
             row_id: next_field_row_id(),
@@ -317,7 +317,13 @@ impl FieldDraft {
             // is `FieldRole::Preserved` (see `from_field`) and has already
             // returned above, so this cannot inject a `"name": ""` onto one.
             name: Some(self.name.clone()),
-            value: edited(self.original.as_ref().and_then(|o| o.value.as_deref()), &self.value),
+            // `edited_secret`, not `edited`: a custom field's value is now
+            // `Zeroizing` on the model side, and this is the save path that
+            // builds it (copy F of the trace in `VaultField::value`'s doc).
+            value: edited_secret(
+                self.original.as_ref().and_then(|o| o.value.as_ref()).map(|v| v.as_str()),
+                &self.value,
+            ),
             other,
         }
     }
@@ -3797,16 +3803,84 @@ mod tests {
         let mut item = item();
         item.fields.push(crate::vault_bridge::VaultField {
             name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
-            value: Some(stored.to_string()),
+            value: Some(Zeroizing::new(stored.to_string())),
             other: serde_json::Map::new(),
         });
         let draft = EditDraft::from_item(&item);
         let saved = draft.apply_to(&item);
         assert_eq!(
-            saved.fields[0].value.as_deref(),
+            saved.fields[0].value.as_ref().map(|v| v.as_str()),
             Some(stored),
             "an untouched binding was rewritten on save"
         );
+    }
+
+    /// **The value the SAVE path builds does not reach the allocator in the
+    /// clear.**
+    ///
+    /// Copy **F** of the trace in [`crate::vault_bridge::VaultField::value`]'s
+    /// doc, and the other half of the pair the type change actually closes.
+    /// `FieldDraft::to_field` is where a secret the user typed into a hidden
+    /// custom field becomes a modelled value, and it is why `edited_secret`
+    /// exists next to `edited`: `edited` returns a bare `String`, which goes
+    /// back to the allocator holding the plaintext when the saved item drops.
+    /// Swap `edited_secret` for `edited` in `to_field` and this fails.
+    ///
+    /// **The draft is built outside the armed window on purpose.** A
+    /// `FieldDraft`'s own `value` is a plain `String` -- egui's text-edit
+    /// buffer, copy B of the trace, a recorded exception -- so building the
+    /// draft inside the window would report a leak this change never claimed
+    /// to fix and the assertion would be about the wrong copy.
+    #[test]
+    fn a_saved_custom_field_value_does_not_reach_the_allocator_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // The instrument is awake and can see an unwiped plaintext go past.
+        // Without it, `!leaked` below is satisfied by a probe that reports
+        // nothing about anything.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe cannot see an unwiped value, so this test proves nothing"
+        );
+
+        // A hidden (`type: 1`) field -- the role that made this a secret.
+        let mut hidden = serde_json::Map::new();
+        hidden.insert("type".to_string(), serde_json::json!(1));
+        let mut item = item();
+        item.fields.push(crate::vault_bridge::VaultField {
+            name: Some("Recovery code".to_string()),
+            value: Some(Zeroizing::new("old".to_string())),
+            other: hidden,
+        });
+
+        let mut draft = EditDraft::from_item(&item);
+        let row = draft
+            .fields
+            .iter_mut()
+            .find(|f| f.name == "Recovery code")
+            .expect("the hidden field has no draft row");
+        assert_eq!(row.role, FieldRole::Hidden, "the fixture row is not a hidden field");
+        // The user types the secret. This plain `String` is copy B and stays
+        // plain; it lives past the armed window and is dropped after it.
+        row.value = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+
+        let mut carried = false;
+        let leaked = plaintext_reached_the_allocator(|| {
+            let saved = draft.apply_to(&item);
+            carried = saved
+                .fields
+                .iter()
+                .any(|f| f.value.as_ref().map(|v| v.as_str()) == Some(PROBE));
+            drop(saved);
+        });
+
+        // Positive control: the save really did build the secret into a
+        // `VaultField`, so `!leaked` cannot mean "nothing was produced".
+        assert!(carried, "the save never wrote the typed secret -- nothing was watched");
+        assert!(!leaked, "the save path freed the typed custom-field value in the clear");
+
+        drop(draft);
     }
 
     /// Changing the item's TYPE in the create form must not throw away a binding
@@ -4161,7 +4235,7 @@ mod tests {
             2,
             crate::vault_bridge::VaultField {
                 name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
-                value: Some(m.to_field_value()),
+                value: Some(Zeroizing::new(m.to_field_value())),
                 other: serde_json::Map::new(),
             },
         );
@@ -6357,7 +6431,7 @@ mod sequence_builder_tests {
     fn vault_field(name: &str, value: &str) -> crate::vault_bridge::VaultField {
         crate::vault_bridge::VaultField {
             name: Some(name.to_string()),
-            value: Some(value.to_string()),
+            value: Some(Zeroizing::new(value.to_string())),
             other: serde_json::Map::new(),
         }
     }
@@ -8843,7 +8917,7 @@ mod edit_pane_layout_tests {
             name: "Contoso 365".to_string(),
             fields: vec![crate::vault_bridge::VaultField {
                 name: Some("PIN".to_string()),
-                value: Some("8421".to_string()),
+                value: Some(Zeroizing::new("8421".to_string())),
                 other: serde_json::Map::new(),
             }],
             login: Some(LoginData {

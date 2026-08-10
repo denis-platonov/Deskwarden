@@ -45,7 +45,27 @@ use zeroize::Zeroizing;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VaultField {
     pub name: Option<String>,
-    pub value: Option<String>,
+    /// `Zeroizing<String>` for the same reason [`LoginData::password`] is,
+    /// and it became the same kind of secret only recently: while custom
+    /// fields were read-only this held whatever `bw` sent, but the edit form
+    /// now creates and edits them, including Bitwarden's `type: 1` *hidden*
+    /// field -- a secret by definition, holding PINs, recovery codes and
+    /// security answers the user typed here.
+    ///
+    /// The guarantee this buys is narrow and worth stating exactly:
+    /// [`VaultCache::items`] hands callers a clone of the whole snapshot, so
+    /// wrapping this wipes **that repeated clone** on drop, and the new value
+    /// the save path builds. It wipes nothing else. The edit form's draft
+    /// buffer and the keystroke preview stay plain `String` (egui owns those
+    /// and its galley cache outlives the frame -- the same recorded exception
+    /// `masked_row` carries), and every value has already passed through
+    /// ureq's response buffer, which is freed unwiped before this type ever
+    /// sees it. That last one is pre-existing and not fixable here.
+    ///
+    /// `Zeroizing<Z>` (de)serializes exactly like `Z` via the `zeroize`
+    /// crate's `serde` feature, and wraps by move, so the wire format `bw
+    /// serve` sends and receives is byte-for-byte unchanged.
+    pub value: Option<Zeroizing<String>>,
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
 }
@@ -360,7 +380,7 @@ pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
     };
     let rebuilt = VaultField {
         name: Some(APP_MATCH_FIELD_NAME.to_string()),
-        value: Some(m.to_field_value()),
+        value: Some(Zeroizing::new(m.to_field_value())),
         other,
     };
     // Replaced IN PLACE, not removed and re-appended: Bitwarden preserves and
@@ -751,7 +771,7 @@ pub fn extract_app_match(item: &VaultItem) -> Option<AppMatch> {
     item.fields
         .iter()
         .find(|f| f.name.as_deref() == Some(APP_MATCH_FIELD_NAME))
-        .and_then(|f| f.value.as_deref())
+        .and_then(|f| f.value.as_ref().map(|v| v.as_str()))
         .and_then(|v| AppMatch::from_field_value(v).ok())
 }
 
@@ -2249,7 +2269,7 @@ mod tests {
             name: "Rockstar".into(),
             fields: vec![VaultField {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
-                value: Some(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.into()),
+                value: Some(Zeroizing::new(r#"{"process":"RockstarGamesLauncher.exe","trigger":"prompt"}"#.to_string())),
                 other: serde_json::Map::new(),
             }],
             login: None,
@@ -2293,7 +2313,7 @@ mod tests {
             name: "Broken".into(),
             fields: vec![VaultField {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
-                value: Some("not json".into()),
+                value: Some(Zeroizing::new("not json".to_string())),
                 other: serde_json::Map::new(),
             }],
             login: None,
@@ -2326,7 +2346,7 @@ mod tests {
             name: "Bare".into(),
             fields: vec![VaultField {
                 name: Some("Some other field".into()),
-                value: Some("x".into()),
+                value: Some(Zeroizing::new("x".to_string())),
                 other: serde_json::Map::new(),
             }],
             login: None,
@@ -2355,7 +2375,7 @@ mod tests {
             let mut item = bare.clone();
             item.fields.push(VaultField {
                 name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
-                value: Some(value.to_string()),
+                value: Some(Zeroizing::new(value.to_string())),
                 other: serde_json::Map::new(),
             });
             assert!(
@@ -2374,7 +2394,7 @@ mod tests {
         let mut broken = bare.clone();
         broken.fields.push(VaultField {
             name: Some(APP_MATCH_FIELD_NAME_FOR_TEST.into()),
-            value: Some("{not json".into()),
+            value: Some(Zeroizing::new("{not json".to_string())),
             other: serde_json::Map::new(),
         });
         assert!(has_app_match_field(&broken) && extract_app_match(&broken).is_none());
@@ -2455,7 +2475,7 @@ mod tests {
         // state-replacing, so anything dropped here is dropped from the vault.
         let names: Vec<&str> = cleared.fields.iter().filter_map(|f| f.name.as_deref()).collect();
         assert_eq!(names, vec!["PIN", "Recovery"]);
-        assert_eq!(cleared.fields[0].value.as_deref(), Some("1234"));
+        assert_eq!(cleared.fields[0].value.as_ref().map(|v| v.as_str()), Some("1234"));
         // ...and the `type` key riding `VaultField::other`, which no model
         // here names.
         assert_eq!(

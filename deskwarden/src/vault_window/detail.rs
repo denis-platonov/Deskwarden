@@ -8921,7 +8921,7 @@ mod tests {
         let mut updated = item.clone();
         updated.fields.push(crate::vault_bridge::VaultField {
             name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
-            value: Some(value.to_string()),
+            value: Some(Zeroizing::new(value.to_string())),
             other: serde_json::Map::new(),
         });
         updated
@@ -14119,7 +14119,7 @@ mod tests {
         let mut item = a_login_on_the_web();
         item.fields = vec![crate::vault_bridge::VaultField {
             name: Some(crate::app_match::APP_MATCH_FIELD_NAME.to_string()),
-            value: Some("{not json".to_string()),
+            value: Some(Zeroizing::new("{not json".to_string())),
             other: serde_json::Map::new(),
         }];
         let mut pane = Pane::new();

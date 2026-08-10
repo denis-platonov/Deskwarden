@@ -635,7 +635,7 @@ pub struct ResolveSource<'a> {
 pub fn custom_pairs(item: &VaultItem) -> Vec<(&str, &str)> {
     item.fields
         .iter()
-        .filter_map(|f| Some((f.name.as_deref()?, f.value.as_deref().unwrap_or(""))))
+        .filter_map(|f| Some((f.name.as_deref()?, f.value.as_ref().map_or("", |v| v.as_str()))))
         .collect()
 }
 
@@ -718,7 +718,7 @@ mod tests {
     fn field(name: &str, value: &str) -> VaultField {
         VaultField {
             name: Some(name.to_string()),
-            value: Some(value.to_string()),
+            value: Some(zeroize::Zeroizing::new(value.to_string())),
             other: serde_json::Map::new(),
         }
     }

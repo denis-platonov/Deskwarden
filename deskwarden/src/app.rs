@@ -1145,7 +1145,7 @@ mod tests {
                 .map(|v| {
                     vec![VaultField {
                         name: Some(APP_MATCH_FIELD_NAME.into()),
-                        value: Some(v.into()),
+                        value: Some(zeroize::Zeroizing::new(v.to_string())),
                         other: serde_json::Map::new(),
                     }]
                 })
@@ -2578,12 +2578,12 @@ mod fill_dispatch_tests {
             fields: vec![
                 VaultField {
                     name: Some(APP_MATCH_FIELD_NAME.into()),
-                    value: Some(m.to_field_value()),
+                    value: Some(zeroize::Zeroizing::new(m.to_field_value())),
                     other: serde_json::Map::new(),
                 },
                 VaultField {
                     name: Some("PIN".into()),
-                    value: Some("4821".into()),
+                    value: Some(zeroize::Zeroizing::new("4821".to_string())),
                     other: serde_json::Map::new(),
                 },
             ],
