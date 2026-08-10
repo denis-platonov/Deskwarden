@@ -2883,11 +2883,30 @@ pub fn draw_detail_edit(
             }
 
             ui.horizontal(|ui| {
+                // `min_size`, and the SAME height Cancel beside it gets from
+                // `theme::secondary_button`. Measured before this line
+                // existed: Save 26pt tall, Cancel 32, both starting at the
+                // strip's top, so Save's bottom edge stopped 6pt short of its
+                // neighbour's -- the "save button is off" the user reported.
+                // `theme::BUTTON_HEIGHT` and not 32, because it is the same
+                // height for the same reason as Cancel's; a literal here is
+                // one the next design change moves only half of.
+                //
+                // Only the height. Save is NOT run through
+                // `theme::secondary_button`: that helper is `ui.add`, and
+                // this button is `add_enabled` (it is disabled while the name
+                // is empty, or the kind is not creatable). Its filled default
+                // look is also what distinguishes the primary action from the
+                // outlined Cancel, and egui's `add_enabled` is what greys it
+                // -- see `the_disabled_save_button_does_not_look_enabled`.
+                // The zero x floor leaves the width to the label, which
+                // changes with the validity ("Save" / "Save (needs a name)").
                 let save = egui::Button::new(if draft.is_valid() {
                     "Save"
                 } else {
                     "Save (needs a name)"
-                });
+                })
+                .min_size(egui::Vec2::new(0.0, theme::BUTTON_HEIGHT));
                 if ui.add_enabled(draft.is_valid() && creatable, save).clicked() {
                     action = EditAction::Save;
                 }
@@ -2988,6 +3007,38 @@ pub fn draw_detail_edit(
                     // that already holds the keystroke builder's chip row
                     // (see `every_chip_and_button_is_reachable_at_the_apps_minimum_width`).
                     ui.horizontal_wrapped(|ui| {
+                        // **Why the row sets `interact_size.y`, and why it is
+                        // `BUTTON_HEIGHT` rather than a number.** The three
+                        // controls here are the only place in this form where
+                        // widgets of three different KINDS stand side by side,
+                        // and left to themselves they came out three different
+                        // heights sitting at three different tops: the button
+                        // 32pt (its `min_size`, from `theme::secondary_button`),
+                        // the `DragValue` and the combo 26pt each -- and the
+                        // combo lower still than the spinner, because
+                        // `ComboBox` wraps itself in a nested `ui.horizontal`
+                        // whose `button_frame` starts from
+                        // `available_rect_before_wrap`, so it is not centred in
+                        // the row the way a directly-added widget is. That is
+                        // the "the dropdown sits lower than the buttons" the
+                        // user reported.
+                        //
+                        // `interact_size.y` is the one dial all three read:
+                        // `Button` takes it as a floor, `DragValue` passes it
+                        // to `min_size`, and `ComboBox::button_frame` raises
+                        // its outer rect to `at_least(interact_size.y)`. Set it
+                        // to the button's own height and the three agree by
+                        // CONSTRUCTION -- there is no second literal to drift.
+                        // `interact_size.x` is deliberately left alone: it is
+                        // what the widths are built from, and the 279.4pt
+                        // content floor this row wraps at must not move.
+                        //
+                        // Scoped to this row: `ui` here is the wrapped row's
+                        // own child, and `spacing_mut` clones its style
+                        // (`Arc::make_mut`), so nothing below the row sees it
+                        // -- the same property the scroll-area `scope` below
+                        // relies on.
+                        ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
                         if theme::secondary_button(ui, "Generate").clicked() {
                             action = EditAction::GeneratePassword;
                         }
@@ -7679,6 +7730,36 @@ mod edit_pane_layout_tests {
             found[0]
         }
 
+        /// The smallest painted rectangle enclosing `inner`: the FRAME a
+        /// widget drew around its own text.
+        ///
+        /// This is what the eye reads as a control's height -- the button's
+        /// outline, the combo's box, the spinner's background -- and none of
+        /// it is a `Shape::Text`, so `rect_of` cannot see any of it. Painted
+        /// ink, not a requested size: `Response::rect` would restate what the
+        /// code asked for, which is the thing under test. Smallest, because
+        /// the card, the pane and the window all enclose it too.
+        fn frame_around(&self, inner: Rect) -> Rect {
+            let mut found: Vec<Rect> = self
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|f| {
+                    f.min.x <= inner.min.x + 1.0
+                        && f.min.y <= inner.min.y + 1.0
+                        && f.max.x >= inner.max.x - 1.0
+                        && f.max.y >= inner.max.y - 1.0
+                })
+                .collect();
+            found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+            *found.first().unwrap_or_else(|| {
+                panic!(
+                    "nothing is painted around {inner:?}, so that control drew no frame at \
+                     all -- which is what a zero-sized or undrawn widget looks like"
+                )
+            })
+        }
+
         /// What was actually DRAWN for the run whose source text is `label`
         /// -- glyphs, not the string the layout job was handed. See
         /// [`Painted::rendered`].
@@ -7858,6 +7939,251 @@ mod edit_pane_layout_tests {
             "{what} was laid out from {label:?} but DREW {rendered:?} on a {}x{} pane -- \
              the control is on screen and unreadable",
             pane.x, pane.y
+        );
+    }
+
+    /// A pane wide enough that the generator row does NOT wrap, and tall
+    /// enough to hold the whole form. Wrapping is asserted separately, at
+    /// `MIN_PANE_WIDTH`, by
+    /// [`the_generator_rows_controls_are_all_reachable_at_the_minimum_width`].
+    const ROOMY_PANE: Vec2 = egui::vec2(560.0, 1400.0);
+
+    /// The three frames the generator row paints, in the order the user
+    /// reads them: Generate, the kind combo, the size spinner.
+    ///
+    /// **The count assertion is the point.** egui culls a shape lying
+    /// entirely outside the screen rect, so a control pushed off the pane
+    /// comes back as NOTHING -- and every "they all agree" assertion is
+    /// vacuously true of two controls, or of one. `frame_around` panics
+    /// rather than skipping when a control drew no frame, which is what a
+    /// zero-sized widget looks like: on screen to a presence check, invisible
+    /// to the eye.
+    fn generator_row_frames(painted: &Painted) -> [Rect; 3] {
+        let generate = painted.rect_of("Generate");
+        // The LAST "Password": the form paints the field label above the row
+        // and the combo's `selected_text` spells the same word.
+        let combo_text = *painted.rects_of("Password").last().unwrap_or_else(|| {
+            panic!(
+                "the generator combo is showing no kind at all; painted: {:?}",
+                painted.strings()
+            )
+        });
+        let spinner = painted.rect_of(" chars");
+        assert!(
+            combo_text.top() > generate.top() - 40.0 && combo_text.top() < generate.top() + 40.0,
+            "the {combo_text:?} taken for the generator combo is nowhere near the Generate \
+             button at {generate:?} -- this helper picked up the wrong galley"
+        );
+        [
+            painted.frame_around(generate),
+            painted.frame_around(combo_text),
+            painted.frame_around(spinner),
+        ]
+    }
+
+    /// **The generator row's three controls are one row of one height.**
+    ///
+    /// The reported defect: "Password dropdown on Edit screen looks off since
+    /// it is lower than the rest of buttons". Measured on the pre-fix layout,
+    /// on this exact pane -- Generate `top=261.94 h=32`, the combo
+    /// `top=268.94 h=26`, the spinner `top=265.44 h=26`. Three heights' worth
+    /// of disagreement and three different tops, with the combo the lowest of
+    /// the three, exactly as reported.
+    ///
+    /// Asserted on PAINTED FRAMES, not on `Response::rect` and not on the
+    /// source: a widget's requested size is the thing under test, so reading
+    /// it back would only restate the code. See [`Painted::frame_around`].
+    #[test]
+    fn the_generator_row_controls_share_one_baseline() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+        let [generate, combo, spinner] = generator_row_frames(&painted);
+        let names = ["Generate", "the kind combo", "the size spinner"];
+        for (name, rect) in names.iter().zip([generate, combo, spinner]) {
+            assert!(
+                rect.width() > 1.0 && rect.height() > 1.0,
+                "{name} painted a {rect:?} -- a control that size is not a control"
+            );
+        }
+        // One row, so one top and one height; the bottoms then follow. Half a
+        // point of slack for the sub-pixel positions egui lays rows out at,
+        // and no more: the defect was 7pt of it.
+        for (name, rect) in names[1..].iter().zip([combo, spinner]) {
+            assert!(
+                (rect.top() - generate.top()).abs() <= 0.5,
+                "{name} is painted at top {} while the Generate button beside it starts at \
+                 {} -- the row does not sit on one line",
+                rect.top(),
+                generate.top()
+            );
+            assert!(
+                (rect.height() - generate.height()).abs() <= 0.5,
+                "{name} is {}pt tall against the Generate button's {}pt -- the row's \
+                 controls are different sizes",
+                rect.height(),
+                generate.height()
+            );
+        }
+        // And the height is the button height by construction, not whatever
+        // the three happened to agree on: a row where all three collapsed to
+        // egui's 26pt default would satisfy everything above.
+        assert!(
+            (generate.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+            "the generator row is {}pt tall, not theme::BUTTON_HEIGHT ({})",
+            generate.height(),
+            theme::BUTTON_HEIGHT
+        );
+    }
+
+    /// The positive control for the test above: the row's controls really can
+    /// be measured as DISAGREEING, so a green run there is a fact about the
+    /// row and not about the measurement.
+    ///
+    /// The folder combo further down the form is a control of the same kind,
+    /// drawn on a line of its own with no `interact_size` set -- so it is
+    /// egui's untreated default height, the height the generator combo had
+    /// before this fix. If `frame_around` were returning some shared
+    /// container for everything, this would come back equal to the generator
+    /// row's and the assertion above would be vacuous.
+    #[test]
+    fn the_alignment_assertion_can_tell_two_different_heights_apart() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+        let [generate, _, _] = generator_row_frames(&painted);
+        let folder = painted.frame_around(painted.rect_of("No folder"));
+        assert!(
+            (folder.height() - generate.height()).abs() > 0.5,
+            "the untreated folder combo measures {}pt and the treated generator row {}pt -- \
+             if those are the same number, `frame_around` is reporting one shared box for \
+             both and the baseline assertion proves nothing",
+            folder.height(),
+            generate.height()
+        );
+    }
+
+    /// **All three generator controls are reachable at the app's minimum
+    /// width** -- the row still wraps, and wrapping is still what keeps it
+    /// inside the pane.
+    ///
+    /// The row's content has a floor of 279.4pt against the 264pt card at
+    /// `MIN_PANE_WIDTH`, so an unwrapped `ui.horizontal` pushes the card out
+    /// past the pane and inflates every `available_width()` measured after it
+    /// -- `aae9429`'s defect. This asserts the outcome rather than the call:
+    /// each control's painted frame is inside the pane on both axes, and the
+    /// spinner's glyphs are still the glyphs (a control elided to nothing
+    /// paints an honest little box and reports the label it was handed).
+    #[test]
+    fn the_generator_rows_controls_are_all_reachable_at_the_minimum_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, 1400.0);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        let names = ["Generate", "the kind combo", "the size spinner"];
+        for (name, rect) in names.iter().zip(generator_row_frames(&painted)) {
+            assert!(
+                rect.width() > 1.0 && rect.height() > 1.0,
+                "{name} painted a {rect:?} at the minimum width -- a control drawn at no size \
+                 passes every in-pane assertion and cannot be clicked"
+            );
+            assert!(
+                bounds.contains_rect(rect),
+                "{name} is painted at {rect:?}, outside the {}x{} pane -- the user cannot \
+                 reach it. Painted: {:?}",
+                pane.x,
+                pane.y,
+                painted.strings()
+            );
+        }
+        assert_inside("the generator's Generate button", "Generate", pane, &painted);
+        assert_eq!(
+            painted.rendered_glyphs(" chars"),
+            " chars",
+            "the size spinner's suffix was squeezed away at the minimum width"
+        );
+    }
+
+    /// **Save and Cancel are one strip of one height.**
+    ///
+    /// The second report on this screen: "Also save button is off". Measured
+    /// on the pre-fix layout -- Save `top=1368 h=26 bot=1394`, Cancel
+    /// `top=1368 h=32 bot=1400`. Save was a bare `egui::Button` and Cancel
+    /// goes through `theme::secondary_button`, so Save's bottom edge stopped
+    /// 6pt above its neighbour's. Both label widths are checked, because the
+    /// caption changes with the draft's validity.
+    #[test]
+    fn the_button_strips_controls_share_one_baseline() {
+        for (what, name) in [(true, "Save"), (false, SAVE)] {
+            let ctx = styled_context(ROOMY_PANE);
+            let mut draft = tallest_draft();
+            if what {
+                draft.name = "Ledgerline".to_string();
+                assert!(draft.is_valid(), "the valid case wants Save's short caption");
+            }
+            let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+            let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+            let save = painted.frame_around(painted.rect_of(name));
+            let cancel = painted.frame_around(painted.rect_of("Cancel"));
+            assert!(
+                (save.top() - cancel.top()).abs() <= 0.5
+                    && (save.height() - cancel.height()).abs() <= 0.5,
+                "{name} is painted {save:?} beside Cancel's {cancel:?} -- the strip's two \
+                 buttons are different sizes"
+            );
+            assert!(
+                (save.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+                "the strip is {}pt tall, not theme::BUTTON_HEIGHT ({})",
+                save.height(),
+                theme::BUTTON_HEIGHT
+            );
+        }
+    }
+
+    /// **A Save that cannot be pressed does not look like one that can.**
+    ///
+    /// The trap in giving Save the height its neighbour has: a button styled
+    /// into agreement with Cancel can lose the one signal that says the form
+    /// is not saveable yet. `add_enabled` greys the fill, and this asserts
+    /// that on the painted rect's colour -- the frame at the identical
+    /// position and size, so nothing but the fill can be carrying it.
+    #[test]
+    fn the_disabled_save_button_does_not_look_enabled() {
+        let fill_of = |draft: &mut EditDraft, label: &str| -> (Rect, egui::Color32) {
+            let ctx = styled_context(ROOMY_PANE);
+            let _ = frame(&ctx, ROOMY_PANE, draft, true, &[]);
+            let painted = frame(&ctx, ROOMY_PANE, draft, true, &[]);
+            let text = painted.rect_of(label);
+            let frame_rect = painted.frame_around(text);
+            let fill = painted
+                .rects
+                .iter()
+                .find(|(r, _)| *r == frame_rect)
+                .map(|(_, c)| *c)
+                .expect("the frame just found by `frame_around` is not in `rects`");
+            (frame_rect, fill)
+        };
+
+        let mut enabled = tallest_draft();
+        enabled.name = "Ledgerline".to_string();
+        let (_, on) = fill_of(&mut enabled, "Save");
+
+        let mut disabled = tallest_draft();
+        assert!(!disabled.is_valid(), "the disabled case wants an invalid draft");
+        let (_, off) = fill_of(&mut disabled, SAVE);
+
+        assert_ne!(
+            on, off,
+            "the Save button paints the same fill whether it can be pressed or not -- the \
+             form gives the user no sign that it will not save"
         );
     }
 
