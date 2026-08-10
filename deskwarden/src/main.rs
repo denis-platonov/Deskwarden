@@ -19024,17 +19024,32 @@ mod startup_shape_tests {
     /// `trim_end` on every line and never a `\r\n` in a needle: this tree is
     /// CRLF in the working copy and LF in the blob, and `str::lines` leaves
     /// the `\r` on.
-    fn the_rebuild_is_unconditional(region: &str) -> Result<(), String> {
-        let lines: Vec<&str> = region.lines().map(str::trim_end).collect();
+    /// The rebuild and everything above it back to the estate binding's own
+    /// closing `};`, line for line, as [`the_rebuild_is_unconditional`]
+    /// requires to find them. Split literals so this file holds no second
+    /// copy of the production lines the counts elsewhere are taken over.
+    const REBUILD_NEIGHBOURHOOD: &[&str] = &[
+        "    };",
+        "",
+        concat!("    log::info!", "("),
+        concat!("        \"match engine loaded with ", "{} app match(es)\","),
+        concat!("        startup_entries.borrow().", "len()"),
+        "    );",
+        concat!("    estate.engine.rebuild(&startup_entries.", "borrow());"),
+    ];
+
+    fn the_rebuild_is_unconditional(production: &str) -> Result<(), String> {
+        let lines: Vec<&str> = production.lines().map(str::trim_end).collect();
         let alone: Vec<usize> = lines
             .iter()
             .enumerate()
             .filter(|(_, line)| line.trim_start() == ARMED_FROM_A_PRE_WINDOW_SNAPSHOT)
             .map(|(at, _)| at)
             .collect();
-        if alone.len() != 1 {
+        let n = REBUILD_NEIGHBOURHOOD.len();
+        if alone.len() != 1 || alone[0] + 1 < n {
             return Err(format!(
-                "{} line(s) below the startup window are nothing but \
+                "{} line(s) in the production half are nothing but \
                  {ARMED_FROM_A_PRE_WINDOW_SNAPSHOT:?}, rather than exactly one. A rebuild \
                  folded onto a line that carries anything else -- a one-line \
                  `if .. {{ .. }}`, a `.then(|| ..)`, a `match` arm -- is a conditional \
@@ -19054,20 +19069,65 @@ mod startup_shape_tests {
                 lines[at]
             ));
         }
-        // Nothing whatever between the log that opens the region and the
-        // statement: not a wrapper, not a `let` computing a flag for one.
-        let between = &lines[..at];
-        let opening: &[&str] = &[
-            "\",",
-            concat!("        startup_entries.borrow().", "len()"),
-            "    );",
-        ];
-        if between != opening {
+        // The whole neighbourhood, from the estate binding's own `};` down to
+        // the statement, line for line. Nothing may stand between them: not a
+        // wrapper, not a `let` computing a flag for one. Anchored at `};` and
+        // not merely at the log, because a wrapper opened ABOVE the log and
+        // left un-reindented would otherwise leave every line this checks
+        // untouched -- the first hole this guard was written with.
+        let sightings = lines
+            .windows(n)
+            .filter(|window| *window == REBUILD_NEIGHBOURHOOD)
+            .count();
+        if sightings != 1 || lines[at + 1 - n..=at] != *REBUILD_NEIGHBOURHOOD {
+            let from = at.saturating_sub(n);
             return Err(format!(
-                "the lines between the engine log and the rebuild are {between:?} rather \
-                 than {opening:?} -- something now stands between them. If that is step 4's \
-                 condition on whether the window tore the session down, this clause is the \
-                 one to rewrite, deliberately, saying what the condition is"
+                "the lines around the rebuild are {:?}, and the pinned neighbourhood \
+                 {REBUILD_NEIGHBOURHOOD:?} occurs {sightings} time(s). Something now stands \
+                 between the estate binding and the statement. If that is step 4's condition \
+                 on whether the window tore the session down, this clause is the one to \
+                 rewrite, deliberately, saying what the condition is",
+                &lines[from..=at]
+            ));
+        }
+        // And no block CLOSES between the rebuild and the tray, which is the
+        // one shape the line-for-line pin above cannot see: a conditional
+        // opened before the estate binding's `};` and left un-reindented
+        // leaves every pinned line identical and shows up only as an extra
+        // `}` on the way down. Measured at 0 today; braces inside the
+        // comments down there are part of the measurement and constant.
+        //
+        // Stated rather than hidden: a wrapper opened above `};` AND closed
+        // below `build_tray` would pass both. That is not a step-4-shaped
+        // edit -- it would swallow `stop_backend_if_idle` and the tray with
+        // the rebuild -- and clause 1's own region check speaks to it.
+        let tray = lines
+            .iter()
+            .position(|line| line.trim_start() == concat!("let mut tray = tray::build", "_tray();"))
+            .ok_or_else(|| {
+                String::from(
+                    "the tray is no longer built on a line of its own below the window, so \
+                     the rebuild's nesting cannot be compared against `main`'s own body",
+                )
+            })?;
+        if tray <= at {
+            return Err(String::from(
+                "the tray is now built ABOVE the engine rebuild, so the brace balance below \
+                 is measured over the wrong stretch of the file",
+            ));
+        }
+        let depth: i32 = lines[at + 1..tray]
+            .iter()
+            .map(|line| {
+                line.matches('{').count() as i32 - line.matches('}').count() as i32
+            })
+            .sum();
+        if depth != 0 {
+            return Err(format!(
+                "the braces between the engine rebuild and `build_tray` no longer balance \
+                 ({depth}). A block closes -- or opens -- between them, which is what a \
+                 conditional wrapped around the rebuild from further up looks like when it \
+                 was written without reindenting the body"
             ));
         }
         Ok(())
@@ -19221,7 +19281,7 @@ mod startup_shape_tests {
         //    one edit step 4 is instructed to make, while the behaviour is
         //    identical to deleting the line. See
         //    [`the_rebuild_is_unconditional`].
-        if let Err(why) = the_rebuild_is_unconditional(region) {
+        if let Err(why) = the_rebuild_is_unconditional(production) {
             panic!(
                 "{why}\n\nThe post-window engine rebuild is no longer an unconditional \
                  statement. That may well be RIGHT -- it is obligation 2 of the four this \
@@ -19241,54 +19301,111 @@ mod startup_shape_tests {
     /// in this file before -- clause 3 is one, and it is green on the mutant
     /// it was written to stop. A source guard that has never been shown to
     /// fail is indistinguishable from one that cannot. So this drives the
-    /// predicate over the real region (which must pass) and over five mutated
-    /// copies of it (each of which must not), the five being the ways an
-    /// "make the rebuild conditional" edit really lands -- and only ONE of
-    /// them is spelled `if` at the front of a reindented block.
+    /// predicate over the real production half (which must pass) and over
+    /// mutated copies of it (each of which must not), the mutants being the
+    /// ways a "make the rebuild conditional" edit really lands. Only one of
+    /// them is spelled `if` at the head of a reindented block, and two of
+    /// them leave every line the pin names byte-identical.
     #[test]
     fn the_unconditional_clause_can_see_a_conditional_rebuild() {
-        let region = after_the_startup_window();
+        let production = production();
         assert_eq!(
-            the_rebuild_is_unconditional(region),
+            the_rebuild_is_unconditional(production),
             Ok(()),
             "control: the rebuild as it stands today is rejected, so every rejection below \
              proves nothing about the mutation and only that the predicate never passes"
         );
 
+        // Spliced BY LINE and rejoined with a bare `\n`, never by matching a
+        // multi-line needle: this tree is CRLF in the working copy and LF in
+        // the blob, and a needle carrying a literal CRLF matches nothing in
+        // one of the two. The predicate trims line ends, so the join is free.
+        let lines: Vec<&str> = production.lines().collect();
         let stmt = ARMED_FROM_A_PRE_WINDOW_SNAPSHOT;
-        let here = format!("    {stmt}");
-        let cases: Vec<(&str, String)> = vec![
+        let rebuild_at = lines
+            .iter()
+            .position(|line| line.trim_end().trim_start() == stmt)
+            .expect("control: the rebuild is no longer a line of its own");
+        assert_eq!(
+            lines.iter().filter(|l| l.trim_end().trim_start() == stmt).count(),
+            1,
+            "control: more than one line is the rebuild, so the splices below land \
+             somewhere unintended"
+        );
+        // The `log::info!(` that opens the neighbourhood, four lines up.
+        let log_at = rebuild_at - 4;
+        assert_eq!(
+            lines[log_at].trim_end(),
+            REBUILD_NEIGHBOURHOOD[2],
+            "control: the engine log is not four lines above the rebuild, so the wrapper \
+             cases below would be spliced into the wrong place"
+        );
+
+        let wrapped = "    if startup_vault.is_none() {";
+        let cases: &[(&str, usize, usize, &[&str])] = &[
             (
                 "wrapped in an `if` and reindented, the tidy version of step 4's edit",
-                format!("    if startup_vault.is_none() {{\r\n        {stmt}\r\n    }}"),
+                rebuild_at,
+                1,
+                &[wrapped, "        <stmt>", "    }"],
             ),
             (
                 "wrapped in an `if` WITHOUT reindenting, the hurried version",
-                format!("    if startup_vault.is_none() {{\r\n    {stmt}\r\n    }}"),
+                rebuild_at,
+                1,
+                &[wrapped, "    <stmt>", "    }"],
             ),
             (
                 "folded onto one line, so the block never opens a line of its own",
-                format!("    if startup_vault.is_none() {{ {stmt} }}"),
+                rebuild_at,
+                1,
+                &["    if startup_vault.is_none() { <stmt> }"],
             ),
             (
                 "not spelled `if` at all -- a `.then` on the condition",
-                String::from(
-                    "    startup_vault.is_none().then(|| estate.engine.rebuild(&\
-                     startup_entries.borrow()));",
-                ),
+                rebuild_at,
+                1,
+                &["    startup_vault.is_none().then(|| <expr>);"],
             ),
             (
                 "not spelled `if` at all -- the flag computed on the line above, the \
-                 statement itself untouched",
-                format!("    let armed = startup_vault.is_none() && armed;\r\n{here}"),
+                 statement itself left byte-identical",
+                rebuild_at,
+                0,
+                &["    let armed = startup_vault.is_none();"],
+            ),
+            (
+                "opened ABOVE the engine log and un-reindented, so every line of the \
+                 rebuild's own neighbourhood is byte-identical",
+                log_at,
+                0,
+                &[wrapped],
+            ),
+            (
+                "opened above the estate binding's own `};` and un-reindented -- the \
+                 line-for-line pin cannot see this one AT ALL, and only the brace balance \
+                 under the rebuild does",
+                rebuild_at + 1,
+                0,
+                &["    }"],
             ),
         ];
-        for (what, replacement) in &cases {
-            let mutated = region.replacen(&here, replacement, 1);
+        for (what, at, take, with) in cases {
+            let mut mutated = lines.clone();
+            let spliced: Vec<String> = with
+                .iter()
+                .map(|line| {
+                    line.replace("<stmt>", stmt)
+                        .replace("<expr>", stmt.trim_end_matches(';'))
+                })
+                .collect();
+            mutated.splice(*at..*at + *take, spliced.iter().map(String::as_str));
+            let mutated = mutated.join("\n");
             assert_ne!(
-                mutated, region,
-                "control: the {what} case did not change the region, so the rejection below \
-                 would be a rejection of the untouched source"
+                mutated,
+                lines.join("\n"),
+                "control: the {what} case did not change the source, so the rejection below \
+                 would be a rejection of the untouched file"
             );
             assert!(
                 the_rebuild_is_unconditional(&mutated).is_err(),
