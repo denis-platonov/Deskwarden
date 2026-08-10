@@ -142,6 +142,21 @@ const BREACH_DESCRIPTION: &str = "Off by default. When on, Deskwarden sends the 
      characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this \
      machine. Your password, and the rest of its hash, never leave your PC.";
 
+const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
+/// **Says what ON adds, and what it costs.** Off is the default and is stated
+/// in the copy rather than left to `Settings::default`, exactly as
+/// `BREACH_DESCRIPTION` states its own: these are the two rows on General
+/// whose ON state gives something away, and a user reading the pane should
+/// not have to infer either from the pill.
+///
+/// The word "masked" is in the copy because the row this turns on is masked
+/// until its eye is clicked -- turning this on does not put a seed on screen,
+/// it puts a row there. And the reason to leave it off is named rather than
+/// implied: the six-digit code expires, the seed it comes from does not.
+const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP secret appears \
+     as an extra masked row under its one-time code, revealed by clicking the eye. The code \
+     expires in 30 seconds; the secret behind it never does.";
+
 const AUTO_LOCK_ENABLED_LABEL: &str = "Lock the vault when idle";
 const AUTO_LOCK_ENABLED_DESCRIPTION: &str =
     "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
@@ -766,6 +781,18 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
             BREACH_LABEL,
             BREACH_DESCRIPTION,
             state.settings.check_breaches,
+        );
+        row_separator(ui);
+        // Directly under the breach row, the other off-by-default row, and
+        // wired exactly as it is. This pill is the only thing that decides
+        // whether the read pane draws a TOTP-secret row at all -- the pane
+        // skips the row outright when this is off rather than drawing it
+        // disabled or invisible.
+        state.settings.reveal_totp_seed = toggle_row(
+            ui,
+            TOTP_SECRET_LABEL,
+            TOTP_SECRET_DESCRIPTION,
+            state.settings.reveal_totp_seed,
         );
         row_separator(ui);
         // The toggle sits above the number it governs, in 3e's own 40x22
@@ -1499,12 +1526,12 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_four_toggles_and_one_stepper() {
+    fn general_paints_exactly_five_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            4,
-            "four 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches` and              `auto_lock_enabled`, and nothing else"
+            5,
+            "five 40x22 pills: `keep_backend_running`, `prompt_on_match`, `check_breaches`,              `reveal_totp_seed` and `auto_lock_enabled`, and nothing else"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -1616,8 +1643,8 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 4, "the General card no longer paints four pills");
-        // Third pill down: backend, prompt, breaches, auto-lock.
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // Third pill down: backend, prompt, breaches, TOTP secret, auto-lock.
         let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
@@ -1628,12 +1655,14 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
 
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.check_breaches, "and back off again");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
     }
 
     /// Where the row is, read off the paint rather than off the source order:
@@ -1655,8 +1684,12 @@ mod tests {
             "the breach row is not under the prompt row: prompt at {prompt:?}, breach at              {breach:?}"
         );
         assert!(
+            breach.top() < painted.ink_of(TOTP_SECRET_LABEL).rect.top(),
+            "the breach row is not above the TOTP-secret row, so it is not DIRECTLY under the              prompt row"
+        );
+        assert!(
             breach.top() < auto_lock.top(),
-            "the breach row is not above the auto-lock row, so it is not DIRECTLY under the              prompt row"
+            "the breach row is not above the auto-lock row"
         );
         // The positive control: the two tops differ by a real amount, so the
         // comparison above is telling two rows apart rather than comparing one
@@ -1672,9 +1705,10 @@ mod tests {
         // ... and the pills follow the labels, so it is the row that moved
         // and not just its text.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 4);
+        assert_eq!(pills.len(), 5);
         assert!(pills[1].top() < pills[2].top(), "the breach pill is not below the prompt pill");
-        assert!(pills[2].top() < pills[3].top(), "the breach pill is not above the auto-lock pill");
+        assert!(pills[2].top() < pills[3].top(), "the breach pill is not above the TOTP-secret pill");
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
             pills[2].top() > prompt.bottom(),
             "the breach pill is level with the prompt row's text, so the pills and the labels              disagree about which row is which"
@@ -1763,21 +1797,144 @@ mod tests {
         assert!(visited >= 3, "fewer widths than the module tests");
     }
 
+    /// The counter-assertions are the test, exactly as they are for the
+    /// breach row above it: a row wired to `check_breaches` or to
+    /// `prompt_on_match` would still flip *a* setting on this click, and an
+    /// assertion that only read `reveal_totp_seed` afterwards would be
+    /// satisfied by that. Every neighbour is asserted at its starting value
+    /// BEFORE the click, which is what makes "unmoved" a claim that can fail.
+    #[test]
+    fn clicking_the_totp_secret_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(
+            !state.settings.reveal_totp_seed,
+            "the default: no TOTP seed is offered on the details screen until this is clicked"
+        );
+        assert!(!state.settings.check_breaches, "the neighbour starts false");
+        assert!(state.settings.keep_backend_running, "the neighbour starts true");
+        assert!(state.settings.prompt_on_match, "the neighbour starts true");
+        assert!(state.settings.auto_lock_enabled, "the neighbour starts true");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // Fourth pill down: backend, prompt, breaches, TOTP secret, auto-lock.
+        let pill = pills[3].center();
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.reveal_totp_seed,
+            "the TOTP-secret toggle did not turn on -- the row is painted but its value is never written back, so the pill is decoration"
+        );
+        assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.reveal_totp_seed, "and back off again");
+        assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+    }
+
+    /// Where the row is, read off the paint rather than off the source order,
+    /// for the reason `the_breach_row_sits_under_the_prompt_row` gives.
+    #[test]
+    fn the_totp_secret_row_sits_between_the_breach_row_and_the_auto_lock_row() {
+        let painted = paint(Section::General);
+        let breach = painted.ink_of(BREACH_LABEL).rect;
+        let secret = painted.ink_of(TOTP_SECRET_LABEL).rect;
+        let auto_lock = painted.ink_of(AUTO_LOCK_ENABLED_LABEL).rect;
+        // The instrument first: three labels at three distinct, non-empty
+        // heights, so `top()` is telling them apart rather than reading one
+        // number three times.
+        assert!(breach.height() > 0.0 && secret.height() > 0.0 && auto_lock.height() > 0.0);
+        assert!(
+            breach.top() < secret.top(),
+            "the TOTP-secret row is not under the breach row: breach at {breach:?}, secret at {secret:?}"
+        );
+        assert!(
+            secret.top() < auto_lock.top(),
+            "the TOTP-secret row is not above the auto-lock row"
+        );
+        // The positive control: the tops differ by a real amount, so the
+        // comparisons above are telling rows apart and not comparing one
+        // number with itself.
+        assert!(secret.top() - breach.top() > 1.0);
+        assert!(auto_lock.top() - secret.top() > 1.0);
+
+        // ... and the pills follow the labels, so it is the ROW that moved
+        // and not just its text.
+        let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 5);
+        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the breach pill");
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert!(
+            pills[3].top() > breach.bottom(),
+            "the TOTP-secret pill is level with the breach row's text, so the pills and the labels disagree about which row is which"
+        );
+        assert!(
+            pills[3].bottom() < auto_lock.top(),
+            "the TOTP-secret pill overhangs the auto-lock row"
+        );
+    }
+
+    /// The copy is on screen, not merely declared -- and it says the two
+    /// things a user has to know before clicking: that it is off unless they
+    /// turn it on, and that what it adds is a MASKED row rather than a seed
+    /// painted in the clear.
+    #[test]
+    fn the_totp_secret_row_says_what_it_turns_on_and_that_it_is_off_by_default() {
+        let painted = paint(Section::General);
+        assert!(painted.contains(TOTP_SECRET_LABEL), "got {:?}", painted.strings());
+        assert!(painted.contains(TOTP_SECRET_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            TOTP_SECRET_LABEL.contains("TOTP secret"),
+            "the label has to name the thing it reveals, not just say \"secret\""
+        );
+        assert!(
+            TOTP_SECRET_DESCRIPTION.contains("Off by default"),
+            "off-by-default is stated in `Settings::default` and has to be stated on screen too"
+        );
+        assert!(
+            TOTP_SECRET_DESCRIPTION.contains("masked"),
+            "turning this on adds a MASKED row; copy that implied a seed appears in the clear would be wrong"
+        );
+        assert!(
+            TOTP_SECRET_DESCRIPTION.contains("details screen") || TOTP_SECRET_DESCRIPTION.contains("one-time code"),
+            "the copy has to say WHERE the row appears"
+        );
+        // The instrument: an ink lookup that panics on a double paint, with a
+        // real rect, so "contains" above is not reading a zero-size ghost.
+        let ink = painted.ink_of(TOTP_SECRET_LABEL);
+        assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
+        assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
+        let desc = painted.ink_of(TOTP_SECRET_DESCRIPTION);
+        assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
+        assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
+    }
+
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and
-        // the FOURTH pill down is the one wired to it -- `prompt_on_match`
-        // and `check_breaches` sit between it and the backend row.
+        // the FIFTH pill down is the one wired to it -- `prompt_on_match`,
+        // `check_breaches` and `reveal_totp_seed` sit between it and the
+        // backend row.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[3].center();
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[4].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
         // What the toggle is FOR, asserted on the value the vault window
         // actually consumes rather than on the flag: a field that flips
         // without reaching `auto_lock` is a switch that does nothing.

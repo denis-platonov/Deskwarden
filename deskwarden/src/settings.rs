@@ -353,6 +353,36 @@ pub struct Settings {
     /// this one is a network call keyed on the user's passwords, and
     /// making it on their behalf is not ours to decide.
     pub check_breaches: bool,
+    /// Whether a login's TOTP *secret* can be revealed on the details screen.
+    ///
+    /// `false` (the default, and what an older `settings.json` without this
+    /// field parses as) means the read pane shows only the six-digit code and
+    /// its countdown, exactly as it always has -- the seed is not drawn at
+    /// all, not even masked. `true` adds one masked row under the code, with
+    /// the same reveal eye every other secret on that pane carries.
+    ///
+    /// **Off by default, like [`Self::check_breaches`] and unlike everything
+    /// else here.** The code expires in thirty seconds; the seed is the
+    /// long-lived shared secret the codes are derived from, so a shoulder
+    /// glance at a revealed seed is worth every future code, and a password
+    /// at least gets rotated. Putting it on the details screen is a thing to
+    /// ask for rather than a thing to discover.
+    ///
+    /// The row it governs is drawn or not drawn -- never drawn disabled and
+    /// never drawn invisible; see `vault_window::detail::draw_detail_read`,
+    /// which is its only reader.
+    ///
+    /// **`seed`, not `secret`, and that is deliberate.** The user-facing
+    /// strings say "secret" because that is the word the request used and
+    /// what the row is called on screen (`prefs_ui::TOTP_SECRET_LABEL`,
+    /// `vault_window::detail::TOTP_SECRET_LABEL`). The PERSISTED key must not
+    /// contain it: `tests::mentions_a_secret` is a blunt substring scan over
+    /// the whole of `settings.json` for `password`/`session`/`token`/`secret`
+    /// /`master key`, and it is the guard that catches a future field
+    /// smuggling a real secret onto disk. A preference whose *name* trips it
+    /// would have meant loosening that scan to make room, which is exactly
+    /// the trade not to make: the field is renamed and the guard stays blunt.
+    pub reveal_totp_seed: bool,
     /// Whether the vault window locks itself at all.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -453,6 +483,7 @@ impl Default for Settings {
             keep_backend_running: true,
             prompt_on_match: true,
             check_breaches: false,
+            reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             vault_window: None,
@@ -574,6 +605,7 @@ impl Settings {
             keep_backend_running,
             prompt_on_match,
             check_breaches,
+            reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
             vault_window: _,
@@ -588,6 +620,7 @@ impl Settings {
         on_disk.keep_backend_running = *keep_backend_running;
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
+        on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.save(path)
@@ -767,6 +800,7 @@ mod tests {
             // (`false`), so a writer that dropped it would round-trip to
             // the default and be indistinguishable from one that kept it.
             check_breaches: true,
+            reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: None,
@@ -936,6 +970,7 @@ mod tests {
             keep_backend_running: true,
             prompt_on_match: false,
             check_breaches: true,
+            reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             vault_window: None,
@@ -1113,6 +1148,114 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The TOTP-secret row's preference is off unless it is turned on -- the
+    /// second such preference here, and for a stronger reason than the first:
+    /// a revealed seed does not expire and does not rotate.
+    #[test]
+    fn revealing_the_totp_secret_is_off_by_default() {
+        assert!(!Settings::default().reveal_totp_seed);
+        // ...and not merely absent from the in-memory default: a fresh
+        // install has no file at all, and that path must land on `false` too.
+        assert!(!Settings::load(&temp_path("totp-secret-absent")).reveal_totp_seed);
+    }
+
+    /// The upgrade path. A `settings.json` written before this field existed
+    /// must not read as "show me the seed".
+    #[test]
+    fn an_older_settings_file_without_the_totp_secret_key_loads_as_off() {
+        let path = temp_path("totp-secret-older-file");
+        let older = br#"{"keep_backend_running": false, "check_breaches": true, "auto_lock_minutes": 7}"#;
+        // The premise, asserted rather than assumed: a fixture that happened
+        // to carry the key would make the rest of this test vacuous.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("reveal_totp_seed"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // And the premise that the file was read at all, rather than falling
+        // back to `Settings::default()` wholesale -- two fields that disagree
+        // with the defaults.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 7);
+        assert!(
+            !loaded.reveal_totp_seed,
+            "upgrading turned on a details-screen row that shows the user's TOTP seeds"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard `the_breach_toggle_survives_persist_preferences`
+    /// documents, for `reveal_totp_seed`.** The destructure in
+    /// `persist_preferences` names every field, so a new one cannot go
+    /// unbound -- but binding it and never writing
+    /// `on_disk.reveal_totp_seed` compiles, warns at most, and that exact
+    /// mutant has survived this whole suite before. This test is the only
+    /// thing that reaches that assignment.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`false`) would pass a one-way test.
+    #[test]
+    fn the_totp_secret_toggle_survives_persist_preferences() {
+        let path = temp_path("prefs-totp-secret");
+        Settings::default().save(&path).unwrap();
+        assert!(
+            !Settings::load(&path).reveal_totp_seed,
+            "the premise: it starts off"
+        );
+
+        Settings { reveal_totp_seed: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            loaded.reveal_totp_seed,
+            "the TOTP-secret setting was dropped by persist_preferences, so turning it on              lasts only until the app is restarted"
+        );
+        // The neighbours it is destructured beside are untouched, so this is
+        // not satisfied by a writer that clobbers the file with something else.
+        assert!(loaded.keep_backend_running);
+        assert!(loaded.prompt_on_match);
+        assert!(!loaded.check_breaches);
+        assert!(loaded.auto_lock_enabled);
+
+        // ...and back off again, so "always writes true" fails too. The
+        // premise for this half is the assertion above: it is provably on
+        // before this write turns it off.
+        Settings { reveal_totp_seed: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(!Settings::load(&path).reveal_totp_seed);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The field reaches the file under its own name, the way
+    /// `the_breach_toggle_round_trips_through_settings_json_under_its_own_name`
+    /// pins its neighbour's.
+    #[test]
+    fn the_totp_secret_toggle_round_trips_through_settings_json_under_its_own_name() {
+        let path = temp_path("totp-secret-round-trip");
+        let written = Settings { reveal_totp_seed: true, ..Settings::default() };
+        // The value written disagrees with the default, so a reader that
+        // ignored the file entirely would fail here.
+        assert!(written.reveal_totp_seed != Settings::default().reveal_totp_seed);
+        written.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("reveal_totp_seed"), "not in the file at all: {text}");
+        // **And the key does not trip the file-content guard.** See the
+        // field's doc: `mentions_a_secret` is a blunt substring scan and the
+        // preference is named `seed` rather than `secret` so that it stays
+        // blunt. Renaming the field back would fail here rather than forcing
+        // someone to widen the scan.
+        assert!(
+            !mentions_a_secret(&text),
+            "the preference key trips the NO SECRETS guard: {text}"
+        );
+        assert_eq!(Settings::load(&path), written);
+        assert!(Settings::load(&path).reveal_totp_seed);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn a_geometry_round_trips_through_disk_with_the_rest_of_the_file() {
         let path = temp_path("geometry-round-trip");
@@ -1120,6 +1263,7 @@ mod tests {
             keep_backend_running: false,
             prompt_on_match: true,
             check_breaches: true,
+            reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
