@@ -499,6 +499,122 @@ fn run_the_one_window(
     });
 }
 
+/// **How far a lock has actually GOT**, as one ordered value.
+///
+/// This was two independent `bool` fields, `worker_started` and
+/// `teardown_reported`, and three consecutive reviews found the same class of
+/// defect on them. The guards pinned WHERE each `= true` is written -- first
+/// by byte distance, then by adjacency -- and nothing pinned that it STAYS
+/// written. Both of these were measured green across the whole suite:
+///
+/// * `self.teardown_reported = false;` appended to the `NeedsSignIn` arm. The
+///   arm's write is still its first statement, the count is still two, the
+///   rule and its table and the call-site pin are untouched -- and a worker
+///   that reported a step and then died has its teardown RETRACTED, so `main`
+///   runs a second teardown of a session already dismantled.
+/// * `self.worker_started = false;` appended to the lock catch, below the
+///   `spawn < started < claim` ordering the position pin measures. The
+///   retraction then never fires: `relocked` stays true, `main` skips its own
+///   recovery, and a worker that died having torn nothing down leaves the
+///   vault showing "locked" with `bw serve` still holding the session. That
+///   is the v0.5.0 defect verbatim.
+///
+/// A third positional pin would not have caught either, because neither moves
+/// anything the position pins look at. So the two facts are ONE value with an
+/// ORDER on it; a lock only ever moves forward along that order
+/// ([`lock_reach_after`], a pure total function with its own exhaustive table,
+/// for the same reason [`session_torn_down`] and [`retracts_the_teardown`]
+/// are); and the value is kept in [`lock_stage::LockStage`], whose field is
+/// private to a module the rest of this file is not inside. `= false` in any
+/// spelling -- a literal, a `match` arm, `std::mem::replace`, a shadowing
+/// binding -- is a TYPE ERROR rather than a silent regression, and the one
+/// remaining wrong write that still compiles has to name `LockStage::fresh`
+/// out loud, which `the_lock_reach_is_not_assignable_only_advanceable` bans.
+///
+/// The order is not an arrangement of convenience. A step can only be reported
+/// by a worker, and a worker only exists if the spawn returned, so
+/// `StepReported` implies `WorkerStarted` in the code as much as in the
+/// ordering. [`retracts_the_teardown`] keeps all eight rows of its own table;
+/// two of them are merely states this value cannot be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LockReach {
+    /// No lock has been caught in this window yet, or the one that was caught
+    /// found its `FnOnce` teardown already spent and started nothing.
+    Nothing,
+    /// The lock arm spawned the teardown worker. A THREAD EXISTS; nothing is
+    /// yet known to have been torn down, which is the whole reason
+    /// [`retracts_the_teardown`] exists.
+    WorkerStarted,
+    /// The worker reported one of its two steps, so the teardown really did
+    /// get underway and must not be retracted.
+    StepReported,
+}
+
+/// **A lock never un-reaches what it reached.**
+///
+/// The later of the two, always -- so no call, wherever it is written and
+/// whatever it is passed, can move a lock backwards. That is the property the
+/// two `bool` fields did not have and could not be given: every `= false` this
+/// file's reviews found was a legal write of a legal value.
+///
+/// Total and pure, with a nine-row table in
+/// `a_lock_only_ever_reaches_further`, because a rule this small written
+/// inline is exactly what the two inversions of [`retracts_the_teardown`]'s
+/// condition proved cannot be trusted to a source pin.
+pub fn lock_reach_after(before: LockReach, reached: LockReach) -> LockReach {
+    if reached > before {
+        reached
+    } else {
+        before
+    }
+}
+
+/// **The only place a [`LockReach`] can be kept**, and the reason the wrong
+/// value is unrepresentable rather than merely unpinned.
+///
+/// A private field in a CHILD module: privacy in Rust reaches the defining
+/// module and its descendants, and the rest of this file is neither. So
+/// outside these few lines there is no expression at all that lowers a stage
+/// -- `self.stage.0 = ..` does not compile, and `self.stage = false` does not
+/// typecheck. The only mutation reachable from [`InWindowLock`] is
+/// [`LockStage::reached`], which routes through [`lock_reach_after`].
+mod lock_stage {
+    use super::LockReach;
+
+    /// The lock's progress. Deliberately NOT `Clone`, `Copy` or `Default`: a
+    /// copy is a stage that can go stale, and a `Default` is a second way to
+    /// spell "back to the beginning" without naming it.
+    #[derive(Debug)]
+    pub struct LockStage(LockReach);
+
+    impl LockStage {
+        /// A window that has not locked. Called ONCE, in
+        /// [`super::InWindowLock::new`], and banned everywhere else by
+        /// `the_lock_reach_is_not_assignable_only_advanceable`.
+        pub fn fresh() -> Self {
+            Self(LockReach::Nothing)
+        }
+
+        /// Records that the lock got this far. Monotone by construction.
+        pub fn reached(&mut self, reached: LockReach) {
+            self.0 = super::lock_reach_after(self.0, reached);
+        }
+
+        /// A teardown worker thread was spawned. See
+        /// [`super::retracts_the_teardown`], which is the only reader.
+        pub fn worker_started(&self) -> bool {
+            self.0 >= LockReach::WorkerStarted
+        }
+
+        /// The worker reported at least one of its two steps.
+        pub fn teardown_reported(&self) -> bool {
+            self.0 >= LockReach::StepReported
+        }
+    }
+}
+
+use lock_stage::LockStage;
+
 /// **The lock's touch points, in one value, for both hosts.**
 ///
 /// [`run_from_vault`] catches the lock today; [`run`] has to catch the same
@@ -549,8 +665,12 @@ struct InWindowLock<T, B> {
     /// actually got underway".** `teardown` is `FnOnce`, so at most one worker
     /// ever starts in one window's life and these need no per-lock reset. See
     /// [`LockProgress::TeardownNeverRan`], which is what the pair is read into.
-    worker_started: bool,
-    teardown_reported: bool,
+    ///
+    /// **One ordered value and not two `bool`s**, so that no write anywhere
+    /// can un-report a step or un-start a worker: see [`LockReach`] for the
+    /// two measured survivors that shape cost, and
+    /// [`lock_stage::LockStage`] for why lowering it does not compile.
+    stage: LockStage,
     /// The PRE-LOCK session's outcome, written by the lock catch and read by
     /// the rebuild and by [`finish_the_locked_session`].
     result: Rc<RefCell<Option<vault_window::VaultWindowResult>>>,
@@ -583,8 +703,7 @@ where
             step_rx,
             token_tx: Some(token_tx),
             token_rx: Some(token_rx),
-            worker_started: false,
-            teardown_reported: false,
+            stage: LockStage::fresh(),
             result,
             relocked,
             vault_handles,
@@ -654,7 +773,7 @@ where
                         let step_tx = step_tx;
                         teardown(&step_tx, token_rx);
                     });
-                    self.worker_started = true;
+                    self.stage.reached(LockReach::WorkerStarted);
                     LockProgress::TeardownStarted
                 } else {
                     LockProgress::TeardownAlreadySpent
@@ -685,7 +804,7 @@ where
     ) -> Result<Event, mpsc::TryRecvError> {
         match self.step_rx.try_recv() {
             Ok(TeardownStep::NeedsSignIn) => {
-                self.teardown_reported = true;
+                self.stage.reached(LockReach::StepReported);
                 log::info!(
                     "the lock's teardown is done and the vault needs a master password; \
                      showing the sign-in card in the window that is already open"
@@ -693,7 +812,7 @@ where
                 Ok(Event::TeardownDone)
             }
             Ok(TeardownStep::Finished) => {
-                self.teardown_reported = true;
+                self.stage.reached(LockReach::StepReported);
                 // Dropped here rather than left alive for the rest of the
                 // window: the worker is finished, and a sender this side keeps
                 // would stop the channel ever reporting `Disconnected` again.
@@ -748,7 +867,7 @@ where
     /// for the same reason [`session_torn_down`] is. Its doc carries why each
     /// of the three inputs is load-bearing, `Deadline` included.
     fn retract_if_the_teardown_never_ran(&mut self, why: WorkFailure) {
-        if retracts_the_teardown(why, self.worker_started, self.teardown_reported) {
+        if retracts_the_teardown(why, self.stage.worker_started(), self.stage.teardown_reported()) {
             log::error!(
                 "the lock's teardown worker ended without ever reporting a step, so nothing \
                  was torn down; the session is reported as still live and the caller's own \
@@ -3166,6 +3285,187 @@ mod lock_transition_tests {
         );
     }
 
+    /// **A lock only ever reaches FURTHER**, all nine pairs.
+    ///
+    /// The property the two `bool` flags did not have. `worker_started` and
+    /// `teardown_reported` were ordinary fields, so every `= false` a review
+    /// found -- appended to the `NeedsSignIn` arm, appended to the lock catch
+    /// -- was a legal write of a legal value that no guard in this file
+    /// looked at. Here going backwards is not a defect to be pinned, it is an
+    /// answer [`lock_reach_after`] cannot give.
+    #[test]
+    fn a_lock_only_ever_reaches_further() {
+        use LockReach::{Nothing, StepReported, WorkerStarted};
+        const ALL: [LockReach; 3] = [Nothing, WorkerStarted, StepReported];
+        // (before, reached, after)
+        let expected = [
+            (Nothing, Nothing, Nothing),
+            (Nothing, WorkerStarted, WorkerStarted),
+            (Nothing, StepReported, StepReported),
+            (WorkerStarted, Nothing, WorkerStarted),
+            (WorkerStarted, WorkerStarted, WorkerStarted),
+            (WorkerStarted, StepReported, StepReported),
+            (StepReported, Nothing, StepReported),
+            (StepReported, WorkerStarted, StepReported),
+            (StepReported, StepReported, StepReported),
+        ];
+        for &(before, reached, after) in &expected {
+            assert_eq!(
+                lock_reach_after(before, reached),
+                after,
+                "lock_reach_after({before:?}, {reached:?}) is a row of this table that is \
+                 wrong, and every row of it is a lock either forgetting a teardown that ran \
+                 or claiming one that did not"
+            );
+        }
+        for &before in &ALL {
+            for &reached in &ALL {
+                assert!(
+                    expected.iter().any(|&(b, r, _)| b == before && r == reached),
+                    "({before:?}, {reached:?}) has no row in the table, so its answer is \
+                     unchecked"
+                );
+                assert!(
+                    lock_reach_after(before, reached) >= before,
+                    "a lock at {before:?} was moved BACKWARDS by {reached:?}. That is the \
+                     whole defect class: un-reporting a step retracts a teardown that really \
+                     ran and `main` dismantles the session twice; un-starting a worker stops \
+                     the retraction firing at all and the vault says locked with `bw serve` \
+                     still holding the session"
+                );
+            }
+        }
+    }
+
+    /// **The two facts the rule reads, and that neither can be lost.**
+    ///
+    /// `LockStage` is what `InWindowLock` actually keeps, so this is the
+    /// accessor pair [`retracts_the_teardown`] is fed. The last line is the
+    /// measured survivor `self.teardown_reported = false;` in the only
+    /// spelling that still typechecks.
+    #[test]
+    fn a_stage_never_un_reports_a_step_or_un_starts_a_worker() {
+        let mut stage = LockStage::fresh();
+        assert!(
+            !stage.worker_started() && !stage.teardown_reported(),
+            "a window that has not locked already claims a worker or a reported step, so the \
+             retraction is decided from facts that were never true"
+        );
+        stage.reached(LockReach::WorkerStarted);
+        assert!(
+            stage.worker_started() && !stage.teardown_reported(),
+            "the spawn does not record a started worker, or it records a REPORTED step -- the \
+             first leaves the retraction unable to fire, the second makes it unreachable"
+        );
+        stage.reached(LockReach::StepReported);
+        assert!(
+            stage.worker_started() && stage.teardown_reported(),
+            "a reported step does not imply the worker that reported it"
+        );
+        stage.reached(LockReach::Nothing);
+        assert!(
+            stage.worker_started() && stage.teardown_reported(),
+            "a stage was talked back down to `Nothing`, which is the `= false` write this \
+             file has now had three reviews about"
+        );
+    }
+
+    /// A lock with no frame behind it: the closures are stubs, the rebuild
+    /// answers `None` (the failed-rebuild path, which needs no
+    /// `VaultFrameHandles` -- there is no way to build one from this module),
+    /// and nothing here spawns a process, opens a window or touches disk.
+    fn a_lock_under_test(
+        relocked: &Rc<RefCell<bool>>,
+    ) -> InWindowLock<
+        impl FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
+        impl FnOnce(
+            Option<crate::settings::Settings>,
+        )
+            -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>,
+    > {
+        InWindowLock::new(
+            |_step_tx: &mpsc::Sender<TeardownStep>, _token_rx: mpsc::Receiver<String>| {},
+            |_edited: Option<crate::settings::Settings>| None,
+            Rc::new(RefCell::new(None)),
+            relocked.clone(),
+            Rc::new(RefCell::new(None)),
+        )
+    }
+
+    /// **A teardown that REPORTED a step is never retracted** -- driven
+    /// through the real value, not through the rule.
+    ///
+    /// This is the measured survivor A1 as behaviour. `catch_the_lock` cannot
+    /// be called from a test (it needs a live `VaultFrameHandles` reporting a
+    /// lost session, and this module cannot build one), so the lock arm is
+    /// reproduced here in its two effects -- the stage advance and the write
+    /// of `relocked` through the rule -- and then the drain and the
+    /// retraction are the production ones. A write that un-reports the step,
+    /// in the arm or anywhere else, ends with `relocked` false and `main`
+    /// tearing down a session that is already dismantled.
+    #[test]
+    fn a_worker_that_reported_a_step_and_then_died_keeps_its_teardown() {
+        let relocked = Rc::new(RefCell::new(false));
+        let mut lock = a_lock_under_test(&relocked);
+        lock.stage.reached(LockReach::WorkerStarted);
+        *relocked.borrow_mut() = session_torn_down(false, LockProgress::TeardownStarted);
+        let step_tx = lock.step_tx.take().expect("the lock holds the only sender");
+        step_tx.send(TeardownStep::NeedsSignIn).expect("the receiver is the lock own end");
+        let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
+        assert!(
+            matches!(lock.answer_the_teardown(&mut vault_fn), Ok(Event::TeardownDone)),
+            "the drain did not answer the step the worker really sent"
+        );
+        lock.retract_if_the_teardown_never_ran(WorkFailure::WorkerDied);
+        assert!(
+            *relocked.borrow(),
+            "a worker that reported `NeedsSignIn` and then died had its teardown RETRACTED, \
+             so `main` runs a second teardown of a session already dismantled -- the master \
+             password is asked for again to redo work that is done"
+        );
+    }
+
+    /// The same walk with the `Finished` step, whose arm also rebuilds.
+    #[test]
+    fn a_worker_that_finished_and_then_died_keeps_its_teardown() {
+        let relocked = Rc::new(RefCell::new(false));
+        let mut lock = a_lock_under_test(&relocked);
+        lock.stage.reached(LockReach::WorkerStarted);
+        *relocked.borrow_mut() = session_torn_down(false, LockProgress::TeardownStarted);
+        let step_tx = lock.step_tx.take().expect("the lock holds the only sender");
+        step_tx.send(TeardownStep::Finished).expect("the receiver is the lock own end");
+        let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
+        assert!(
+            matches!(lock.answer_the_teardown(&mut vault_fn), Ok(Event::WorkFailed)),
+            "the rebuild stub answered `None`, so this walk must be the failed-rebuild one"
+        );
+        lock.retract_if_the_teardown_never_ran(WorkFailure::WorkerDied);
+        assert!(
+            *relocked.borrow(),
+            "a worker that finished its teardown and then died had it retracted, so the \
+             session is torn down twice"
+        );
+    }
+
+    /// **And the other direction, which is the one the vault actually hangs
+    /// on:** a worker that started and reported NOTHING must retract, so the
+    /// caller runs the only recovery that lock will ever get.
+    #[test]
+    fn a_worker_that_reported_nothing_retracts_through_the_real_value() {
+        let relocked = Rc::new(RefCell::new(false));
+        let mut lock = a_lock_under_test(&relocked);
+        lock.stage.reached(LockReach::WorkerStarted);
+        *relocked.borrow_mut() = session_torn_down(false, LockProgress::TeardownStarted);
+        assert!(*relocked.borrow(), "control: the lock arm claims the teardown it started");
+        lock.retract_if_the_teardown_never_ran(WorkFailure::WorkerDied);
+        assert!(
+            !*relocked.borrow(),
+            "a teardown worker that died having reported nothing still reports the session as \
+             torn down. `main` skips its own recovery, and the vault shows `locked` with the \
+             cache full and `bw serve` still holding the session -- the v0.5.0 defect"
+        );
+    }
+
     /// **The whole of [`retracts_the_teardown`], spelled out rather than
     /// derived** -- all eight combinations of its three inputs, in one table,
     /// so a rewritten predicate cannot be checked against itself.
@@ -3966,8 +4266,8 @@ mod lock_host_tests {
         assert_eq!(
             value
                 .matches(concat!(
-                    "retracts_the_teardown(why, self.worker_started, ",
-                    "self.teardown_reported)"
+                    "retracts_the_teardown(why, self.stage.worker_started(), ",
+                    "self.stage.teardown_reported())"
                 ))
                 .count(),
             1,
@@ -3980,8 +4280,8 @@ mod lock_host_tests {
         );
         assert!(
             retract.contains(concat!(
-                "retracts_the_teardown(why, self.worker_started, ",
-                "self.teardown_reported)"
+                "retracts_the_teardown(why, self.stage.worker_started(), ",
+                "self.stage.teardown_reported())"
             )),
             "the call is not in `retract_if_the_teardown_never_ran`, so it is somewhere the \
              failure kind is not the one being answered: {retract}"
@@ -4032,12 +4332,12 @@ mod lock_host_tests {
         // is discarded.
         for (needle, why) in [
             (
-                concat!("self.worker_started = ", "true;"),
+                concat!("self.stage.reached(LockReach::", "WorkerStarted);"),
                 "nothing ever records that a worker started, so the rule is asked about a flag \
                  that is always `false` and the retraction never fires",
             ),
             (
-                concat!("self.teardown_reported = ", "true;"),
+                concat!("self.stage.reached(LockReach::", "StepReported);"),
                 "nothing ever records that a step arrived, so the rule is asked about a flag \
                  that is always `false` and a genuine teardown gets retracted",
             ),
@@ -4057,7 +4357,7 @@ mod lock_host_tests {
         // worker that the spent-`FnOnce` path never started -- and both leave
         // the rule, the table and the call above completely untouched.
         assert_eq!(
-            regions.matches(concat!("worker_started = ", "true;")).count(),
+            regions.matches(concat!("stage.reached(LockReach::", "WorkerStarted);")).count(),
             1,
             "`worker_started` is set somewhere other than exactly once: {regions}"
         );
@@ -4066,7 +4366,7 @@ mod lock_host_tests {
             .find(concat!("std::thread::", "spawn(move || {"))
             .expect("the spawn is pinned by the_lock_arm_starts_the_teardown_on_a_thread");
         let started =
-            catch.find(concat!("worker_started = ", "true;")).expect("counted above, in the catch");
+            catch.find(concat!("stage.reached(LockReach::", "WorkerStarted);")).expect("counted above");
         let claim = catch
             .find(concat!("LockProgress::", "TeardownStarted"))
             .expect("pinned by the_hosts_two_relocked_writes_both_go_through_the_rule");
@@ -4082,7 +4382,7 @@ mod lock_host_tests {
         // `the_host_answers_both_teardown_steps`.
         let drain = drain_body();
         assert_eq!(
-            regions.matches(concat!("teardown_reported = ", "true;")).count(),
+            regions.matches(concat!("stage.reached(LockReach::", "StepReported);")).count(),
             2,
             "`teardown_reported` is not set exactly twice -- once per teardown step. A \
              MISSING one is a worker whose reported step is forgotten, so a session that \
@@ -4098,7 +4398,7 @@ mod lock_host_tests {
                 .find(step)
                 .unwrap_or_else(|| panic!("control: {step:?} is not in the drain: {drain}"));
             let next = drain[arm..]
-                .find(concat!("self.teardown_reported = ", "true;"))
+                .find(concat!("self.stage.reached(LockReach::", "StepReported);"))
                 .unwrap_or_else(|| panic!("no `teardown_reported` write follows {step:?}: {drain}"));
             assert!(
                 next < 400,
@@ -4145,8 +4445,8 @@ mod lock_host_tests {
         // not a call whose answer is computed and then thrown away.
         let at = retract
             .find(concat!(
-                "retracts_the_teardown(why, self.worker_started, ",
-                "self.teardown_reported)"
+                "retracts_the_teardown(why, self.stage.worker_started(), ",
+                "self.stage.teardown_reported())"
             ))
             .expect("counted just above");
         let write = retract
@@ -4485,6 +4785,71 @@ mod lock_host_tests {
                 1,
                 "{call:?} is not called exactly once from the vault host, so the one call \
                  counted above is somewhere else: {closure}"
+            );
+        }
+    }
+
+    /// **The stage is ADVANCED, never assigned.**
+    ///
+    /// The type does the work: [`LockReach`] lives behind a private field in
+    /// a child module, so `self.stage = false` is a type error and
+    /// `self.stage.0 = ..` is a privacy error. Exactly one wrong write still
+    /// compiles -- re-seeding the field with a fresh stage -- and it has to
+    /// name `LockStage::fresh` out loud. This is the whole remaining surface,
+    /// and it is banned as a CLASS rather than pinned to a position: the two
+    /// positional pins on these flags each caught the shape they were given
+    /// and left the class open.
+    #[test]
+    fn the_lock_reach_is_not_assignable_only_advanceable() {
+        let regions = where_a_lock_decision_could_live();
+        assert_eq!(
+            regions.matches(concat!("LockStage::", "fresh()")).count(),
+            1,
+            "the lock stage is seeded somewhere other than exactly once. A SECOND seed is a \
+             lock talked back to `Nothing` after it started a worker or answered a step, \
+             which is the `= false` write this file has had three reviews about, in the one \
+             spelling the type system still allows: {regions}"
+        );
+        let seed = lifted(concat!("fn ", "new("), concat!("fn catch_the_", "lock("));
+        assert!(
+            seed.contains(concat!("stage: LockStage::", "fresh()")),
+            "the one seed is not the constructor own, so the stage is re-seeded somewhere a \
+             lock is already under way: {seed}"
+        );
+        for (region, name) in [
+            (catch_body(), "the lock catch"),
+            (drain_body(), "the teardown drain"),
+            (retract_body(), "the retraction"),
+            (closure(), "the vault host"),
+        ] {
+            // `.stage =` and not `stage =`: both hosts keep a LOCAL called
+            // `stage` for the state machine, which is a different thing
+            // entirely and is assigned every frame.
+            for banned in [concat!("LockStage::", "fresh"), concat!(".stage", " =")] {
+                assert!(
+                    !region.contains(banned),
+                    "{name} contains {banned:?}: the stage is being written rather than \
+                     advanced, which is how a worker that started reads as one that did not \
+                     -- the retraction never fires and the vault says locked with `bw serve` \
+                     still holding the session: {region}"
+                );
+            }
+            assert!(
+                !region.contains(concat!("LockReach::", "Nothing")),
+                "{name} advances the stage to `Nothing`, which is a write dressed as a step: \
+                 {region}"
+            );
+        }
+        // Positive control: the two advances the rule is fed really are in
+        // the lifted value, so the bans above are not vacuous.
+        for needle in [
+            concat!("self.stage.reached(LockReach::", "WorkerStarted);"),
+            concat!("self.stage.reached(LockReach::", "StepReported);"),
+        ] {
+            assert!(
+                regions.contains(needle),
+                "control: {needle:?} is not in the lock own code, so nothing ever records \
+                 the fact the retraction is decided from"
             );
         }
     }
