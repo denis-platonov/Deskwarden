@@ -7867,15 +7867,34 @@ mod edit_pane_layout_tests {
         item: Option<&VaultItem>,
         totp: &detail::TotpState,
     ) -> Painted {
+        acting_frame_for(ctx, pane, draft, creating, events, item, totp).1
+    }
+
+    /// [`frame_for`], keeping the action the form reported.
+    ///
+    /// Every layout test here throws the action away, which is right for a
+    /// test about pixels -- but it left the Save button's validity gate
+    /// measured by nothing but a fill colour. See
+    /// [`clicking_save_on_an_invalid_draft_saves_nothing`].
+    fn acting_frame_for(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        creating: bool,
+        events: &[egui::Event],
+        item: Option<&VaultItem>,
+        totp: &detail::TotpState,
+    ) -> (EditAction, Painted) {
         let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(pane, events), |ui| {
-            let _ = draw_detail_edit(ui, draft, &[], creating, &mut apps, item, totp);
+            action = draw_detail_edit(ui, draft, &[], creating, &mut apps, item, totp);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
         }
-        painted
+        (action, painted)
     }
 
     /// The tallest form the app can actually put on screen: a Login (the only
@@ -7905,6 +7924,13 @@ mod edit_pane_layout_tests {
 
     /// The label the disabled Save wears while the name is empty.
     const SAVE: &str = "Save (needs a name)";
+
+    /// The suffix the generator's size spinner wears in each of the row's two
+    /// states. One place, so a test that measures one state cannot silently
+    /// be measuring the other's widget.
+    fn spinner_suffix(passphrase: bool) -> &'static str {
+        if passphrase { " words" } else { " chars" }
+    }
 
     /// `label` is painted inside the pane **and is still legible as itself**.
     ///
@@ -7949,7 +7975,21 @@ mod edit_pane_layout_tests {
     const ROOMY_PANE: Vec2 = egui::vec2(560.0, 1400.0);
 
     /// The three frames the generator row paints, in the order the user
-    /// reads them: Generate, the kind combo, the size spinner.
+    /// reads them: Generate, the kind combo, the size spinner --
+    /// **in whichever of the row's two states `passphrase` names.**
+    ///
+    /// **Both states, and why that is not a detail.** The row's third control
+    /// is a `DragValue` on either branch -- `2cb45fc`'s report claimed the
+    /// widget itself changes with the kind, and that is simply false; what
+    /// changes is which draft field it is bound to and which suffix it wears
+    /// (`" words"` against `" chars"`), and the combo's `selected_text` with
+    /// it. But this helper used to key on `" chars"` unconditionally and
+    /// every caller passed a draft with `passphrase == false`, so the
+    /// passphrase branch was measured by NOTHING: an `interact_size.y = 26.0`
+    /// planted inside it left the row misaligned in exactly the way the fix
+    /// was written to stop, and the whole suite stayed green. Taking the
+    /// state as a parameter is what makes the alignment a fact about the ROW
+    /// rather than about one of its two spellings.
     ///
     /// **The count assertion is the point.** egui culls a shape lying
     /// entirely outside the screen rect, so a control pushed off the pane
@@ -7958,17 +7998,19 @@ mod edit_pane_layout_tests {
     /// rather than skipping when a control drew no frame, which is what a
     /// zero-sized widget looks like: on screen to a presence check, invisible
     /// to the eye.
-    fn generator_row_frames(painted: &Painted) -> [Rect; 3] {
+    fn generator_row_frames(painted: &Painted, passphrase: bool) -> [Rect; 3] {
         let generate = painted.rect_of("Generate");
-        // The LAST "Password": the form paints the field label above the row
-        // and the combo's `selected_text` spells the same word.
-        let combo_text = *painted.rects_of("Password").last().unwrap_or_else(|| {
+        // The LAST match: on the password branch the form paints the field
+        // label "Password" above the row and the combo's `selected_text`
+        // spells the same word, so the combo is the lower of the two.
+        let kind = if passphrase { "Passphrase" } else { "Password" };
+        let combo_text = *painted.rects_of(kind).last().unwrap_or_else(|| {
             panic!(
                 "the generator combo is showing no kind at all; painted: {:?}",
                 painted.strings()
             )
         });
-        let spinner = painted.rect_of(" chars");
+        let spinner = painted.rect_of(spinner_suffix(passphrase));
         assert!(
             combo_text.top() > generate.top() - 40.0 && combo_text.top() < generate.top() + 40.0,
             "the {combo_text:?} taken for the generator combo is nowhere near the Generate \
@@ -7993,49 +8035,74 @@ mod edit_pane_layout_tests {
     /// Asserted on PAINTED FRAMES, not on `Response::rect` and not on the
     /// source: a widget's requested size is the thing under test, so reading
     /// it back would only restate the code. See [`Painted::frame_around`].
+    ///
+    /// **Run in BOTH of the row's states.** The row is drawn from a branch on
+    /// `draft.generator.passphrase`, and until this test was parametrised
+    /// every caller of [`generator_row_frames`] handed it a password draft --
+    /// so the passphrase arm, a separate `ui.add` on a separate line of
+    /// source, was measured by nothing at all. A stray `interact_size` set
+    /// inside that arm alone survived the entire suite.
     #[test]
     fn the_generator_row_controls_share_one_baseline() {
-        let ctx = styled_context(ROOMY_PANE);
-        let mut draft = tallest_draft();
-        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        for passphrase in [false, true] {
+            let ctx = styled_context(ROOMY_PANE);
+            let mut draft = tallest_draft();
+            draft.generator.passphrase = passphrase;
+            let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+            let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        let [generate, combo, spinner] = generator_row_frames(&painted);
-        let names = ["Generate", "the kind combo", "the size spinner"];
-        for (name, rect) in names.iter().zip([generate, combo, spinner]) {
+            // The state really is the one asked for: the two arms differ only
+            // by suffix and by the combo's caption, so a row drawn from the
+            // wrong arm would otherwise be measured happily and reported as
+            // the other one.
             assert!(
-                rect.width() > 1.0 && rect.height() > 1.0,
-                "{name} painted a {rect:?} -- a control that size is not a control"
+                painted.strings().iter().any(|s| *s == spinner_suffix(passphrase)),
+                "asked for passphrase={passphrase} and the row is not showing \
+                 {:?}; painted: {:?}",
+                spinner_suffix(passphrase),
+                painted.strings()
+            );
+
+            let [generate, combo, spinner] = generator_row_frames(&painted, passphrase);
+            let names = ["Generate", "the kind combo", "the size spinner"];
+            for (name, rect) in names.iter().zip([generate, combo, spinner]) {
+                assert!(
+                    rect.width() > 1.0 && rect.height() > 1.0,
+                    "{name} painted a {rect:?} in the passphrase={passphrase} state -- a \
+                     control that size is not a control"
+                );
+            }
+            // One row, so one top and one height; the bottoms then follow.
+            // Half a point of slack for the sub-pixel positions egui lays
+            // rows out at, and no more: the defect was 7pt of it.
+            for (name, rect) in names[1..].iter().zip([combo, spinner]) {
+                assert!(
+                    (rect.top() - generate.top()).abs() <= 0.5,
+                    "{name} is painted at top {} while the Generate button beside it starts \
+                     at {} -- the row does not sit on one line in the \
+                     passphrase={passphrase} state",
+                    rect.top(),
+                    generate.top()
+                );
+                assert!(
+                    (rect.height() - generate.height()).abs() <= 0.5,
+                    "{name} is {}pt tall against the Generate button's {}pt in the \
+                     passphrase={passphrase} state -- the row's controls are different sizes",
+                    rect.height(),
+                    generate.height()
+                );
+            }
+            // And the height is the button height by construction, not
+            // whatever the three happened to agree on: a row where all three
+            // collapsed to egui's 26pt default would satisfy everything above.
+            assert!(
+                (generate.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+                "the generator row is {}pt tall in the passphrase={passphrase} state, not \
+                 theme::BUTTON_HEIGHT ({})",
+                generate.height(),
+                theme::BUTTON_HEIGHT
             );
         }
-        // One row, so one top and one height; the bottoms then follow. Half a
-        // point of slack for the sub-pixel positions egui lays rows out at,
-        // and no more: the defect was 7pt of it.
-        for (name, rect) in names[1..].iter().zip([combo, spinner]) {
-            assert!(
-                (rect.top() - generate.top()).abs() <= 0.5,
-                "{name} is painted at top {} while the Generate button beside it starts at \
-                 {} -- the row does not sit on one line",
-                rect.top(),
-                generate.top()
-            );
-            assert!(
-                (rect.height() - generate.height()).abs() <= 0.5,
-                "{name} is {}pt tall against the Generate button's {}pt -- the row's \
-                 controls are different sizes",
-                rect.height(),
-                generate.height()
-            );
-        }
-        // And the height is the button height by construction, not whatever
-        // the three happened to agree on: a row where all three collapsed to
-        // egui's 26pt default would satisfy everything above.
-        assert!(
-            (generate.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
-            "the generator row is {}pt tall, not theme::BUTTON_HEIGHT ({})",
-            generate.height(),
-            theme::BUTTON_HEIGHT
-        );
     }
 
     /// The positive control for the test above: the row's controls really can
@@ -8055,7 +8122,7 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        let [generate, _, _] = generator_row_frames(&painted);
+        let [generate, _, _] = generator_row_frames(&painted, false);
         let folder = painted.frame_around(painted.rect_of("No folder"));
         assert!(
             (folder.height() - generate.height()).abs() > 0.5,
@@ -8080,35 +8147,40 @@ mod edit_pane_layout_tests {
     /// paints an honest little box and reports the label it was handed).
     #[test]
     fn the_generator_rows_controls_are_all_reachable_at_the_minimum_width() {
-        let pane = egui::vec2(MIN_PANE_WIDTH, 1400.0);
-        let ctx = styled_context(pane);
-        let mut draft = tallest_draft();
-        let _ = frame(&ctx, pane, &mut draft, true, &[]);
-        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+        for passphrase in [false, true] {
+            let pane = egui::vec2(MIN_PANE_WIDTH, 1400.0);
+            let ctx = styled_context(pane);
+            let mut draft = tallest_draft();
+            draft.generator.passphrase = passphrase;
+            let _ = frame(&ctx, pane, &mut draft, true, &[]);
+            let painted = frame(&ctx, pane, &mut draft, true, &[]);
 
-        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
-        let names = ["Generate", "the kind combo", "the size spinner"];
-        for (name, rect) in names.iter().zip(generator_row_frames(&painted)) {
-            assert!(
-                rect.width() > 1.0 && rect.height() > 1.0,
-                "{name} painted a {rect:?} at the minimum width -- a control drawn at no size \
-                 passes every in-pane assertion and cannot be clicked"
-            );
-            assert!(
-                bounds.contains_rect(rect),
-                "{name} is painted at {rect:?}, outside the {}x{} pane -- the user cannot \
-                 reach it. Painted: {:?}",
-                pane.x,
-                pane.y,
-                painted.strings()
+            let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+            let names = ["Generate", "the kind combo", "the size spinner"];
+            for (name, rect) in names.iter().zip(generator_row_frames(&painted, passphrase)) {
+                assert!(
+                    rect.width() > 1.0 && rect.height() > 1.0,
+                    "{name} painted a {rect:?} at the minimum width in the \
+                     passphrase={passphrase} state -- a control drawn at no size passes \
+                     every in-pane assertion and cannot be clicked"
+                );
+                assert!(
+                    bounds.contains_rect(rect),
+                    "{name} is painted at {rect:?}, outside the {}x{} pane -- the user cannot \
+                     reach it. Painted: {:?}",
+                    pane.x,
+                    pane.y,
+                    painted.strings()
+                );
+            }
+            assert_inside("the generator's Generate button", "Generate", pane, &painted);
+            let suffix = spinner_suffix(passphrase);
+            assert_eq!(
+                painted.rendered_glyphs(suffix),
+                suffix,
+                "the size spinner's suffix was squeezed away at the minimum width"
             );
         }
-        assert_inside("the generator's Generate button", "Generate", pane, &painted);
-        assert_eq!(
-            painted.rendered_glyphs(" chars"),
-            " chars",
-            "the size spinner's suffix was squeezed away at the minimum width"
-        );
     }
 
     /// **Save and Cancel are one strip of one height.**
@@ -8184,6 +8256,84 @@ mod edit_pane_layout_tests {
             on, off,
             "the Save button paints the same fill whether it can be pressed or not -- the \
              form gives the user no sign that it will not save"
+        );
+    }
+
+    /// **A Save that cannot be pressed does not save**, asserted on the
+    /// action the form returns and not on how the button looks.
+    ///
+    /// The gap this closes, stated exactly. Until this test existed, the only
+    /// thing between the user and "Save writes an item with no name" was
+    /// [`the_disabled_save_button_does_not_look_enabled`] -- a comparison of
+    /// two fill colours. Two mutations prove it: `add_enabled(valid, save)`
+    /// reduced to `add(save)` with the validity still checked on the click
+    /// (behaviour preserved, appearance broken) failed that one test, and the
+    /// SAME reduction with **no guard at all** -- an invalid draft genuinely
+    /// saved -- failed that same one test and nothing else. A colour was
+    /// carrying a correctness property.
+    ///
+    /// Both halves are here because either alone is worthless. The invalid
+    /// half can pass on a click that lands nowhere, on a form that reports no
+    /// action at all, or on a Save button that has been deleted; the valid
+    /// half is what says the click really reaches the control and really
+    /// produces `EditAction::Save` when it should. The visual test stays --
+    /// it covers a different property, which is that the user can SEE the
+    /// refusal before spending a click on it.
+    #[test]
+    fn clicking_save_on_an_invalid_draft_saves_nothing() {
+        let press = |draft: &mut EditDraft, label: &str| -> (EditAction, EditAction) {
+            let ctx = styled_context(ROOMY_PANE);
+            let no_input: &[egui::Event] = &[];
+            let _ = frame(&ctx, ROOMY_PANE, draft, true, no_input);
+            let (idle, painted) = acting_frame_for(
+                &ctx,
+                ROOMY_PANE,
+                draft,
+                true,
+                no_input,
+                None,
+                &detail::TotpState::NoSecret,
+            );
+            let at = painted.rect_of(label).center();
+            let (clicked, _) = acting_frame_for(
+                &ctx,
+                ROOMY_PANE,
+                draft,
+                true,
+                &click(at),
+                None,
+                &detail::TotpState::NoSecret,
+            );
+            (idle, clicked)
+        };
+
+        // The control first, so a green run below is a fact about the gate
+        // rather than about a harness that cannot click anything.
+        let mut valid = tallest_draft();
+        valid.name = "Ledgerline".to_string();
+        assert!(valid.is_valid(), "the control case wants a saveable draft");
+        let (idle, saved) = press(&mut valid, "Save");
+        assert_eq!(
+            idle,
+            EditAction::None,
+            "control: the form reported an action on a frame with no input at all, so the \
+             click below proves nothing"
+        );
+        assert_eq!(
+            saved,
+            EditAction::Save,
+            "control: clicking Save on a VALID draft did not save, so this harness cannot \
+             tell a working gate from a Save button it never hit"
+        );
+
+        let mut invalid = tallest_draft();
+        assert!(!invalid.is_valid(), "the case under test wants an unsaveable draft");
+        let (_, refused) = press(&mut invalid, SAVE);
+        assert_eq!(
+            refused,
+            EditAction::None,
+            "clicking Save on a draft with no name asked the caller to SAVE it. The form's \
+             only remaining defence would be the fill colour the disabled button wears"
         );
     }
 
