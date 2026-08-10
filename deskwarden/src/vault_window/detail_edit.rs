@@ -194,8 +194,17 @@ pub struct FieldDraft {
 /// `the_editor_hides_the_same_prefix_the_palette_hides` holds them together.
 const OURS_PREFIX: &str = "deskwarden:";
 
-/// The next [`FieldDraft::row_id`]. Starts at 1 so a `0` read anywhere is a
-/// draft that was built without going through one of the two constructors.
+/// The next [`FieldDraft::row_id`].
+///
+/// **Starts at 1, and that is not a sentinel.** This doc used to say that a
+/// `0` read anywhere was a draft built without going through one of the two
+/// constructors. It cannot be: `row_id` is private, `FieldDraft` derives no
+/// `Default`, and both struct literals that build one -- in
+/// [`FieldDraft::from_field`] and [`FieldDraft::new_of`] -- call this
+/// function for the value. A `0` is unconstructible, so the check that
+/// sentence invited would be dead code, and the claim was wider than the
+/// thing backing it. The count starts at 1 because a counter has to start
+/// somewhere.
 fn next_field_row_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -8783,6 +8792,24 @@ mod edit_pane_layout_tests {
     /// the shift, egui drops the focus at the end of the frame, and the answer
     /// is `None`.
     ///
+    /// **The premise is measured on the ids egui was handed, not on
+    /// `row_id`.** A `custom_fields_block` that gave every row ONE shared id
+    /// -- no identity at all, as against a shifted one -- leaves the focus
+    /// comparison below trivially green, because a shared id has nothing to
+    /// shift into. Comparing the drafts' `row_id`s could not have seen that:
+    /// those are distinct whatever the block does with them, or ignores. So
+    /// the three identities are read back out of egui, by focusing each row's
+    /// name box in turn and keeping the id egui reports.
+    ///
+    /// **And the identity has to survive the user typing.** A row id taken
+    /// from something the row *shows* -- its name, say -- passes everything
+    /// above: the three fixture names differ, so the three ids differ, and
+    /// none of them changes when a different row is removed. It is still
+    /// wrong, and visibly so: the id changes under the caret on the first
+    /// character the user types into the name box, and two rows named the
+    /// same would share one state outright. That mutant survived the whole
+    /// suite until the last block of this test was added.
+    ///
     /// The row is removed off the draft directly rather than by clicking
     /// Remove, because a click is itself an interaction with the focus system
     /// and would leave the reading ambiguous. It is the same mutation of
@@ -8798,16 +8825,6 @@ mod edit_pane_layout_tests {
             field.name = name.to_string();
             draft.fields.push(field);
         }
-        // The premise, before any pixels: the three rows really do have three
-        // different identities. A constructor that handed every row the same
-        // id would make everything below pass for the wrong reason.
-        let ids: Vec<u64> = draft.fields.iter().map(|f| f.row_id()).collect();
-        assert_eq!(ids.len(), 3, "the fixture is not three rows");
-        let mut distinct = ids.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(distinct.len(), 3, "two rows share a row_id: {ids:?}");
-
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
         assert_eq!(
@@ -8817,14 +8834,44 @@ mod edit_pane_layout_tests {
             painted.strings()
         );
 
-        // The caret goes into the LAST row, which is the one every shift moves.
-        let at = painted.rect_of("third").center();
-        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
-        let focused = ctx.memory(|m| m.focused());
-        assert!(
-            focused.is_some(),
-            "clicking the third row's name box did not focus it, so there is no state              for a shift to lose and this test proves nothing"
+        // **The premise, and it is read back off egui, not off the drafts.**
+        // The three rows must have three different identities *as widgets*.
+        // Asserting that the three [`FieldDraft::row_id`]s differ would be an
+        // assertion about the struct instead: a `custom_fields_block` that
+        // ignored `row_id` and handed every row ONE explicit id would leave
+        // that green -- and would then leave the comparison at the bottom of
+        // this test green too, trivially, because an id every row shares has
+        // nothing to shift into when a row goes. So each row's name box is
+        // focused in turn and the id egui itself reports is what is compared.
+        let mut row_focus: Vec<Option<egui::Id>> = Vec::new();
+        for name in ["first", "second", "third"] {
+            let at = painted.rect_of(name).center();
+            let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+            let id = ctx.memory(|m| m.focused());
+            assert!(
+                id.is_some(),
+                "clicking the {name:?} row's name box did not focus it, so there is no \
+                 state for a shift to lose and this test proves nothing"
+            );
+            row_focus.push(id);
+        }
+        // A set, not a sort: `egui::Id` is `Hash + Eq` and is deliberately
+        // not `Ord` -- it is a hash, and an ordering over it would mean
+        // nothing.
+        let distinct: std::collections::HashSet<Option<egui::Id>> =
+            row_focus.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the three rows' name boxes answered to fewer than three widget ids \
+             ({row_focus:?}) -- the rows are not told apart at all, so the removal below \
+             could not shift anything and everything past this point would pass on a form \
+             with no per-row identity"
         );
+
+        // The caret is left in the LAST row, which is the one every shift
+        // moves -- that was the final click of the loop above.
+        let focused = row_focus[2];
 
         draft.fields.remove(0);
         let after = frame(&ctx, pane, &mut draft, false, &[]);
@@ -8851,6 +8898,52 @@ mod edit_pane_layout_tests {
             ctx.memory(|m| m.focused()),
             focused,
             "the caret left the third row's name box when the FIRST row was removed --              the rows are still identified by their position"
+        );
+
+        // And it survives the user typing into that same box. A row
+        // identified by what it displays -- its name -- would change id under
+        // the caret on the first character, so the box the user is typing in
+        // would stop being the box that holds the focus.
+        let typed = frame(
+            &ctx,
+            pane,
+            &mut draft,
+            false,
+            &[egui::Event::Text("x".to_string())],
+        );
+        assert_eq!(
+            typed.rects_of(FIELD_NAME_LABEL).len(),
+            2,
+            "the form stopped drawing two rows while a character was typed: {:?}",
+            typed.strings()
+        );
+        // The control: the keystroke really reached the third row's name box,
+        // so the assertion after it is about a row whose name has changed.
+        let third = draft.fields.last().expect("the third row is gone").name.clone();
+        assert!(
+            third != "third" && third.len() == 6 && third.contains('x'),
+            "the typed character did not land in the third row's name box -- it reads \
+             {third:?}"
+        );
+        // One more frame, and it is load-bearing. The frame that carries the
+        // keystroke draws the row under its OLD name, so a name-salted id is
+        // still the id the focus is on when it ends; it is the NEXT frame
+        // that asks for the row under a new id and leaves the old one unseen,
+        // which is when egui drops the focus. Without this frame the
+        // assertion below is green under exactly the mutant it exists for --
+        // measured, not supposed.
+        let settled = frame(&ctx, pane, &mut draft, false, &[]);
+        assert_eq!(
+            settled.rects_of(FIELD_NAME_LABEL).len(),
+            2,
+            "the form stopped drawing two rows on the frame after the keystroke: {:?}",
+            settled.strings()
+        );
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            focused,
+            "the caret left the third row's name box as soon as the row was RENAMED -- the \
+             row is identified by something it displays, which changes under the user"
         );
     }
 

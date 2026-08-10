@@ -4421,6 +4421,18 @@ const NOTES_COPY_LABEL: &str = "Notes";
 /// The cost is one `TextEditState` entry per item whose note the user has put
 /// a caret in, for the life of the window -- bounded by the vault and by far
 /// the smaller of the two prices.
+///
+/// **Two items with equal -- or empty -- ids would share one state again,
+/// and nothing here defends against that, deliberately.** It is not a path
+/// this app has. `draw_detail_read` has one call site, in
+/// `vault_window/mod.rs`, and the item it is handed comes straight off the
+/// loaded vault list, where the id is Bitwarden's own and is what the whole
+/// pane -- copy, open, edit, delete -- already addresses the item by; two
+/// list entries sharing one would break far more than a caret. An item this
+/// app is still making has no id at all, and never reaches this function: it
+/// is a `DetailMode::Create(EditDraft)`, whose note is a separate `TextEdit`
+/// with an id egui allocates itself. A guard here would be a guard on a
+/// caller that does not exist.
 const NOTES_TEXT_ID_SALT: &str = "detail-notes-body";
 
 fn notes_text_id(item_id: &str) -> egui::Id {
