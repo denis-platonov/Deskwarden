@@ -929,6 +929,55 @@ pub fn session_torn_down(current: bool, step: LockProgress) -> bool {
     }
 }
 
+/// **Whether a failed working stage is the discovery that the teardown never
+/// ran** -- i.e. whether this is the moment to report
+/// [`LockProgress::TeardownNeverRan`] and retract the claim the lock arm made.
+///
+/// A pure function for the reason [`vault_close`] and [`session_torn_down`]
+/// are: this decision used to be three bare terms inside `run_from_vault`'s
+/// frame closure, and no test in this crate can call that closure --
+/// `eframe::Frame` has no public constructor. A rule the closure decides
+/// inline is a rule nothing checks, and a measured mutation run showed exactly
+/// that: inverting `!teardown_reported` there, and swapping
+/// [`WorkFailure::WorkerDied`] for [`WorkFailure::Deadline`], were each one
+/// token and each left the whole suite green. The first of those two IS the
+/// v0.5.0 defect restored -- a vault reporting itself locked with a full cache
+/// and a live `bw serve` -- inside the fix written for it.
+///
+/// All three arguments are load-bearing, and the table above
+/// `the_retraction_rule_is_a_table_over_every_combination_of_its_three_inputs`
+/// spells out all eight combinations rather than deriving them:
+///
+/// * **`why` must be [`WorkFailure::WorkerDied`] and not
+///   [`WorkFailure::Deadline`].** On the deadline the worker is ALIVE and
+///   mid-sequence; telling the caller to start a second teardown against a
+///   session another thread is still dismantling is the multiple-owner shape
+///   the parked estate exists to remove. It is also not needed there, and for
+///   a better reason than "the worker is probably fine": `EstatePark::with`
+///   holds the slot mutex across the whole sequence, so the caller's
+///   `park.reclaim()` BLOCKS until the teardown finishes and the worker's
+///   writes have landed. (The progress ledger's row claiming an abandoned
+///   worker "writes into an empty slot" is wrong for this host; `EstatePark`'s
+///   own doc has it right.)
+/// * **`worker_started` must hold.** Without it, the second lock of one
+///   session -- whose `FnOnce` teardown is spent, so nothing was ever spawned
+///   -- would "retract" a claim it never made. `session_torn_down` answers
+///   `false` for `TeardownAlreadySpent` from `false` anyway, so this is not
+///   currently a behaviour change, but reporting a step about a worker that
+///   does not exist is a lie the next reader would build on.
+/// * **`teardown_reported` must NOT hold.** A worker that reported
+///   `NeedsSignIn` or `Finished` and then died really did drain the cache,
+///   stop `bw serve` and take the session down; retracting there sends `main`
+///   to run a SECOND teardown against a session already dismantled, and
+///   inverting this term also stops the genuine retraction happening at all.
+pub fn retracts_the_teardown(
+    why: WorkFailure,
+    worker_started: bool,
+    teardown_reported: bool,
+) -> bool {
+    why == WorkFailure::WorkerDied && worker_started && !teardown_reported
+}
+
 /// **What one window's session produced, when the window held TWO sessions.**
 ///
 /// The in-window lock ends one vault session and (usually) starts another in
@@ -1394,17 +1443,19 @@ where
                                     // stopped or cleared. Retract the claim
                                     // here so the caller runs the recovery
                                     // that is now the only teardown this lock
-                                    // will get. NOT done for
-                                    // `WorkFailure::Deadline`: there the
-                                    // worker is alive and mid-sequence, and
-                                    // telling the caller to start a second
-                                    // teardown against a session another
-                                    // thread is still dismantling is the
-                                    // multiple-owner shape the parked estate
-                                    // exists to remove.
-                                    if why == WorkFailure::WorkerDied
-                                        && worker_started
-                                        && !teardown_reported
+                                    // will get.
+                                    //
+                                    // The CONDITION is not spelled out here.
+                                    // It was, and two one-token inversions of
+                                    // it were measured green across the whole
+                                    // suite -- so it is
+                                    // [`retracts_the_teardown`], a pure
+                                    // function with an exhaustive table, for
+                                    // the same reason `session_torn_down` is.
+                                    // Its doc carries why each of the three
+                                    // inputs is load-bearing, `Deadline`
+                                    // included.
+                                    if retracts_the_teardown(why, worker_started, teardown_reported)
                                     {
                                         log::error!(
                                             "the lock's teardown worker ended without ever \
@@ -3006,6 +3057,117 @@ mod lock_transition_tests {
         );
     }
 
+    /// **The whole of [`retracts_the_teardown`], spelled out rather than
+    /// derived** -- all eight combinations of its three inputs, in one table,
+    /// so a rewritten predicate cannot be checked against itself.
+    ///
+    /// This test exists because the condition it covers used to be three bare
+    /// terms inside `run_from_vault`'s frame closure, where nothing could
+    /// reach it. Two separate one-token inversions of it were MEASURED green
+    /// across the entire suite, and one of them was the v0.5.0 defect
+    /// restored: a worker that dies having reported nothing keeps
+    /// `relocked: true`, `main` skips its recovery, and the vault reports
+    /// itself locked with a full cache and a live `bw serve`.
+    ///
+    /// The exhaustiveness is what kills a predicate that IGNORES one of its
+    /// arguments: every input is the sole difference between some pair of rows
+    /// below, so dropping any one of the three makes two rows disagree.
+    #[test]
+    fn the_retraction_rule_is_a_table_over_every_combination_of_its_three_inputs() {
+        // (why, worker_started, teardown_reported, retracts)
+        let expected: &[(WorkFailure, bool, bool, bool)] = &[
+            // The one row that retracts, and the only one: the worker really
+            // started, it really died, and it never reported a step.
+            (WorkFailure::WorkerDied, true, false, true),
+            // It reported a step first, so the teardown really ran -- a
+            // retraction here sends `main` to tear down a session already
+            // dismantled, and the claim it retracts was true.
+            (WorkFailure::WorkerDied, true, true, false),
+            // No worker was ever spawned (the second lock of one session,
+            // `FnOnce` spent), so there is no claim of this shape to retract.
+            (WorkFailure::WorkerDied, false, false, false),
+            (WorkFailure::WorkerDied, false, true, false),
+            // The deadline: the worker is ALIVE and mid-sequence. Never.
+            (WorkFailure::Deadline, true, false, false),
+            (WorkFailure::Deadline, true, true, false),
+            (WorkFailure::Deadline, false, false, false),
+            (WorkFailure::Deadline, false, true, false),
+        ];
+        for &(why, worker_started, teardown_reported, retracts) in expected {
+            assert_eq!(
+                retracts_the_teardown(why, worker_started, teardown_reported),
+                retracts,
+                "retracts_the_teardown({why:?}, {worker_started}, {teardown_reported}) is the \
+                 wrong way round. Retracting when it should not re-runs a teardown against a \
+                 session that is already down, or against one another thread is still \
+                 dismantling; NOT retracting when it should leaves the window claiming a \
+                 teardown that never happened -- `main` skips its recovery and the vault \
+                 reports itself locked with the cache full and `bw serve` still answering"
+            );
+        }
+        assert_eq!(expected.len(), 8, "the table is no longer all eight combinations");
+        // Exhaustiveness on `WorkFailure` itself: a third variant makes this
+        // fail to compile, rather than quietly leaving four rows unwritten.
+        for &(why, ..) in expected {
+            match why {
+                WorkFailure::WorkerDied | WorkFailure::Deadline => {}
+            }
+        }
+        // Each argument is the SOLE difference across some pair of rows above,
+        // so a predicate that ignores it cannot satisfy both. Stated here as
+        // well as implied by the table, because "the table is exhaustive" and
+        // "every argument matters" are different claims.
+        assert_ne!(
+            retracts_the_teardown(WorkFailure::WorkerDied, true, false),
+            retracts_the_teardown(WorkFailure::Deadline, true, false),
+            "`why` is ignored: the deadline and a dead worker are answered alike"
+        );
+        assert_ne!(
+            retracts_the_teardown(WorkFailure::WorkerDied, true, false),
+            retracts_the_teardown(WorkFailure::WorkerDied, false, false),
+            "`worker_started` is ignored: a lock that spawned nothing retracts a claim it \
+             never made"
+        );
+        assert_ne!(
+            retracts_the_teardown(WorkFailure::WorkerDied, true, false),
+            retracts_the_teardown(WorkFailure::WorkerDied, true, true),
+            "`teardown_reported` is ignored: a worker that reported a step is treated as one \
+             that reported none"
+        );
+    }
+
+    /// The rule and [`session_torn_down`] read together, which is the claim
+    /// the window actually makes: on the one retracting row the flag really
+    /// goes back to `false`, and on the neighbouring rows it really stays set.
+    #[test]
+    fn only_the_retracting_row_puts_the_flag_back_to_false() {
+        let after_lock = session_torn_down(false, LockProgress::TeardownStarted);
+        assert!(after_lock, "control: the lock arm's own step must claim the teardown");
+        for (why, worker_started, teardown_reported) in [
+            (WorkFailure::WorkerDied, true, true),
+            (WorkFailure::Deadline, true, false),
+        ] {
+            assert!(
+                !retracts_the_teardown(why, worker_started, teardown_reported),
+                "control: this row is supposed to leave the claim standing"
+            );
+            assert!(
+                after_lock,
+                "a row that does not retract must leave `relocked` exactly as the lock arm set \
+                 it -- the window must not answer `false` about a session that IS being torn \
+                 down"
+            );
+        }
+        assert!(
+            retracts_the_teardown(WorkFailure::WorkerDied, true, false),
+            "control: the retracting row"
+        );
+        assert!(
+            !session_torn_down(after_lock, LockProgress::TeardownNeverRan),
+            "the retraction does not actually clear the flag"
+        );
+    }
+
     /// One vault result, spelled out field by field so a new field cannot be
     /// silently defaulted into these fixtures.
     fn result_with(
@@ -3116,6 +3278,167 @@ mod lock_transition_tests {
             "a window that had no vault frame at all invents a result, which `main` would read \
              as an ordinary close"
         );
+    }
+
+    /// How one non-crossing field is read out of a result. A `String` and not
+    /// the value, because `VaultWindowResult` is neither `Debug` nor `Clone`
+    /// and the six fields are six different types.
+    type FieldRead = fn(&vault_window::VaultWindowResult) -> String;
+
+    /// **The six fields [`carry_settings_forward`]'s doc says must come from
+    /// the LATER session** -- every field of `VaultWindowResult` except
+    /// `edited_settings`.
+    ///
+    /// A table rather than six assertions, so a seventh field added to the
+    /// struct is one row here rather than a whole test nobody writes. The
+    /// count is asserted against the fixtures' own field count below.
+    fn non_crossing_fields() -> [(&'static str, FieldRead); 6] {
+        [
+            ("locked", |r| format!("{}", r.locked)),
+            ("needs_reauth", |r| format!("{}", r.needs_reauth)),
+            ("switch_to", |r| format!("{:?}", r.switch_to)),
+            ("add_account", |r| format!("{}", r.add_account)),
+            ("remove_account", |r| format!("{}", r.remove_account)),
+            ("account_details", |r| format!("{:?}", r.account_details)),
+        ]
+    }
+
+    /// A result whose six non-crossing fields are ALL set to the value that
+    /// asks `main` to do something (`loud`), or all to the value that asks for
+    /// nothing (`quiet`).
+    ///
+    /// This exists because `result_with` built every one of them as `false` /
+    /// `None`, so no fixture in this file could tell a field that crossed the
+    /// lock from a field that did not: a merge that additionally did
+    /// `after.needs_reauth |= before.needs_reauth` -- a master-password prompt
+    /// on a vault the window had just rebuilt -- was measured green across the
+    /// entire suite.
+    ///
+    /// Spelled out field by field, and `edited_settings` deliberately `None`
+    /// on both sides so the crossing field is tested where it is tested and
+    /// not accidentally here.
+    fn every_field_set(loud: bool, id: &crate::accounts::AccountId) -> vault_window::VaultWindowResult {
+        vault_window::VaultWindowResult {
+            locked: loud,
+            needs_reauth: loud,
+            edited_settings: None,
+            switch_to: loud.then(|| id.clone()),
+            add_account: loud,
+            remove_account: loud,
+            account_details: loud.then(|| crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("loud@example.invalid".to_string()),
+                server_url: Some("https://example.invalid".to_string()),
+            }),
+        }
+    }
+
+    /// **THE FINDING: of the six fields the doc says must not cross the lock,
+    /// exactly one was pinned.**
+    ///
+    /// `locked` had a test; `needs_reauth`, `switch_to`, `add_account`,
+    /// `remove_account` and `account_details` had none, and every fixture in
+    /// this file built all six as `false`/`None`, so nothing could distinguish
+    /// crossing from not. A merge that additionally did
+    /// `after.needs_reauth |= before.needs_reauth` survived the whole suite:
+    /// a pre-lock re-auth request then reaches `main` about a session the
+    /// window has just REBUILT, which is a master password demanded on a live
+    /// vault.
+    ///
+    /// Both directions are checked, because they fail to different mutations:
+    /// this one to a field leaking FORWARD out of the ending session, and
+    /// [`the_rebuilt_sessions_own_requests_all_survive_the_merge`] to a field
+    /// being clobbered on the way through.
+    #[test]
+    fn no_request_of_the_ending_session_crosses_the_lock_except_the_gear_visit() {
+        let id = crate::accounts::AccountId::generate();
+        let before = every_field_set(true, &id);
+        let after = every_field_set(false, &id);
+        let fields = non_crossing_fields();
+        assert_eq!(fields.len(), 6, "the table no longer covers every non-crossing field");
+        // Control: the two fixtures really do disagree on every field, so a
+        // green run below is a fact about the merge and not about two fixtures
+        // that were equal all along -- which is precisely the state this file
+        // was in.
+        for (name, read) in fields {
+            assert_ne!(
+                read(&before),
+                read(&after),
+                "control: the two fixtures agree on `{name}`, so the assertion below cannot \
+                 tell a field that crossed the lock from one that did not"
+            );
+        }
+
+        let expected: Vec<String> = fields.iter().map(|(_, read)| read(&after)).collect();
+        let merged = carry_settings_forward(Some(before), Some(after))
+            .expect("a window with two sessions must produce a result");
+        for ((name, read), want) in fields.into_iter().zip(expected) {
+            assert_eq!(
+                read(&merged),
+                want,
+                "`{name}` crossed the lock. Every field but `edited_settings` is a request \
+                 about the session that is ENDING; carried into the rebuilt session's result \
+                 it tells `main` to act on a vault this window has already brought back -- a \
+                 lock recovery, a master-password prompt, an account switch or an account \
+                 removal against a live session"
+            );
+        }
+    }
+
+    /// The other direction: nothing the REBUILT session asked for is lost or
+    /// overwritten by the older result. Without this, a merge that simply
+    /// zeroed the six fields would pass the test above.
+    #[test]
+    fn the_rebuilt_sessions_own_requests_all_survive_the_merge() {
+        let id = crate::accounts::AccountId::generate();
+        let before = every_field_set(false, &id);
+        let after = every_field_set(true, &id);
+        let fields = non_crossing_fields();
+        for (name, read) in fields {
+            assert_ne!(
+                read(&before),
+                read(&after),
+                "control: the two fixtures agree on `{name}`"
+            );
+        }
+        let expected: Vec<String> = fields.iter().map(|(_, read)| read(&after)).collect();
+        let merged = carry_settings_forward(Some(before), Some(after))
+            .expect("a window with two sessions must produce a result");
+        for ((name, read), want) in fields.into_iter().zip(expected) {
+            assert_eq!(
+                read(&merged),
+                want,
+                "`{name}` was dropped or overwritten by the pre-lock session's answer, so a \
+                 request the user made AFTER signing back in is silently discarded"
+            );
+        }
+    }
+
+    /// The gear visit crosses in the presence of all six, which the two tests
+    /// above deliberately do not check (their fixtures carry no edit at all).
+    /// Together the three say: exactly one field crosses, and it is that one.
+    #[test]
+    fn the_gear_visit_crosses_while_the_six_beside_it_do_not() {
+        let id = crate::accounts::AccountId::generate();
+        let mut before = every_field_set(true, &id);
+        before.edited_settings = Some(edited_settings());
+        let after = every_field_set(false, &id);
+        let merged = carry_settings_forward(Some(before), Some(after))
+            .expect("a window with two sessions must produce a result");
+        assert_eq!(
+            merged.edited_settings,
+            Some(edited_settings()),
+            "the gear visit made before the lock did not survive alongside the six fields that \
+             must not"
+        );
+        for (name, read) in non_crossing_fields() {
+            assert_eq!(
+                read(&merged),
+                read(&every_field_set(false, &id)),
+                "`{name}` crossed the lock when a gear visit was present, so the one field \
+                 that is allowed to cross drags the other six with it"
+            );
+        }
     }
 }
 
@@ -3290,6 +3613,103 @@ mod lock_host_tests {
                  rule is defined over is never actually reported by the window: {closure}"
             );
         }
+    }
+
+    /// **The retraction ASKS [`retracts_the_teardown`]; it does not decide
+    /// inline.**
+    ///
+    /// The unit table above holds the rule to all eight combinations of its
+    /// inputs. This is the other half, and it is the half that was missing:
+    /// the condition selecting the retraction lived in this closure as three
+    /// bare terms, and two separate one-token inversions of it -- inverting
+    /// `!teardown_reported`, and `WorkerDied` for `Deadline` -- were MEASURED
+    /// green across the whole suite. `eframe::Frame` has no public
+    /// constructor, so nothing behavioural in this crate can reach the arm; a
+    /// source pin on the call is what ties the closure to the tabled rule.
+    ///
+    /// The call is pinned AS WRITTEN, arguments and order included, so a
+    /// swapped pair is caught here rather than by the rule (which cannot see
+    /// it -- both are `bool`).
+    #[test]
+    fn the_retraction_asks_the_rule_rather_than_deciding_it_inline() {
+        let closure = closure();
+        assert_eq!(
+            closure
+                .matches(concat!(
+                    "retracts_the_teardown(why, worker_started, ",
+                    "teardown_reported)"
+                ))
+                .count(),
+            1,
+            "the vault host does not select the retraction through `retracts_the_teardown`, \
+             called exactly once with `why`, `worker_started` and `teardown_reported` in that \
+             order. A MISSING call is a lock whose teardown never ran still reporting itself \
+             torn down -- `main` skips the only recovery it can get and the vault says locked \
+             with the cache full and `bw serve` answering. A SECOND call is a second decision \
+             point the rule does not govern: {closure}"
+        );
+        // The inline shape, banned term by term. Each of these three is one of
+        // the mutations that survived when the condition lived here.
+        for (fragment, why) in [
+            (
+                concat!("why == WorkFailure::", "WorkerDied"),
+                "the host tests the failure kind itself again, so which kinds retract is back \
+                 to being a decision no test can reach",
+            ),
+            (
+                concat!("&& worker_", "started"),
+                "the host conjoins `worker_started` inline instead of handing it to the rule",
+            ),
+            (
+                concat!("!teardown_", "reported"),
+                "the host negates `teardown_reported` inline -- the exact term whose inversion \
+                 restored the v0.5.0 defect and left the whole suite green",
+            ),
+        ] {
+            assert!(
+                !closure.contains(fragment),
+                "{why}: {fragment:?} is back in the vault host: {closure}"
+            );
+        }
+        // Positive controls. The two facts the rule is asked about are really
+        // maintained here, and the call really does guard the retraction --
+        // otherwise the pin above would be a call whose answer is discarded.
+        for (needle, why) in [
+            (
+                concat!("worker_started = ", "true;"),
+                "nothing in the host ever records that a worker started, so the rule is asked \
+                 about a flag that is always `false` and the retraction never fires",
+            ),
+            (
+                concat!("teardown_reported = ", "true;"),
+                "nothing in the host ever records that a step arrived, so the rule is asked \
+                 about a flag that is always `false` and a genuine teardown gets retracted",
+            ),
+            (
+                concat!("LockProgress::", "TeardownNeverRan)"),
+                "control: the step the retraction reports is not in this closure at all, so \
+                 the call pinned above guards nothing",
+            ),
+        ] {
+            assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
+        }
+        // The call and the write it guards are adjacent -- the retraction is
+        // not a call whose answer is computed and then thrown away.
+        let at = closure
+            .find(concat!("retracts_the_teardown(why, worker_started, ", "teardown_reported)"))
+            .expect("counted just above");
+        let write = closure
+            .find(concat!("session_torn_down(was, LockProgress::", "TeardownNeverRan)"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the retraction's write of `relocked` is not in this closure: {closure}"
+                )
+            });
+        assert!(
+            write > at && write - at < 1_200,
+            "the retraction's write is not inside the block the rule guards, so the rule's \
+             answer is computed and discarded -- a correct condition reaching nothing"
+        );
     }
 
     /// **The lock actually starts the teardown**, on a thread.
