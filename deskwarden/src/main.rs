@@ -18984,6 +18984,95 @@ mod startup_shape_tests {
         region
     }
 
+    /// The post-window engine rebuild, spelled once. Split so this file does
+    /// not hold a second literal copy of a production line the counts above
+    /// are taken over.
+    const ARMED_FROM_A_PRE_WINDOW_SNAPSHOT: &str =
+        concat!("estate.engine.rebuild(&startup_entries.", "borrow());");
+
+    /// **The rebuild is a statement, not a decision** -- `Ok` only when it
+    /// stands alone, unconditionally, on the line immediately after the log
+    /// that opens the region.
+    ///
+    /// **Why this exists, and what it is worth.** Step 8.2 pinned the rebuild
+    /// by its exact text so that step 4 -- the step that moves the teardown
+    /// INSIDE the startup window, inverting the order and making this line the
+    /// last word -- would have to come back through the guard rather than
+    /// discover the problem in the field. That pin does not do it. It asserts
+    /// PRESENCE and PROVENANCE: the text occurs, and `engine.rebuild(` occurs
+    /// once in the region. **Wrapping the line in any conditional keeps both
+    /// true**, so the one edit step 4 is explicitly instructed to make -- "make
+    /// the rebuild conditional on whether the window tore the session down" --
+    /// walked straight past the test written to catch it. Measured, not
+    /// argued: the line wrapped in `if startup_vault.is_none() { .. }` passed
+    /// the whole suite, while behaving exactly like DELETING it (autofill dead
+    /// for the session, no diagnostic) -- the mutation step 8.2 reports as
+    /// killed.
+    ///
+    /// So the guard has to pin the third property as well: that the statement
+    /// is UNCONDITIONAL **today**. It is deliberately brittle. Any conditional
+    /// -- `if`, `if let`, `match`, `.then(..)`, a flag computed on a line
+    /// above -- turns this red, and red is the correct answer: step 4's
+    /// obligation is to rewrite this clause saying what the condition now is,
+    /// not to satisfy it.
+    ///
+    /// Returns `Err` rather than asserting so that
+    /// [`the_unconditional_clause_can_see_a_conditional_rebuild`] can feed it
+    /// mutated regions and prove each one is rejected. A source guard whose
+    /// failure path is never exercised is the shape that failed here before.
+    ///
+    /// `trim_end` on every line and never a `\r\n` in a needle: this tree is
+    /// CRLF in the working copy and LF in the blob, and `str::lines` leaves
+    /// the `\r` on.
+    fn the_rebuild_is_unconditional(region: &str) -> Result<(), String> {
+        let lines: Vec<&str> = region.lines().map(str::trim_end).collect();
+        let alone: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == ARMED_FROM_A_PRE_WINDOW_SNAPSHOT)
+            .map(|(at, _)| at)
+            .collect();
+        if alone.len() != 1 {
+            return Err(format!(
+                "{} line(s) below the startup window are nothing but \
+                 {ARMED_FROM_A_PRE_WINDOW_SNAPSHOT:?}, rather than exactly one. A rebuild \
+                 folded onto a line that carries anything else -- a one-line \
+                 `if .. {{ .. }}`, a `.then(|| ..)`, a `match` arm -- is a conditional \
+                 rebuild wearing the pinned text, which is the edit this clause exists to \
+                 stop being silent",
+                alone.len()
+            ));
+        }
+        let at = alone[0];
+        let expected_line =
+            concat!("    estate.engine.rebuild(&startup_entries.", "borrow());");
+        if lines[at] != expected_line {
+            return Err(format!(
+                "the rebuild is spelled {:?}, not at the four spaces of `main`'s own body. \
+                 Deeper indentation means it is nested inside a block that was opened \
+                 above it -- which is what making it conditional looks like",
+                lines[at]
+            ));
+        }
+        // Nothing whatever between the log that opens the region and the
+        // statement: not a wrapper, not a `let` computing a flag for one.
+        let between = &lines[..at];
+        let opening: &[&str] = &[
+            "\",",
+            concat!("        startup_entries.borrow().", "len()"),
+            "    );",
+        ];
+        if between != opening {
+            return Err(format!(
+                "the lines between the engine log and the rebuild are {between:?} rather \
+                 than {opening:?} -- something now stands between them. If that is step 4's \
+                 condition on whether the window tore the session down, this clause is the \
+                 one to rewrite, deliberately, saying what the condition is"
+            ));
+        }
+        Ok(())
+    }
+
     /// **The initialisation order the in-window lock's step 2 had to decide,
     /// written down as a check rather than as a comment.**
     ///
@@ -19110,8 +19199,6 @@ mod startup_shape_tests {
         // 3. THE EXCEPTION, pinned by its exact text. See this test's doc for
         //    why it is safe today and why it stops being safe the moment the
         //    teardown moves inside the window.
-        const ARMED_FROM_A_PRE_WINDOW_SNAPSHOT: &str =
-            concat!("estate.engine.rebuild(&startup_entries.", "borrow());");
         assert_eq!(
             region.matches(concat!("engine.rebuild", "(")).count(),
             1,
@@ -19127,6 +19214,88 @@ mod startup_shape_tests {
              because the arming moved, autofill is being armed from somewhere this test \
              cannot see"
         );
+
+        // 4. AND IT IS UNCONDITIONAL, which clause 3 alone does not say. A
+        //    line wrapped in an `if` still occurs, still occurs once, and is
+        //    still spelled exactly the same -- so clauses 1 and 3 pass on the
+        //    one edit step 4 is instructed to make, while the behaviour is
+        //    identical to deleting the line. See
+        //    [`the_rebuild_is_unconditional`].
+        if let Err(why) = the_rebuild_is_unconditional(region) {
+            panic!(
+                "{why}\n\nThe post-window engine rebuild is no longer an unconditional \
+                 statement. That may well be RIGHT -- it is obligation 2 of the four this \
+                 file's step-8.2 answer left for the step that moves the teardown inside \
+                 the startup window. It is not something to make green: rewrite this clause \
+                 and the doc above it to say what the rebuild is now conditional ON, and why \
+                 that condition is the one that distinguishes a window that tore the session \
+                 down from one that did not."
+            );
+        }
+    }
+
+    /// **The positive control for clause 4**: every shape a conditional
+    /// rebuild arrives in is REJECTED by [`the_rebuild_is_unconditional`].
+    ///
+    /// Clause 4 is a source-analysis guard, which is the class that has failed
+    /// in this file before -- clause 3 is one, and it is green on the mutant
+    /// it was written to stop. A source guard that has never been shown to
+    /// fail is indistinguishable from one that cannot. So this drives the
+    /// predicate over the real region (which must pass) and over five mutated
+    /// copies of it (each of which must not), the five being the ways an
+    /// "make the rebuild conditional" edit really lands -- and only ONE of
+    /// them is spelled `if` at the front of a reindented block.
+    #[test]
+    fn the_unconditional_clause_can_see_a_conditional_rebuild() {
+        let region = after_the_startup_window();
+        assert_eq!(
+            the_rebuild_is_unconditional(region),
+            Ok(()),
+            "control: the rebuild as it stands today is rejected, so every rejection below \
+             proves nothing about the mutation and only that the predicate never passes"
+        );
+
+        let stmt = ARMED_FROM_A_PRE_WINDOW_SNAPSHOT;
+        let here = format!("    {stmt}");
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "wrapped in an `if` and reindented, the tidy version of step 4's edit",
+                format!("    if startup_vault.is_none() {{\r\n        {stmt}\r\n    }}"),
+            ),
+            (
+                "wrapped in an `if` WITHOUT reindenting, the hurried version",
+                format!("    if startup_vault.is_none() {{\r\n    {stmt}\r\n    }}"),
+            ),
+            (
+                "folded onto one line, so the block never opens a line of its own",
+                format!("    if startup_vault.is_none() {{ {stmt} }}"),
+            ),
+            (
+                "not spelled `if` at all -- a `.then` on the condition",
+                String::from(
+                    "    startup_vault.is_none().then(|| estate.engine.rebuild(&\
+                     startup_entries.borrow()));",
+                ),
+            ),
+            (
+                "not spelled `if` at all -- the flag computed on the line above, the \
+                 statement itself untouched",
+                format!("    let armed = startup_vault.is_none() && armed;\r\n{here}"),
+            ),
+        ];
+        for (what, replacement) in &cases {
+            let mutated = region.replacen(&here, replacement, 1);
+            assert_ne!(
+                mutated, region,
+                "control: the {what} case did not change the region, so the rejection below \
+                 would be a rejection of the untouched source"
+            );
+            assert!(
+                the_rebuild_is_unconditional(&mutated).is_err(),
+                "a rebuild {what} is accepted by clause 4. That is the hole clause 3 already \
+                 has, moved one step along"
+            );
+        }
     }
 
     /// **A startup window closed without a session ends the process, and that
