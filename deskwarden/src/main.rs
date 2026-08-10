@@ -530,6 +530,45 @@ fn main() {
     // check that both paths produce one than a reviewer is.
     let mut session_token: String;
 
+    // Outcome of a background operation that starts or restarts `bw serve`:
+    // either `open_vault_window` making sure it's up before showing the
+    // window, or the tray's "Sync" item forcing a resync. Reported back here
+    // rather than joined inline on whichever thread kicked it off --
+    // `try_start_backend` can take up to 30s (a port-release wait plus a
+    // synchronous `bw sync`), and blocking on that before returning control
+    // to the main loop used to freeze the tray, hotkey, and window-watching
+    // for the whole wait -- see the fix note on `open_vault_window`.
+    //
+    // Both operations funnel through this one channel (rather than one each)
+    // so the estate's `task_in_progress` can guarantee at most one is ever
+    // in flight: two `try_start_backend` calls racing to bind the same port
+    // would make one fail for a reason that has nothing to do with a real
+    // problem, and it also means there is exactly one place -- not two -- a
+    // lock event has to drain before it can safely stop/restart the backend
+    // itself (see `open_vault_window`'s `locked` branch).
+    //
+    // Behind an `Arc<Mutex<_>>` rather than owned outright: the drain above
+    // is the one the teardown path performs before it stops and restarts
+    // `bw serve`, and that path is moving onto a worker thread. Sharing the
+    // receiver changes nothing about who drains it -- there is still exactly
+    // one consumer at any instant, because the lock says so -- it changes
+    // only whether that consumer has to be THIS thread.
+    //
+    // **Created HERE, above the startup branch, rather than beside its first
+    // reader ~450 lines below.** Nothing between this line and that first
+    // reader touches either half, so where it is built is not a behavioural
+    // question today -- but it stops being free the moment the in-window
+    // teardown runs INSIDE the startup window: that sequence's first act is
+    // the bounded drain of this receiver, so the worker the startup host
+    // spawns has to be handed it BEFORE `app_window::run` is called. Building
+    // it after the branch would leave the startup host with nothing to hand
+    // over. It captures nothing, reads no estate field, and is none of the six
+    // initialisations `the_startup_windows_initialisations_stay_below_it_and_
+    // read_the_estate` pins BELOW the window -- all of which must stay below
+    // it, and none of which this is.
+    let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
+    let backend_op_rx = Arc::new(Mutex::new(backend_op_rx));
+
     // **Both arms below END with a `SessionEstate`, and everything after the
     // branch reads it.**
     //
@@ -578,7 +617,9 @@ fn main() {
     //   (`BackendOpKind`) this is, so the wedge-deadline check can report a
     //   stall in terms of what was actually requested (review Minor 4) instead
     //   of always assuming a sync. Nothing has started one here: the channel
-    //   it would be set beside does not exist until after the branch.
+    //   it would be reported over now exists just above, but nothing has been
+    //   sent on it -- the only senders are `spawn_backend_start`'s callers,
+    //   all of which are below the branch.
     let mut estate = if let Some(token) = cached_session {
     session_token = token;
     bw_serve_child = Some(start_backend(&session_token, job_ref(&job)));
@@ -1018,31 +1059,6 @@ fn main() {
         );
     }
 
-    // Outcome of a background operation that starts or restarts `bw serve`:
-    // either `open_vault_window` making sure it's up before showing the
-    // window, or the tray's "Sync" item forcing a resync. Reported back here
-    // rather than joined inline on whichever thread kicked it off --
-    // `try_start_backend` can take up to 30s (a port-release wait plus a
-    // synchronous `bw sync`), and blocking on that before returning control
-    // to the main loop used to freeze the tray, hotkey, and window-watching
-    // for the whole wait -- see the fix note on `open_vault_window`.
-    //
-    // Both operations funnel through this one channel (rather than one each)
-    // so the estate's `task_in_progress` can guarantee at most one is ever
-    // in flight: two `try_start_backend` calls racing to bind the same port
-    // would make one fail for a reason that has nothing to do with a real
-    // problem, and it also means there is exactly one place -- not two -- a
-    // lock event has to drain before it can safely stop/restart the backend
-    // itself (see `open_vault_window`'s `locked` branch).
-    //
-    // Behind an `Arc<Mutex<_>>` rather than owned outright: the drain above
-    // is the one the teardown path performs before it stops and restarts
-    // `bw serve`, and that path is moving onto a worker thread. Sharing the
-    // receiver changes nothing about who drains it -- there is still exactly
-    // one consumer at any instant, because the lock says so -- it changes
-    // only whether that consumer has to be THIS thread.
-    let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
-    let backend_op_rx = Arc::new(Mutex::new(backend_op_rx));
     // Tray menu clicks that arrived while one of this app's blocking windows
     // was up and SURVIVED the sweep that runs when it closes -- i.e. requests
     // that window did not answer. Popped before the channel below, so they are
