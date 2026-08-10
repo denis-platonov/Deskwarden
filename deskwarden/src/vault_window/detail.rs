@@ -2406,7 +2406,7 @@ pub fn draw_detail_read(
     // is last by the same rule as every other kind rather than by accident.
     if let Some(notes) = notes_text(item) {
         card(ui, "NOTES", |ui| {
-            notes_body(ui, notes, &mut action);
+            notes_body(ui, &item.id, notes, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -4302,7 +4302,7 @@ fn card_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) {
 ///
 /// The frame, the margin and the width are [`card_text`]'s, so the note still
 /// sits on the same left edge as every row label on the pane.
-fn notes_body(ui: &mut egui::Ui, notes: &str, action: &mut DetailAction) {
+fn notes_body(ui: &mut egui::Ui, item_id: &str, notes: &str, action: &mut DetailAction) {
     let scope = ui.scope_builder(
         egui::UiBuilder::new().sense(egui::Sense::click()),
         |ui| {
@@ -4319,7 +4319,7 @@ fn notes_body(ui: &mut egui::Ui, notes: &str, action: &mut DetailAction) {
                     // selection work, typing does nothing.
                     let mut source = notes;
                     egui::TextEdit::multiline(&mut source)
-                        .id(notes_text_id())
+                        .id(notes_text_id(item_id))
                         // No box, no fill, no margin of its own: this must
                         // look exactly like the paragraph it replaced, whose
                         // left edge is the card's `CARD_PAD_X`.
@@ -4369,18 +4369,43 @@ fn notes_body(ui: &mut egui::Ui, notes: &str, action: &mut DetailAction) {
 /// the test cannot disagree about it.
 const NOTES_COPY_LABEL: &str = "Notes";
 
-/// The note's `TextEdit` id.
+/// The note's `TextEdit` id: **this constant AND the item's own id**.
 ///
-/// **Fixed rather than left to egui's auto-id.** A selection lives in
-/// `TextEditState`, which is keyed on the widget's id, and an id derived
-/// from source position is one `a_note_can_be_selected_without_copying_the_
-/// whole_thing` cannot ask for -- so the selection half of this card would
-/// have had no assertion at all. It is also what keeps the caret where the
-/// user put it when the pane repaints.
+/// **Named rather than left to egui's auto-id**, because a selection lives in
+/// `TextEditState`, which is keyed on the widget's id, and an id derived from
+/// source position is one `a_note_can_be_selected_without_copying_the_whole_
+/// thing` cannot ask for -- so the selection half of this card would have had
+/// no assertion at all. It is also what keeps the caret where the user put it
+/// when the pane repaints.
+///
+/// **Keyed on the item, and that half is not about testability at all.** The
+/// salt alone was a GLOBAL id, so every item this pane ever showed shared one
+/// `TextEditState`. Drag-select thirty characters of one item's note, click
+/// the next item in the list, and its note came up with its first thirty
+/// characters already selected -- a selection the user never made, over text
+/// they had not read, on the copy target of the whole card. Measured, before
+/// this: `Some(CCursorRange { primary: CharIndex(30), secondary: CharIndex(0)
+/// })` still loaded after the pane had been handed a different item with an
+/// unrelated note.
+///
+/// So the id was chosen for a test and bought cross-item state no test
+/// reached, which is this file's recurring defect. **Both are kept**: the id
+/// is still something a test can name -- it just has to name the item too,
+/// which the test already has -- and `a_notes_selection_does_not_follow_the_
+/// user_to_the_next_item` is the assertion that the sharing is gone.
+///
+/// Salting rather than clearing the state on a change of item was the choice
+/// because "the shown item changed" is not a fact this pane holds: it is
+/// handed an item per frame and remembers nothing between frames, so a clear
+/// would have needed new state whose only job was to notice. A distinct id
+/// per item needs none: egui simply never finds the other item's cursor.
+/// The cost is one `TextEditState` entry per item whose note the user has put
+/// a caret in, for the life of the window -- bounded by the vault and by far
+/// the smaller of the two prices.
 const NOTES_TEXT_ID_SALT: &str = "detail-notes-body";
 
-fn notes_text_id() -> egui::Id {
-    egui::Id::new(NOTES_TEXT_ID_SALT)
+fn notes_text_id(item_id: &str) -> egui::Id {
+    egui::Id::new((NOTES_TEXT_ID_SALT, item_id))
 }
 
 /// [`card_text`] with a second run after the first: the same frame, the same
@@ -7490,7 +7515,7 @@ mod tests {
         let _ = dragged;
 
         // HALF ONE: a real, PARTIAL selection exists.
-        let range = notes_selection(&pane.ctx)
+        let range = notes_selection(&pane.ctx, &item.id)
             .expect("the note carries no text cursor at all, so nothing can be selected");
         let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
         assert!(
@@ -7518,11 +7543,218 @@ mod tests {
         );
     }
 
-    /// The note's text cursor, straight out of egui's own `TextEdit` state --
-    /// which is the only place a selection exists, and the reason the widget
-    /// is given a stable id.
-    fn notes_selection(ctx: &egui::Context) -> Option<egui::text_selection::CCursorRange> {
-        egui::text_edit::TextEditState::load(ctx, notes_text_id())?.cursor.char_range()
+    /// The note's text cursor for ONE item, straight out of egui's own
+    /// `TextEdit` state -- which is the only place a selection exists, and the
+    /// reason the widget is given a named id.
+    ///
+    /// The item id is a parameter rather than baked in precisely because the
+    /// widget id carries it: that is what makes
+    /// `a_notes_selection_does_not_follow_the_user_to_the_next_item` able to
+    /// ask the question "and what does the OTHER item's note think" at all.
+    fn notes_selection(
+        ctx: &egui::Context,
+        item_id: &str,
+    ) -> Option<egui::text_selection::CCursorRange> {
+        egui::text_edit::TextEditState::load(ctx, notes_text_id(item_id))?.cursor.char_range()
+    }
+
+    /// A second noted item, distinct from `a_noted_item(Some(1))` in the only
+    /// two ways that matter here: **a different id, and a different note.**
+    ///
+    /// The NAME is deliberately left alone -- both are `an_item`'s "Sample" --
+    /// so an id salted with the item's name rather than its id is not told
+    /// apart from the real thing by accident.
+    fn another_noted_item() -> VaultItem {
+        let mut item = a_noted_item(Some(1));
+        item.id = "id-2".to_string();
+        item.notes = Some(ANOTHER_NOTE.to_string().into());
+        item
+    }
+
+    /// Long, and sharing no prefix with [`A_NOTE`], so a range measured on one
+    /// is meaningless on the other.
+    const ANOTHER_NOTE: &str = "Spare key with the neighbour at number eleven.";
+
+    /// **A selection made in one item's note does not follow the user to the
+    /// next item.**
+    ///
+    /// The note's `TextEdit` id used to be one global constant, so egui's
+    /// `TextEditState` -- which is keyed on that id -- was shared by every
+    /// item this pane ever showed. Drag thirty characters of one note, click
+    /// the next item, and its note came up with its first thirty characters
+    /// already selected: a selection over text the user had not read, on the
+    /// copy target of the whole card. See [`NOTES_TEXT_ID_SALT`].
+    ///
+    /// **Three assertions, and the first two are the controls.** A test that
+    /// only asked the second item for a selection would pass just as well
+    /// against a pane that had stopped drawing notes at all, or against one
+    /// where the drag never selected anything in the first place.
+    #[test]
+    fn a_notes_selection_does_not_follow_the_user_to_the_next_item() {
+        let first = a_noted_item(Some(1));
+        let second = another_noted_item();
+        assert_ne!(first.id, second.id, "the two fixtures are the same item");
+        assert_eq!(
+            first.name, second.name,
+            "the fixtures differ by name too, so an id salted with the NAME would pass"
+        );
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&first, &TotpState::NoSecret);
+        let text = laid_out.rect_of(A_NOTE);
+        let from = egui::pos2(text.left() + 2.0, text.center().y);
+        let to = egui::pos2(text.left() + text.width() * 0.6, text.center().y);
+        let _ = pane.frame(
+            &first,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = pane.frame(&first, &TotpState::NoSecret, vec![egui::Event::PointerMoved(to)]);
+        let _ = pane.frame(
+            &first,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(to),
+                egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+
+        // CONTROL ONE: the drag really did select part of the first note.
+        // Without this the whole test is satisfied by a pane on which nothing
+        // is ever selectable.
+        let selected = notes_selection(&pane.ctx, &first.id)
+            .map(|r| r.primary.index.0.abs_diff(r.secondary.index.0))
+            .unwrap_or(0);
+        assert!(
+            selected > 0,
+            "the drag selected nothing in the first item's note, so there is no state              for the second item to inherit and this test proves nothing"
+        );
+
+        // The pane is now handed a DIFFERENT item -- the list click, as far as
+        // this function can see it.
+        let switched = pane.idle(&second, &TotpState::NoSecret);
+
+        // CONTROL TWO: the second item's note really is on screen. egui culls
+        // a shape outside the screen rect entirely, and a pane that drew no
+        // note at all would carry no selection either.
+        assert!(
+            switched.painted(ANOTHER_NOTE),
+            "the second item's note was never painted, so 'no selection' is not a              claim about a note; the frame painted: {:?}",
+            switched.strings()
+        );
+        assert!(
+            !switched.painted(A_NOTE),
+            "the pane is still painting the FIRST item's note, so it was never handed              the second one"
+        );
+
+        // THE FINDING: nothing is selected in it.
+        let inherited = notes_selection(&pane.ctx, &second.id);
+        let inherited_len = inherited
+            .map(|r| r.primary.index.0.abs_diff(r.secondary.index.0))
+            .unwrap_or(0);
+        assert_eq!(
+            inherited_len, 0,
+            "the second item's note came up with {inherited_len} characters already              selected ({inherited:?}) -- the first item's selection followed the user"
+        );
+
+        // And the first item's own selection is still its own: the sharing is
+        // gone because the ids differ, not because the state was wiped.
+        let kept = notes_selection(&pane.ctx, &first.id)
+            .map(|r| r.primary.index.0.abs_diff(r.secondary.index.0))
+            .unwrap_or(0);
+        assert_eq!(
+            kept, selected,
+            "the first item's selection was destroyed rather than kept apart, so              coming back to it loses the caret"
+        );
+    }
+
+    /// **Every chord this pane owns still fires while the note holds keyboard
+    /// focus.**
+    ///
+    /// The note is a multiline `TextEdit` and a focused one is a keyboard
+    /// consumer: egui's own text machinery takes the arrows, Home/End and
+    /// Ctrl+A out of the event queue before anything downstream sees them.
+    /// Nothing had ever asked whether CTRL+B, CTRL+U and CTRL+SHIFT+U survive
+    /// that.
+    ///
+    /// They do, and the reason is ORDER, not luck: [`draw_detail_read`] calls
+    /// `consume_chord` at the top of the function, before a single card is
+    /// laid out, so the chord is out of the queue before the note exists this
+    /// frame. This test is what makes that an assertion rather than a reading
+    /// of the source -- and what fails if a later change either moves the
+    /// consumption below the body or teaches it to stand down when something
+    /// has focus.
+    ///
+    /// The focus is asserted, not assumed: a test that thought it had focused
+    /// the note and had not would be an ordinary chord test wearing a
+    /// misleading name.
+    #[test]
+    fn every_pane_chord_still_fires_while_the_note_holds_focus() {
+        let mut item = a_login();
+        item.notes = Some(A_NOTE.to_string().into());
+
+        let mut fired = 0;
+        for (chord, events, expected) in [
+            ("CTRL+B", ctrl(egui::Key::B), DetailAction::CopyPassword),
+            ("CTRL+U", ctrl(egui::Key::U), DetailAction::CopyUsername),
+            (
+                "CTRL+SHIFT+U",
+                vec![egui::Event::Key {
+                    key: egui::Key::U,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                }],
+                DetailAction::CopyValue(WEBSITE.to_string()),
+            ),
+        ] {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                laid_out.painted(A_NOTE),
+                "{chord}: the fixture drew no note at all, so nothing can hold focus"
+            );
+
+            // The note is focused the way the window's own Ctrl+K focuses the
+            // search box -- through egui's memory -- and then given a frame to
+            // take it up.
+            pane.ctx.memory_mut(|m| m.request_focus(notes_text_id(&item.id)));
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                pane.ctx.memory(|m| m.has_focus(notes_text_id(&item.id))),
+                "{chord}: the note never took keyboard focus, so this frame is not the                  case this test is named for"
+            );
+
+            let after = pane.frame(&item, &TotpState::NoSecret, events);
+            assert_eq!(
+                after.action, expected,
+                "{chord} reported {:?} while the note had focus -- the text field ate it",
+                after.action
+            );
+            // Still focused afterwards: the chord was answered without the
+            // pane having to take the note's focus away to do it, which would
+            // move the user's caret out from under them.
+            assert!(
+                pane.ctx.memory(|m| m.has_focus(notes_text_id(&item.id))),
+                "{chord} stole the note's focus to fire"
+            );
+            fired += 1;
+        }
+        assert_eq!(fired, 3, "the chord loop visited {fired} chords, not 3");
     }
 
     /// **An empty password draws no row: no label, no bullets, no eye, and no
