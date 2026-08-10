@@ -4807,10 +4807,10 @@ mod auth_in_flight_tests {
 pub(crate) mod password_lifetime_tests {
     use super::*;
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     /// Long and distinctive: it must not occur by chance in an unrelated
     /// freed block, and it must be longer than a machine word so a partial
@@ -4848,18 +4848,55 @@ pub(crate) mod password_lifetime_tests {
     ///
     /// [`SEEN_ANYWHERE`] is process-global, so two probes armed concurrently
     /// would read each other's leaks. Both entry points take this for the
-    /// whole of their armed window, which makes the global flag unambiguous
-    /// and costs nothing outside those windows.
+    /// whole of their armed window, which makes the global flag unambiguous.
     ///
-    /// **The limit that remains, precisely.** Serialising the *armed windows*
-    /// does not serialise the tests around them: a test that builds probe
-    /// plaintext, arms, disarms, and only then drops it can free that block
-    /// while a different test is armed, and the free would be attributed to
-    /// the wrong probe. Every call site in this crate keeps its probe data
-    /// inside the closure it passes, which is what makes that not happen; a
-    /// new one that does not would show up as a cross-thread report from a
-    /// test that spawned nothing.
+    /// **It is held past the armed window, to the end of the test thread.**
+    /// That is [`PROBE_HOLD`], and it is not an optimisation -- serialising
+    /// only the armed windows left a hole that was a live flake, reproduced
+    /// 20 times out of 20 by running
+    /// `vault_cache::tests::a_custom_field_value_does_not_reach_the_allocator_in_the_clear`
+    /// beside `a_custom_field_name_is_still_a_plain_string` at
+    /// `--test-threads=2`. The name test builds a fixture whose field *name*
+    /// is [`PROBE`] and drops a clone of it **outside** any armed window; with
+    /// the value test armed on another thread, the global scan attributed that
+    /// free to the value test, whose own body was clean, and
+    /// [`plaintext_reached_the_allocator`]'s cross-check panicked. Noise, not
+    /// blindness -- but noise landing on a security test, and the obvious way
+    /// to quieten it is to delete the cross-check, which would trade a false
+    /// positive for the false negative that check exists to prevent.
     static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// [`PROBE_LOCK`], taken at this thread's **first** arm and released
+        /// only when the thread ends -- which, under libtest, is when the test
+        /// ends. This is what serialises the *tests* rather than only their
+        /// armed windows.
+        ///
+        /// **Why the whole test and not the window.** A probe test's fixture
+        /// building, its snapshot clones and its final drops all touch probe
+        /// plaintext outside the window it arms. Those frees are invisible to
+        /// its own verdict but perfectly visible to whatever *other* probe
+        /// test is armed at that instant, because the scan is global. Holding
+        /// from the first arm covers all of it, because every probe test in
+        /// this crate arms its positive control as its first probe act -- the
+        /// house rule that each of them asserts its control first is what
+        /// makes this cover the whole body, and a new probe test that
+        /// allocates probe plaintext *before* its first arm would sit outside
+        /// the hold again.
+        ///
+        /// Reentrant by inspection: a second arm on a thread that already
+        /// holds it re-uses the hold instead of deadlocking on a
+        /// non-reentrant `Mutex`.
+        static PROBE_HOLD: RefCell<Option<MutexGuard<'static, ()>>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Whether this thread is holding [`PROBE_LOCK`] through [`PROBE_HOLD`].
+    /// The observable the serialisation test asserts on; deliberately not a
+    /// cross-thread `try_lock`, which would race a third probe test.
+    fn this_thread_holds_the_probe_lock() -> bool {
+        PROBE_HOLD.with(|held| held.borrow().is_some())
+    }
 
     struct Watcher;
 
@@ -4962,7 +4999,17 @@ pub(crate) mod password_lifetime_tests {
         // does exactly that -- and a poisoned lock here would turn one
         // deliberate panic into a cascade of unrelated failures. The data is
         // `()`; there is no invariant to have been broken.
-        let _held = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        //
+        // Taken into `PROBE_HOLD` rather than a local, so it outlives this
+        // window and covers the rest of the test around it; see `PROBE_HOLD`.
+        // The `borrow_mut` is dropped before `body` runs, so a nested arm on
+        // this thread re-borrows cleanly and finds the hold already there.
+        PROBE_HOLD.with(|held| {
+            let mut held = held.borrow_mut();
+            if held.is_none() {
+                *held = Some(PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+        });
         SEEN.with(|seen| seen.set(false));
         SEEN_ANYWHERE.store(false, Ordering::Relaxed);
 
@@ -5110,6 +5157,50 @@ pub(crate) mod password_lifetime_tests {
         assert!(
             plaintext_reached_the_allocator(move || drop(bare)),
             "the instrument did not recover from an unwind out of an armed window"
+        );
+    }
+
+    /// **The armed windows were serialised; the tests around them were not.**
+    ///
+    /// That gap was a live flake, not a hypothetical: with
+    /// `vault_cache::tests::a_custom_field_value_does_not_reach_the_allocator_in_the_clear`
+    /// run beside `a_custom_field_name_is_still_a_plain_string` at
+    /// `--test-threads=2`, the value test failed 20 times out of 20 on the
+    /// cross-thread cross-check, because the name test frees a [`PROBE`]-
+    /// bearing `String` outside any window it arms and the scan is global.
+    ///
+    /// The fix is that [`PROBE_LOCK`] is now held from a thread's first arm
+    /// until the thread ends, so no second probe test runs *at all* -- window
+    /// or not -- while one is in flight. This pins that, and it is the only
+    /// assertion that can: the exclusion is invisible to a single-threaded
+    /// reading of the verdicts, so nothing else in this module would notice
+    /// the hold going back to a window-scoped local.
+    ///
+    /// Its control is the `false` before the first arm, which says the slot is
+    /// genuinely empty to start with -- without it, a `this_thread_holds_the_
+    /// probe_lock` wired to `true` would satisfy the claim below saying
+    /// nothing. It is read on this thread's own slot rather than by racing
+    /// another thread for the lock, because a third probe test holding it
+    /// would make a `try_lock` control fail for the wrong reason.
+    #[test]
+    fn the_probe_lock_is_held_past_the_armed_window_so_whole_tests_are_serialised() {
+        assert!(
+            !this_thread_holds_the_probe_lock(),
+            "control: this thread is holding the probe lock before it has armed anything, so \
+             the assertion below cannot distinguish a retained hold from a stuck one"
+        );
+
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "the probe is deaf, so nothing here means anything"
+        );
+
+        assert!(
+            this_thread_holds_the_probe_lock(),
+            "the hold was released when the armed window closed. Only the windows are \
+             serialised again, so this test's own fixtures and drops can be attributed to \
+             whatever probe is armed on another thread -- which is the flake this pins"
         );
     }
 
