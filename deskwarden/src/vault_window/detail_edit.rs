@@ -154,6 +154,31 @@ pub struct FieldDraft {
     /// `bool` resets every frame. Never consulted for the other roles.
     pub reveal: bool,
     role: FieldRole,
+    /// **This row's identity, and the only thing on this struct that is not
+    /// about the field.**
+    ///
+    /// Nothing else here can serve: a name is empty on a row the user has
+    /// just added and duplicable on any other, a value likewise, and the
+    /// position in `EditDraft::fields` is exactly what changes when a row is
+    /// removed. So the row's `id_salt` used to be its index, and the comment
+    /// on the deferred remove in [`custom_fields_block`] claimed that
+    /// deferring the removal to the end of the frame avoided "a shifted list
+    /// would hand one row the next row's widget state". **It did not.**
+    /// Deferring avoids invalidating the iterator; it says nothing about the
+    /// NEXT frame, on which every row below the removed one answers to its
+    /// predecessor's id and inherits that row's egui `TextEdit` state -- the
+    /// caret, the selection and the undo buffer.
+    ///
+    /// A counter rather than a hash of the contents, because two blank rows
+    /// added in a row are identical and must still be two rows. Process-local
+    /// and never compared across runs: it is a salt, not a key.
+    ///
+    /// **It never reaches the wire.** [`Self::to_field`] builds the
+    /// `VaultField` out of `name`, `value`, `role` and `original` and touches
+    /// nothing else, and `EditDraft::to_new_item` carries no fields at all;
+    /// `an_untouched_save_is_byte_for_byte_what_was_read` and the round-trip
+    /// tests would see it if it did.
+    row_id: u64,
     /// What arrived, or `None` for a field this form created.
     ///
     /// Private, and read only by [`Self::to_field`]: it is the byte-identity
@@ -168,6 +193,13 @@ pub struct FieldDraft {
 /// `const` rather than a literal so the two cannot drift apart in silence;
 /// `the_editor_hides_the_same_prefix_the_palette_hides` holds them together.
 const OURS_PREFIX: &str = "deskwarden:";
+
+/// The next [`FieldDraft::row_id`]. Starts at 1 so a `0` read anywhere is a
+/// draft that was built without going through one of the two constructors.
+fn next_field_row_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 impl FieldDraft {
     /// Reads one field off an item, deciding by its `type` what this form may
@@ -197,6 +229,7 @@ impl FieldDraft {
             value: drafted(field.value.as_deref()),
             reveal: false,
             role,
+            row_id: next_field_row_id(),
             original: Some(field.clone()),
         }
     }
@@ -218,12 +251,19 @@ impl FieldDraft {
             value: String::new(),
             reveal: false,
             role,
+            row_id: next_field_row_id(),
             original: None,
         }
     }
 
     pub fn role(&self) -> FieldRole {
         self.role
+    }
+
+    /// This row's `id_salt` -- see [`Self::row_id`]. Read by
+    /// [`custom_fields_block`] and by the test that pins it.
+    fn row_id(&self) -> u64 {
+        self.row_id
     }
 
     /// Whether this form draws boxes for this field.
@@ -1733,9 +1773,15 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
     }
 
     // Collected, not removed inside the loop: removing while iterating by
-    // index is the classic off-by-one, and a row's index is also its
-    // `id_salt`, so a shifted list would hand one row the next row's widget
-    // state for a frame.
+    // index is the classic off-by-one.
+    //
+    // **Deferring is all that claim is worth**, and this comment used to
+    // claim more -- that it also stopped "a shifted list handing one row the
+    // next row's widget state for a frame". It never did: deferring the
+    // removal to the end of the frame protects the iterator and nothing else,
+    // and on every FOLLOWING frame each row below the removed one would have
+    // answered to its predecessor's id. What actually protects the widget
+    // state is that the `id_salt` below is [`FieldDraft::row_id`] and not `i`.
     let mut remove: Option<usize> = None;
     for (i, field) in fields.iter_mut().enumerate() {
         match field.role {
@@ -1756,31 +1802,52 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
             FieldRole::Text | FieldRole::Hidden => {
                 let hidden = field.role == FieldRole::Hidden;
                 theme::field_label(ui, FIELD_NAME_LABEL);
-                // `push_id`, because every row draws the same widgets: two
-                // boxes and a button. Without it egui gives all of them one
-                // id and the focus jumps between rows as the user types.
-                ui.push_id(("custom-field", i), |ui| {
-                    theme::text_field(ui, &mut field.name, false);
-                    ui.add_space(4.0);
-                    theme::field_label(
-                        ui,
-                        if hidden { FIELD_HIDDEN_VALUE_LABEL } else { FIELD_VALUE_LABEL },
-                    );
-                    // A hidden field is a secret and gets the password box --
-                    // masked, with the same reveal toggle. Round-tripping it
-                    // through a plain box would put it on screen for anyone
-                    // standing behind the user, which is most of what "hidden"
-                    // buys them.
-                    if hidden {
-                        theme::password_field(ui, &mut field.value, &mut field.reveal);
-                    } else {
-                        theme::text_field(ui, &mut field.value, false);
-                    }
-                    ui.add_space(4.0);
-                    if theme::secondary_button(ui, FIELD_REMOVE_BUTTON).clicked() {
-                        remove = Some(i);
-                    }
-                });
+                // A scope of its own, because every row draws the same
+                // widgets: two boxes and a button. Without one egui gives all
+                // of them one id and the focus jumps between rows as the user
+                // types.
+                //
+                // **`UiBuilder::id`, not `push_id`, and that is the whole
+                // repair.** `push_id` asks for an id egui derives with
+                // `IdSource::Child`, which mixes in the PARENT's
+                // `next_auto_id_salt` -- a running count of the widgets the
+                // parent has made so far. The heading, the notice and every
+                // earlier row's `field_label` are made on that parent, so a
+                // removal shifts that counter and every row below the removed
+                // one gets a different id anyway, however stable its salt is.
+                // Salting with `row_id` alone was measured doing exactly that:
+                // the caret left the last row's box when the first row was
+                // taken away. `UiBuilder::id` is `IdSource::Explicit`, which
+                // egui uses verbatim.
+                //
+                // See [`FieldDraft::row_id`] and
+                // `removing_a_field_row_leaves_the_rows_below_it_holding_their_own_state`.
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id(egui::Id::new(("custom-field", field.row_id()))),
+                    |ui| {
+                        theme::text_field(ui, &mut field.name, false);
+                        ui.add_space(4.0);
+                        theme::field_label(
+                            ui,
+                            if hidden { FIELD_HIDDEN_VALUE_LABEL } else { FIELD_VALUE_LABEL },
+                        );
+                        // A hidden field is a secret and gets the password box
+                        // -- masked, with the same reveal toggle.
+                        // Round-tripping it through a plain box would put it on
+                        // screen for anyone standing behind the user, which is
+                        // most of what "hidden" buys them.
+                        if hidden {
+                            theme::password_field(ui, &mut field.value, &mut field.reveal);
+                        } else {
+                            theme::text_field(ui, &mut field.value, false);
+                        }
+                        ui.add_space(4.0);
+                        if theme::secondary_button(ui, FIELD_REMOVE_BUTTON).clicked() {
+                            remove = Some(i);
+                        }
+                    },
+                );
                 ui.add_space(10.0);
             }
         }
@@ -8697,6 +8764,94 @@ mod edit_pane_layout_tests {
 
         let names: Vec<&str> = draft.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["first", "third"], "the wrong row was removed");
+    }
+
+    /// **A removal does not hand the rows below it the removed row's widget
+    /// state.**
+    ///
+    /// A row's `id_salt` used to be its index in `EditDraft::fields`, and the
+    /// deferred remove was documented as protecting against exactly this. It
+    /// did not: deferring guards the iterator for one frame and says nothing
+    /// about the next, on which every row below the removed one answers to its
+    /// predecessor's id and inherits its caret, its selection and its undo
+    /// buffer. See [`FieldDraft::row_id`].
+    ///
+    /// Stated as focus, which is the cheapest visible consequence of a
+    /// widget's identity: put the caret in the LAST row's name box, take the
+    /// FIRST row away, and the caret is still in the same box. Under
+    /// index-salted ids the id that box answered to belongs to nothing after
+    /// the shift, egui drops the focus at the end of the frame, and the answer
+    /// is `None`.
+    ///
+    /// The row is removed off the draft directly rather than by clicking
+    /// Remove, because a click is itself an interaction with the focus system
+    /// and would leave the reading ambiguous. It is the same mutation of
+    /// `fields` that `custom_fields_block` performs -- the click path is
+    /// already pinned by `removing_a_field_row_takes_that_row_and_no_other`.
+    #[test]
+    fn removing_a_field_row_leaves_the_rows_below_it_holding_their_own_state() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        for name in ["first", "second", "third"] {
+            let mut field = FieldDraft::new_of(FieldRole::Text);
+            field.name = name.to_string();
+            draft.fields.push(field);
+        }
+        // The premise, before any pixels: the three rows really do have three
+        // different identities. A constructor that handed every row the same
+        // id would make everything below pass for the wrong reason.
+        let ids: Vec<u64> = draft.fields.iter().map(|f| f.row_id()).collect();
+        assert_eq!(ids.len(), 3, "the fixture is not three rows");
+        let mut distinct = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "two rows share a row_id: {ids:?}");
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+        assert_eq!(
+            painted.rects_of(FIELD_NAME_LABEL).len(),
+            3,
+            "three rows did not draw three name boxes: {:?}",
+            painted.strings()
+        );
+
+        // The caret goes into the LAST row, which is the one every shift moves.
+        let at = painted.rect_of("third").center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
+        let focused = ctx.memory(|m| m.focused());
+        assert!(
+            focused.is_some(),
+            "clicking the third row's name box did not focus it, so there is no state              for a shift to lose and this test proves nothing"
+        );
+
+        draft.fields.remove(0);
+        let after = frame(&ctx, pane, &mut draft, false, &[]);
+
+        // The control: the removal really happened and the pane really redrew.
+        assert_eq!(
+            after.rects_of(FIELD_NAME_LABEL).len(),
+            2,
+            "the frame after the removal drew {} name boxes, not 2: {:?}",
+            after.rects_of(FIELD_NAME_LABEL).len(),
+            after.strings()
+        );
+        assert!(
+            !after.strings().iter().any(|s| *s == "first"),
+            "the first row is still on screen, so nothing was removed"
+        );
+        assert!(
+            after.strings().iter().any(|s| *s == "third"),
+            "the third row stopped being drawn: {:?}",
+            after.strings()
+        );
+
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            focused,
+            "the caret left the third row's name box when the FIRST row was removed --              the rows are still identified by their position"
+        );
     }
 
     /// Scrolls the form down in 20pt steps until `label` is drawn **wholly
