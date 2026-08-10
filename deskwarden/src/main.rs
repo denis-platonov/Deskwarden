@@ -2902,7 +2902,6 @@ fn drain_requests_queued_behind_a_window(pending: &mut VecDeque<MenuEvent>, sati
 /// for, if the policy said to. It's now a detached background operation
 /// reported back through `backend_op_tx`/`backend_op_rx` and applied by
 /// `main`'s own loop, same non-blocking shape as the update-download flow.
-#[allow(clippy::too_many_arguments)]
 /// What [`open_vault_window`]'s loop must do once a vault session has ended.
 ///
 /// **The whole point is that this is a decision, not a chain of `if`s each
