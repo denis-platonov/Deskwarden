@@ -18959,6 +18959,223 @@ mod startup_shape_tests {
         !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
     }
 
+    /// **Everything between the startup window closing and the main loop**,
+    /// bounded by the log that follows the branch at one end and the dispatch
+    /// of the window's own vault outcome at the other. Both anchors are
+    /// single, distinctive lines that cannot drift into a neighbouring branch.
+    fn after_the_startup_window() -> &'static str {
+        let production = production();
+        let after = production
+            .split_once(concat!("match engine loaded with ", "{} app match(es)"))
+            .expect("the startup branch must still be followed by the engine log")
+            .1;
+        let region = after
+            .split_once(concat!("if startup_vault.is_", "some() {"))
+            .expect("the region must still end where the startup window's outcome is dispatched")
+            .0;
+        assert!(
+            region.len() < after.len(),
+            "control: the split isolated a region rather than keeping the rest of the file"
+        );
+        assert!(
+            region.contains(concat!("let mut tray = tray::build", "_tray();")),
+            "control: the region really is the one that builds the tray"
+        );
+        region
+    }
+
+    /// **The initialisation order the in-window lock's step 2 had to decide,
+    /// written down as a check rather than as a comment.**
+    ///
+    /// The question: `app_window::run` shows the startup window, and the
+    /// engine rebuild, `stop_backend_if_idle`, the fill hotkey, the tray, the
+    /// accounts submenu and the foreground watcher all run AFTER it and all
+    /// initialise FROM the estate. Once that window can tear the session down
+    /// and rebuild it in place, what must those six do?
+    ///
+    /// **The answer is that all six stay exactly where they are, and five of
+    /// them are already right for the reason the estate exists** -- they read
+    /// it AFTER the window, so a teardown that ran inside the window is
+    /// already reflected in what they read. Two of the six could not move up
+    /// even if that were wanted: `tray::build_tray` and
+    /// `hotkey::register_fill_hotkey` each create a hidden Win32 window bound
+    /// to the thread that builds it and deliver their events only while that
+    /// thread pumps its message queue -- and for the whole life of the startup
+    /// window that thread is inside `eframe`. A tray built above the window
+    /// would also be clickable during it, and its "Open Vault" would reenter
+    /// `open_vault_window` on top of a window that is already showing the
+    /// vault. Building AFTER is not a compromise here, it is the stronger
+    /// order: the tray is INITIALISED from the final state instead of having
+    /// to be reconciled toward it, and at startup there is no idle loop yet to
+    /// do any reconciling.
+    ///
+    /// **The sixth is the exception, and it is the only one that is a WRITE.**
+    /// `estate.engine.rebuild(&startup_entries.borrow())` does not read the
+    /// estate at all: it overwrites the match engine from a snapshot taken
+    /// before the window. Today that is harmless, because a lock from the
+    /// startup window is still an ordinary close and the teardown runs after
+    /// this line, so the teardown has the last word. The moment the teardown
+    /// moves INSIDE the window that order inverts and this line has the last
+    /// word instead -- reverting a repopulated engine to its pre-lock contents
+    /// and, on a sign-in the user declined, re-arming autofill against a vault
+    /// they just locked, which `stand_down_after_unlock` had deliberately
+    /// disarmed. So this line is pinned here by its exact text: whoever moves
+    /// the teardown into the window has to come back through this test and
+    /// make the rebuild conditional rather than discovering it in the field.
+    ///
+    /// Each clause is fired by its own mutant; none of the three is decoration.
+    #[test]
+    fn the_startup_windows_initialisations_stay_below_it_and_read_the_estate() {
+        let production = production();
+        const WINDOW: &str = concat!("let outcome = app_window::", "run(");
+        assert_eq!(
+            production.matches(WINDOW).count(),
+            1,
+            "control: {WINDOW:?} is not in the production half exactly once, so \"below the \
+             startup window\" no longer names one place and every offset compared below is \
+             compared against nothing"
+        );
+        let window_at = production.find(WINDOW).expect("counted just above");
+        let region = after_the_startup_window();
+
+        // 1. Nothing that initialises from the estate is spelled ABOVE the
+        //    window, and each is spelled inside the region below it. The
+        //    counts are pinned as well as the offsets, because the way a
+        //    "start it earlier" edit really arrives is a SECOND copy above the
+        //    window beside the one that stayed -- which an offset check alone
+        //    would pass on the survivor.
+        let below: &[(&str, usize)] = &[
+            (
+                concat!(
+                    "stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_",
+                    "running);"
+                ),
+                2,
+            ),
+            (concat!("let fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
+            (concat!("let mut tray = tray::build", "_tray();"), 1),
+            (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),
+            (concat!("window_watch::watch_foreground_", "windows("), 1),
+            (concat!("estate.engine.rebuild(&startup_entries.", "borrow());"), 1),
+        ];
+        for (needle, expected) in below {
+            let hits: Vec<usize> = production.match_indices(needle).map(|(at, _)| at).collect();
+            assert_eq!(
+                hits.len(),
+                *expected,
+                "{needle:?} occurs {} time(s) in the production half rather than {expected}. \
+                 A new copy of a startup initialisation is how one of them ends up running \
+                 twice, or running before the window against a session the window is about \
+                 to tear down",
+                hits.len()
+            );
+            assert!(
+                hits.iter().all(|at| *at > window_at),
+                "{needle:?} is spelled ABOVE the startup window. The tray and the fill hotkey \
+                 cannot work there at all -- both need the thread that owns them to be pumping \
+                 its message queue, and for the window's whole life that thread is inside \
+                 eframe -- and anything else moved up would be initialising from a session the \
+                 window can still tear down and rebuild"
+            );
+            assert!(
+                region.contains(needle),
+                "{needle:?} is no longer between the startup window and the main loop, so \
+                 whatever it does is no longer covered by the order this test fixes"
+            );
+        }
+
+        // 2. The five that touch the session read it OFF THE ESTATE, which is
+        //    what makes "they stay below the window" a correctness argument
+        //    rather than an accident of layout: the estate is what a teardown
+        //    inside the window would have rewritten, and it comes home on the
+        //    happy, deadline and panic paths alike.
+        let reads: &[&str] = &[
+            concat!("estate.settings.keep_backend_", "running"),
+            concat!("estate.accounts.as_", "ref()"),
+            concat!("estate.active_account.as_ref().map(|a| a.id.", "clone())"),
+            concat!("&estate.", "cache,"),
+            concat!("&estate.", "engine,"),
+            concat!("estate.settings.prompt_on_", "match,"),
+        ];
+        for needle in reads {
+            assert!(
+                region.contains(needle),
+                "{needle:?} is gone from the region below the startup window. Something down \
+                 there stopped reading the estate, which is the one value a teardown inside \
+                 the window rewrites -- so it is now initialising from a pre-window local \
+                 that the teardown never saw"
+            );
+        }
+
+        // 3. THE EXCEPTION, pinned by its exact text. See this test's doc for
+        //    why it is safe today and why it stops being safe the moment the
+        //    teardown moves inside the window.
+        const ARMED_FROM_A_PRE_WINDOW_SNAPSHOT: &str =
+            concat!("estate.engine.rebuild(&startup_entries.", "borrow());");
+        assert_eq!(
+            region.matches(concat!("engine.rebuild", "(")).count(),
+            1,
+            "the region below the startup window arms the match engine other than once. This \
+             is the only WRITE into the estate down here and the only one of the six that \
+             does not read what the window left behind"
+        );
+        assert!(
+            region.contains(ARMED_FROM_A_PRE_WINDOW_SNAPSHOT),
+            "the post-window engine rebuild no longer reads `startup_entries`. If that is \
+             because it became conditional on whether the window tore the session down, this \
+             assertion is the one to rewrite -- deliberately, saying what it is now. If it is \
+             because the arming moved, autofill is being armed from somewhere this test \
+             cannot see"
+        );
+    }
+
+    /// **A startup window closed without a session ends the process, and that
+    /// is pinned rather than trusted.**
+    ///
+    /// This is the other half of step 2's initialisation-order question: if
+    /// the user locks and then closes the window on the sign-in card, what
+    /// keeps the app alive? Nothing does, and nothing should -- at that point
+    /// there is no tray, no hotkey and no idle loop, so an app that carried on
+    /// would be an invisible process holding a session it does not have. The
+    /// `else` below `outcome.token` is the only thing that ends it, and until
+    /// this test existed nothing in the crate held it there: replacing the
+    /// exit with `outcome.token.unwrap_or_default()` left the whole suite
+    /// green while `main` went on to persist an EMPTY token to disk with
+    /// `store.save`, so the next launch would take the cached-session arm on a
+    /// session that never existed.
+    ///
+    /// **What this does not yet cover, and step 4 must.** The exit is reached
+    /// from `outcome.token` being `None`, which today means "the card was
+    /// closed without ever signing in". Once the window can lock and show the
+    /// card a SECOND time, the cell already holds the first sign-in's token,
+    /// so a lock followed by a close on the card returns `Some(stale)` and
+    /// this exit never fires at all -- `main` would build a tray over a token
+    /// the teardown invalidated and a `bw serve` the teardown stopped, and
+    /// `store.save` would write the dead token to disk. `token` has to come to
+    /// mean the token the window ENDED with, not the token it produced.
+    #[test]
+    fn closing_the_startup_window_without_a_session_ends_the_process() {
+        let arm = signing_in_arm();
+        const NO_TOKEN: &str = concat!("let Some(token) = outcome.", "token else {");
+        assert_eq!(
+            arm.matches(NO_TOKEN).count(),
+            1,
+            "the signing-in arm no longer asks whether the startup window produced a session \
+             token exactly once, so there is no single place where a closed card is answered"
+        );
+        let at = arm.find(NO_TOKEN).expect("counted just above");
+        let rest = &arm[at..];
+        let end = rest
+            .find(concat!("\n    };", ""))
+            .expect("the `let ... else` on the startup token is never closed");
+        let body = &rest[..end];
+        assert!(
+            body.contains(concat!("std::process::", "exit(1);")),
+            "the startup window can now be closed on the sign-in card and leave this process \
+             running with no session, no tray, no hotkey and no window: {body:?}"
+        );
+    }
+
     /// **Below the cut there is nothing but test-only modules, and the cut is
     /// where every guard in this file believes it is.**
     ///
