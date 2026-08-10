@@ -898,6 +898,14 @@ pub fn build_frame(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).check_breaches)
         .unwrap_or(false);
+    // Whether the read pane may offer a login's TOTP SECRET as a masked row,
+    // read the same way and for the same reason: off by default, live-editable
+    // from the preferences modal, written to disk only when the window closes.
+    // `draw_detail_read` is the only thing that reads either.
+    let reveal_totp_seed_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).reveal_totp_seed)
+        .unwrap_or(false);
     // **The window's one breach cache**, alive exactly as long as the window
     // and holding nothing but five-character SHA-1 prefixes and counts.
     //
@@ -2517,6 +2525,11 @@ pub fn build_frame(
                                 .borrow()
                                 .as_ref()
                                 .map_or(check_breaches_at_open, |s| s.check_breaches);
+                            // The same live read, for the same reason.
+                            let reveal_totp_seed = edited_settings_for_closure
+                                .borrow()
+                                .as_ref()
+                                .map_or(reveal_totp_seed_at_open, |s| s.reveal_totp_seed);
                             let action = draw_read_arm(
                                 ui,
                                 item,
@@ -2528,6 +2541,7 @@ pub fn build_frame(
                                 icons.textures.get(item.id.as_str()),
                                 &mut app_identities,
                                 check_breaches,
+                                reveal_totp_seed,
                                 &mut breaches,
                             );
                             // `item` and `totp_code` already hold everything
@@ -2609,6 +2623,24 @@ pub fn build_frame(
                                     // action handler can never drift apart).
                                     if let TotpState::Code { code, .. } = &totp_state {
                                         ui.ctx().copy_text(code.clone());
+                                    }
+                                }
+                                // **The SEED, not the code.** Read back off
+                                // the item through the same borrow the pane
+                                // painted it from, so what lands on the
+                                // clipboard is what was on screen. The item
+                                // holds it as `Zeroizing<String>`;
+                                // `copy_text` takes an owned `String`, so a
+                                // plain copy is made here and handed
+                                // straight to the clipboard -- the same
+                                // trade `CopyPassword`, `CopyCardNumber` and
+                                // `CopySshPrivateKey` already make, and
+                                // stated rather than implied.
+                                DetailAction::CopyTotpSecret => {
+                                    if let Some(seed) =
+                                        item.login.as_ref().and_then(|l| l.totp.as_ref())
+                                    {
+                                        ui.ctx().copy_text(seed.to_string());
                                     }
                                 }
                                 DetailAction::OpenWebsite(url) => {
@@ -4123,6 +4155,10 @@ fn draw_read_arm(
     // owns every condition; this arm's job is only to make sure the pane can
     // be driven headlessly with both of them under a test's control.
     check_breaches: bool,
+    // `Settings::reveal_totp_seed` as this frame has it -- forwarded, not
+    // decided here, exactly as `check_breaches` is. Off means the read pane
+    // draws no TOTP-secret row at all.
+    reveal_totp_seed: bool,
     breaches: &mut crate::breach::BreachCache,
 ) -> DetailAction {
     let action = draw_detail_read(
@@ -4136,6 +4172,7 @@ fn draw_read_arm(
         icon,
         apps,
         check_breaches,
+        reveal_totp_seed,
         breaches,
     );
     // **CTRL+SHIFT+F used to be read here, and is gone with the button it
@@ -10593,9 +10630,11 @@ mod draw_read_arm_tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
-                // The badge off, and a cache whose check answers "could not
+                // The badge off, the TOTP-secret row off, and a cache whose
+                // check answers "could not
                 // be checked" rather than "safe" if anything ever reaches it.
                 // `BreachCache::live` is not named in this module.
+                false,
                 false,
                 &mut crate::breach::BreachCache::new(std::sync::Arc::new(|_, _| {
                     crate::breach::BreachStatus::Unavailable

@@ -128,6 +128,15 @@ const TOTP_CODE_TRACKING: f32 = 2.04;
 const TOTP_GAP: f32 = 12.0;
 const TOTP_BAR_WIDTH: f32 = 96.0;
 const TOTP_BAR_HEIGHT: f32 = 4.0;
+/// The masked SECRET row's label -- the seed, distinct from the "One-time
+/// code" row above it, which is the six digits derived from it.
+///
+/// Not read out of `copy_shortcut_label`: that helper's whole job is to keep a
+/// row and its copy TOAST spelling the same string, and this row has no chord
+/// and therefore no `CopyShortcut` variant. The word "secret" is the user's
+/// own ("a field masked 'show secret'"), and it is what the preferences row
+/// that turns this on calls it too (`prefs_ui::TOTP_SECRET_LABEL`).
+const TOTP_SECRET_LABEL: &str = "One-time code secret";
 /// The 11px runs the design uses for a row's secondary line (2b's `18s`).
 const ROW_HINT_SIZE: f32 = 11.0;
 
@@ -325,6 +334,23 @@ pub struct RevealState {
     /// same way, so the field is added and cleared without that file
     /// changing.
     pub ssh_private_key: bool,
+    /// A login's TOTP SECRET row -- the fifth flag, and the one the paragraph
+    /// above about a fifth masked row not reusing a fourth's was written for.
+    ///
+    /// **This is the whole of "the reveal is per-view".** The row itself
+    /// remembers nothing: `masked_row` is handed this `&mut bool` and there
+    /// is no `egui` memory entry, no id and no cache anywhere on that path,
+    /// so a revealed seed can survive a change of item only if THIS field
+    /// does. `vault_window::mod`'s `run` builds the struct with
+    /// [`Default::default`] and re-assigns it wholesale on every selection
+    /// change, so the field is added and cleared without that file changing
+    /// -- which is why the guard here is a test that resets exactly as `run`
+    /// does and then asserts the next item's seed comes up masked.
+    ///
+    /// It matters more here than for a password: a password left revealed can
+    /// be rotated afterwards, and a TOTP seed cannot -- it is the long-lived
+    /// shared secret every future code is derived from.
+    pub totp_secret: bool,
 }
 
 /// How many PREVIOUS PASSWORDS rows the pane will draw.
@@ -345,6 +371,19 @@ pub enum DetailAction {
     CopyUsername,
     CopyPassword,
     CopyTotp,
+    /// A login's TOTP *secret* -- the seed, not the six-digit code -- was
+    /// copied off the details screen's masked secret row.
+    ///
+    /// Named rather than carrying the value, for exactly the reason
+    /// [`Self::CopyCardNumber`] and [`Self::CopySshPrivateKey`] are: the seed
+    /// is `Option<Zeroizing<String>>` on the item, the caller already holds
+    /// the item, and routing it through [`Self::CopyValue`] would give the
+    /// plaintext a second, non-zeroizing home inside this enum.
+    ///
+    /// Distinct from [`Self::CopyTotp`], which copies the derived code out of
+    /// the [`TotpState`]. One expires in thirty seconds; the other does not
+    /// expire at all, so they are two actions and never one.
+    CopyTotpSecret,
     /// A card's number was copied. Named rather than carrying the value, for
     /// the same reason [`Self::CopyPassword`] is: the caller already holds the
     /// item and can read the `Zeroizing<String>` out of it, so the plaintext
@@ -1811,6 +1850,15 @@ pub fn draw_detail_read(
     // entire question this pane is allowed to ask of it; see
     // [`should_check`], which is the only thing that consumes it.
     check_breaches: bool,
+    // `Settings::reveal_totp_seed`, as the window has it THIS frame -- off
+    // by default, and this pane is its first and only reader. A bool for the
+    // same reason `check_breaches` is one: it is the entire question this
+    // pane is allowed to ask of the settings.
+    //
+    // **Off means the row is NOT DRAWN**, not drawn empty and not drawn
+    // disabled. See the call site below; the rule is the one the empty
+    // password row and the unbound MATCHED APP card already follow.
+    reveal_totp_seed: bool,
     // The window's one `BreachCache`, threaded through for the same reason
     // `apps` is: the answer comes off a worker thread, is keyed on the
     // password's five-character prefix, and has to outlive the frame that
@@ -1838,6 +1886,19 @@ pub fn draw_detail_read(
     let password = login
         .and_then(|l| l.password.as_deref())
         .map(|p| p.as_str())
+        .unwrap_or("");
+    // **The TOTP seed, borrowed and never copied.** `LoginData::totp` is
+    // `Option<Zeroizing<String>>`; `as_deref` yields `&Zeroizing<String>` and
+    // `as_str` a `&str` into the same allocation, so nothing on this line
+    // materialises a plain `String`. The one place a plain copy does appear
+    // is inside `masked_row`, and only while the row is REVEALED -- see the
+    // call site.
+    //
+    // `""` for an item with no seed, which `masked_row_visible` then reads as
+    // "no row at all", exactly as it does for an absent password.
+    let totp_secret = login
+        .and_then(|l| l.totp.as_deref())
+        .map(|s| s.as_str())
         .unwrap_or("");
     // **One expression for the AUTOFILL TARGETS card and for CTRL+SHIFT+U.**
     // Derived up here with the other two fields rather than beside the card
@@ -2286,6 +2347,46 @@ pub fn draw_detail_read(
                         TotpRow::Unavailable => totp_unavailable_row(ui),
                         TotpRow::NoCode => totp_no_code_row(ui),
                     }
+                }
+                // **The seed, under the code, and only when BOTH are true.**
+                // The preference is off unless the user turned it on, and the
+                // item has to actually carry a seed. Either one false and
+                // nothing is laid out at all -- no band, no hairline, no eye,
+                // no zero-height placeholder and no alpha-0 ghost. Drawing it
+                // invisible is not the same as not drawing it: an invisible
+                // row still takes vertical space, still sits between two
+                // hairlines and still answers `rect_of`, which is the exact
+                // defect `masked_row_visible`'s doc was written about.
+                //
+                // The hairline is inside the guard for the same reason the
+                // password row's is: a rule left standing over the gap is a
+                // separator with nothing on one side of it.
+                //
+                // **This is a fifth production caller of `masked_row`, and it
+                // gates the CALL on `masked_row_visible` rather than relying
+                // on that function's own early return** -- which its doc
+                // states is defence in depth and production-unreachable, and
+                // this row does not change that.
+                if reveal_totp_seed && masked_row_visible(totp_secret) {
+                    theme::row_rule(ui);
+                    masked_row(
+                        ui,
+                        TOTP_SECRET_LABEL,
+                        totp_secret,
+                        // Per-view, not sticky: this flag is cleared by the
+                        // selection-change reset in `vault_window::mod`'s
+                        // `run`, and there is nothing else on this path that
+                        // remembers a reveal. See `RevealState::totp_secret`.
+                        &mut reveal.totp_secret,
+                        &mut action,
+                        DetailAction::CopyTotpSecret,
+                        // No chord. `CTRL+ALT+T` copies the CODE
+                        // (`CopyShortcut::Totp`), and a second, near-identical
+                        // chord for a value that is not the one the user just
+                        // read off the screen is how a seed ends up on the
+                        // clipboard by accident.
+                        None,
+                    );
                 }
             });
             ui.add_space(CARD_GAP);
@@ -5248,6 +5349,7 @@ mod tests {
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
                 false,
+                false,
                 &mut inert_breach_cache(),
             );
         });
@@ -5592,6 +5694,7 @@ mod tests {
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
                 false,
+                false,
                 &mut inert_breach_cache(),
             );
         })
@@ -5668,6 +5771,12 @@ mod tests {
         /// always answer "gone" and the resolved-name half of this card
         /// would be untestable.
         apps: crate::app_identity::AppIdentityCache,
+        /// `Settings::reveal_totp_seed`, carried across frames exactly as
+        /// `vault_window::mod`'s `run` carries it. `false` unless a test asks
+        /// for it (see [`Pane::revealing_secrets`]) -- which is the shipped
+        /// default, so every existing test here keeps measuring the pane a
+        /// user gets out of the box.
+        reveal_totp_seed: bool,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -5914,6 +6023,7 @@ mod tests {
                 delete_pending: false,
                 folder: None,
                 apps: crate::app_identity::AppIdentityCache::default(),
+                reveal_totp_seed: false,
             }
         }
 
@@ -5942,6 +6052,13 @@ mod tests {
                 egui::TextureOptions::default(),
             );
             self.apps.seed_ready(path, name, Some(texture));
+            self
+        }
+
+        /// The same pane, on a machine whose `settings.json` has the
+        /// TOTP-secret preference turned ON.
+        fn revealing_secrets(mut self) -> Self {
+            self.reveal_totp_seed = true;
             self
         }
 
@@ -5975,6 +6092,7 @@ mod tests {
                         None,
                         &mut self.apps,
                         false,
+                        self.reveal_totp_seed,
                         &mut inert_breach_cache(),
                     );
                 },
@@ -6871,6 +6989,7 @@ mod tests {
             card_code: true,
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: false,
+            totp_secret: false,
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
         assert!(
@@ -6923,6 +7042,7 @@ mod tests {
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
+                totp_secret: false,
             },
             "clicking the card number's eye did not write through to the caller's \
              RevealState, or wrote through to the wrong field"
@@ -9248,6 +9368,7 @@ mod tests {
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
+                totp_secret: false,
             },
         );
         assert!(
@@ -9269,6 +9390,7 @@ mod tests {
                 card_code: true,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
+                totp_secret: false,
             },
         );
         assert!(
@@ -9385,6 +9507,7 @@ mod tests {
                 card_code: true,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
+                totp_secret: false,
             },
         );
         for value in [fields.number.expect("number"), fields.code.expect("code")] {
@@ -9599,6 +9722,7 @@ mod tests {
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: true,
+                totp_secret: false,
             },
         );
         assert!(
@@ -9651,6 +9775,7 @@ mod tests {
             card_code: false,
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: true,
+            totp_secret: false,
         };
         let texts = painted_with_reveal(&an_ssh_key_item(), &TotpState::NoSecret, ssh_only);
         assert!(
@@ -9674,6 +9799,7 @@ mod tests {
             card_code: true,
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: false,
+            totp_secret: false,
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, card_only);
         assert!(
@@ -11023,6 +11149,515 @@ mod tests {
         item
     }
 
+    // ------------------------------------------------ the TOTP SECRET row
+
+    /// The seed every fixture below hides. Long, distinctive, and not a
+    /// lookalike of anything else in this file, so a painted-strings search
+    /// for it cannot match some other row by accident.
+    const SEED: &str = "JBSWY3DPEHPK3PXPSEEDSEED";
+
+    /// A login with a TOTP seed on it. `a_login` deliberately has `totp:
+    /// None`, so this is the only fixture here that can draw the secret row
+    /// at all.
+    fn a_login_with_a_seed(id: &str, seed: &str) -> VaultItem {
+        let mut item = a_login();
+        item.id = id.to_string();
+        if let Some(login) = item.login.as_mut() {
+            login.totp = Some(seed.to_string().into());
+        }
+        item
+    }
+
+    /// A live code, so the pane draws the One-time code row the secret row
+    /// goes under. The digits are deliberately not a prefix of [`SEED`].
+    fn a_live_code() -> TotpState {
+        TotpState::Code { code: "418902".to_string(), seconds_left: 19 }
+    }
+
+    /// The bullets `masked_row` paints, as a whole string.
+    fn mask() -> String {
+        "\u{2022}".repeat(MASKED_BULLETS)
+    }
+
+    /// The `LOGIN CREDENTIALS` card's own box, so the two passes can be
+    /// compared on HEIGHT and not merely on which strings appeared.
+    fn login_card(frame: &Frame) -> egui::Rect {
+        frame.filled_box_around(frame.rect_of("LOGIN CREDENTIALS"), theme::CARD)
+    }
+
+    /// One row rule inside `card` -- a 1pt `theme::CANVAS` fill, the shape
+    /// `theme::row_rule` paints. A removed row leaves its hairline standing
+    /// about a point tall, which a height comparison is too coarse to see.
+    fn rules_in(frame: &Frame, card: egui::Rect) -> usize {
+        frame
+            .rects
+            .iter()
+            .filter(|(rect, fill)| {
+                *fill == theme::CANVAS
+                    && (rect.height() - 1.0).abs() < 0.5
+                    && card.contains_rect(*rect)
+            })
+            .count()
+    }
+
+    /// The reveal eye nearest `row_y` -- the one belonging to the row whose
+    /// label sits there. Asserts it really is on that row rather than
+    /// returning whichever eye happened to be closest.
+    ///
+    /// **The frame a click is DELIVERED on still paints the old state.**
+    /// `masked_row` has already chosen its bullets by the time egui reports
+    /// the click, so every test below that reads a revealed value takes the
+    /// NEXT frame -- see `reveal_by_clicking`. `clicking_the_eye_reveals_
+    /// without_copying` never noticed because it asserts on the flag.
+    fn eye_on_row(frame: &Frame, row_y: f32) -> egui::Rect {
+        assert!(!frame.eyes.is_empty(), "the frame painted no eye at all");
+        let eye = *frame
+            .eyes
+            .iter()
+            .min_by(|a, b| {
+                (a.center().y - row_y)
+                    .abs()
+                    .total_cmp(&(b.center().y - row_y).abs())
+            })
+            .expect("the frame painted an eye");
+        assert!(
+            (eye.center().y - row_y).abs() < ROW_CONTENT_HEIGHT,
+            "the nearest eye is on a different row entirely: eye {eye:?}, row at {row_y}"
+        );
+        eye
+    }
+
+    /// Clicks the eye on the row whose label sits at `row_y` and returns the
+    /// frame AFTER the click -- the first one that can paint the new state.
+    fn reveal_by_clicking(
+        pane: &mut Pane,
+        frame: &Frame,
+        item: &VaultItem,
+        totp: &TotpState,
+        row_y: f32,
+    ) -> Frame {
+        let eye = eye_on_row(frame, row_y);
+        let _delivering = pane.click(item, totp, eye.center());
+        pane.idle(item, totp)
+    }
+
+    /// **Off means the row is not drawn -- not drawn empty, not drawn
+    /// disabled, not drawn at alpha 0 and not drawn at zero size.**
+    ///
+    /// Four instruments, because each one alone has a way of passing on a row
+    /// that is still there: the LABEL is absent from the painted frame (an
+    /// alpha-0 label is still a painted galley, so this catches that), the
+    /// card is exactly as TALL as it is with no row (a zero-size or
+    /// off-screen row would pass the label check but not this one), the card
+    /// carries no extra reveal EYE or row rule, and no second bullet run.
+    ///
+    /// Every negative half is paired with the setting-ON pass in this same
+    /// test, so none of them can pass against a pane that drew nothing.
+    #[test]
+    fn the_secret_row_is_not_drawn_when_the_setting_is_off() {
+        let item = a_login_with_a_seed("seed-off", SEED);
+
+        let mut pane_off = Pane::new();
+        let off = pane_off.idle(&item, &a_live_code());
+        let mut pane_on = Pane::new().revealing_secrets();
+        let on = pane_on.idle(&item, &a_live_code());
+
+        // The premise: BOTH passes really drew the card and the code row, so
+        // an absent label cannot be "the pane drew nothing this time".
+        for (name, frame) in [("off", &off), ("on", &on)] {
+            assert!(
+                frame.painted("LOGIN CREDENTIALS"),
+                "{name}: the login card was not drawn at all: {:?}",
+                frame.strings()
+            );
+            assert!(
+                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
+                "{name}: the One-time code row the secret row goes under was not drawn: {:?}",
+                frame.strings()
+            );
+        }
+
+        // 1. THE LABEL IS GONE. Not faint, not clipped -- absent from the
+        //    frame's own shape list.
+        assert!(
+            !off.painted(TOTP_SECRET_LABEL),
+            "the setting is off and the pane still painted {TOTP_SECRET_LABEL:?}: {:?}",
+            off.strings()
+        );
+        assert!(
+            on.painted(TOTP_SECRET_LABEL),
+            "with the setting ON the row is missing too, so the check above is vacuous: {:?}",
+            on.strings()
+        );
+
+        // 2. THE CARD IS EXACTLY AS TALL as one with no such row. A row
+        //    hidden rather than skipped still takes its band, and this is the
+        //    only instrument that can tell the two apart.
+        let (card_off, card_on) = (login_card(&off), login_card(&on));
+        assert!(card_off.height() > 0.0, "the card has no box at all: {card_off:?}");
+        let grew = card_on.height() - card_off.height();
+        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
+        assert!(
+            grew >= a_row,
+            "turning the setting ON grew the card by only {grew}pt where a row is {a_row}pt, so \
+             this instrument cannot see a row's worth of height at all"
+        );
+
+        // 3. NO EXTRA EYE, and no extra hairline. A row drawn at alpha 0
+        //    still paints its eye's strokes and still sits under a rule.
+        assert_eq!(
+            on.eyes.len(),
+            off.eyes.len() + 1,
+            "the ON pass did not add exactly one reveal eye ({} -> {}), so counting eyes cannot \
+             show the OFF pass is missing one",
+            off.eyes.len(),
+            on.eyes.len()
+        );
+        assert_eq!(
+            rules_in(&on, card_on),
+            rules_in(&off, card_off) + 1,
+            "the ON pass did not add exactly one row rule, so a leftover hairline in the OFF \
+             pass could not have been seen either"
+        );
+
+        // 4. AND NO MASK. The password row paints one bullet run; two would
+        //    be a secret row drawn with its label suppressed.
+        let masks = |frame: &Frame| frame.strings().iter().filter(|t| **t == mask()).count();
+        assert_eq!(masks(&off), 1, "off: {:?}", off.strings());
+        assert_eq!(masks(&on), 2, "on: {:?}", on.strings());
+    }
+
+    /// **No seed on the item means no row, even with the setting on** -- for
+    /// the same reason an empty password draws no row: a mask is a claim that
+    /// there is a secret behind it.
+    ///
+    /// `masked_row`'s own empty-value guard is not what is being tested here.
+    /// That guard is documented as defence in depth and production-
+    /// unreachable; the CALL is gated, and this test is about the call.
+    #[test]
+    fn the_secret_row_is_not_drawn_for_an_item_with_no_seed() {
+        // Same preference, same TOTP state, two items -- so the only
+        // difference between the passes is whether the seed is there.
+        let seedless = a_login();
+        let seeded = a_login_with_a_seed("seed-present", SEED);
+        assert!(
+            seedless.login.as_ref().unwrap().totp.is_none(),
+            "the premise: the fixture really carries no seed"
+        );
+
+        let mut pane = Pane::new().revealing_secrets();
+        let without = pane.idle(&seedless, &a_live_code());
+        let mut pane = Pane::new().revealing_secrets();
+        let with = pane.idle(&seeded, &a_live_code());
+
+        for (name, frame) in [("without", &without), ("with", &with)] {
+            assert!(
+                frame.painted("LOGIN CREDENTIALS"),
+                "{name}: the card was not drawn at all: {:?}",
+                frame.strings()
+            );
+            assert!(
+                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
+                "{name}: the One-time code row was not drawn: {:?}",
+                frame.strings()
+            );
+        }
+
+        assert!(
+            !without.painted(TOTP_SECRET_LABEL),
+            "an item with no seed still painted a secret row: {:?}",
+            without.strings()
+        );
+        assert!(
+            with.painted(TOTP_SECRET_LABEL),
+            "the control: an item WITH a seed draws the row on the same setting: {:?}",
+            with.strings()
+        );
+
+        let (card_without, card_with) = (login_card(&without), login_card(&with));
+        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
+        assert!(
+            card_with.height() - card_without.height() >= a_row,
+            "the seedless card is not a whole row shorter ({} vs {}), so the row is taking its \
+             space and was hidden rather than skipped",
+            card_without.height(),
+            card_with.height()
+        );
+        assert_eq!(
+            with.eyes.len(),
+            without.eyes.len() + 1,
+            "the seedless pass did not lose exactly one reveal eye"
+        );
+        assert_eq!(
+            rules_in(&with, card_with),
+            rules_in(&without, card_without) + 1,
+            "a hairline was left standing where the seedless item's row would have been"
+        );
+    }
+
+    /// **The positive control for both hiding rules**, so neither can pass by
+    /// hiding everything: with the setting on and a seed present the row IS
+    /// drawn, under the code row, inside the card, masked, with a reveal eye
+    /// that works.
+    #[test]
+    fn the_secret_row_is_drawn_with_its_reveal_when_the_setting_is_on_and_the_item_has_a_seed() {
+        let item = a_login_with_a_seed("seed-on", SEED);
+        let mut pane = Pane::new().revealing_secrets();
+        let frame = pane.idle(&item, &a_live_code());
+
+        assert!(frame.painted(TOTP_SECRET_LABEL), "got {:?}", frame.strings());
+
+        // UNDER the One-time code row, which is the placement the request
+        // asked for -- read off the paint, not off the source order.
+        let code = frame.rect_of(copy_shortcut_label(CopyShortcut::Totp));
+        let secret = frame.rect_of(TOTP_SECRET_LABEL);
+        assert!(
+            secret.height() > 0.0 && secret.width() > 0.0,
+            "the label has no box, so every geometry check below is about nothing: {secret:?}"
+        );
+        assert!(code.height() > 0.0);
+        assert!(
+            code.bottom() <= secret.top(),
+            "the secret row is not under the code row: code at {code:?}, secret at {secret:?}"
+        );
+        assert!(
+            secret.top() - code.top() > 1.0,
+            "the two rows are at the same height, so the comparison above is reading one number \
+             twice"
+        );
+        // ...and inside the login card, not floating in the pane.
+        assert!(
+            login_card(&frame).contains_rect(secret),
+            "the secret row is outside the LOGIN CREDENTIALS card"
+        );
+
+        // MASKED, with an eye that is not struck through -- the only visible
+        // difference between a masked row and a revealed one.
+        assert_eq!(
+            frame.strings().iter().filter(|t| **t == mask()).count(),
+            2,
+            "two bullet runs expected (password and secret); got {:?}",
+            frame.strings()
+        );
+        assert_eq!(frame.struck_eyes(), 0, "nothing is revealed yet");
+
+        // THE EYE WORKS, which is the half of "with its reveal" that a
+        // painted icon does not prove.
+        let after = reveal_by_clicking(&mut pane, &frame, &item, &a_live_code(), secret.center().y);
+        assert!(
+            pane.reveal.totp_secret,
+            "the click set no reveal flag at all, so it hit nothing"
+        );
+        assert!(
+            after.painted(SEED),
+            "the eye did not reveal the seed: {:?}",
+            after.strings()
+        );
+        assert_eq!(
+            after.strings().iter().filter(|t| **t == mask()).count(),
+            1,
+            "the password row's mask should be the only one left; got {:?}",
+            after.strings()
+        );
+        assert_eq!(after.struck_eyes(), 1, "exactly one eye is struck through");
+    }
+
+    /// **Masked until asked, and the plaintext is never in the frame before
+    /// then** -- asserted on the glyphs egui actually laid out and not only
+    /// on the source strings, because an elided run reports the string it was
+    /// asked to draw rather than what it drew.
+    #[test]
+    fn the_secret_is_masked_until_revealed_and_never_painted_in_the_clear() {
+        let item = a_login_with_a_seed("seed-mask", SEED);
+        let mut pane = Pane::new().revealing_secrets();
+        let masked = pane.idle(&item, &a_live_code());
+
+        assert!(
+            masked.painted(TOTP_SECRET_LABEL),
+            "the row is missing entirely, so 'it is masked' is vacuous: {:?}",
+            masked.strings()
+        );
+        // Nothing in the frame carries the seed -- not as a whole string, not
+        // as a substring of some longer run, and not in the glyphs.
+        for (text, _) in &masked.texts {
+            assert!(!text.contains(SEED), "the seed was painted in the clear: {text:?}");
+        }
+        for (source, rendered, _) in &masked.rendered {
+            assert!(!source.contains(SEED), "the seed reached a layout job: {source:?}");
+            assert!(!rendered.contains(SEED), "the seed was laid out as glyphs: {rendered:?}");
+        }
+        // Nor any prefix of it worth having: a mask that leaked the first
+        // third would pass every check above.
+        let head = &SEED[..8];
+        for (source, rendered, _) in &masked.rendered {
+            assert!(
+                !source.contains(head) && !rendered.contains(head),
+                "the first {} characters of the seed were painted: {source:?} / {rendered:?}",
+                head.len()
+            );
+        }
+        // And the length is not leaked either: the run is `MASKED_BULLETS`
+        // long whatever the seed is.
+        assert!(
+            masked.strings().iter().any(|t| *t == mask()),
+            "the row painted no mask at all: {:?}",
+            masked.strings()
+        );
+        assert_ne!(
+            SEED.len(),
+            MASKED_BULLETS,
+            "the fixture's seed is exactly as long as the mask, which would make the check above \
+             unable to tell a leak of the length from a fixed-length run"
+        );
+
+        // THE CONTROL, in this same test: revealed, the glyphs DO carry the
+        // seed. Without it every assertion above would pass against a pane
+        // that cannot paint the seed under any circumstances.
+        let row_y = masked.rect_of(TOTP_SECRET_LABEL).center().y;
+        let revealed = reveal_by_clicking(&mut pane, &masked, &item, &a_live_code(), row_y);
+        assert!(
+            revealed.rendered.iter().any(|(_, glyphs, _)| glyphs.contains(SEED)),
+            "the control: the seed is not laid out even when revealed, so this harness cannot \
+             see it and the assertions above are about an instrument that is blind: {:?}",
+            revealed.strings()
+        );
+    }
+
+    /// **The reveal is per-view.** A seed revealed on one item comes up
+    /// masked on the next -- which matters more than it does for a password,
+    /// because a seed is not rotated afterwards.
+    ///
+    /// The pane is driven exactly as `vault_window::mod`'s `run` drives it:
+    /// the `RevealState` lives across frames and is re-assigned wholesale on
+    /// a selection change. So this test fails for a reveal held ANYWHERE else
+    /// -- an `egui` memory entry under a fixed id, a `Context` data slot, a
+    /// `static` -- which is exactly how a note's selection once followed the
+    /// user to the next item (`8973e9e`).
+    ///
+    /// **The two fixtures differ only by id and seed and share a NAME**, so a
+    /// reveal keyed on the item's name rather than cleared outright is not
+    /// mistaken for the fix.
+    #[test]
+    fn revealing_the_secret_on_one_item_does_not_reveal_it_on_the_next() {
+        const OTHER_SEED: &str = "MZXW6YTBOI7777OTHERSEEDX";
+        let first = a_login_with_a_seed("item-a", SEED);
+        let second = a_login_with_a_seed("item-b", OTHER_SEED);
+        assert_eq!(first.name, second.name, "the fixtures must share a name");
+        assert_ne!(first.id, second.id, "...and differ by id");
+        assert_ne!(SEED, OTHER_SEED);
+
+        let mut pane = Pane::new().revealing_secrets();
+        let shown = pane.idle(&first, &a_live_code());
+        let row_y = shown.rect_of(TOTP_SECRET_LABEL).center().y;
+
+        // THE PREMISE: the click really revealed the first item's seed.
+        let revealed = reveal_by_clicking(&mut pane, &shown, &first, &a_live_code(), row_y);
+        assert!(
+            revealed.painted(SEED),
+            "the premise: the eye did not reveal the first item's seed at all, so the rest of \
+             this test is about nothing: {:?}",
+            revealed.strings()
+        );
+        assert!(
+            pane.reveal.totp_secret,
+            "the flag being watched is not the one the click set"
+        );
+
+        // THE SELECTION CHANGES, exactly as `run` does it.
+        pane.reveal = RevealState::default();
+        let next = pane.idle(&second, &a_live_code());
+
+        assert!(
+            next.painted(TOTP_SECRET_LABEL),
+            "the second item drew no secret row at all, so 'its seed is masked' is vacuous: {:?}",
+            next.strings()
+        );
+        assert!(
+            !next.painted(OTHER_SEED),
+            "the second item's seed came up REVEALED -- the reveal followed the user to the \
+             next item: {:?}",
+            next.strings()
+        );
+        for (source, glyphs, _) in &next.rendered {
+            assert!(
+                !glyphs.contains(OTHER_SEED) && !glyphs.contains(SEED),
+                "a seed was laid out on the next item: {source:?} / {glyphs:?}"
+            );
+        }
+        assert!(
+            next.strings().iter().any(|t| *t == mask()),
+            "the second item's secret row is not masked: {:?}",
+            next.strings()
+        );
+        assert_eq!(next.struck_eyes(), 0, "an eye is still drawn in the revealed state");
+
+        // ...AND THE CONTROL: the second item's seed CAN be revealed on its
+        // own row, so "masked" above is not "this pane can never show it".
+        let row_y = next.rect_of(TOTP_SECRET_LABEL).center().y;
+        let again = reveal_by_clicking(&mut pane, &next, &second, &a_live_code(), row_y);
+        assert!(
+            again.painted(OTHER_SEED),
+            "the control: the second item's own eye does not reveal its seed: {:?}",
+            again.strings()
+        );
+    }
+
+    /// **The seed does not reach the allocator in the clear while the row is
+    /// masked** -- the crate's `#[global_allocator]` probe, with the control
+    /// asserted FIRST, because a probe reporting clean while blind is this
+    /// codebase's signature failure.
+    ///
+    /// **What this does NOT claim.** `masked_row` materialises
+    /// `value.to_string()` -- a plain `String`, not `Zeroizing` -- for the run
+    /// it hands to egui while the row is REVEALED, exactly as the password
+    /// row has always done, and egui's galley cache holds that text past the
+    /// frame anyway, which is why a `Zeroizing` draft buffer there would be a
+    /// guarantee in name only. So the claim is about the MASKED path, which
+    /// is the state the row is in unless the user clicks the eye.
+    ///
+    /// Everything up to the paint borrows rather than copies:
+    /// `LoginData::totp` is `Option<Zeroizing<String>>`, `draw_detail_read`'s
+    /// `totp_secret` binding is a `&str` into it, and `masked_row` is handed
+    /// that `&str`.
+    #[test]
+    fn the_totp_seed_is_masked_and_never_painted_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // THE CONTROL, first: an ordinary `String` holding the probe bytes is
+        // seen going past the allocator. Built before the watch is armed.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: an ordinary String's plaintext went past the allocator unnoticed, so the \
+             assertion below is about an instrument that sees nothing"
+        );
+
+        // The item, the pane and its fonts are all built OUTSIDE the watched
+        // region: what is measured is what the masked paint does with the
+        // seed, not what the scaffolding does on its way in.
+        let item = a_login_with_a_seed("seed-probe", PROBE);
+        let mut pane = Pane::new().revealing_secrets();
+        let warm = pane.idle(&item, &a_live_code());
+        assert!(
+            warm.painted(TOTP_SECRET_LABEL),
+            "the premise: the row under test is not being drawn at all: {:?}",
+            warm.strings()
+        );
+        assert!(!warm.painted(PROBE), "the premise: the row starts masked");
+
+        let mut drew = false;
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                let frame = pane.idle(&item, &a_live_code());
+                drew = frame.painted(TOTP_SECRET_LABEL) && !frame.painted(PROBE);
+            }),
+            "painting the MASKED secret row released a copy of the seed to the allocator"
+        );
+        // The closure really drew the masked row, so it cannot have been
+        // optimised into nothing.
+        assert!(drew, "the watched frame did not draw a masked secret row");
+    }
+
     /// A row is `display: flex; align-items: center; gap: 16px; padding: 13px
     /// 16px` over a `width: 130px` label column. On this pane that puts the
     /// label at 24 (body padding) + 1 (the card's own border, which the design
@@ -11144,6 +11779,7 @@ mod tests {
                 card_code: false,
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
+                totp_secret: false,
             },
         );
         assert!(
@@ -13838,6 +14474,7 @@ mod read_pane_scroll_tests {
                         None,
                         &mut self.apps,
                         false,
+                        false,
                         &mut super::tests::inert_breach_cache(),
                     );
                 },
@@ -15629,6 +16266,7 @@ mod breach_badge_tests {
                     None,
                     &mut apps,
                     enabled,
+                    false,
                     &mut cache,
                 );
             });
