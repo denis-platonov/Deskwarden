@@ -183,6 +183,28 @@ pub enum Event {
     TeardownDone,
 }
 
+/// **Which of two channels the startup host's working stage is draining.**
+///
+/// [`run`]'s working stage is entered TWICE once that host can survive a lock:
+/// once after the first sign-in, where what it waits for is `prepare`'s result
+/// coming down `work_rx`, and again after a lock, where what it waits for is
+/// the teardown's steps coming through [`InWindowLock::answer_the_teardown`].
+/// The two are different channels with different meanings, and a stage that
+/// drained the wrong one would sit out the whole `WORKING_DEADLINE` behind a
+/// ghosted close button.
+///
+/// **Written in exactly one place** -- the lock catch -- which is what makes
+/// it a fact about the window's history rather than a flag anything can
+/// disagree with. The stage is otherwise shared whole with the other host:
+/// one refusal, one watchdog, one `Closing`, one `advance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingOn {
+    /// The first sign-in's `prepare`, on `work_rx`.
+    TheFirstPreparation,
+    /// A lock's teardown, on the step channel [`InWindowLock`] owns.
+    TheLocksTeardown,
+}
+
 /// Where an event leaves the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
@@ -455,6 +477,19 @@ pub struct StartupOutcome<P> {
     /// `Vault` says so in the log rather than being something a user has to
     /// notice and report.
     pub stages: Vec<Stage>,
+    /// **Whether this window TORE ITS SESSION DOWN**, which is a different
+    /// question from [`VaultSessionOutcome::relocked`] and must not be
+    /// confused with it. `relocked` answers "is the session down AND NOT
+    /// BACK" -- a successful rebuild CLEARS it. This one answers "did a lock
+    /// in this window ever start a teardown", and a rebuild does not clear
+    /// it, because the thing the caller needs it for is the opposite
+    /// question: `main`'s post-window `engine.rebuild` replays a snapshot of
+    /// the match engine taken BEFORE this window opened, and a teardown --
+    /// rebuilt or not -- has since rewritten that engine. Replayed over a
+    /// successful rebuild it reverts the repopulate; replayed over a declined
+    /// sign-in it re-arms autofill against a vault the user just locked,
+    /// which is exactly what `stand_down_after_unlock` had disarmed.
+    pub tore_the_session_down: bool,
 }
 
 /// **The one place this module puts an OS window on the screen**, and the one
@@ -920,19 +955,51 @@ fn finish_the_locked_session(
 /// frame: populate the cache, then `vault_window::build_frame`. It answers
 /// `None` when there is no vault to show, which ends the window and leaves
 /// `main` to run its existing recovery.
-pub fn run<P, W, V>(
+///
+/// `teardown` and `rebuild_vault` are the SAME two closures [`run_from_vault`]
+/// takes and mean the same things: this host catches the same lock, through
+/// the same [`InWindowLock`], because a startup window that closes on a lock
+/// and lets `main` reopen a sign-in window IS the reported bug -- "still
+/// showing separate screen after login".
+pub fn run<P, W, V, T, B>(
     account: Option<(&Path, &Account)>,
     first_run: bool,
-    working_message: &'static str,
+    // **A LOCAL, seeded by the caller, not a fixed parameter read every
+    // frame.** The message changes mid-stage on this host now, exactly as it
+    // does on the other one: the seed while `prepare` runs, [`LOCK_MESSAGE`]
+    // while a lock's teardown runs, and the seed again while the post-lock
+    // repopulate runs. See [`LOCK_MESSAGE`]'s own doc, which named this host
+    // as the one that did not have it yet.
+    mut working_message: &'static str,
     prepare: W,
     build_vault: V,
+    teardown: T,
+    rebuild_vault: B,
 ) -> StartupOutcome<P>
 where
     P: Send + 'static,
     W: FnOnce(String) -> P + Send + 'static,
     V: FnOnce(&str, &mut P) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
         + 'static,
+    T: FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
+    B: FnOnce(
+            Option<crate::settings::Settings>,
+        ) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
+        + 'static,
 {
+    // What the spinner goes back to saying after the post-lock card, kept
+    // before `working_message` is ever reassigned. The other host takes this
+    // as its own `after_sign_in_message` parameter; here the seed IS that
+    // message, because the thing being set up after the second card is the
+    // same vault the first card was setting up.
+    let setup_message = working_message;
+    // Owned copies for the post-lock card. The parameters are borrows off the
+    // caller's stack and the frame closure is `'static`, so the card that is
+    // built INSIDE it cannot name them -- the same copy-out
+    // `RealVaultOps::open_window` makes for its own `build_sign_in`.
+    let sign_in_account: Option<(std::path::PathBuf, Account)> =
+        account.map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
+    let sign_in_first_run = first_run;
     // **The vault window's placement, read the way the vault window reads it**
     // -- by calling its own `initial_placement`, exactly as `login_ui` already
     // does, so this window opens where the vault will be and the vault does
@@ -970,7 +1037,7 @@ where
     // frame installs the fonts, rounds the corners and raises it, and a
     // produced token must NOT close the window -- it has two more states to
     // enter. See `login_ui::build_login_frame`.
-    let (_login_options, mut login_fn, login_handles) =
+    let (_login_options, login_fn, login_handles) =
         login_ui::build_login_frame(account, first_run, true, false);
 
     // Read back after the event loop returns. `Rc<RefCell<_>>` rather than
@@ -986,11 +1053,27 @@ where
     let vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>> =
         Rc::new(RefCell::new(None));
     let stages: Rc<RefCell<Vec<Stage>>> = Rc::new(RefCell::new(Vec::new()));
+    // The PRE-LOCK vault session's outcome cells, written by the lock catch
+    // at the moment of the lock and merged with the rebuilt session's at the
+    // end. See `finish_the_locked_session`.
+    let result: Rc<RefCell<Option<vault_window::VaultWindowResult>>> = Rc::new(RefCell::new(None));
+    // Written only through `session_torn_down`, by `InWindowLock`. This host
+    // does not read it -- `main`'s startup path has no "skip my own lock
+    // recovery" branch to spend it on, because a startup window that ends
+    // torn-down ends with no token at all and `main` exits. It exists because
+    // the shared value writes it, and dropping it here would mean a second
+    // constructor for `InWindowLock` with one fewer cell.
+    let relocked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    // **Did a lock in this window start a teardown at all.** Not `relocked`:
+    // see `StartupOutcome::tore_the_session_down` for why a rebuild clears
+    // the one and must not clear the other.
+    let tore_down: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     let token_for_closure = token.clone();
     let prepared_for_closure = prepared.clone();
     let vault_handles_for_closure = vault_handles.clone();
     let stages_for_closure = stages.clone();
+    let tore_down_for_closure = tore_down.clone();
 
     // **In an `Option`, and handed to the worker whole.** It used to be cloned
     // into the thread, which left the original alive inside the closure for the
@@ -1002,7 +1085,28 @@ where
     let mut work_tx = Some(work_tx);
     let mut prepare = Some(prepare);
     let mut build_vault = Some(build_vault);
+    // **The lock lives in the shared value, not in this closure** -- the
+    // whole reason `InWindowLock` exists. The five entry points this host
+    // calls are the five the other host calls, and the tail out here is the
+    // same `finish_the_locked_session`.
+    let mut lock = InWindowLock::new(
+        teardown,
+        rebuild_vault,
+        result.clone(),
+        relocked.clone(),
+        vault_handles.clone(),
+    );
+    // The sign-in card, in an `Option` so the lock can drop it: the FIRST
+    // card's frame has already been through a successful sign-in and is
+    // sitting on its own "signing in" state, so the post-lock card is a fresh
+    // one built on demand. Exactly the shape `run_from_vault` uses, arrived
+    // at from the other end.
+    let mut login: Option<(login_ui::LoginFrameFn, login_ui::LoginFrameHandles)> =
+        Some((login_fn, login_handles));
     let mut vault_fn: Option<vault_window::VaultFrameFn> = None;
+    // Which channel the working stage drains. Written in exactly ONE place,
+    // the lock catch. See `WorkingOn`.
+    let mut working_on = WorkingOn::TheFirstPreparation;
     let mut stage = Stage::SignIn;
     // When sign-in was accepted. The span from here to the first vault frame is
     // the number this change is judged by -- everything the user experiences as
@@ -1040,30 +1144,73 @@ where
 
         match stage {
             Stage::SignIn => {
+                // Built on demand rather than up front: the FIRST card is
+                // the one handed in above, and the lock drops it so that a
+                // post-lock card is a fresh frame instead of one still
+                // wearing the first sign-in's own "signing in" state.
+                if login.is_none() {
+                    let (_options, frame, handles) = login_ui::build_login_frame(
+                        sign_in_account
+                            .as_ref()
+                            .map(|(config_dir, account)| (config_dir.as_path(), account)),
+                        sign_in_first_run,
+                        true,
+                        false,
+                    );
+                    login = Some((frame, handles));
+                }
+                let Some((login_fn, login_handles)) = login.as_mut() else {
+                    return;
+                };
                 login_fn(ui, frame);
                 // The card records its token and does NOT close the window
                 // (`close_on_success: false`); this is where that token is
                 // noticed. `take_token` takes, so this cannot fire twice.
                 if let Some(produced) = login_handles.take_token() {
+                    // **The token the window ENDED with**, which is what
+                    // `StartupOutcome::token` means. The lock catch clears
+                    // it, so a post-lock card overwrites it here and a
+                    // post-lock card the user CLOSED leaves it `None` --
+                    // which is the whole of `main`'s "closed without a
+                    // session, so exit" check, a check that could never fire
+                    // while this cell went on holding the first sign-in's
+                    // token across a lock that threw that session away.
                     *token_for_closure.borrow_mut() = Some(produced.clone());
                     signed_in_at = Some(Instant::now());
-                    // THE WORK GOES TO A THREAD. Everything `prepare` does is
-                    // synchronous and slow -- a `bw serve` cold start alone is
-                    // regularly several seconds -- and doing any of it here
-                    // would freeze the window on the frame that is supposed to
-                    // start showing the spinner.
-                    if let Some(prepare) = prepare.take() {
-                        // `take`, not `clone`: the worker gets the only sender,
-                        // so its death is a `Disconnected` the stage can act on.
-                        if let Some(work_tx) = work_tx.take() {
-                            std::thread::spawn(move || {
-                                let _ = work_tx.send(prepare(produced));
-                            });
+                    // **THE FIRST CARD OR THE SECOND, told apart by the
+                    // `FnOnce` itself.** `prepare` is in an `Option` because
+                    // it may only run once; `take()` answering `None`
+                    // therefore IS "the first sign-in already happened and
+                    // this card is the lock's", and no second flag can
+                    // disagree with it. The first card starts the worker; the
+                    // second hands its password to the teardown worker that
+                    // is already blocked waiting for one.
+                    match prepare.take() {
+                        // THE WORK GOES TO A THREAD. Everything `prepare`
+                        // does is synchronous and slow -- a `bw serve` cold
+                        // start alone is regularly several seconds -- and
+                        // doing any of it here would freeze the window on the
+                        // frame that is supposed to start showing the
+                        // spinner.
+                        Some(prepare) => {
+                            // `take`, not `clone`: the worker gets the only
+                            // sender, so its death is a `Disconnected` the
+                            // stage can act on.
+                            if let Some(work_tx) = work_tx.take() {
+                                std::thread::spawn(move || {
+                                    let _ = work_tx.send(prepare(produced));
+                                });
+                            }
                         }
+                        None => lock.hand_over_the_token(produced),
                     }
                     if let Next::Show(next) = advance(stage, Event::SignedIn) {
                         stage = next;
                         if next == Stage::Working {
+                            // Back to the seed: what is being set up after
+                            // the post-lock card is the same vault the first
+                            // card was setting up.
+                            working_message = setup_message;
                             working_since = Some(Instant::now());
                         }
                     }
@@ -1133,53 +1280,84 @@ where
                 // skipped here: the deadline cannot still be owed to a stage
                 // that has already ended itself.
                 if !closing.decided() {
-                    match work_rx.try_recv() {
-                        Ok(mut work) => {
-                            let signed_in = token_for_closure.borrow().clone();
-                            let built = match (build_vault.take(), signed_in.as_deref()) {
-                                (Some(build), Some(token)) => build(token, &mut work),
-                                _ => None,
-                            };
-                            *prepared_for_closure.borrow_mut() = Some(work);
-                            let event = match built {
-                                Some((vault, handles)) => {
-                                    vault_fn = Some(vault);
-                                    *vault_handles_for_closure.borrow_mut() = Some(handles);
-                                    Event::WorkReady
-                                }
-                                None => Event::WorkFailed,
-                            };
+                    // **ONE DRAIN, TWO SOURCES.** Which source is
+                    // `working_on`'s answer and nothing else's. What is done
+                    // with what comes out -- the transition, the watchdog,
+                    // the refusal and the `Closing` -- is shared whole
+                    // between the two entries into this stage, because a
+                    // second copy of that machinery inside one host is the
+                    // same move as a second host, one level down.
+                    let drained = match working_on {
+                        WorkingOn::TheFirstPreparation => match work_rx.try_recv() {
+                            Ok(mut work) => {
+                                let signed_in = token_for_closure.borrow().clone();
+                                let built = match (build_vault.take(), signed_in.as_deref()) {
+                                    (Some(build), Some(token)) => build(token, &mut work),
+                                    _ => None,
+                                };
+                                *prepared_for_closure.borrow_mut() = Some(work);
+                                Ok(match built {
+                                    Some((vault, handles)) => {
+                                        vault_fn = Some(vault);
+                                        *vault_handles_for_closure.borrow_mut() = Some(handles);
+                                        Event::WorkReady
+                                    }
+                                    None => Event::WorkFailed,
+                                })
+                            }
+                            // **Not `Err(_)`.** The decision is
+                            // `poll_working`'s, whole -- a `Disconnected`
+                            // means the worker is gone and nothing will ever
+                            // arrive, and an `Empty` past the deadline means
+                            // it is alive and not coming back either.
+                            Err(err) => Err(err),
+                        },
+                        // **The lock's two steps, answered by the SHARED
+                        // value** -- the same `answer_the_teardown` the other
+                        // host drains, not a second reading of the same
+                        // channel.
+                        WorkingOn::TheLocksTeardown => lock.answer_the_teardown(&mut vault_fn),
+                    };
+
+                    match drained {
+                        Ok(event) => {
                             match advance(stage, event) {
                                 Next::Show(next) => {
-                                    if let Some(at) = signed_in_at {
-                                        log::info!(
-                                            "single window: vault ready {:?} after sign-in \
-                                             was accepted",
-                                            at.elapsed()
-                                        );
+                                    if next == Stage::Vault {
+                                        if let Some(at) = signed_in_at {
+                                            log::info!(
+                                                "single window: vault ready {:?} after \
+                                                 sign-in was accepted",
+                                                at.elapsed()
+                                            );
+                                        }
                                     }
                                     stage = next;
                                 }
                                 Next::Close => {
-                                    log::warn!(
-                                        "the single window has no vault to show; closing so \
-                                         the startup recovery can run"
-                                    );
+                                    match working_on {
+                                        WorkingOn::TheFirstPreparation => log::warn!(
+                                            "the single window has no vault to show; \
+                                             closing so the startup recovery can run"
+                                        ),
+                                        // `main` does NOT re-run a recovery
+                                        // for this one: the teardown already
+                                        // ran and already authenticated, and
+                                        // the window ends with no token, so
+                                        // the startup path exits rather than
+                                        // asking for the master password the
+                                        // user just gave.
+                                        WorkingOn::TheLocksTeardown => log::warn!(
+                                            "the lock's recovery produced no vault to \
+                                             show; the session is torn down and stays \
+                                             down, so the window closes"
+                                        ),
+                                    }
                                     close_this_window(ui.ctx(), &mut closing);
                                 }
                             }
                             ui.ctx().request_repaint();
                         }
-                        // **Not `Err(_)`.** The decision is `poll_working`'s,
-                        // whole -- a `Disconnected` means the worker is gone and
-                        // nothing will ever arrive, and an `Empty` past the
-                        // deadline means it is alive and not coming back either.
-                        // Both land on `Event::WorkFailed`, which `advance`
-                        // sends to `Next::Close`: the window ends and `main`'s
-                        // `recover_from_failed_vault_wait` takes over, which is
-                        // a fresh login the user can close. That is the point of
-                        // the fix -- not a fourth stage that apologises with the
-                        // same disabled ✕.
                         Err(err) => {
                             let elapsed = working_since.map_or(Duration::ZERO, |at| at.elapsed());
                             match poll_working(err, elapsed) {
@@ -1187,6 +1365,15 @@ where
                                     ui.ctx().request_repaint_after(WORKING_POLL)
                                 }
                                 WorkPoll::Failed(why) => {
+                                    // Called on BOTH entries and correct on
+                                    // both: `retracts_the_teardown` answers
+                                    // `false` for a lock that never started a
+                                    // worker, which is every failure of the
+                                    // first preparation. Guarding the call
+                                    // with `working_on` would be a second
+                                    // spelling of the same condition, in a
+                                    // place the rule's own table cannot see.
+                                    lock.retract_if_the_teardown_never_ran(why);
                                     give_up_working(ui.ctx(), &mut closing, why, elapsed);
                                     ui.ctx().request_repaint();
                                 }
@@ -1203,6 +1390,35 @@ where
                 if let Some(vault_fn) = vault_fn.as_mut() {
                     vault_fn(ui, frame);
                 }
+                // **THE LOCK, CAUGHT IN THE STARTUP WINDOW.** Without this
+                // arm the vault frame's own `ViewportCommand::Close` is
+                // honoured, this window goes, and `main` reopens a sign-in
+                // window of its own -- which is the user's report verbatim:
+                // "still showing separate screen after login". The catch
+                // itself is `InWindowLock`'s and shared with the other host;
+                // what is decided here is only where the window goes next.
+                if lock.catch_the_lock(ui.ctx(), &mut vault_fn) {
+                    // The session this token belongs to is being dismantled,
+                    // so it is no longer the token the window will end with.
+                    // The post-lock card writes the new one; a post-lock card
+                    // the user closes leaves `None` here.
+                    *token_for_closure.borrow_mut() = None;
+                    // Set whether or not the teardown is later rebuilt: see
+                    // `StartupOutcome::tore_the_session_down`.
+                    *tore_down_for_closure.borrow_mut() = true;
+                    // The first card's frame is spent; the next one is fresh.
+                    login = None;
+                    // **The one write of the mode local.**
+                    working_on = WorkingOn::TheLocksTeardown;
+                    if let Next::Show(next) = advance(stage, Event::Locked) {
+                        stage = next;
+                        if next == Stage::Working {
+                            working_message = LOCK_MESSAGE;
+                            working_since = Some(Instant::now());
+                        }
+                    }
+                    ui.ctx().request_repaint();
+                }
             }
         }
     });
@@ -1211,7 +1427,12 @@ where
     // persists the geometry and reads the four outcome cells. `None` when the
     // vault stage was never entered, which is the whole of the difference
     // between "the user closed their vault" and "the user never saw it".
-    let vault = vault_handles.borrow().as_ref().map(|handles| handles.finish());
+    // **The shared tail**, not a bare `finish` -- the same one
+    // `run_from_vault` ends on. A window that locked had its pre-lock cells
+    // read at the moment of the lock, and a gear visit made before that lock
+    // would be thrown away by an unconditional read of the rebuilt session's
+    // fresh cells. See `carry_settings_forward`.
+    let vault = finish_the_locked_session(&result, &vault_handles);
     let stages = stages.borrow().clone();
     if !stages.contains(&Stage::Vault) {
         log::warn!(
@@ -1223,7 +1444,8 @@ where
     // after the `Rc` it borrows from has already been dropped.
     let token = token.borrow_mut().take();
     let prepared = prepared.borrow_mut().take();
-    StartupOutcome { token, prepared, vault, stages }
+    let tore_the_session_down = *tore_down.borrow();
+    StartupOutcome { token, prepared, vault, stages, tore_the_session_down }
 }
 
 /// What the spinner says while a lock's teardown runs.
@@ -2421,7 +2643,7 @@ mod startup_window_tests {
         // `both_hosts_go_through_the_one_window_opener`, which is what now
         // holds the fact the old anchor incidentally held.
         let at = production
-            .find(concat!("pub fn ", "run<P, W, V>("))
+            .find(concat!("pub fn ", "run<P, W, V, T, B>("))
             .expect(
                 "no startup host in this file -- if `run` is gone, the single-window startup \
                  is gone entirely",
@@ -3959,7 +4181,7 @@ mod lock_host_tests {
             );
         let rest = &production[at..];
         let end = rest
-            .find(concat!("pub fn ", "run<P, W, V>("))
+            .find(concat!("pub fn ", "run<P, W, V, T, B>("))
             .expect("the shared lock value is not above the startup host");
         let value = rest[..end].to_string();
         assert!(
@@ -4005,6 +4227,36 @@ mod lock_host_tests {
     /// its own body and the guard would be red on a correct tree.
     fn where_a_lock_decision_could_live() -> String {
         format!("{}\n{}", lock_value(), closure())
+    }
+
+    /// **The startup host**, bounded the same way the vault host is: from
+    /// its own `pub fn` down to the next one. Added when step 5 wired the
+    /// lock into it -- the guard below names both call sites rather than
+    /// raising a number, which is what that step's brief requires and what
+    /// keeps "one caller per host" a statement about each host.
+    fn startup_host() -> String {
+        let production = code(production());
+        let at = production
+            .find(concat!("pub fn ", "run<P, W, V, T, B>("))
+            .expect(
+                "the startup host is gone entirely -- the single-window startup is gone \
+                 with it",
+            );
+        let rest = &production[at..];
+        let end = rest
+            .find(concat!("pub fn run_from_", "vault<T, S, B>("))
+            .expect("the startup host is no longer above the vault host");
+        let host = rest[..end].to_string();
+        assert!(
+            host.len() > 3_000,
+            "the startup host sliced down to {} bytes, which is not the whole of it",
+            host.len()
+        );
+        assert!(
+            !host.contains(concat!("struct InWindow", "Lock<T, B> {")),
+            "control: the startup host slice reaches back over the shared lock value"
+        );
+        host
     }
 
     fn catch_body() -> String {
@@ -4750,6 +5002,7 @@ mod lock_host_tests {
         let production = code(production());
         let value = lock_value();
         let closure = closure();
+        let startup = startup_host();
         for (define, call) in [
             (concat!("fn ", "new("), concat!("InWindow", "Lock::new(")),
             (concat!("fn catch_the_", "lock("), concat!("lock.catch_the_", "lock(")),
@@ -4771,11 +5024,19 @@ mod lock_host_tests {
                  definition is the copy this lift exists to prevent, and none at all is a \
                  touch point that has gone back inside a host: {value}"
             );
+            // **TWO callers now, and both are NAMED rather than counted.**
+            // Step 5 wired the startup host into the same value, so the
+            // production count went from one to two -- and a raised number
+            // is precisely the edit this guard's own doc forbids: it would
+            // be satisfied by two calls from ONE host, which is two
+            // teardown workers against one estate. What is pinned instead
+            // is one call from each host, which no arrangement of two
+            // calls in one place can satisfy.
             assert_eq!(
                 production.matches(call).count(),
-                1,
-                "{call:?} is called from more than one place in this file, or from none. A \
-                 SECOND caller is not a second copy, so nothing that counts copies can see it \
+                2,
+                "{call:?} is called from other than the two hosts. A SECOND caller inside \
+                 ONE host is not a second copy, so nothing that counts copies can see it \
                  -- and a second caller of the catch is two teardown workers against one \
                  session, which is the multiple-owner shape the estate exists to remove: \
                  {production}"
@@ -4783,10 +5044,108 @@ mod lock_host_tests {
             assert_eq!(
                 closure.matches(call).count(),
                 1,
-                "{call:?} is not called exactly once from the vault host, so the one call \
-                 counted above is somewhere else: {closure}"
+                "{call:?} is not called exactly once from the vault host, so one of the \
+                 two calls counted above is somewhere else: {closure}"
+            );
+            assert_eq!(
+                startup.matches(call).count(),
+                1,
+                "{call:?} is not called exactly once from the STARTUP host. Zero is the \
+                 reported bug restored: the startup window closes on a lock and `main` \
+                 opens a sign-in window of its own, which is \"still showing separate \
+                 screen after login\" verbatim: {startup}"
             );
         }
+    }
+
+    /// **THE REPORTED BUG, as a source guard over the startup host.**
+    ///
+    /// The user's sentence is "still showing separate screen after login":
+    /// launch, sign in, press Lock, and the window closes while a separate
+    /// sign-in window appears. A tray-opened vault already keeps its
+    /// window; the startup one did not, because nothing in it caught the
+    /// close the vault frame asks for on all three lock routes.
+    ///
+    /// The guard above pins that the startup host CALLS the shared catch.
+    /// This one pins the five things the arm has to do around that call,
+    /// each of which is silent on its own: an arm that catches the lock but
+    /// never switches the drain sits out `WORKING_DEADLINE` behind a
+    /// ghosted close button; one that never clears the token carries the
+    /// dead session's token into the tray; one that never records the
+    /// teardown lets `main` replay a pre-window snapshot over the engine
+    /// the teardown just armed; one that keeps the first card's frame shows
+    /// a spent card; one that never changes the message tells the user it
+    /// is setting their vault up while it is locking it.
+    #[test]
+    fn the_startup_host_catches_its_own_lock_rather_than_letting_the_window_close() {
+        let startup = startup_host();
+        for (needle, why) in [
+            (
+                concat!("lock.catch_the_", "lock(ui.ctx(), &mut vault_fn)"),
+                "the startup window does not catch its own lock at all, so the vault \
+                 frame's own close is honoured, the window goes, and `main` opens a \
+                 separate sign-in window -- the reported bug, verbatim",
+            ),
+            (
+                concat!("working_on = WorkingOn::", "TheLocksTeardown;"),
+                "the working stage is never told which channel it is draining, so after \
+                 a lock it polls the spent `work_rx` and waits out the whole \
+                 `WORKING_DEADLINE` behind a close button that refuses every click",
+            ),
+            (
+                concat!("*token_for_closure.borrow_mut() = ", "None;"),
+                "the window goes on reporting the FIRST sign-in's token after a lock \
+                 threw that session away, so `main`'s \"closed without a session\" check \
+                 never fires and a dead token is carried into the tray",
+            ),
+            (
+                concat!("*tore_down_for_closure.borrow_mut() = ", "true;"),
+                "nothing records that the session was torn down, so `main` replays its \
+                 pre-window match-engine snapshot over whatever the teardown left -- and \
+                 on a declined sign-in that re-arms autofill against a vault the user \
+                 just locked",
+            ),
+            (
+                concat!("working_message = ", "LOCK_MESSAGE;"),
+                "the spinner goes on saying it is setting the vault up while it is \
+                 locking it, which is the message half of the same report",
+            ),
+        ] {
+            assert!(startup.contains(needle), "{why}: {needle:?} is not in the startup host");
+        }
+        // The mode local is written in exactly ONE place. A second write
+        // is a stage that can be told it is draining the other channel
+        // from somewhere that is not the lock.
+        // The SEED is not an assignment for this purpose -- it is the
+        // declaration -- so it is subtracted rather than matched around,
+        // the same difference-of-two-counts idiom `main.rs` uses to tell a
+        // `SessionEstate` construction from a destructure.
+        let all = startup.matches(concat!("working_on", " = ")).count();
+        let seeds = startup.matches(concat!("let mut working_on", " = ")).count();
+        assert_eq!(seeds, 1, "the mode local is declared other than once: {startup}");
+        assert_eq!(
+            all - seeds,
+            1,
+            "the working stage's mode is assigned {} time(s) below its declaration \
+             rather than exactly once. Which channel the stage drains then stops being \
+             a fact about whether a lock happened: {startup}",
+            all - seeds
+        );
+        // And the FIRST card is told from the SECOND by the `FnOnce`
+        // itself, not by a flag that can disagree with it.
+        assert!(
+            startup.contains(concat!("match prepare.", "take() {")),
+            "the startup host no longer discriminates its two sign-in cards by whether \
+             `prepare` has already been spent. Any other discriminator is a second piece \
+             of state that can disagree with the one that decides whether the worker \
+             actually starts: {startup}"
+        );
+        assert!(
+            startup.contains(concat!("None => lock.hand_over_the_", "token(produced),")),
+            "the post-lock card's password is not handed to the teardown worker, which \
+             is blocked waiting for one: the spinner then waits out the deadline for a \
+             password the user has already typed: {startup}"
+        );
     }
 
     /// **The stage is ADVANCED, never assigned.**

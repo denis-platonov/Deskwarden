@@ -569,6 +569,30 @@ fn main() {
     let (backend_op_tx, backend_op_rx) = mpsc::channel::<BackendOp>();
     let backend_op_rx = Arc::new(Mutex::new(backend_op_rx));
 
+    // **The tray labels a teardown INSIDE the startup window reported.**
+    //
+    // `resettle_session_reporting_tray` reports its Sync-item updates as
+    // values rather than applying them, because `AppTray` owns a hidden
+    // Win32 window bound to the thread that built it and the teardown runs
+    // on a worker. The vault host drops them and says so: `main`'s tray
+    // already exists there and its idle pass reconciles the label as soon
+    // as the window is gone.
+    //
+    // **Neither of those is true here.** At this point in the launch there
+    // is no tray at all -- `tray::build_tray()` runs below the branch -- and
+    // no idle loop to do any reconciling, so a dropped `SyncFailed` is a
+    // tray that comes up in its resting state claiming a sync succeeded when
+    // it did not. Declared above the branch and applied immediately after
+    // the tray is built.
+    let startup_tray_effects: Arc<Mutex<Vec<TrayEffect>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // **Whether the startup window tore its own session down and rebuilt it
+    // in place.** Written by the signing-in arm alone -- the cached-session
+    // arm opens no window and so can lock nothing -- and read exactly once,
+    // by the engine rebuild below the branch. See there for what it costs to
+    // get wrong.
+    let mut the_startup_window_tore_the_session_down = false;
+
     // **Both arms below END with a `SessionEstate`, and everything after the
     // branch reads it.**
     //
@@ -703,15 +727,29 @@ fn main() {
     // here and not on the frame closure: `try_start_backend` alone is regularly
     // several seconds, and any of it on the frame thread would freeze the window
     // exactly where it is meant to be showing a spinner.
-    // Where the worker publishes the `bw serve` it starts, so that a
-    // `WORKING_DEADLINE` expiry -- which throws the worker's whole result
-    // away -- cannot also throw away the handle to a live backend. See
-    // `StartupChildHandoff`.
-    let startup_child = Arc::new(StartupChildHandoff::new());
-    let handoff_for_work = startup_child.clone();
+    // **Everything the off-thread closures need, taken BEFORE the estate is
+    // parked.** A worker is `'static` and cannot borrow this stack frame; the
+    // estate itself is not copied anywhere -- it is parked, and both the
+    // teardown worker and the window's own `prepare` reach it through the
+    // park.
     let job_for_work = job.clone();
     let vault_for_work = vault.clone();
     let schedule_for_work = schedule.clone();
+    let job_for_teardown = job.clone();
+    let drain_for_teardown = Arc::clone(&backend_op_rx);
+    let schedule_for_teardown = schedule.clone();
+
+    // **The sign-in card's account, owned.** `login` borrows
+    // `active_account`, and `active_account` is about to move into the
+    // parked estate for the window's whole life -- so the card, which runs
+    // during exactly that stretch, cannot be handed the borrow. This is the
+    // same copy-out `RealVaultOps::open_window` makes for its own
+    // `build_sign_in`, for the same reason, and it is a copy of two display
+    // values rather than of anything the estate owns.
+    let sign_in_account: Option<(std::path::PathBuf, Account)> = login
+        .account
+        .map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
+    let sign_in_first_run = login.first_run;
 
     let cache_for_vault = cache.clone();
     let fill_stats_for_vault = fill_stats.clone();
@@ -719,65 +757,209 @@ fn main() {
     let auto_lock_for_vault = settings.auto_lock();
     let accounts_for_vault = accounts_state.clone();
     let entries_out = startup_entries.clone();
+    let fill_stats_for_rebuild = fill_stats.clone();
+    let icon_cache_dir_for_rebuild = icon_cache_dir.clone();
 
-    let outcome = app_window::run(
-        login.account,
-        login.first_run,
-        SETUP_MESSAGE,
-        // ON A WORKER THREAD. `try_start_backend` rather than `start_backend`:
-        // the fatal variant puts a modal message box up, and doing that from a
-        // worker while an eframe window owns the main thread is a dialog behind
-        // a window nobody can reach. The failure is carried back instead and is
-        // just as fatal, one frame later, on the thread that can show it.
-        move |token| StartupWork::produce(
-            &token,
-            &job_for_work,
-            &vault_for_work,
-            &schedule_for_work,
-            &handoff_for_work,
+    // Where the lock hands the teardown worker its two channel ends. **The
+    // worker is spawned by `park_and_work` before the window opens and blocks
+    // there**, because the estate has to be parked for the window's whole
+    // life: a park set up at the moment of the lock would need the estate at
+    // that moment, and at that moment it is inside eframe's frame closure. A
+    // window that never locks drops this sender when its closure is dropped,
+    // and the worker leaves having touched nothing.
+    let (lock_tx, lock_rx) = mpsc::channel::<LockChannels>();
+    // What the teardown publishes for the rebuild, which runs on the frame
+    // thread and must not touch the park.
+    let rebuilt: Arc<Mutex<Option<RebuiltVault>>> = Arc::new(Mutex::new(None));
+    let rebuilt_for_worker = Arc::clone(&rebuilt);
+    let tray_effects_for_worker = Arc::clone(&startup_tray_effects);
+
+    // Written by the wait below, on the one line under the call: `wait` is
+    // `FnOnce` and hands back only an `EstateOutcome`.
+    let mut window: Option<app_window::StartupOutcome<StartupWork>> = None;
+
+    let (estate_after_the_window, parked) = park_and_work(
+        the_estate_the_startup_window_runs_against(
+            cache,
+            engine,
+            store,
+            active_account,
+            accounts_state,
+            settings,
         ),
-        // ON THE MAIN THREAD, in the frame that drains the worker. The cache
-        // has to be filled BEFORE the vault frame is built, or the window's
-        // first vault frame paints an empty vault as data.
-        move |token, work: &mut StartupWork| {
-            // Annotated: without it, deref coercion picks `&mut [VaultItem]`
-            // and `mem::take` asks for a `Default` slice.
-            let items: Vec<deskwarden::vault_bridge::VaultItem> =
-                std::mem::take(work.items.as_mut().ok()?);
-            arm_autofill_and_seed_cache(&entries_out, &cache_for_vault, items, startup_epoch);
-            let (_options, frame, handles) = vault_window::build_frame(
-                cache_for_vault.clone(),
-                fill_stats_for_vault,
-                // `Ready`, not a fetch of its own: `StartupWork::produce`
-                // already asked `bw status` on the worker thread, beside the
-                // spinner this window was showing at the time. That is the
-                // same "never on the frame thread" rule the tray path now
-                // follows by fetching alongside its window -- one mechanism,
-                // reached differently -- so the vault stage paints the avatar
-                // on its first frame and nothing appears late here.
-                vault_window::AccountDetails::Ready(work.details.clone()),
-                token.to_string(),
-                icon_cache_dir_for_vault,
-                auto_lock_for_vault,
-                // The readiness probe in `prepare` has just answered, so the
-                // backend is up and the vault's own initial load may skip its
-                // readiness wait -- the same exemption `open_vault_window`
-                // makes when it finds the backend already running.
-                true,
-                accounts_for_vault,
-                // This window's first frame already installed the fonts,
-                // rounded the corners and raised it, three stages ago.
-                true,
-            );
-            Some((frame, handles))
+        // ---- THE TEARDOWN WORKER, the SAME lifted sequence the vault host
+        // runs. Spawned here and blocked in `lock_rx.recv()` for a window
+        // that never locks.
+        move |park| {
+            run_the_in_window_teardown(
+                park,
+                &lock_rx,
+                &job_for_teardown,
+                &drain_for_teardown,
+                &schedule_for_teardown,
+                &rebuilt_for_worker,
+                &tray_effects_for_worker,
+            )
+        },
+        // ---- THE WAIT, AND ITS BODY IS THE WINDOW. A blocking wait here
+        // would run on the thread eframe needs in order to paint, so it would
+        // be a frozen window -- strictly worse than the blink this feature
+        // exists to remove.
+        |park, done_rx| {
+            // **The park handle the worker `prepare` arms the estate through.**
+            // `prepare` is `'static` and can borrow nothing off this stack, so
+            // an owned handle on the same slot is the only way it can write
+            // `est.child` and `est.token` at the moment `bw serve` is spawned.
+            // This is what step 4 (`park_and_work` handing `wait` the park)
+            // exists for.
+            let park_for_work = park.handle();
+            window = Some(app_window::run(
+                sign_in_account
+                    .as_ref()
+                    .map(|(config_dir, account)| (config_dir.as_path(), account)),
+                sign_in_first_run,
+                SETUP_MESSAGE,
+                // ON A WORKER THREAD. `try_start_backend` rather than
+                // `start_backend`: the fatal variant puts a modal message box
+                // up, and doing that from a worker while an eframe window owns
+                // the main thread is a dialog behind a window nobody can
+                // reach. The failure is carried back instead and is just as
+                // fatal, one frame later, on the thread that can show it.
+                move |token| StartupWork::produce(
+                    &token,
+                    &job_for_work,
+                    &vault_for_work,
+                    &schedule_for_work,
+                    &park_for_work,
+                ),
+                // ON THE MAIN THREAD, in the frame that drains the worker. The
+                // cache has to be filled BEFORE the vault frame is built, or
+                // the window's first vault frame paints an empty vault as data.
+                move |token, work: &mut StartupWork| {
+                    // Annotated: without it, deref coercion picks
+                    // `&mut [VaultItem]` and `mem::take` asks for a `Default`
+                    // slice.
+                    let items: Vec<deskwarden::vault_bridge::VaultItem> =
+                        std::mem::take(work.items.as_mut().ok()?);
+                    arm_autofill_and_seed_cache(
+                        &entries_out,
+                        &cache_for_vault,
+                        items,
+                        startup_epoch,
+                    );
+                    let (_options, frame, handles) = vault_window::build_frame(
+                        cache_for_vault.clone(),
+                        fill_stats_for_vault,
+                        // `Ready`, not a fetch of its own: `StartupWork::
+                        // produce` already asked `bw status` on the worker
+                        // thread, beside the spinner this window was showing at
+                        // the time.
+                        vault_window::AccountDetails::Ready(work.details.clone()),
+                        token.to_string(),
+                        icon_cache_dir_for_vault,
+                        auto_lock_for_vault,
+                        // The readiness probe in `prepare` has just answered,
+                        // so the backend is up and the vault's own initial load
+                        // may skip its readiness wait.
+                        true,
+                        accounts_for_vault,
+                        // This window's first frame already installed the
+                        // fonts, rounded the corners and raised it, three
+                        // stages ago.
+                        true,
+                    );
+                    Some((frame, handles))
+                },
+                // **THE LOCK, in the window that is already open.** The same
+                // one-line handoff the vault host performs, into the same
+                // lifted worker. Without it a lock here closes the window and
+                // `main` reopens a sign-in window of its own, which is the
+                // user's report verbatim.
+                move |step_tx, token_rx| forward_lock_channels(&lock_tx, step_tx, token_rx),
+                // The vault, rebuilt in place. Reads only what the teardown
+                // published; it must not reach the park, which the worker may
+                // still be holding.
+                move |edited_before_lock| {
+                    rebuild_the_vault_after_the_lock(
+                        &rebuilt,
+                        fill_stats_for_rebuild,
+                        icon_cache_dir_for_rebuild,
+                        edited_before_lock,
+                    )
+                },
+            ));
+            // How the parked work ended, read off the completion signal the
+            // worker sends last. `Empty` means the window is gone and the
+            // worker is not -- the reclaim below is what then takes the estate
+            // away from it.
+            match done_rx.try_recv() {
+                Ok(()) => EstateOutcome::Completed,
+                Err(mpsc::TryRecvError::Disconnected) => EstateOutcome::WorkerPanicked,
+                Err(mpsc::TryRecvError::Empty) => EstateOutcome::DeadlineExpired,
+            }
         },
     );
+
+    // **DESTRUCTURED, never cloned and never taken.** The recoveries below
+    // want `&mut` on two of these fields at once and the terminal estate wants
+    // all ten by value; a destructure is the one statement that gives both,
+    // and it is also what keeps every call site below spelled exactly as it
+    // was before the estate was parked at all.
+    //
+    // **The two `_`-prefixed names are the residue, spelled out loud.** The
+    // terminal estate below seeds `details: None` and `task_in_progress: None`,
+    // so whatever the window's teardown left in these two is dropped here.
+    // That is truthful today -- the teardown deliberately empties the cached
+    // details, and `resettle_session_with` leaves no operation in flight -- but
+    // it is truthful by coincidence rather than by construction, so it is
+    // named rather than absorbed into a `..`. See
+    // `the_startup_windows_round_trip_drops_only_the_two_fields_its_teardown_
+    // leaves_empty`.
+    let SessionEstate {
+        cache,
+        engine,
+        child: mut bw_serve_child,
+        token: _token_the_window_left,
+        details: _details_the_window_left,
+        task_in_progress: _task_the_window_left,
+        store,
+        active_account,
+        accounts: accounts_state,
+        settings,
+    } = estate_after_the_window;
+    log::info!("the startup window's parked estate came home {parked:?}");
+    // Rebuilt rather than reused: the one `main` built above the branch
+    // borrows `active_account`, and `active_account` spent this window
+    // inside the parked estate. Built through `login_context` -- the one
+    // place a `LoginContext` is built -- off the field that just came home,
+    // so it names the same account with no second copy of it anywhere.
+    let login = login_context(
+        config_dir.as_path(),
+        active_account.as_ref(),
+        first_run_account.as_ref(),
+    );
+
+    let outcome = window.expect(
+        "`app_window::run` returned without leaving its outcome behind, which is impossible: \
+         the wait writes it on the one statement that calls it",
+    );
+
+    // **Whether the window tore its own session down**, carried out of the
+    // branch so the engine rebuild below it can ask. See
+    // `app_window::StartupOutcome::tore_the_session_down`.
+    the_startup_window_tore_the_session_down = outcome.tore_the_session_down;
 
     // Closing the card is the same gesture, and costs the same thing, as
     // closing the old login window: every downstream operation needs a session.
     // `login_ui::run_login_flow` is where that decision lives for every OTHER
     // caller and it exits the process; this window cannot go through it (it
     // does not open a window of its own), so it says the same thing here.
+    //
+    // **And it now fires on the path it was written for.** This cell holds the
+    // token the window ENDED with: a lock clears it and the post-lock card
+    // writes the new one, so a lock followed by a declined sign-in arrives
+    // here as `None` -- a session that really is gone -- instead of the first
+    // sign-in's token, which would have carried a dead session into the tray.
     let Some(token) = outcome.token else {
         log::error!("the startup window was closed without producing a session token; exiting");
         std::process::exit(1);
@@ -785,16 +967,8 @@ fn main() {
     if let Err(e) = store.save(&token) {
         log::error!("failed to persist session token: {e}");
     }
-    session_token = token;
+    let mut session_token = token;
     startup_vault = outcome.vault;
-
-    // **Before the arms split, not inside them.** Whether the worker finished
-    // or `app_window::WORKING_DEADLINE` fired, this process may have a
-    // `bw serve` listening on `BW_SERVE_PORT`; the two arms differ in what
-    // they do next, not in whether that is possible. Asking here is what
-    // stops the `None` arm from assuming the answer is no and then failing
-    // fatally on its own orphan -- see `StartupChildHandoff`.
-    bw_serve_child = startup_child.claim();
 
     match outcome.prepared {
         Some(work) => {
@@ -808,8 +982,9 @@ fn main() {
             }
             if bw_serve_child.is_none() {
                 log::error!(
-                    "the startup worker reported that `bw serve` started but parked no handle \
-                     for it; the backend cannot be stopped or restarted from here"
+                    "the startup worker reported that `bw serve` started but the estate came \
+                     home with no handle for it; the backend cannot be stopped or restarted \
+                     from here"
                 );
             }
             // `build_vault` above already armed `startup_entries` and filled the
@@ -835,18 +1010,19 @@ fn main() {
             // or `WORKING_DEADLINE` fired on a worker still blocked in the
             // readiness probe or in `check_bw_status_details`.
             //
-            // **The worker may well have started a backend by then**, and
-            // this arm used to state the opposite and pass `None` down. The
-            // claim above has already adopted it if so, which is what lets
-            // the recovery below actually kill it: recovery's first act is
-            // `stop_bw_serve`, and with `None` it stopped nothing, re-asked
-            // for the master password, then died on the port its own orphan
-            // was holding.
+            // **The worker may well have started a backend by then**, and this
+            // arm used to state the opposite and pass `None` down. It no longer
+            // has to ask anybody: the worker armed `est.child` at the spawn, so
+            // the estate that came home above is already holding whatever was
+            // started -- which is what lets the recovery below actually kill
+            // it. Recovery's first act is `stop_bw_serve`, and with `None` it
+            // stopped nothing, re-asked for the master password, then died on
+            // the port its own orphan was holding.
             if bw_serve_child.is_some() {
                 log::warn!(
                     "the startup window gave up while a `bw serve` this process started was \
-                     already running; adopting it so the recovery below can stop it instead of \
-                     colliding with it"
+                     already running; the parked estate brought it home so the recovery below \
+                     can stop it instead of colliding with it"
                 );
             }
             let items = recover_from_failed_vault_wait(
@@ -882,7 +1058,32 @@ fn main() {
         "match engine loaded with {} app match(es)",
         startup_entries.borrow().len()
     );
-    estate.engine.rebuild(&startup_entries.borrow());
+    // **CONDITIONAL, and the condition is the whole of step 8.**
+    //
+    // This line overwrites the match engine from a snapshot taken BEFORE
+    // the window opened. While a lock in the startup window was an ordinary
+    // close that was harmless -- the teardown ran after this line and had
+    // the last word. Now that the teardown runs INSIDE the window that
+    // order is inverted and this line has the last word instead:
+    //
+    // * over a lock that rebuilt, it reverts the repopulated engine to its
+    //   pre-lock contents;
+    // * over a lock whose sign-in the user DECLINED, it re-arms autofill
+    //   against a vault the user just locked -- undoing the
+    //   `stand_down_after_unlock` the teardown ran on purpose, which is the
+    //   worst outcome this feature can produce.
+    //
+    // Both arms of the branch above reach here, and only the signing-in one
+    // can have locked.
+    if the_startup_window_tore_the_session_down {
+        log::info!(
+            "the startup window tore its session down and settled it again in place, so \
+             the match engine is the one that teardown left; the pre-window snapshot is \
+             NOT replayed over it"
+        );
+    } else {
+        estate.engine.rebuild(&startup_entries.borrow());
+    }
 
     // The lifecycle this app promises: unlock -> start the backend -> fill
     // the cache once -> *then* obey the policy. The backend has had to be up
@@ -912,6 +1113,15 @@ fn main() {
     // removal and switch, and rebuilding mints new `MenuId`s that the tray has
     // to remember.
     let mut tray = tray::build_tray();
+    // **The teardown's tray labels, applied on the first thread that can.**
+    // Empty unless the startup window locked; see `startup_tray_effects`. A
+    // dropped `SyncFailed` here is a tray icon that comes up claiming a
+    // sync succeeded, on a launch where it did not, with no idle pass yet
+    // to correct it.
+    for effect in startup_tray_effects.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        log::info!("applying a tray label the startup window's teardown reported: {effect:?}");
+        effect.apply(&tray);
+    }
     // Filled once here, so the submenu is correct before the user can open it,
     // and again after every account change below. `accounts_state` is `None`
     // for `StartupAccounts::NoAccountList` -- see `tray::accounts_menu_plan`,
@@ -3177,6 +3387,56 @@ impl EstatePark {
 /// all. That is not merely documented -- the read-back's `expect` turns it
 /// into an immediate, named panic rather than a silent loss, and
 /// `a_wait_that_reclaims_the_estate_is_caught_at_the_read_back` drives it.
+/// **The estate the startup window is handed BEFORE it opens.**
+///
+/// `park_and_work` takes a [`SessionEstate`] by value, so one has to exist
+/// before `app_window::run` is called -- and at that moment two of its ten
+/// fields have no value yet: the sign-in card has not produced a token and
+/// no `bw serve` has been started. `main.rs`'s own notes above the startup
+/// branch say a seeded `token: String::new()` and a seeded `child: None`
+/// must not be spellable THERE, and this is why: they are not spelled
+/// there. They are spelled here, once, under a name that says what they
+/// are.
+///
+/// **They are uninitialised, not false, and there is a proof rather than a
+/// hope.** `StartupWork::produce` writes BOTH of them into this very
+/// estate, through the park, in one `with`, at the moment `bw serve` is
+/// spawned -- which is every path out of the window on which a token was
+/// ever produced, including the two `build_vault` cannot reach (an `items`
+/// that is `Err` bails at its `?`, and a deadline / panic / abandoned
+/// window never calls it at all). The one path home with these two values
+/// still in place is the window closed on the sign-in card, and that path
+/// is `main`'s `exit(1)`: nothing reads the estate on it.
+///
+/// **A function and not a literal inside the branch**, because the arms'
+/// terminal `SessionEstate` is a different KIND of construction -- it is
+/// each arm's answer, built from values that arm decided -- and
+/// `both_startup_arms_end_with_the_same_estate` is written over exactly
+/// those two. A third literal inside the branch, seeded with the two
+/// values that guard's per-field clause exists to forbid, would be
+/// indistinguishable from the regression it is there to catch.
+fn the_estate_the_startup_window_runs_against(
+    cache: Arc<VaultCache>,
+    engine: MatchEngine,
+    store: session_store::SessionStore,
+    active_account: Option<accounts::Account>,
+    accounts: Option<accounts::AccountsState>,
+    settings: settings::Settings,
+) -> SessionEstate {
+    SessionEstate {
+        cache,
+        engine,
+        child: None,
+        token: String::new(),
+        details: None,
+        task_in_progress: None,
+        store,
+        active_account,
+        accounts,
+        settings,
+    }
+}
+
 /// The two channel ends the lock's teardown worker is blocked waiting for:
 /// the sender it reports its [`app_window::TeardownStep`]s on, and the
 /// receiver the master-password card's token comes down.
@@ -3490,6 +3750,7 @@ fn run_the_in_window_teardown(
     drain: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     schedule: &[Duration],
     rebuilt: &Arc<Mutex<Option<RebuiltVault>>>,
+    tray_effects_out: &Arc<Mutex<Vec<TrayEffect>>>,
 ) {
     // `if let`, not a `let ... else { return; }`: the three
     // regions behind `ops` are held to having no early exit at
@@ -3548,17 +3809,28 @@ fn run_the_in_window_teardown(
                 },
                 &mut tray_effects,
             );
-            // **The tray labels are dropped here, and that is not an
-            // oversight.** `AppTray` owns a hidden Win32 window bound
-            // to the thread that built it, so a worker cannot apply
-            // them; `main`'s idle loop reconciles the Sync label as
-            // soon as this window is gone. The lift exists so the body
-            // is movable, and this is the caller that moves it.
+            // **The tray labels are CARRIED OUT, not dropped.** `AppTray`
+            // owns a hidden Win32 window bound to the thread that built
+            // it, so a worker cannot apply them -- but it can hand them
+            // to the thread that can.
+            //
+            // This used to say the labels were dropped because "`main`'s
+            // idle loop reconciles the Sync label as soon as this window
+            // is gone". That is true of the vault host and FALSE of the
+            // startup host: at startup there is no tray at all yet
+            // (`tray::build_tray` runs below the window) and no idle loop
+            // to do any reconciling, so a dropped `SyncFailed` is a tray
+            // that comes up claiming a sync succeeded when it did not.
             log::info!(
                 "the in-window lock's teardown finished with {outcome:?}; {} tray label \
-                 update(s) were reported and are left to `main`'s reconciliation",
+                 update(s) were reported and are carried out to whichever host has a \
+                 tray to apply them to",
                 tray_effects.len()
             );
+            tray_effects_out
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(&mut tray_effects);
             RebuiltVault {
                 outcome,
                 cache: Arc::clone(&est.cache),
@@ -3793,6 +4065,13 @@ impl VaultOps for RealVaultOps<'_> {
         // thread and must not touch the park. `None` until the teardown ends.
         let rebuilt: Arc<Mutex<Option<RebuiltVault>>> = Arc::new(Mutex::new(None));
         let rebuilt_for_worker = Arc::clone(&rebuilt);
+        // **This host really does leave them to the idle loop**, and that
+        // is sound HERE and only here: `main`'s tray already exists and its
+        // idle pass reconciles the Sync label as soon as this window is
+        // gone. The startup host has neither, which is why the sink exists
+        // at all -- see `run_the_in_window_teardown`.
+        let tray_effects: Arc<Mutex<Vec<TrayEffect>>> = Arc::new(Mutex::new(Vec::new()));
+        let tray_effects_for_worker = Arc::clone(&tray_effects);
 
         // Read back after the wait returns: `wait` is `FnOnce` and hands back
         // only an `EstateOutcome`.
@@ -3813,6 +4092,7 @@ impl VaultOps for RealVaultOps<'_> {
                     &drain_for_worker,
                     &schedule_for_worker,
                     &rebuilt_for_worker,
+                    &tray_effects_for_worker,
                 )
             },
             // ---- THE WAIT, AND ITS BODY IS THE EVENT LOOP. A blocking wait
@@ -5767,132 +6047,6 @@ fn adopt_started_child(bw_serve_child: &mut Option<Child>, mut child: Child) -> 
     true
 }
 
-/// What became of a child handed to [`StartupChildHandoff::deposit`].
-///
-/// Returned rather than swallowed so the worker can log honestly, and so the
-/// decision itself can be asserted on directly instead of being inferred from
-/// whether a process happens to still be alive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandoffDeposit {
-    /// Parked in the slot. Whoever claims next gets it.
-    Parked,
-    /// The slot had already been claimed -- the startup window hit its
-    /// `WORKING_DEADLINE` and `main` moved on without waiting for this
-    /// worker. Nobody will ever look in the slot again, so the child was
-    /// stopped here instead of being left listening on `BW_SERVE_PORT` with
-    /// no handle anywhere in the process.
-    ///
-    /// **A belt, not the mechanism.** Reaching this needs the worker still
-    /// inside `try_start_backend` when `WORKING_DEADLINE` fires, and that
-    /// call is bounded by `PORT_RELEASE_GRACE` plus a spawn -- seconds, not
-    /// the minutes the deadline allows -- so in production the deposit has
-    /// essentially always landed before the claim. What actually stops the
-    /// orphan is the ordering: the deposit is `produce`'s first act and the
-    /// claim happens before `match outcome.prepared` splits, so the deadline
-    /// arm inherits a real handle. This arm is what keeps the invariant
-    /// ("there is no window in which a spawned `bw serve` is owned by
-    /// nobody") total rather than merely likely, and it is exercised
-    /// directly by tests because the schedule will not produce it.
-    StoppedAfterClaim,
-    /// A second child arrived while one was still parked. Not reachable from
-    /// the one production depositor (`StartupWork::produce` deposits at most
-    /// once), but stopping the newcomer is the only answer that cannot orphan
-    /// anything: overwriting the slot would drop the parked handle, and
-    /// `Child::drop` does not kill its process.
-    StoppedAsRedundant,
-}
-
-/// The state of a [`StartupChildHandoff`]'s single slot.
-enum HandoffSlot {
-    /// Nothing deposited yet, and nobody has given up.
-    Empty,
-    /// A `bw serve` is waiting to be collected.
-    Parked(Child),
-    /// Somebody called `claim`. The handoff is closed for good.
-    Claimed,
-}
-
-/// A one-shot channel for the `bw serve` the startup window's WORKER THREAD
-/// starts, separate from the worker's *result*.
-///
-/// **The defect this exists for.** The single startup window's `Working`
-/// stage has a wall-clock deadline (`app_window::WORKING_DEADLINE`). The
-/// worker's result -- `StartupWork` -- only reaches `main` if the worker
-/// finishes first; when the deadline fires instead, `main` takes the `None`
-/// arm and the worker's `StartupWork`, including its `Child`, is eventually
-/// dropped on the worker thread and forgotten. But `StartupWork::produce`
-/// spawns `bw serve` as its FIRST act and can then block for a long time
-/// (the readiness probe, and an untimed `check_bw_status_details` after it),
-/// so by the time the deadline fires there is very often a `bw serve`
-/// listening on `BW_SERVE_PORT` whose only handle is a local in a thread
-/// nobody is waiting on. `recover_from_failed_vault_wait` then asks the user
-/// for their master password again, tries to start a backend, finds the port
-/// held by that very process, and kills the app with
-/// "Deskwarden could not start its Bitwarden backend".
-///
-/// The `bw serve` is spawned into a `KillOnCloseJob`, so the orphan normally
-/// dies with this process and the damage stops at one wasted re-auth. It does
-/// NOT when `KillOnCloseJob::new()` failed and `job` is `None`: there the
-/// orphan outlives the process and every subsequent launch hits the same
-/// held port until the user kills it by hand. That case is why this is a slot
-/// and not a comment.
-///
-/// So the child is published the moment it exists, before anything that can
-/// block, and ownership passes through here rather than through the result:
-/// whichever side gets to `claim` first owns it, and a deposit that loses the
-/// race stops the child itself rather than leaking it. There is no window in
-/// which a spawned `bw serve` is owned by nobody.
-struct StartupChildHandoff {
-    slot: Mutex<HandoffSlot>,
-}
-
-impl StartupChildHandoff {
-    fn new() -> Self {
-        Self { slot: Mutex::new(HandoffSlot::Empty) }
-    }
-
-    /// Publishes a freshly spawned `bw serve`. Called on the worker thread.
-    fn deposit(&self, mut child: Child) -> HandoffDeposit {
-        // `unwrap_or_else(PoisonError::into_inner)`: a panic elsewhere while
-        // holding this lock must not turn "there is a live `bw serve` to
-        // account for" into a second panic that loses it. The slot is three
-        // states and a handle; there is no invariant a poisoned lock could
-        // have left half-written.
-        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-        match &*slot {
-            HandoffSlot::Empty => {
-                *slot = HandoffSlot::Parked(child);
-                HandoffDeposit::Parked
-            }
-            HandoffSlot::Claimed => {
-                bw_serve::stop_bw_serve(&mut child);
-                HandoffDeposit::StoppedAfterClaim
-            }
-            HandoffSlot::Parked(_) => {
-                bw_serve::stop_bw_serve(&mut child);
-                HandoffDeposit::StoppedAsRedundant
-            }
-        }
-    }
-
-    /// Takes whatever is parked and closes the handoff for good, so a deposit
-    /// that arrives afterwards stops its own child instead of parking it
-    /// where nobody will look again.
-    ///
-    /// Called on the main thread, on BOTH arms of `match outcome.prepared`:
-    /// the worker succeeding and the deadline firing are the same question
-    /// here -- "is there a `bw serve` this process started?" -- and answering
-    /// it in one place is what stops the `None` arm from assuming the answer
-    /// is no.
-    fn claim(&self) -> Option<Child> {
-        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
-        match std::mem::replace(&mut *slot, HandoffSlot::Claimed) {
-            HandoffSlot::Parked(child) => Some(child),
-            HandoffSlot::Empty | HandoffSlot::Claimed => None,
-        }
-    }
-}
-
 /// Kicks off a background attempt to make sure `bw serve` is running,
 /// reporting the outcome through `tx` rather than being joined -- see
 /// `BackendOp`'s doc for why this can't just be awaited inline.
@@ -6782,13 +6936,14 @@ struct StartupWork {
     /// Whether `bw serve` started. `Err` is fatal, but not HERE -- see
     /// `produce`.
     ///
-    /// **Deliberately not the `Child` itself.** The handle travels through
-    /// `StartupChildHandoff` instead, published the moment the process
-    /// exists rather than carried here and only delivered if the worker beats
-    /// `app_window::WORKING_DEADLINE` -- see that type for the orphan this
-    /// closes. Keeping a `Child` in this struct as well would give the same
-    /// process two owners and put back exactly the "which copy did we
-    /// forget?" question the handoff removes.
+    /// **Deliberately not the `Child` itself.** The handle is written
+    /// straight into the PARKED ESTATE the moment the process exists (see
+    /// `produce`), rather than carried here and only delivered if the
+    /// worker beats `app_window::WORKING_DEADLINE` -- the deadline throws
+    /// this whole struct away, and a `Child` inside it went with it.
+    /// Keeping one here as well would give the same process two owners and
+    /// put back exactly the "which copy did we forget?" question the park
+    /// removes.
     child: Result<(), String>,
     items: Result<Vec<deskwarden::vault_bridge::VaultItem>, String>,
     details: login_ui::BwStatusDetails,
@@ -6806,21 +6961,55 @@ impl StartupWork {
         job: &Arc<Option<job_object::KillOnCloseJob>>,
         vault: &VaultBridge,
         schedule: &[Duration],
-        handoff: &StartupChildHandoff,
+        park: &EstatePark,
     ) -> Self {
-        // Published BEFORE the readiness probe and before
-        // `check_bw_status_details`, both of which can block past
-        // `app_window::WORKING_DEADLINE`. From this line on the child is
-        // reachable from the main thread whatever happens to this one.
+        // **BOTH ARMED, IN ONE `with`, AT THE SPAWN.**
+        //
+        // Armed BEFORE the readiness probe and before the status call,
+        // both of which can block past `app_window::WORKING_DEADLINE`.
+        // From this line on the child is reachable from the main thread
+        // whatever happens to this one -- which is the whole of the orphan
+        // fix: an estate that comes home holding `child: None` cannot stop
+        // `bw serve`, so `recover_from_failed_vault_wait` stops nothing,
+        // re-asks for the master password, and then dies on the port its
+        // own orphan is holding.
+        //
+        // **The token is armed in the SAME `with`, and that is not a
+        // convenience.** `build_vault` cannot arm either one on two of the
+        // four paths out of `app_window::run` -- `items == Err` bails at
+        // its `?`, and the deadline / panic / abandoned path never calls
+        // it at all -- whereas this line runs on every path that has a
+        // token to arm. The only path home with `token == ""` is the one
+        // where the card was closed and no token was ever produced, and
+        // that path is `main`'s `exit(1)`. That is what makes the
+        // pre-window seed's empty token an UNINITIALISED value with a
+        // proof of non-observation rather than a false belief.
         let child = match try_start_backend(token, job_ref(job), bw_serve::PORT_RELEASE_GRACE) {
             Ok(child) => {
-                match handoff.deposit(child) {
-                    HandoffDeposit::Parked => {}
-                    outcome => log::warn!(
-                        "the startup window had already given up on this worker ({outcome:?}); \
-                         the `bw serve` it just started was stopped here rather than left \
-                         holding the port"
-                    ),
+                // In an `Option` on THIS side of the `with`, so that a
+                // `None` answer leaves the handle here to be stopped. The
+                // closure moves nothing it cannot give back.
+                let mut spawned = Some(child);
+                let armed = park.with(|est| {
+                    est.child = spawned.take();
+                    est.token = token.to_string();
+                });
+                if armed.is_none() {
+                    // The waiting thread has already reclaimed the estate:
+                    // this worker was abandoned (the window gave up, or
+                    // ended before the work landed) and there is nobody
+                    // left to hand a backend to. Stopping it HERE is what
+                    // stops it being an orphan holding `BW_SERVE_PORT`
+                    // against the very restart the recovery is about to
+                    // attempt.
+                    if let Some(mut orphan) = spawned.take() {
+                        log::warn!(
+                            "the startup window had already given up on this worker; the \
+                             `bw serve` it just started was stopped here rather than left \
+                             holding the port"
+                        );
+                        bw_serve::stop_bw_serve(&mut orphan);
+                    }
                 }
                 Ok(())
             }
@@ -7222,154 +7411,166 @@ mod tests {
         kill_and_reap(&mut bw_serve_child);
     }
 
-    // ---- the startup window's `bw serve` handoff -------------------------
+    // ---- the startup window's `bw serve`, armed into the parked estate ---
     //
     // The defect: `StartupWork::produce` spawns `bw serve` as its first act
-    // and then blocks -- the readiness probe, then an untimed
-    // `check_bw_status_details`. If that outlasts
-    // `app_window::WORKING_DEADLINE` the window closes, `main` takes the
-    // `None` arm, and the worker's `StartupWork` (and its `Child`) is dropped
-    // on a thread nobody joins. `Child::drop` does not kill its process, so a
-    // `bw serve` was left listening on `BW_SERVE_PORT` with no handle
-    // anywhere -- and `recover_from_failed_vault_wait`, running with
-    // `bw_serve_child: &mut None`, stopped nothing, re-asked for the master
-    // password, and then died on `PortHeld` against its own orphan.
+    // and then blocks -- the readiness probe, then a status call. If that
+    // outlasts `app_window::WORKING_DEADLINE` the window ends, `main` takes
+    // the `None` arm, and the worker's `StartupWork` is dropped on a thread
+    // nobody joins. `Child::drop` does not kill its process, so a `bw serve`
+    // was left listening on `BW_SERVE_PORT` with no handle anywhere -- and
+    // `recover_from_failed_vault_wait`, running with `bw_serve_child: &mut
+    // None`, stopped nothing, re-asked for the master password, and then died
+    // on `PortHeld` against its own orphan.
     //
-    // These drive `StartupChildHandoff` directly with ordinary long-lived
-    // child processes. NOTHING here spawns `bw serve`, binds
-    // `BW_SERVE_PORT`, or touches the real profile: the handoff is about
-    // ownership of a `Child`, and any `Child` proves it.
+    // **The mechanism that closes it is now the park, not a handoff of its
+    // own.** `produce` writes the `Child` straight into the parked estate at
+    // the spawn, so the estate `park_and_work`'s read-back brings home is
+    // already holding it -- on the deadline path exactly as on the happy one.
+    // `StartupChildHandoff`, `HandoffSlot` and `HandoffDeposit` are gone with
+    // the five guards that drove them:
+    //
+    // * "a deposited child is handed to whoever claims", "the child can only
+    //   be claimed once", "a second deposit stops the newcomer" and "an
+    //   untouched handoff hands over nothing" each drove a method of a type
+    //   that no longer exists. They are UNREACHABLE rather than merely
+    //   unexercised: there is no deposit, no claim and no slot to be in any
+    //   of those states. The properties they held are now the park's own and
+    //   are held by its own guards -- one owner (`reclaim` is the single
+    //   read-back, and `park_and_work`'s `expect` names a second reclaimer
+    //   out loud), one write (the `work` closure is `FnOnce`, so exactly one
+    //   worker ever arms `est.child`), and an empty start (the seed is built
+    //   by `the_estate_the_startup_window_runs_against`, which is the only
+    //   place `child: None` is spelled at startup at all).
+    // * `the_single_window_claims_the_startup_child_before_the_arms_split`
+    //   pinned the CLAIM above `match outcome.prepared`. There is no claim:
+    //   both arms read `bw_serve_child` out of the one destructure of the
+    //   estate that came home, which is ABOVE the split by construction --
+    //   the arms cannot see the field any other way, and there is no
+    //   ordering left for an edit to get wrong.
+    //
+    // The sixth -- the ORPHAN -- is not deleted. Its mechanism is gone; its
+    // property is not, and it is rewritten below against the arm that now
+    // carries it.
 
-    #[test]
-    fn a_deposited_startup_child_is_handed_to_whoever_claims() {
-        let handoff = StartupChildHandoff::new();
-        let child = long_lived_command().spawn().unwrap();
-        let pid = child.id();
-        let watch = ProcessWatch::on(pid);
-
-        assert_eq!(handoff.deposit(child), HandoffDeposit::Parked);
-
-        let mut claimed = handoff.claim();
-        assert_eq!(
-            claimed.as_ref().map(Child::id),
-            Some(pid),
-            "the claimer must receive the very child the worker started"
-        );
-        assert!(
-            watch.still_running(),
-            "control: parking and claiming must not have stopped the child -- the point is to \
-             hand a LIVE backend over, so recovery can stop it deliberately"
-        );
-        kill_and_reap(&mut claimed);
-    }
-
-    /// **The orphan, exactly.** The startup window gives up first (`claim`),
-    /// and only afterwards does the worker finish spawning and deposit. There
-    /// is nobody left to collect it, so the handoff must stop it here rather
-    /// than park it where no one will look again.
+    /// **The orphan, exactly, against the arm that now answers it.**
+    ///
+    /// The window gives up first (the waiting thread reclaims the estate),
+    /// and only afterwards does the worker finish spawning and try to arm.
+    /// `EstatePark::with` answers `None` -- there is nobody left to hand a
+    /// backend to -- and the worker must STOP the child there rather than
+    /// drop it, because a dropped `Child` keeps running and holds
+    /// `BW_SERVE_PORT` against the very restart `recover_from_failed_vault_
+    /// wait` is about to attempt.
+    ///
+    /// Driven through the real `EstatePark` and a real, ordinary long-lived
+    /// child process -- NOT a `bw serve`, nothing binds `BW_SERVE_PORT`, and
+    /// nothing touches the real profile: the question is ownership of a
+    /// `Child`, and any `Child` proves it.
     #[test]
     fn a_child_that_arrives_after_the_deadline_gave_up_is_stopped_not_orphaned() {
-        let handoff = StartupChildHandoff::new();
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-abandoned-worker-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let park = EstatePark::holding(SessionEstate {
+            cache: Arc::new(VaultCache::new(VaultBridge::new(
+                "http://127.0.0.1:1".to_string(),
+            ))),
+            engine: MatchEngine::new(),
+            child: None,
+            token: String::new(),
+            details: None,
+            task_in_progress: None,
+            store: session_store::SessionStore::new(dir.join("session.bin")),
+            active_account: None,
+            accounts: None,
+            settings: deskwarden::settings::Settings::default(),
+        });
+        let worker_view = park.handle();
 
+        // The deadline fires: the waiting thread takes the estate back.
         assert!(
-            handoff.claim().is_none(),
-            "control: the deadline fired before anything was deposited, so there was nothing \
-             to adopt at that moment"
+            park.reclaim().is_some(),
+            "control: the read-back really did take the estate, so the worker below is \
+             genuinely abandoned rather than merely late"
         );
 
         let late = long_lived_command().spawn().unwrap();
         let pid = late.id();
-        // Opened before the deposit, for `ProcessWatch`'s reason: after
-        // `stop_bw_serve` reaps the process the pid stops naming it, and this
-        // test carries the same reuse exposure the sibling below was actually
-        // bitten by.
+        // Opened before the arming attempt, for `ProcessWatch`'s reason:
+        // after `stop_bw_serve` reaps the process the pid stops naming it.
         let watch = ProcessWatch::on(pid);
-        assert!(
-            watch.still_running(),
-            "control: the late arrival was not alive to begin with"
-        );
-        assert_eq!(handoff.deposit(late), HandoffDeposit::StoppedAfterClaim);
+        assert!(watch.still_running(), "control: the late arrival was not alive to begin with");
 
-        // `stop_bw_serve` kills and then `wait()`s, so the process is already
-        // reaped by the time this runs -- the wait below is signalled
-        // immediately in the passing case and only spends its budget when the
-        // child really was left running.
+        // The exact shape `StartupWork::produce` uses: the handle stays on
+        // THIS side of the `with`, so a `None` answer leaves it here to be
+        // stopped rather than swallowed by a closure that was never called.
+        let mut spawned = Some(late);
+        let armed = worker_view.with(|est| {
+            est.child = spawned.take();
+            est.token = "a token nobody will ever read".to_string();
+        });
+        assert!(
+            armed.is_none(),
+            "control: the park answered the abandoned worker as though it still owned the \
+             estate, so this test is not exercising the abandoned arm at all"
+        );
+        if let Some(mut orphan) = spawned.take() {
+            bw_serve::stop_bw_serve(&mut orphan);
+        }
+
         assert!(
             watch.exited_within(STOP_OBSERVATION_BUDGET),
-            "a `bw serve` deposited after the startup window gave up must be stopped; leaving \
-             it is the orphan that holds localhost:8087 against the next launch"
+            "a `bw serve` started after the startup window gave up must be stopped; leaving \
+             it is the orphan that holds localhost:8087 against the next launch, and the \
+             estate it could not be written into cannot stop it either -- an estate holding \
+             `child: None` stops nothing"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The production worker really does that**, and not merely the test
+    /// above. The arm is inside `produce`, which no test can call (it spawns
+    /// `bw serve`), so what is pinned here is that the stop is spelled on the
+    /// `armed.is_none()` path and that the handle is held outside the `with`.
     #[test]
-    fn the_startup_child_can_only_be_claimed_once() {
-        let handoff = StartupChildHandoff::new();
-        let mut claimed = {
-            let child = long_lived_command().spawn().unwrap();
-            handoff.deposit(child);
-            handoff.claim()
-        };
-        assert!(claimed.is_some(), "control: the first claim takes the child");
+    fn the_startup_worker_stops_a_backend_the_park_would_not_take() {
+        let body = the_produce_body();
+        let squeezed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (needle, why) in [
+            (
+                "let mut spawned = Some(child);",
+                "the child is moved straight into the `with` closure, so a `None` answer \
+                 leaves nothing on this side to stop -- the closure was never called and \
+                 the handle went with it",
+            ),
+            (
+                "if armed.is_none() {",
+                "the worker does not notice that the park refused its write at all, so an \
+                 abandoned worker leaves a live `bw serve` holding the port",
+            ),
+            (
+                "bw_serve::stop_bw_serve(&mut orphan);",
+                "the abandoned worker drops its `Child` instead of stopping it, and \
+                 `Child::drop` does not kill its process",
+            ),
+        ] {
+            assert!(
+                squeezed.contains(needle),
+                "{why}: {needle:?} is not in `StartupWork::produce`"
+            );
+        }
+        let stop_at = squeezed.find("stop_bw_serve").expect("counted just above");
+        let guard_at = squeezed.find("if armed.is_none() {").expect("counted just above");
         assert!(
-            handoff.claim().is_none(),
-            "a second claim must not hand the same process out twice -- two owners is how a \
-             kill lands on a handle the other side is still using"
-        );
-        kill_and_reap(&mut claimed);
-    }
-
-    #[test]
-    fn a_second_deposit_stops_the_newcomer_and_keeps_the_parked_child() {
-        let handoff = StartupChildHandoff::new();
-        let first = long_lived_command().spawn().unwrap();
-        let first_pid = first.id();
-        // Both watches are opened while both processes are alive and their
-        // `Child`s are still held, which is what makes each pid still name the
-        // process this test means by it. See `ProcessWatch`: asking `tasklist`
-        // after `stop_bw_serve` has reaped the process is asking about a number
-        // Windows has already put back in the pool.
-        let first_watch = ProcessWatch::on(first_pid);
-        assert_eq!(handoff.deposit(first), HandoffDeposit::Parked);
-
-        let second = long_lived_command().spawn().unwrap();
-        let second_pid = second.id();
-        let second_watch = ProcessWatch::on(second_pid);
-        assert!(
-            second_watch.still_running(),
-            "control: the newcomer was not alive before it was deposited, so proving it stopped \
-             afterwards would prove nothing about the deposit"
-        );
-        assert_eq!(handoff.deposit(second), HandoffDeposit::StoppedAsRedundant);
-
-        let mut claimed = handoff.claim();
-        assert_eq!(
-            claimed.as_ref().map(Child::id),
-            Some(first_pid),
-            "the parked child must not be overwritten -- overwriting drops its handle, and a \
-             dropped `Child` keeps running"
-        );
-        assert!(
-            second_watch.exited_within(STOP_OBSERVATION_BUDGET),
-            "the redundant newcomer must be stopped"
-        );
-        // The other half of the same claim, and the half a pid lookup could
-        // never have made safely: the child that was KEPT is still running.
-        // Without this, a `deposit` that stopped both would pass.
-        assert!(
-            first_watch.still_running(),
-            "the parked child was stopped along with the newcomer -- the claimer is handed a \
-             dead backend and starts over, which is the wasted re-auth this handoff exists to \
-             prevent"
-        );
-        kill_and_reap(&mut claimed);
-    }
-
-    #[test]
-    fn an_untouched_handoff_hands_over_nothing() {
-        assert!(
-            StartupChildHandoff::new().claim().is_none(),
-            "control: no worker ever got as far as spawning, so there is genuinely nothing to \
-             adopt and recovery is right to start from scratch"
+            guard_at < stop_at,
+            "the stop is not underneath the refused-write check, so it is either \
+             unconditional -- stopping the backend it just handed over -- or reached some \
+             other way this guard cannot see"
         );
     }
 
@@ -7404,9 +7605,17 @@ mod tests {
     #[test]
     fn the_startup_worker_publishes_bw_serve_before_anything_that_can_block() {
         let body = the_produce_body();
-        let deposit = body
-            .find(concat!("handoff.dep", "osit(child)"))
-            .expect("`produce` must publish the child it started through the handoff");
+        let armed = body
+            .find(concat!("park.wi", "th(|est| {"))
+            .expect("`produce` must arm the parked estate with the child it started");
+        assert!(
+            body.contains(concat!("est.token = token.to_", "string();")),
+            "`produce` arms the child but not the TOKEN. The two paths out of the window \
+             `build_vault` cannot reach -- an `items` that is `Err`, and a window that \
+             ended before the work landed -- then bring the estate home with an empty \
+             token and a live `bw serve`, and `main`'s \"closed without a session\" check \
+             is the only thing that would have noticed"
+        );
         for later in [
             concat!("wait_for_vault", "_ready(vault, schedule)"),
             concat!("login_ui::check_bw_", "status_details_bounded()"),
@@ -7415,9 +7624,10 @@ mod tests {
                 .find(later)
                 .unwrap_or_else(|| panic!("`produce` must still call `{later}`"));
             assert!(
-                deposit < at,
+                armed < at,
                 "`{later}` can block past `app_window::WORKING_DEADLINE`; the child must be \
-                 published before it, or the deadline still finds no handle to adopt"
+                 armed into the parked estate before it, or the deadline reads the estate \
+                 back with no handle in it and the recovery stops nothing"
             );
         }
     }
@@ -7496,9 +7706,15 @@ mod tests {
     /// single-line anchors that cannot drift into a neighbouring branch.
     fn the_single_window_startup_region() -> &'static str {
         let production = production_half_of_this_file();
+        // Re-anchored: the handoff the region used to open on is gone, and
+        // the first line of the arm that cannot drift into the
+        // cached-session branch is the vault stage's own cache clone.
         let after = production
-            .split_once(concat!("let handoff_for", "_work = startup_child.clone();"))
-            .expect("the single startup window must still hand the worker a handoff clone")
+            .split_once(concat!("let job_for_work = job.", "clone();"))
+            .expect(
+                "the single startup window must still take its worker's copies before the \
+                 estate is parked",
+            )
             .1;
         let region = after
             .split_once(concat!("match engine loaded with ", "{} app match(es)"))
@@ -7513,51 +7729,6 @@ mod tests {
             "control: the region really is the one that decides on the worker's result"
         );
         region
-    }
-
-    /// **The whole point of the fix, as wiring.** The claim has to happen
-    /// before the `Some`/`None` split, because the `None` arm is the one that
-    /// used to assume no backend had been started. If it moves inside the
-    /// `Some` arm, the deadline path is orphaning again with every unit test
-    /// above still green.
-    #[test]
-    fn the_single_window_claims_the_startup_child_before_the_arms_split() {
-        let region = the_single_window_startup_region();
-        let claim = region
-            .find(concat!("bw_serve_child = startup_child.cl", "aim();"))
-            .expect("`main` must claim the startup handoff into `bw_serve_child`");
-        let split = region
-            .find(concat!("match outcome.pre", "pared {"))
-            .expect("control: the region must still contain the split");
-        assert!(
-            claim < split,
-            "the claim must precede `match outcome.prepared`; inside the `Some` arm it never \
-             runs on the deadline path, which is the path that orphans"
-        );
-        let recovery = region
-            .find(concat!("recover_from_failed_vault", "_wait("))
-            .expect("the region must still reach the startup recovery");
-        assert!(
-            claim < recovery,
-            "recovery's first act is `stop_bw_serve` on whatever it is handed; claiming after \
-             it would hand it `None` again"
-        );
-        assert_eq!(
-            production_half_of_this_file()
-                .matches(concat!("startup_child.cl", "aim()"))
-                .count(),
-            1,
-            "exactly one place may take ownership of the startup child; a second claim would \
-             silently get `None` and conclude no backend is running"
-        );
-        // Claiming and then throwing the answer away is the original bug
-        // wearing the fix's clothes: the `None` arm's whole defect was that
-        // it went into recovery believing `bw_serve_child` was `None`.
-        assert!(
-            !region[claim..].contains(concat!("bw_serve_child = ", "None")),
-            "nothing after the claim may put `bw_serve_child` back to `None`; recovery would \
-             then stop nothing and collide with the very backend just adopted"
-        );
     }
 
     /// **The claim's VALUE, not merely its position.** The guard above proves
@@ -7660,31 +7831,166 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_worker_is_given_the_same_handoff_main_claims_from() {
+    fn the_startup_worker_arms_the_same_park_main_reads_back() {
         let production = production_half_of_this_file();
         assert_eq!(
-            production
-                .matches(concat!("let startup_child = Arc::new(StartupChildHan", "doff::new())"))
-                .count(),
+            production.matches(concat!("let park_for_work = park.", "handle();")).count(),
             1,
-            "there must be exactly one startup handoff, or the worker deposits into one slot \
-             while `main` claims from another and the orphan is back"
-        );
-        assert_eq!(
-            production
-                .matches(concat!("let handoff_for", "_work = startup_child.clone();"))
-                .count(),
-            1,
-            "the worker's handoff must be a clone of that same one"
+            "the startup worker must be handed a handle on the park the wait was given -- \
+             exactly one. A park built here instead of handled off the one `park_and_work` \
+             owns takes every write the worker makes and drops it into a slot nobody reads, \
+             with no error anywhere: `main` then reads its own estate back with no child \
+             and no token"
         );
         let region = the_single_window_startup_region();
         assert!(
-            region.contains(concat!("&handoff_for", "_work,")),
-            "the worker closure must actually be passed the handoff; without the argument \
-             `produce` has nowhere to publish and the deposit is unreachable"
+            region.contains(concat!("&park_for_", "work,")),
+            "the worker closure is not actually passed the park handle; without the \
+             argument `produce` has nowhere to arm and the estate comes home empty"
+        );
+        // The handle is taken from the park the WAIT was handed, which is
+        // the park `park_and_work` reads back from. `EstatePark::handle` is
+        // the only way to reach the same slot, and `holding` is the only way
+        // to make a different one -- so a second `holding` inside this
+        // region is the detached-park mutation spelled out.
+        assert_eq!(
+            region.matches(concat!("EstatePark::", "holding(")).count(),
+            0,
+            "the startup region parks an estate of its own beside the one `park_and_work` \
+             owns; the worker would then arm a slot that is never read back"
         );
     }
 
+    /// **The `BackendOp` channel is built ONCE, and the drain the startup
+    /// teardown worker is handed is the one `main`'s idle loop reads.**
+    ///
+    /// The channel was hoisted above the startup branch at `066461a` so that
+    /// the in-window teardown could be handed its receiver before
+    /// `app_window::run` is called. What that hoist opened is a shape nothing
+    /// held: a SECOND `let (backend_op_tx, backend_op_rx) = mpsc::channel::
+    /// <BackendOp>();` further down shadows the first, and from then on the
+    /// teardown worker drains a channel nothing sends to while every
+    /// `spawn_backend_start` reports into one nothing reads. The teardown's
+    /// bounded drain -- its first act, and the whole reason it is safe to
+    /// stop and restart `bw serve` -- then drains an empty channel and the
+    /// in-flight operation it was waiting for lands afterwards, against a
+    /// backend that has already been replaced.
+    ///
+    /// Today that mutant is caught only by `unused_variables` on the shadowed
+    /// binding, which is luck rather than a guard: moving the shadow below one
+    /// use of the original makes the warning vanish and leaves the whole suite
+    /// green. This is writable now and was not before, because until the
+    /// startup host existed there was no second consumer to point it at.
+    #[test]
+    fn main_builds_exactly_one_backend_op_channel_and_hands_that_drain_to_both_teardowns() {
+        let production = production_half_of_this_file();
+        let channel = concat!("mpsc::channel::<Backend", "Op>()");
+        assert_eq!(
+            production.matches(channel).count(),
+            1,
+            "there is more than one `{channel}` in production. A second one shadows the \
+             first: the teardown worker then drains a receiver nothing sends to, and every \
+             background backend operation reports into a sender nothing reads"
+        );
+        assert_eq!(
+            production.matches(concat!("let backend_op_rx = Arc::new(Mutex::", "new(")).count(),
+            1,
+            "the shared drain is wrapped more than once, so which `Arc` a consumer holds is \
+             no longer decided in one place"
+        );
+        // The startup teardown worker's drain is a CLONE of that one `Arc`,
+        // not a fresh channel and not a second wrapper.
+        let region = the_single_window_startup_region();
+        assert!(
+            region.contains(concat!("let drain_for_teardown = Arc::clone(&backend_op_", "rx);")),
+            "the startup window's teardown worker is not handed `main`'s own drain. Handed \
+             anything else, its bounded drain -- the sequence's first act -- empties a \
+             channel nobody sends on, and the in-flight `bw serve` start it was supposed to \
+             wait for lands afterwards against a backend that has since been replaced"
+        );
+        assert!(
+            !region.contains(channel),
+            "the startup region builds a `BackendOp` channel of its own"
+        );
+        // And `main`'s own idle drain reads the same binding. Both halves are
+        // needed: a worker handed the real receiver is worth nothing if the
+        // loop below has been re-pointed at a second one.
+        let below = production
+            .split_once(concat!("window = Some(app_window::", "run("))
+            .expect("the startup window must still be opened exactly once")
+            .1;
+        assert!(
+            below.contains(concat!("backend_op_rx", "")),
+            "the main loop no longer names `backend_op_rx` at all, so the drain the worker \
+             was handed is not the one anything else reads"
+        );
+        assert!(
+            !below.contains(channel),
+            "a second `BackendOp` channel is built BELOW the startup window, which is the \
+             shadow this guard exists for: placed after one use of the original, \
+             `unused_variables` does not fire and nothing else notices"
+        );
+    }
+
+    /// **The round trip drops exactly the two fields the teardown empties,
+    /// and it says so out loud.**
+    ///
+    /// The signing-in arm ends with `details: None, task_in_progress: None`,
+    /// so whatever the window's teardown left in those two is discarded. That
+    /// is truthful -- `resettle_session_with` empties the cached details on
+    /// purpose (the toolbar must not paint the locked session's account) and
+    /// leaves no operation in flight -- but it is truthful by COINCIDENCE,
+    /// and a silent field-dropper is exactly what `SessionEstate`'s own doc
+    /// forbids. So the drop is spelled as two `_`-prefixed bindings rather
+    /// than a `..`, and this guard holds both halves of the coincidence: the
+    /// arm drops only those two, and the sequence really does leave both
+    /// empty.
+    #[test]
+    fn the_startup_windows_round_trip_drops_only_what_its_teardown_empties() {
+        let region = the_single_window_startup_region();
+        for named in [
+            "details: _details_the_window_left,",
+            "task_in_progress: _task_the_window_left,",
+        ] {
+            assert!(
+                region.contains(named),
+                "the estate the startup window left is no longer destructured with \
+                 `{named}`. Either the field is now carried forward -- in which case the \
+                 terminal `None` beside it is a contradiction -- or it is absorbed into a \
+                 `..` and dropped with nothing saying so"
+            );
+        }
+        // The other half: the sequence really does empty both. Pinned on
+        // the two writes rather than driven, because both live inside
+        // `resettle_session_reporting_tray` / `resettle_session_with`, which
+        // between them need a real `tray::AppTray` and a real backend --
+        // the halves that ARE drivable are already driven by
+        // `the_recovery_empties_the_details_and_the_loop_does_not_put_them_back`
+        // and by the resettle family above.
+        let production = production_half_of_this_file();
+        for (write, why) in [
+            (
+                concat!("*cached_status_details = ", "None;"),
+                "the teardown stops emptying the cached account details, so the terminal \
+                 estate's `details: None` now throws away a fetch the window really made -- \
+                 and the toolbar of the next window paints the LOCKED session's account",
+            ),
+            (
+                concat!("*backend_task_in_progress = ", "None;"),
+                "the teardown stops clearing the in-flight backend operation, so the \
+                 terminal estate's `task_in_progress: None` now hides one that is really \
+                 outstanding: `stop_backend_if_idle` and `open_vault_window` both refuse to \
+                 run while it is set, and neither would ever see it",
+            ),
+        ] {
+            assert_eq!(
+                production.matches(write).count(),
+                1,
+                "{why}: {write:?} occurs {} time(s) in production rather than once",
+                production.matches(write).count()
+            );
+        }
+    }
     fn vault_item_with_match(id: &str, process: &str) -> String {
         format!(
             r#"{{"id":"{id}","name":"{id}","type":1,"fields":[{{"name":"deskwarden:app-match","value":"{{\"process\":\"{process}\",\"trigger\":\"auto\"}}"}}]}}"#
@@ -7809,8 +8115,13 @@ mod tests {
                  guard cannot find the startup sequence it is about",
             );
         let main_body = main_body[..arming_at].to_string();
+        // Constructions, not mentions: the signing-in arm destructures the
+        // estate the park hands back, and a destructure is spelled the same
+        // way. See `both_startup_arms_end_with_the_same_estate`.
+        let mentions = main_body.matches("SessionEstate {").count();
+        let destructures = main_body.matches("let SessionEstate {").count();
         assert!(
-            main_body.matches("SessionEstate {").count() == 2,
+            mentions - destructures == 2,
             "control: the startup region does not build exactly the two `SessionEstate`s the \
              two startup paths end with, so it is not the region this guard is about"
         );
@@ -9058,14 +9369,25 @@ mod tests {
             names
         }
 
-        /// `open_vault_window`'s estate destructuring PATTERN -- the text
-        /// between `let SessionEstate {` and the `}` of `} = estate;`.
+        /// `account_action`'s estate destructuring PATTERN -- the text
+        /// between its `let SessionEstate {` and the `}` of `} = &mut est;`.
+        ///
+        /// **Sliced out of `account_action` rather than out of the whole
+        /// production half**, because there are TWO ten-field destructures
+        /// now: this one, and the one the startup branch makes of the estate
+        /// `park_and_work` hands back. Both are legitimate and both name all
+        /// ten fields; a slicer that required exactly one would simply be
+        /// red. What this helper is used for -- a positive control that the
+        /// field scanner fires somewhere -- is served by either, and naming
+        /// the one it always meant keeps the control pointing at the vault
+        /// loop the module is about.
         fn estate_destructure() -> String {
             let code = production_code();
+            let body = super::vault_ops_method_body(&code, "account_action");
             let pattern = braced_after(
-                &code,
+                &body,
                 concat!("let Session", "Estate {"),
-                "`open_vault_window`'s estate destructure",
+                "`account_action`'s estate destructure",
             );
             assert!(
                 (60..4000).contains(&pattern.len()),
@@ -10349,7 +10671,7 @@ mod tests {
                     squeeze(concat!(
                         "move |park| { run_the_in_window_teardown( park, &lock_rx, ",
                         "&job_for_worker, &drain_for_worker, &schedule_for_worker, ",
-                        "&rebuilt_for_worker, ) },"
+                        "&rebuilt_for_worker, &tray_effects_for_worker, ) },"
                     )),
                 ),
                 (
@@ -10454,29 +10776,46 @@ mod tests {
         fn the_lifted_teardown_pieces_have_one_definition_and_one_caller_each() {
             let code = code_only(production_half_of_this_file());
             let call_site = opener();
+            let startup = super::the_single_window_startup_region();
             let mut checked = 0usize;
             for name in [
                 concat!("run_the_in_window_", "teardown("),
                 concat!("rebuild_the_vault_after_", "the_lock("),
             ] {
                 checked += 1;
+                // **THREE mentions now: one definition and TWO callers**, and
+                // the two are NAMED rather than the number being raised. A
+                // raised number alone would be satisfied by two calls from
+                // ONE host, which is two teardown workers against one parked
+                // estate -- the multiple-owner shape the estate exists to
+                // remove. Pinning one call in each host is what no such
+                // arrangement can satisfy, and it is also what makes
+                // deleting the startup host's call red rather than merely
+                // lowering a count that nobody reads.
                 assert_eq!(
                     code.matches(name).count(),
-                    2,
-                    "`{name}` is mentioned {} time(s) in the production code; two is the only \
-                     count that means one definition and one caller. Three is a second route \
-                     into the one teardown-and-repopulate path this crate has, which is what \
+                    3,
+                    "`{name}` is mentioned {} time(s) in the production code; three is the \
+                     only count that means one definition and one caller in each of the two \
+                     hosts. Four is a second route into the one teardown-and-repopulate path \
+                     this crate has, which is what \
                      `there_is_exactly_one_teardown_and_repopulate_path` cannot see because it \
-                     counts COPIES rather than callers. One means the lift lost its caller and \
-                     the in-window lock does nothing at all",
+                     counts COPIES rather than callers. Two means one host lost its call, and \
+                     the host that loses it is the one whose lock stops working",
                     code.matches(name).count()
                 );
                 assert_eq!(
                     call_site.matches(name).count(),
                     1,
-                    "`{name}`'s one call is not inside `RealVaultOps::open_window`. The lifted \
-                     bodies are that method's own work; a call from anywhere else is a second \
-                     host wired in without the decision that step being landed"
+                    "`{name}` is not called exactly once inside `RealVaultOps::open_window`"
+                );
+                assert_eq!(
+                    startup.matches(name).count(),
+                    1,
+                    "`{name}` is not called exactly once inside the STARTUP window's region. \
+                     Zero is the reported bug restored: the startup window has no teardown \
+                     behind its lock, so a lock there closes the window and `main` opens a \
+                     separate sign-in window"
                 );
             }
             assert_eq!(checked, 2, "control: both lifted pieces were checked");
@@ -19514,18 +19853,90 @@ mod startup_shape_tests {
     fn both_startup_arms_end_with_the_same_estate() {
         let branch = startup_branch();
         let head = concat!("Session", "Estate {");
+        // **CONSTRUCTIONS, not mentions.** The signing-in arm now
+        // DESTRUCTURES the estate `park_and_work` hands back -- it has to,
+        // because its two recoveries want `&mut` on two fields at once and
+        // the terminal estate wants all ten by value, and a destructure is
+        // the one statement that gives both without a `.clone()` or a
+        // `.take()`. A destructure is spelled `SessionEstate {` too, so the
+        // bare count is 3 on a correct tree. The difference of the two
+        // counts is the number of CONSTRUCTIONS, which is what this guard
+        // has always been about and what is still exactly 2 -- the same
+        // idiom `the_estate_is_the_only_copy::mints_an_estate` uses, and it
+        // has its own two-directional control there.
+        let destructures = branch.matches(concat!("let Session", "Estate {")).count();
         assert_eq!(
-            branch.matches(head).count(),
+            destructures,
+            1,
+            "the startup branch destructures {destructures} estates rather than the one \
+             the signing-in arm reads back out of the park. A second destructure is a \
+             second set of ten locals live at once, which is the two-copies-disagree \
+             shape `SessionEstate` exists to remove"
+        );
+        assert_eq!(
+            branch.matches(head).count() - destructures,
             2,
             "the startup branch constructs {} estates, not one per arm. Fewer means an arm \
              ends with something else -- and then the branch is not an expression both arms \
              answer, so the ten locals it was built from are live below it again",
-            branch.matches(head).count()
+            branch.matches(head).count() - destructures
         );
 
         let split = branch.find(OUTER_ELSE).expect("control: the branch has an `} else {`");
         let cached = braced_after(&branch[..split], head);
-        let signing = braced_after(&branch[split..], head);
+        // The signing-in arm's CONSTRUCTION, not its destructure: the
+        // destructure comes first in the text, so the naive `braced_after`
+        // would slice the pattern instead of the literal.
+        let signing_half = &branch[split..];
+        let after_destructure = signing_half
+            .split_once(concat!("} = estate_after_the_", "window;"))
+            .expect(
+                "the signing-in arm no longer destructures the estate the park handed \
+                 back, so whatever it ends with was not built out of what the window left",
+            )
+            .1;
+        let signing = braced_after(after_destructure, head);
+        // The destructure names all ten fields, so nothing is absorbed into
+        // a `..` on the way through. The two `_`-prefixed names are the
+        // RESIDUE the terminal literal drops, and naming them is what makes
+        // that drop loud instead of silent -- see
+        // `the_startup_windows_round_trip_drops_only_what_its_teardown_empties`.
+        let pattern = signing_half
+            .split_once(concat!("let Session", "Estate {"))
+            .expect("counted one just above")
+            .1
+            .split_once(concat!("} = estate_after_the_", "window;"))
+            .expect("counted one just above")
+            .0;
+        let mut bound = 0usize;
+        for field in [
+            "cache,",
+            "engine,",
+            "child: mut bw_serve_child,",
+            "token: _token_the_window_left,",
+            "details: _details_the_window_left,",
+            "task_in_progress: _task_the_window_left,",
+            "store,",
+            "active_account,",
+            "accounts: accounts_state,",
+            "settings,",
+        ] {
+            bound += 1;
+            assert!(
+                pattern.contains(field),
+                "the read-back destructure does not bind `{field}`. A field absorbed into \
+                 a `..` is a field the window's teardown wrote and the terminal estate \
+                 never sees -- and the two that matter most are `child` (a live `bw serve` \
+                 dropped on the floor, holding the port against every later start) and \
+                 `engine` (autofill dead for the rest of the session): {pattern}"
+            );
+        }
+        assert_eq!(bound, 10, "control: fewer than ten fields were checked");
+        assert!(
+            !pattern.contains(".."),
+            "the read-back destructure ends in a `..`, so a field added to the estate \
+             would be dropped here without anything saying so: {pattern}"
+        );
 
         let squeeze = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
@@ -19563,9 +19974,14 @@ mod startup_shape_tests {
         // The estate is each arm's LAST expression -- not a value built early
         // and then followed by more of the arm, which is how a field decided
         // after the construction ends up written to a local instead.
+        // The signing-in arm is sliced from BELOW its destructure, for the
+        // reason the construction above is: the destructure is spelled
+        // `SessionEstate {` too and comes first, so `arm.find(head)` would
+        // otherwise land on the pattern and measure the whole of the arm's
+        // body as "work done after the estate was built".
         for (what, arm, closer) in [
             ("the cached-session arm", &branch[..split + OUTER_ELSE.len()], OUTER_ELSE),
-            ("the signing-in arm", &branch[split..], concat!("\n    }", ";")),
+            ("the signing-in arm", after_destructure, concat!("\n    }", ";")),
         ] {
             let at = arm.find(head).expect("control: this arm constructs an estate");
             let after_body = at + head.len() + braced_after(arm, head).len();
@@ -19788,149 +20204,6 @@ mod startup_shape_tests {
     const ARMED_FROM_A_PRE_WINDOW_SNAPSHOT: &str =
         concat!("estate.engine.rebuild(&startup_entries.", "borrow());");
 
-    /// **The rebuild is a statement, not a decision** -- `Ok` only when it
-    /// stands alone, unconditionally, on the line immediately after the log
-    /// that opens the region.
-    ///
-    /// **Why this exists, and what it is worth.** Step 8.2 pinned the rebuild
-    /// by its exact text so that step 4 -- the step that moves the teardown
-    /// INSIDE the startup window, inverting the order and making this line the
-    /// last word -- would have to come back through the guard rather than
-    /// discover the problem in the field. That pin does not do it. It asserts
-    /// PRESENCE and PROVENANCE: the text occurs, and `engine.rebuild(` occurs
-    /// once in the region. **Wrapping the line in any conditional keeps both
-    /// true**, so the one edit step 4 is explicitly instructed to make -- "make
-    /// the rebuild conditional on whether the window tore the session down" --
-    /// walked straight past the test written to catch it. Measured, not
-    /// argued: the line wrapped in `if startup_vault.is_none() { .. }` passed
-    /// the whole suite, while behaving exactly like DELETING it (autofill dead
-    /// for the session, no diagnostic) -- the mutation step 8.2 reports as
-    /// killed.
-    ///
-    /// So the guard has to pin the third property as well: that the statement
-    /// is UNCONDITIONAL **today**. It is deliberately brittle. Any conditional
-    /// -- `if`, `if let`, `match`, `.then(..)`, a flag computed on a line
-    /// above -- turns this red, and red is the correct answer: step 4's
-    /// obligation is to rewrite this clause saying what the condition now is,
-    /// not to satisfy it.
-    ///
-    /// Returns `Err` rather than asserting so that
-    /// [`the_unconditional_clause_can_see_a_conditional_rebuild`] can feed it
-    /// mutated regions and prove each one is rejected. A source guard whose
-    /// failure path is never exercised is the shape that failed here before.
-    ///
-    /// `trim_end` on every line and never a `\r\n` in a needle: this tree is
-    /// CRLF in the working copy and LF in the blob, and `str::lines` leaves
-    /// the `\r` on.
-    /// The rebuild and everything above it back to the estate binding's own
-    /// closing `};`, line for line, as [`the_rebuild_is_unconditional`]
-    /// requires to find them. Split literals so this file holds no second
-    /// copy of the production lines the counts elsewhere are taken over.
-    const REBUILD_NEIGHBOURHOOD: &[&str] = &[
-        "    };",
-        "",
-        concat!("    log::info!", "("),
-        concat!("        \"match engine loaded with ", "{} app match(es)\","),
-        concat!("        startup_entries.borrow().", "len()"),
-        "    );",
-        concat!("    estate.engine.rebuild(&startup_entries.", "borrow());"),
-    ];
-
-    fn the_rebuild_is_unconditional(production: &str) -> Result<(), String> {
-        let lines: Vec<&str> = production.lines().map(str::trim_end).collect();
-        let alone: Vec<usize> = lines
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.trim_start() == ARMED_FROM_A_PRE_WINDOW_SNAPSHOT)
-            .map(|(at, _)| at)
-            .collect();
-        let n = REBUILD_NEIGHBOURHOOD.len();
-        if alone.len() != 1 || alone[0] + 1 < n {
-            return Err(format!(
-                "{} line(s) in the production half are nothing but \
-                 {ARMED_FROM_A_PRE_WINDOW_SNAPSHOT:?}, rather than exactly one. A rebuild \
-                 folded onto a line that carries anything else -- a one-line \
-                 `if .. {{ .. }}`, a `.then(|| ..)`, a `match` arm -- is a conditional \
-                 rebuild wearing the pinned text, which is the edit this clause exists to \
-                 stop being silent",
-                alone.len()
-            ));
-        }
-        let at = alone[0];
-        let expected_line =
-            concat!("    estate.engine.rebuild(&startup_entries.", "borrow());");
-        if lines[at] != expected_line {
-            return Err(format!(
-                "the rebuild is spelled {:?}, not at the four spaces of `main`'s own body. \
-                 Deeper indentation means it is nested inside a block that was opened \
-                 above it -- which is what making it conditional looks like",
-                lines[at]
-            ));
-        }
-        // The whole neighbourhood, from the estate binding's own `};` down to
-        // the statement, line for line. Nothing may stand between them: not a
-        // wrapper, not a `let` computing a flag for one. Anchored at `};` and
-        // not merely at the log, because a wrapper opened ABOVE the log and
-        // left un-reindented would otherwise leave every line this checks
-        // untouched -- the first hole this guard was written with.
-        let sightings = lines
-            .windows(n)
-            .filter(|window| *window == REBUILD_NEIGHBOURHOOD)
-            .count();
-        if sightings != 1 || lines[at + 1 - n..=at] != *REBUILD_NEIGHBOURHOOD {
-            let from = at.saturating_sub(n);
-            return Err(format!(
-                "the lines around the rebuild are {:?}, and the pinned neighbourhood \
-                 {REBUILD_NEIGHBOURHOOD:?} occurs {sightings} time(s). Something now stands \
-                 between the estate binding and the statement. If that is step 4's condition \
-                 on whether the window tore the session down, this clause is the one to \
-                 rewrite, deliberately, saying what the condition is",
-                &lines[from..=at]
-            ));
-        }
-        // And no block CLOSES between the rebuild and the tray, which is the
-        // one shape the line-for-line pin above cannot see: a conditional
-        // opened before the estate binding's `};` and left un-reindented
-        // leaves every pinned line identical and shows up only as an extra
-        // `}` on the way down. Measured at 0 today; braces inside the
-        // comments down there are part of the measurement and constant.
-        //
-        // Stated rather than hidden: a wrapper opened above `};` AND closed
-        // below `build_tray` would pass both. That is not a step-4-shaped
-        // edit -- it would swallow `stop_backend_if_idle` and the tray with
-        // the rebuild -- and clause 1's own region check speaks to it.
-        let tray = lines
-            .iter()
-            .position(|line| line.trim_start() == concat!("let mut tray = tray::build", "_tray();"))
-            .ok_or_else(|| {
-                String::from(
-                    "the tray is no longer built on a line of its own below the window, so \
-                     the rebuild's nesting cannot be compared against `main`'s own body",
-                )
-            })?;
-        if tray <= at {
-            return Err(String::from(
-                "the tray is now built ABOVE the engine rebuild, so the brace balance below \
-                 is measured over the wrong stretch of the file",
-            ));
-        }
-        let depth: i32 = lines[at + 1..tray]
-            .iter()
-            .map(|line| {
-                line.matches('{').count() as i32 - line.matches('}').count() as i32
-            })
-            .sum();
-        if depth != 0 {
-            return Err(format!(
-                "the braces between the engine rebuild and `build_tray` no longer balance \
-                 ({depth}). A block closes -- or opens -- between them, which is what a \
-                 conditional wrapped around the rebuild from further up looks like when it \
-                 was written without reindenting the body"
-            ));
-        }
-        Ok(())
-    }
-
     /// **The initialisation order the in-window lock's step 2 had to decide,
     /// written down as a check rather than as a comment.**
     ///
@@ -19974,13 +20247,15 @@ mod startup_shape_tests {
     #[test]
     fn the_startup_windows_initialisations_stay_below_it_and_read_the_estate() {
         let production = production();
-        const WINDOW: &str = concat!("let outcome = app_window::", "run(");
+        const WINDOW: &str = concat!("window = Some(app_window::", "run(");
         assert_eq!(
             production.matches(WINDOW).count(),
             1,
             "control: {WINDOW:?} is not in the production half exactly once, so \"below the \
              startup window\" no longer names one place and every offset compared below is \
-             compared against nothing"
+             compared against nothing. The window's call is written into a local by the \
+             `wait` closure now -- `park_and_work`'s wait is `FnOnce` and hands back only \
+             an `EstateOutcome` -- so this is the one spelling of it"
         );
         let window_at = production.find(WINDOW).expect("counted just above");
         let region = after_the_startup_window();
@@ -20004,6 +20279,10 @@ mod startup_shape_tests {
             (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),
             (concat!("window_watch::watch_foreground_", "windows("), 1),
             (concat!("estate.engine.rebuild(&startup_entries.", "borrow());"), 1),
+            (
+                concat!("if the_startup_window_tore_the_session_", "down {"),
+                1,
+            ),
         ];
         for (needle, expected) in below {
             let hits: Vec<usize> = production.match_indices(needle).map(|(at, _)| at).collect();
@@ -20073,26 +20352,184 @@ mod startup_shape_tests {
              cannot see"
         );
 
-        // 4. AND IT IS UNCONDITIONAL, which clause 3 alone does not say. A
-        //    line wrapped in an `if` still occurs, still occurs once, and is
-        //    still spelled exactly the same -- so clauses 1 and 3 pass on the
-        //    one edit step 4 is instructed to make, while the behaviour is
-        //    identical to deleting the line. See
-        //    [`the_rebuild_is_unconditional`].
-        if let Err(why) = the_rebuild_is_unconditional(production) {
+        // 4. AND IT IS CONDITIONAL, ON THE ONE FACT THAT MAKES IT SAFE.
+        //    Clause 3 alone does not say this: a line wrapped in ANY `if`
+        //    still occurs, still occurs once, and is still spelled exactly
+        //    the same. This clause is what says WHICH condition, and it is
+        //    the step-8 rewrite of the clause that used to demand the
+        //    opposite. See `the_rebuild_is_conditional_on_the_windows_own_
+        //    teardown`.
+        if let Err(why) = the_rebuild_is_conditional_on_the_windows_own_teardown(production) {
             panic!(
-                "{why}\n\nThe post-window engine rebuild is no longer an unconditional \
-                 statement. That may well be RIGHT -- it is obligation 2 of the four this \
-                 file's step-8.2 answer left for the step that moves the teardown inside \
-                 the startup window. It is not something to make green: rewrite this clause \
-                 and the doc above it to say what the rebuild is now conditional ON, and why \
-                 that condition is the one that distinguishes a window that tore the session \
-                 down from one that did not."
+                "{why}\n\nThe post-window `engine.rebuild` overwrites the match engine from \
+                 a snapshot taken BEFORE the startup window. Now that the window's own lock \
+                 tears the session down and settles it again in place, this line has the \
+                 last word rather than the first: over a lock that rebuilt it reverts the \
+                 repopulate, and over a lock whose sign-in the user DECLINED it re-arms \
+                 autofill against a vault they just locked -- undoing the \
+                 `stand_down_after_unlock` the teardown ran on purpose. It is guarded by \
+                 exactly one condition and that condition is pinned here."
             );
         }
     }
 
-    /// **The positive control for clause 4**: every shape a conditional
+    /// **The rebuild is guarded, and by the ONE fact that makes it safe** --
+    /// `Ok` only when `estate.engine.rebuild(&startup_entries.borrow())` is
+    /// the whole of the `else` arm of `if the_startup_window_tore_the_session
+    /// _down`.
+    ///
+    /// **This clause used to demand the opposite, deliberately.** It was
+    /// `the_rebuild_is_unconditional`, and its own doc said so: "step 4's
+    /// obligation is to rewrite this clause saying what the condition now is,
+    /// not to satisfy it". This is that rewrite. Nothing was relaxed on the
+    /// way through -- the old clause's three properties (the statement stands
+    /// alone on a line of its own; it is spelled exactly; nothing stands
+    /// between the estate binding and it that the pin cannot see) are all
+    /// still here, re-anchored one level in, and the brace-balance check that
+    /// caught the un-reindented wrapper is unchanged.
+    ///
+    /// **What it now forbids** is every way of getting the condition wrong
+    /// while keeping a condition: an inverted test, a different flag, the
+    /// two arms swapped, the guard removed altogether. Each is a real
+    /// behaviour and three of the four leave the pinned statement
+    /// byte-identical.
+    ///
+    /// Returns `Err` rather than asserting so that
+    /// [`the_conditional_clause_can_see_a_rebuild_that_is_not_guarded`] can
+    /// feed it mutated regions and prove each one is rejected. A source guard
+    /// whose failure path is never exercised is the shape that failed here
+    /// before.
+    ///
+    /// `trim_end` on every line and never a `\r\n` in a needle: this tree is
+    /// CRLF in the working copy and LF in the blob, and `str::lines` leaves
+    /// the `\r` on.
+    fn the_rebuild_is_conditional_on_the_windows_own_teardown(
+        production: &str,
+    ) -> Result<(), String> {
+        let lines: Vec<&str> = production.lines().map(str::trim_end).collect();
+        // The statement, ONE LEVEL IN: inside the `else` arm, at eight
+        // spaces. Four spaces is `main`'s own body and would mean the guard
+        // is gone; anything deeper means a second block was opened.
+        const GUARDED: &str = concat!("        estate.engine.rebuild(&startup_entries.", "borrow());");
+        const OPENER: &str = concat!("    if the_startup_window_tore_the_session_", "down {");
+        let alone: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start() == ARMED_FROM_A_PRE_WINDOW_SNAPSHOT)
+            .map(|(at, _)| at)
+            .collect();
+        if alone.len() != 1 {
+            return Err(format!(
+                "{} line(s) in the production half are nothing but \
+                 {ARMED_FROM_A_PRE_WINDOW_SNAPSHOT:?}, rather than exactly one. A rebuild \
+                 folded onto a line that carries anything else -- a one-line `if .. {{ .. }}`, \
+                 a `.then(|| ..)`, a `match` arm -- is a rebuild whose guard the lines below \
+                 cannot see, wearing the pinned text",
+                alone.len()
+            ));
+        }
+        let at = alone[0];
+        if lines[at] != GUARDED {
+            return Err(format!(
+                "the rebuild is spelled {:?}, not at the eight spaces of the `else` arm that \
+                 guards it. Four spaces is `main`'s own body, which is the guard REMOVED -- \
+                 the pre-window snapshot replayed over whatever the window's teardown left. \
+                 Deeper means a further block was opened around it",
+                lines[at]
+            ));
+        }
+        if at < 2 || lines[at - 1] != "    } else {" {
+            return Err(format!(
+                "the line above the rebuild is {:?}, not the `}} else {{` of its guard. If the \
+                 two arms have been swapped, the rebuild now runs on exactly the launches it \
+                 must not run on",
+                lines.get(at.wrapping_sub(1)).copied().unwrap_or("<start of file>")
+            ));
+        }
+        if lines.get(at + 1).copied() != Some("    }") {
+            return Err(format!(
+                "the line below the rebuild is {:?}, not the close of its `else` arm, so the \
+                 arm carries more than the one statement this clause is about",
+                lines.get(at + 1).copied().unwrap_or("<end of file>")
+            ));
+        }
+        // The opener, above the `} else {` and with nothing but the
+        // teardown-took-the-last-word log between them.
+        let opener_at = lines[..at]
+            .iter()
+            .rposition(|line| *line == OPENER)
+            .ok_or_else(|| {
+                String::from(
+                    "the rebuild's guard is not `if the_startup_window_tore_the_session_down \
+                     {`. Any other condition is a different question: an inverted one replays \
+                     the snapshot on exactly the launches that must not have it, and a \
+                     different flag is a fact about something else entirely",
+                )
+            })?;
+        let between = &lines[opener_at + 1..at - 1];
+        if between.iter().any(|line| line.trim_start().starts_with("if ")) {
+            return Err(String::from(
+                "a second condition is opened between the guard and the rebuild",
+            ));
+        }
+        if !between.iter().any(|line| line.trim_start().starts_with("log::")) {
+            return Err(String::from(
+                "the guard's taken arm says nothing. A silent skip of the match-engine \
+                 rebuild is indistinguishable in the field from autofill having died",
+            ));
+        }
+        // The flag is decided in exactly one place, and it is the window's
+        // own answer rather than something computed here.
+        let assignment = concat!(
+            "    the_startup_window_tore_the_session_down = outcome.tore_the_session_",
+            "down;"
+        );
+        if production.matches(assignment).count() != 1 {
+            return Err(format!(
+                "the guard's flag is written {} time(s) as {assignment:?} rather than exactly \
+                 once. Computed anywhere but off the window's own outcome, it is a second \
+                 opinion about whether a teardown ran -- and the window is the only thing \
+                 that knows",
+                production.matches(assignment).count()
+            ));
+        }
+        // And no block CLOSES between the guard's own close and the tray,
+        // which is the one shape the line-for-line pin above cannot see: a
+        // wrapper opened further up and left un-reindented leaves every
+        // pinned line identical and shows up only as an extra `}` on the way
+        // down. Measured at 0 today; braces inside the comments down there
+        // are part of the measurement and constant.
+        let tray = lines
+            .iter()
+            .position(|line| line.trim_start() == concat!("let mut tray = tray::build", "_tray();"))
+            .ok_or_else(|| {
+                String::from(
+                    "the tray is no longer built on a line of its own below the window, so \
+                     the rebuild's nesting cannot be compared against `main`'s own body",
+                )
+            })?;
+        if tray <= at {
+            return Err(String::from(
+                "the tray is now built ABOVE the engine rebuild, so the brace balance below \
+                 is measured over the wrong stretch of the file",
+            ));
+        }
+        let depth: i32 = lines[at + 2..tray]
+            .iter()
+            .map(|line| line.matches('{').count() as i32 - line.matches('}').count() as i32)
+            .sum();
+        if depth != 0 {
+            return Err(format!(
+                "the braces between the rebuild's guard and `build_tray` no longer balance \
+                 ({depth}). A block closes -- or opens -- between them, which is what a \
+                 further conditional wrapped around the region from higher up looks like \
+                 when it was written without reindenting the body"
+            ));
+        }
+        Ok(())
+    }
+
+    /// **The positive control for clause 4**    /// **The positive control for clause 4**: every shape a conditional
     /// rebuild arrives in is REJECTED by [`the_rebuild_is_unconditional`].
     ///
     /// Clause 4 is a source-analysis guard, which is the class that has failed
@@ -20105,19 +20542,20 @@ mod startup_shape_tests {
     /// them is spelled `if` at the head of a reindented block, and two of
     /// them leave every line the pin names byte-identical.
     #[test]
-    fn the_unconditional_clause_can_see_a_conditional_rebuild() {
+    fn the_conditional_clause_can_see_a_rebuild_that_is_not_guarded() {
         let production = production();
         assert_eq!(
-            the_rebuild_is_unconditional(production),
+            the_rebuild_is_conditional_on_the_windows_own_teardown(production),
             Ok(()),
             "control: the rebuild as it stands today is rejected, so every rejection below \
              proves nothing about the mutation and only that the predicate never passes"
         );
 
-        // Spliced BY LINE and rejoined with a bare `\n`, never by matching a
-        // multi-line needle: this tree is CRLF in the working copy and LF in
-        // the blob, and a needle carrying a literal CRLF matches nothing in
-        // one of the two. The predicate trims line ends, so the join is free.
+        // Spliced BY LINE and rejoined with a bare newline, never by matching
+        // a multi-line needle: this tree is CRLF in the working copy and LF
+        // in the blob, and a needle carrying a literal CRLF matches nothing
+        // in one of the two. The predicate trims line ends, so the join is
+        // free.
         let lines: Vec<&str> = production.lines().collect();
         let stmt = ARMED_FROM_A_PRE_WINDOW_SNAPSHOT;
         let rebuild_at = lines
@@ -20130,73 +20568,69 @@ mod startup_shape_tests {
             "control: more than one line is the rebuild, so the splices below land \
              somewhere unintended"
         );
-        // The `log::info!(` that opens the neighbourhood, four lines up.
-        let log_at = rebuild_at - 4;
-        assert_eq!(
-            lines[log_at].trim_end(),
-            REBUILD_NEIGHBOURHOOD[2],
-            "control: the engine log is not four lines above the rebuild, so the wrapper \
-             cases below would be spliced into the wrong place"
+        let opener = concat!("    if the_startup_window_tore_the_session_", "down {");
+        let opener_at = lines[..rebuild_at]
+            .iter()
+            .rposition(|line| line.trim_end() == opener)
+            .expect("control: the rebuild has no guard above it to mutate");
+        assert!(
+            rebuild_at - opener_at >= 2,
+            "control: the guard and the rebuild are the same two lines, so the splices \
+             below would overlap"
         );
 
-        let wrapped = "    if startup_vault.is_none() {";
+        // Each case is a real way the step-8 guard comes undone, and three of
+        // the five leave the pinned statement itself byte-identical.
         let cases: &[(&str, usize, usize, &[&str])] = &[
             (
-                "wrapped in an `if` and reindented, the tidy version of step 4's edit",
-                rebuild_at,
+                "the guard removed altogether -- the mutation the whole clause exists for, \
+                 and behaviourally identical to the pre-step-8 tree: the pre-window snapshot \
+                 replayed over the teardown's own engine, and on a declined sign-in autofill \
+                 re-armed against a vault the user just locked",
+                opener_at,
+                rebuild_at + 2 - opener_at,
+                &["    <stmt>"],
+            ),
+            (
+                "the condition INVERTED, so the snapshot is replayed on exactly the launches \
+                 that must not have it and skipped on the ones that must",
+                opener_at,
                 1,
-                &[wrapped, "        <stmt>", "    }"],
+                &[concat!("    if !the_startup_window_tore_the_session_", "down {")],
             ),
             (
-                "wrapped in an `if` WITHOUT reindenting, the hurried version",
-                rebuild_at,
+                "the condition swapped for a different flag, which is a fact about something \
+                 else entirely",
+                opener_at,
                 1,
-                &[wrapped, "    <stmt>", "    }"],
+                &["    if startup_vault.is_none() {"],
             ),
             (
-                "folded onto one line, so the block never opens a line of its own",
-                rebuild_at,
-                1,
-                &["    if startup_vault.is_none() { <stmt> }"],
+                "the two arms SWAPPED, which leaves the condition byte-identical and the \
+                 statement spelled exactly as the pin names it",
+                opener_at,
+                rebuild_at + 2 - opener_at,
+                &[
+                    concat!("    if the_startup_window_tore_the_session_", "down {"),
+                    "        <stmt>",
+                    "    } else {",
+                    "        log::info!(\"nothing to say\");",
+                    "    }",
+                ],
             ),
             (
-                "not spelled `if` at all -- a `.then` on the condition",
-                rebuild_at,
-                1,
-                &["    startup_vault.is_none().then(|| <expr>);"],
-            ),
-            (
-                "not spelled `if` at all -- the flag computed on the line above, the \
-                 statement itself left byte-identical",
-                rebuild_at,
-                0,
-                &["    let armed = startup_vault.is_none();"],
-            ),
-            (
-                "opened ABOVE the engine log and un-reindented, so every line of the \
-                 rebuild's own neighbourhood is byte-identical",
-                log_at,
-                0,
-                &[wrapped],
-            ),
-            (
-                "opened above the estate binding's own `};` and un-reindented -- the \
-                 line-for-line pin cannot see this one AT ALL, and only the brace balance \
-                 under the rebuild does",
-                rebuild_at + 1,
+                "a further block opened above the guard and left un-reindented, so every \
+                 line the pin names is byte-identical and only the brace balance under it \
+                 can see the difference",
+                rebuild_at + 2,
                 0,
                 &["    }"],
             ),
         ];
         for (what, at, take, with) in cases {
             let mut mutated = lines.clone();
-            let spliced: Vec<String> = with
-                .iter()
-                .map(|line| {
-                    line.replace("<stmt>", stmt)
-                        .replace("<expr>", stmt.trim_end_matches(';'))
-                })
-                .collect();
+            let spliced: Vec<String> =
+                with.iter().map(|line| line.replace("<stmt>", stmt)).collect();
             mutated.splice(*at..*at + *take, spliced.iter().map(String::as_str));
             let mutated = mutated.join("\n");
             assert_ne!(
@@ -20206,14 +20640,14 @@ mod startup_shape_tests {
                  would be a rejection of the untouched file"
             );
             assert!(
-                the_rebuild_is_unconditional(&mutated).is_err(),
-                "a rebuild {what} is accepted by clause 4. That is the hole clause 3 already \
-                 has, moved one step along"
+                the_rebuild_is_conditional_on_the_windows_own_teardown(&mutated).is_err(),
+                "a rebuild with {what} is accepted by clause 4. That is the hole clause 3 \
+                 already has, moved one step along"
             );
         }
     }
 
-    /// **A startup window closed without a session ends the process, and that
+    /// **A startup window closed without a session ends the process, and that    /// **A startup window closed without a session ends the process, and that
     /// is pinned rather than trusted.**
     ///
     /// This is the other half of step 2's initialisation-order question: if
