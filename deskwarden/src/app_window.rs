@@ -3742,6 +3742,39 @@ mod lock_host_tests {
                  it is not this arm's own write -- one of the two steps no longer records that \
                  the worker reported anything"
             );
+            // **REACHABILITY, not distance.** The byte budget above only
+            // says the write is NEAR its arm; it says nothing about whether
+            // the arm ever executes it. Wrapping the write in
+            // `if closing.decided() { ... }` -- inside an arm that is
+            // already under `if !closing.decided()`, so the write is dead --
+            // costs about 60 bytes against a 400-byte budget and left the
+            // whole suite green: count still 2, both writes still near their
+            // arms, rule and table and call-site pin all untouched, and a
+            // worker that reports `NeedsSignIn` and then dies has its
+            // teardown RETRACTED, so `main` tears down a session already
+            // dismantled. That is the "MISSING one" case the count's own
+            // message names, reached without moving the count.
+            //
+            // So the write is pinned as the arm's FIRST STATEMENT: between
+            // the arm's marker and the write there may be the arm's own
+            // opening brace and nothing else. Comments are already stripped
+            // by `code`, so this is a statement about code. Any wrapper --
+            // `if`, `match`, a nested block, a closure -- puts a second
+            // token in that gap and fails here, whatever its size. The
+            // distance assertion above is KEPT rather than replaced: it is
+            // what kills a write hoisted OUT of its arm (the two arms'
+            // writes are 738 bytes apart), which adjacency alone would not
+            // distinguish from a correct arm whose own write moved.
+            let between = closure[arm + step.len()..arm + next].trim();
+            assert_eq!(
+                between, "{",
+                "the `teardown_reported` write for {step:?} is not that arm's first \
+                 statement -- {between:?} stands between the arm and the write, so the \
+                 write is nested inside something that may not run. A write the arm does \
+                 not reach leaves `teardown_reported` false for a step that WAS reported, \
+                 and the retraction then un-reports a teardown that really happened: \
+                 `main` runs a second teardown of a session already torn down"
+            );
         }
 
         // The call and the write it guards are adjacent -- the retraction is
