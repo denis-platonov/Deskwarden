@@ -3693,6 +3693,57 @@ mod lock_host_tests {
         ] {
             assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
         }
+        // **Where the two flags are SET, not merely that they are set.** A
+        // correct rule fed a flag written in the wrong arm is this file's
+        // recurring defect one level down: `teardown_reported = true;` hoisted
+        // into the lock arm makes the retraction unreachable, and
+        // `worker_started = true;` moved outside the spawn makes it claim a
+        // worker that the spent-`FnOnce` path never started -- and both leave
+        // the rule, the table and the call above completely untouched.
+        assert_eq!(
+            closure.matches(concat!("worker_started = ", "true;")).count(),
+            1,
+            "`worker_started` is set somewhere other than exactly once: {closure}"
+        );
+        let spawn = closure
+            .find(concat!("std::thread::", "spawn(move || {"))
+            .expect("the spawn is pinned by the_lock_arm_starts_the_teardown_on_a_thread");
+        let started = closure.find(concat!("worker_started = ", "true;")).expect("counted above");
+        let claim = closure
+            .find(concat!("LockProgress::", "TeardownStarted"))
+            .expect("pinned by the_hosts_two_relocked_writes_both_go_through_the_rule");
+        assert!(
+            spawn < started && started < claim,
+            "`worker_started` is not set between the spawn and the `TeardownStarted` claim, so \
+             it no longer means what the rule is told it means -- set before the spawn it is \
+             `true` on the second lock of one session, whose `FnOnce` teardown is spent and \
+             which starts no worker at all"
+        );
+        // Both of the teardown's steps set `teardown_reported`, and each does
+        // it inside its own arm. The two arms are pinned by
+        // `the_host_answers_both_teardown_steps`.
+        assert_eq!(
+            closure.matches(concat!("teardown_reported = ", "true;")).count(),
+            2,
+            "`teardown_reported` is not set exactly twice -- once per teardown step. A MISSING \
+             one is a worker whose reported step is forgotten, so a session that really was \
+             torn down gets a second teardown from `main`; an EXTRA one, or one hoisted out of \
+             these arms, makes the retraction unreachable and restores the v0.5.0 defect: \
+             {closure}"
+        );
+        for step in [concat!("Ok(TeardownStep::", "NeedsSignIn) =>"), concat!("Ok(TeardownStep::", "Finished) =>")] {
+            let arm = closure.find(step).unwrap_or_else(|| panic!("control: {step:?} is not in the vault host"));
+            let next = closure[arm..]
+                .find(concat!("teardown_reported = ", "true;"))
+                .unwrap_or_else(|| panic!("no `teardown_reported` write follows {step:?}: {closure}"));
+            assert!(
+                next < 400,
+                "the `teardown_reported` write nearest to {step:?} is {next} bytes below it, so \
+                 it is not this arm's own write -- one of the two steps no longer records that \
+                 the worker reported anything"
+            );
+        }
+
         // The call and the write it guards are adjacent -- the retraction is
         // not a call whose answer is computed and then thrown away.
         let at = closure
