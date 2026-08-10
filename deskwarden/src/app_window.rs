@@ -886,6 +886,23 @@ pub enum LockProgress {
     /// The recovery produced no vault. The session stays down, and the
     /// teardown that took it down has already authenticated once.
     RebuildFailed,
+    /// **The worker that [`TeardownStarted`](Self::TeardownStarted) was
+    /// reported for ENDED WITHOUT EVER REPORTING A STEP.**
+    ///
+    /// `TeardownStarted` is reported from `std::thread::spawn` returning --
+    /// which says a thread exists, not that the teardown ran. A worker that
+    /// never receives the two channel ends the frame thread is supposed to
+    /// forward, or that panics before it reaches the sign-in request, drops
+    /// the only `TeardownStep` sender and the working stage hears
+    /// `Disconnected` with no step ever seen. Nothing was drained, `bw serve`
+    /// was never stopped and the cache was never cleared, so the session is
+    /// NOT torn down and the caller's own recovery is the only teardown this
+    /// lock is ever going to get.
+    ///
+    /// Without this step the window answers `relocked: true` there -- the
+    /// v0.5.0 defect exactly: a vault reporting itself locked while a live
+    /// `bw serve` still answers out of a full cache.
+    TeardownNeverRan,
 }
 
 /// Whether the session is torn down and not rebuilt, after one more step.
@@ -897,14 +914,65 @@ pub enum LockProgress {
 /// the closure cannot be called by a test, so a rule written inside it is a
 /// rule nothing checks.
 ///
-/// `current` is carried rather than ignored because two of the four steps
+/// `current` is carried rather than ignored because two of the five steps
 /// deliberately change nothing: a lock with a spent teardown must not claim a
 /// teardown, and a failed rebuild must not retract the one that did run.
+///
+/// [`LockProgress::TeardownNeverRan`] RETRACTS one, and is the only step that
+/// does so other than a rebuild: it is the discovery that the teardown the
+/// lock arm optimistically claimed never actually happened.
 pub fn session_torn_down(current: bool, step: LockProgress) -> bool {
     match step {
         LockProgress::TeardownStarted => true,
-        LockProgress::VaultRebuilt => false,
+        LockProgress::VaultRebuilt | LockProgress::TeardownNeverRan => false,
         LockProgress::TeardownAlreadySpent | LockProgress::RebuildFailed => current,
+    }
+}
+
+/// **What one window's session produced, when the window held TWO sessions.**
+///
+/// The in-window lock ends one vault session and (usually) starts another in
+/// the same window, and each has its own outcome cells:
+/// [`vault_window::build_frame`] makes a fresh `edited_settings` cell per
+/// frame. `main` reads exactly one [`vault_window::VaultWindowResult`] per
+/// window and is the only writer of `settings.json`, so whichever result does
+/// not survive this merge is a preference change the user made and watched
+/// vanish.
+///
+/// **The rule: the LATER session decides everything except a gear visit, and a
+/// gear visit survives from either.** Every other field is a request about the
+/// session that is ending right now -- `locked`, `needs_reauth`, `switch_to`,
+/// `add_account`, `remove_account`, `account_details` -- and carrying the
+/// pre-lock session's `locked: true` forward would tell `main` to run a
+/// recovery against the vault this window has just rebuilt. `edited_settings`
+/// is the one field that is deliberately NOT about the session: it is `Some`
+/// for the rest of a window's life once the gear has been clicked (see
+/// [`vault_window::VaultWindowResult::edited_settings`]), and a lock in the
+/// middle of a window's life must not shorten that life.
+///
+/// **When BOTH carry one, the rebuilt session's wins**, because it is the
+/// later of the two visits to the gear and the two are not merged field by
+/// field -- `Settings` is edited as a whole in the modal. This is not a lossy
+/// choice: the rebuilt frame is constructed with the pre-lock edit already
+/// applied (`run_from_vault` hands it to `rebuild_vault`), so its gear opens
+/// on the carried-forward value and what comes back out of it is the pre-lock
+/// edit plus whatever the user did next.
+pub fn carry_settings_forward(
+    before_lock: Option<vault_window::VaultWindowResult>,
+    after_rebuild: Option<vault_window::VaultWindowResult>,
+) -> Option<vault_window::VaultWindowResult> {
+    match (before_lock, after_rebuild) {
+        // The failed-rebuild path: there is no later session, so the one that
+        // locked is the whole answer -- including its `locked: true`, which is
+        // what makes `main`'s branches see a lock at all.
+        (Some(before), None) => Some(before),
+        (before, Some(mut after)) => {
+            if after.edited_settings.is_none() {
+                after.edited_settings = before.and_then(|before| before.edited_settings);
+            }
+            Some(after)
+        }
+        (None, None) => None,
     }
 }
 
@@ -1003,6 +1071,16 @@ pub struct VaultSessionOutcome {
 /// worker per lock with no bound on how many are in flight against one parked
 /// estate, which is the multiple-owner shape the estate exists to remove.
 ///
+/// **`rebuild_vault` is handed the preference edit the PRE-LOCK session
+/// produced**, because the estate the worker reads the rebuilt vault's
+/// settings out of is the pre-edit one: `main` is the only writer of
+/// `settings.json` and it does not run until this window is gone. Without
+/// this, a gear visit that changed the auto-lock policy and was then followed
+/// by a lock would come back to a window still running the OLD policy -- the
+/// regression that undoes "the open window honours an auto-lock change at
+/// once" across a lock. Whatever the rebuilt session then reports wins; see
+/// [`carry_settings_forward`].
+///
 /// `build_sign_in` and `rebuild_vault` both run on THIS thread. They are
 /// closures rather than parameters because both are lazy on purpose:
 /// `login_ui::build_login_frame` spawns a `bw status` of its own, and a vault
@@ -1023,7 +1101,10 @@ pub fn run_from_vault<T, S, B>(
 where
     T: FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
     S: FnOnce() -> (login_ui::LoginFrameFn, login_ui::LoginFrameHandles) + 'static,
-    B: FnOnce() -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)> + 'static,
+    B: FnOnce(
+            Option<crate::settings::Settings>,
+        ) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
+        + 'static,
 {
     let (options, vault_frame, handles) = vault;
 
@@ -1081,6 +1162,12 @@ where
     // healthily coming up, which throws away the sign-in that just happened.
     let mut working_since: Option<Instant> = None;
     let mut closing = Closing::not_yet();
+    // **The two facts that turn "a thread was spawned" into "the teardown
+    // actually got underway".** `teardown` is `FnOnce`, so at most one worker
+    // ever starts in one window's life and these need no per-lock reset. See
+    // [`LockProgress::TeardownNeverRan`], which is what the pair is read into.
+    let mut worker_started = false;
+    let mut teardown_reported = false;
 
     run_the_one_window(options, move |ui, frame| {
         if stages_for_closure.borrow().last() != Some(&stage) {
@@ -1152,6 +1239,7 @@ where
                                 let step_tx = step_tx;
                                 teardown(&step_tx, token_rx);
                             });
+                            worker_started = true;
                             LockProgress::TeardownStarted
                         } else {
                             LockProgress::TeardownAlreadySpent
@@ -1212,6 +1300,7 @@ where
                 if !closing.decided() {
                     match step_rx.try_recv() {
                         Ok(TeardownStep::NeedsSignIn) => {
+                            teardown_reported = true;
                             log::info!(
                                 "the lock's teardown is done and the vault needs a master \
                                  password; showing the sign-in card in the window that is \
@@ -1223,12 +1312,27 @@ where
                             ui.ctx().request_repaint();
                         }
                         Ok(TeardownStep::Finished) => {
+                            teardown_reported = true;
                             // Dropped here rather than left alive for the rest
                             // of the window: the worker is finished, and a
                             // sender this side keeps would stop the channel
                             // ever reporting `Disconnected` again.
                             token_tx = None;
-                            let built = rebuild_vault.take().and_then(|build| build());
+                            // The gear visit the PRE-LOCK session produced --
+                            // read out of the cell the lock arm's `finish`
+                            // wrote, and cloned rather than borrowed across
+                            // the call because `build` is a caller's closure
+                            // and this cell is alive for the rest of the
+                            // window. See this function's doc: `main` has not
+                            // written `settings.json` yet, so this is the only
+                            // place the rebuilt vault can learn the new
+                            // policy.
+                            let edited_before_lock = result_for_closure
+                                .borrow()
+                                .as_ref()
+                                .and_then(|before| before.edited_settings.clone());
+                            let built =
+                                rebuild_vault.take().and_then(|build| build(edited_before_lock));
                             // **The session is LIVE again on the `Some` arm,
                             // so the teardown stops being outstanding there
                             // and only there.** Left set through a rebuild, a
@@ -1279,6 +1383,39 @@ where
                                     ui.ctx().request_repaint_after(WORKING_POLL)
                                 }
                                 WorkPoll::Failed(why) => {
+                                    // **The worker died having reported
+                                    // NOTHING.** `relocked` was set from the
+                                    // spawn returning, which says a thread
+                                    // exists and not that the teardown ran; if
+                                    // the frame thread's forwarding of the two
+                                    // channel ends never arrived, or the
+                                    // worker panicked before it asked for the
+                                    // master password, nothing was drained,
+                                    // stopped or cleared. Retract the claim
+                                    // here so the caller runs the recovery
+                                    // that is now the only teardown this lock
+                                    // will get. NOT done for
+                                    // `WorkFailure::Deadline`: there the
+                                    // worker is alive and mid-sequence, and
+                                    // telling the caller to start a second
+                                    // teardown against a session another
+                                    // thread is still dismantling is the
+                                    // multiple-owner shape the parked estate
+                                    // exists to remove.
+                                    if why == WorkFailure::WorkerDied
+                                        && worker_started
+                                        && !teardown_reported
+                                    {
+                                        log::error!(
+                                            "the lock's teardown worker ended without ever \
+                                             reporting a step, so nothing was torn down; the \
+                                             session is reported as still live and the caller's \
+                                             own lock recovery runs"
+                                        );
+                                        let was = *relocked_for_closure.borrow();
+                                        *relocked_for_closure.borrow_mut() =
+                                            session_torn_down(was, LockProgress::TeardownNeverRan);
+                                    }
                                     give_up_working(ui.ctx(), &mut closing, why, elapsed);
                                     ui.ctx().request_repaint();
                                 }
@@ -1292,15 +1429,20 @@ where
 
     // The vault frame that is still up when the window ends -- an ordinary
     // close, or the one rebuilt after a lock -- ends the way every vault
-    // session ends. The lock's own `finish` above already wrote a result; this
-    // one overwrites it, which is right: it is the LATER session, and its
-    // geometry and its cells are the ones the user left behind.
-    if let Some(handles) = vault_handles.borrow().as_ref() {
-        *result.borrow_mut() = Some(handles.finish());
-    }
+    // session ends: `finish` writes the geometry and reads the outcome cells.
+    // `None` here is the failed-rebuild path, where the lock arm took the
+    // handles and nothing put any back.
+    //
+    // **MERGED with the lock's own result, not substituted for it.** This
+    // line used to be an unconditional overwrite, and `build_frame` gives
+    // every frame a FRESH `edited_settings` cell -- so a gear visit made
+    // before the lock was thrown away by the very session the lock arm's
+    // `finish` exists to preserve. See [`carry_settings_forward`] for which
+    // field survives from which session and why it is only the one.
+    let rebuilt = vault_handles.borrow().as_ref().map(|handles| handles.finish());
     let stages = stages.borrow().clone();
     let relocked = *relocked.borrow();
-    let result = result.borrow_mut().take();
+    let result = carry_settings_forward(result.borrow_mut().take(), rebuilt);
     VaultSessionOutcome { result, stages, relocked }
 }
 
@@ -2747,11 +2889,12 @@ mod lock_transition_tests {
         LockProgress::TeardownAlreadySpent,
         LockProgress::VaultRebuilt,
         LockProgress::RebuildFailed,
+        LockProgress::TeardownNeverRan,
     ];
 
     /// **The whole of [`session_torn_down`], spelled out rather than derived
     /// from the function it checks**, and asserted to have visited every one
-    /// of the eight `(current, step)` pairs -- a table that silently stopped
+    /// of the ten `(current, step)` pairs -- a table that silently stopped
     /// covering a pair would be a rule nobody checks for that pair.
     #[test]
     fn the_torn_down_rule_is_a_table_and_every_pair_is_in_it() {
@@ -2765,6 +2908,8 @@ mod lock_transition_tests {
             (true, LockProgress::VaultRebuilt, false),
             (false, LockProgress::RebuildFailed, false),
             (true, LockProgress::RebuildFailed, true),
+            (false, LockProgress::TeardownNeverRan, false),
+            (true, LockProgress::TeardownNeverRan, false),
         ];
         let mut visited = 0usize;
         for &(current, step, want) in expected {
@@ -2776,10 +2921,10 @@ mod lock_transition_tests {
             );
             visited += 1;
         }
-        assert_eq!(visited, 8, "the table stopped covering all eight pairs");
+        assert_eq!(visited, 10, "the table stopped covering all ten pairs");
         assert_eq!(
             ALL_PROGRESS.len() * 2,
-            8,
+            10,
             "a `LockProgress` variant was added or removed, so the table above is no longer \
              exhaustive -- add its two rows"
         );
@@ -2836,6 +2981,140 @@ mod lock_transition_tests {
             session_torn_down(after_lock, LockProgress::RebuildFailed),
             "a teardown that ran and then failed to repopulate is reported as no teardown at \
              all, so the caller runs the whole sequence again on a session that is already gone"
+        );
+    }
+
+    /// **A worker that reported NOTHING never tore anything down.**
+    ///
+    /// The lock arm sets the flag from `std::thread::spawn` returning, which
+    /// is a claim about a thread existing and not about the teardown running.
+    /// If the frame thread's forwarding of the two channel ends is dropped --
+    /// or the worker panics before it asks for the master password -- the
+    /// step channel goes `Disconnected` with no step ever seen, and the
+    /// window would otherwise tell the caller "already torn down" about a
+    /// session whose cache is full and whose `bw serve` still answers. That
+    /// is the v0.5.0 defect, reachable through the in-window lock.
+    #[test]
+    fn a_teardown_that_never_reported_a_step_retracts_its_own_claim() {
+        let after_lock = session_torn_down(false, LockProgress::TeardownStarted);
+        assert!(after_lock, "control: the lock arm's own step must claim the teardown");
+        assert!(
+            !session_torn_down(after_lock, LockProgress::TeardownNeverRan),
+            "a lock whose worker ended without ever reporting a step still reports the session \
+             as torn down, so the caller skips the only recovery that lock can get and the \
+             vault does not lock"
+        );
+    }
+
+    /// One vault result, spelled out field by field so a new field cannot be
+    /// silently defaulted into these fixtures.
+    fn result_with(
+        locked: bool,
+        edited: Option<crate::settings::Settings>,
+    ) -> vault_window::VaultWindowResult {
+        vault_window::VaultWindowResult {
+            locked,
+            needs_reauth: false,
+            edited_settings: edited,
+            switch_to: None,
+            add_account: false,
+            remove_account: false,
+            account_details: None,
+        }
+    }
+
+    /// A `Settings` that is NOT the default, so "the edit survived" cannot be
+    /// satisfied by a struct nobody wrote to.
+    fn edited_settings() -> crate::settings::Settings {
+        let mut settings = crate::settings::Settings::default();
+        settings.auto_lock_enabled = !settings.auto_lock_enabled;
+        assert_ne!(
+            settings,
+            crate::settings::Settings::default(),
+            "control: the fixture equals the default, so every assertion below would pass \
+             against a `Settings` the gear never touched"
+        );
+        settings
+    }
+
+    /// **THE FINDING: a gear visit made before a lock reached `main` as
+    /// nothing at all.**
+    ///
+    /// `build_frame` gives every frame a fresh `edited_settings` cell, so the
+    /// rebuilt session's result carries `None` -- and the tail used to
+    /// overwrite the lock's own carefully preserved result with it. `main` is
+    /// the only writer of `settings.json`, so the change was not merely
+    /// delayed: it was gone.
+    #[test]
+    fn a_gear_visit_made_before_the_lock_survives_the_rebuilt_session() {
+        let merged = carry_settings_forward(
+            Some(result_with(true, Some(edited_settings()))),
+            Some(result_with(false, None)),
+        )
+        .expect("a window with two sessions must produce a result");
+        assert_eq!(
+            merged.edited_settings,
+            Some(edited_settings()),
+            "the preference change the user made before locking was discarded by the session \
+             that replaced it"
+        );
+        assert!(
+            !merged.locked,
+            "the LATER session decides the lock/close fields; carrying `locked` forward would \
+             send `main` to run a lock recovery against the vault this window just rebuilt"
+        );
+    }
+
+    /// The other half of the same rule: everything that is *not* a gear visit
+    /// comes from the later session, and the rebuilt session's own gear visit
+    /// is not overwritten by the older one.
+    #[test]
+    fn the_rebuilt_sessions_own_gear_visit_wins_when_both_carry_one() {
+        let mut newer = edited_settings();
+        newer.auto_lock_minutes += 7;
+        assert_ne!(newer, edited_settings(), "control: the two fixtures are the same edit");
+        let merged = carry_settings_forward(
+            Some(result_with(true, Some(edited_settings()))),
+            Some(result_with(false, Some(newer.clone()))),
+        )
+        .expect("a window with two sessions must produce a result");
+        assert_eq!(
+            merged.edited_settings,
+            Some(newer),
+            "the gear visit made AFTER the lock was overwritten by the one made before it, so \
+             the window's last word about the user's preferences is its first one"
+        );
+    }
+
+    /// **The failed-rebuild path must not be broken by the fix for the
+    /// succeeding one.** No vault came back, so the lock's own result -- the
+    /// only one there is, `locked: true` included -- is the whole answer.
+    #[test]
+    fn a_lock_whose_rebuild_failed_still_reports_the_lock_and_its_gear_visit() {
+        let merged = carry_settings_forward(Some(result_with(true, Some(edited_settings()))), None)
+            .expect("the failed-rebuild path still has the lock's own result");
+        assert!(
+            merged.locked,
+            "a lock whose rebuild failed stopped reporting the lock, so `main`'s branches see \
+             an ordinary close of a vault that is not there"
+        );
+        assert_eq!(merged.edited_settings, Some(edited_settings()));
+    }
+
+    /// An ordinary close of the second host -- no lock at all -- still
+    /// produces the frame's own cells. Deleting the tail entirely made this
+    /// return `None`, which `main` answers with an all-`false` fallback: a
+    /// close that silently discards a gear visit, an account switch and the
+    /// warm account details together.
+    #[test]
+    fn an_ordinary_close_reports_the_only_session_there_was() {
+        let merged = carry_settings_forward(None, Some(result_with(false, Some(edited_settings()))))
+            .expect("an ordinary close must still produce outcome cells");
+        assert_eq!(merged.edited_settings, Some(edited_settings()));
+        assert!(
+            carry_settings_forward(None, None).is_none(),
+            "a window that had no vault frame at all invents a result, which `main` would read \
+             as an ordinary close"
         );
     }
 }
@@ -2958,8 +3237,14 @@ mod lock_host_tests {
         );
     }
 
-    /// **Both writes of `relocked` go through [`session_torn_down`], and
-    /// neither is a literal.**
+    /// **Every write of `relocked` goes through [`session_torn_down`], and
+    /// none is a literal.**
+    ///
+    /// The name says "two" because that is what there were when the mutant
+    /// below was first killed; there are THREE now -- the lock, the rebuild,
+    /// and the retraction when the teardown worker dies having reported
+    /// nothing. The count moved, the rule did not, and the mutant the name
+    /// records (a literal `= true` in the lock arm) is still killed here.
     ///
     /// The rule is unit-tested above, but a rule the closure does not call is
     /// a rule that governs nothing -- and the shape it replaced was exactly
@@ -2973,10 +3258,11 @@ mod lock_host_tests {
         let closure = closure();
         assert_eq!(
             closure.matches(concat!("session_torn_", "down(was, ")).count(),
-            2,
-            "the vault host does not have exactly two writes of `relocked` routed through the \
-             rule -- one at the lock and one at the rebuild. A write that bypasses it is a \
-             `relocked` nothing checks: {closure}"
+            3,
+            "the vault host does not have exactly three writes of `relocked` routed through the \
+             rule -- one at the lock, one at the rebuild, and one retracting a teardown that \
+             never ran. A write that bypasses it is a `relocked` nothing checks; a MISSING one \
+             is a lock that claims a teardown nothing performed: {closure}"
         );
         for literal in [
             concat!("relocked_for_closure.borrow_mut() = ", "true"),
@@ -2996,10 +3282,11 @@ mod lock_host_tests {
             concat!("LockProgress::", "TeardownAlreadySpent"),
             concat!("LockProgress::", "VaultRebuilt"),
             concat!("LockProgress::", "RebuildFailed"),
+            concat!("LockProgress::", "TeardownNeverRan"),
         ] {
             assert!(
                 closure.contains(needle),
-                "control: {needle:?} is not in the vault host, so one of the four steps the \
+                "control: {needle:?} is not in the vault host, so one of the five steps the \
                  rule is defined over is never actually reported by the window: {closure}"
             );
         }
@@ -3112,6 +3399,69 @@ mod lock_host_tests {
             !closure.contains(concat!("Err(", "_) =>")),
             "the vault host's poll arm treats every channel error alike, so a dead teardown \
              worker is polled as a busy one -- a spinner that refuses every close, forever"
+        );
+    }
+
+    /// **The tail MERGES the two sessions' results; it does not overwrite one
+    /// with the other.**
+    ///
+    /// The unit tests above hold `carry_settings_forward` to the rule. This is
+    /// the other half: a rule the host does not call is a rule that governs
+    /// nothing, and the shape it replaced was
+    /// `*result.borrow_mut() = Some(handles.finish());` -- an unconditional
+    /// overwrite sitting directly under a comment explaining why the lock's
+    /// own result had been preserved.
+    #[test]
+    fn the_tail_merges_the_two_sessions_rather_than_replacing_one() {
+        let closure = closure();
+        assert!(
+            closure.contains(concat!("carry_settings_", "forward(result.borrow_mut().take(), rebuilt)")),
+            "the vault host's tail does not merge the pre-lock result into the rebuilt one, so \
+             a visit to the gear made before a lock is discarded by the session that replaced \
+             it -- and `main`, the only writer of `settings.json`, never hears about it: \
+             {closure}"
+        );
+        assert!(
+            !closure.contains(concat!("*result.borrow_mut() = Some(handles.", "finish());")),
+            "the tail is back to overwriting the lock's own result with the rebuilt frame's, \
+             whose `edited_settings` cell is always fresh: {closure}"
+        );
+        // Positive controls: the region really does contain the tail, and the
+        // lock arm's own preserving write -- the one the merge consumes -- is
+        // still there. Without the second, the merge would be reading a cell
+        // nothing ever fills.
+        assert!(
+            closure.contains(concat!("VaultSessionOutcome { result, ", "stages, relocked }")),
+            "control: the sliced region stops before the tail it is a claim about: {closure}"
+        );
+        assert!(
+            closure.contains(concat!("*result_for_closure.borrow_mut() = Some(handles.", "finish());")),
+            "control: the lock arm no longer records the ending session at all, so the merge \
+             above has nothing to merge: {closure}"
+        );
+    }
+
+    /// **The rebuilt vault is built with the preference edit the pre-lock
+    /// session produced.**
+    ///
+    /// The estate the worker reads `auto_lock` out of is the PRE-EDIT one --
+    /// `main` is the only writer of `settings.json` and it does not run until
+    /// this window is gone. Handed nothing, the rebuilt window silently
+    /// reverts to the old auto-lock policy, which undoes "the open window
+    /// honours an auto-lock change at once" across a lock.
+    #[test]
+    fn the_rebuild_is_handed_the_gear_visit_that_preceded_the_lock() {
+        let closure = closure();
+        assert!(
+            closure.contains(concat!("build(", "edited_before_lock)")),
+            "the rebuilt vault is built without the preference edit made before the lock, so a \
+             window that changed its auto-lock policy and then locked comes back running the \
+             OLD policy: {closure}"
+        );
+        assert!(
+            closure.contains(concat!("before.edited_settings.", "clone()")),
+            "the value handed to the rebuild is not the pre-lock session's gear visit: \
+             {closure}"
         );
     }
 }

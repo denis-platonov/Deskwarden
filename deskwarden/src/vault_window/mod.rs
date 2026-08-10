@@ -69,7 +69,13 @@ const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
 /// exactly as it does to one made before the window opened. A modal that
 /// briefly reads `auto_lock_minutes: 0` therefore cannot close the window on
 /// the next frame with `locked = true` and force a master-password re-auth.
-pub(crate) fn effective_auto_lock(
+/// **`pub`, not `pub(crate)`, because the SECOND host needs it too.** The
+/// in-window lock rebuilds a vault frame from `main.rs`, and the estate it
+/// reads `opened_with` out of is the PRE-EDIT one -- `main` is the only
+/// writer of `settings.json` and it does not run until the window is gone.
+/// The same question, with the same answer, asked from the other side of the
+/// crate boundary; a second copy of it there would be a second rule.
+pub fn effective_auto_lock(
     edited: Option<&crate::settings::Settings>,
     opened_with: AutoLock,
 ) -> AutoLock {

@@ -3148,6 +3148,38 @@ impl EstatePark {
 /// The worker is not joined. On the deadline path it is still running by
 /// definition, and there is nothing to wait for: the reclaim has emptied the
 /// slot, so everything it does from here on is a `None` from `with`.
+/// The two channel ends the lock's teardown worker is blocked waiting for:
+/// the sender it reports its [`app_window::TeardownStep`]s on, and the
+/// receiver the master-password card's token comes down.
+type LockChannels = (mpsc::Sender<app_window::TeardownStep>, mpsc::Receiver<String>);
+
+/// **The whole of the lock -> worker handoff, as a function a test can call.**
+///
+/// This is one line of code and it is the hinge of the entire in-window lock.
+/// `RealVaultOps::open_window`'s teardown closure is called from inside
+/// eframe's frame closure, which no test in this crate can run, so while this
+/// send lived there it was pinned by nothing at all: replaced with a no-op,
+/// the lock arm still spawned its thread and still reported a teardown, the
+/// worker's `lock_rx.recv()` returned `Err`, NOTHING was drained, stopped or
+/// cleared, and `main` skipped its own recovery -- the v0.5.0 defect, with
+/// every test in this crate green. Out here it is driven end to end by
+/// `the_lock_handoff_really_carries_both_channel_ends`.
+///
+/// **The sender is CLONED, not moved.** The forwarding closure's own copy is
+/// dropped when the frame closure is dropped; if that were the only live
+/// sender the working stage could never hear a dead worker as `Disconnected`,
+/// and `app_window`'s watchdog would have nothing to watch.
+fn forward_lock_channels(
+    lock_tx: &mpsc::Sender<LockChannels>,
+    step_tx: &mpsc::Sender<app_window::TeardownStep>,
+    token_rx: mpsc::Receiver<String>,
+) {
+    // Ignored: an `Err` is the worker having already left (the window gave up
+    // on the teardown, or was never going to lock), which the working stage
+    // reads for itself as a dead channel.
+    let _ = lock_tx.send((step_tx.clone(), token_rx));
+}
+
 fn park_and_work(
     estate: SessionEstate,
     work: impl FnOnce(&EstatePark) + Send + 'static,
@@ -3527,8 +3559,7 @@ impl VaultOps for RealVaultOps<'_> {
         // moment, and at that moment it is inside eframe's frame closure. A
         // window that never locks drops this sender when its closure is
         // dropped, and the worker leaves without touching anything.
-        let (lock_tx, lock_rx) =
-            mpsc::channel::<(mpsc::Sender<app_window::TeardownStep>, mpsc::Receiver<String>)>();
+        let (lock_tx, lock_rx) = mpsc::channel::<LockChannels>();
         // What the worker publishes for the rebuild, which runs on the frame
         // thread and must not touch the park. `None` until the teardown ends.
         let rebuilt: Arc<Mutex<Option<RebuiltVault>>> = Arc::new(Mutex::new(None));
@@ -3651,9 +3682,7 @@ impl VaultOps for RealVaultOps<'_> {
                     // as its thread ends -- leaving the worker holding the only
                     // live one, which is what lets the working stage hear a
                     // dead worker as `Disconnected`.
-                    move |step_tx, token_rx| {
-                        let _ = lock_tx.send((step_tx.clone(), token_rx));
-                    },
+                    move |step_tx, token_rx| forward_lock_channels(&lock_tx, step_tx, token_rx),
                     // The sign-in card, in the window that is already open.
                     // `close_on_success: false`: the card reports its token
                     // and the window stays, because the spinner is the next
@@ -3672,7 +3701,7 @@ impl VaultOps for RealVaultOps<'_> {
                     // The vault, rebuilt in place. Reads only what the worker
                     // published; it must not reach the park, which the worker
                     // may still be holding.
-                    move || {
+                    move |edited_before_lock| {
                         // Expression-shaped, with no `?` and no early
                         // `return`, for the reason the worker above is: this
                         // whole method is held to having no jump in it.
@@ -3714,7 +3743,22 @@ impl VaultOps for RealVaultOps<'_> {
                                     details,
                                     published.token,
                                     icon_cache_dir_for_rebuild,
-                                    published.auto_lock,
+                                    // **The gear beats the estate here.**
+                                    // `published.auto_lock` was read off the
+                                    // parked estate, and `main` -- the only
+                                    // writer of `settings.json` and the only
+                                    // writer of `est.settings` -- does not
+                                    // run until this window is gone, so the
+                                    // estate still holds the PRE-EDIT policy.
+                                    // Taking it would silently revert an
+                                    // auto-lock change made just before the
+                                    // lock, which is `c99fa40`
+                                    // ("the open window honours an auto-lock
+                                    // change at once") undone across a lock.
+                                    vault_window::effective_auto_lock(
+                                        edited_before_lock.as_ref(),
+                                        published.auto_lock,
+                                    ),
                                     // The readiness probe has just answered, so
                                     // this vault's own initial load may skip
                                     // its wait.
@@ -8492,7 +8536,7 @@ mod tests {
 
         /// Whitespace runs collapsed to one space, so a needle survives
         /// rustfmt moving a line break.
-        fn squeeze(source: &str) -> String {
+        pub(super) fn squeeze(source: &str) -> String {
             source.split_whitespace().collect::<Vec<_>>().join(" ")
         }
 
@@ -9630,6 +9674,7 @@ mod tests {
     /// raw text would find all three and report the opposite of the truth.
     mod the_in_window_lock_is_wired_to_the_one_sequence {
         use super::production_half_of_this_file;
+        use super::the_estate_is_the_only_copy::squeeze;
         use super::vault_ops_method_body;
         use super::what_a_finished_vault_session_means::code_only;
 
@@ -9756,6 +9801,145 @@ mod tests {
             assert!(
                 body.contains(concat!("login_ui::build_login_", "frame(")),
                 "the sign-in card is not built as a frame for the window that is already open"
+            );
+        }
+
+        /// **THE HANDOFF, driven end to end.**
+        ///
+        /// `forward_lock_channels` is one line, and it is the hinge of the
+        /// whole feature: without it the lock arm still spawns its thread and
+        /// still reports a teardown, while the worker's `lock_rx.recv()`
+        /// returns `Err` and NOTHING is drained, stopped or cleared. This
+        /// test is the only thing in the crate that can fail when that line
+        /// stops working, because the closure it used to live in is called
+        /// from inside eframe's frame closure.
+        ///
+        /// Behavioural, not a scan: every assertion is about values that
+        /// really travelled, in both directions, through the ends that were
+        /// forwarded.
+        #[test]
+        fn the_lock_handoff_really_carries_both_channel_ends() {
+            use super::super::app_window::TeardownStep;
+            use std::sync::mpsc;
+            let (lock_tx, lock_rx) = mpsc::channel::<super::super::LockChannels>();
+            let (step_tx, step_rx) = mpsc::channel::<TeardownStep>();
+            let (token_tx, token_rx) = mpsc::channel::<String>();
+
+            super::super::forward_lock_channels(&lock_tx, &step_tx, token_rx);
+
+            // `recv_timeout`, not `recv`: in production the worker blocks
+            // forever on this and that is correct -- a window that never locks
+            // simply drops the sender. A test that did the same would HANG
+            // rather than fail when the handoff stops working, which is a
+            // worse signal than a red line and blocks every suite it is in.
+            let (worker_step_tx, worker_token_rx) = lock_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect(
+                    "the worker's `lock_rx.recv()` never produced the two channel ends, so the \
+                     teardown never gets them: the lock reports a teardown that drains nothing, \
+                     stops no `bw serve` and clears no cache, and `main` skips its own recovery",
+                );
+
+            worker_step_tx
+                .send(TeardownStep::NeedsSignIn)
+                .expect("the forwarded sender does not reach the window's step channel");
+            assert_eq!(
+                step_rx.try_recv(),
+                Ok(TeardownStep::NeedsSignIn),
+                "a step the worker reported does not arrive at the stage that shows the card"
+            );
+
+            token_tx
+                .send("the-master-password".to_string())
+                .expect("the card's sender does not reach the forwarded receiver");
+            assert_eq!(
+                worker_token_rx.recv().ok(),
+                Some("the-master-password".to_string()),
+                "the token the sign-in card produced does not reach the worker that \
+                 authenticates with it"
+            );
+
+            // **The clone, as behaviour.** The frame closure's own sender dies
+            // with the closure; the worker must be left holding a LIVE one, or
+            // the working stage hears `Disconnected` the moment the window
+            // stops forwarding and gives up on a teardown that is running.
+            drop(step_tx);
+            assert!(
+                worker_step_tx.send(TeardownStep::Finished).is_ok(),
+                "the worker's sender died with the frame closure's, so the working stage gives \
+                 up on a teardown that is still running"
+            );
+            assert_eq!(step_rx.try_recv(), Ok(TeardownStep::Finished));
+
+            // ...and once the WORKER's copy goes, the channel really is dead,
+            // which is what `app_window`'s watchdog reads as a dead worker.
+            drop(worker_step_tx);
+            assert_eq!(
+                step_rx.try_recv(),
+                Err(mpsc::TryRecvError::Disconnected),
+                "control: a dropped worker does not disconnect the step channel, so the \
+                 watchdog this crate relies on has nothing to see"
+            );
+        }
+
+        /// **The rebuilt vault is built with the preference edit made before
+        /// the lock, not with the estate's stale copy.**
+        ///
+        /// `published.auto_lock` is read off the PARKED estate, and `main` --
+        /// the only writer of both `settings.json` and `est.settings` -- does
+        /// not run until this window is gone. Handed straight to
+        /// `build_frame`, a user who changes the auto-lock policy and then
+        /// locks comes back to a window still running the OLD policy: commit
+        /// `c99fa40` ("the open window honours an auto-lock change at once")
+        /// undone across a lock.
+        ///
+        /// `app_window` has its own guard that the value is HANDED to the
+        /// rebuild. This is the other end: that the rebuild then USES it. The
+        /// first mutation run of this fix had the first guard and not this
+        /// one, and dropping the value on the floor here survived the whole
+        /// suite -- the "correct in isolation, reaching nothing" shape, inside
+        /// the fix for it.
+        #[test]
+        fn the_rebuilt_vault_honours_a_preference_edit_made_before_the_lock() {
+            let body = squeeze(&opener());
+            assert!(
+                body.contains(concat!(
+                    "effective_auto_lock( edited_before_lock.as_ref(), ",
+                    "published.auto_lock, )"
+                )),
+                "the rebuilt vault does not resolve its auto-lock policy through \
+                 `effective_auto_lock` against the pre-lock gear visit, so a policy change made \
+                 just before a lock is silently reverted by the window that comes back: {body}"
+            );
+            assert_eq!(
+                body.matches(concat!("published.", "auto_lock")).count(),
+                1,
+                "control: the estate's own `auto_lock` is read somewhere else in this method \
+                 too, so the needle above no longer identifies the one value the rebuilt frame \
+                 is built with: {body}"
+            );
+        }
+
+        /// **The production closure really calls it.**
+        ///
+        /// The test above holds `forward_lock_channels` to its job; this holds
+        /// `open_window` to calling it. Both halves are needed: a correct
+        /// function nobody calls is exactly the defect this file keeps
+        /// re-finding.
+        #[test]
+        fn the_lock_arm_hands_the_worker_its_channels_through_that_function() {
+            let body = opener();
+            assert!(
+                body.contains(concat!("forward_lock_", "channels(&lock_tx, step_tx, token_rx)")),
+                "the teardown closure does not forward the two channel ends to the worker. The \
+                 lock then reports a teardown that never ran, `main` skips its recovery, and \
+                 the vault says locked with a live `bw serve` answering out of a full cache"
+            );
+            // Positive control: the receiving end really is in this method, so
+            // the needle above is about a handoff that has somewhere to go.
+            assert!(
+                body.contains(concat!("lock_rx.", "recv()")),
+                "control: `open_window` has no worker waiting on the lock channel at all"
             );
         }
     }
@@ -14107,6 +14291,15 @@ mod tests {
     /// deliberately reintroduced `Rc` parameter, which is exactly the "correct
     /// in isolation, reaching nothing" shape it exists to catch. Anything
     /// moved in here that stops being `Send` now fails to compile.
+    ///
+    /// **That rule applies to the two CLOSURE parameters too, and it did not
+    /// used to.** `|| None` and `|_message| VaultReadyOutcome::Ready(...)`
+    /// capture nothing, and a closure that captures nothing is `Send` whatever
+    /// the signature around it says -- so an `authenticate` or `probe` that
+    /// was itself `!Send` would have sailed through this assertion, the same
+    /// blindness the paragraph above describes, one parameter to the right.
+    /// Both now move a value in, so both are `Send` only because what they
+    /// hold is.
     #[test]
     fn the_lifted_resettle_body_can_be_moved_to_a_worker() {
         fn assert_send<T: Send>(_: &T) {}
@@ -14121,6 +14314,12 @@ mod tests {
         let mut details: Option<login_ui::BwStatusDetails> = None;
         let mut token = String::new();
         let mut effects: Vec<TrayEffect> = Vec::new();
+        // Captured by the two closure parameters below, so that THEIR
+        // `Send`-ness is a fact about what they hold rather than about their
+        // holding nothing. Swap either for an `Rc` and this test stops
+        // compiling, which is the whole point of it.
+        let produced_token = String::from("the-token-the-card-would-produce");
+        let probe_schedule: Vec<Duration> = vec![Duration::from_millis(1)];
 
         let closure = move || {
             resettle_session_reporting_tray(
@@ -14132,10 +14331,16 @@ mod tests {
                 &mut task,
                 &mut details,
                 &mut token,
-                || None,
+                move || {
+                    let _ = &produced_token;
+                    None
+                },
                 // A windowless probe -- item 8's shape, standing in here for
                 // the real one. That this substitutes cleanly IS the lift.
-                |_message| VaultReadyOutcome::Ready(Vec::new()),
+                move |_message| {
+                    let _ = &probe_schedule;
+                    VaultReadyOutcome::Ready(Vec::new())
+                },
                 &mut effects,
             )
         };
