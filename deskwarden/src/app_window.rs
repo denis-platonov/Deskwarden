@@ -499,6 +499,294 @@ fn run_the_one_window(
     });
 }
 
+/// **The lock's touch points, in one value, for both hosts.**
+///
+/// [`run_from_vault`] catches the lock today; [`run`] has to catch the same
+/// one when the startup window learns to survive it. The sequence -- cancel
+/// the frame's own close, end the pre-lock session through `finish`, start the
+/// teardown worker, answer its two steps, rebuild, and route every write of
+/// `relocked` through [`session_torn_down`] -- is the most heavily guarded in
+/// this module, and a second copy of it inside the startup host is exactly the
+/// move the recorded design rejects by name. Both hosts already share
+/// [`run_the_one_window`]; this is that argument one level in.
+///
+/// **A value rather than a handful of free functions**, because the state the
+/// sequence turns on has to survive between frames and must not be writable
+/// from anywhere else: the two `FnOnce` closures (see [`run_from_vault`]'s
+/// floor note on what a second lock in one session costs), the two channels,
+/// and the two flags the retraction is decided from. `worker_started` and
+/// `teardown_reported` are private and are each written in exactly one arm --
+/// which is what `the_retraction_asks_the_rule_rather_than_deciding_it_inline`
+/// pins, both count and position, over this body.
+///
+/// **The three `Rc` cells are the HOST's, cloned in.** The host reads them
+/// after the event loop returns, which is the only way anything gets out of an
+/// eframe update closure. This value is moved INTO that closure and never
+/// comes back, so the tail is [`finish_the_locked_session`] over the host's
+/// own clones rather than a method here.
+struct InWindowLock<T, B> {
+    /// The teardown, taken by the first lock. `None` afterwards, which is what
+    /// makes the second lock of one session report
+    /// [`LockProgress::TeardownAlreadySpent`] rather than claim a worker.
+    teardown: Option<T>,
+    /// The rebuild, taken by [`TeardownStep::Finished`].
+    rebuild_vault: Option<B>,
+    /// **The worker gets the ONLY sender.** Cloned into the thread instead,
+    /// this side would hold a sender that never sends and never drops, so a
+    /// worker that panicked mid-teardown would answer `Empty` forever -- and
+    /// the working stage refuses every close. `try_recv` says `Disconnected`
+    /// only because nothing is kept here.
+    step_tx: Option<mpsc::Sender<TeardownStep>>,
+    step_rx: mpsc::Receiver<TeardownStep>,
+    /// The other direction: the master password the card produces. In an
+    /// `Option` so that LEAVING the sign-in card without a token drops it --
+    /// the worker's own `recv` then fails, which is how a user who closes the
+    /// window on the card reaches the declined arm instead of blocking a
+    /// thread on a password that is never coming.
+    token_tx: Option<mpsc::Sender<String>>,
+    token_rx: Option<mpsc::Receiver<String>>,
+    /// **The two facts that turn "a thread was spawned" into "the teardown
+    /// actually got underway".** `teardown` is `FnOnce`, so at most one worker
+    /// ever starts in one window's life and these need no per-lock reset. See
+    /// [`LockProgress::TeardownNeverRan`], which is what the pair is read into.
+    worker_started: bool,
+    teardown_reported: bool,
+    /// The PRE-LOCK session's outcome, written by the lock catch and read by
+    /// the rebuild and by [`finish_the_locked_session`].
+    result: Rc<RefCell<Option<vault_window::VaultWindowResult>>>,
+    relocked: Rc<RefCell<bool>>,
+    vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>>,
+}
+
+impl<T, B> InWindowLock<T, B>
+where
+    T: FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
+    B: FnOnce(
+        Option<crate::settings::Settings>,
+    ) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>,
+{
+    /// Both channels are made HERE and not by the host, so neither host can
+    /// wire them to each other's ends.
+    fn new(
+        teardown: T,
+        rebuild_vault: B,
+        result: Rc<RefCell<Option<vault_window::VaultWindowResult>>>,
+        relocked: Rc<RefCell<bool>>,
+        vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>>,
+    ) -> Self {
+        let (step_tx, step_rx) = mpsc::channel::<TeardownStep>();
+        let (token_tx, token_rx) = mpsc::channel::<String>();
+        Self {
+            teardown: Some(teardown),
+            rebuild_vault: Some(rebuild_vault),
+            step_tx: Some(step_tx),
+            step_rx,
+            token_tx: Some(token_tx),
+            token_rx: Some(token_rx),
+            worker_started: false,
+            teardown_reported: false,
+            result,
+            relocked,
+            vault_handles,
+        }
+    }
+
+    /// **The lock catch**, called from either host's vault stage every frame.
+    ///
+    /// The vault frame asks for the close itself on all three lock routes (the
+    /// account menu's Lock, CTRL+L, and the auto-lock timer), so the lock
+    /// arrives as a close with the flag already set -- which is why no lock
+    /// site needed editing for this feature.
+    ///
+    /// Answers whether the lock was caught. The caller's only remaining job is
+    /// the stage transition, which is the machine's and not the lock's.
+    fn catch_the_lock(
+        &mut self,
+        ctx: &egui::Context,
+        vault_fn: &mut Option<vault_window::VaultFrameFn>,
+    ) -> bool {
+        let lost = self.vault_handles.borrow().as_ref().is_some_and(|h| h.lost_session());
+        match vault_close(ctx.input(|i| i.viewport().close_requested()), lost) {
+            // Nothing to do, and deliberately spelled out rather than folded
+            // into a `_`: "no close" and "a close we honour" are the two
+            // answers that must NOT keep the window, and a wildcard here would
+            // swallow a fourth answer added later.
+            VaultClose::Ignore | VaultClose::LetGo => false,
+            VaultClose::Lock => {
+                // The window's own exit, cancelled. Without this the vault
+                // frame's `ViewportCommand::Close` is honoured and the window
+                // goes -- which is the blink.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                // **This vault session ends here**, the way every vault
+                // session ends: `finish` persists the geometry and reads the
+                // outcome cells. Read NOW, because the frame that reported the
+                // lock is about to be dropped and replaced -- and its
+                // `edited_settings` is a visit to the gear that would
+                // otherwise be silently lost.
+                let ended = self.vault_handles.borrow_mut().take();
+                if let Some(handles) = ended {
+                    *self.result.borrow_mut() = Some(handles.finish());
+                }
+                *vault_fn = None;
+                // THE TEARDOWN GOES TO A THREAD, for the reason [`run`]'s
+                // `prepare` does: it stops and restarts `bw serve`, which is
+                // seconds at best, and run here it would freeze the window on
+                // the very frame that is supposed to start showing the
+                // spinner.
+                //
+                // **`relocked` is set from whether the worker ACTUALLY
+                // STARTED, not from having reached this arm.** The difference
+                // is the second lock of one session: the closures are
+                // `FnOnce`, so `teardown.take()` answers `None` there and
+                // nothing is torn down. Set unconditionally, this flag would
+                // tell the caller "the teardown has already run" about a lock
+                // that tore nothing down, and the caller -- whose whole use
+                // for it is to SKIP its own recovery -- would skip the only
+                // teardown that lock was ever going to get. The vault would
+                // report itself locked with the cache still full and
+                // `bw serve` still holding a live session, which is the v0.5.0
+                // defect in a new place and invisible to every test that
+                // cannot run a frame.
+                let progress = if let (Some(teardown), Some(step_tx), Some(token_rx)) =
+                    (self.teardown.take(), self.step_tx.take(), self.token_rx.take())
+                {
+                    std::thread::spawn(move || {
+                        let step_tx = step_tx;
+                        teardown(&step_tx, token_rx);
+                    });
+                    self.worker_started = true;
+                    LockProgress::TeardownStarted
+                } else {
+                    LockProgress::TeardownAlreadySpent
+                };
+                let was = *self.relocked.borrow();
+                *self.relocked.borrow_mut() = session_torn_down(was, progress);
+                true
+            }
+        }
+    }
+
+    /// The card produced a master password; down the channel the worker is
+    /// blocked on. The frame thread only ever draws -- it is the worker that
+    /// authenticates and starts the backend.
+    fn hand_over_the_token(&self, produced: String) {
+        if let Some(token_tx) = self.token_tx.as_ref() {
+            let _ = token_tx.send(produced);
+        }
+    }
+
+    /// **Both of the teardown's steps**, answered from either host's working
+    /// stage. `Err` is the channel's own answer, handed straight back for
+    /// [`poll_working`] -- not swallowed here, because the watchdog is the
+    /// stage's and is shared with the startup host.
+    fn answer_the_teardown(
+        &mut self,
+        vault_fn: &mut Option<vault_window::VaultFrameFn>,
+    ) -> Result<Event, mpsc::TryRecvError> {
+        match self.step_rx.try_recv() {
+            Ok(TeardownStep::NeedsSignIn) => {
+                self.teardown_reported = true;
+                log::info!(
+                    "the lock's teardown is done and the vault needs a master password; \
+                     showing the sign-in card in the window that is already open"
+                );
+                Ok(Event::TeardownDone)
+            }
+            Ok(TeardownStep::Finished) => {
+                self.teardown_reported = true;
+                // Dropped here rather than left alive for the rest of the
+                // window: the worker is finished, and a sender this side keeps
+                // would stop the channel ever reporting `Disconnected` again.
+                self.token_tx = None;
+                // The gear visit the PRE-LOCK session produced -- read out of
+                // the cell the lock catch's `finish` wrote, and cloned rather
+                // than borrowed across the call because `build` is a caller's
+                // closure and this cell is alive for the rest of the window.
+                // `main` has not written `settings.json` yet, so this is the
+                // only place the rebuilt vault can learn the new policy.
+                let edited_before_lock =
+                    self.result.borrow().as_ref().and_then(|before| before.edited_settings.clone());
+                let built = self.rebuild_vault.take().and_then(|build| build(edited_before_lock));
+                // **The session is LIVE again on the `Some` arm, so the
+                // teardown stops being outstanding there and only there.**
+                // Left set through a rebuild, a session that locked, signed
+                // back in and was then locked AGAIN would tell the caller a
+                // teardown had run when the second lock's `FnOnce` teardown
+                // was already spent -- and that lock would be honoured by
+                // nobody.
+                let (event, progress) = match built {
+                    Some((rebuilt, handles)) => {
+                        *vault_fn = Some(rebuilt);
+                        *self.vault_handles.borrow_mut() = Some(handles);
+                        (Event::WorkReady, LockProgress::VaultRebuilt)
+                    }
+                    None => (Event::WorkFailed, LockProgress::RebuildFailed),
+                };
+                let was = *self.relocked.borrow();
+                *self.relocked.borrow_mut() = session_torn_down(was, progress);
+                Ok(event)
+            }
+            // **Not `Err(_) =>` folded in above.** The kinds are the
+            // watchdog's to tell apart, and this arm exists only to hand the
+            // error on unchanged.
+            Err(err) => Err(err),
+        }
+    }
+
+    /// **The worker died having reported NOTHING.**
+    ///
+    /// `relocked` was set from the spawn returning, which says a thread exists
+    /// and not that the teardown ran; if the frame thread's forwarding of the
+    /// two channel ends never arrived, or the worker panicked before it asked
+    /// for the master password, nothing was drained, stopped or cleared.
+    /// Retract the claim here so the caller runs the recovery that is now the
+    /// only teardown this lock will get.
+    ///
+    /// The CONDITION is not spelled out here. It was, and two one-token
+    /// inversions of it were measured green across the whole suite -- so it is
+    /// [`retracts_the_teardown`], a pure function with an exhaustive table,
+    /// for the same reason [`session_torn_down`] is. Its doc carries why each
+    /// of the three inputs is load-bearing, `Deadline` included.
+    fn retract_if_the_teardown_never_ran(&mut self, why: WorkFailure) {
+        if retracts_the_teardown(why, self.worker_started, self.teardown_reported) {
+            log::error!(
+                "the lock's teardown worker ended without ever reporting a step, so nothing \
+                 was torn down; the session is reported as still live and the caller's own \
+                 lock recovery runs"
+            );
+            let was = *self.relocked.borrow();
+            *self.relocked.borrow_mut() = session_torn_down(was, LockProgress::TeardownNeverRan);
+        }
+    }
+}
+
+/// **The tail of a session that may have locked**, shared by both hosts for
+/// the same reason the catch is.
+///
+/// The vault frame that is still up when the window ends -- an ordinary close,
+/// or the one rebuilt after a lock -- ends the way every vault session ends:
+/// `finish` writes the geometry and reads the outcome cells. `None` there is
+/// the failed-rebuild path, where the lock catch took the handles and nothing
+/// put any back.
+///
+/// **MERGED with the lock's own result, not substituted for it.** This used to
+/// be an unconditional overwrite, and `build_frame` gives every frame a FRESH
+/// `edited_settings` cell -- so a gear visit made before the lock was thrown
+/// away by the very session the lock catch's `finish` exists to preserve. See
+/// [`carry_settings_forward`] for which field survives from which session and
+/// why it is only the one.
+///
+/// A free function and not a method on [`InWindowLock`], because the lock is
+/// moved into the frame closure and does not come back: what the host still
+/// holds out here is its own clones of the two cells.
+fn finish_the_locked_session(
+    result: &Rc<RefCell<Option<vault_window::VaultWindowResult>>>,
+    vault_handles: &Rc<RefCell<Option<vault_window::VaultFrameHandles>>>,
+) -> Option<vault_window::VaultWindowResult> {
+    let rebuilt = vault_handles.borrow().as_ref().map(|handles| handles.finish());
+    carry_settings_forward(result.borrow_mut().take(), rebuilt)
+}
+
 /// Runs the single window. Blocks until it closes.
 ///
 /// `prepare` runs on a detached worker thread with the session token, and is
@@ -1164,39 +1452,32 @@ where
     let result: Rc<RefCell<Option<vault_window::VaultWindowResult>>> = Rc::new(RefCell::new(None));
     let stages: Rc<RefCell<Vec<Stage>>> = Rc::new(RefCell::new(Vec::new()));
     let relocked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-
-    let result_for_closure = result.clone();
-    let stages_for_closure = stages.clone();
-    let relocked_for_closure = relocked.clone();
-
-    // **The worker gets the only sender, exactly as `run`'s does.** Cloned
-    // into the thread instead, the closure would hold a sender that never
-    // sends and never drops, so a worker that panicked mid-teardown would
-    // answer `Empty` forever -- and the working stage refuses every close.
-    // `try_recv` says `Disconnected` only because this side keeps nothing.
-    let (step_tx, step_rx) = mpsc::channel::<TeardownStep>();
-    let mut step_tx = Some(step_tx);
-    // The other direction: the master password the card produces. Held in an
-    // `Option` so that LEAVING the sign-in card without a token drops it --
-    // the worker's own `recv` then fails, which is how a user who closes the
-    // window on the card reaches `resettle_session_with`'s declined arm
-    // instead of blocking a thread on a password that is never coming.
-    let (token_tx, token_rx) = mpsc::channel::<String>();
-    let mut token_tx = Some(token_tx);
-    let mut token_rx = Some(token_rx);
-
-    let mut teardown = Some(teardown);
-    let mut build_sign_in = Some(build_sign_in);
-    let mut rebuild_vault = Some(rebuild_vault);
-
-    let mut vault_fn: Option<vault_window::VaultFrameFn> = Some(vault_frame);
     // The HANDLES, not the frame, in a cell: the frame is `FnMut` and stays
     // owned by the closure, while `finish` -- the geometry write and the
     // outcome read -- has to be callable out here, after the window is gone.
     // Exactly the split [`run`] makes, and for the same reason.
     let vault_handles: Rc<RefCell<Option<vault_window::VaultFrameHandles>>> =
         Rc::new(RefCell::new(Some(handles)));
-    let vault_handles_for_closure = vault_handles.clone();
+
+    let stages_for_closure = stages.clone();
+    // **The lock lives in the shared value, not in this closure.** Everything
+    // the lock touches -- the cancelled close, the worker, both teardown
+    // steps, the rebuild, every write of `relocked` and the retraction --
+    // moved into [`InWindowLock`] so that the startup host reaches the same
+    // code rather than a second copy of it. What is left here is this host's
+    // own machine: which stage is up, what the spinner says, and when its
+    // stopwatch started.
+    let mut lock = InWindowLock::new(
+        teardown,
+        rebuild_vault,
+        result.clone(),
+        relocked.clone(),
+        vault_handles.clone(),
+    );
+
+    let mut build_sign_in = Some(build_sign_in);
+
+    let mut vault_fn: Option<vault_window::VaultFrameFn> = Some(vault_frame);
     let mut login: Option<(login_ui::LoginFrameFn, login_ui::LoginFrameHandles)> = None;
 
     let mut stage = Stage::Vault;
@@ -1211,12 +1492,6 @@ where
     // healthily coming up, which throws away the sign-in that just happened.
     let mut working_since: Option<Instant> = None;
     let mut closing = Closing::not_yet();
-    // **The two facts that turn "a thread was spawned" into "the teardown
-    // actually got underway".** `teardown` is `FnOnce`, so at most one worker
-    // ever starts in one window's life and these need no per-lock reset. See
-    // [`LockProgress::TeardownNeverRan`], which is what the pair is read into.
-    let mut worker_started = false;
-    let mut teardown_reported = false;
 
     run_the_one_window(options, move |ui, frame| {
         if stages_for_closure.borrow().last() != Some(&stage) {
@@ -1229,81 +1504,18 @@ where
                 if let Some(vault_fn) = vault_fn.as_mut() {
                     vault_fn(ui, frame);
                 }
-                // **The lock catch.** The vault frame asks for the close
-                // itself on all three lock routes (the account menu's Lock,
-                // CTRL+L, and the auto-lock timer), so the lock arrives here
-                // as a close with the flag already set -- which is why no lock
-                // site needed editing for this feature.
-                let lost = vault_handles_for_closure
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|h| h.lost_session());
-                match vault_close(ui.ctx().input(|i| i.viewport().close_requested()), lost) {
-                    // Nothing to do, and deliberately spelled out rather than
-                    // folded into a `_`: "no close" and "a close we honour"
-                    // are the two answers that must NOT keep the window, and a
-                    // wildcard here would swallow a fourth answer added later.
-                    VaultClose::Ignore | VaultClose::LetGo => {}
-                    VaultClose::Lock => {
-                        // The window's own exit, cancelled. Without this the
-                        // vault frame's `ViewportCommand::Close` is honoured
-                        // and the window goes -- which is the blink.
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                        // **This vault session ends here**, the way every
-                        // vault session ends: `finish` persists the geometry
-                        // and reads the outcome cells. Read NOW, because the
-                        // frame that reported the lock is about to be dropped
-                        // and replaced -- and its `edited_settings` is a visit
-                        // to the gear that would otherwise be silently lost.
-                        let ended = vault_handles_for_closure.borrow_mut().take();
-                        if let Some(handles) = ended {
-                            *result_for_closure.borrow_mut() = Some(handles.finish());
+                // The lock catch is [`InWindowLock::catch_the_lock`]'s; what
+                // is decided here is only where the window goes next, which is
+                // the machine's business and not the lock's.
+                if lock.catch_the_lock(ui.ctx(), &mut vault_fn) {
+                    if let Next::Show(next) = advance(stage, Event::Locked) {
+                        stage = next;
+                        if next == Stage::Working {
+                            working_message = LOCK_MESSAGE;
+                            working_since = Some(Instant::now());
                         }
-                        vault_fn = None;
-                        // THE TEARDOWN GOES TO A THREAD, for the reason
-                        // `run`'s `prepare` does: it stops and restarts
-                        // `bw serve`, which is seconds at best, and run here
-                        // it would freeze the window on the very frame that is
-                        // supposed to start showing the spinner.
-                        //
-                        // **`relocked` is set from whether the worker ACTUALLY
-                        // STARTED, not from having reached this arm.** The
-                        // difference is the second lock of one session: the
-                        // closures are `FnOnce`, so `teardown.take()` answers
-                        // `None` there and nothing is torn down (see this
-                        // function's floor note). Set unconditionally, this
-                        // flag would tell the caller "the teardown has already
-                        // run" about a lock that tore nothing down, and the
-                        // caller -- whose whole use for it is to SKIP its own
-                        // recovery -- would skip the only teardown that lock
-                        // was ever going to get. The vault would report itself
-                        // locked with the cache still full and `bw serve`
-                        // still holding a live session, which is the v0.5.0
-                        // defect in a new place and invisible to every test
-                        // that does not drive this host.
-                        let progress = if let (Some(teardown), Some(step_tx), Some(token_rx)) =
-                            (teardown.take(), step_tx.take(), token_rx.take())
-                        {
-                            std::thread::spawn(move || {
-                                let step_tx = step_tx;
-                                teardown(&step_tx, token_rx);
-                            });
-                            worker_started = true;
-                            LockProgress::TeardownStarted
-                        } else {
-                            LockProgress::TeardownAlreadySpent
-                        };
-                        let was = *relocked_for_closure.borrow();
-                        *relocked_for_closure.borrow_mut() = session_torn_down(was, progress);
-                        if let Next::Show(next) = advance(stage, Event::Locked) {
-                            stage = next;
-                            if next == Stage::Working {
-                                working_message = LOCK_MESSAGE;
-                                working_since = Some(Instant::now());
-                            }
-                        }
-                        ui.ctx().request_repaint();
                     }
+                    ui.ctx().request_repaint();
                 }
             }
             Stage::SignIn => {
@@ -1315,12 +1527,7 @@ where
                 if let Some((login_fn, login_handles)) = login.as_mut() {
                     login_fn(ui, frame);
                     if let Some(produced) = login_handles.take_token() {
-                        // Down the channel the worker is blocked on. It is the
-                        // worker that authenticates and starts the backend --
-                        // this thread only ever draws.
-                        if let Some(token_tx) = token_tx.as_ref() {
-                            let _ = token_tx.send(produced);
-                        }
+                        lock.hand_over_the_token(produced);
                         if let Next::Show(next) = advance(stage, Event::SignedIn) {
                             stage = next;
                             if next == Stage::Working {
@@ -1347,59 +1554,8 @@ where
                 refuse_close_while_working(ui.ctx(), closing);
 
                 if !closing.decided() {
-                    match step_rx.try_recv() {
-                        Ok(TeardownStep::NeedsSignIn) => {
-                            teardown_reported = true;
-                            log::info!(
-                                "the lock's teardown is done and the vault needs a master \
-                                 password; showing the sign-in card in the window that is \
-                                 already open"
-                            );
-                            if let Next::Show(next) = advance(stage, Event::TeardownDone) {
-                                stage = next;
-                            }
-                            ui.ctx().request_repaint();
-                        }
-                        Ok(TeardownStep::Finished) => {
-                            teardown_reported = true;
-                            // Dropped here rather than left alive for the rest
-                            // of the window: the worker is finished, and a
-                            // sender this side keeps would stop the channel
-                            // ever reporting `Disconnected` again.
-                            token_tx = None;
-                            // The gear visit the PRE-LOCK session produced --
-                            // read out of the cell the lock arm's `finish`
-                            // wrote, and cloned rather than borrowed across
-                            // the call because `build` is a caller's closure
-                            // and this cell is alive for the rest of the
-                            // window. See this function's doc: `main` has not
-                            // written `settings.json` yet, so this is the only
-                            // place the rebuilt vault can learn the new
-                            // policy.
-                            let edited_before_lock = result_for_closure
-                                .borrow()
-                                .as_ref()
-                                .and_then(|before| before.edited_settings.clone());
-                            let built =
-                                rebuild_vault.take().and_then(|build| build(edited_before_lock));
-                            // **The session is LIVE again on the `Some` arm,
-                            // so the teardown stops being outstanding there
-                            // and only there.** Left set through a rebuild, a
-                            // session that locked, signed back in and was then
-                            // locked AGAIN would tell the caller a teardown
-                            // had run when the second lock's `FnOnce` teardown
-                            // was already spent -- and that lock would be
-                            // honoured by nobody.
-                            let (event, progress) = match built {
-                                Some((rebuilt, handles)) => {
-                                    vault_fn = Some(rebuilt);
-                                    *vault_handles_for_closure.borrow_mut() = Some(handles);
-                                    (Event::WorkReady, LockProgress::VaultRebuilt)
-                                }
-                                None => (Event::WorkFailed, LockProgress::RebuildFailed),
-                            };
-                            let was = *relocked_for_closure.borrow();
-                            *relocked_for_closure.borrow_mut() = session_torn_down(was, progress);
+                    match lock.answer_the_teardown(&mut vault_fn) {
+                        Ok(event) => {
                             match advance(stage, event) {
                                 Next::Show(next) => stage = next,
                                 Next::Close => {
@@ -1432,41 +1588,7 @@ where
                                     ui.ctx().request_repaint_after(WORKING_POLL)
                                 }
                                 WorkPoll::Failed(why) => {
-                                    // **The worker died having reported
-                                    // NOTHING.** `relocked` was set from the
-                                    // spawn returning, which says a thread
-                                    // exists and not that the teardown ran; if
-                                    // the frame thread's forwarding of the two
-                                    // channel ends never arrived, or the
-                                    // worker panicked before it asked for the
-                                    // master password, nothing was drained,
-                                    // stopped or cleared. Retract the claim
-                                    // here so the caller runs the recovery
-                                    // that is now the only teardown this lock
-                                    // will get.
-                                    //
-                                    // The CONDITION is not spelled out here.
-                                    // It was, and two one-token inversions of
-                                    // it were measured green across the whole
-                                    // suite -- so it is
-                                    // [`retracts_the_teardown`], a pure
-                                    // function with an exhaustive table, for
-                                    // the same reason `session_torn_down` is.
-                                    // Its doc carries why each of the three
-                                    // inputs is load-bearing, `Deadline`
-                                    // included.
-                                    if retracts_the_teardown(why, worker_started, teardown_reported)
-                                    {
-                                        log::error!(
-                                            "the lock's teardown worker ended without ever \
-                                             reporting a step, so nothing was torn down; the \
-                                             session is reported as still live and the caller's \
-                                             own lock recovery runs"
-                                        );
-                                        let was = *relocked_for_closure.borrow();
-                                        *relocked_for_closure.borrow_mut() =
-                                            session_torn_down(was, LockProgress::TeardownNeverRan);
-                                    }
+                                    lock.retract_if_the_teardown_never_ran(why);
                                     give_up_working(ui.ctx(), &mut closing, why, elapsed);
                                     ui.ctx().request_repaint();
                                 }
@@ -1478,22 +1600,9 @@ where
         }
     });
 
-    // The vault frame that is still up when the window ends -- an ordinary
-    // close, or the one rebuilt after a lock -- ends the way every vault
-    // session ends: `finish` writes the geometry and reads the outcome cells.
-    // `None` here is the failed-rebuild path, where the lock arm took the
-    // handles and nothing put any back.
-    //
-    // **MERGED with the lock's own result, not substituted for it.** This
-    // line used to be an unconditional overwrite, and `build_frame` gives
-    // every frame a FRESH `edited_settings` cell -- so a gear visit made
-    // before the lock was thrown away by the very session the lock arm's
-    // `finish` exists to preserve. See [`carry_settings_forward`] for which
-    // field survives from which session and why it is only the one.
-    let rebuilt = vault_handles.borrow().as_ref().map(|handles| handles.finish());
     let stages = stages.borrow().clone();
     let relocked = *relocked.borrow();
-    let result = carry_settings_forward(result.borrow_mut().take(), rebuilt);
+    let result = finish_the_locked_session(&result, &vault_handles);
     VaultSessionOutcome { result, stages, relocked }
 }
 
@@ -3485,14 +3594,25 @@ mod lock_host_tests {
         );
     }
 
-    /// `run_from_vault`'s frame closure, comments stripped, bounded forward by
-    /// the end of production code.
+    /// **The host's own body**: `run_from_vault` from its head to the end of
+    /// production code, comments stripped.
     ///
-    /// Stripping first is not tidiness: the arm below is guarded on names --
-    /// `CancelClose`, `vault_close(`, `TeardownStep::` -- that this function's
-    /// own prose says out loud, and a guard that matched the raw source would
-    /// go on passing after the call itself was deleted. This crate has shipped
-    /// exactly that mistake before.
+    /// **The lock's touch points are NO LONGER IN HERE**, and that is the
+    /// whole of what changed under these guards. `InWindowLock` and
+    /// `finish_the_locked_session` sit ABOVE `run` -- with the one window
+    /// opener, which is where this module keeps what both hosts share -- so
+    /// this slice is the CALL SITES and nothing else. Every guard below
+    /// therefore says which of the two regions it is a statement about, and
+    /// the ones that moved carry a control asserting the needle is NOT in the
+    /// other region. A guard that quietly matched the lifted body from here,
+    /// or the call site from there, would pass for free, which is this
+    /// ledger's house defect in its precise form for a lift.
+    ///
+    /// Stripping first is not tidiness: the arms below are guarded on names
+    /// -- `CancelClose`, `vault_close(`, `TeardownStep::` -- that this
+    /// module's own prose says out loud, and a guard that matched the raw
+    /// source would go on passing after the call itself was deleted. This
+    /// crate has shipped exactly that mistake before.
     fn closure() -> String {
         let production = code(production());
         let at = production
@@ -3509,10 +3629,112 @@ mod lock_host_tests {
              code it names",
             closure.len()
         );
+        // **The lifted value is really outside this slice.** If it were ever
+        // moved below the host, every "the call site does X" guard here would
+        // be satisfied by the lifted body itself and every "the lifted body
+        // does X" control would be satisfied twice.
+        assert!(
+            !closure.contains(concat!("struct InWindow", "Lock<T, B> {")),
+            "the shared lock value has moved BELOW the vault host, so this slice contains it \
+             and the two regions the guards below distinguish are one region"
+        );
         closure
     }
 
-    /// The `Stage::Vault` arm alone: the lock catch, and nothing else.
+    /// The shared lock value: from its declaration to the startup host, which
+    /// is the next production item below it. Comments already stripped.
+    ///
+    /// Bounded forward at `run` rather than run to the end of production, for
+    /// the reason `startup_window_tests::closure` is bounded at
+    /// `run_from_vault`: unbounded, every `contains` here would be satisfied
+    /// by either host's own body and deleting the lifted code would leave this
+    /// file green on the strength of a call site.
+    fn lock_value() -> String {
+        let production = code(production());
+        let at = production
+            .find(concat!("struct InWindow", "Lock<T, B> {"))
+            .expect(
+                "the shared lock value is gone -- the lock's touch points are back inside one \
+                 host, so the other host can only get them by copying them",
+            );
+        let rest = &production[at..];
+        let end = rest
+            .find(concat!("pub fn ", "run<P, W, V>("))
+            .expect("the shared lock value is not above the startup host");
+        let value = rest[..end].to_string();
+        assert!(
+            value.len() > 2_000,
+            "the shared lock value sliced down to {} bytes, which is not the whole of it",
+            value.len()
+        );
+        // Positive control on the slice: it really is the lifted region and
+        // not a region that reaches into a host.
+        assert!(
+            !value.contains(concat!("run_the_one_", "window(options, move |ui, frame|")),
+            "control: the lifted region reaches into a host's frame closure"
+        );
+        value
+    }
+
+    /// One method of the lifted value, bounded by the next item below it.
+    /// Every guard that moved names the METHOD it moved into, not merely the
+    /// value: a needle that drifted from the catch into the drain would
+    /// otherwise still be "in the lifted body".
+    fn lifted(from: &str, to: &str) -> String {
+        let value = lock_value();
+        let start = value
+            .find(from)
+            .unwrap_or_else(|| panic!("the lifted value has no {from:?}: {value}"));
+        let rest = &value[start..];
+        let end = rest
+            .find(to)
+            .unwrap_or_else(|| panic!("{from:?} is not followed by {to:?}: {value}"));
+        let body = rest[..end].to_string();
+        assert!(
+            body.len() > 200,
+            "{from:?} sliced down to {} bytes, which is not the whole of it",
+            body.len()
+        );
+        body
+    }
+
+    /// The two regions a lock decision could live in: the shared value and
+    /// the host that calls it. **Not the whole production half** -- the rule
+    /// `retracts_the_teardown` is itself written in terms of `worker_started`
+    /// and `teardown_reported`, so a ban over the file would forbid the rule
+    /// its own body and the guard would be red on a correct tree.
+    fn where_a_lock_decision_could_live() -> String {
+        format!("{}\n{}", lock_value(), closure())
+    }
+
+    fn catch_body() -> String {
+        lifted(concat!("fn catch_the_", "lock("), concat!("fn hand_over_the_", "token("))
+    }
+
+    fn drain_body() -> String {
+        lifted(
+            concat!("fn answer_the_", "teardown("),
+            concat!("fn retract_if_the_teardown_never_", "ran("),
+        )
+    }
+
+    fn retract_body() -> String {
+        lifted(
+            concat!("fn retract_if_the_teardown_never_", "ran("),
+            concat!("fn finish_the_locked_", "session("),
+        )
+    }
+
+    fn tail_body() -> String {
+        let value = lock_value();
+        let at = value
+            .find(concat!("fn finish_the_locked_", "session("))
+            .expect("the shared tail is gone, so each host merges its two sessions by hand");
+        value[at..].to_string()
+    }
+
+    /// The host's `Stage::Vault` arm alone: the call site of the lock catch,
+    /// and nothing else.
     fn vault_arm() -> String {
         let closure = closure();
         let start = closure
@@ -3524,7 +3746,7 @@ mod lock_host_tests {
             .expect("the vault arm is not followed by the sign-in arm");
         let arm = rest[..end].to_string();
         assert!(
-            arm.len() > 1_000,
+            arm.len() > 200,
             "the vault arm sliced down to {} bytes, which is not the whole of it",
             arm.len()
         );
@@ -3532,32 +3754,123 @@ mod lock_host_tests {
     }
 
     /// **THE FEATURE, as a source guard.** The vault frame asks for the close
-    /// itself on all three lock routes; if this arm does not cancel it, the
+    /// itself on all three lock routes; if the catch does not cancel it, the
     /// window goes away and `main` opens another -- which is the blink, with
     /// every behavioural test in this file still green, because none of them
     /// can run a frame.
+    ///
+    /// **Two halves now, and both are load-bearing.** The cancel and the
+    /// question live in `InWindowLock::catch_the_lock`, so that the startup
+    /// host reaches the same code rather than a second copy; the host's vault
+    /// arm has to CALL it. Pinned separately, with a control on each that the
+    /// needle is not in the other region -- a lift whose body is perfect and
+    /// whose call site was dropped is a window that closes on every lock, and
+    /// it is invisible to any guard that reads the two regions as one.
     #[test]
     fn the_lock_arm_keeps_the_window_instead_of_letting_it_close() {
+        let catch = catch_body();
+        assert!(
+            catch.contains(concat!("ViewportCommand::", "CancelClose")),
+            "the lock catch does not cancel the vault frame's own close, so the window is torn \
+             down and reopened -- the blink this feature exists to remove: {catch}"
+        );
+        // **Both arguments, in order.** `lost` replaced by `false` was measured
+        // green across the whole suite here and at `8556e21`, where this call
+        // was still inline: a session the backend has lost then reads as an
+        // ordinary close, the window goes and `main` opens another -- the
+        // blink, on the one route the user did not ask for. The rule cannot
+        // see it (both are `bool`), so it is pinned here.
+        assert!(
+            catch.contains(concat!(
+                "vault_",
+                "close(ctx.input(|i| i.viewport().close_requested()), lost)"
+            )),
+            "the lock catch no longer asks `vault_close` what the close meant, with the \
+             close request and the lost session in that order, so the decision is back inside \
+             a frame closure no test can call -- or it is asking about something other than \
+             this frame: {catch}"
+        );
+        assert!(
+            catch.contains(concat!(
+                "let lost = self.vault_handles.borrow().as_ref().is_some_and(|h| h.lost_",
+                "session());"
+            )),
+            "the lost-session half of the question is read from something other than the \
+             handles of the vault frame that is up, so a lock forced by a backend that dropped \
+             the session is not caught: {catch}"
+        );
+        // Positive control on the slice: it really is the catch.
+        assert!(
+            catch.contains(concat!("VaultClose::", "Lock =>")),
+            "control: the sliced region is not the method that decides what a close meant: \
+             {catch}"
+        );
+
+        let closure = closure();
+        assert_eq!(
+            closure
+                .matches(concat!("if lock.catch_the_", "lock(ui.ctx(), &mut vault_fn) {"))
+                .count(),
+            1,
+            "the vault host does not ask the shared lock value to catch its close, exactly \
+             once, with this frame's context and this host's vault frame slot. A MISSING call \
+             is a perfectly lifted catch that nothing runs -- every guard over the lifted body \
+             stays green and the window closes on every lock, which is the blink restored by \
+             the refactor meant to enable removing it: {closure}"
+        );
+        // Positive control on the slice: it really is the arm that draws the
+        // vault, and the call is in THAT arm rather than anywhere in the host.
         let arm = vault_arm();
-        assert!(
-            arm.contains(concat!("ViewportCommand::", "CancelClose")),
-            "the lock arm does not cancel the vault frame's own close, so the window is torn \
-             down and reopened -- the blink this feature exists to remove: {arm}"
-        );
-        assert!(
-            arm.contains(concat!("vault_", "close(ui.ctx().input(|i| i.viewport().close_requested())")),
-            "the lock arm no longer asks `vault_close` what the close meant, so the decision \
-             is back inside a closure no test can call: {arm}"
-        );
-        assert!(
-            !arm.contains(concat!("ViewportCommand::", "Close)")),
-            "the lock arm sends a plain Close of its own: {arm}"
-        );
-        // Positive control on the slice: it really is the vault arm.
         assert!(
             arm.contains(concat!("vault_fn(ui, ", "frame);")),
             "control: the sliced region is not the arm that draws the vault: {arm}"
         );
+        assert!(
+            arm.contains(concat!("if lock.catch_the_", "lock(ui.ctx(), &mut vault_fn) {")),
+            "the catch is called from somewhere other than the vault arm, so a lock that \
+             arrives while the vault is on screen is not caught at all: {arm}"
+        );
+        // **The call IS the condition, and nothing stands in front of it.**
+        // `if false && lock.catch_the_lock(..)` left the needle in place and
+        // the whole suite green: short-circuited away, the catch never runs,
+        // so nothing is cancelled and nothing is torn down and the window
+        // closes on every lock. Pinning the `if ` and the `{` is what makes
+        // the guard a statement about a call the code REACHES rather than one
+        // it merely contains -- the same reachability-over-mention lesson the
+        // teardown flags' adjacency pin records.
+        let at = arm
+            .find(concat!("lock.catch_the_", "lock(ui.ctx(), &mut vault_fn)"))
+            .expect("pinned just above");
+        let transition = arm
+            .find(concat!("advance(stage, Event::", "Locked)"))
+            .unwrap_or_else(|| panic!("the vault arm takes no `Locked` transition: {arm}"));
+        assert!(
+            transition > at && transition - at < 200,
+            "the `Locked` transition is not inside the block the catch guards, so the catch's \
+             answer is computed and discarded: the window stays on the vault stage with its \
+             close cancelled and no spinner ever appears"
+        );
+
+        // **Neither region holds the other's needle.** Without these two the
+        // guard above would pass for free the moment the lifted body moved
+        // back into the host, or the call site grew a second inline copy.
+        assert!(
+            !closure.contains(concat!("ViewportCommand::", "CancelClose")),
+            "the vault host cancels a close of its own, beside the shared catch -- a second \
+             copy of the touch point this lift exists to share: {closure}"
+        );
+        assert!(
+            !catch.contains(concat!("lock.catch_the_", "lock(")),
+            "control: the lifted catch contains its own call site, so the two slices overlap"
+        );
+
+        // The plain Close nobody may send, over BOTH regions.
+        for (region, what) in [(&closure, "the vault host"), (&catch, "the lock catch")] {
+            assert!(
+                !region.contains(concat!("ViewportCommand::", "Close)")),
+                "{what} sends a plain Close of its own: {region}"
+            );
+        }
     }
 
     /// **Every write of `relocked` goes through [`session_torn_down`], and
@@ -3569,37 +3882,46 @@ mod lock_host_tests {
     /// nothing. The count moved, the rule did not, and the mutant the name
     /// records (a literal `= true` in the lock arm) is still killed here.
     ///
-    /// The rule is unit-tested above, but a rule the closure does not call is
-    /// a rule that governs nothing -- and the shape it replaced was exactly
-    /// two literal assignments, one of which was wrong. A literal `= true` in
-    /// the lock arm claims a teardown for the second lock of a session, whose
-    /// `FnOnce` teardown is spent; the caller then skips the only recovery
-    /// that lock can get and the vault does not lock. Nothing behavioural in
-    /// this file can see that, because no test can call this closure.
+    /// **Counted twice, deliberately.** Three inside the lifted value says
+    /// every write the lock makes is routed; three in the WHOLE production
+    /// half says there is no fourth anywhere else -- in particular not a copy
+    /// left behind in a host, which counting the lifted region alone could
+    /// never see.
     #[test]
     fn the_hosts_two_relocked_writes_both_go_through_the_rule() {
-        let closure = closure();
-        assert_eq!(
-            closure.matches(concat!("session_torn_", "down(was, ")).count(),
-            3,
-            "the vault host does not have exactly three writes of `relocked` routed through the \
-             rule -- one at the lock, one at the rebuild, and one retracting a teardown that \
-             never ran. A write that bypasses it is a `relocked` nothing checks; a MISSING one \
-             is a lock that claims a teardown nothing performed: {closure}"
-        );
+        let value = lock_value();
+        let production = code(production());
+        for (region, where_) in [
+            (&value, "the shared lock value"),
+            (&production, "this file"),
+        ] {
+            assert_eq!(
+                region.matches(concat!("session_torn_", "down(was, ")).count(),
+                3,
+                "{where_} does not have exactly three writes of `relocked` routed through the \
+                 rule -- one at the lock, one at the rebuild, and one retracting a teardown \
+                 that never ran. A write that bypasses it is a `relocked` nothing checks; a \
+                 MISSING one is a lock that claims a teardown nothing performed; a FOURTH is a \
+                 second copy of a touch point that is supposed to exist once: {region}"
+            );
+        }
+        // The two counts agreeing is the statement: all three writes are in
+        // the lifted value and none survives in a host.
         for literal in [
+            concat!("self.relocked.borrow_mut() = ", "true"),
+            concat!("self.relocked.borrow_mut() = ", "false"),
             concat!("relocked_for_closure.borrow_mut() = ", "true"),
             concat!("relocked_for_closure.borrow_mut() = ", "false"),
         ] {
             assert!(
-                !closure.contains(literal),
-                "the vault host assigns `relocked` the literal {literal:?} instead of asking \
+                !production.contains(literal),
+                "this file assigns `relocked` the literal {literal:?} instead of asking \
                  `session_torn_down`, which is the shape that shipped a lock claiming a \
-                 teardown it never started: {closure}"
+                 teardown it never started: {production}"
             );
         }
-        // Positive controls: both of the rule's two decision points are really
-        // in this closure, so the count above is over the real sites.
+        // Positive controls: all five of the rule's decision points are really
+        // in the lifted value, so the counts above are over the real sites.
         for needle in [
             concat!("LockProgress::", "TeardownStarted"),
             concat!("LockProgress::", "TeardownAlreadySpent"),
@@ -3608,9 +3930,9 @@ mod lock_host_tests {
             concat!("LockProgress::", "TeardownNeverRan"),
         ] {
             assert!(
-                closure.contains(needle),
-                "control: {needle:?} is not in the vault host, so one of the five steps the \
-                 rule is defined over is never actually reported by the window: {closure}"
+                value.contains(needle),
+                "control: {needle:?} is not in the shared lock value, so one of the five steps \
+                 the rule is defined over is never actually reported: {value}"
             );
         }
     }
@@ -3620,96 +3942,132 @@ mod lock_host_tests {
     ///
     /// The unit table above holds the rule to all eight combinations of its
     /// inputs. This is the other half, and it is the half that was missing:
-    /// the condition selecting the retraction lived in this closure as three
-    /// bare terms, and two separate one-token inversions of it -- inverting
-    /// `!teardown_reported`, and `WorkerDied` for `Deadline` -- were MEASURED
-    /// green across the whole suite. `eframe::Frame` has no public
+    /// the condition selecting the retraction lived in a frame closure as
+    /// three bare terms, and two separate one-token inversions of it --
+    /// inverting `!teardown_reported`, and `WorkerDied` for `Deadline` -- were
+    /// MEASURED green across the whole suite. `eframe::Frame` has no public
     /// constructor, so nothing behavioural in this crate can reach the arm; a
-    /// source pin on the call is what ties the closure to the tabled rule.
+    /// source pin on the call is what ties the code to the tabled rule.
     ///
     /// The call is pinned AS WRITTEN, arguments and order included, so a
     /// swapped pair is caught here rather than by the rule (which cannot see
     /// it -- both are `bool`).
+    ///
+    /// **All of it now measures the lifted value**, because that is where the
+    /// two flags live: they are private fields written in one arm each, and
+    /// the host cannot reach them at all. The one thing measured at the CALL
+    /// SITE is that the host asks for the retraction -- a lifted retraction
+    /// nobody calls is a lock whose dead worker still reports itself torn
+    /// down.
     #[test]
     fn the_retraction_asks_the_rule_rather_than_deciding_it_inline() {
-        let closure = closure();
+        let value = lock_value();
+        let retract = retract_body();
         assert_eq!(
-            closure
+            value
                 .matches(concat!(
-                    "retracts_the_teardown(why, worker_started, ",
-                    "teardown_reported)"
+                    "retracts_the_teardown(why, self.worker_started, ",
+                    "self.teardown_reported)"
                 ))
                 .count(),
             1,
-            "the vault host does not select the retraction through `retracts_the_teardown`, \
-             called exactly once with `why`, `worker_started` and `teardown_reported` in that \
-             order. A MISSING call is a lock whose teardown never ran still reporting itself \
-             torn down -- `main` skips the only recovery it can get and the vault says locked \
-             with the cache full and `bw serve` answering. A SECOND call is a second decision \
-             point the rule does not govern: {closure}"
+            "the shared lock value does not select the retraction through \
+             `retracts_the_teardown`, called exactly once with `why`, `worker_started` and \
+             `teardown_reported` in that order. A MISSING call is a lock whose teardown never \
+             ran still reporting itself torn down -- `main` skips the only recovery it can get \
+             and the vault says locked with the cache full and `bw serve` answering. A SECOND \
+             call is a second decision point the rule does not govern: {value}"
         );
-        // The inline shape, banned term by term. Each of these three is one of
-        // the mutations that survived when the condition lived here.
+        assert!(
+            retract.contains(concat!(
+                "retracts_the_teardown(why, self.worker_started, ",
+                "self.teardown_reported)"
+            )),
+            "the call is not in `retract_if_the_teardown_never_ran`, so it is somewhere the \
+             failure kind is not the one being answered: {retract}"
+        );
+        // The inline shape, banned term by term, over the shared value AND
+        // the host -- the two places a decision could be written back by
+        // hand, and not the rule's own body, which is written in exactly
+        // these terms and must stay legal. Each of these three is one of the
+        // mutations that survived when the condition lived in the closure.
+        let regions = where_a_lock_decision_could_live();
         for (fragment, why) in [
             (
                 concat!("why == WorkFailure::", "WorkerDied"),
-                "the host tests the failure kind itself again, so which kinds retract is back \
-                 to being a decision no test can reach",
+                "the failure kind is tested by hand again, so which kinds retract is back to \
+                 being a decision no test can reach",
             ),
             (
                 concat!("&& worker_", "started"),
-                "the host conjoins `worker_started` inline instead of handing it to the rule",
+                "`worker_started` is conjoined inline instead of being handed to the rule",
             ),
             (
                 concat!("!teardown_", "reported"),
-                "the host negates `teardown_reported` inline -- the exact term whose inversion \
+                "`teardown_reported` is negated inline -- the exact term whose inversion \
                  restored the v0.5.0 defect and left the whole suite green",
             ),
         ] {
             assert!(
-                !closure.contains(fragment),
-                "{why}: {fragment:?} is back in the vault host: {closure}"
+                !regions.contains(fragment),
+                "{why}: {fragment:?} is back in the lock's own code: {regions}"
             );
         }
+        // The host asks for it, exactly once, and hands the kind straight on.
+        let closure = closure();
+        assert_eq!(
+            closure
+                .matches(concat!("lock.retract_if_the_teardown_never_", "ran(why)"))
+                .count(),
+            1,
+            "the vault host does not ask the shared value to retract, exactly once, with the \
+             failure kind the watchdog just decided. A MISSING call leaves a perfectly lifted \
+             retraction that nothing runs: a teardown worker that dies having reported nothing \
+             still reports the session torn down, `main` skips the only recovery that lock can \
+             get, and the vault says locked with `bw serve` still answering: {closure}"
+        );
         // Positive controls. The two facts the rule is asked about are really
-        // maintained here, and the call really does guard the retraction --
-        // otherwise the pin above would be a call whose answer is discarded.
+        // maintained in the lifted value, and the call really does guard the
+        // retraction -- otherwise the pin above would be a call whose answer
+        // is discarded.
         for (needle, why) in [
             (
-                concat!("worker_started = ", "true;"),
-                "nothing in the host ever records that a worker started, so the rule is asked \
-                 about a flag that is always `false` and the retraction never fires",
+                concat!("self.worker_started = ", "true;"),
+                "nothing ever records that a worker started, so the rule is asked about a flag \
+                 that is always `false` and the retraction never fires",
             ),
             (
-                concat!("teardown_reported = ", "true;"),
-                "nothing in the host ever records that a step arrived, so the rule is asked \
-                 about a flag that is always `false` and a genuine teardown gets retracted",
+                concat!("self.teardown_reported = ", "true;"),
+                "nothing ever records that a step arrived, so the rule is asked about a flag \
+                 that is always `false` and a genuine teardown gets retracted",
             ),
             (
                 concat!("LockProgress::", "TeardownNeverRan)"),
-                "control: the step the retraction reports is not in this closure at all, so \
-                 the call pinned above guards nothing",
+                "control: the step the retraction reports is not in the lifted value at all, \
+                 so the call pinned above guards nothing",
             ),
         ] {
-            assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
+            assert!(value.contains(needle), "{why}: {needle:?} is not in the shared lock value");
         }
         // **Where the two flags are SET, not merely that they are set.** A
         // correct rule fed a flag written in the wrong arm is this file's
         // recurring defect one level down: `teardown_reported = true;` hoisted
-        // into the lock arm makes the retraction unreachable, and
+        // into the lock catch makes the retraction unreachable, and
         // `worker_started = true;` moved outside the spawn makes it claim a
         // worker that the spent-`FnOnce` path never started -- and both leave
         // the rule, the table and the call above completely untouched.
         assert_eq!(
-            closure.matches(concat!("worker_started = ", "true;")).count(),
+            regions.matches(concat!("worker_started = ", "true;")).count(),
             1,
-            "`worker_started` is set somewhere other than exactly once: {closure}"
+            "`worker_started` is set somewhere other than exactly once: {regions}"
         );
-        let spawn = closure
+        let catch = catch_body();
+        let spawn = catch
             .find(concat!("std::thread::", "spawn(move || {"))
             .expect("the spawn is pinned by the_lock_arm_starts_the_teardown_on_a_thread");
-        let started = closure.find(concat!("worker_started = ", "true;")).expect("counted above");
-        let claim = closure
+        let started =
+            catch.find(concat!("worker_started = ", "true;")).expect("counted above, in the catch");
+        let claim = catch
             .find(concat!("LockProgress::", "TeardownStarted"))
             .expect("pinned by the_hosts_two_relocked_writes_both_go_through_the_rule");
         assert!(
@@ -3722,20 +4080,26 @@ mod lock_host_tests {
         // Both of the teardown's steps set `teardown_reported`, and each does
         // it inside its own arm. The two arms are pinned by
         // `the_host_answers_both_teardown_steps`.
+        let drain = drain_body();
         assert_eq!(
-            closure.matches(concat!("teardown_reported = ", "true;")).count(),
+            regions.matches(concat!("teardown_reported = ", "true;")).count(),
             2,
-            "`teardown_reported` is not set exactly twice -- once per teardown step. A MISSING \
-             one is a worker whose reported step is forgotten, so a session that really was \
-             torn down gets a second teardown from `main`; an EXTRA one, or one hoisted out of \
-             these arms, makes the retraction unreachable and restores the v0.5.0 defect: \
-             {closure}"
+            "`teardown_reported` is not set exactly twice -- once per teardown step. A \
+             MISSING one is a worker whose reported step is forgotten, so a session that \
+             really was torn down gets a second teardown from `main`; an EXTRA one, or one \
+             hoisted out of these arms, makes the retraction unreachable and restores the \
+             v0.5.0 defect: {regions}"
         );
-        for step in [concat!("Ok(TeardownStep::", "NeedsSignIn) =>"), concat!("Ok(TeardownStep::", "Finished) =>")] {
-            let arm = closure.find(step).unwrap_or_else(|| panic!("control: {step:?} is not in the vault host"));
-            let next = closure[arm..]
-                .find(concat!("teardown_reported = ", "true;"))
-                .unwrap_or_else(|| panic!("no `teardown_reported` write follows {step:?}: {closure}"));
+        for step in [
+            concat!("Ok(TeardownStep::", "NeedsSignIn) =>"),
+            concat!("Ok(TeardownStep::", "Finished) =>"),
+        ] {
+            let arm = drain
+                .find(step)
+                .unwrap_or_else(|| panic!("control: {step:?} is not in the drain: {drain}"));
+            let next = drain[arm..]
+                .find(concat!("self.teardown_reported = ", "true;"))
+                .unwrap_or_else(|| panic!("no `teardown_reported` write follows {step:?}: {drain}"));
             assert!(
                 next < 400,
                 "the `teardown_reported` write nearest to {step:?} is {next} bytes below it, so \
@@ -3762,10 +4126,10 @@ mod lock_host_tests {
             // `if`, `match`, a nested block, a closure -- puts a second
             // token in that gap and fails here, whatever its size. The
             // distance assertion above is KEPT rather than replaced: it is
-            // what kills a write hoisted OUT of its arm (the two arms'
-            // writes are 738 bytes apart), which adjacency alone would not
-            // distinguish from a correct arm whose own write moved.
-            let between = closure[arm + step.len()..arm + next].trim();
+            // what kills a write hoisted OUT of its arm, which adjacency
+            // alone would not distinguish from a correct arm whose own write
+            // moved.
+            let between = drain[arm + step.len()..arm + next].trim();
             assert_eq!(
                 between, "{",
                 "the `teardown_reported` write for {step:?} is not that arm's first \
@@ -3779,15 +4143,16 @@ mod lock_host_tests {
 
         // The call and the write it guards are adjacent -- the retraction is
         // not a call whose answer is computed and then thrown away.
-        let at = closure
-            .find(concat!("retracts_the_teardown(why, worker_started, ", "teardown_reported)"))
+        let at = retract
+            .find(concat!(
+                "retracts_the_teardown(why, self.worker_started, ",
+                "self.teardown_reported)"
+            ))
             .expect("counted just above");
-        let write = closure
+        let write = retract
             .find(concat!("session_torn_down(was, LockProgress::", "TeardownNeverRan)"))
             .unwrap_or_else(|| {
-                panic!(
-                    "the retraction's write of `relocked` is not in this closure: {closure}"
-                )
+                panic!("the retraction's write of `relocked` is not in this method: {retract}")
             });
         assert!(
             write > at && write - at < 1_200,
@@ -3800,26 +4165,45 @@ mod lock_host_tests {
     ///
     /// The v0.5.0 defect in its new home: a lock that reaches the spinner and
     /// never tears anything down leaves `bw serve` holding a live session with
-    /// the vault "locked" on screen. Run on this thread instead, it freezes the
-    /// window on the frame that is meant to start showing the spinner.
+    /// the vault "locked" on screen. Run on the frame thread instead, it
+    /// freezes the window on the frame that is meant to start showing the
+    /// spinner.
+    ///
+    /// Measured over the lifted catch, with a control that no host spawns a
+    /// teardown of its own beside it -- which is the second copy this lift
+    /// exists to make impossible.
     #[test]
     fn the_lock_arm_starts_the_teardown_on_a_thread() {
-        let arm = vault_arm();
+        let catch = catch_body();
         assert!(
-            arm.contains(concat!("std::thread::", "spawn(move || {")),
+            catch.contains(concat!("std::thread::", "spawn(move || {")),
             "the lock does not start its teardown on a worker thread: either nothing is torn \
              down at all -- the vault says locked and `bw serve` still holds the session -- or \
-             it runs here and freezes the spinner it is meant to be showing: {arm}"
+             it runs on the frame thread and freezes the spinner it is meant to be showing: \
+             {catch}"
         );
         assert!(
-            arm.contains(concat!("teardown(&step_tx, ", "token_rx);")),
-            "the spawned thread does not run the caller's teardown: {arm}"
+            catch.contains(concat!("teardown(&step_tx, ", "token_rx);")),
+            "the spawned thread does not run the caller's teardown: {catch}"
         );
         assert!(
-            arm.contains(concat!("handles.", "finish()")),
+            catch.contains(concat!("handles.", "finish()")),
             "the vault session that just locked is not ended through `finish`, so its geometry \
              is never written and a visit to the gear earlier in the same session is lost: \
-             {arm}"
+             {catch}"
+        );
+        let production = code(production());
+        assert_eq!(
+            production.matches(concat!("teardown(&step_tx, ", "token_rx);")).count(),
+            1,
+            "the caller's teardown is run from more than one place in this file, which is the \
+             second copy of the lock's touch points that the shared value exists to prevent: \
+             {production}"
+        );
+        let closure = closure();
+        assert!(
+            !closure.contains(concat!("std::thread::", "spawn(move || {")),
+            "the vault host starts a thread of its own beside the shared catch: {closure}"
         );
     }
 
@@ -3828,6 +4212,10 @@ mod lock_host_tests {
     /// A host that re-implemented the refusal, the watchdog or the closing flag
     /// would be a second copy of the most heavily guarded sequence in this
     /// crate -- which is the move the recorded design rejects by name.
+    ///
+    /// These five needles did NOT move: the stage machinery is the host's and
+    /// stays there. What moved is what the stage's drain does, which is the
+    /// guard below.
     #[test]
     fn the_vault_host_reuses_the_one_working_stage_rather_than_writing_a_second() {
         let closure = closure();
@@ -3866,8 +4254,8 @@ mod lock_host_tests {
             "control: the sliced region reaches back above the vault host"
         );
         assert!(
-            closure.contains(concat!("TeardownStep::", "NeedsSignIn")),
-            "control: the sliced region is not the host that handles the teardown's steps"
+            closure.contains(concat!("lock.answer_the_", "teardown(&mut vault_fn)")),
+            "control: the sliced region is not the host that drains the teardown's steps"
         );
     }
 
@@ -3876,21 +4264,52 @@ mod lock_host_tests {
     /// spinner waits out the deadline for a password nobody is asked for) or
     /// the vault is never rebuilt (the window closes and `main` reopens it --
     /// the blink, one step later).
+    ///
+    /// The two arms are the lifted drain's; the transition they produce is the
+    /// host's, because the state machine belongs to the window and not to the
+    /// lock. Both halves are pinned, and each carries the control that the
+    /// other region does not hold its needle.
     #[test]
     fn the_host_answers_both_teardown_steps() {
-        let closure = closure();
+        let drain = drain_body();
         for (needle, why) in [
             (
                 concat!("Ok(TeardownStep::", "NeedsSignIn) =>"),
-                "the host never shows the card when the teardown asks for a password",
+                "the card is never shown when the teardown asks for a password",
             ),
             (
                 concat!("Ok(TeardownStep::", "Finished) =>"),
-                "the host never notices the teardown finished, so the vault is never rebuilt",
+                "nothing notices the teardown finished, so the vault is never rebuilt",
             ),
             (
                 concat!("Event::", "TeardownDone"),
-                "the host does not take the `TeardownDone` transition",
+                "the drain does not produce the `TeardownDone` transition",
+            ),
+            (
+                concat!("Event::", "WorkReady"),
+                "a rebuilt vault does not produce the transition that shows it",
+            ),
+            (
+                concat!("Event::", "WorkFailed"),
+                "a failed rebuild does not produce the transition that closes the window",
+            ),
+        ] {
+            assert!(drain.contains(needle), "{why}: {needle:?} is not in the lifted drain");
+        }
+        let closure = closure();
+        assert_eq!(
+            closure.matches(concat!("lock.answer_the_", "teardown(&mut vault_fn)")).count(),
+            1,
+            "the vault host does not drain the teardown's steps through the shared value, \
+             exactly once, handing it this host's vault frame slot. A MISSING call is a \
+             perfectly lifted drain that nothing runs: the spinner waits out the deadline for \
+             a step that has already arrived: {closure}"
+        );
+        for (needle, why) in [
+            (
+                concat!("advance(stage, ", "event)"),
+                "the host does not feed the drain's answer to the transition table, so a \
+                 finished teardown moves the window nowhere",
             ),
             (
                 concat!("Event::", "Locked"),
@@ -3899,49 +4318,82 @@ mod lock_host_tests {
         ] {
             assert!(closure.contains(needle), "{why}: {needle:?} is not in the vault host");
         }
-        assert!(
-            !closure.contains(concat!("Err(", "_) =>")),
-            "the vault host's poll arm treats every channel error alike, so a dead teardown \
-             worker is polled as a busy one -- a spinner that refuses every close, forever"
-        );
+        // The kinds stay apart, in BOTH regions: the drain hands its `Err`
+        // straight on and the host gives it to the watchdog whole.
+        for (region, what) in [(&drain, "the lifted drain"), (&closure, "the vault host")] {
+            assert!(
+                !region.contains(concat!("Err(", "_) =>")),
+                "{what} treats every channel error alike, so a dead teardown worker is polled \
+                 as a busy one -- a spinner that refuses every close, forever: {region}"
+            );
+        }
     }
 
     /// **The tail MERGES the two sessions' results; it does not overwrite one
     /// with the other.**
     ///
     /// The unit tests above hold `carry_settings_forward` to the rule. This is
-    /// the other half: a rule the host does not call is a rule that governs
-    /// nothing, and the shape it replaced was
+    /// the other half: a rule nothing calls is a rule that governs nothing,
+    /// and the shape it replaced was
     /// `*result.borrow_mut() = Some(handles.finish());` -- an unconditional
     /// overwrite sitting directly under a comment explaining why the lock's
     /// own result had been preserved.
+    ///
+    /// The merge is `finish_the_locked_session`, shared for the same reason
+    /// the catch is: the startup host ends the same two sessions.
     #[test]
     fn the_tail_merges_the_two_sessions_rather_than_replacing_one() {
-        let closure = closure();
+        let tail = tail_body();
         assert!(
-            closure.contains(concat!("carry_settings_", "forward(result.borrow_mut().take(), rebuilt)")),
-            "the vault host's tail does not merge the pre-lock result into the rebuilt one, so \
-             a visit to the gear made before a lock is discarded by the session that replaced \
+            tail.contains(concat!(
+                "carry_settings_",
+                "forward(result.borrow_mut().take(), rebuilt)"
+            )),
+            "the shared tail does not merge the pre-lock result into the rebuilt one, so a \
+             visit to the gear made before a lock is discarded by the session that replaced \
              it -- and `main`, the only writer of `settings.json`, never hears about it: \
-             {closure}"
+             {tail}"
         );
         assert!(
-            !closure.contains(concat!("*result.borrow_mut() = Some(handles.", "finish());")),
-            "the tail is back to overwriting the lock's own result with the rebuilt frame's, \
-             whose `edited_settings` cell is always fresh: {closure}"
+            tail.contains(concat!("vault_handles.borrow().as_ref().map(|handles| handles.", "finish())")),
+            "the shared tail does not end the surviving vault session through `finish`, so \
+             whichever session is up when the window closes never writes its geometry: {tail}"
         );
-        // Positive controls: the region really does contain the tail, and the
-        // lock arm's own preserving write -- the one the merge consumes -- is
-        // still there. Without the second, the merge would be reading a cell
-        // nothing ever fills.
+        let closure = closure();
+        assert_eq!(
+            closure
+                .matches(concat!("finish_the_locked_", "session(&result, &vault_handles)"))
+                .count(),
+            1,
+            "the vault host does not end its session through the shared tail, exactly once, \
+             over its own two cells. A MISSING call leaves a perfectly lifted merge that \
+             nothing runs: {closure}"
+        );
+        // The overwrite shape, banned over the whole production half -- it is
+        // what either region would grow back.
+        let production = code(production());
+        assert!(
+            !production.contains(concat!("*result.borrow_mut() = Some(handles.", "finish());")),
+            "the tail is back to overwriting the lock's own result with the rebuilt frame's, \
+             whose `edited_settings` cell is always fresh: {production}"
+        );
+        // Positive controls: the host really does contain the tail it calls
+        // the merge from, and the lock catch's own preserving write -- the one
+        // the merge consumes -- is still there. Without the second, the merge
+        // would be reading a cell nothing ever fills.
         assert!(
             closure.contains(concat!("VaultSessionOutcome { result, ", "stages, relocked }")),
             "control: the sliced region stops before the tail it is a claim about: {closure}"
         );
         assert!(
-            closure.contains(concat!("*result_for_closure.borrow_mut() = Some(handles.", "finish());")),
-            "control: the lock arm no longer records the ending session at all, so the merge \
-             above has nothing to merge: {closure}"
+            catch_body()
+                .contains(concat!("*self.result.borrow_mut() = Some(handles.", "finish());")),
+            "control: the lock catch no longer records the ending session at all, so the merge \
+             above has nothing to merge"
+        );
+        assert!(
+            !closure.contains(concat!("carry_settings_", "forward(")),
+            "the vault host merges by hand beside the shared tail: {closure}"
         );
     }
 
@@ -3955,17 +4407,85 @@ mod lock_host_tests {
     /// honours an auto-lock change at once" across a lock.
     #[test]
     fn the_rebuild_is_handed_the_gear_visit_that_preceded_the_lock() {
-        let closure = closure();
+        let drain = drain_body();
         assert!(
-            closure.contains(concat!("build(", "edited_before_lock)")),
+            drain.contains(concat!("build(", "edited_before_lock)")),
             "the rebuilt vault is built without the preference edit made before the lock, so a \
              window that changed its auto-lock policy and then locked comes back running the \
-             OLD policy: {closure}"
+             OLD policy: {drain}"
         );
         assert!(
-            closure.contains(concat!("before.edited_settings.", "clone()")),
-            "the value handed to the rebuild is not the pre-lock session's gear visit: \
-             {closure}"
+            drain.contains(concat!("before.edited_settings.", "clone()")),
+            "the value handed to the rebuild is not the pre-lock session's gear visit: {drain}"
         );
+        // The cell it is read out of is the one the catch wrote, and it is the
+        // SHARED one -- read from a cell of the drain's own the value would
+        // always be `None` and this guard would still pass.
+        assert!(
+            drain.contains(concat!("self.result.borrow().as_ref()", ".and_then")),
+            "the gear visit is read from something other than the lock's own result cell, so \
+             the rebuild is handed whatever that other cell happens to hold: {drain}"
+        );
+    }
+
+    /// **Each lifted piece has ONE definition and ONE caller, and the caller
+    /// is named.**
+    ///
+    /// `the_lock_arm_keeps_the_window_instead_of_letting_it_close` and the
+    /// three guards beside it each pin their own call site; this is the same
+    /// property stated once, over every entry point at once, and it is the one
+    /// that bites when a piece grows a SECOND caller. A second caller is not a
+    /// second copy, so nothing that counts copies can see it -- and a second
+    /// caller of the catch is two teardown workers against one estate, which
+    /// is the multiple-owner shape the estate exists to remove.
+    ///
+    /// **This guard is what forces step 5 through a test edit.** When the
+    /// startup host wires the lock in, every count here goes to three, and the
+    /// honest edit is to name the second call site as well -- not to raise a
+    /// number. That is the shape finding C prescribes and the shape step 1's
+    /// `the_lifted_teardown_pieces_have_one_definition_and_one_caller_each`
+    /// already uses in `main.rs`.
+    #[test]
+    fn the_lifted_lock_pieces_have_one_definition_and_one_caller_each() {
+        let production = code(production());
+        let value = lock_value();
+        let closure = closure();
+        for (define, call) in [
+            (concat!("fn ", "new("), concat!("InWindow", "Lock::new(")),
+            (concat!("fn catch_the_", "lock("), concat!("lock.catch_the_", "lock(")),
+            (concat!("fn hand_over_the_", "token("), concat!("lock.hand_over_the_", "token(")),
+            (concat!("fn answer_the_", "teardown("), concat!("lock.answer_the_", "teardown(")),
+            (
+                concat!("fn retract_if_the_teardown_never_", "ran("),
+                concat!("lock.retract_if_the_teardown_never_", "ran("),
+            ),
+            (
+                concat!("fn finish_the_locked_", "session("),
+                concat!("finish_the_locked_", "session(&result"),
+            ),
+        ] {
+            assert_eq!(
+                value.matches(define).count(),
+                1,
+                "{define:?} is not defined exactly once in the shared lock value -- a second \
+                 definition is the copy this lift exists to prevent, and none at all is a \
+                 touch point that has gone back inside a host: {value}"
+            );
+            assert_eq!(
+                production.matches(call).count(),
+                1,
+                "{call:?} is called from more than one place in this file, or from none. A \
+                 SECOND caller is not a second copy, so nothing that counts copies can see it \
+                 -- and a second caller of the catch is two teardown workers against one \
+                 session, which is the multiple-owner shape the estate exists to remove: \
+                 {production}"
+            );
+            assert_eq!(
+                closure.matches(call).count(),
+                1,
+                "{call:?} is not called exactly once from the vault host, so the one call \
+                 counted above is somewhere else: {closure}"
+            );
+        }
     }
 }
