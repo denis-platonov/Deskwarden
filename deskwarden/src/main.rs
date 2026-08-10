@@ -635,8 +635,7 @@ fn main() {
         ),
     };
 
-    *startup_entries.borrow_mut() = match_entries(&items);
-    seed_cache_at_startup(&cache, items, startup_epoch);
+    arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
 
     SessionEstate {
         cache,
@@ -704,8 +703,7 @@ fn main() {
             // and `mem::take` asks for a `Default` slice.
             let items: Vec<deskwarden::vault_bridge::VaultItem> =
                 std::mem::take(work.items.as_mut().ok()?);
-            *entries_out.borrow_mut() = match_entries(&items);
-            seed_cache_at_startup(&cache_for_vault, items, startup_epoch);
+            arm_autofill_and_seed_cache(&entries_out, &cache_for_vault, items, startup_epoch);
             let (_options, frame, handles) = vault_window::build_frame(
                 cache_for_vault.clone(),
                 fill_stats_for_vault,
@@ -788,8 +786,7 @@ fn main() {
                     &config_dir,
                     login,
                 );
-                *startup_entries.borrow_mut() = match_entries(&items);
-                seed_cache_at_startup(&cache, items, startup_epoch);
+                arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
             }
         }
         None => {
@@ -822,8 +819,7 @@ fn main() {
                 &config_dir,
                 login,
             );
-            *startup_entries.borrow_mut() = match_entries(&items);
-            seed_cache_at_startup(&cache, items, startup_epoch);
+            arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
         }
     }
 
@@ -3147,6 +3143,24 @@ impl EstatePark {
 /// The worker is not joined. On the deadline path it is still running by
 /// definition, and there is nothing to wait for: the reclaim has emptied the
 /// slot, so everything it does from here on is a `None` from `with`.
+///
+/// **`wait` is handed the park as well as the completion channel, and that is
+/// step 4 of the in-window lock's five** (`progress.md`, the eighth stop's
+/// item 4). The startup host's `wait` IS `app_window::run`, and the `prepare`
+/// closure that runs underneath it is `'static`: it can borrow nothing off the
+/// host's stack, so the only way it can arm `est.child` at the moment
+/// `bw serve` is spawned is to be given an owned [`EstatePark::handle`] --
+/// which requires a park, which only this function has. Nothing production
+/// passes today ignores the parameter; the two `#[cfg(test)]` waits that do
+/// name it with `_park`.
+///
+/// **What `wait` may do with it, and the one thing it may not.** It may
+/// `with`, and it may `handle()` for a thread it starts. It may NOT `reclaim`:
+/// the slot is emptied exactly once, by the read-back below, and a `wait` that
+/// empties it first leaves the thread that owns the session with no session at
+/// all. That is not merely documented -- the read-back's `expect` turns it
+/// into an immediate, named panic rather than a silent loss, and
+/// `a_wait_that_reclaims_the_estate_is_caught_at_the_read_back` drives it.
 /// The two channel ends the lock's teardown worker is blocked waiting for:
 /// the sender it reports its [`app_window::TeardownStep`]s on, and the
 /// receiver the master-password card's token comes down.
@@ -3182,7 +3196,7 @@ fn forward_lock_channels(
 fn park_and_work(
     estate: SessionEstate,
     work: impl FnOnce(&EstatePark) + Send + 'static,
-    wait: impl FnOnce(&mpsc::Receiver<()>) -> EstateOutcome,
+    wait: impl FnOnce(&EstatePark, &mpsc::Receiver<()>) -> EstateOutcome,
 ) -> (SessionEstate, EstateOutcome) {
     let park = EstatePark::holding(estate);
     let worker_view = park.handle();
@@ -3194,7 +3208,11 @@ fn park_and_work(
         let _ = signal.send(());
     });
 
-    let outcome = wait(&done_rx);
+    // The SAME park the worker is editing -- `&park`, not a second one built
+    // here. A detached park handed out here would take every write the caller
+    // makes (step 5's `est.child = Some(child)` above all) and drop it into a
+    // slot nobody reads, with no error anywhere.
+    let outcome = wait(&park, &done_rx);
 
     // THE READ-BACK. One statement, below every way the wait can have ended,
     // naming no field -- the whole value comes home or nothing does, and
@@ -3225,7 +3243,10 @@ fn work_on_the_parked_estate(
     deadline: Duration,
     work: impl FnOnce(&EstatePark) + Send + 'static,
 ) -> (SessionEstate, EstateOutcome) {
-    park_and_work(estate, work, |done_rx| match done_rx.recv_timeout(deadline) {
+    // `_park`: this wait blocks, so there is nothing it could do with the park
+    // that the worker is not already doing better. The startup host's wait is
+    // the one that needs it.
+    park_and_work(estate, work, |_park, done_rx| match done_rx.recv_timeout(deadline) {
         Ok(()) => EstateOutcome::Completed,
         Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
         Err(mpsc::RecvTimeoutError::Disconnected) => EstateOutcome::WorkerPanicked,
@@ -3783,7 +3804,12 @@ impl VaultOps for RealVaultOps<'_> {
             // to paint the spinner for the whole teardown -- so a
             // `recv_timeout` here would be a frozen window, which is strictly
             // worse than the blink this feature exists to remove.
-            |done_rx| {
+            // `_park`: this host parks an estate that is ALREADY complete --
+            // the child, the token and the engine were all settled before the
+            // window opened -- so it has nothing to arm. The startup host,
+            // whose token and child do not exist until its own window has run,
+            // is the caller the park parameter is for.
+            |_park, done_rx| {
                 let ended = app_window::run_from_vault(
                     (options, vault_frame, handles),
                     SETUP_AFTER_SIGN_IN_MESSAGE,
@@ -6685,6 +6711,45 @@ fn seed_cache_at_startup(
     }
 }
 
+/// **Arms the match engine's entries and seeds the cache FROM THE SAME
+/// `items`, as one act -- because doing one without the other is a failure
+/// nothing in this crate could see.**
+///
+/// Startup reaches this from four places: the cached-session path, the single
+/// window's `build_vault` on the happy path, and the two recovery arms
+/// (`work.items == Err`, and the window that ended before the work landed).
+/// Every one of them used to write the pair out by hand, and the eighth stop's
+/// M6 measured what that cost: **deleting the entries line from the
+/// `Err(items)` recovery arm alone -- keeping the cache seed -- passed 1908
+/// lib + 201 bin tests green.** `build_vault` has already bailed at its `?`
+/// on that path without arming anything, so `startup_entries` stays the empty
+/// `Vec` it was declared as, `engine.rebuild(&[])` runs a few lines later, and
+/// **autofill is dead for the whole session** while the vault itself looks
+/// perfectly healthy: the cache is full, the window paints, the log line says
+/// "match engine loaded with 0 app match(es)" and nothing calls that an error.
+/// That is the brief's own named worst case -- "leave the match engine dead
+/// with every test green" -- reached by deleting one line.
+///
+/// Making it a function is the fix, not a tidy-up. The coupling is now one
+/// call: a recovery arm either repopulates BOTH or repopulates neither, and
+/// the half-done shape has no spelling at a call site.
+/// `every_startup_repopulation_arms_autofill_and_seeds_the_cache_together`
+/// holds the other half -- that no site goes back to calling
+/// [`seed_cache_at_startup`] on its own.
+///
+/// `items` is moved on into the cache rather than cloned: `match_entries`
+/// borrows, so the whole vault is walked once for the entries and then becomes
+/// the cache's own storage. See [`seed_cache_at_startup`] on why that matters.
+fn arm_autofill_and_seed_cache(
+    entries: &RefCell<Vec<(String, AppMatch)>>,
+    cache: &VaultCache,
+    items: Vec<deskwarden::vault_bridge::VaultItem>,
+    epoch: VaultEpoch,
+) {
+    *entries.borrow_mut() = match_entries(&items);
+    seed_cache_at_startup(cache, items, epoch);
+}
+
 /// Everything the single startup window's WORKER THREAD produces: the backend
 /// it started, the vault the readiness probe fetched, and who the CLI says is
 /// signed in.
@@ -7619,6 +7684,151 @@ mod tests {
                     .expect("the test fixture must deserialize as a vault item")
             })
             .collect()
+    }
+
+    /// **The eighth stop's M6, closed behaviourally: a startup repopulation
+    /// arms autofill AND fills the cache, from the same items, or it does
+    /// neither.**
+    ///
+    /// M6 deleted the entries line from the `work.items == Err` recovery arm
+    /// and kept the cache seed. It SURVIVED 1908 lib + 201 bin green: the
+    /// window paints a full vault, the log says "match engine loaded with 0
+    /// app match(es)", and autofill is dead for the rest of the session with
+    /// nothing calling it an error. The pair is one function now, and this is
+    /// the test of that function -- delete either line from its body and one
+    /// of the two assertions below goes red.
+    ///
+    /// Both controls are asserted before the call, because "the engine is
+    /// armed" and "the cache has an item" are both satisfiable by a fixture
+    /// that started that way.
+    #[test]
+    fn a_startup_repopulation_arms_autofill_and_seeds_the_cache_from_the_same_items() {
+        let mut server = mockito::Server::new();
+        // `populate_with` still fetches folders; nothing else here talks to
+        // the backend.
+        server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":[]}}"#)
+            .create();
+
+        let cache = VaultCache::new(VaultBridge::new(server.url()));
+        let epoch = cache.epoch();
+        let entries: RefCell<Vec<(String, AppMatch)>> = RefCell::new(Vec::new());
+
+        assert!(
+            entries.borrow().is_empty(),
+            "control: the entries cell is already armed, so the assertion below would pass \
+             against a call that did nothing"
+        );
+        assert!(
+            cache.items().is_empty(),
+            "control: the cache already holds items, so the seed assertion below would pass \
+             against a call that seeded nothing"
+        );
+
+        arm_autofill_and_seed_cache(
+            &entries,
+            &cache,
+            probe_items(&[("7", "notepad.exe")]),
+            epoch,
+        );
+
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&entries.borrow());
+        assert!(
+            engine.lookup(&foreground("notepad.exe")).is_some(),
+            "the repopulation filled the cache but left autofill unarmed. This is M6 exactly: \
+             the vault window looks perfectly healthy -- full cache, items on screen -- and no \
+             keystroke will ever be filled again for the life of this session, with no \
+             diagnostic anywhere"
+        );
+        assert_eq!(
+            cache.items().len(),
+            1,
+            "the repopulation armed autofill but left the cache empty, so the window that \
+             opens next paints an empty vault as though the account held nothing"
+        );
+    }
+
+    /// **The other half of M6: no startup path may go back to seeding the
+    /// cache without arming autofill beside it.**
+    ///
+    /// The behavioural test above holds the function's body. This holds its
+    /// call sites, which is where M6 actually lived: a recovery arm that
+    /// writes `seed_cache_at_startup(..)` by hand again is the mutant
+    /// respelt, and it compiles. `fn main()` is not callable from a test --
+    /// it opens real windows and never returns -- so the four sites are
+    /// pinned by a scan over the code, comments and string bodies already
+    /// blanked.
+    ///
+    /// The count is exact rather than a lower bound: a FIFTH repopulation
+    /// site is a fifth place that can be got wrong, and it should force
+    /// whoever adds it to come here and say so.
+    #[test]
+    fn every_startup_repopulation_arms_autofill_and_seeds_the_cache_together() {
+        let code = what_a_finished_vault_session_means::code_only(production_half_of_this_file());
+        let main_body = body_of(&code, "fn main() {");
+        assert!(
+            (10_000..200_000).contains(&main_body.len()),
+            "the sliced `fn main()` is {} bytes, which is not that function",
+            main_body.len()
+        );
+        assert!(
+            main_body.contains("SessionEstate {"),
+            "control: the slice does not build a `SessionEstate`, so it is not the startup \
+             sequence this guard is about"
+        );
+
+        // The STARTUP sequence, not the whole of `main`: everything above the
+        // one rebuild that arms the engine from `startup_entries`. Below it
+        // the loop rebuilds the engine from other sources for other reasons
+        // (an app match saved from the picker, a settled sync), and those are
+        // not repopulations of a fresh session.
+        let arming_at = main_body
+            .find(concat!("estate.engine.rebuild(&startup_", "entries."))
+            .expect(
+                "control: `main` no longer arms the engine from `startup_entries`, so this \
+                 guard cannot find the startup sequence it is about",
+            );
+        let main_body = main_body[..arming_at].to_string();
+        assert!(
+            main_body.matches("SessionEstate {").count() == 2,
+            "control: the startup region does not build exactly the two `SessionEstate`s the \
+             two startup paths end with, so it is not the region this guard is about"
+        );
+
+        let paired = main_body.matches(concat!("arm_autofill_and_", "seed_cache(")).count();
+        assert_eq!(
+            paired, 4,
+            "startup has {paired} repopulation sites, not the four it should have (the cached \
+             session, the single window's `build_vault`, the `work.items == Err` recovery and \
+             the no-work recovery). Each one must arm the match engine and seed the cache from \
+             the same items, and this count is what makes a new one a deliberate decision"
+        );
+        assert_eq!(
+            main_body.matches(concat!("seed_cache_at_", "startup(")).count(),
+            0,
+            "a startup path seeds the cache directly again, outside \
+             `arm_autofill_and_seed_cache`. That is the eighth stop's M6 respelt: the cache \
+             fills, `startup_entries` stays the empty `Vec` it was declared as, \
+             `engine.rebuild(&[])` runs a few lines later and autofill is dead for the whole \
+             session with every test green"
+        );
+        assert_eq!(
+            code.matches(concat!("seed_cache_at_", "startup(")).count(),
+            2,
+            "`seed_cache_at_startup` should have exactly two mentions in production -- its own \
+             definition and the single call inside `arm_autofill_and_seed_cache`. A third is a \
+             second, unpaired seeding path"
+        );
+        assert_eq!(
+            main_body.matches(concat!("match_", "entries(")).count(),
+            0,
+            "startup builds match entries by hand again outside the paired helper; the two \
+             halves of a repopulation are drifting apart at a call site once more"
+        );
     }
 
     /// Review 15's Important: a transient `list_folders` failure on the
@@ -9481,9 +9691,20 @@ mod tests {
             // `with` finds the slot already empty, and the three path tests
             // catch that; this is the source-side statement of the same
             // ordering, so the position is pinned from both directions.
+            // `wait(&park, &done_rx)` since step 4: the wait is handed the
+            // park as well as the completion channel, because the startup
+            // host's `'static` `prepare` closure can only reach the estate
+            // through an owned `park.handle()`. The needle moved with the
+            // signature; the STATEMENT it makes -- read-back below wait -- did
+            // not, and the mutant it was written for (the read-back hoisted
+            // above the wait) was re-run against this spelling.
             let wait_at = driver
-                .find("wait(&done_rx)")
-                .expect("`park_and_work` must still hand the wait to the caller");
+                .find("wait(&park, &done_rx)")
+                .expect(
+                    "`park_and_work` must still hand the wait BOTH the park and the completion \
+                     channel. Dropping the park from the wait is step 4 undone: the startup \
+                     host's `prepare` worker then has no way to arm `est.child` at the spawn",
+                );
             let read_back_at = driver
                 .find("park.reclaim()")
                 .expect("counted one, found none");
@@ -10531,7 +10752,7 @@ mod tests {
                     assert!(park.with(the_work).is_some(), "the worker owns the estate");
                     let _ = step_tx.send(());
                 },
-                |done_rx| {
+                |_park, done_rx| {
                     // The event loop's stand-in: poll, never block on the
                     // park's own channel.
                     loop {
@@ -10595,7 +10816,7 @@ mod tests {
                     assert!(park.with(the_work).is_some(), "the worker owns the estate");
                     let _ = done_tx.send(());
                 },
-                |done_rx| {
+                |_park, done_rx| {
                     // Waited for, so the worker demonstrably DID finish --
                     // the answer below is a decision and not a race.
                     done_seen_rx
@@ -10615,6 +10836,209 @@ mod tests {
                  abandoned as one that settled"
             );
             the_worker_reached_the_estate(&back, "an overriding wait");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// What a `wait` appends to the token once it has the park. Distinct
+        /// from [`AFTER`] so a write that never happened cannot be mistaken
+        /// for the worker's.
+        const BY_THE_WAIT: &str = " +written-through-the-park-by-the-wait";
+
+        /// [`the_worker_reached_the_estate`] for the two tests below, whose
+        /// `wait` writes through the park as well: the token must hold BOTH
+        /// writes, in order, and the worker's other two must still be there.
+        ///
+        /// A separate helper rather than a loosened one, so the three tests
+        /// that expect the worker's token ALONE keep an exact assertion.
+        fn both_writes_came_home(est: &SessionEstate, path: &str) {
+            assert_eq!(
+                est.token,
+                format!("{AFTER}{BY_THE_WAIT}"),
+                "on {path} the estate that came home does not hold both the worker's write and \
+                 the wait's. They must be editing ONE estate: if the caller's park is a second, \
+                 detached one, step 5's `est.child = Some(child)` lands nowhere and a live \
+                 `bw serve` is left with no owner at all"
+            );
+            assert!(
+                est.engine.lookup(&foreground(ARMED)).is_some(),
+                "on {path} the match engine came back unarmed -- autofill silently dead, which \
+                 is the recorded obstacle-5 failure exactly"
+            );
+            assert!(
+                est.task_in_progress.is_some(),
+                "on {path} the in-progress backend task did not come back"
+            );
+        }
+
+        /// **Step 4's own property: the park the `wait` is handed is the park
+        /// the worker is editing, and what the `wait` writes through it comes
+        /// home.**
+        ///
+        /// This is the whole point of the signature change and it is the one
+        /// thing a signature alone does not say. `park_and_work` could hand
+        /// the caller a freshly built, empty `EstatePark` and still compile,
+        /// still return the worker's estate, and still pass every other test
+        /// in this module -- and step 5's startup host, whose `prepare` worker
+        /// arms `est.child` through exactly this handle at the moment
+        /// `bw serve` is spawned, would drop that handle into a slot nobody
+        /// ever reads. A live `bw serve` with no owner, silently, which is the
+        /// orphan the eighth stop's decision exists to make impossible.
+        ///
+        /// The control is the `is_some()`: against a detached park `with`
+        /// answers `None`, and it fails on the control line rather than on a
+        /// confusing value mismatch.
+        #[test]
+        fn the_wait_is_given_the_same_park_the_worker_edits() {
+            let dir = scratch("wait-park");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) = park_and_work(
+                est,
+                |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                },
+                |park, done_rx| {
+                    // Sequenced deliberately: the worker's writes are all in
+                    // before the wait adds its own, so the token below is the
+                    // two of them in order and not a race.
+                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    };
+                    let reached = park
+                        .with(|est| est.token.push_str(BY_THE_WAIT))
+                        .is_some();
+                    assert!(
+                        reached,
+                        "control: the `wait` was handed a park with nothing in it. It is not \
+                         the park the worker is editing, so every write a caller makes through \
+                         it is discarded"
+                    );
+                    outcome
+                },
+            );
+
+            assert_eq!(outcome, EstateOutcome::Completed, "the worker ran to the end");
+            both_writes_came_home(&back, "a wait that holds the park");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The one thing a `wait` may not do with the park it is now given:
+        /// take the estate out from under the read-back.**
+        ///
+        /// The park handle escaping the read-back is the hazard step 4's
+        /// signature creates, and it is the read-back's `expect` that bounds
+        /// it: a second reclaimer is a loud, named panic on the spot rather
+        /// than a session silently emptied. Without this the `expect` is a
+        /// message nothing has ever produced, and the shape it forbids is
+        /// exactly the one a host trying to "read the estate a bit early"
+        /// would reach for.
+        #[test]
+        #[should_panic(expected = "the parked session state was gone at the read-back")]
+        fn a_wait_that_reclaims_the_estate_is_caught_at_the_read_back() {
+            let dir = scratch("wait-reclaims");
+            let est = fresh_estate(&dir);
+
+            let (_back, _outcome) = park_and_work(
+                est,
+                |park| {
+                    let _ = park.with(the_work);
+                },
+                |park, done_rx| {
+                    let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                    // The forbidden move: the wait empties the slot the
+                    // read-back below is about to read.
+                    let stolen = park.reclaim();
+                    assert!(
+                        stolen.is_some(),
+                        "control: the wait reclaimed nothing, so this test never set up the \
+                         double-reclaim it is about"
+                    );
+                    EstateOutcome::Completed
+                },
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A worker that panics mid-teardown leaves the estate WRITABLE, not
+        /// merely reclaimable.**
+        ///
+        /// `a_panicking_worker_does_not_poison_the_estate_out_of_reach` above
+        /// pins [`EstatePark::reclaim`]'s poison recovery -- measured, not
+        /// assumed: replacing `reclaim`'s `unwrap_or_else(PoisonError::
+        /// into_inner)` with an `expect` fails that test. Nothing pinned
+        /// [`EstatePark::with`]'s identical recovery, and the same replacement
+        /// there passed the whole suite.
+        ///
+        /// That gap matters exactly where step 5 puts its weight. A worker
+        /// panicking mid-teardown is what poisons the slot in the first place,
+        /// and from step 5 onward the thread that must still reach the estate
+        /// after such a panic -- to arm `est.child`, or to stop a `bw serve`
+        /// nobody else can see -- reaches it through `with`. An `expect` there
+        /// turns "a worker died" into "the session is unreachable": obstacle 5
+        /// by a second route, on the one path the type exists to survive.
+        ///
+        /// **The control is asserted first and is the whole point.** A test
+        /// that "passes" because the panic never poisoned anything proves
+        /// nothing at all, so the poisoning is verified against the mutex
+        /// itself before the recovery is asked for.
+        #[test]
+        fn a_panicking_worker_leaves_the_estate_writable_not_merely_reclaimable() {
+            let dir = scratch("panic-writable");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) = park_and_work(
+                est,
+                |park| {
+                    let _: Option<()> = park.with(|est| {
+                        the_work(est);
+                        panic!("a deliberate panic, raised while the estate's lock is held");
+                    });
+                },
+                |park, done_rx| {
+                    // The worker's sender is dropped as it unwinds, so this is
+                    // the panic arriving -- and it arrives AFTER the guard the
+                    // panic poisoned has been released.
+                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    };
+                    assert!(
+                        park.slot.lock().is_err(),
+                        "control: the slot's mutex is NOT poisoned, so the write below is an \
+                         ordinary one and this test says nothing about poison recovery. Every \
+                         assertion after this line would pass against an `EstatePark` that \
+                         cannot survive a panic at all"
+                    );
+                    let reached = park
+                        .with(|est| est.token.push_str(BY_THE_WAIT))
+                        .is_some();
+                    assert!(
+                        reached,
+                        "the estate was unreachable through `with` after a worker panicked \
+                         holding its lock. `with` must recover from poisoning exactly as \
+                         `reclaim` does: a dead worker is the state this type exists to \
+                         survive, and from step 5 onward the thread that has to arm the child \
+                         or stop an orphaned `bw serve` after such a panic goes through here"
+                    );
+                    outcome
+                },
+            );
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::WorkerPanicked,
+                "control: the worker did not unwind, so nothing was poisoned"
+            );
+            both_writes_came_home(&back, "a panic the estate was written through");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
