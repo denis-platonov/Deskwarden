@@ -8854,33 +8854,57 @@ mod edit_pane_layout_tests {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
         let ctx = styled_context(pane);
         let mut draft = EditDraft::empty_of(ItemKind::Login);
-        let mut text = FieldDraft::new_of(FieldRole::Text);
-        text.name = "Account number".into();
-        let mut hidden = FieldDraft::new_of(FieldRole::Hidden);
-        hidden.name = "Recovery code".into();
-        draft.fields.push(text);
-        draft.fields.push(hidden);
+        // SIX rows, four text and two hidden, and the counts below are exact.
+        // Two rows would pass a form that drew only the first few and left
+        // the rest with no boxes at all -- silently uneditable, which is the
+        // shape this file keeps re-finding: correct for the case the test
+        // happened to build, absent for the one the user has.
+        for i in 0..4 {
+            let mut text = FieldDraft::new_of(FieldRole::Text);
+            text.name = format!("text {i}");
+            draft.fields.push(text);
+        }
+        for i in 0..2 {
+            let mut hidden = FieldDraft::new_of(FieldRole::Hidden);
+            hidden.name = format!("hidden {i}");
+            draft.fields.push(hidden);
+        }
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-        // The premise: two rows really were drawn. A culled row paints
-        // nothing, and the loop below would then be silent.
+        // The premise: all six rows really were drawn. A row that was never
+        // drawn -- or one culled off the pane -- paints nothing, and the loop
+        // below would then be silent about it.
         assert_eq!(
             painted.rects_of(FIELD_NAME_LABEL).len(),
-            2,
-            "two rows did not draw two name labels: {:?}",
+            6,
+            "six rows did not draw six name labels: {:?}",
             painted.strings()
         );
-        assert_eq!(painted.rects_of(FIELD_VALUE_LABEL).len(), 1, "the text row's value label");
+        assert_eq!(
+            painted.rects_of(FIELD_VALUE_LABEL).len(),
+            4,
+            "the four text rows' value labels"
+        );
         assert_eq!(
             painted.rects_of(FIELD_HIDDEN_VALUE_LABEL).len(),
-            1,
-            "the hidden row must say it is hidden -- a masked box alone looks like a text box"
+            2,
+            "a hidden row must say it is hidden -- a masked box alone looks like a text box"
+        );
+        assert_eq!(
+            painted.rects_of(FIELD_REMOVE_BUTTON).len(),
+            6,
+            "every row must offer its own remove"
         );
 
         let mut checked = 0;
-        for label in [FIELD_NAME_LABEL, FIELD_VALUE_LABEL, FIELD_HIDDEN_VALUE_LABEL] {
+        for label in [
+            FIELD_NAME_LABEL,
+            FIELD_VALUE_LABEL,
+            FIELD_HIDDEN_VALUE_LABEL,
+            FIELD_REMOVE_BUTTON,
+        ] {
             for rect in painted.rects_of(label) {
                 checked += 1;
                 assert!(
@@ -8892,7 +8916,7 @@ mod edit_pane_layout_tests {
                 );
             }
         }
-        assert_eq!(checked, 4, "the row loop visited {checked} labels");
+        assert_eq!(checked, 18, "the row loop visited {checked} labels");
     }
 
     /// **The TOTP seed is masked, and is never painted in the clear.**
