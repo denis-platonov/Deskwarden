@@ -42,6 +42,102 @@ use std::time::{Duration, Instant};
 /// lock itself is the same place it otherwise tells you when it will.
 const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
 
+/// Which auto-lock policy a frame of the open window must honour.
+///
+/// `opened_with` is the [`AutoLock`] `main.rs` computed from `settings.json`
+/// and passed to [`run`] when the window was created. `edited` is whatever
+/// the gear's Preferences modal has written into `VaultWindowResult::
+/// edited_settings` since -- `None` until the gear has been clicked once,
+/// and from then on `Some` for the rest of this window's life (the cell is
+/// deliberately never reset; see that field's doc).
+///
+/// **The edited value wins whenever there is one, and `None` means the
+/// construction-time value.** The alternatives were both wrong. Keeping
+/// `opened_with` when it disagrees is the reported bug verbatim: the user
+/// turns auto-lock off, the countdown keeps running, and nothing they can
+/// see says why. Taking "the stricter of the two" would honour a shortened
+/// timeout but quietly refuse a lengthened one, which is a preference the
+/// window silently declines to obey -- and the same reasoning would have to
+/// pick a side between `Never` and `After`, where "stricter" is exactly the
+/// judgement the user just made for themselves. So: the most recent thing
+/// the user said, in either direction.
+///
+/// **The clamp is not bypassed.** This goes through
+/// [`crate::settings::Settings::auto_lock`], the same
+/// `auto_lock_policy(enabled, minutes)` `main.rs` used to build
+/// `opened_with`, so `MIN_AUTO_LOCK_MINUTES` applies to a mid-session edit
+/// exactly as it does to one made before the window opened. A modal that
+/// briefly reads `auto_lock_minutes: 0` therefore cannot close the window on
+/// the next frame with `locked = true` and force a master-password re-auth.
+pub(crate) fn effective_auto_lock(
+    edited: Option<&crate::settings::Settings>,
+    opened_with: AutoLock,
+) -> AutoLock {
+    match edited {
+        Some(edited) => edited.auto_lock(),
+        None => opened_with,
+    }
+}
+
+/// What one frame of the idle timer decides.
+///
+/// Split out of [`run`]'s update closure so it can be tested at all: `run`
+/// is handed to `eframe::run_ui_native` and opens a real OS window, so the
+/// only thing that used to hold this behaviour was a source-text guard
+/// (`auto_lock_never_wiring_tests`). Everything except reading the clock and
+/// closing the viewport lives here, where a test can hand it a policy and an
+/// idle duration directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdleFrame {
+    /// The timeout has elapsed: the caller sets `locked` and closes.
+    Lock,
+    /// The line the sidebar shows where the countdown goes -- either the
+    /// running "Locks in m:ss" or [`AUTO_LOCK_OFF_LABEL`].
+    Sidebar(String),
+}
+
+/// The idle timer's whole decision, for one frame.
+///
+/// `idle` is `last_activity.elapsed()` at the call site. **Elapsed idle time
+/// deliberately carries over across a change to `auto_lock`**: this clock
+/// measures how long the human has actually been away from the keyboard,
+/// and that fact is not altered by their having changed a preference. The
+/// alternative -- resetting `last_activity` whenever the policy changes --
+/// is a weakening in the one direction that matters: the modal writes to
+/// `edited_settings` on *every* frame it is up, so "reset on change" degrades
+/// into "a Preferences window left open holds the vault unlocked forever".
+///
+/// The consequence to be honest about is that shortening the timeout below
+/// the idle time already accrued locks at once, and switching `Never` ->
+/// `After` starts counting from the last real activity rather than from the
+/// edit. In practice neither is the ambush it sounds like: changing a
+/// setting is keyboard and pointer activity, and the same frame loop that
+/// reads this cell has already reset `last_activity` from those events, so
+/// a user who just made the edit has an idle time of ~0. The case where it
+/// really does lock immediately is a user who shortened the timeout and then
+/// walked away past the new limit -- which is what they asked for.
+pub(crate) fn idle_frame(auto_lock: AutoLock, idle: Duration) -> IdleFrame {
+    // `Never` is handled by there being no timeout to compare against at
+    // all -- not by a comparison against a large number. The sidebar still
+    // gets a line, because a countdown that simply vanished would read as
+    // the timer having broken rather than as a setting the user themselves
+    // turned off.
+    match auto_lock {
+        AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+        AutoLock::After(timeout) => {
+            if idle >= timeout {
+                return IdleFrame::Lock;
+            }
+            let remaining = timeout.saturating_sub(idle);
+            IdleFrame::Sidebar(format!(
+                "Locks in {}:{:02}",
+                remaining.as_secs() / 60,
+                remaining.as_secs() % 60
+            ))
+        }
+    }
+}
+
 /// Visible to the crate for `WINDOW_SIZE`'s reason just below: the login
 /// window paints this window's titlebar, wordmark and all.
 pub(crate) const WINDOW_TITLE: &str = "Deskwarden";
@@ -940,26 +1036,30 @@ pub fn build_frame(
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
             last_activity = Instant::now();
         }
-        // `Never` is handled by there being no timeout to compare against at
-        // all -- not by a comparison against a large number. The sidebar
-        // still gets a line, because a countdown that simply vanished would
-        // read as the timer having broken rather than as a setting the user
-        // themselves turned off.
-        let lock_countdown = match auto_lock {
-            AutoLock::Never => AUTO_LOCK_OFF_LABEL.to_owned(),
-            AutoLock::After(timeout) => {
-                if last_activity.elapsed() >= timeout {
-                    *locked_for_closure.borrow_mut() = true;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    return;
-                }
-                let remaining = timeout.saturating_sub(last_activity.elapsed());
-                format!(
-                    "Locks in {}:{:02}",
-                    remaining.as_secs() / 60,
-                    remaining.as_secs() % 60
-                )
+        // **Re-read every frame, never the construction-time copy alone.**
+        // `auto_lock` (the parameter) is what Preferences said when this
+        // window opened; `edited_settings_for_closure` is what the gear's
+        // modal has said since. Using only the former is the reported defect:
+        // turning auto-lock off in Settings changed nothing until the vault
+        // was closed and reopened -- the countdown kept ticking and the
+        // vault kept locking on a timer the user had just switched off.
+        // The reverse direction is why this is not merely cosmetic: turning
+        // auto-lock ON, or shortening the timeout, has to bind at once too.
+        // See `effective_auto_lock` for which value wins.
+        let auto_lock_now =
+            effective_auto_lock(edited_settings_for_closure.borrow().as_ref(), auto_lock);
+        // The decision itself is `idle_frame`, a pure function of the policy
+        // and the idle time, because `run` is an eframe application no test
+        // in this crate can call -- see that function's doc. This site is
+        // only the two things it cannot do: read the clock, and act on
+        // `Lock`.
+        let lock_countdown = match idle_frame(auto_lock_now, last_activity.elapsed()) {
+            IdleFrame::Lock => {
+                *locked_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
             }
+            IdleFrame::Sidebar(text) => text,
         };
 
         while let Ok(result) = favicon_rx.try_recv() {
@@ -10928,14 +11028,21 @@ mod settings_gear_placement_tests {
 
 /// That "auto-lock is off" really is off, in the one place it has to be.
 ///
-/// A source-text guard, for the same reason the modules above are: the idle
-/// check lives inside `run`'s eframe closure, and no harness in this crate can
-/// call `run`. `AutoLock` being an enum already makes the *type* mistakes
-/// impossible -- `last_activity.elapsed() >= auto_lock` no longer compiles,
-/// and neither does forgetting the `Never` arm -- but nothing in the compiler
-/// stops someone writing a lock, or an elapsed-time comparison, into the
-/// `Never` arm itself, which is exactly the change that would make "never"
-/// mean "after a while" again.
+/// A source-text guard. The decision it watches has since moved out of
+/// `run`'s eframe closure and into `idle_frame`, which IS callable and IS
+/// behaviourally tested (`the_idle_timer_follows_the_edited_setting`) -- so
+/// what is left here is the shape of the arms rather than the outcome:
+/// `AutoLock` being an enum already makes the *type* mistakes impossible
+/// (`idle >= auto_lock` does not compile, and neither does forgetting the
+/// `Never` arm), but nothing in the compiler stops someone writing a lock,
+/// or an elapsed-time comparison, into the `Never` arm itself, which is
+/// exactly the change that would make "never" mean "after a while" again.
+///
+/// **The needles moved with the code**, from `run`'s inline
+/// `let lock_countdown = match auto_lock {` to `idle_frame`'s `match`. That
+/// is a guard-move, so the mutation this module was written for -- the
+/// `Never` arm losing its off-label answer -- was re-run against the moved
+/// needles and still bites; see the ledger's mutation table (M3).
 ///
 /// Every needle is split with `concat!` and is single-line: `include_str!`
 /// pulls this module in too, so a one-piece literal would match its own
@@ -10943,11 +11050,13 @@ mod settings_gear_placement_tests {
 /// CRLF -- this repo has both.
 #[cfg(test)]
 mod auto_lock_never_wiring_tests {
-    const MATCH_HEAD: &str = concat!("let lock_countdown = match auto_", "lock {");
-    const NEVER_ARM: &str = concat!("AutoLock::Never => AUTO_LOCK_OFF_", "LABEL.to_owned(),");
+    const MATCH_HEAD: &str =
+        concat!("fn idle_frame(auto_lock: AutoLock, idle: ", "Duration) -> IdleFrame {");
+    const NEVER_ARM: &str =
+        concat!("AutoLock::Never => IdleFrame::Sidebar(AUTO_LOCK_OFF_", "LABEL.to_owned()),");
     const AFTER_ARM: &str = concat!("AutoLock::After(timeout) ", "=> {");
-    const ELAPSED_CHECK: &str = concat!("if last_activity.elapsed() >= ", "timeout {");
-    const LOCKS: &str = concat!("*locked_for_closure.borrow_mut() = ", "true;");
+    const ELAPSED_CHECK: &str = concat!("if idle >= ", "timeout {");
+    const LOCKS: &str = concat!("IdleFrame::", "Lock");
 
     fn production() -> &'static str {
         let source = include_str!("mod.rs");
@@ -10987,13 +11096,16 @@ mod auto_lock_never_wiring_tests {
         assert!(
             !arm.contains(LOCKS),
             "the off branch locks the vault -- auto-lock being turned off must mean the idle \
-             timer never closes the window with `locked = true` at all: {arm:?}"
+             timer never answers `IdleFrame::Lock` at all: {arm:?}"
         );
-        assert!(
-            !arm.contains("elapsed()"),
-            "the off branch measures elapsed time -- `Never` is not a very long timeout, and \
-             anything comparing against it is a timeout by another name: {arm:?}"
-        );
+        for comparison in ["idle >", "idle <", "idle.", "elapsed()"] {
+            assert!(
+                !arm.contains(comparison),
+                "the off branch measures the idle time ({comparison:?}) -- `Never` is not a \
+                 very long timeout, and anything comparing against it is a timeout by another \
+                 name: {arm:?}"
+            );
+        }
         assert!(
             arm.contains(NEVER_ARM),
             "{NEVER_ARM:?} is not in the off branch, so the two assertions above are no longer \
@@ -11015,6 +11127,344 @@ mod auto_lock_never_wiring_tests {
             .find(LOCKS)
             .expect("the timed arm no longer locks once its timeout has elapsed");
         assert!(locks > 0, "the lock must be inside the elapsed check, not before it");
+    }
+}
+
+/// **A setting changed in the gear reaches the idle timer of the window that
+/// is already open**, in both directions.
+///
+/// The user's report: *"If lock on timer disabled - Show that message instead
+/// of timer. BTW even if disabled it keeps running after visiting settings
+/// screen"*. Both halves were one defect. `AUTO_LOCK_OFF_LABEL` and its arm
+/// existed and were correct; `run` simply never looked at anything but the
+/// `AutoLock` it was constructed with, and `edited_settings` is only read by
+/// `main` *after* the window closes. So the countdown kept ticking, the vault
+/// kept locking on a timer that was switched off, and the "off" message could
+/// not appear until the vault was closed and reopened.
+///
+/// This is the same shape as the v0.5.0 lock defect the ledger records: a
+/// setting written into the shared cell that the surrounding code does not
+/// re-read. It is treated here as security-adjacent rather than cosmetic,
+/// which is why the tests below run in both directions -- a user who *enables*
+/// auto-lock or *shortens* the timeout mid-session is owed the change at once
+/// far more urgently than one who turns it off.
+///
+/// These are real tests, not source guards: the decision was extracted into
+/// `effective_auto_lock` and `idle_frame` precisely so it could be called.
+/// The off-label test goes further and asserts the label is **painted** by
+/// `draw_sidebar`, because "the value changed" is a claim about a variable
+/// and the user's complaint is about a pane.
+#[cfg(test)]
+mod the_idle_timer_follows_the_edited_setting {
+    use super::*;
+    use crate::settings::Settings;
+    use sidebar::VaultLists;
+
+    const FIVE_MINUTES: Duration = Duration::from_secs(300);
+
+    /// What `main.rs` handed `run` when the window opened: auto-lock on, five
+    /// minutes. Every test below starts from a window in this state, so
+    /// "without reopening" means what it says.
+    const OPENED_WITH: AutoLock = AutoLock::After(FIVE_MINUTES);
+
+    fn settings_saying(enabled: bool, minutes: u64) -> Settings {
+        Settings { auto_lock_enabled: enabled, auto_lock_minutes: minutes, ..Settings::default() }
+    }
+
+    /// One frame of the open window: the policy it resolves and what the idle
+    /// timer then answers. Exactly the two lines `run`'s closure runs.
+    fn frame(edited: Option<&Settings>, idle: Duration) -> IdleFrame {
+        idle_frame(effective_auto_lock(edited, OPENED_WITH), idle)
+    }
+
+    fn sidebar_line(f: IdleFrame) -> String {
+        match f {
+            IdleFrame::Sidebar(text) => text,
+            IdleFrame::Lock => panic!("the idle timer locked the vault on a frame that should \
+                                       have painted a sidebar line instead"),
+        }
+    }
+
+    // ---- the reported bug -------------------------------------------------
+
+    #[test]
+    fn disabling_auto_lock_in_settings_stops_the_countdown_without_reopening() {
+        let off = settings_saying(false, 5);
+        // Well past the five-minute timeout the window was opened with.
+        let idle = FIVE_MINUTES + Duration::from_secs(600);
+
+        // The positive control FIRST, so this test cannot pass against a
+        // window that stopped locking altogether: with nothing edited, this
+        // very idle time locks.
+        assert_eq!(
+            frame(None, idle),
+            IdleFrame::Lock,
+            "the unedited window no longer locks at all, so the assertion below would hold \
+             for the wrong reason"
+        );
+
+        assert_eq!(
+            frame(Some(&off), idle),
+            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned()),
+            "auto-lock was turned off in the gear and the already-open window locked anyway -- \
+             this is the reported defect, where the setting only took effect on reopen"
+        );
+    }
+
+    #[test]
+    fn disabling_auto_lock_in_settings_shows_the_off_label_without_reopening() {
+        let off = settings_saying(false, 5);
+        // A frame the window is comfortably alive on, so the countdown would
+        // otherwise be a running "Locks in 4:00".
+        let idle = Duration::from_secs(60);
+
+        let ticking = sidebar_line(frame(None, idle));
+        assert_eq!(
+            ticking, "Locks in 4:00",
+            "the unedited window is not painting a running countdown, so the swap below is not \
+             the swap this test claims to be"
+        );
+
+        let line = sidebar_line(frame(Some(&off), idle));
+        assert_eq!(line, AUTO_LOCK_OFF_LABEL);
+
+        // And it is really PAINTED. A string in a local is not what the user
+        // reported; they reported a pane. `painted_sidebar_text` runs
+        // `draw_sidebar` through a real `egui::Context` and reads the shapes
+        // back, so a label that moved off-pane (egui culls shapes entirely
+        // outside the screen rect) would come back as nothing here.
+        let painted = painted_sidebar_text(&line);
+        assert!(
+            painted.iter().any(|t| t == AUTO_LOCK_OFF_LABEL),
+            "the sidebar did not paint {AUTO_LOCK_OFF_LABEL:?}; it painted {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|t| t.starts_with("Locks in")),
+            "the sidebar painted a countdown as well as the off label: {painted:?}"
+        );
+
+        // Positive control on the fixture itself: the same sidebar, handed
+        // the running countdown, paints THAT -- so the assertion above is
+        // reading a pane that renders its argument, not one that renders
+        // nothing.
+        let painted_ticking = painted_sidebar_text(&ticking);
+        assert!(
+            painted_ticking.iter().any(|t| t == "Locks in 4:00"),
+            "the fixture does not paint the countdown either, so it cannot witness the off \
+             label: {painted_ticking:?}"
+        );
+    }
+
+    // ---- the other direction, which is the security-relevant one ----------
+
+    #[test]
+    fn enabling_auto_lock_mid_session_starts_honouring_it() {
+        // This window opened with auto-lock OFF.
+        let never = AutoLock::Never;
+        let on = settings_saying(true, 1);
+
+        // Unedited, it never locks, no matter how long the user is away.
+        let long_idle = Duration::from_secs(3600);
+        assert_eq!(
+            idle_frame(effective_auto_lock(None, never), long_idle),
+            IdleFrame::Sidebar(AUTO_LOCK_OFF_LABEL.to_owned())
+        );
+
+        // Turned on in the gear, the already-open window starts locking --
+        // and, per `idle_frame`'s doc, it counts from the last real activity
+        // rather than from the edit, so an hour already spent away is an hour
+        // already spent away.
+        assert_eq!(
+            idle_frame(effective_auto_lock(Some(&on), never), long_idle),
+            IdleFrame::Lock,
+            "auto-lock was switched on and the open window went on never locking -- the \
+             direction of this bug that leaves a vault unattended and unlocked"
+        );
+
+        // And inside the new minute it ticks rather than locking, so the
+        // assertion above is not "enabling anything locks instantly".
+        assert_eq!(
+            sidebar_line(idle_frame(effective_auto_lock(Some(&on), never), Duration::from_secs(10))),
+            "Locks in 0:50"
+        );
+    }
+
+    #[test]
+    fn shortening_the_timeout_mid_session_takes_effect() {
+        // Idle for four minutes of the five the window opened with.
+        let idle = Duration::from_secs(240);
+        assert_eq!(sidebar_line(frame(None, idle)), "Locks in 1:00");
+
+        // Shortened to two minutes. **The elapsed idle time carries over** --
+        // see `idle_frame`'s doc: this clock measures how long the human has
+        // actually been away, and that is not changed by their editing a
+        // preference. Four minutes is already past two, so the window locks
+        // on this frame. Asserted explicitly because the opposite choice
+        // (resetting `last_activity` on a policy change) is defensible too,
+        // and is rejected here because the modal writes to `edited_settings`
+        // every frame it is up, which would turn "reset on change" into "an
+        // open Preferences window holds the vault unlocked forever".
+        let shorter = settings_saying(true, 2);
+        assert_eq!(frame(Some(&shorter), idle), IdleFrame::Lock);
+
+        // Not merely "any edit locks": shortened to two minutes but only one
+        // minute idle, it ticks against the NEW timeout.
+        assert_eq!(
+            sidebar_line(frame(Some(&shorter), Duration::from_secs(60))),
+            "Locks in 1:00"
+        );
+
+        // Lengthening binds at once too, and does NOT restart the clock: at
+        // four minutes idle under a ten-minute timeout, six minutes remain,
+        // not ten.
+        let longer = settings_saying(true, 10);
+        assert_eq!(sidebar_line(frame(Some(&longer), idle)), "Locks in 6:00");
+    }
+
+    // ---- the positive controls -------------------------------------------
+
+    #[test]
+    fn an_untouched_window_still_ticks_down_and_still_locks() {
+        // The whole fix must not be able to pass by disabling locking.
+        let counted: Vec<(u64, String)> = [0u64, 60, 240, 299]
+            .into_iter()
+            .map(|secs| (secs, sidebar_line(frame(None, Duration::from_secs(secs)))))
+            .collect();
+        assert_eq!(
+            counted,
+            vec![
+                (0, "Locks in 5:00".to_owned()),
+                (60, "Locks in 4:00".to_owned()),
+                (240, "Locks in 1:00".to_owned()),
+                (299, "Locks in 0:01".to_owned()),
+            ],
+            "the untouched window's countdown does not count down"
+        );
+        assert_eq!(counted.len(), 4, "the countdown loop visited no frames");
+
+        assert_eq!(frame(None, FIVE_MINUTES), IdleFrame::Lock, "on the dot");
+        assert_eq!(frame(None, FIVE_MINUTES + Duration::from_secs(1)), IdleFrame::Lock);
+    }
+
+    #[test]
+    fn a_gear_that_changed_nothing_leaves_the_timer_exactly_where_it_was() {
+        // `edited_settings` goes `Some` the moment the gear is clicked, even
+        // if nothing was changed. That must be indistinguishable from `None`.
+        let same = settings_saying(true, 5);
+        for secs in [0u64, 60, 299] {
+            let idle = Duration::from_secs(secs);
+            assert_eq!(frame(Some(&same), idle), frame(None, idle), "at {secs}s idle");
+        }
+        assert_eq!(frame(Some(&same), FIVE_MINUTES), IdleFrame::Lock);
+    }
+
+    #[test]
+    fn a_zero_minute_edit_is_still_clamped_and_cannot_lock_the_first_frame() {
+        // The clamp reaches a MID-SESSION edit too, not only the value
+        // `main.rs` computed before the window opened -- a modal that briefly
+        // reads `auto_lock_minutes: 0` must not close this window with
+        // `locked = true` and force a master-password re-auth.
+        // `a_pre_existing_zero_still_means_one_minute_and_not_never` pins the
+        // same rule on the other side of the seam.
+        let zero = settings_saying(true, 0);
+        assert_eq!(effective_auto_lock(Some(&zero), OPENED_WITH), AutoLock::After(Duration::from_secs(60)));
+        assert_eq!(sidebar_line(frame(Some(&zero), Duration::ZERO)), "Locks in 1:00");
+        // And zero does NOT mean never, either.
+        assert_eq!(frame(Some(&zero), Duration::from_secs(60)), IdleFrame::Lock);
+    }
+
+    // ---- the seam `run` owns, which no harness can call -------------------
+
+    /// The one part of this that is still source text: that `run`'s closure
+    /// actually calls the two functions above, with the edited cell and the
+    /// live clock, rather than branching on its construction-time parameter
+    /// again. This is the exact defect being fixed, so it gets a guard.
+    #[test]
+    fn runs_closure_resolves_the_policy_from_the_edited_cell_every_frame() {
+        let production = {
+            let source = include_str!("mod.rs");
+            let end = source.find(concat!("#[cfg(", "test)]")).expect("no test marker");
+            &source[..end]
+        };
+        let resolve = concat!(
+            "effective_auto_lock(edited_settings_for_closure.borrow().as_ref(), auto_",
+            "lock)"
+        );
+        assert_eq!(
+            production.matches(resolve).count(),
+            1,
+            "{resolve:?} appears in production code a number of times other than once -- the \
+             open window must resolve its auto-lock policy from the edited settings, once per \
+             frame"
+        );
+        let call = concat!("idle_frame(auto_lock_now, last_activity.", "elapsed())");
+        assert_eq!(
+            production.matches(call).count(),
+            1,
+            "{call:?} is not in production code exactly once -- the idle timer must be asked \
+             about the RESOLVED policy and the live clock"
+        );
+        // And the old shape is gone: nothing in production may branch the
+        // countdown on the raw parameter again.
+        let old = concat!("let lock_countdown = match auto_", "lock {");
+        assert!(
+            !production.contains(old),
+            "{old:?} is back -- the window is branching on its construction-time `AutoLock` \
+             again, which is the reported defect verbatim"
+        );
+    }
+
+    // ---- the painting fixture --------------------------------------------
+
+    /// Every string `draw_sidebar` actually paints, given a countdown line.
+    ///
+    /// Modelled on `sidebar.rs`'s own `painted_sidebar_lists`, including the
+    /// two warm-up frames: `theme::apply`'s font families only exist from the
+    /// next frame on. 212x800 is `SIDEBAR_WIDTH` by a comfortable height, so
+    /// the countdown -- which is pinned to the sidebar's bottom -- is inside
+    /// the screen rect and is not culled.
+    fn painted_sidebar_text(lock_countdown: &str) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SIDEBAR_WIDTH, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let items: Vec<VaultItem> = Vec::new();
+        let folders: Vec<Folder> = Vec::new();
+        let mut selected = SidebarFilter::All;
+        let output = ctx.run_ui(input(), |ui| {
+            draw_sidebar(ui, VaultLists::live_only(&items), &folders, &mut selected, lock_countdown);
+        });
+
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            collect_painted_text(&clipped.shape, &mut out);
+        }
+        assert!(
+            !out.is_empty(),
+            "the sidebar painted no text at all, so every assertion over this list would pass \
+             against nothing"
+        );
+        out
+    }
+
+    fn collect_painted_text(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_painted_text(shape, out);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -14168,7 +14618,7 @@ mod preferences_modal_wiring_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 50,
+            modules, 51,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
