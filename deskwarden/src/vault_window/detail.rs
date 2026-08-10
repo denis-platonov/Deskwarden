@@ -1635,6 +1635,11 @@ const SECRET_PARAM: &str = "secret";
 ///   [`masked_row_visible`] hides the row entirely rather than offering an
 ///   eye that reveals nothing. A URI is not a key. The empty stored value
 ///   takes the pass-through arm and lands on `""` as well.
+/// * **The fragment is cut off FIRST, and it is cut off at both ends of the
+///   query.** A `?` that sits inside a `#fragment` is not the query's `?`,
+///   so `#frag?secret=NOPE` yields nothing; and a `#frag` that follows a
+///   real query is not part of the seed, so `?secret=GOOD22#frag` yields
+///   `GOOD22` and not `GOOD22#frag`. Both directions are rows of the table.
 ///
 /// **What this does NOT touch: the derived code.** `bw serve` is given
 /// whatever is stored, URI and all, and generates the six digits from it.
@@ -1724,6 +1729,17 @@ fn percent_decoded(raw: &str) -> Zeroizing<String> {
         return Zeroizing::new(raw.to_string());
     }
     let bytes = raw.as_bytes();
+    // **The capacity is a REQUIREMENT, not a nicety.** A `Vec` that grows
+    // frees its old block, and the freed block holds a partial plaintext
+    // seed that `Zeroizing` never sees -- it wipes the buffer it owns at the
+    // end, not the ones reallocation left behind. `bytes.len()` is enough
+    // for every input because decoding only ever shortens: each `%HH` triple
+    // becomes one byte and every other byte is copied one-for-one, so the
+    // output length is always <= `bytes.len()` and this `Vec` never grows.
+    // Any future decoder that can EXPAND its input must reserve for the
+    // expansion here, or the probe guard
+    // `the_seed_inside_a_uri_never_reaches_the_allocator_in_the_clear` is
+    // being asked about a path that no longer holds.
     let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0;
     while i < bytes.len() {
@@ -11883,7 +11899,26 @@ mod tests {
             (KEYLESS_URI, "", "a URI with no secret= is not a key"),
             ("otpauth://totp/L?secret=&issuer=Acme", "", "an empty secret= is not a key either"),
             ("otpauth://totp/L", "", "a URI with no query at all is not a key"),
-            ("otpauth://totp/L#secret=NOPE", "", "a fragment is not a query"),
+            (
+                "otpauth://totp/L#secret=NOPE",
+                "",
+                "a fragment with no query at all is not a key. NOTE this row alone holds \
+                 NOTHING about the fragment strip: with the strip deleted there is still \
+                 no `?`, so the split still fails and the answer is still \"\". The two \
+                 rows below are the ones that hold it",
+            ),
+            (
+                "otpauth://totp/L#frag?secret=NOPE",
+                "",
+                "a `?` INSIDE the fragment is not the query's `?`: delete the fragment \
+                 strip and this reads a key straight out of the fragment",
+            ),
+            (
+                "otpauth://totp/L?secret=GOOD22#frag",
+                "GOOD22",
+                "a fragment AFTER a real query is cut off the key: delete the fragment \
+                 strip and the row shows -- and the clipboard gets -- `GOOD22#frag`",
+            ),
             (
                 "otpauth://totp/L?secret=AB%43D%2fE",
                 "ABCD/E",
@@ -11966,7 +12001,19 @@ mod tests {
                 "REAL22",
                 "...so a stray bare secret does not shadow the real one",
             ),
-            ("\u{e9}otpauth://x", "\u{e9}otpauth://x", "a multi-byte first char does not panic the prefix slice"),
+            (
+                "\u{e9}otpauth://x",
+                "\u{e9}otpauth://x",
+                "a multi-byte FIRST char is not a URI. NOTE byte 10 of this value is still \
+                 a char boundary, so this row alone holds nothing about the boundary \
+                 check -- the row below is the one that holds it",
+            ),
+            (
+                "otpauth:/\u{e9}",
+                "otpauth:/\u{e9}",
+                "a multi-byte char STRADDLING the end of the scheme: byte 10 falls inside \
+                 it, so `is_char_boundary` is what stops `&s[..10]` panicking here",
+            ),
         ];
         assert!(
             !table.is_empty(),
