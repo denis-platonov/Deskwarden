@@ -33,6 +33,10 @@ use crate::vault_bridge::{
     password_history, CardData, IdentityData, ItemKind, PasswordHistoryEntry, SshKeyData, VaultItem,
 };
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
+/// [`totp_key_of`] has to allocate to hand back a decoded key, and the seed is
+/// the one value in this file where that allocation must not be an ordinary
+/// `String` -- see that function's doc and the crate's allocator probe.
+use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
 // Design 2b's detail-pane metrics, read off the block marked `2b` in
@@ -1577,6 +1581,182 @@ fn masked_row_visible(value: &str) -> bool {
     row_offers_copy(value)
 }
 
+/// The `otpauth` scheme, with its `//`, as [`totp_key_of`] matches it.
+///
+/// Matched with the `//` attached on purpose: `otpauth:` alone would accept
+/// `otpauthx://...`, and a bare `otpauth` would fire on any stored value that
+/// merely *contains* the word (`my-otpauth-backup-seed` is a perfectly
+/// ordinary thing for a user to have typed into the field).
+const OTPAUTH_SCHEME: &str = "otpauth://";
+
+/// The query parameter that carries the seed, matched as a whole NAME.
+const SECRET_PARAM: &str = "secret";
+
+/// **The bare key behind whatever the vault stored in `LoginData::totp`.**
+///
+/// The user's words: "should drop and show just the key and not
+/// `otpauth://totp/Offline%20one-time%20password?secret=`". Bitwarden stores
+/// the field verbatim, so it holds whichever of two shapes the user pasted:
+/// a bare base32 seed, or a full `otpauth://` URI. `9df8c3d`'s masked row and
+/// its copy action were handed the stored string as-is, so for the second
+/// shape the row showed the scheme, the label and the whole query string, and
+/// the clipboard got the same.
+///
+/// **This is the seam.** The parsing lives here and not at the call site so
+/// that the shapes can be enumerated by a unit test rather than inferred from
+/// a rendered frame -- and so that the row and the clipboard cannot disagree,
+/// which they would if either one re-derived the value for itself.
+///
+/// The rules, each one a row of `the_stored_value_reduces_to_its_bare_key`:
+///
+/// * **Not a URI: passed through, trimmed.** A bare base32 seed is the other
+///   common shape and must survive untouched. A value that merely contains
+///   the word `otpauth` is not a URI (see [`OTPAUTH_SCHEME`]).
+/// * **The scheme match is case-insensitive**, `OTPAUTH://` included.
+/// * **The parameter NAME is matched whole and case-insensitively**, so
+///   `SECRET=` is the seed and `issuer=`, `algorithm=`, `digits=`, `period=`
+///   and -- the one that a substring search gets wrong -- `issuersecret=` are
+///   not.
+/// * **First `secret=` wins** if the URI repeats it. There is no second seed
+///   to choose between, and picking the last would mean a trailing
+///   `&secret=` typo silently replacing a good key with nothing.
+/// * **The value is percent-decoded.** The user's own example has the label
+///   encoded and the seed can be too. `+` is left ALONE -- `otpauth` query
+///   values are percent-encoded, not form-encoded, so a `+` is a literal `+`
+///   and turning it into a space would corrupt a key that contains one.
+/// * **A malformed `%` escape is left literal.** `%ZZ`, or a `%` in the last
+///   two bytes, is copied through byte-for-byte rather than dropped or
+///   treated as a parse failure: a key the user can see and fix beats a row
+///   that vanished. Likewise a decode that is not valid UTF-8 falls back to
+///   the raw parameter value.
+/// * **A URI with no `secret=` at all, or with an empty one, yields the empty
+///   string** -- and so does a URI with no query at all. That is deliberately
+///   the same "nothing to show" that an absent seed produces, so
+///   [`masked_row_visible`] hides the row entirely rather than offering an
+///   eye that reveals nothing. A URI is not a key. The empty stored value
+///   takes the pass-through arm and lands on `""` as well.
+///
+/// **What this does NOT touch: the derived code.** `bw serve` is given
+/// whatever is stored, URI and all, and generates the six digits from it.
+/// That path is untouched -- this function is only ever asked about the row
+/// the user reads and the value the user copies.
+///
+/// **Why `Zeroizing<String>` and not `String`.** The return value is a real
+/// copy of the seed -- there is no borrowing a decoded key out of the stored
+/// URI -- and the crate's `#[global_allocator]` probe scans blocks on their
+/// way back to the allocator, so a plain `String` here would be the seed in
+/// the clear at every free. Every intermediate in the decoder is `Zeroizing`
+/// for the same reason, and
+/// `the_seed_inside_a_uri_never_reaches_the_allocator_in_the_clear` asserts
+/// it against the probe with its control first.
+///
+/// This is *not* a claim that the key is never plaintext anywhere: `masked_row`
+/// still materialises a plain `String` for the run it hands egui once the row
+/// is REVEALED (egui's galley cache holds that text past the frame anyway),
+/// and `copy_text` takes an owned `String`, so the clipboard hand-off in
+/// `vault_window::mod` is a plain copy too. Both are pre-existing trades,
+/// stated rather than implied.
+pub fn totp_key_of(stored: &str) -> Zeroizing<String> {
+    let trimmed = stored.trim();
+    let Some(after_scheme) = strip_prefix_ascii_case(trimmed, OTPAUTH_SCHEME) else {
+        return Zeroizing::new(trimmed.to_string());
+    };
+    // The fragment first: `?` inside a `#fragment` is not the query's `?`.
+    let no_fragment = after_scheme.split('#').next().unwrap_or("");
+    let Some((_label, query)) = no_fragment.split_once('?') else {
+        return Zeroizing::new(String::new());
+    };
+    for pair in query.split('&') {
+        // A parameter with no `=` cannot be the seed; skipped rather than
+        // treated as an empty `secret`, so a stray `&secret&` does not
+        // shadow a real one further along.
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(SECRET_PARAM) {
+            return trimmed_key(percent_decoded(value));
+        }
+    }
+    Zeroizing::new(String::new())
+}
+
+/// **Exactly what [`DetailAction::CopyTotpSecret`] puts on the clipboard**,
+/// or `None` for the items that put nothing there.
+///
+/// The whole of that arm's body in `vault_window::mod`, lifted here so it can
+/// be called by a test: the clipboard itself lives behind `egui::Context` in
+/// a closure no test in this crate renders as far as, so an assertion phrased
+/// against a painted frame would have been an assertion about the row and not
+/// about the copy -- which is precisely the pair this change exists to keep
+/// in step. `the_clipboard_gets_the_key_not_the_uri` calls this.
+///
+/// `None` rather than `Some("")` for an item with no login, no seed, or a URI
+/// with no usable `secret=`: those draw no row and so offer no copy, and an
+/// empty `copy_text` would silently clear whatever the user had.
+pub fn totp_secret_clipboard_text(item: &VaultItem) -> Option<Zeroizing<String>> {
+    let stored = item.login.as_ref().and_then(|l| l.totp.as_ref())?;
+    let key = totp_key_of(stored.as_str());
+    (!key.is_empty()).then_some(key)
+}
+
+/// `str::strip_prefix`, case-insensitively over ASCII.
+///
+/// Guards the char boundary as well as the length so a multi-byte first
+/// character cannot panic the slice -- `stored` is whatever the user typed.
+fn strip_prefix_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len()
+        && s.is_char_boundary(prefix.len())
+        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+/// Percent-decoding for one query-parameter value, keeping the plaintext in
+/// `Zeroizing` buffers throughout. See [`totp_key_of`] for the `+`, the
+/// malformed-escape and the non-UTF-8 rules.
+fn percent_decoded(raw: &str) -> Zeroizing<String> {
+    // The overwhelmingly common case -- a base32 seed has no `%` -- and it
+    // avoids the byte buffer entirely.
+    if !raw.contains('%') {
+        return Zeroizing::new(raw.to_string());
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = char::from(bytes[i + 1]).to_digit(16);
+            let lo = char::from(bytes[i + 2]).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    // `String::from_utf8` would move the bytes out of the `Zeroizing`
+    // wrapper; validating and copying keeps both buffers wiped.
+    match std::str::from_utf8(&out) {
+        Ok(decoded) => Zeroizing::new(decoded.to_string()),
+        Err(_) => Zeroizing::new(raw.to_string()),
+    }
+}
+
+/// Trims a decoded key without leaving an untrimmed plain copy behind, and
+/// without reallocating in the usual case where there is nothing to trim.
+fn trimmed_key(key: Zeroizing<String>) -> Zeroizing<String> {
+    if key.trim().len() == key.len() {
+        key
+    } else {
+        Zeroizing::new(key.trim().to_string())
+    }
+}
+
 /// A row's keyboard-shortcut hint, on the control line.
 ///
 /// Bare 10px monospace in ghost grey, matching the design's other shortcut
@@ -1887,19 +2067,25 @@ pub fn draw_detail_read(
         .and_then(|l| l.password.as_deref())
         .map(|p| p.as_str())
         .unwrap_or("");
-    // **The TOTP seed, borrowed and never copied.** `LoginData::totp` is
-    // `Option<Zeroizing<String>>`; `as_deref` yields `&Zeroizing<String>` and
-    // `as_str` a `&str` into the same allocation, so nothing on this line
-    // materialises a plain `String`. The one place a plain copy does appear
-    // is inside `masked_row`, and only while the row is REVEALED -- see the
-    // call site.
+    // **The TOTP seed, reduced to the bare key.** `LoginData::totp` is
+    // `Option<Zeroizing<String>>` holding whatever the user pasted, which is
+    // often a whole `otpauth://` URI; `totp_key_of` is the one place that
+    // shape is understood, and it hands back a `Zeroizing<String>` so the
+    // copy it has to make is not the seed in the clear. See its doc for the
+    // rules and for what is deliberately NOT `Zeroizing` further down. The
+    // `mod.rs` clipboard arm calls the same function on the same stored
+    // value, so the row and the clipboard cannot disagree.
     //
-    // `""` for an item with no seed, which `masked_row_visible` then reads as
-    // "no row at all", exactly as it does for an absent password.
-    let totp_secret = login
-        .and_then(|l| l.totp.as_deref())
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    // `""` for an item with no seed -- and also for a URI that carries no
+    // usable `secret=` -- which `masked_row_visible` then reads as "no row at
+    // all", exactly as it does for an absent password.
+    let totp_key = totp_key_of(
+        login
+            .and_then(|l| l.totp.as_deref())
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+    );
+    let totp_secret = totp_key.as_str();
     // **One expression for the AUTOFILL TARGETS card and for CTRL+SHIFT+U.**
     // Derived up here with the other two fields rather than beside the card
     // it draws, because the chord is resolved before anything is drawn and
@@ -11656,6 +11842,424 @@ mod tests {
         // The closure really drew the masked row, so it cannot have been
         // optimised into nothing.
         assert!(drew, "the watched frame did not draw a masked secret row");
+    }
+
+    // ------------------------------- the stored value reduced to its key
+
+    /// The `otpauth://` URI from the user's report, carrying [`SEED`] and an
+    /// encoded label, so a row drawn from it is unmistakably wrong if the
+    /// reduction is skipped.
+    const SEED_URI: &str = concat!(
+        "otpauth://totp/Offline%20one-time%20password",
+        "?secret=JBSWY3DPEHPK3PXPSEEDSEED&issuer=Ledgerline"
+    );
+
+    /// A real `otpauth://` URI that carries no key at all. Not malformed --
+    /// it simply has no `secret=` -- because "a URI is not a key" is the rule
+    /// under test and a garbage string would prove nothing about it.
+    const KEYLESS_URI: &str =
+        "otpauth://totp/Offline%20one-time%20password?issuer=Ledgerline&period=30";
+
+    /// **Every shape the field can hold, and what the row and the clipboard
+    /// get for it.** The table is [`totp_key_of`]'s whole contract; its doc
+    /// states the same rules in prose and this is what holds them.
+    ///
+    /// The table is asserted non-empty and every row is counted, so neither
+    /// an empty literal nor a loop that stopped early can pass as green.
+    #[test]
+    fn the_stored_value_reduces_to_its_bare_key() {
+        // (what the vault stored, what the pane shows and copies, why)
+        let table: &[(&str, &str, &str)] = &[
+            (SEED, SEED, "a bare base32 seed is the other common shape and must survive untouched"),
+            ("  JBSWY3DPEHPK3PXP  ", "JBSWY3DPEHPK3PXP", "a pasted seed is trimmed"),
+            ("", "", "an empty field yields nothing, which hides the row"),
+            ("   ", "", "whitespace only is an empty field"),
+            (SEED_URI, SEED, "THE REPORTED DEFECT: the whole URI reduces to its key"),
+            (
+                "otpauth://totp/L?issuer=Acme&algorithm=SHA1&secret=ABC234&digits=6&period=30",
+                "ABC234",
+                "the key is found among the other parameters wherever it sits",
+            ),
+            (KEYLESS_URI, "", "a URI with no secret= is not a key"),
+            ("otpauth://totp/L?secret=&issuer=Acme", "", "an empty secret= is not a key either"),
+            ("otpauth://totp/L", "", "a URI with no query at all is not a key"),
+            ("otpauth://totp/L#secret=NOPE", "", "a fragment is not a query"),
+            (
+                "otpauth://totp/L?secret=AB%43D%2fE",
+                "ABCD/E",
+                "the value is percent-decoded, upper- and lower-case escapes alike",
+            ),
+            (
+                "otpauth://totp/L?secret=%C3%A9KEY",
+                "\u{e9}KEY",
+                "a multi-byte escape decodes to one character",
+            ),
+            (
+                "otpauth://totp/L?secret=%20AB234%20",
+                "AB234",
+                "the key is trimmed AFTER decoding, not only before",
+            ),
+            (
+                "otpauth://totp/L?secret=AB%ZZCD",
+                "AB%ZZCD",
+                "a malformed escape is left literal rather than dropped",
+            ),
+            (
+                "otpauth://totp/L?secret=ABCD%",
+                "ABCD%",
+                "a % in the last two bytes is left literal too",
+            ),
+            (
+                "otpauth://totp/L?secret=%FF%FE",
+                "%FF%FE",
+                "a decode that is not UTF-8 falls back to the raw value",
+            ),
+            (
+                "otpauth://totp/L?secret=A+B234",
+                "A+B234",
+                "a + is a literal +: otpauth values are percent-encoded, not form-encoded",
+            ),
+            (
+                "OTPAUTH://TOTP/L?SECRET=ABC234",
+                "ABC234",
+                "the scheme and the parameter name are both matched case-insensitively",
+            ),
+            (
+                "my-otpauth-backup-seed",
+                "my-otpauth-backup-seed",
+                "a value that merely CONTAINS the word is not a URI",
+            ),
+            (
+                "otpauth:totp/L?secret=NOPE",
+                "otpauth:totp/L?secret=NOPE",
+                "the scheme is anchored WITH its slashes: a bare otpauth: is not a URI this row \
+                 reduces, and a mutant that dropped the // from OTPAUTH_SCHEME survived until \
+                 this row existed",
+            ),
+            (
+                "otpauth-migration://offline?data=xyz",
+                "otpauth-migration://offline?data=xyz",
+                "a different scheme sharing the first letters is not otpauth://",
+            ),
+            (
+                "otpauth://totp/L?issuersecret=NOPE&secret=YES234",
+                "YES234",
+                "the NAME is matched whole, so issuersecret= does not win",
+            ),
+            (
+                "otpauth://totp/L?issuersecret=NOPE",
+                "",
+                "...and on its own issuersecret= is still not a key",
+            ),
+            (
+                "otpauth://totp/L?secret=FIRST2&secret=SECOND",
+                "FIRST2",
+                "the FIRST secret= wins, so a trailing typo cannot blank a good key",
+            ),
+            (
+                "otpauth://totp/L?secret",
+                "",
+                "a parameter with no = is skipped, not read as an empty secret",
+            ),
+            (
+                "otpauth://totp/L?secret&secret=REAL22",
+                "REAL22",
+                "...so a stray bare secret does not shadow the real one",
+            ),
+            ("\u{e9}otpauth://x", "\u{e9}otpauth://x", "a multi-byte first char does not panic the prefix slice"),
+        ];
+        assert!(
+            !table.is_empty(),
+            "the table is empty, so the loop below asserts nothing at all"
+        );
+        assert!(
+            SEED_URI.contains(SEED) && !KEYLESS_URI.contains(SEED),
+            "the fixtures do not hold the relationship every row below assumes"
+        );
+
+        let mut ran = 0usize;
+        for (stored, want, why) in table {
+            assert_eq!(totp_key_of(stored).as_str(), *want, "{why} -- stored {stored:?}");
+            ran += 1;
+        }
+        assert_eq!(ran, table.len(), "not every row of the table ran");
+    }
+
+    /// **A URI with no `secret=` draws no row at all** -- the same rule as an
+    /// absent seed and an empty password, because a URI is not a key and a
+    /// mask over one would be an eye offering to reveal nothing.
+    ///
+    /// Four instruments, for the reason
+    /// `the_secret_row_is_not_drawn_for_an_item_with_no_seed` gives: the
+    /// label is absent (an alpha-0 label is still a painted galley), the card
+    /// is a whole row SHORTER (a zero-height or off-screen row would pass the
+    /// label check -- egui culls a shape pushed off the screen rect entirely,
+    /// so it comes back as nothing), one fewer eye and one fewer hairline.
+    ///
+    /// The expected row count is asserted BEFORE any geometry is read.
+    #[test]
+    fn a_uri_with_no_secret_draws_no_row() {
+        let keyless = a_login_with_a_seed("uri-no-secret", KEYLESS_URI);
+        let keyed = a_login_with_a_seed("uri-with-secret", SEED_URI);
+
+        let mut pane = Pane::new().revealing_secrets();
+        let without = pane.idle(&keyless, &a_live_code());
+        let mut pane = Pane::new().revealing_secrets();
+        let with = pane.idle(&keyed, &a_live_code());
+
+        // The premise: both passes really drew the card and the code row, so
+        // an absent label cannot be "the pane drew nothing this time".
+        for (name, frame) in [("keyless", &without), ("keyed", &with)] {
+            assert!(
+                frame.painted("LOGIN CREDENTIALS"),
+                "{name}: the card was not drawn at all: {:?}",
+                frame.strings()
+            );
+            assert!(
+                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
+                "{name}: the One-time code row was not drawn: {:?}",
+                frame.strings()
+            );
+        }
+        // The expected number of secret rows, before a single rect is read.
+        assert_eq!(
+            with.strings().iter().filter(|t| **t == TOTP_SECRET_LABEL).count(),
+            1,
+            "the control pass did not draw exactly one secret row: {:?}",
+            with.strings()
+        );
+        assert_eq!(
+            without.strings().iter().filter(|t| **t == TOTP_SECRET_LABEL).count(),
+            0,
+            "a URI with no secret= still painted a secret row: {:?}",
+            without.strings()
+        );
+        // ...and neither pass leaked the URI itself onto the pane.
+        for (name, frame) in [("keyless", &without), ("keyed", &with)] {
+            assert!(
+                !frame.strings().iter().any(|t| t.contains("otpauth")),
+                "{name}: the stored URI reached the pane: {:?}",
+                frame.strings()
+            );
+        }
+
+        let (card_without, card_with) = (login_card(&without), login_card(&with));
+        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
+        assert!(
+            card_with.height() - card_without.height() >= a_row,
+            "the keyless card is not a whole row shorter ({} vs {}), so the row is taking its \
+             space and was hidden rather than skipped",
+            card_without.height(),
+            card_with.height()
+        );
+        assert_eq!(
+            with.eyes.len(),
+            without.eyes.len() + 1,
+            "the keyless pass did not lose exactly one reveal eye"
+        );
+        assert_eq!(
+            rules_in(&with, card_with),
+            rules_in(&without, card_without) + 1,
+            "a hairline was left standing where the keyless item's row would have been"
+        );
+    }
+
+    /// **The row shows the KEY, not the stored URI** -- the user's request,
+    /// read off the revealed frame rather than off [`totp_key_of`], which the
+    /// table already covers. A reduction that is right and a pane that hands
+    /// `masked_row` the raw field anyway is exactly the pair this file's
+    /// findings keep being.
+    #[test]
+    fn the_revealed_row_shows_the_key_and_not_the_uri() {
+        let item = a_login_with_a_seed("uri-revealed", SEED_URI);
+        let mut pane = Pane::new().revealing_secrets();
+        let frame = pane.idle(&item, &a_live_code());
+        assert!(
+            frame.painted(TOTP_SECRET_LABEL),
+            "the premise: no secret row was drawn at all: {:?}",
+            frame.strings()
+        );
+
+        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let after = reveal_by_clicking(&mut pane, &frame, &item, &a_live_code(), row_y);
+        assert!(
+            pane.reveal.totp_secret,
+            "the click set no reveal flag, so it hit nothing"
+        );
+        assert!(
+            after.painted(SEED),
+            "the revealed row is not the bare key: {:?}",
+            after.strings()
+        );
+        assert!(
+            !after.painted(SEED_URI) && !after.strings().iter().any(|t| t.contains("otpauth")),
+            "the revealed row still carries the scheme, label or query: {:?}",
+            after.strings()
+        );
+        // The glyphs, not only the source strings: an elided run reports what
+        // it was asked to draw. The label is encoded in the URI, so this also
+        // catches a reduction that decoded but did not strip.
+        assert_eq!(
+            after.rendered_glyphs(SEED),
+            SEED,
+            "the key was laid out as something other than itself"
+        );
+    }
+
+    /// **The clipboard gets the key, not the URI.** Asserted on
+    /// [`totp_secret_clipboard_text`], which is the entire body of
+    /// `vault_window::mod`'s `DetailAction::CopyTotpSecret` arm -- the
+    /// clipboard itself is behind an `egui::Context` no test here renders as
+    /// far as, so a frame-shaped assertion would have been about the row
+    /// again and not about the copy.
+    ///
+    /// The last assertion is the one that makes the rest reach anything: the
+    /// arm really calls this function.
+    #[test]
+    fn the_clipboard_gets_the_key_not_the_uri() {
+        let from_uri = a_login_with_a_seed("clip-uri", SEED_URI);
+        let copied = totp_secret_clipboard_text(&from_uri).expect("a keyed URI offers a copy");
+        assert_eq!(copied.as_str(), SEED, "the clipboard got something other than the key");
+        assert!(
+            !copied.contains("otpauth") && !copied.contains('?') && !copied.contains('='),
+            "the clipboard got URI syntax: {:?}",
+            copied.as_str()
+        );
+
+        // What is SHOWN and what is COPIED are the same string -- the whole
+        // point of one seam rather than two derivations.
+        let mut pane = Pane::new().revealing_secrets();
+        let frame = pane.idle(&from_uri, &a_live_code());
+        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let shown = reveal_by_clicking(&mut pane, &frame, &from_uri, &a_live_code(), row_y);
+        assert!(
+            shown.painted(copied.as_str()),
+            "the pane shows one value and the clipboard gets another: copied {:?}, painted {:?}",
+            copied.as_str(),
+            shown.strings()
+        );
+
+        // Nothing to copy where nothing is drawn.
+        assert!(
+            totp_secret_clipboard_text(&a_login_with_a_seed("clip-keyless", KEYLESS_URI)).is_none(),
+            "a URI with no secret= offered a copy, which would clear the clipboard"
+        );
+        assert!(
+            totp_secret_clipboard_text(&a_login()).is_none(),
+            "an item with no seed at all offered a copy"
+        );
+
+        // The arm is wired to this function. One line, no newline in the
+        // needle -- this tree is CRLF and a multi-line needle matches nothing.
+        let wiring = include_str!("mod.rs");
+        assert_eq!(
+            wiring.matches("detail::totp_secret_clipboard_text(item)").count(),
+            1,
+            "the CopyTotpSecret arm does not call totp_secret_clipboard_text, so everything \
+             asserted above is about a function nothing runs"
+        );
+    }
+
+    /// **The positive control: a bare seed is shown and copied unchanged.**
+    /// Without it every assertion above could be satisfied by a reduction
+    /// that returns the empty string for everything.
+    #[test]
+    fn a_bare_seed_still_shows_and_copies_unchanged() {
+        let item = a_login_with_a_seed("bare-seed", SEED);
+
+        let copied = totp_secret_clipboard_text(&item).expect("a bare seed offers a copy");
+        assert_eq!(copied.as_str(), SEED, "the bare seed was altered on its way to the clipboard");
+
+        let mut pane = Pane::new().revealing_secrets();
+        let frame = pane.idle(&item, &a_live_code());
+        assert!(
+            frame.painted(TOTP_SECRET_LABEL),
+            "the bare-seed row is no longer drawn at all: {:?}",
+            frame.strings()
+        );
+        assert!(!frame.painted(SEED), "the row does not start masked");
+
+        let row_y = frame.rect_of(TOTP_SECRET_LABEL).center().y;
+        let after = reveal_by_clicking(&mut pane, &frame, &item, &a_live_code(), row_y);
+        assert_eq!(
+            after.rendered_glyphs(SEED),
+            SEED,
+            "the revealed bare seed is not itself: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **The seed inside a URI does not reach the allocator in the clear
+    /// either** -- the probe again, with its control asserted FIRST, because
+    /// a probe reporting clean while blind is this codebase's signature
+    /// failure.
+    ///
+    /// `the_totp_seed_is_masked_and_never_painted_in_the_clear` covers the
+    /// pass-through path, where nothing is copied at all. This one covers the
+    /// path [`totp_key_of`] added: a stored URI whose `secret=` is
+    /// percent-encoded, so the scheme match, the byte buffer, the UTF-8
+    /// validation and the trim all run over the probe bytes inside the
+    /// watched window. Every buffer on that path is `Zeroizing`; if any one
+    /// of them were a plain `String` or `Vec<u8>` this would fail.
+    ///
+    /// Same caveat as the sibling test: the claim is about the MASKED row.
+    /// `masked_row` materialises a plain `String` once REVEALED, as it always
+    /// has, and egui's galley cache holds that text past the frame anyway.
+    #[test]
+    fn the_seed_inside_a_uri_never_reaches_the_allocator_in_the_clear() {
+        use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
+
+        // THE CONTROL, first: an ordinary `String` holding the probe bytes is
+        // seen going past the allocator. Built before the watch is armed.
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: an ordinary String's plaintext went past the allocator unnoticed, so the \
+             assertion below is about an instrument that sees nothing"
+        );
+
+        // A URI whose secret is the probe, with an escape in front of it so
+        // the decoder's byte buffer and the trim both run over those bytes.
+        let stored = format!("otpauth://totp/Offline%20code?secret=%20{PROBE}&issuer=Acme");
+        assert_eq!(
+            totp_key_of(&stored).as_str(),
+            PROBE,
+            "the premise: this fixture does not reduce to the probe, so the watch below is \
+             armed over the wrong bytes"
+        );
+
+        let item = a_login_with_a_seed("uri-probe", &stored);
+        let mut pane = Pane::new().revealing_secrets();
+        let warm = pane.idle(&item, &a_live_code());
+        assert!(
+            warm.painted(TOTP_SECRET_LABEL),
+            "the premise: the row under test is not being drawn at all: {:?}",
+            warm.strings()
+        );
+        assert!(!warm.painted(PROBE), "the premise: the row starts masked");
+
+        let mut drew = false;
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                let frame = pane.idle(&item, &a_live_code());
+                drew = frame.painted(TOTP_SECRET_LABEL) && !frame.painted(PROBE);
+            }),
+            "reducing and painting the MASKED secret row released a copy of the seed to the \
+             allocator"
+        );
+        assert!(drew, "the watched frame did not draw a masked secret row");
+
+        // The clipboard seam runs the same reduction; it must not leak on the
+        // way either. `copy_text` itself takes an owned `String` and is the
+        // documented plain copy, so the assertion stops at this function.
+        let mut got = false;
+        assert!(
+            !plaintext_reached_the_allocator(|| {
+                got = totp_secret_clipboard_text(&item).is_some_and(|k| k.as_str() == PROBE);
+            }),
+            "deriving the clipboard text released a copy of the seed to the allocator"
+        );
+        assert!(got, "the watched clipboard derivation did not produce the key");
     }
 
     /// A row is `display: flex; align-items: center; gap: 16px; padding: 13px

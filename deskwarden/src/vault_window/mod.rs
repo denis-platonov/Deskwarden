@@ -2625,22 +2625,39 @@ pub fn build_frame(
                                         ui.ctx().copy_text(code.clone());
                                     }
                                 }
-                                // **The SEED, not the code.** Read back off
-                                // the item through the same borrow the pane
-                                // painted it from, so what lands on the
-                                // clipboard is what was on screen. The item
-                                // holds it as `Zeroizing<String>`;
+                                // **The SEED, not the code -- and the bare
+                                // KEY, not the stored `otpauth://` URI.**
+                                // Read back off the item and put through
+                                // `detail::totp_key_of`, the same function
+                                // `draw_detail_read` reduced the row's text
+                                // with, so what lands on the clipboard is
+                                // exactly what was on screen. Showing one
+                                // value and copying another is worse than
+                                // showing the URI, and re-deriving it here by
+                                // hand is how the two would drift apart.
+                                //
+                                // A URI with no usable `secret=` reduces to
+                                // `""`, which draws no row at all, so this
+                                // arm is unreachable for it; the emptiness
+                                // check keeps a drifted button state from
+                                // clearing the clipboard anyway.
+                                //
+                                // `totp_key_of` returns `Zeroizing<String>`;
                                 // `copy_text` takes an owned `String`, so a
                                 // plain copy is made here and handed
                                 // straight to the clipboard -- the same
                                 // trade `CopyPassword`, `CopyCardNumber` and
                                 // `CopySshPrivateKey` already make, and
                                 // stated rather than implied.
+                                //
+                                // The arm's whole body is one call, so
+                                // `the_clipboard_gets_the_key_not_the_uri`
+                                // can assert on the value this hands to
+                                // `copy_text` instead of on a rendered frame
+                                // that cannot reach a clipboard at all.
                                 DetailAction::CopyTotpSecret => {
-                                    if let Some(seed) =
-                                        item.login.as_ref().and_then(|l| l.totp.as_ref())
-                                    {
-                                        ui.ctx().copy_text(seed.to_string());
+                                    if let Some(key) = detail::totp_secret_clipboard_text(item) {
+                                        ui.ctx().copy_text(key.to_string());
                                     }
                                 }
                                 DetailAction::OpenWebsite(url) => {
