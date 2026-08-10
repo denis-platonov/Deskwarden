@@ -3430,6 +3430,199 @@ struct RebuiltVault {
     accounts: Option<accounts::AccountsState>,
 }
 
+/// **The in-window lock's teardown, as a function rather than a closure body.**
+///
+/// Lifted out of [`RealVaultOps::open_window`]'s `park_and_work` worker
+/// WITHOUT a behaviour change: every line below is the line that was there,
+/// with the four captured values (`job_for_worker`, `drain_for_worker`,
+/// `schedule_for_worker`, `rebuilt_for_worker`) spelled as parameters. Nothing
+/// is cloned or taken on the way in -- all four arrive as shared borrows, and
+/// the estate itself is never handed here at all: it is reached through
+/// `park`, which is the whole point of [`EstatePark`].
+///
+/// **Why it is a function.** `there_is_exactly_one_teardown_and_repopulate_path`
+/// forbids a SECOND copy of this sequence, and the startup host needs the same
+/// ~110 lines. A caller that needs them must reach them here. Today
+/// `open_window` is the only caller, and
+/// `the_lifted_teardown_pieces_have_one_definition_and_one_caller_each` holds
+/// it to exactly that -- so this function is provable now and shareable later.
+fn run_the_in_window_teardown(
+    park: &EstatePark,
+    lock_rx: &mpsc::Receiver<LockChannels>,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    drain: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    schedule: &[Duration],
+    rebuilt: &Arc<Mutex<Option<RebuiltVault>>>,
+) {
+    // `if let`, not a `let ... else { return; }`: the three
+    // regions behind `ops` are held to having no early exit at
+    // all (see `nothing_outside_the_two_branch_bodies_may_jump`),
+    // and that rule is about the shape of the code rather than
+    // about which frame the jump leaves. An `Err` here is the
+    // window having ended without ever locking -- nothing was torn
+    // down and nothing has to be put back.
+    if let Ok((step_tx, token_rx)) = lock_rx.recv() {
+        // **ONE `with`, spanning the whole sequence, and a deliberate
+        // departure from `EstatePark`'s "short critical sections"
+        // note -- which names this caller and says what it costs.**
+        // `resettle_session_reporting_tray` needs `engine`, `child`,
+        // `token`, `details` and `task_in_progress` mutably and at the
+        // same time for its whole length; there is no shorter hold
+        // that is not a second teardown path spelled in phases. What
+        // is kept is the property obstacle 5 is about: the estate is
+        // in the slot the entire time, so it is never lost.
+        let published = park.with(|est| {
+            let mut tray_effects = Vec::new();
+            let outcome = resettle_session_reporting_tray(
+                &est.cache,
+                &mut est.engine,
+                &mut est.child,
+                job,
+                drain,
+                &mut est.task_in_progress,
+                &mut est.details,
+                &mut est.token,
+                // **The authenticate round trip.** `reauthenticate`
+                // opens an eframe window of its own, which is the
+                // blink; here the card is a STAGE of the window that
+                // is already up, so this side only asks for it and
+                // waits for what it produced. A window closed on the
+                // card drops the sender, this `recv` fails, and `None`
+                // reaches `resettle_session_with`'s declined arm --
+                // which stands autofill down rather than blocking a
+                // thread on a password that is never coming.
+                || {
+                    let _ = step_tx.send(app_window::TeardownStep::NeedsSignIn);
+                    let produced = token_rx.recv().ok()?;
+                    if let Err(e) = est.store.save(&produced) {
+                        log::error!("failed to persist session token: {e}");
+                    }
+                    Some(produced)
+                },
+                // **The spinner-less probe.** `resettle_session`'s own
+                // probe is `wait_for_vault_ready_with_spinner`, which
+                // opens an eframe window of its own; the spinner is
+                // already on screen here -- it is this window's
+                // `Working` stage -- and a worker thread may not open
+                // one at all. Same wait, same schedule, no window.
+                |_message| match wait_for_vault_ready(est.cache.bridge(), schedule) {
+                    Ok(items) => VaultReadyOutcome::Ready(items),
+                    Err(e) => VaultReadyOutcome::Failed(e),
+                },
+                &mut tray_effects,
+            );
+            // **The tray labels are dropped here, and that is not an
+            // oversight.** `AppTray` owns a hidden Win32 window bound
+            // to the thread that built it, so a worker cannot apply
+            // them; `main`'s idle loop reconciles the Sync label as
+            // soon as this window is gone. The lift exists so the body
+            // is movable, and this is the caller that moves it.
+            log::info!(
+                "the in-window lock's teardown finished with {outcome:?}; {} tray label \
+                 update(s) were reported and are left to `main`'s reconciliation",
+                tray_effects.len()
+            );
+            RebuiltVault {
+                outcome,
+                cache: Arc::clone(&est.cache),
+                token: est.token.clone(),
+                auto_lock: est.settings.auto_lock(),
+                accounts: est.accounts.clone(),
+            }
+        });
+        // `None` means the waiting thread has already reclaimed: the
+        // window gave up on this teardown, so there is nobody left to
+        // tell and nothing left to rebuild.
+        if let Some(published) = published {
+            *rebuilt.lock().unwrap_or_else(|e| e.into_inner()) = Some(published);
+            let _ = step_tx.send(app_window::TeardownStep::Finished);
+        }
+    }
+}
+
+/// **The vault frame the window comes back to after its own lock.**
+///
+/// Lifted out of [`RealVaultOps::open_window`]'s `rebuild_vault` closure
+/// WITHOUT a behaviour change: the two captured values become owned
+/// parameters and `edited_before_lock` -- which `run_from_vault` hands the
+/// closure -- becomes the last one. Runs on the FRAME thread, and so must
+/// not reach the park: it reads only what [`run_the_in_window_teardown`]
+/// published, which is why `rebuilt` is the only shared thing it takes.
+fn rebuild_the_vault_after_the_lock(
+    rebuilt: &Arc<Mutex<Option<RebuiltVault>>>,
+    fill_stats: fill_stats::FillStats,
+    icon_cache_dir: std::path::PathBuf,
+    edited_before_lock: Option<settings::Settings>,
+) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)> {
+    // Expression-shaped, with no `?` and no early
+    // `return`, for the reason the worker above is: this
+    // whole method is held to having no jump in it.
+    rebuilt
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .filter(|published| {
+            // **The one thing that decides whether there is
+            // a vault to come back to.** `BackendNotStarted`
+            // is a declined sign-in or a backend that would
+            // not come back: `stand_down_after_unlock` has
+            // already run, so asking again would ask for the
+            // master password the user just gave, to retry
+            // the thing that just failed.
+            let rebuildable = published.outcome != ResettleOutcome::BackendNotStarted;
+            if !rebuildable {
+                log::warn!(
+                    "the lock's teardown produced no session, so there is \
+                     no vault to rebuild; the window closes to the tray"
+                );
+            }
+            rebuildable
+        })
+        .map(|published| {
+            // A fetch of its own, alongside the frame
+            // rather than in front of it: the teardown
+            // deliberately empties the cached details, so
+            // there is nothing to reuse.
+            let details = account_details_source(None, |tx| {
+                std::thread::spawn(move || {
+                    let _ = tx.send(login_ui::check_bw_status_details());
+                });
+            });
+            let (_options, frame, handles) = vault_window::build_frame(
+                Arc::clone(&published.cache),
+                fill_stats,
+                details,
+                published.token,
+                icon_cache_dir,
+                // **The gear beats the estate here.**
+                // `published.auto_lock` was read off the
+                // parked estate, and `main` -- the only
+                // writer of `settings.json` and the only
+                // writer of `est.settings` -- does not
+                // run until this window is gone, so the
+                // estate still holds the PRE-EDIT policy.
+                // Taking it would silently revert an
+                // auto-lock change made just before the
+                // lock, which is `c99fa40`
+                // ("the open window honours an auto-lock
+                // change at once") undone across a lock.
+                vault_window::effective_auto_lock(
+                    edited_before_lock.as_ref(),
+                    published.auto_lock,
+                ),
+                // The readiness probe has just answered, so
+                // this vault's own initial load may skip
+                // its wait.
+                true,
+                published.accounts,
+                // This window was styled and raised stages
+                // ago.
+                true,
+            );
+            (frame, handles)
+        })
+}
+
 impl VaultOps for RealVaultOps<'_> {
     fn open_window(
         &mut self,
@@ -3576,95 +3769,14 @@ impl VaultOps for RealVaultOps<'_> {
             // would freeze the window on the very frame that is supposed to
             // start showing the spinner.
             move |park| {
-                // `if let`, not a `let ... else { return; }`: the three
-                // regions behind `ops` are held to having no early exit at
-                // all (see `nothing_outside_the_two_branch_bodies_may_jump`),
-                // and that rule is about the shape of the code rather than
-                // about which frame the jump leaves. An `Err` here is the
-                // window having ended without ever locking -- nothing was torn
-                // down and nothing has to be put back.
-                if let Ok((step_tx, token_rx)) = lock_rx.recv() {
-                // **ONE `with`, spanning the whole sequence, and a deliberate
-                // departure from `EstatePark`'s "short critical sections"
-                // note -- which names this caller and says what it costs.**
-                // `resettle_session_reporting_tray` needs `engine`, `child`,
-                // `token`, `details` and `task_in_progress` mutably and at the
-                // same time for its whole length; there is no shorter hold
-                // that is not a second teardown path spelled in phases. What
-                // is kept is the property obstacle 5 is about: the estate is
-                // in the slot the entire time, so it is never lost.
-                let published = park.with(|est| {
-                    let mut tray_effects = Vec::new();
-                    let outcome = resettle_session_reporting_tray(
-                        &est.cache,
-                        &mut est.engine,
-                        &mut est.child,
-                        &job_for_worker,
-                        &drain_for_worker,
-                        &mut est.task_in_progress,
-                        &mut est.details,
-                        &mut est.token,
-                        // **The authenticate round trip.** `reauthenticate`
-                        // opens an eframe window of its own, which is the
-                        // blink; here the card is a STAGE of the window that
-                        // is already up, so this side only asks for it and
-                        // waits for what it produced. A window closed on the
-                        // card drops the sender, this `recv` fails, and `None`
-                        // reaches `resettle_session_with`'s declined arm --
-                        // which stands autofill down rather than blocking a
-                        // thread on a password that is never coming.
-                        || {
-                            let _ = step_tx.send(app_window::TeardownStep::NeedsSignIn);
-                            let produced = token_rx.recv().ok()?;
-                            if let Err(e) = est.store.save(&produced) {
-                                log::error!("failed to persist session token: {e}");
-                            }
-                            Some(produced)
-                        },
-                        // **The spinner-less probe.** `resettle_session`'s own
-                        // probe is `wait_for_vault_ready_with_spinner`, which
-                        // opens an eframe window of its own; the spinner is
-                        // already on screen here -- it is this window's
-                        // `Working` stage -- and a worker thread may not open
-                        // one at all. Same wait, same schedule, no window.
-                        |_message| {
-                            match wait_for_vault_ready(
-                                est.cache.bridge(),
-                                &schedule_for_worker,
-                            ) {
-                                Ok(items) => VaultReadyOutcome::Ready(items),
-                                Err(e) => VaultReadyOutcome::Failed(e),
-                            }
-                        },
-                        &mut tray_effects,
-                    );
-                    // **The tray labels are dropped here, and that is not an
-                    // oversight.** `AppTray` owns a hidden Win32 window bound
-                    // to the thread that built it, so a worker cannot apply
-                    // them; `main`'s idle loop reconciles the Sync label as
-                    // soon as this window is gone. The lift exists so the body
-                    // is movable, and this is the caller that moves it.
-                    log::info!(
-                        "the in-window lock's teardown finished with {outcome:?}; {} tray label \
-                         update(s) were reported and are left to `main`'s reconciliation",
-                        tray_effects.len()
-                    );
-                    RebuiltVault {
-                        outcome,
-                        cache: Arc::clone(&est.cache),
-                        token: est.token.clone(),
-                        auto_lock: est.settings.auto_lock(),
-                        accounts: est.accounts.clone(),
-                    }
-                });
-                // `None` means the waiting thread has already reclaimed: the
-                // window gave up on this teardown, so there is nobody left to
-                // tell and nothing left to rebuild.
-                if let Some(published) = published {
-                    *rebuilt_for_worker.lock().unwrap_or_else(|e| e.into_inner()) = Some(published);
-                    let _ = step_tx.send(app_window::TeardownStep::Finished);
-                }
-                }
+                run_the_in_window_teardown(
+                    park,
+                    &lock_rx,
+                    &job_for_worker,
+                    &drain_for_worker,
+                    &schedule_for_worker,
+                    &rebuilt_for_worker,
+                )
             },
             // ---- THE WAIT, AND ITS BODY IS THE EVENT LOOP. A blocking wait
             // here runs on THIS thread, which is the one eframe needs in order
@@ -3701,74 +3813,12 @@ impl VaultOps for RealVaultOps<'_> {
                     // published; it must not reach the park, which the worker
                     // may still be holding.
                     move |edited_before_lock| {
-                        // Expression-shaped, with no `?` and no early
-                        // `return`, for the reason the worker above is: this
-                        // whole method is held to having no jump in it.
-                        rebuilt
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .take()
-                            .filter(|published| {
-                                // **The one thing that decides whether there is
-                                // a vault to come back to.** `BackendNotStarted`
-                                // is a declined sign-in or a backend that would
-                                // not come back: `stand_down_after_unlock` has
-                                // already run, so asking again would ask for the
-                                // master password the user just gave, to retry
-                                // the thing that just failed.
-                                let rebuildable =
-                                    published.outcome != ResettleOutcome::BackendNotStarted;
-                                if !rebuildable {
-                                    log::warn!(
-                                        "the lock's teardown produced no session, so there is \
-                                         no vault to rebuild; the window closes to the tray"
-                                    );
-                                }
-                                rebuildable
-                            })
-                            .map(|published| {
-                                // A fetch of its own, alongside the frame
-                                // rather than in front of it: the teardown
-                                // deliberately empties the cached details, so
-                                // there is nothing to reuse.
-                                let details = account_details_source(None, |tx| {
-                                    std::thread::spawn(move || {
-                                        let _ = tx.send(login_ui::check_bw_status_details());
-                                    });
-                                });
-                                let (_options, frame, handles) = vault_window::build_frame(
-                                    Arc::clone(&published.cache),
-                                    fill_stats_for_rebuild,
-                                    details,
-                                    published.token,
-                                    icon_cache_dir_for_rebuild,
-                                    // **The gear beats the estate here.**
-                                    // `published.auto_lock` was read off the
-                                    // parked estate, and `main` -- the only
-                                    // writer of `settings.json` and the only
-                                    // writer of `est.settings` -- does not
-                                    // run until this window is gone, so the
-                                    // estate still holds the PRE-EDIT policy.
-                                    // Taking it would silently revert an
-                                    // auto-lock change made just before the
-                                    // lock, which is `c99fa40`
-                                    // ("the open window honours an auto-lock
-                                    // change at once") undone across a lock.
-                                    vault_window::effective_auto_lock(
-                                        edited_before_lock.as_ref(),
-                                        published.auto_lock,
-                                    ),
-                                    // The readiness probe has just answered, so
-                                    // this vault's own initial load may skip
-                                    // its wait.
-                                    true,
-                                    published.accounts,
-                                    // This window was styled and raised stages
-                                    // ago.
-                                    true,
-                                );
-                                (frame, handles)
-                            })
+                        rebuild_the_vault_after_the_lock(
+                            &rebuilt,
+                            fill_stats_for_rebuild,
+                            icon_cache_dir_for_rebuild,
+                            edited_before_lock,
+                        )
                     },
                 );
                 session = Some(ended);
@@ -8240,7 +8290,21 @@ mod tests {
         /// `StartupWork::produce`, which runs on the worker `app_window`
         /// spawns. Neither is on the path a window opens from; this is.
         fn open_vault_window_body() -> String {
-            let body = super::vault_ops_method_body(production_half_of_this_file(), "open_window");
+            // **Plus the lifted rebuild.** One of this region's two status
+            // calls -- the rebuilt vault's own fetch -- left `open_window`
+            // when the rebuild closure was lifted into
+            // `rebuild_the_vault_after_the_lock`. That call still runs on the
+            // frame thread of a window that is on screen, so it is still
+            // exactly what this guard exists to keep off that thread; read
+            // from `open_window` alone the guard would go on passing while
+            // watching one call instead of two.
+            let source = production_half_of_this_file();
+            let body = format!(
+                "{}\n{}",
+                super::vault_ops_method_body(source, "open_window"),
+                super::body_of(source, concat!("fn rebuild_the_vault_after_", "the_lock(")),
+            );
+            let body = body.as_str();
             assert!(
                 body.contains("handing off to eframe"),
                 "the sliced body is not the window-open region: every assertion over it would \
@@ -8256,7 +8320,17 @@ mod tests {
                 "the slice ran past the end of `open_window` and swept up the startup worker, \
                  whose own status call is legitimately synchronous"
             );
-            body
+            // Control that the rebuild half really joined the region: without
+            // it, a `body_of` that silently sliced something else would leave
+            // this guard reading one call again.
+            assert_eq!(
+                body.matches(status_call()).count(),
+                2,
+                "the region holds {} status call(s), not the two it has had since the lock \
+                 rebuilt the vault in place -- one at the open, one at the rebuild",
+                body.matches(status_call()).count()
+            );
+            body.to_string()
         }
 
         /// Every synchronous `bw status` call left on the path a window opens
@@ -8833,6 +8907,21 @@ mod tests {
                     100,
                     super::body_of(&code, concat!("fn open_vault_", "window(")),
                 ),
+                // The two bodies the in-window lock's lift moved out of
+                // `open_window`. The teardown reaches every estate field the
+                // loop does -- through the park rather than the destructure,
+                // but the divorce this module forbids is spellable in it just
+                // the same, and before the lift it was inside the region.
+                (
+                    "run_the_in_window_teardown",
+                    400,
+                    super::body_of(&code, concat!("fn run_the_in_window_", "teardown(")),
+                ),
+                (
+                    "rebuild_the_vault_after_the_lock",
+                    400,
+                    super::body_of(&code, concat!("fn rebuild_the_vault_after_", "the_lock(")),
+                ),
             ] {
                 assert!(
                     body.len() > floor,
@@ -8850,8 +8939,8 @@ mod tests {
                 region.push('\n');
             }
             assert_eq!(
-                seen, 5,
-                "control: the region is not the five places the vault loop now lives in"
+                seen, 7,
+                "control: the region is not the seven places the vault loop now lives in"
             );
             for marker in [
                 concat!("let Session", "Estate {"),
@@ -9694,6 +9783,58 @@ mod tests {
             body
         }
 
+        /// The lifted teardown worker's body as CODE.
+        ///
+        /// **A slice of its own, not folded into [`wiring`], and that is the
+        /// point of splitting the helper up.** The lift moved most of the
+        /// needles below out of `open_window` and into these two functions;
+        /// re-pointing every assertion at the UNION would let a needle that
+        /// belongs to the worker be satisfied by the call site, and vice
+        /// versa -- which is this file's signature defect (a guard that, after
+        /// a lift, passes for free) reintroduced by the very edit that moved
+        /// it. Positives are asserted where the code must be; only the
+        /// negatives, which are strictly stronger over more text, run over the
+        /// union.
+        fn teardown_worker() -> String {
+            let code = code_only(production_half_of_this_file());
+            let body = super::body_of(&code, concat!("fn run_the_in_window_", "teardown("));
+            assert!(
+                body.len() > 800,
+                "control: the lifted teardown sliced to {} bytes, which is not this function",
+                body.len()
+            );
+            body
+        }
+
+        /// The lifted rebuild's body as CODE. See [`teardown_worker`].
+        fn rebuilder() -> String {
+            let code = code_only(production_half_of_this_file());
+            let body = super::body_of(&code, concat!("fn rebuild_the_vault_after_", "the_lock("));
+            assert!(
+                body.len() > 500,
+                "control: the lifted rebuild sliced to {} bytes, which is not this function",
+                body.len()
+            );
+            body
+        }
+
+        /// The whole of the in-window lock's production wiring: the call site
+        /// and the two functions the lift moved its two longest bodies into.
+        ///
+        /// This is what the NEGATIVE assertions run over, because a spinner
+        /// probe, a `reauthenticate` or a `vault_window::run` is just as fatal
+        /// in a lifted body as it was in the closure it came from -- and after
+        /// the lift, `open_window` alone would forbid them in a region that no
+        /// longer contains the code that could commit them.
+        pub(super) fn wiring() -> String {
+            let mut all = opener();
+            all.push('\n');
+            all.push_str(&teardown_worker());
+            all.push('\n');
+            all.push_str(&rebuilder());
+            all
+        }
+
         /// The comments really do name the three things the scans below say
         /// are absent -- so "absent" is a fact about the code and not about a
         /// method that never mentions them at all.
@@ -9703,7 +9844,20 @@ mod tests {
         /// and the difference would be invisible.
         #[test]
         fn the_prose_names_what_the_code_must_not() {
-            let raw = vault_ops_method_body(production_half_of_this_file(), "open_window");
+            // The RAW union, matching [`wiring`]: the lift moved the comments
+            // that explain why the spinner probe and `reauthenticate` are not
+            // used into the two lifted functions, along with the code they
+            // explain. Read only from `open_window` this control would go
+            // silently vacuous the moment the lift happened -- which is the
+            // failure it exists to prevent, one level up.
+            let source = production_half_of_this_file();
+            let raw = format!(
+                "{}\n{}\n{}",
+                vault_ops_method_body(source, "open_window"),
+                super::body_of(source, concat!("fn run_the_in_window_", "teardown(")),
+                super::body_of(source, concat!("fn rebuild_the_vault_after_", "the_lock(")),
+            );
+            let raw = raw.as_str();
             for named in [
                 concat!("vault_window::", "run"),
                 concat!("reauthen", "ticate"),
@@ -9736,7 +9890,7 @@ mod tests {
                  screen, and a different window opens. That is the blink"
             );
             assert!(
-                !body.contains(concat!("vault_window::", "run(")),
+                !wiring().contains(concat!("vault_window::", "run(")),
                 "the vault window opens its OWN event loop again. `vault_window::run` returns \
                  only once its window is gone, so a lock caught inside it cannot keep the \
                  window -- which is the whole feature"
@@ -9751,14 +9905,20 @@ mod tests {
         /// it calls, and the two arguments it supplies are what item 8 is.
         #[test]
         fn the_worker_runs_the_lifted_body_with_a_windowless_probe() {
-            let body = opener();
+            // **Re-pointed at the lifted worker, not at the union.** Every
+            // positive here is a claim about the code the teardown RUNS; the
+            // call site could satisfy none of them and the teardown still be
+            // wrong. The negatives run over the union, where they are strictly
+            // stronger.
+            let body = teardown_worker();
+            let everywhere = wiring();
             assert!(
                 body.contains(concat!("resettle_session_reporting_", "tray(")),
                 "the in-window lock no longer runs the one teardown-and-repopulate sequence. \
                  Whatever it runs instead is a second one, and this crate has exactly one"
             );
             assert!(
-                !body.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
+                !everywhere.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
                 "the lock's worker probes with the SPINNER probe, which opens an `eframe` \
                  window of its own -- from a worker thread, behind a window that is already \
                  showing a spinner of its own"
@@ -9769,7 +9929,7 @@ mod tests {
                  repopulate runs against a backend that may not be up yet"
             );
             assert!(
-                !body.contains("tray::"),
+                !everywhere.contains("tray::"),
                 "the lock's worker touches the tray. `AppTray` owns a hidden Win32 window bound \
                  to the thread that built it, and this code runs on neither that thread nor \
                  with that tray in reach"
@@ -9780,25 +9940,29 @@ mod tests {
         /// window.**
         #[test]
         fn the_sign_in_is_a_round_trip_through_the_window_that_is_already_open() {
-            let body = opener();
+            // Split by where each half of the round trip lives after the lift:
+            // the ASK and the WAIT are the worker's, the CARD is the call
+            // site's. Asserting all four over one union would let the card
+            // alone satisfy "the worker asks for it".
+            let worker = teardown_worker();
             assert!(
-                !body.contains(concat!("reauthen", "ticate(")),
+                !wiring().contains(concat!("reauthen", "ticate(")),
                 "the lock's worker calls `reauthenticate`, which opens a whole new `eframe` \
                  window -- from a worker thread, while this window is on screen. That is the \
                  blink, moved rather than removed"
             );
             assert!(
-                body.contains(concat!("token_rx.", "recv()")),
+                worker.contains(concat!("token_rx.", "recv()")),
                 "nothing waits for the token the sign-in card produces, so the teardown either \
                  never authenticates or authenticates somewhere else"
             );
             assert!(
-                body.contains(concat!("TeardownStep::", "NeedsSignIn")),
+                worker.contains(concat!("TeardownStep::", "NeedsSignIn")),
                 "the worker never asks for the card, so the window sits on a spinner while the \
                  worker blocks on a password it never requested"
             );
             assert!(
-                body.contains(concat!("login_ui::build_login_", "frame(")),
+                opener().contains(concat!("login_ui::build_login_", "frame(")),
                 "the sign-in card is not built as a frame for the window that is already open"
             );
         }
@@ -9900,7 +10064,10 @@ mod tests {
         /// the fix for it.
         #[test]
         fn the_rebuilt_vault_honours_a_preference_edit_made_before_the_lock() {
-            let body = squeeze(&opener());
+            // The rebuild's OWN body: the lift moved it out of `open_window`,
+            // and the count control below is only meaningful over the region
+            // that builds the frame.
+            let body = squeeze(&rebuilder());
             assert!(
                 body.contains(concat!(
                     "effective_auto_lock( edited_before_lock.as_ref(), ",
@@ -9919,6 +10086,168 @@ mod tests {
             );
         }
 
+        /// **Both call sites are the lifted call and NOTHING ELSE.**
+        ///
+        /// A lift's own failure mode, and one this file has now found by
+        /// mutation twice: the body moves out correctly and the call site
+        /// then drops what it produced. `{ rebuild_the_vault_after_the_lock(
+        /// .. ); None }` compiles, warns about nothing, leaves every guard
+        /// over the lifted body green -- and the window closes to the tray
+        /// after every lock, which is the blink this whole feature exists to
+        /// remove, restored by the refactor that was supposed to enable
+        /// removing it. The same shape on the worker side (a call whose
+        /// arguments have been reordered or replaced) is invisible to a
+        /// mention count.
+        ///
+        /// So the two closures are pinned WHOLE, by exact text: the call is
+        /// the closure's only statement and its tail expression.
+        /// Whitespace-squeezed, so rustfmt may move the line breaks; nothing
+        /// else may move.
+        #[test]
+        fn the_two_lifted_calls_are_the_whole_of_the_closures_that_make_them() {
+            let body = squeeze(&opener());
+            for (what, wanted) in [
+                (
+                    "the teardown worker",
+                    squeeze(concat!(
+                        "move |park| { run_the_in_window_teardown( park, &lock_rx, ",
+                        "&job_for_worker, &drain_for_worker, &schedule_for_worker, ",
+                        "&rebuilt_for_worker, ) },"
+                    )),
+                ),
+                (
+                    "the rebuild",
+                    squeeze(concat!(
+                        "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
+                        "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
+                        "edited_before_lock, ) },"
+                    )),
+                ),
+            ] {
+                assert!(
+                    body.contains(&wanted),
+                    "{what}'s closure in `open_window` is not exactly its one call to the \
+                     lifted function. Anything before or after it is work the lift was \
+                     supposed to have moved, and anything AFTER it can discard what the call \
+                     produced -- a rebuild whose frame is thrown away closes the window on \
+                     every lock.\nwanted: {wanted}\ngot: {body}"
+                );
+            }
+            // Control: the pin really rejects the discarding shape it names,
+            // rather than matching any text that merely contains the call.
+            let discarding = squeeze(concat!(
+                "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
+                "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
+                "edited_before_lock, ); None },"
+            ));
+            let wanted = squeeze(concat!(
+                "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
+                "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
+                "edited_before_lock, ) },"
+            ));
+            assert!(
+                !discarding.contains(&wanted),
+                "control: the pin matches a call site that throws the rebuilt frame away, so \
+                 it is not checking what it says it checks"
+            );
+        }
+
+        /// **The teardown is handed the PARKED ESTATE's own six mutable
+        /// fields, not values of its own.**
+        ///
+        /// Found by mutation while lifting this body, and it survives at
+        /// `dd83229` too, so it is a pre-existing hole rather than one the
+        /// lift opened -- but the lift is what made it spellable in one line.
+        /// `&est.cache` replaced by `&Arc::new(VaultCache::new(est.cache.
+        /// bridge().clone()))` compiles, warns about nothing and passed all
+        /// 1905 + 198 tests: the sequence then clears a cache that is thrown
+        /// away one line later, so the window comes back showing the vault
+        /// items of the session it just "locked". Every neighbouring guard
+        /// was satisfied -- `resettle_session_reporting_tray(` was still
+        /// named, the probe was still windowless, the tray was still
+        /// untouched. What none of them said is WHAT it is called ON.
+        ///
+        /// Six fields, by exact text, because each one is a different way for
+        /// the lock to report success and lock nothing: a detached `cache`
+        /// serves the old items, a detached `engine` leaves autofill armed
+        /// for the old vault, a detached `child` strands `bw serve` on the
+        /// port, a detached `token` leaves the estate authenticating with a
+        /// dead session.
+        #[test]
+        fn the_teardown_runs_against_the_parked_estate_itself() {
+            let body = squeeze(&teardown_worker());
+            let wanted = squeeze(concat!(
+                "resettle_session_reporting_tray( &est.cache, &mut est.engine, &mut est.child, ",
+                "job, drain, &mut est.task_in_progress, &mut est.details, &mut est.token,"
+            ));
+            assert!(
+                body.contains(&wanted),
+                "the lock's teardown is not called on the parked estate's own fields. Anything \
+                 else here is a teardown of a value that is dropped when this call returns: the \
+                 window reports a lock, `main` skips its recovery, and the vault it comes back \
+                 to is the one that was supposed to be gone.\nwanted: {wanted}\ngot: {body}"
+            );
+            // Control: the needle is exact enough to reject a single field
+            // being swapped for a value of its own.
+            assert!(
+                !squeeze("resettle_session_reporting_tray( &fresh_cache, &mut est.engine,")
+                    .contains(&wanted),
+                "control: the needle matches a call that detached the cache, so it is not \
+                 checking what it says it checks"
+            );
+        }
+
+        /// **Each lifted piece has exactly ONE definition and exactly ONE
+        /// caller, and that caller is `open_window`.**
+        ///
+        /// The lift exists so that the startup host can reach the same
+        /// teardown instead of writing a second copy of it -- which
+        /// `there_is_exactly_one_teardown_and_repopulate_path` forbids and,
+        /// as that guard's own ledger records, a second CALLER does not trip.
+        /// So the "one path" property has to be held here instead, and held
+        /// in the form that still bites while there is only one host: two
+        /// mentions each (the `fn` and the call), with the call named inside
+        /// `open_window`.
+        ///
+        /// **When step 5 wires the startup host, this guard is what forces
+        /// the decision through a test edit** rather than letting a second
+        /// call site appear silently -- and the edit it will need is to pin
+        /// BOTH positions, not to raise a number.
+        #[test]
+        fn the_lifted_teardown_pieces_have_one_definition_and_one_caller_each() {
+            let code = code_only(production_half_of_this_file());
+            let call_site = opener();
+            let mut checked = 0usize;
+            for name in [
+                concat!("run_the_in_window_", "teardown("),
+                concat!("rebuild_the_vault_after_", "the_lock("),
+            ] {
+                checked += 1;
+                assert_eq!(
+                    code.matches(name).count(),
+                    2,
+                    "`{name}` is mentioned {} time(s) in the production code; two is the only \
+                     count that means one definition and one caller. Three is a second route \
+                     into the one teardown-and-repopulate path this crate has, which is what \
+                     `there_is_exactly_one_teardown_and_repopulate_path` cannot see because it \
+                     counts COPIES rather than callers. One means the lift lost its caller and \
+                     the in-window lock does nothing at all",
+                    code.matches(name).count()
+                );
+                assert_eq!(
+                    call_site.matches(name).count(),
+                    1,
+                    "`{name}`'s one call is not inside `RealVaultOps::open_window`. The lifted \
+                     bodies are that method's own work; a call from anywhere else is a second \
+                     host wired in without the decision that step being landed"
+                );
+            }
+            assert_eq!(checked, 2, "control: both lifted pieces were checked");
+            // Control: the counter can tell a real absence from a needle it
+            // cannot see at all.
+            assert_eq!(code.matches(concat!("run_the_in_window_", "teardowns(")).count(), 0);
+        }
+
         /// **The production closure really calls it.**
         ///
         /// The test above holds `forward_lock_channels` to its job; this holds
@@ -9934,11 +10263,12 @@ mod tests {
                  lock then reports a teardown that never ran, `main` skips its recovery, and \
                  the vault says locked with a live `bw serve` answering out of a full cache"
             );
-            // Positive control: the receiving end really is in this method, so
-            // the needle above is about a handoff that has somewhere to go.
+            // Positive control: the receiving end really exists, so the needle
+            // above is about a handoff that has somewhere to go. In the LIFTED
+            // worker since the lift, which is where the `recv` went.
             assert!(
-                body.contains(concat!("lock_rx.", "recv()")),
-                "control: `open_window` has no worker waiting on the lock channel at all"
+                teardown_worker().contains(concat!("lock_rx.", "recv()")),
+                "control: the lock's worker does not wait on the lock channel at all"
             );
         }
     }
@@ -11218,6 +11548,34 @@ mod tests {
                 methods, 3,
                 "control: the loop visited every `VaultOps` method"
             );
+
+            // **And the two bodies the lift moved OUT of `open_window`.**
+            // Both are still `open_window`'s work, one call frame further
+            // down; an early exit in either skips the rest of a teardown or a
+            // rebuild exactly as it would have when they were closures inside
+            // the method above. Read from the three methods alone, this guard
+            // would have gone on passing over code that no longer contains
+            // what it forbids -- the "correct in isolation, reaching nothing"
+            // shape, produced by the lift itself.
+            let mut lifted = 0usize;
+            for head in [
+                concat!("fn run_the_in_window_", "teardown("),
+                concat!("fn rebuild_the_vault_after_", "the_lock("),
+            ] {
+                let body = super::body_of(&production_code, head);
+                assert!(
+                    body.len() > 400,
+                    "`{head}` sliced to {} bytes, which is not its body",
+                    body.len()
+                );
+                lifted += 1;
+                assert!(
+                    jumps_in(&body).is_empty(),
+                    "`{head}` jumps with {:?}:\n{body}",
+                    jumps_in(&body)
+                );
+            }
+            assert_eq!(lifted, 2, "control: both lifted bodies were visited");
 
             // The second net. Every override of the decision, wherever it is
             // put and whatever it does, has to ask this question again.
