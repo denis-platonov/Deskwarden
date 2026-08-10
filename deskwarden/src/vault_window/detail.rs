@@ -1511,6 +1511,25 @@ fn row_offers_copy(value: &str) -> bool {
 /// from the painted frame and the card is shorter by the row's height) and by
 /// its positive control `a_non_empty_password_still_draws_its_whole_row`.
 ///
+/// **Where the skip actually happens, stated exactly, because a commit
+/// message once overstated it.** Every one of the four production calls to
+/// [`masked_row`] is already gated on emptiness BEFORE the call:
+///
+/// * the login password and each previous password, on this predicate itself
+///   (`password_row`'s caller and `previous_passwords`);
+/// * a card's `Number` and `Security code`, and an SSH key's `Private key`,
+///   because those three arrive as `Option`s their field structs have already
+///   trimmed and filtered, so an empty one is `None` and the call is not made.
+///
+/// So the early return inside `masked_row` is **defence in depth and not a
+/// repair of a live path**: nothing in production reaches it, and the test
+/// that covers it calls `masked_row` directly. It is kept because the
+/// function is public to this module and a fifth caller must not have to
+/// rediscover the rule -- not because a row was ever observed getting past
+/// it. `64192c7`'s subject reads as a repair and `235e1f1`'s "and the same
+/// for every `masked_row` caller" reads as four separate gates; the truth is
+/// one gate on this predicate, two structural, and one guard nobody calls.
+///
 /// Deliberately the same rule as [`row_offers_copy`] rather than a second
 /// spelling of it: "nothing to copy" and "nothing to show" are the same fact
 /// about a secret, and two predicates could drift into a row that copies and
@@ -4539,8 +4558,14 @@ fn masked_row(
 ) {
     // **Nothing to hide, so nothing to draw** -- see [`masked_row_visible`].
     // The return is BEFORE any allocation, so the row leaves no band, no
-    // hairline slot and no eye behind it; the callers gate their separators
-    // on the same predicate so the hairline above it goes with it.
+    // hairline slot and no eye behind it.
+    //
+    // **Unreachable from production, deliberately.** The callers do not merely
+    // "gate their separators on the same predicate" -- they gate the CALL, so
+    // no production path arrives here with an empty value at all (see
+    // `masked_row_visible`'s doc for the four, one by one). This is the rule
+    // stated where a fifth caller will read it, and the test that exercises it
+    // calls this function directly.
     if !masked_row_visible(value) {
         return;
     }
@@ -7311,12 +7336,22 @@ mod tests {
     /// half a claim. `DetailBody::NotesOnly` -- a secure note, whose only card
     /// in the unbound pass IS its note -- is in the loop for the same reason:
     /// it must hold by the rule and not by there being nothing to be last of.
+    ///
+    /// **The login case is the loaded one, and it used not to be.** NOTES was
+    /// moved out from between PREVIOUS PASSWORDS and AUTOFILL TARGETS -- and
+    /// `a_noted_item` carries neither a website nor a password history, so
+    /// neither of those two cards was in the frame and the ordering was proved
+    /// against every card except the two it is about. The `Login` pass now
+    /// uses a fixture that draws both, and asserts by name that it did.
     #[test]
     fn notes_is_the_last_card_for_every_kind_that_shows_it() {
         let mut visited = 0;
         for kind in EVERY_KIND {
             for bound in [false, true] {
-                let base = a_noted_item(item_type_for(kind));
+                let base = match kind {
+                    ItemKind::Login => a_noted_login_with_targets_and_history(),
+                    _ => a_noted_item(item_type_for(kind)),
+                };
                 let item = if bound {
                     bound_to(&base, &a_desktop_match())
                 } else {
@@ -7350,6 +7385,20 @@ mod tests {
                         headings
                     );
                 }
+                if kind == ItemKind::Login {
+                    // The two cards NOTES was moved out from between. Named,
+                    // because the whole point of the login fixture is that
+                    // they are in the frame this assertion is made against --
+                    // a count alone would be satisfied by two other cards.
+                    for heading in ["AUTOFILL TARGETS", "PREVIOUS PASSWORDS"] {
+                        assert!(
+                            headings.iter().any(|(h, _)| *h == heading),
+                            "the login fixture drew no {heading} card, so 'NOTES is below \
+                             it' is not being asserted at all; cards: {:?}",
+                            headings.iter().map(|(h, _)| *h).collect::<Vec<_>>()
+                        );
+                    }
+                }
 
                 let (last, last_rect) = *headings.last().expect("no cards at all");
                 assert_eq!(
@@ -7379,9 +7428,27 @@ mod tests {
         let body = match kind {
             // A secure note's body IS its note: no body card of its own.
             ItemKind::SecureNote => 0,
+            // LOGIN CREDENTIALS, plus the AUTOFILL TARGETS and PREVIOUS
+            // PASSWORDS that `a_noted_login_with_targets_and_history` exists
+            // to put on the pane.
+            ItemKind::Login => 3,
             _ => 1,
         };
         body + 1 + usize::from(bound)
+    }
+
+    /// A login that draws **every card a login can**, carrying a note: a
+    /// website (so AUTOFILL TARGETS is painted), two previous passwords (so
+    /// PREVIOUS PASSWORDS is), and credentials.
+    ///
+    /// This is the fixture `notes_is_the_last_card_for_every_kind_that_shows_
+    /// it` needs and `a_noted_item` is not: NOTES used to be drawn BETWEEN
+    /// those two cards, and a fixture without them proves the ordering
+    /// against every card except the two the change is about.
+    fn a_noted_login_with_targets_and_history() -> VaultItem {
+        let mut item = a_login_with_history(2);
+        item.notes = Some(A_NOTE.to_string().into());
+        item
     }
 
     /// `an_item` of `kind` carrying a note, which is what a NOTES card needs

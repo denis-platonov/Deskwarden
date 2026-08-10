@@ -9074,6 +9074,60 @@ mod edit_pane_layout_tests {
         assert_eq!(checked, 18, "the row loop visited {checked} labels");
     }
 
+    /// **And every one of those six rows can be reached on a pane the app can
+    /// really be resized to.**
+    ///
+    /// The width test above draws its six rows on an `UNCULLED_PANE_HEIGHT`
+    /// pane, which is the only way to have all six in one frame -- and that
+    /// makes it a claim about DRAWING, not about reach. A form whose sixth row
+    /// sat below the last scroll position would satisfy it and still be
+    /// uneditable. This is the height half: `MIN_PANE_HEIGHT`, and each row
+    /// scrolled to in turn by its own name, which is the only thing on a row
+    /// that tells it from the other five.
+    ///
+    /// The rows are visited top-down because `scroll_to_reveal` only ever
+    /// scrolls down; the first one is asserted reachable before any scrolling,
+    /// and the LAST one is asserted culled before any, so the walk cannot be a
+    /// no-op on a form that already fits.
+    #[test]
+    fn every_custom_field_row_is_reachable_at_the_minimum_window_height() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        let names: Vec<String> = (0..4)
+            .map(|i| format!("text {i}"))
+            .chain((0..2).map(|i| format!("hidden {i}")))
+            .collect();
+        assert_eq!(names.len(), 6, "the fixture is not six rows");
+        for (i, name) in names.iter().enumerate() {
+            let mut field =
+                FieldDraft::new_of(if i < 4 { FieldRole::Text } else { FieldRole::Hidden });
+            field.name = name.clone();
+            draft.fields.push(field);
+        }
+
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let unscrolled = frame(&ctx, pane, &mut draft, false, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        assert!(
+            !unscrolled
+                .rects_of(names.last().expect("six names"))
+                .iter()
+                .any(|r| bounds.contains_rect(*r)),
+            "the six-row form already fits a {}x{} pane, so this test is not exercising              scrolling at all",
+            pane.x,
+            pane.y
+        );
+
+        let mut reached = 0;
+        for name in &names {
+            let after = scroll_to_reveal(&ctx, pane, &mut draft, name);
+            assert_inside(&format!("the {name:?} row's name box"), name, pane, &after);
+            reached += 1;
+        }
+        assert_eq!(reached, 6, "the row walk reached {reached} rows, not 6");
+    }
+
     /// **The TOTP seed is masked, and is never painted in the clear.**
     ///
     /// The seed is the whole of a second factor: anyone who reads it off the
