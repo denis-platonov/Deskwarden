@@ -11898,7 +11898,23 @@ mod tests {
             ),
             (KEYLESS_URI, "", "a URI with no secret= is not a key"),
             ("otpauth://totp/L?secret=&issuer=Acme", "", "an empty secret= is not a key either"),
-            ("otpauth://totp/L", "", "a URI with no query at all is not a key"),
+            (
+                "otpauth://totp/L",
+                "",
+                "a URI with no query at all is not a key. NOTE this row alone holds \
+                 NOTHING about the `no query` early return: delete that return, let \
+                 the whole path fall through AS the query, and `totp/L` still has no \
+                 `=`, so the loop skips it and the answer is still \"\". The row below \
+                 is the one that holds it",
+            ),
+            (
+                "otpauth://secret=NOPE",
+                "",
+                "a path that would READ AS A QUERY if the `no query` early return \
+                 were deleted: with the return gone the loop finds `secret=NOPE` in \
+                 the PATH and the row shows -- and the clipboard gets -- a key the \
+                 user never stored, out of a URI that has no query at all",
+            ),
             (
                 "otpauth://totp/L#secret=NOPE",
                 "",
@@ -11942,7 +11958,18 @@ mod tests {
             (
                 "otpauth://totp/L?secret=ABCD%",
                 "ABCD%",
-                "a % in the last two bytes is left literal too",
+                "a % as the LAST byte is left literal. NOTE this position alone holds \
+                 NOTHING about the bound `i + 2 < bytes.len()`: here `i + 1 < len` is \
+                 already false too, so the off-by-one mutant never fires on this row. \
+                 The row below is the position that holds it",
+            ),
+            (
+                "otpauth://totp/L?secret=ABCD%A",
+                "ABCD%A",
+                "a % as the SECOND-TO-LAST byte -- the position `i + 2 < bytes.len()` \
+                 exists for. Weaken the bound to `i + 1 < bytes.len()` and the decoder \
+                 reads bytes[i + 2] one past the end and PANICS, on a value the user \
+                 typed into their own vault. The shipped bound is what stops that",
             ),
             (
                 "otpauth://totp/L?secret=%FF%FE",
@@ -11985,6 +12012,14 @@ mod tests {
                 "otpauth://totp/L?issuersecret=NOPE",
                 "",
                 "...and on its own issuersecret= is still not a key",
+            ),
+            (
+                "otpauth://totp/L?secretx=NOPE&secret=YES234",
+                "YES234",
+                "the name is matched whole at BOTH ends. The two issuersecret= rows \
+                 hold only the prefix end -- weaken `eq_ignore_ascii_case` to \
+                 `starts_with` and they still pass, while secretx= walks off with \
+                 the key. This row is the suffix end",
             ),
             (
                 "otpauth://totp/L?secret=FIRST2&secret=SECOND",
