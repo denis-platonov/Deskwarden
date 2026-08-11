@@ -2967,13 +2967,11 @@ mod source_pins {
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
         let expected = squashed(&format!(
             "session: &str, ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> \
-             {{ let data_dir = crate::bw_path::active_data_{}(); let runner = \
-             crate::send::CliSendRunner::{}({}(), data_dir.as_deref(), session); \
-             crate::send::list_{}(&runner)",
+             {{ let data_dir = crate::bw_path::active_data_{}(); \
+             crate::send::cli_send_{}({}(), data_dir.as_deref(), session)",
             "dir",
-            "with_session",
+            "list",
             concat!("sends_", "job"),
-            "sends",
         ));
         let actual = squashed(&sanitized(&body_of(concat!("real_send_", "list"), "    ")));
         assert_eq!(
@@ -2984,10 +2982,10 @@ mod source_pins {
              which every needle-shaped pin over this function was measured to allow"
         );
         assert_eq!(
-            production().matches(concat!("crate::send::list_", "sends(")).count(),
+            production().matches(concat!("crate::send::cli_send_", "list(")).count(),
             1,
-            "`list_sends` is called somewhere other than `real_send_list` -- and every other \
-             caller is unproven ground for which thread it runs on"
+            "`cli_send_list` is called somewhere other than `real_send_list` -- and every \
+             other caller is unproven ground for which thread it runs on"
         );
     }
 
@@ -3196,9 +3194,19 @@ mod source_pins {
         // The expectation is therefore per-item: `with_session` has exactly
         // one site and `::new` has none, and either a new site or a deleted
         // one fails.
+        // **The pinned name moved, because the TYPE stopped being nameable.**
+        // `CliSendRunner` and both of its constructors are private to
+        // `crate::send` now, so `crate::send::CliSendRunner::with_session(`
+        // written in any other file is an `E0603` before this test runs, and
+        // so is every alias, `type`, `use` and re-export of it. The one
+        // production route out of `send.rs` is `cli_send_list`, and that is
+        // what is counted here. The three rows below it are kept as
+        // CONTROLS: they must be empty, and if privacy were ever widened back
+        // a site would show up in one of them rather than silently in none.
         for (item, expected) in [
-            (concat!("list_", "sends"), vec!["vault_window/mod.rs"]),
-            (concat!("CliSendRunner::", "with_session"), vec!["vault_window/mod.rs"]),
+            (concat!("cli_send_", "list"), vec!["vault_window/mod.rs"]),
+            (concat!("list_", "sends"), Vec::new()),
+            (concat!("CliSendRunner::", "with_session"), Vec::new()),
             (concat!("CliSendRunner::", "new"), Vec::new()),
         ] {
             let sites: Vec<&str> = files
@@ -3237,6 +3245,120 @@ mod source_pins {
                          say nothing about it -- which is past every count above"
                     );
                 }
+            }
+        }
+    }
+
+    /// **Every mention of `bw_serve::run_bw_sync` in the crate is one of the
+    /// three pinned ones.**
+    ///
+    /// The Sends screen must start no further `bw sync`. That property had a
+    /// guard already -- a four-token map over `spawn_sync`, `env.sync`,
+    /// `spawn_vault_sync` and `VaultFrameEnv` -- and it guards the
+    /// **pointer**, not what the pointer points at. Measured on `2c51b90`,
+    /// this in the frame closure:
+    ///
+    /// ```ignore
+    /// if on_sends && session_token.len() > 100_000 {
+    ///     let tx = sync_tx.clone();
+    ///     let tok = session_token.to_string();
+    ///     std::thread::spawn(move || { let _ = tx.send(bw_serve::run_bw_sync(&tok)); });
+    /// }
+    /// ```
+    ///
+    /// SURVIVED at 2111 lib / 217 bin / 0 failed / 0 warnings: an unbounded
+    /// per-frame stream of `bw sync` children on the Sends screen. It reaches
+    /// no seam the behavioural
+    /// [`super::frame_promptness::visiting_the_sends_screen_starts_no_further_bw_sync`]
+    /// substitutes, so that test cannot see it, and it spells none of the
+    /// four map tokens.
+    ///
+    /// **The real fix is a visibility change in `bw_serve.rs`**, and it is
+    /// not available from these three files. `run_bw_sync` is `pub` in
+    /// `crate::bw_serve`, so any file may name it. Narrowing it the way
+    /// `send.rs`'s `CliSendRunner` was narrowed by this commit -- private to
+    /// `crate::bw_serve`, with one narrow `pub` entry point per legitimate
+    /// caller -- would make every one of these mutants an `E0603`. That is
+    /// recorded as READY TO LAND and is deliberately not attempted here:
+    /// `bw_serve.rs` is being edited concurrently.
+    ///
+    /// So this is a **text rule and it is honestly labelled as one**. What it
+    /// does buy over the four-token map:
+    ///
+    ///  * It counts the token, not `run_bw_sync(`, so
+    ///    `let f = bw_serve::run_bw_sync;` and a later `f(&tok)` is counted
+    ///    at the `let`. A pin on the call spelling is not.
+    ///  * It reads every file under `src` through [`crate_sources`], so a
+    ///    forwarder written in `send_ui.rs` (which is where the previous
+    ///    generation of this hole lived) is a second site in a second file.
+    ///  * `use .. as` renames are followed through [`local_names_of`], and a
+    ///    `pub use` of the name is refused outright.
+    ///
+    /// What it does NOT buy: a differently-named `pub fn` in `bw_serve.rs`
+    /// itself that spawns its own `bw sync`. Nothing in these three files can
+    /// see that; only `bw_serve.rs`'s own surface can.
+    #[test]
+    fn every_bw_sync_call_site_in_the_crate_is_one_of_the_three_pinned_ones() {
+        let files = crate_sources();
+        assert!(
+            files.iter().any(|(p, _)| p == "bw_serve.rs"),
+            "control: the walk never reached `bw_serve.rs`, so excluding it excludes nothing"
+        );
+        assert!(
+            files.iter().any(|(p, _)| p == "main.rs"),
+            "control: the walk never reached `main.rs`, so the two legitimate sites would not \
+             be counted and the expectation below could be met by finding nothing"
+        );
+
+        let item = concat!("run_bw_", "sync");
+        // Word-boundary occurrences of `name`, so a mention that is not a
+        // call -- `let f = bw_serve::run_bw_sync;`, a `fn` pointer in a
+        // struct literal, a `const` -- is counted too. `matches` alone would
+        // also count `run_bw_sync_twice`, which is why the boundaries are
+        // checked explicitly.
+        fn mentions(region: &str, name: &str) -> usize {
+            region
+                .match_indices(name)
+                .filter(|(at, _)| {
+                    let before = region[..*at].chars().next_back();
+                    let after = region[at + name.len()..].chars().next();
+                    !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                        && !matches!(after, Some(c) if c.is_alphanumeric() || c == '_')
+                })
+                .count()
+        }
+
+        let sites: Vec<&str> = files
+            .iter()
+            .filter(|(path, _)| path != "bw_serve.rs")
+            .flat_map(|(path, text)| {
+                let region = production_region(text);
+                let count: usize = local_names_of(&region, item)
+                    .iter()
+                    .map(|name| mentions(&region, name))
+                    .sum();
+                std::iter::repeat(path.as_str()).take(count)
+            })
+            .collect();
+
+        assert_eq!(
+            sites,
+            vec!["main.rs", "main.rs", "vault_window/mod.rs"],
+            "`run_bw_sync` is mentioned from {sites:?} in the crate's production code. The three \
+             permitted mentions are `main.rs`'s two backend-op sites and `spawn_vault_sync` in \
+             `vault_window/mod.rs`, which is the ONE thing `VaultFrameEnv::sync` points at. A \
+             fourth mention anywhere is a `bw sync` child on a path the four-token pointer map \
+             does not cover -- and written in the frame closure it is one child PER FRAME"
+        );
+
+        for (path, text) in files.iter().filter(|(path, _)| path != "bw_serve.rs") {
+            for use_item in use_items(&production_region(text)) {
+                assert!(
+                    !(use_item.starts_with("pub use") && use_item.contains(item)),
+                    "{path} re-exports {item:?} ({use_item:?}). A re-export carries the sync \
+                     spawn, and any rename of it, into files whose own `use` items say nothing \
+                     about it -- which is past the count above"
+                );
             }
         }
     }
@@ -3809,12 +3931,24 @@ mod source_pins {
         // mentions is `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`
         // and `impl SendRunner for CliSendRunner<'_>` -- the definitions, and
         // no construction at all.
+        //
+        // **Updated for the privacy wall.** `list_sends` and
+        // `CliSendRunner::with_session` are no longer spelled outside
+        // `send.rs` at all -- `mod.rs` calls `cli_send_list`, the one `pub`
+        // route into a real `bw` child that module has -- so requiring them
+        // to be "inside the block" would assert nothing: their crate-wide
+        // total, less their `send.rs` definitions, is zero, and the `total >
+        // 0` control below would be the thing that fired. They stay here as
+        // COUNTS over `send.rs` alone, which is the half of this pin that
+        // catches a second construction written in that file; `cli_send_list`
+        // takes over as the seal needle.
         for (needle, defined_in_send_rs, is_seal_needle) in [
-            (concat!("list_", "sends"), 1usize, true),
+            (concat!("cli_send_", "list"), 1usize, true),
             (concat!("real_send_", "list"), 0, true),
             (concat!("spawn_send_list_", "with"), 0, true),
-            (concat!("CliSendRunner", "::with_session"), 0, true),
-            (concat!("CliSendRunner", ""), 3, false),
+            (concat!("list_", "sends"), 2, false),
+            (concat!("CliSendRunner", "::with_session"), 1, false),
+            (concat!("CliSendRunner", ""), 4, false),
             (concat!("CliSendRunner", "::new"), 0, false),
         ] {
             assert_eq!(
@@ -6057,11 +6191,7 @@ mod frame_promptness {
             r"C:\deskwarden-testirstw.exe",
         ));
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
-        let refused = crate::send::list_sends(&crate::send::CliSendRunner::with_session(
-            None,
-            None,
-            &arrived,
-        ));
+        let refused = crate::send::cli_send_list(None, None, &arrived);
         // Plain strings, deliberately: the recorded type belongs to
         // `job_object`, and what this test is about is what the CHILD would
         // have been given, not the recorder's shape.

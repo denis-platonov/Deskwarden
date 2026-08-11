@@ -977,7 +977,7 @@ fn drain<R: Read>(pipe: Option<R>) -> Vec<u8> {
 /// It adds nothing to the invocation. The arguments, the stdin body and the
 /// session are all read off the [`SendInvocation`] it is handed, which is the
 /// point of that type being the whole of what reaches the CLI.
-pub struct CliSendRunner<'a> {
+struct CliSendRunner<'a> {
     /// The kill-on-close job the child is placed in **before it executes a
     /// single instruction**.
     ///
@@ -1036,7 +1036,7 @@ pub struct CliSendRunner<'a> {
 }
 
 impl<'a> CliSendRunner<'a> {
-    pub fn new(
+    fn new(
         job: Option<&'a crate::job_object::KillOnCloseJob>,
         data_dir: Option<&'a Path>,
     ) -> Self {
@@ -1056,15 +1056,14 @@ impl<'a> CliSendRunner<'a> {
     /// what the Sends screen used to show. `create` never had this problem
     /// because its invocation is built from a plan the caller already holds a
     /// session for.
-    pub fn with_session(
+    fn with_session(
         job: Option<&'a crate::job_object::KillOnCloseJob>,
         data_dir: Option<&'a Path>,
         session: &str,
     ) -> Self {
         Self {
-            job,
-            data_dir,
             session: Some(Zeroizing::new(session.to_string())),
+            ..Self::new(job, data_dir)
         }
     }
 
@@ -1079,7 +1078,7 @@ impl<'a> CliSendRunner<'a> {
     /// already read it back without a process. Job membership cannot be read
     /// back that way, and this is the nearest thing to it that is still a
     /// value rather than a line of source text.
-    pub fn job(&self) -> Option<&'a crate::job_object::KillOnCloseJob> {
+    fn job(&self) -> Option<&'a crate::job_object::KillOnCloseJob> {
         self.job
     }
 
@@ -1205,6 +1204,62 @@ impl SendRunner for CliSendRunner<'_> {
             }
         })
     }
+}
+
+/// **The one way into a real `bw send list` from outside this module.**
+///
+/// [`CliSendRunner`] is the only [`SendRunner`] in this crate that starts a
+/// process, and as of this commit the type and both of its constructors are
+/// **private to `crate::send`**. That is a compile-time wall and it replaced
+/// a count. The count pinned the number of times the tokens `CliSendRunner`,
+/// `CliSendRunner::new` and `CliSendRunner::with_session` appeared; a
+/// measured mutant wrote
+///
+/// ```ignore
+/// impl<'a> CliSendRunner<'a> {
+///     pub fn warm_cache(session: &str) -> Result<(), SendError> {
+///         let runner = Self::new(None, None);
+///         let _ = runner.run(&list_invocation(Some(session)))?;
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// and called it from the frame closure. `Self` spells none of the pinned
+/// tokens, so every count stayed exact: 2109 lib / 217 bin / 0 failed / 0
+/// warnings, an unbounded per-frame `bw send list`. The free-function shape
+/// of the same mutant, which spells `CliSendRunner::new`, died. **The only
+/// difference between the killed and the surviving mutant was the token
+/// `Self`** -- a count pins the set of spellings, not the set of routes.
+///
+/// Privacy pins the route. `pub(in ..)` was not available: it accepts only
+/// ANCESTOR modules, and `crate::vault_window::send_fetch_thread` is not an
+/// ancestor of `crate::send`, so `pub(in crate::vault_window::send_fetch_thread)`
+/// is E0742 here exactly as `pub(in crate::bw_serve)` was E0433 in an earlier
+/// round. What IS available is plain module privacy: with no `pub` at all,
+/// the type is visible in `crate::send` and its descendants -- which is
+/// this module's own tests, and nothing else in the crate. Every spelling
+/// `vault_window` could reach for -- `crate::send::CliSendRunner`, a `use`,
+/// a `type` alias, a re-export, `Self` inside an `impl` written over there
+/// -- is now **E0603**, at compile time, before any test runs.
+///
+/// **What this does not close, said plainly.** The mutant above was written
+/// INSIDE this file, where `CliSendRunner` is still nameable. A new
+/// `pub fn` added here could still build one and the frame could still call
+/// it. What refuses that is
+/// [`this_modules_public_surface_is_exactly_what_it_was`], an EQUALITY over
+/// every module-level `pub` item in this file's production half -- not a
+/// count of one spelling, so a differently-named helper fails it too.
+///
+/// The session, the job and the profile directory are all parameters for the
+/// same reason they were parameters of the constructor: this function reads
+/// no process state and holds none.
+pub fn cli_send_list(
+    job: Option<&crate::job_object::KillOnCloseJob>,
+    data_dir: Option<&Path>,
+    session: &str,
+) -> Result<Vec<SendSummary>, SendError> {
+    list_sends(&CliSendRunner::with_session(job, data_dir, session))
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,7 +2051,7 @@ mod runner_tests {
         // `code_under_test` that answered an empty string would make each
         // `!contains` pin pass while asserting nothing whatsoever.
         let code = code_under_test();
-        assert!(code.contains("pub struct CliSendRunner<'a> {"));
+        assert!(code.contains("struct CliSendRunner<'a> {"));
         assert!(!code.contains("no such line appears anywhere in this module"));
         // And the split really did drop the tests: this function's own name
         // is below the cut.

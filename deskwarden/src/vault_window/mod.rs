@@ -4564,9 +4564,7 @@ mod send_fetch_thread {
         // this process dies, by any route including a `TerminateProcess` the
         // app never runs code after, the kernel closes the handle and every
         // member child dies with it.
-        let runner =
-            crate::send::CliSendRunner::with_session(sends_job(), data_dir.as_deref(), session);
-        crate::send::list_sends(&runner)
+        crate::send::cli_send_list(sends_job(), data_dir.as_deref(), session)
     }
 
     /// The job every `bw send` child this window starts is placed in.
