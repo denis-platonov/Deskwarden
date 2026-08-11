@@ -2924,34 +2924,64 @@ mod source_pins {
         );
     }
 
-    /// The delegated fetch really is a real `bw send list`. A fake here, or a
-    /// runner built for some other account, would be a screen that lists
-    /// nothing whatever the account holds -- and `fetch_thread_tests` cannot
-    /// see it, because it deliberately supplies its own fetch.
+    /// **`real_send_list` is the whole of the fetch, as an equality.**
     ///
-    /// Needles are safe *here*: `real_send_list` is a plain function with no
-    /// closure in it, so there is no inside and outside to move code between.
+    /// This replaces a set of NEEDLES, and the replacement is the point. The
+    /// old pin required the body to *contain*
+    /// `CliSendRunner::with_session(None, data_dir.as_deref(), session)`,
+    /// which pins the SPELLING of an identifier and says nothing about what
+    /// that identifier is bound to. Its own doc argued needles were safe here
+    /// because "`real_send_list` is a plain function with no closure in it,
+    /// so there is no inside and outside to move code between" -- reasoning
+    /// about code MOTION, which does not cover REBINDING. Measured on
+    /// `49f0f51`, inserting one statement above the pinned line:
+    ///
+    /// ```ignore
+    /// let session = "";
+    /// let runner = crate::send::CliSendRunner::with_session(None, .., session);
+    /// ```
+    ///
+    /// left every needle word-perfect and the suite green at 2097 passed / 0
+    /// failed, while production set `BW_SESSION=""` on every `bw send list`
+    /// and a real vault answered `Locked` -- the exact bug `07f0e09` is named
+    /// for fixing.
+    ///
+    /// So this is the same shape as
+    /// [`spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`],
+    /// which the reviewer attacked and could not defeat: a whole-body
+    /// equality, where any inserted statement, any rebinding, any extra
+    /// argument and any swapped callee all change the compared string.
+    ///
+    /// **Comments are blanked first**, so this pins the code and not the
+    /// prose around it -- the body carries a long comment about why the job
+    /// is there, and an equality that included it would fail on a typo fix.
+    ///
+    /// **It is not the only guard, and deliberately.** An equality still only
+    /// says the text is what it was; it cannot say what that text DOES.
+    /// [`the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given`]
+    /// says that, by running this very function. The two fail to different
+    /// mutations -- a body rewritten to something equivalent-but-wrong fails
+    /// here; a `sends_job` or `with_session` that quietly stopped carrying
+    /// what it names fails there -- and neither subsumes the other.
     #[test]
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
-        let body = body_of(concat!("real_send_", "list"), "    ");
-        let runner = concat!(
-            "crate::send::CliSendRunner::",
-            "with_session(None, data_dir.as_deref(), session)"
-        );
-        assert!(
-            body.contains(runner),
-            "the Sends fetch no longer runs through {runner:?}. Body was: {body}"
-        );
-        let dir = concat!("crate::bw_path::active_data_", "dir()");
-        assert!(
-            body.contains(dir),
-            "the fetch no longer reads the active account's profile directory, so it can \
-             list a different account's Sends than the window is showing"
-        );
-        let call = concat!("crate::send::list_", "sends(&runner)");
-        assert!(
-            body.contains(call),
-            "`real_send_list` does not call {call:?} -- it is not the thing fetching the list"
+        let expected = squashed(&format!(
+            "session: &str, ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> \
+             {{ let data_dir = crate::bw_path::active_data_{}(); let runner = \
+             crate::send::CliSendRunner::{}({}(), data_dir.as_deref(), session); \
+             crate::send::list_{}(&runner)",
+            "dir",
+            "with_session",
+            concat!("sends_", "job"),
+            "sends",
+        ));
+        let actual = squashed(&sanitized(&body_of(concat!("real_send_", "list"), "    ")));
+        assert_eq!(
+            actual, expected,
+            "`real_send_list` is no longer exactly one `bw send list`, in this window's job, \
+             for the active account, with the session it was handed. Anything at all added, \
+             removed or rebound here fails -- including a `let session = ..;` above the call, \
+             which every needle-shaped pin over this function was measured to allow"
         );
         assert_eq!(
             production().matches(concat!("crate::send::list_", "sends(")).count(),
@@ -2959,6 +2989,129 @@ mod source_pins {
             "`list_sends` is called somewhere other than `real_send_list` -- and every other \
              caller is unproven ground for which thread it runs on"
         );
+    }
+
+    /// **The real fetch runs `bw send list`, in this window's job, with the
+    /// session it was given.**
+    ///
+    /// The behavioural half, and the one that makes the pointer -> child leg
+    /// of this feature something other than an assertion about text.
+    /// `frame_promptness` substitutes `VaultFrameEnv::send_list`, so no test
+    /// that drives a frame can see past the pointer; everything below it was
+    /// held by source pins alone. This calls the production function ITSELF,
+    /// with `job_object`'s spawn probe armed, and reads back what ARRIVED at
+    /// `spawn_in_job`. There is no stand-in and no forwarder to be wrong --
+    /// `real_send_list` is `pub(super)` for exactly this, and what replaces
+    /// the privacy it gave up is spelled out at its definition.
+    ///
+    /// Three properties, each of which was a real defect or a real hazard:
+    ///
+    ///  1. **The session reaches the child's environment.** `bw send list` is
+    ///     authenticated; a child that inherits no `BW_SESSION`, or an empty
+    ///     one, answers `Locked`. The token compared against is the one this
+    ///     test passed IN, so a body that substitutes its own constant, or
+    ///     empties the parameter, fails here rather than being spelled right.
+    ///  2. **The child is in this window's job.** Compared by ADDRESS against
+    ///     `sends_job`, so "some job" is not enough: an orphaned `bw send`
+    ///     holds the vault key in an environment block that any same-user
+    ///     process can read with `PROCESS_VM_READ`.
+    ///  3. **The token is in none of argv.** A process's argument vector is
+    ///     readable machine-wide by far cheaper means than that.
+    ///
+    /// **No child is started.** The probe refuses every spawn before
+    /// `CreateProcess` and `list_sends` maps the refusal through its ordinary
+    /// failure path.
+    #[test]
+    fn the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given() {
+        // A token this test owns, ending in `=` because a real `bw` session
+        // token is base64 and does: a mutation that trims, splits or
+        // percent-decodes the parameter would leave a token without one
+        // untouched and pass a test that used one.
+        const TOKEN: &str = "fetch-test-session-token/9+x=";
+
+        // The verified CLI path `bw_job_command_in` refuses without. A path
+        // that does not exist and never will: nothing is executed, because
+        // the probe below refuses every spawn before `CreateProcess`.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-testirstw.exe",
+        ));
+
+        let expected_job = super::super::send_fetch_thread::sends_job().map(|j| std::ptr::from_ref(j) as usize);
+        assert!(
+            expected_job.is_some(),
+            "control: this window could not create a job object at all, so the job assertion \
+             below would be satisfied by a jobless spawn"
+        );
+
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let refused = super::super::send_fetch_thread::real_send_list(TOKEN);
+        // Plain strings, deliberately: what this test is about is what the
+        // CHILD would have been given, not the recorder's own shape.
+        let attempts: Vec<(Option<usize>, Vec<String>, Vec<(String, Option<String>)>)> = probe
+            .attempts()
+            .into_iter()
+            .map(|a| {
+                (
+                    a.job,
+                    a.args.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
+                    a.envs
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.as_ref().map(|v| v.to_string_lossy().into_owned()),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        drop(probe);
+
+        assert!(
+            refused.is_err(),
+            "the probe refused the only spawn this read may make, yet it answered {refused:?} \
+             -- so a child was started by a route the probe cannot see"
+        );
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the real fetch did not reach the one spawn exactly once, so every assertion below \
+             is about nothing: {attempts:?}"
+        );
+        let (job, args, envs) = attempts.into_iter().next().expect("just counted one");
+
+        assert_eq!(
+            args,
+            vec!["send".to_string(), "list".to_string()],
+            "control: `real_send_list` did not spawn a `bw send list`, so this test is \
+             measuring some other command"
+        );
+        assert_eq!(
+            envs.iter()
+                .filter(|(k, _)| k == "BW_SESSION")
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(TOKEN.to_string())],
+            "`BW_SESSION` did not arrive at the child set exactly once to the session \
+             `real_send_list` was handed, so a real `bw send list` answers `locked`. The \
+             overlay that arrived was {envs:?}"
+        );
+        assert_eq!(
+            job, expected_job,
+            "the `bw send list` child was not placed in this window's `KillOnCloseJob`. Its \
+             environment block carries the token that unlocks the whole vault, and on Windows \
+             an environment block is readable by any same-user process holding \
+             `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` -- no elevation. Without the job, \
+             an app that dies mid-fetch leaves that child, and that token, alive"
+        );
+        for arg in &args {
+            assert!(
+                !arg.contains(TOKEN),
+                "the session token is in argv, where every other process on the machine can \
+                 read it: {arg}"
+            );
+        }
     }
 
     /// **The blocking fetch has exactly one call site in the whole crate.**
@@ -3025,7 +3178,19 @@ mod source_pins {
         // .. as` renames the spelling. So each file's own `use` items are
         // read first and every local name they bind to these two is counted
         // as well -- see `local_names_of`.
-        for item in [concat!("list_", "sends"), concat!("CliSendRunner::", "with_session")] {
+        // **Both constructors, not just the one production uses today.** When
+        // the pinned call moved from `CliSendRunner::new` to
+        // `CliSendRunner::with_session` this list moved with it, and `::new`
+        // stopped being counted anywhere in the crate -- so a second, jobless,
+        // sessionless runner written on a non-list path was invisible again.
+        // The expectation is therefore per-item: `with_session` has exactly
+        // one site and `::new` has none, and either a new site or a deleted
+        // one fails.
+        for (item, expected) in [
+            (concat!("list_", "sends"), vec!["vault_window/mod.rs"]),
+            (concat!("CliSendRunner::", "with_session"), vec!["vault_window/mod.rs"]),
+            (concat!("CliSendRunner::", "new"), Vec::new()),
+        ] {
             let sites: Vec<&str> = files
                 .iter()
                 .filter(|(path, _)| path != "send.rs")
@@ -3040,8 +3205,7 @@ mod source_pins {
                 .collect();
             let needle = format!("{item}(");
             assert_eq!(
-                sites,
-                vec!["vault_window/mod.rs"],
+                sites, expected,
                 "{needle:?} is called from {sites:?} in the crate's production code. The one \
                  permitted site is `real_send_list`, inside `mod send_fetch_thread`, whose \
                  caller is proven to be a background thread. Every other site is an up-to-sixty\
@@ -3216,8 +3380,29 @@ mod source_pins {
         let spawn = squashed(concat!(
             "(spawn_send_",
             "list)( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), ",
-            "zeroize::Zeroizing::new(session_token.clone()), );"
+            "session_token.clone(), );"
         ));
+        // The `Zeroizing` the argument used to be wrapped in here is now the
+        // type of `session_token` ITSELF -- `build_frame` wraps the bare
+        // `String` it is handed on its first line, so the window's own copy is
+        // wiped when the window closes instead of going back to the allocator
+        // with the vault key still in it. So the clone above is already a
+        // `Zeroizing<String>`, which `VaultFrameEnv::send_list`'s signature
+        // requires, and the type checker holds what this needle used to.
+        //
+        // TWICE, and the second is the sibling copy. `spawn_vault_sync` takes
+        // a bare `String` because `VaultFrameEnv::sync`'s `fn` pointer says
+        // so, so it wraps on arrival the same way -- one wipe per Sync
+        // instead of one more freed heap block holding the vault key per
+        // Sync, for the life of the process.
+        let wrapped = concat!("let session_token = zeroize::Zeroizing::new(session_", "token);");
+        assert_eq!(
+            production.matches(wrapped).count(),
+            2,
+            "{wrapped:?} is not in production exactly twice -- the window's copy of the vault \
+             session is a bare `String` again, which goes back to the allocator with the token \
+             still in it, readable by whatever allocates that block next"
+        );
         assert_eq!(
             squashed(&production).matches(&spawn).count(),
             1,
@@ -3363,10 +3548,15 @@ mod source_pins {
         assert_eq!(
             exported,
             vec![
+                concat!("pub(super) fn real_send_", "list("),
+                concat!(
+                    "pub(super) fn sends_", "job() -> ",
+                    "Option<&'static crate::job_object::KillOnCloseJob> {"
+                ),
                 concat!("pub(super) fn spawn_send_", "list("),
                 concat!("pub(super) fn spawn_send_list_", "with<F>("),
             ],
-            "`mod send_fetch_thread` no longer declares exactly the two spawners and nothing \
+            "`mod send_fetch_thread` no longer declares exactly the two spawners, the fetch and the job, and nothing \
              else. Every `pub` in the block is listed here whatever item it is on: a \
              `pub(super) const`, `static`, `type`, `use`, `mod` or `trait` is as good a handle \
              on the blocking fetch as a `pub(super) fn` wrapper is, and a function-pointer \

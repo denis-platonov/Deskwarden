@@ -492,6 +492,21 @@ pub fn build_frame(
     // had before this parameter existed.
     env: VaultFrameEnv,
 ) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
+    // **The session, wrapped before anything else touches it.** The parameter
+    // arrives as a bare `String`, and a bare `String` holding the token that
+    // unlocks the whole vault goes back to the allocator with the token still
+    // in it -- readable by whatever allocates that block next, for the rest
+    // of the process's life. This is a MOVE, not a copy: the same heap buffer
+    // the caller built, now owned by something whose `Drop` overwrites it.
+    // The window holds it for its entire session, so this is the longest-
+    // lived copy in the app outside `main.rs` itself.
+    //
+    // Every use below is a clone into something that also wipes: the two
+    // `spawn_sync` calls hand a `String` to `spawn_vault_sync`, which wraps
+    // it the same way on the receiving side (its parameter type is fixed by
+    // `VaultFrameEnv::sync`'s `fn` pointer), and the Sends fetch clones a
+    // `Zeroizing<String>` directly.
+    let session_token = zeroize::Zeroizing::new(session_token);
     // Copied out first -- both are `fn` pointers, so this is a copy and the
     // closure below can take one without borrowing `env`.
     let spawn_sync = env.sync;
@@ -1093,7 +1108,7 @@ pub fn build_frame(
         if !auto_synced {
             auto_synced = true;
             sync_in_progress = true;
-            (spawn_sync)(sync_tx.clone(), session_token.clone());
+            (spawn_sync)(sync_tx.clone(), session_token.to_string());
         }
 
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
@@ -1621,7 +1636,7 @@ pub fn build_frame(
                 );
                 if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                     sync_in_progress = true;
-                    (spawn_sync)(sync_tx.clone(), session_token.clone());
+                    (spawn_sync)(sync_tx.clone(), session_token.to_string());
                 }
             },
         ) {
@@ -1827,7 +1842,7 @@ pub fn build_frame(
                 // The window's own session, cloned per fetch into a
                 // `Zeroizing` that the fetching thread drops -- so the token
                 // never outlives the one `bw send list` it authenticates.
-                zeroize::Zeroizing::new(session_token.clone()),
+                session_token.clone(),
             );
         }
         egui::Panel::left("vault-sidebar")
@@ -4425,15 +4440,18 @@ mod send_fetch_thread {
     //! it, because the only textual call to the underlying `send.rs` entry
     //! point was still the one inside the fetch function.
     //!
-    //! There is no position left to hoist to. The fetch is **private to this
-    //! module**, so writing that line in the frame closure is a compile error
-    //! rather than a green suite, and this module exports nothing but the two
-    //! spawners. The one remaining spelling -- importing `send.rs`'s entry
-    //! point into the frame's scope and calling it bare -- is held by
-    //! `send_ui`'s
+    //! There is no position left to hoist to. Writing that line in the frame
+    //! closure is caught by `send_ui`'s
     //! `every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`,
-    //! which requires every occurrence of those names in production to be
-    //! inside this block, and the export list to be exactly the two spawners.
+    //! which requires every occurrence of `real_send_list`, `list_sends` and
+    //! `CliSendRunner::with_session` in production to be inside this block --
+    //! a call in the frame closure spells the first of those, so it is a
+    //! mention outside the block and the suite goes red. That guard also
+    //! fixes the export list, so a differently-NAMED forwarder (which would
+    //! spell no needle at its call site) is refused too. Privacy used to be a
+    //! second lock on the same door; `real_send_list` and `sends_job` are
+    //! `pub(super)` since the round that made this half behavioural, and
+    //! `real_send_list`'s own doc records exactly what was traded for it.
     //!
     //! **`.output()` blocks, and it must never run on the eframe thread.**
     //! `send.rs`'s runner spawns a real `bw` child and waits on it for up to
@@ -4466,13 +4484,45 @@ mod send_fetch_thread {
 
     /// What one `bw send list` is, with nothing in it about threads.
     ///
-    /// **Private, and deliberately unnameable from the frame closure.** A
-    /// plain function and not a closure inside the spawn, so that "the fetch"
-    /// is a **value** that can be handed to [`spawn_send_list_with`] -- and
-    /// so that `send_ui::fetch_thread_tests` can hand it a different one and
-    /// watch where it runs. Privacy is what stops that same value being
-    /// obtained by anyone who would then call it in place.
-    fn real_send_list(
+    /// A plain function and not a closure inside the spawn, so that "the
+    /// fetch" is a **value** that can be handed to [`spawn_send_list_with`]
+    /// -- and so that `send_ui::fetch_thread_tests` can hand it a different
+    /// one and watch where it runs.
+    ///
+    /// **`pub(super)`, and what holds it now that privacy does not.** This
+    /// was private, and privacy was one of two things stopping the frame
+    /// closure calling the sixty-second blocking fetch in place. It is
+    /// visible to `vault_window` now for one reason: the only way to prove
+    /// BEHAVIOURALLY what this function does -- rather than pinning the
+    /// spelling of its text -- is to call it with `job_object`'s spawn probe
+    /// armed, and that probe is thread-local, so it must be called on the
+    /// test's own thread. See
+    /// `send_ui::source_pins::the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given`.
+    ///
+    /// The other of the two things is untouched and is the stronger one:
+    /// `send_ui::source_pins::every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`
+    /// requires every occurrence of the token `real_send_list` in production
+    /// to be inside this block. A call written in the frame closure spells
+    /// it, so it is a mention outside the block, so it fails -- and unlike
+    /// privacy, that also refuses a call written in a SIBLING file, which
+    /// `pub(super)` never permitted but `pub(crate)` would have.
+    ///
+    /// **Why not a test-gated seam instead.** Tried first, and it is not
+    /// available in this file: three controls across three modules
+    /// (`nothing_but_gated_test_modules_lives_below_the_pins_cut` and its two
+    /// siblings) cut `mod.rs` at its FIRST test-configuration attribute --
+    /// whose literal spelling is deliberately not written anywhere in this
+    /// file above that point, because writing it MOVES that very cut -- and
+    /// require everything below that point to be gated test modules. A gated
+    /// item
+    /// here -- two thousand lines above the last production item -- moves
+    /// that cut and reports the whole rest of the file as code hiding below
+    /// it. Measured: four tests red, none of them about this fetch. That is
+    /// the same hazard [`VaultFrameEnv`]'s doc records for its own seam,
+    /// which is why that one lives at the very bottom of the file; a seam for
+    /// THIS function cannot, because it must be inside this block to reach
+    /// it.
+    pub(super) fn real_send_list(
         session: &str,
     ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
         // Read on the fetching thread, not captured from the frame: `bw_path`
@@ -4481,16 +4531,64 @@ mod send_fetch_thread {
         // account, and a copy taken a frame earlier is a copy that can be
         // stale.
         let data_dir = crate::bw_path::active_data_dir();
-        // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
-        // owns the one `bw serve` is in), so the child is unprotected against
-        // an abrupt death of this process. `bw send list` is a read that
-        // finishes in seconds, so it is a far smaller orphan hazard than the
-        // long-lived `bw serve` the job exists for -- but it DOES now carry
-        // the session, so when this window is given a job the runner must be
-        // handed it here and the property re-proven at this call.
+        // The job, and why the child must be in one. This command carries the
+        // vault-unlocking session in its ENVIRONMENT BLOCK, and on Windows an
+        // environment block is readable by any process holding
+        // `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` on the target --
+        // which, for a same-user same-integrity process, is the default and
+        // needs no elevation. So an orphaned `bw send list` is a live vault
+        // key sitting in another process's address space for as long as it
+        // lives. That is the same hazard `bw serve` is in a job for; argv is
+        // clean here (`SESSION_ENV` goes through `command.env` and never
+        // `command.args`, asserted in `send.rs`) so the cheap
+        // `Get-CimInstance Win32_Process` read does not reach it, but the
+        // environment read does. `KillOnCloseJob` closes that window: when
+        // this process dies, by any route including a `TerminateProcess` the
+        // app never runs code after, the kernel closes the handle and every
+        // member child dies with it.
         let runner =
-            crate::send::CliSendRunner::with_session(None, data_dir.as_deref(), session);
+            crate::send::CliSendRunner::with_session(sends_job(), data_dir.as_deref(), session);
         crate::send::list_sends(&runner)
+    }
+
+    /// The job every `bw send` child this window starts is placed in.
+    ///
+    /// **Its own job, not the one `main.rs` holds for `bw serve`.** Three
+    /// reasons, in order of weight:
+    ///
+    ///  1. `VaultFrameEnv::send_list` is a **`fn` pointer**. It carries no
+    ///     captured state by construction, and that is the property the whole
+    ///     seal rests on -- a pointer that could close over an
+    ///     `Arc<Option<KillOnCloseJob>>` is a pointer that could close over
+    ///     anything else too. Threading `main.rs`'s job to this call would
+    ///     mean widening that signature to carry a handle through the frame
+    ///     closure, which is precisely the widening
+    ///     `production_is_the_only_env_a_shipping_build_has` exists to refuse.
+    ///  2. The two jobs have different lifetimes on purpose. `main.rs` drops
+    ///     and rebuilds its job around backend restarts (lock/reauth
+    ///     recovery); a Sends fetch in flight across one of those would be
+    ///     killed mid-read for no reason connected to it.
+    ///  3. Nothing in `job_object`'s hardening is touched. No allow-list
+    ///     gains an entry, no choke point gains a caller: this names the one
+    ///     public constructor `main.rs` and `send.rs`'s own tests already
+    ///     name, and hands the result to the one spawn route there is.
+    ///
+    /// **Process-lifetime, and that is the right lifetime.** The hazard is an
+    /// orphan outliving the app, not a child outliving one window: a
+    /// `OnceLock` handle is closed by the kernel at process death however the
+    /// process dies, which is exactly when the orphan would otherwise appear.
+    /// A per-window job would additionally kill a fetch when the window
+    /// closes, which is nice but is not the security property.
+    ///
+    /// **`None` when the job cannot be created.** `KillOnCloseJob::new` is a
+    /// kernel call and can genuinely fail. Refusing to list Sends because a
+    /// job object could not be made would be a worse trade than listing them
+    /// unprotected, and `spawn_in_job` already accepts `None` -- so a failure
+    /// degrades to exactly today's behaviour rather than to a broken screen.
+    pub(super) fn sends_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+        static JOB: std::sync::OnceLock<Option<crate::job_object::KillOnCloseJob>> =
+            std::sync::OnceLock::new();
+        JOB.get_or_init(|| crate::job_object::KillOnCloseJob::new().ok()).as_ref()
     }
 
     /// Fetches the account's Sends on a background thread.
@@ -4521,9 +4619,9 @@ mod send_fetch_thread {
     /// returned. See `send_ui::fetch_thread_tests`.
     ///
     /// Exported alongside `spawn_send_list` only so those tests can drive it.
-    /// That is harmless: a caller outside this module has no blocking fetch
-    /// to hand it, because the only one in the crate reachable from here is
-    /// private above.
+    /// That is harmless: a caller outside this module that hands it the real
+    /// fetch has to NAME the real fetch, and every mention of that name
+    /// outside this block is refused by the seal (see the module doc).
     pub(super) fn spawn_send_list_with<F>(
         ctx_for_sends: egui::Context,
         tx: SendListSender,
@@ -4537,6 +4635,7 @@ mod send_fetch_thread {
             ctx_for_sends.request_repaint();
         });
     }
+
 }
 
 /// The Sends channel's sending half. Named because three signatures carry it.
@@ -5255,6 +5354,13 @@ fn spawn_vault_load_with_schedule(
 /// responsible for setting `sync_in_progress` before calling this, same as
 /// before this was extracted.
 fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String) {
+    // Wrapped on arrival, and a MOVE rather than a copy: the parameter's type
+    // is fixed by `VaultFrameEnv::sync`'s `fn` pointer, so the wipe has to
+    // happen on this side. Without it, every Sync -- the auto-sync on the
+    // window's first real frame and every press of the button -- left one
+    // more copy of the vault-unlocking token in a freed heap block, one per
+    // sync, for the rest of the process's life.
+    let session_token = zeroize::Zeroizing::new(session_token);
     std::thread::spawn(move || {
         let _ = tx.send(bw_serve::run_bw_sync(&session_token));
     });
