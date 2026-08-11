@@ -4923,7 +4923,7 @@ pub(crate) mod password_lifetime_tests {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::{Cell, RefCell};
     use std::panic::AssertUnwindSafe;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
 
     /// Long and distinctive: it must not occur by chance in an unrelated
@@ -4957,6 +4957,50 @@ pub(crate) mod password_lifetime_tests {
     /// [`plaintext_reached_the_allocator_on_any_thread`], and cross-checked
     /// against [`SEEN`] by [`plaintext_reached_the_allocator`].
     static SEEN_ANYWHERE: AtomicBool = AtomicBool::new(false);
+
+    /// Bumped once per arm. A thread is **participating** in the window that is
+    /// open now if it first touched this allocator at or after the window
+    /// opened -- which is what "a worker the body spawned" means, expressed in
+    /// terms the allocator can actually see.
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+    /// [`EPOCH`] as it stood when the innermost window opened.
+    static WINDOW: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// [`EPOCH`] the first time this thread entered the allocator, and never
+        /// written again. `u64::MAX` means "not yet stamped".
+        ///
+        /// A `Cell<u64>` with a `const` initialiser and no destructor: reading it
+        /// cannot allocate and cannot run lazy initialisation, which is the only
+        /// reason a thread-local is usable from inside a `GlobalAlloc` at all.
+        /// `try_with` rather than `with` because a thread that is being torn down
+        /// still frees things, and `with` panics once the TLS block is gone.
+        static FIRST_SEEN: Cell<u64> = const { Cell::new(u64::MAX) };
+    }
+
+    /// Stamps this thread on its first visit to the allocator. **Ungated on
+    /// purpose**: gating it on a probe being active would stamp a long-lived
+    /// background thread with the epoch of whatever window it happened to wake
+    /// up in, which is precisely the misattribution this exists to prevent.
+    fn stamp_this_thread() {
+        let _ = FIRST_SEEN.try_with(|first| {
+            if first.get() == u64::MAX {
+                first.set(EPOCH.load(Ordering::Relaxed));
+            }
+        });
+    }
+
+    /// Whether this thread is one the currently open window can speak for: the
+    /// thread that armed it, or a thread that did not exist before it opened.
+    fn this_thread_is_participating() -> bool {
+        if WATCHING.with(Cell::get) {
+            return true;
+        }
+        FIRST_SEEN
+            .try_with(|first| first.get() >= WINDOW.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
 
     /// How many threads are currently inside a probe test -- holding
     /// [`PROBE_LOCK`] through [`PROBE_HOLD`]. Non-zero means [`PROBE`]
@@ -5050,10 +5094,12 @@ pub(crate) mod password_lifetime_tests {
     // trade inside a test-only instrument, not a soundness claim.
     unsafe impl GlobalAlloc for Watcher {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            stamp_this_thread();
             unsafe { System.alloc(layout) }
         }
 
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            stamp_this_thread();
             unsafe { System.alloc_zeroed(layout) }
         }
 
@@ -5076,6 +5122,7 @@ pub(crate) mod password_lifetime_tests {
         /// wipe-then-grow would look like a leak at random depending on what
         /// the heap felt like doing.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            stamp_this_thread();
             let carries = layout.size() >= PROBE.len()
                 && probe_bytes_may_be_live()
                 && {
@@ -5116,6 +5163,7 @@ pub(crate) mod password_lifetime_tests {
         }
 
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            stamp_this_thread();
             if layout.size() >= PROBE.len() && any_watch_is_armed() {
                 let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
                 if block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()) {
@@ -5178,7 +5226,39 @@ pub(crate) mod password_lifetime_tests {
         if WATCHING.with(Cell::get) {
             SEEN.with(|seen| seen.set(true));
         }
-        SEEN_ANYWHERE.store(true, Ordering::Relaxed);
+        // **THE SECOND CHANNEL, AND THE WIPE CANNOT REACH IT.**
+        //
+        // Zeroing freed blocks stops a recycled block carrying *stale* probe
+        // bytes into a later window. It does nothing about probe bytes that are
+        // genuinely alive and owned by a thread that has nothing to do with the
+        // armed test -- and this crate manufactures those by the dozen.
+        //
+        // **The measured culprit, caught by instrumenting the hit rather than
+        // guessed at.** This file declares [`PROBE`] as a string literal, so THE
+        // SOURCE TEXT OF THIS FILE CONTAINS THE PROBE. Around thirty tests in
+        // this crate read `src/` back and lint it;
+        // `job_object::tests::only_the_files_that_must_leave_the_job_can_open_a_bare_command`
+        // was the one caught in the act, freeing a 284,896-byte block whose
+        // contents were this very module around the `const` declaration. Every
+        // such read allocates a copy of the probe and frees it on its own libtest
+        // thread, on no schedule at all, and the global scan credited it to
+        // whichever probe test happened to be armed. No wipe can touch that:
+        // those bytes are live and correct, they are simply not ours.
+        //
+        // So the global channel now takes hits only from threads the open window
+        // can actually speak for: the arming thread, and threads that did not
+        // exist before it opened.
+        //
+        // **What this narrows, said plainly.** A leak on a thread that predates
+        // the window is no longer reported. That is a real reduction, and it is
+        // the claim these entry points already make -- a worker the body spawned
+        // -- rather than a claim about every thread in the process, which was
+        // never honest: such a thread is by construction not doing the work the
+        // window is measuring. A body that leaks on a pre-existing pool thread is
+        // outside what this instrument covers, and always was.
+        if this_thread_is_participating() {
+            SEEN_ANYWHERE.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Arms the watch for `body` and clears both verdicts, holding
@@ -5218,6 +5298,13 @@ pub(crate) mod password_lifetime_tests {
                 WATCHING.with(|watching| watching.set(false));
             }
         }
+
+        // Opened BEFORE the watch is armed, so any thread that starts while the
+        // window is open reads an `EPOCH` at least this high and stamps itself as
+        // participating. A thread already running reads it later or not at all,
+        // and its older stamp keeps it out.
+        let opened = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+        WINDOW.store(opened, Ordering::Relaxed);
 
         WATCHING.with(|watching| watching.set(true));
         ANY_WATCH.fetch_add(1, Ordering::Relaxed);
@@ -5491,6 +5578,86 @@ pub(crate) mod password_lifetime_tests {
              crate can then be produced by an unrelated test's garbage, and this suite is \
              the mutation oracle"
         );
+    }
+
+    /// **The second channel, and the one the wipe cannot reach.**
+    ///
+    /// Zeroing every freed block stops a recycled block carrying *stale* probe
+    /// bytes into a later window. It does nothing about probe bytes that are
+    /// genuinely alive and owned by a thread with no connection to the armed
+    /// test -- and this crate manufactures those by the dozen.
+    ///
+    /// **The culprit was measured, not guessed.** With the hit instrumented to
+    /// name the thread that produced it, the answer came back
+    /// `job_object::tests::only_the_files_that_must_leave_the_job_can_open_a_bare_command`,
+    /// freeing a 284,896-byte block whose contents were the text of THIS FILE
+    /// around the `const PROBE` declaration. This module declares the probe as a
+    /// string literal, so the source of this file contains it; around thirty
+    /// tests in this crate read `src/` back to lint it, and every one of them
+    /// allocates a copy of the probe and frees it on its own libtest thread, on
+    /// no schedule at all. The global scan has no way to tell those bytes from
+    /// the armed test's own, and credited them to whoever was armed.
+    ///
+    /// This is why the wipe alone was not enough: after it was in place the suite
+    /// still failed, because these bytes are live and correct rather than stale.
+    ///
+    /// This is that, made deterministic. The worker is started and has allocated
+    /// its probe plaintext BEFORE any window opens -- the `ready` handshake is
+    /// what makes that an ordering rather than a hope -- and frees it INSIDE the
+    /// window. A thread that predates the window is not a thread the window can
+    /// speak for, and its free is not this window's leak.
+    ///
+    /// Its control is the leak on a worker born INSIDE the window, which must
+    /// still be reported. Without it, a filter wired to reject everything
+    /// cross-thread would pass the negative below and quietly undo the whole
+    /// reason the global channel exists.
+    #[test]
+    fn a_free_on_a_thread_that_predates_the_window_is_not_that_windows_leak() {
+        use std::sync::mpsc::channel;
+
+        let (ready_tx, ready_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+
+        // The stand-in for the source-linting tests: a thread that is alive, and
+        // holding probe plaintext, before this test arms anything at all.
+        let outsider = std::thread::spawn(move || {
+            let held = probe_password();
+            ready_tx.send(()).expect("the test is listening");
+            go_rx.recv().expect("the window opened");
+            drop(held);
+            done_tx.send(()).expect("the test is listening");
+        });
+        // Not a nicety: until this returns, the worker may not have touched the
+        // allocator yet, and a worker that first allocates inside the window is a
+        // participant rather than an outsider. The handshake is the premise.
+        ready_rx.recv().expect("the outsider allocated its probe");
+
+        // 1. Control: a worker born INSIDE a window still gets reported, so the
+        //    negative at 2 is a filter and not a blindfold.
+        assert!(
+            plaintext_reached_the_allocator_on_any_thread(|| {
+                let leaked = probe_password();
+                std::thread::spawn(move || drop(leaked)).join().expect("the worker ran");
+            }),
+            "control: a leak on a worker the body itself spawned is no longer reported, so \
+             the global channel has been filtered into uselessness and the negative below \
+             is satisfied by blindness"
+        );
+
+        // 2. The outsider frees its probe plaintext inside this window.
+        let leaked = plaintext_reached_the_allocator_on_any_thread(|| {
+            go_tx.send(()).expect("the outsider is listening");
+            done_rx.recv().expect("the outsider freed its probe");
+        });
+        assert!(
+            !leaked,
+            "a thread that existed before this window opened freed probe plaintext of its \
+             own, and the window called it its leak. That is how a test that does nothing \
+             but read this crate's own source failed whichever probe test was armed"
+        );
+
+        outsider.join().expect("the outsider ran");
     }
 
     /// A heap copy of [`PROBE`], built *before* any watch is armed so that the
