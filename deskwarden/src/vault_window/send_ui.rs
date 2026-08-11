@@ -3521,6 +3521,31 @@ mod source_pins {
     /// `let session_token = String::new();` written between the two presses
     /// would leave both call sites word-perfect and both arguments empty,
     /// and the whole-body equality one test up cannot see into the closure.
+    ///
+    /// **A count of one SPELLING is not a count of the call sites.** Measured
+    /// on `328996b`, writing in the frame closure right after
+    /// `send_fetch.note_screen(on_sends);`
+    ///
+    /// ```ignore
+    /// if on_sends {
+    ///     let sync_now = spawn_sync;
+    ///     sync_now(sync_tx.clone(), String::new());
+    /// }
+    /// ```
+    ///
+    /// gave 2108 / 0 failed / 0 warnings. A local `let` alias changes the
+    /// spelling, so `(spawn_sync)(` was still written exactly twice and the
+    /// `let session_token` needle was untouched; and the behavioural half
+    /// missed it because `press_sync` never visits the Sends screen. That is
+    /// an UNBOUNDED per-frame stream of `bw sync` children, each with
+    /// `BW_SESSION=""`, for as long as the Sends screen is up.
+    ///
+    /// So what is counted now is the NAME, not the call: `spawn_sync` may be
+    /// written in the closure exactly twice, and both of those are the two
+    /// `(spawn_sync)(` sites already counted. A third site must either spell
+    /// the name (fails here, whatever the syntax around it -- a `let`, a
+    /// struct field, a `match` arm, a closure) or obtain the pointer some
+    /// other way, which the crate-wide map below refuses.
     #[test]
     fn both_sync_call_sites_pass_the_windows_own_session() {
         let closure = squashed(&frame_closure());
@@ -3552,6 +3577,70 @@ mod source_pins {
              `Zeroizing<String>` `build_frame` wrapped on its first line -- and both call \
              sites stay word-perfect while both arguments go empty"
         );
+
+        // The NAME, not the call. Substring matching is deliberate: a
+        // `spawn_sync2` or a `my_spawn_sync` contains this and is counted
+        // too, which is the right answer -- a near-miss name binding the
+        // same pointer is a call site.
+        let name = concat!("spawn_", "sync");
+        assert_eq!(
+            closure.matches(name).count(),
+            2,
+            "{name:?} is NAMED in the frame closure {} times, not twice. The two times it \
+             may be named are the two `(spawn_sync)(` call sites counted just above; any \
+             further mention -- `let sync_now = spawn_sync;`, a struct field, a `match` \
+             arm, a closure that forwards to it -- is a third `bw sync` call site whose \
+             spelling no literal count reaches, and one written under a per-frame `if` is \
+             an unbounded stream of un-jobbed children",
+            closure.matches(name).count()
+        );
+
+        // And the pointer cannot be obtained WITHOUT naming `spawn_sync`
+        // either -- not by re-reading the field, not by taking the real
+        // spawner directly, and not from another file. Every one of these is
+        // a whole-crate map with a file on it, so a fourth file that starts
+        // naming any of them fails here and says which file.
+        //
+        // `main.rs`'s two `spawn_sync` are the TRAY's own unrelated
+        // `fn spawn_sync(..)` and its one call; they are pinned, not
+        // exempted, so they cannot grow either.
+        for (needle, expected) in [
+            (
+                concat!("spawn_", "sync"),
+                vec![("main.rs", 2usize), ("vault_window/mod.rs", 3)],
+            ),
+            (concat!("env.", "sync"), vec![("vault_window/mod.rs", 1)]),
+            (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),
+            (
+                concat!("VaultFrame", "Env"),
+                vec![("main.rs", 3), ("vault_window/mod.rs", 4)],
+            ),
+        ] {
+            let files = crate_sources();
+            assert!(
+                files.len() > 30,
+                "control: the crate walk found only {} source files, which is not this crate",
+                files.len()
+            );
+            let seen: Vec<(&str, usize)> = files
+                .iter()
+                .map(|(path, text)| {
+                    (path.as_str(), sanitized(&production_region(text)).matches(needle).count())
+                })
+                .filter(|(_, n)| *n > 0)
+                .collect();
+            assert_eq!(
+                seen, expected,
+                "{needle:?} is written in the crate's production at {seen:?}, not \
+                 {expected:?}. `VaultFrameEnv::sync` is a `fn` pointer to a real `bw sync` \
+                 spawner, and these four counts are every way there is to get hold of one: \
+                 the binding and its two calls (`spawn_sync` in `mod.rs`), the one read of \
+                 the field (`env.sync`), the real spawner's own definition and the one \
+                 place `VaultFrameEnv::production` names it, and the type itself -- which \
+                 no file but `mod.rs` and `main.rs`'s three constructions may name, so a \
+                 sibling cannot even take an `env` to read the pointer out of"
+            );
+        }
     }
 
     /// **The blocking fetch cannot be reached from the frame closure.**
@@ -3603,13 +3692,39 @@ mod source_pins {
         // thread, past every guard in this module.
         //
         // So the counts are taken over every `.rs` file under `src`, walked
-        // rather than listed so that a file added next month is read, minus
-        // `send.rs` where two of the four are DEFINED -- the same exclusion,
-        // for the same reason, as
-        // `the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate`.
-        // Both sides are `sanitized`, so a mention in another file's prose is
-        // not a mention and cannot inflate the total past what the block can
-        // account for.
+        // rather than listed so that a file added next month is read. Both
+        // sides are `sanitized`, so a mention in another file's prose is not a
+        // mention and cannot inflate the total past what the block can account
+        // for.
+        //
+        // **`send.rs` is IN the walk, and pinned rather than excluded.** It
+        // used to be subtracted, an exclusion copied verbatim from
+        // `the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate`,
+        // where it is right because `list_sends` and `CliSendRunner` are
+        // DEFINED there. Copying it here turned a definition-site exemption
+        // into a CALL-site exemption, and `send.rs` is the most natural file
+        // in the crate in which to write the forwarder. Measured on
+        // `328996b`, adding to `send.rs`'s production
+        //
+        // ```ignore
+        // pub fn blocking_prefetch(session: &str)
+        //     -> Result<Vec<SendSummary>, SendError> {
+        //     list_sends(&CliSendRunner::with_session(None, None, session))
+        // }
+        // ```
+        //
+        // plus `let _ = crate::send::blocking_prefetch(&session_token);` in
+        // the frame closure gave 2108 lib / 217 bin / 0 failed / 0 warnings,
+        // and 2094 passed again with `--skip frame_promptness --skip
+        // vault_window::tests`, so it was not a frame-harness accident. Both
+        // needles that line spells live in the one file nothing looked at.
+        //
+        // The fix is not a wider exclusion but a NARROWER one: `send.rs` may
+        // spell each needle exactly the number of times its definitions do,
+        // and that number is asserted here rather than subtracted silently.
+        // A forwarder written there spells `list_sends(` or
+        // `CliSendRunner::with_session(` -- it cannot forward without naming
+        // what it forwards to -- so its count moves and this fails.
         let files = crate_sources();
         assert!(
             files.len() > 30,
@@ -3623,12 +3738,23 @@ mod source_pins {
                  written there would be counted by nothing at all"
             );
         }
+        assert!(
+            files.iter().any(|(p, _)| p == "send.rs"),
+            "control: the crate walk never reached `send.rs`, so the definition counts \
+             pinned below are pinned on nothing"
+        );
         let production: String = files
             .iter()
-            .filter(|(path, _)| path != "send.rs")
             .map(|(_, text)| production_region(text))
             .collect::<Vec<_>>()
             .join("\r\n");
+        let send_rs = sanitized(
+            &files
+                .iter()
+                .find(|(p, _)| p == "send.rs")
+                .map(|(_, text)| production_region(text))
+                .expect("asserted just above"),
+        );
         let block = sanitized(&sealed_module());
 
         // Control: the slice is a slice, not the whole file. Without this the
@@ -3645,13 +3771,66 @@ mod source_pins {
              of the module and every containment assertion here is vacuous"
         );
 
-        for needle in [
-            concat!("list_", "sends"),
-            concat!("real_send_", "list"),
-            concat!("spawn_send_list_", "with"),
-            concat!("CliSendRunner", "::with_session"),
+        // `send.rs` DEFINES two of the four, so it cannot be required to
+        // spell them zero times -- but the definitions are all it may spell.
+        // `pub fn list_sends<R: SendRunner>` is one mention of `list_sends`
+        // and no call; `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`
+        // and `impl SendRunner for CliSendRunner<'_>` name the type but never
+        // `CliSendRunner::with_session`, which is spelled `fn with_session(`
+        // inside the `impl`. So the allowance is one, and it is one for the
+        // FIRST needle only.
+        //
+        // **The last two rows are not seal needles; they are `send.rs`'s
+        // CONSTRUCTORS.** Measured on this commit's first draft, with only the
+        // four needles pinned, writing in `send.rs`'s production
+        //
+        // ```ignore
+        // pub fn warm_cache(session: &str) -> Result<(), SendError> {
+        //     let runner = CliSendRunner::new(None, None);
+        //     let _ = runner.run(&list_invocation(Some(session)))?;
+        //     Ok(())
+        // }
+        // ```
+        //
+        // plus `let _ = crate::send::warm_cache(&session_token);` in the frame
+        // closure gave `source_pins` 20 passed / 0 failed. It is the same
+        // sixty-second blocking `bw send list` -- built from the OTHER
+        // constructor and driven through `SendRunner::run` and the private
+        // `list_invocation` directly, so it spells not one of the four needles
+        // above nor `list_sends(`. The same shape written in a FOURTH file is
+        // an `E0603`, refused by rustc: `list_invocation` is private to
+        // `send.rs`, so this route exists in `send.rs` alone -- which is
+        // exactly the file the old exclusion made invisible.
+        //
+        // So the type itself is counted. Every way there is to obtain a
+        // `CliSendRunner` names it: `CliSendRunner::new`,
+        // `CliSendRunner::with_session`, or the struct literal (whose fields
+        // are private to this file, so nowhere else can write it). Three
+        // mentions is `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`
+        // and `impl SendRunner for CliSendRunner<'_>` -- the definitions, and
+        // no construction at all.
+        for (needle, defined_in_send_rs, is_seal_needle) in [
+            (concat!("list_", "sends"), 1usize, true),
+            (concat!("real_send_", "list"), 0, true),
+            (concat!("spawn_send_list_", "with"), 0, true),
+            (concat!("CliSendRunner", "::with_session"), 0, true),
+            (concat!("CliSendRunner", ""), 3, false),
+            (concat!("CliSendRunner", "::new"), 0, false),
         ] {
-            let total = production.matches(needle).count();
+            assert_eq!(
+                send_rs.matches(needle).count(),
+                defined_in_send_rs,
+                "`send.rs`'s production spells {needle:?} {} times, not the \
+                 {defined_in_send_rs} its DEFINITIONS account for. The extra mention is a \
+                 blocking `bw send list` written in the one file this seal used to \
+                 subtract -- and a `pub fn` there is callable from the frame closure by a \
+                 line that spells none of these needles at all",
+                send_rs.matches(needle).count()
+            );
+            if !is_seal_needle {
+                continue;
+            }
+            let total = production.matches(needle).count() - defined_in_send_rs;
             let inside = block.matches(needle).count();
             assert!(
                 total > 0,
@@ -3661,7 +3840,8 @@ mod source_pins {
             assert_eq!(
                 inside, total,
                 "{needle:?} occurs {total} times in the CRATE's production (every file under \
-                 `src` but `send.rs`) but only {inside} of them are \
+                 `src`, less the {defined_in_send_rs} definition(s) in `send.rs`) but only \
+                 {inside} of them are \
                  inside `mod send_fetch_thread`. Every mention outside that block -- in \
                  `mod.rs` or in any sibling file, which `pub(super)` admits -- is a blocking \
                  `bw send list` reachable from the eframe frame closure, where it freezes the \
@@ -5995,6 +6175,50 @@ mod frame_promptness {
              `bw sync` whose `BW_SESSION` is missing or empty is answered `Locked` by a \
              real vault, so Sync silently stops syncing while the pill still says it \
              worked"
+        );
+    }
+
+    /// **Visiting the Sends screen starts no further `bw sync`.**
+    ///
+    /// [`the_windows_own_session_is_what_reaches_the_bw_sync_child`] pins
+    /// `sync_spawns == 2` -- but under `press_sync`, a scenario that never
+    /// leaves the Vault screen. A third `(spawn_sync)` call site written on
+    /// the SENDS arm is therefore never entered there, and the scenario that
+    /// does reach Sends read `send_list_sessions` and never looked at the
+    /// sync counters at all. Measured on `328996b`: an aliased
+    /// `sync_now(sync_tx.clone(), String::new())` under `if on_sends` in the
+    /// frame closure was green at 2108 / 0 failed.
+    ///
+    /// This is the half that does not care how the third site is SPELLED.
+    /// `press_sends` drives three further frames on the Sends screen, so a
+    /// per-frame `bw sync` there is not one extra spawn but several -- and
+    /// in the shipping window it is one per frame for as long as the screen
+    /// is up, every one of them an un-jobbed child.
+    ///
+    /// The expectation is the auto-sync on the window's first real frame and
+    /// nothing else, and it is an equality on the SESSIONS as well as the
+    /// count, so the one permitted sync still has to carry the window's own
+    /// token. `send_list_spawns` is the positive control that the click
+    /// landed and the Sends arm really was drawn; without it a scenario that
+    /// never left the Vault screen would satisfy this trivially.
+    #[test]
+    fn visiting_the_sends_screen_starts_no_further_bw_sync() {
+        let outcome = measured("sends-sync", Scenario { press_sends: true, ..Scenario::new() });
+        assert!(
+            outcome.send_list_spawns >= 1,
+            "control: the Sends row was pressed and no Sends fetch was started, so this \
+             window never reached the Sends screen and a sync call site written on that \
+             arm would go unentered here too. What was painted: {:?}",
+            outcome.painted
+        );
+        assert_eq!(
+            outcome.sync_sessions,
+            vec![HARNESS_SESSION.to_string()],
+            "driving the window to the Sends screen started {} `bw sync` children, not the \
+             one auto-sync of the window's first real frame. Every frame the Sends screen \
+             is up would start another, un-jobbed, and any of them handed a session other \
+             than the window's own is answered `Locked` by a real vault",
+            outcome.sync_spawns
         );
     }
 
