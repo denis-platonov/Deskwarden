@@ -777,6 +777,629 @@ pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError>
 }
 
 // ---------------------------------------------------------------------------
+// The real runner: one `bw` child per invocation
+// ---------------------------------------------------------------------------
+
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// The environment variable the CLI reads its session from.
+///
+/// **An environment variable and never an argument.** A process's argument
+/// vector is readable by any other process on the machine (Task Manager's
+/// "Command line" column, `Get-CimInstance Win32_Process`), and the session
+/// token unlocks the whole vault. `bw_serve::run_bw_sync` hands the session
+/// over exactly this way, and this is the same rule applied to the same
+/// secret.
+const SESSION_ENV: &str = "BW_SESSION";
+
+/// The wall-clock cap on one CLI child.
+///
+/// Sixty seconds, not five: creating a Send talks to the server, and a slow
+/// link that would have succeeded must not be cut off. When the cap *does*
+/// expire the answer is [`SendError::TimedOut`], which
+/// [`SendError::is_ambiguous`] reports as ambiguous -- the request may well
+/// have reached the server before this app stopped waiting, so a Send may
+/// exist and a public link with it. Reporting a timeout as a clean failure
+/// would leave an unrevoked link nobody knows about, which is the exact harm
+/// this whole module is arranged around.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the wait loop asks whether the child has exited.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// What the wait loop should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitDecision {
+    /// The child exited; collect its output.
+    Finished,
+    /// Still running, still inside the cap.
+    KeepWaiting,
+    /// Still running and the cap has passed: kill it and report the ambiguous
+    /// [`SendError::TimedOut`].
+    GiveUp,
+}
+
+/// The one decision the wait loop makes, as a pure function of the two facts
+/// it has.
+///
+/// Pulled out of the loop precisely so that the deadline rule is testable
+/// without a process: nothing in this crate may spawn `bw` from a test, so if
+/// this lived inline it would be untested. `cap` is a parameter rather than a
+/// read of [`SEND_TIMEOUT`] so the boundary can be reached without waiting a
+/// minute for it.
+///
+/// `exited` wins over the clock: a child that finished on the last
+/// millisecond produced a result, and calling that a timeout would report an
+/// answer this app actually has as an ambiguous non-answer.
+pub fn wait_decision(exited: bool, elapsed: Duration, cap: Duration) -> WaitDecision {
+    if exited {
+        WaitDecision::Finished
+    } else if elapsed >= cap {
+        WaitDecision::GiveUp
+    } else {
+        WaitDecision::KeepWaiting
+    }
+}
+
+/// Turns an exit status plus the two captured streams into a [`RawOutput`].
+///
+/// Pure, and separate from the spawn for that reason: everything downstream of
+/// the child -- [`classify_failure`], [`parse_created_send`],
+/// [`parse_send_list`] -- reads only this, so this is where "what the CLI
+/// said" is decided, and it can be tested directly instead of through a
+/// process.
+///
+/// `from_utf8_lossy` rather than a hard error: the CLI's own sentence is the
+/// only explanation the user will get, and throwing it away because one byte
+/// was not UTF-8 would downgrade a readable rejection to
+/// [`SendError::FailedSilently`].
+///
+/// A `None` exit code means the child was killed rather than exited, and
+/// [`classify_failure`] already reads that as [`SendError::TimedOut`] -- i.e.
+/// ambiguous -- which is why nothing here invents a code to stand in for it.
+pub fn raw_output_from(exit_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> RawOutput {
+    RawOutput {
+        exit_code,
+        stdout: String::from_utf8_lossy(stdout).into_owned(),
+        stderr: String::from_utf8_lossy(stderr).into_owned(),
+    }
+}
+
+/// Reads a captured pipe to end-of-file. A read error yields what was read so
+/// far rather than nothing: a partial message still explains more than an
+/// empty one.
+fn drain<R: Read>(pipe: Option<R>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buf);
+    }
+    buf
+}
+
+/// The production [`SendRunner`]: runs one [`SendInvocation`] as a real child
+/// of the verified Bitwarden CLI, and reports exactly what it said.
+///
+/// It adds nothing to the invocation. The arguments, the stdin body and the
+/// session are all read off the [`SendInvocation`] it is handed, which is the
+/// point of that type being the whole of what reaches the CLI.
+pub struct CliSendRunner<'a> {
+    /// The kill-on-close job the child is placed in **before it executes a
+    /// single instruction**.
+    ///
+    /// From the design, verbatim: an orphaned `bw` holding `BW_SESSION` after
+    /// deskwarden dies is the same hazard `bw serve` is in the job for.
+    job: Option<&'a crate::job_object::KillOnCloseJob>,
+    /// The active account's CLI profile directory, passed straight through to
+    /// [`crate::bw_path::bw_command_in`] so a Send is created, listed and
+    /// revoked against the same account as every other write in this app.
+    data_dir: Option<&'a Path>,
+}
+
+impl<'a> CliSendRunner<'a> {
+    pub fn new(
+        job: Option<&'a crate::job_object::KillOnCloseJob>,
+        data_dir: Option<&'a Path>,
+    ) -> Self {
+        Self { job, data_dir }
+    }
+
+    /// Builds the command for one invocation, **without spawning anything**.
+    ///
+    /// Separate from [`Self::run`] so that the built object can be inspected
+    /// by a test: `get_program`, `get_args` and `get_envs` answer without a
+    /// process, so the assertions that matter here -- that the body is not in
+    /// argv, that the session is not in argv -- read the thing that would be
+    /// executed rather than the inputs the test handed in.
+    ///
+    /// The command comes from [`crate::bw_path::bw_command_in`] and from
+    /// nowhere else: that is the one place that names the executable whose
+    /// signature `check_bw_signature` verified at startup, and it refuses
+    /// outright when no verified path was recorded. Building one here by hand
+    /// would run whatever binary the ambient search order found first.
+    fn build_command(&self, inv: &SendInvocation) -> Result<Command, SendError> {
+        let mut command =
+            crate::bw_path::bw_command_in(self.data_dir).map_err(SendError::NoVerifiedCli)?;
+        command.args(inv.args());
+        if let Some(token) = inv.session_token() {
+            command.env(SESSION_ENV, token);
+        }
+        // Both pipes captured, and stdin piped because the request body goes
+        // in that way. No stream is inherited: a console handed to the child
+        // is a console this app does not own.
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(command)
+    }
+}
+
+impl SendRunner for CliSendRunner<'_> {
+    fn run(&self, inv: &SendInvocation) -> Result<RawOutput, SendError> {
+        let command = self.build_command(inv)?;
+
+        // Spawned suspended, put in the job, and only then resumed -- see
+        // `job_object::spawn_in_job`, which also re-ORs `CREATE_NO_WINDOW`
+        // because `creation_flags` REPLACES the flags a command holds rather
+        // than adding to them.
+        let mut child = crate::job_object::spawn_in_job(self.job, command).map_err(|e| {
+            SendError::SpawnFailed(format!(
+                "Bitwarden's command-line tool could not be started ({e}). Nothing was sent."
+            ))
+        })?;
+
+        // Write the body and **close the pipe**. The CLI reads its
+        // `encodedJson` from stdin to end-of-file, so a write handle left
+        // open would keep it reading forever while this side waited for an
+        // exit that could only arrive when the sixty-second cap expired --
+        // a deadlock that reports itself as an ambiguous timeout. Taking the
+        // handle out of the child moves it into this scope, so it is dropped,
+        // and the pipe closed, before a single byte is read back.
+        let write_error = match child.stdin.take() {
+            Some(mut pipe) => {
+                let body = inv.stdin_json_b64();
+                let outcome = if body.is_empty() {
+                    Ok(())
+                } else {
+                    pipe.write_all(body.as_bytes()).and_then(|()| pipe.flush())
+                };
+                drop(pipe);
+                outcome.err()
+            }
+            None => None,
+        };
+        if let Some(e) = write_error {
+            // Unambiguous: a body that never arrived in full is not valid
+            // JSON, so nothing was created. Kill rather than leave a child
+            // waiting on a stream it will never get.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SendError::SpawnFailed(format!(
+                "The request could not be handed to Bitwarden's command-line tool ({e}). \
+                 Nothing was sent."
+            )));
+        }
+
+        let out_pipe = child.stdout.take();
+        let err_pipe = child.stderr.take();
+
+        std::thread::scope(|scope| {
+            // Both pipes are drained concurrently: a child that fills one
+            // while this side waits on the other would block forever, and the
+            // only symptom would be the sixty-second cap.
+            let out_reader = scope.spawn(move || drain(out_pipe));
+            let err_reader = scope.spawn(move || drain(err_pipe));
+
+            let started = Instant::now();
+            let status = loop {
+                // A `try_wait` error is read as "not finished": the cap is
+                // then what ends the wait, which is the ambiguous answer and
+                // therefore the safe direction.
+                let exited = child.try_wait().ok().flatten();
+                match wait_decision(exited.is_some(), started.elapsed(), SEND_TIMEOUT) {
+                    WaitDecision::Finished => break exited,
+                    WaitDecision::KeepWaiting => std::thread::sleep(POLL_INTERVAL),
+                    WaitDecision::GiveUp => {
+                        // Killing is also what lets the two readers finish:
+                        // they are blocked on pipes that close only when the
+                        // child does.
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                }
+            };
+
+            let stdout = out_reader.join().unwrap_or_default();
+            let stderr = err_reader.join().unwrap_or_default();
+            match status {
+                Some(status) => Ok(raw_output_from(status.code(), &stdout, &stderr)),
+                None => Err(SendError::TimedOut),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    /// The same instant the pure half's tests use.
+    const NOW: FixedClock = FixedClock(1_786_408_997_148);
+    /// Invented. No real session token appears in this file.
+    const SESSION: &str = "an-invented-session-token-not-a-real-one";
+    const SECRET: &str = "correct-horse-battery-staple";
+    const SHARE_PASSWORD: &str = "share-pw-9271";
+
+    fn a_plan() -> SendPlan {
+        SendPlan {
+            name: "Wi-Fi password".to_string(),
+            text: Zeroizing::new(SECRET.to_string()),
+            password: Some(Zeroizing::new(SHARE_PASSWORD.to_string())),
+            max_access_count: Some(3),
+            ..SendPlan::default()
+        }
+    }
+
+    /// Records a verified CLI path so [`crate::bw_path::bw_command_in`] will
+    /// answer at all, and hands back whichever path won the process-wide
+    /// `OnceLock`.
+    ///
+    /// **Records a path; it does not touch the filesystem and nothing is
+    /// spawned.** The path is deliberately the same invented one
+    /// `bw_path`'s own tests record, and the assertions below compare against
+    /// whatever `verified_bw_exe()` reports rather than against this literal,
+    /// so the first-wins lock makes them order-independent.
+    fn verified_exe() -> &'static Path {
+        crate::bw_path::remember_verified_bw_exe(PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        crate::bw_path::verified_bw_exe().expect("a verified path was just recorded")
+    }
+
+    fn create_invocation() -> SendInvocation {
+        plan_to_invocation(&a_plan(), SESSION, &NOW).expect("the plan is valid")
+    }
+
+    fn args_of(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn the_built_command_runs_the_verified_executable_and_not_an_ambient_one() {
+        let exe = verified_exe();
+        assert!(
+            exe.is_absolute(),
+            "control: the recorded path is relative, so the comparison below would not \
+             distinguish an absolute path from a bare binary name"
+        );
+
+        let command = CliSendRunner::new(None, None)
+            .build_command(&create_invocation())
+            .expect("a verified path is recorded, so the command builds");
+
+        // Read off the BUILT object, not off what was passed in.
+        assert_eq!(
+            Path::new(command.get_program()),
+            exe,
+            "the command names something other than the executable whose signature startup \
+             verified; a bare binary name would be resolved by the ambient search order, which \
+             on Windows checks this app's own user-writable directory first"
+        );
+    }
+
+    #[test]
+    fn there_is_no_command_at_all_when_no_verified_executable_was_recorded() {
+        // The failure direction, without depending on the OnceLock being
+        // empty (another test may have filled it): whatever `bw_command_in`
+        // refuses with must arrive as `NoVerifiedCli` and never as a silent
+        // fallback to some other binary.
+        match crate::bw_path::bw_command_in(None) {
+            Ok(command) => assert_eq!(
+                Path::new(command.get_program()),
+                crate::bw_path::verified_bw_exe().expect("it answered, so a path is recorded"),
+                "the builder answered with a program that is not the verified one"
+            ),
+            Err(why) => assert!(
+                !why.is_empty(),
+                "the refusal must carry the reason the user is shown"
+            ),
+        }
+    }
+
+    #[test]
+    fn the_request_body_reaches_stdin_and_never_the_argument_vector() {
+        let _ = verified_exe();
+        let inv = create_invocation();
+        let body = inv.stdin_json_b64().to_string();
+        assert!(
+            !body.is_empty(),
+            "control: creating a Send really does have a body, so the assertions below are \
+             about a body that exists"
+        );
+
+        let command = CliSendRunner::new(None, None)
+            .build_command(&inv)
+            .expect("the command builds");
+        let args = args_of(&command);
+
+        // The whole design exists for this line: the argument vector is the
+        // two literal words and nothing else.
+        assert_eq!(
+            args,
+            vec!["send".to_string(), "create".to_string()],
+            "the argument vector grew past `send create`; every field that could carry a \
+             secret goes in through stdin as JSON, and argv is world-readable"
+        );
+        for arg in &args {
+            assert!(
+                !arg.contains(&body),
+                "the encoded request body is in argv: {arg}"
+            );
+            assert!(!arg.contains(SECRET), "the shared secret is in argv: {arg}");
+            assert!(
+                !arg.contains(SHARE_PASSWORD),
+                "the share password is in argv: {arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_token_is_handed_over_in_the_environment_and_never_in_argv() {
+        let _ = verified_exe();
+        let command = CliSendRunner::new(None, None)
+            .build_command(&create_invocation())
+            .expect("the command builds");
+
+        let envs: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.iter()
+                .any(|(k, v)| k == SESSION_ENV && v.as_deref() == Some(SESSION)),
+            "the session is not in the child's environment under {SESSION_ENV}; it was {envs:?}"
+        );
+        for arg in args_of(&command) {
+            assert!(
+                !arg.contains(SESSION),
+                "the session token is in argv, where any process on the machine can read it: \
+                 {arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invocations_that_carry_no_session_do_not_have_one_invented_for_them() {
+        // `list` and `delete` leave `session_token` as `None`, meaning "use
+        // the session the runner was configured with". Honouring that means
+        // setting nothing, not reaching for some other source.
+        let _ = verified_exe();
+        for inv in [list_invocation(), delete_invocation("send-id-1")] {
+            assert!(inv.session_token().is_none(), "control: {inv:?} has none");
+            let command = CliSendRunner::new(None, None)
+                .build_command(&inv)
+                .expect("the command builds");
+            assert!(
+                command
+                    .get_envs()
+                    .all(|(k, _)| k != OsStr::new(SESSION_ENV)),
+                "a session was set for an invocation that carries none"
+            );
+            assert!(
+                inv.stdin_json_b64().is_empty(),
+                "control: this invocation has no body"
+            );
+        }
+    }
+
+    #[test]
+    fn the_profile_directory_the_runner_was_given_reaches_the_child() {
+        let _ = verified_exe();
+        let dir = PathBuf::from(r"C:\deskwarden-test\profile-b");
+        let command = CliSendRunner::new(None, Some(&dir))
+            .build_command(&list_invocation())
+            .expect("the command builds");
+        assert!(
+            command.get_envs().any(|(k, v)| k
+                == OsStr::new(crate::bw_path::BW_DATA_DIR_ENV)
+                && v == Some(OsStr::new(dir.as_os_str()))),
+            "the account's profile directory did not reach the child, so a Send would be \
+             created against whichever account the CLI defaults to"
+        );
+    }
+
+    #[test]
+    fn the_wait_loop_gives_up_only_once_the_cap_has_passed() {
+        let cap = Duration::from_secs(60);
+        assert_eq!(
+            wait_decision(false, Duration::ZERO, cap),
+            WaitDecision::KeepWaiting
+        );
+        assert_eq!(
+            wait_decision(false, Duration::from_secs(59), cap),
+            WaitDecision::KeepWaiting
+        );
+        assert_eq!(
+            wait_decision(false, cap - Duration::from_millis(1), cap),
+            WaitDecision::KeepWaiting,
+            "one millisecond short of the cap is still inside it"
+        );
+        assert_eq!(wait_decision(false, cap, cap), WaitDecision::GiveUp);
+        assert_eq!(
+            wait_decision(false, Duration::from_secs(3600), cap),
+            WaitDecision::GiveUp
+        );
+        assert_eq!(
+            wait_decision(true, Duration::from_secs(3600), cap),
+            WaitDecision::Finished,
+            "a child that finished produced a result; calling that a timeout would report an \
+             answer this app actually has as an ambiguous non-answer"
+        );
+        assert_eq!(
+            SEND_TIMEOUT,
+            Duration::from_secs(60),
+            "the cap the loop actually uses is no longer the sixty seconds documented"
+        );
+        assert!(
+            POLL_INTERVAL < SEND_TIMEOUT,
+            "control: the loop polls many times inside the cap"
+        );
+    }
+
+    #[test]
+    fn giving_up_on_the_child_is_ambiguous_and_never_a_clean_failure() {
+        assert!(
+            SendError::TimedOut.is_ambiguous(),
+            "a Send may have been created before this app stopped waiting"
+        );
+        // The other route to the same answer: a killed child has no exit
+        // code, and that must not be read as a clean non-zero failure either.
+        let killed = raw_output_from(None, b"", b"");
+        assert_eq!(
+            classify_failure(killed.exit_code, &killed.stdout, &killed.stderr),
+            SendError::TimedOut
+        );
+        assert_ne!(
+            killed.exit_code,
+            Some(0),
+            "a killed child must not read as a clean exit"
+        );
+    }
+
+    #[test]
+    fn the_captured_streams_become_the_output_the_parsers_read() {
+        let out = raw_output_from(Some(0), b"{\"id\":\"send-1\"}", b"");
+        assert_eq!(out.exit_code, Some(0));
+        assert_eq!(out.stdout, "{\"id\":\"send-1\"}");
+        assert_eq!(out.stderr, "");
+
+        // Not UTF-8, and the rest of the sentence survives: it is the only
+        // explanation the user will get.
+        let lossy = raw_output_from(Some(1), b"", b"could not \xff reach the server");
+        assert!(
+            lossy.stderr.contains("could not") && lossy.stderr.contains("reach the server"),
+            "a single bad byte swallowed the CLI's message: {:?}",
+            lossy.stderr
+        );
+        assert!(
+            matches!(
+                classify_failure(lossy.exit_code, &lossy.stdout, &lossy.stderr),
+                SendError::Rejected(_)
+            ),
+            "the recovered sentence did not reach the classifier"
+        );
+    }
+
+    /// **Source pins, not tests -- and each one says why it cannot be a
+    /// test.**
+    ///
+    /// Three properties of [`CliSendRunner::run`] are facts about a process
+    /// that exists only once the CLI has actually been spawned: that the child
+    /// joins the kill-on-close job, that it comes up with no console
+    /// (`CREATE_NO_WINDOW`), and that the command was built by
+    /// [`crate::bw_path`] rather than by hand. **No test in this crate may
+    /// spawn a process**, and the fake runner the rest of this module's tests
+    /// use never starts one -- so a fake proves none of the three. They are
+    /// therefore pinned over the source text, in the shape `bw_path.rs:889`
+    /// and `login_ui.rs:3530` established: every needle is `concat!`-split so
+    /// that it cannot match its own declaration here, every needle is
+    /// single-line so that a CRLF checkout cannot turn it into a false pass,
+    /// and every needle is *required*, so the assertion is itself the evidence
+    /// that it still matches live code.
+    ///
+    /// Two more are pinned for the same reason: the stdin handle being taken
+    /// out of the child and dropped before anything is read (leaving it in
+    /// place deadlocks until the cap, which no test can see), and the
+    /// give-up branch returning the ambiguous failure.
+    #[test]
+    fn the_spawn_time_properties_no_test_can_observe_are_pinned_to_the_source() {
+        let source = include_str!("send.rs");
+        for (required, why) in [
+            (
+                concat!("bw_path::bw_command_in(", "self.data_dir)"),
+                "the command is no longer built by the one module that names the executable \
+                 whose signature startup verified",
+            ),
+            (
+                concat!("job_object::spawn_in_job(", "self.job, command)"),
+                "the child no longer joins the kill-on-close job: an orphaned CLI holding the \
+                 session after deskwarden dies is the same hazard `bw serve` is in the job for",
+            ),
+            (
+                concat!("child.stdin.", "take()"),
+                "the stdin handle is left inside the child, so the pipe stays open, the CLI \
+                 keeps reading to a end-of-file that never comes, and the only symptom is the \
+                 sixty-second cap",
+            ),
+            (
+                concat!("drop(", "pipe);"),
+                "the write handle is no longer closed before the output is read",
+            ),
+            (
+                concat!("None => Err(SendError::", "TimedOut),"),
+                "giving up on the child no longer reports the ambiguous failure, so a Send \
+                 that may exist would render as a clean failure",
+            ),
+        ] {
+            assert!(source.contains(required), "`{required}` is gone: {why}");
+        }
+
+        // `CREATE_NO_WINDOW` is the third, and it is not in this file at all.
+        // `spawn_in_job` re-ORs it because `creation_flags` REPLACES the flags
+        // a command holds rather than adding to them, so setting
+        // `CREATE_SUSPENDED` alone silently drops it and the child comes up
+        // with a real console attached. Pinned where it lives, because this
+        // module's correctness depends on it.
+        let job_source = include_str!("job_object.rs");
+        assert!(
+            job_source.contains(concat!(
+                "creation_flags(crate::bw_path::CREATE_NO_WINDOW",
+                " | CREATE_SUSPENDED.0)"
+            )),
+            "`spawn_in_job` no longer re-applies CREATE_NO_WINDOW, so every Send would flash a \
+             console window on screen"
+        );
+    }
+
+    #[test]
+    fn the_two_secret_bearing_flags_still_appear_nowhere_in_this_file() {
+        // The pure half pins this too; it is repeated here because this is the
+        // step that builds a real command line, and a flag added to the runner
+        // rather than to `plan_to_invocation` would slip past a pin that only
+        // ever looked at the invocation builders.
+        let source = include_str!("send.rs");
+        for forbidden in [concat!("--", "password"), concat!("--", "emails")] {
+            assert!(
+                !source.contains(forbidden),
+                "`{forbidden}` is spelled in this file: every field that carries a secret or a \
+                 recipient list goes in as JSON on stdin, never as a flag"
+            );
+        }
+        assert!(
+            source.contains(concat!("--", "password").trim_start_matches('-')),
+            "control: the needles above are not vacuous -- the bare word is present, so the \
+             absence asserted is the absence of the flag spelling"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
