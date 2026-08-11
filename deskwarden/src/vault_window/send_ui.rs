@@ -1940,10 +1940,26 @@ mod source_pins {
     //! production: that `spawn_send_list` is *nothing but* the delegation, and
     //! that the fetch it delegates is the real one.
 
-    fn production() -> &'static str {
-        let source = include_str!("mod.rs");
-        let end = source.find(concat!("#[cfg(", "test)]")).expect("no test marker");
-        &source[..end]
+    /// What the compiler builds into the shipped binary from `mod.rs`.
+    ///
+    /// **This was a first-occurrence cut** -- `&source[..source.find(gate)]`
+    /// -- propped up by a separate shape walk
+    /// (`nothing_but_gated_test_modules_lives_below_the_pins_cut`) asserting
+    /// that `mod.rs` really is "production, then nothing but test modules to
+    /// EOF". That is the exact fragility [`production_region`] was written to
+    /// remove one file over, and leaving it standing here meant the two files
+    /// this seal covers were read by two different rules, only one of which
+    /// had been beaten into shape by measurement. Both go through the same
+    /// function now. The shape walk stays: it is a true statement about
+    /// `mod.rs` and a useful one, but nothing depends on it any more.
+    ///
+    /// Note the return type changed with it -- the region is *built*, not
+    /// borrowed, and it is already [`sanitized`], so callers that used to
+    /// sanitize it themselves no longer need to (doing so anyway is
+    /// harmless: `sanitized` preserves byte length and is idempotent over
+    /// already-blanked text).
+    fn production() -> String {
+        production_region_source(include_str!("mod.rs"))
     }
 
     /// The same idea over **this** file. `production()` reads `mod.rs` only,
@@ -2179,11 +2195,72 @@ mod source_pins {
     /// could not see -- plus a call in the frame closure. 2061 lib + 217 bin,
     /// 0 failed. A sixty-second freeze, green.
     ///
-    /// So the gated items are *removed*, not cut at: each `#[cfg(test)]` is
-    /// followed to its item's extent -- the matching `}` of the item's brace
-    /// group, or the `;` that ends a braceless item such as
-    /// `#[cfg(test)] use foo::bar;` -- and everything else is kept, however
-    /// many times production and tests interleave.
+    /// So the gated items are *removed*, not cut at: each gate is followed to
+    /// its item's extent -- the matching `}` of the item's brace group, the
+    /// `;` that ends a braceless item such as `#[cfg(test)] use foo::bar;`,
+    /// or the `,` that ends a gated **struct field, enum variant, tuple
+    /// element or match arm** -- and everything else is kept, however many
+    /// times production and tests interleave.
+    ///
+    /// **The `,` and the depth tracking are the second round's fix, and the
+    /// hole they close was strictly worse than the one above.** The first
+    /// version of this scanner knew only two terminators, `;` and `{..}`, and
+    /// tracked no enclosing brace at all. A gate on an item that has neither
+    /// -- a struct field is the shortest -- therefore ran *past the closing
+    /// brace of its own parent* and deleted everything up to the next `;` or
+    /// brace group ANYWHERE later in the file. Where the first-occurrence cut
+    /// was blind only after a point, this was blind at a point of the
+    /// author's choosing. Measured on `cbe915e`, in this file's production
+    /// immediately above `mod fetch_thread_tests`:
+    ///
+    /// ```ignore
+    /// struct GateHole {
+    ///     #[cfg(test)]
+    ///     marker: u32,
+    ///     real: u32,
+    /// }
+    ///
+    /// pub(super) fn prefetch_now() -> Result<Vec<SendSummary>, SendError> {
+    ///     let runner = crate::send::CliSendRunner::new(None, /* data dir */);
+    ///     crate::send::list_sends(&runner)
+    /// }
+    /// ```
+    ///
+    /// plus the call in the frame closure: the region ended at
+    /// `struct GateHole {` and resumed after `prefetch_now`'s body, so both
+    /// banned spellings were written out in full inside a function that ran
+    /// on the eframe thread every frame. 2068 lib + 217 bin, 0 failed.
+    ///
+    /// So the walk now carries its own brace and paren depth and **stops
+    /// before any closer it did not open**: a `}` or `)` or `]` at local
+    /// depth zero is the parent's, not the item's, and the walk ends there
+    /// without consuming it. A gated item can therefore never swallow code
+    /// beyond its own syntactic parent, whatever shape it has. The walk may
+    /// still *under*-consume -- a gated field whose type is
+    /// `HashMap<K, V>` ends at the `,` inside the generics, since `<` and `>`
+    /// are not tracked (they are not reliably delimiters in Rust) -- and that
+    /// direction is deliberate: under-consuming leaves a fragment of TEST
+    /// code inside the region, which can only ever turn a guard red, while
+    /// over-consuming deletes PRODUCTION code, which is how a guard goes
+    /// blind. Every ambiguity here resolves toward the red.
+    ///
+    /// **Which attributes count as a gate**, in the same direction. The gate
+    /// used to be the literal `#[cfg(test)]`, so `#[cfg(all(test, windows))]`
+    /// was not recognised and its test module stayed in the "production"
+    /// region -- harmless for hiding, but it reds the crate walk the first
+    /// time somebody writes a perfectly normal platform-scoped test module.
+    /// The rule is now: the attribute is `cfg(..)` and its predicate
+    /// *implies* `test`, i.e. a bare `test` reached through nothing but
+    /// `all(..)`. Deliberately NOT gates:
+    ///
+    ///  * `#[cfg(any(test, ..))]` -- `any` is satisfiable without `test`, so
+    ///    the item may well be in the shipped binary. Treating it as a gate
+    ///    would make `#[cfg(any(test, all()))]` -- which is unconditionally
+    ///    true -- a one-line invisibility cloak over any production item.
+    ///  * `#[cfg(not(test))]` -- that is production code by definition.
+    ///  * `#[cfg_attr(test, ..)]` -- it adds an *attribute* under test; the
+    ///    item itself is production either way, and removing it would be the
+    ///    Critical above with a different spelling.
     ///
     /// The alternative considered and rejected was to require every file in
     /// the crate to have `mod.rs`'s "one trailing run of test modules" shape,
@@ -2195,49 +2272,169 @@ mod source_pins {
     /// `the_production_region_survives_interleaved_test_items` runs it
     /// against interleaving that the old cut got wrong.
     fn production_region(text: &str) -> String {
-        let gate = concat!("#[cfg(", "test)]");
+        sanitized(&production_region_source(text))
+    }
+
+    /// [`production_region`] before the blanking: the same spans of `text`,
+    /// in the original, with comments and literals still readable.
+    ///
+    /// The gates are still located over the *sanitized* copy -- that is the
+    /// whole of how a `#[cfg(test)]` written in a doc comment stays a piece
+    /// of prose -- and [`sanitized`] preserves byte length and character
+    /// boundaries exactly, so every offset it yields indexes the original.
+    ///
+    /// Two callers want the two halves and they are not the same want. A
+    /// needle counted for a *behavioural* claim ("nothing calls `.recv()`")
+    /// must not see comments, so it takes the blanked form. A needle that
+    /// pins a *literal* -- `egui::Panel::left("vault-item-list")` -- is
+    /// pinning the string's contents, and blanking them turns that pin into
+    /// a match against nothing at all.
+    fn production_region_source(text: &str) -> String {
         let clean = sanitized(text);
         let b = clean.as_bytes();
-        let mut out = String::with_capacity(clean.len());
+        let mut out = String::with_capacity(text.len());
         let mut i = 0usize;
-        while let Some(rel) = clean[i..].find(gate) {
-            let at = i + rel;
-            out.push_str(&clean[i..at]);
-            // Walk from the end of the attribute to the end of the item it
-            // gates. `(` and `[` are tracked so a `;` inside a type such as
-            // `[u8; 4]` or a `const` generic is not mistaken for the item's
-            // terminator.
-            let mut j = at + gate.len();
-            let mut nesting = 0usize;
-            let end = loop {
-                if j >= b.len() {
-                    break b.len();
-                }
-                match b[j] {
-                    b'(' | b'[' => nesting += 1,
-                    b')' | b']' => nesting = nesting.saturating_sub(1),
-                    b';' if nesting == 0 => break j + 1,
-                    b'{' => {
-                        let mut depth = 1usize;
-                        j += 1;
-                        while j < b.len() && depth > 0 {
-                            match b[j] {
-                                b'{' => depth += 1,
-                                b'}' => depth -= 1,
-                                _ => {}
-                            }
-                            j += 1;
-                        }
-                        break j;
+        let mut kept_from = 0usize;
+        while i < b.len() {
+            if b[i] == b'#' {
+                if let Some((body, after)) = attribute_span(b, i) {
+                    if attribute_implies_test(&clean[body.0..body.1]) {
+                        out.push_str(&text[kept_from..i]);
+                        i = gated_item_end(b, after);
+                        kept_from = i;
+                    } else {
+                        i = after;
                     }
-                    _ => {}
+                    continue;
                 }
-                j += 1;
-            };
-            i = end;
+            }
+            i += 1;
         }
-        out.push_str(&clean[i..]);
+        out.push_str(&text[kept_from..]);
         out
+    }
+
+    /// If `b[at]` opens an attribute (`#[..]` or `#![..]`), the byte range of
+    /// its *contents* and the offset just past its closing `]`.
+    ///
+    /// Separated from [`production_region`] so the gate decision is made on
+    /// the attribute's own text rather than on a substring match that cannot
+    /// tell `cfg(test)` from `cfg(not(test))`.
+    fn attribute_span(b: &[u8], at: usize) -> Option<((usize, usize), usize)> {
+        let mut i = at + 1;
+        if b.get(i) == Some(&b'!') {
+            i += 1;
+        }
+        if b.get(i) != Some(&b'[') {
+            return None;
+        }
+        let body_start = i + 1;
+        let mut i = body_start;
+        let mut square = 1usize;
+        let mut round = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'[' => square += 1,
+                b'(' => round += 1,
+                b')' => round = round.saturating_sub(1),
+                b']' => {
+                    square -= 1;
+                    if square == 0 && round == 0 {
+                        return Some(((body_start, i), i + 1));
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether an attribute's contents mean "this item exists only under
+    /// `cfg(test)`", and so may be removed from the production region.
+    ///
+    /// See [`production_region`]'s doc for the cases this deliberately says
+    /// `false` to. The shape of the answer: the head identifier must be
+    /// exactly `cfg`, and a bare `test` token must be reachable through
+    /// nothing but `all(..)` -- any `not(..)`, `any(..)` or unknown
+    /// combinator on the way makes it a maybe, and a maybe is production.
+    fn attribute_implies_test(body: &str) -> bool {
+        let b = body.as_bytes();
+        // The identifier that opened each still-open `(`, outermost first.
+        let mut opened: Vec<&str> = Vec::new();
+        let mut i = 0usize;
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                let word = &body[start..i];
+                let mut j = i;
+                while j < b.len() && (b[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'(') {
+                    // A combinator (or the head `cfg` itself).
+                    if opened.is_empty() && word != "cfg" {
+                        // `cfg_attr`, `derive`, `allow`, ... -- not a gate at
+                        // all, whatever it contains.
+                        return false;
+                    }
+                    opened.push(word);
+                    i = j + 1;
+                } else if word == "test" && opened.iter().all(|f| *f == "cfg" || *f == "all") {
+                    return !opened.is_empty();
+                }
+                continue;
+            }
+            if c == b')' {
+                opened.pop();
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The offset just past the end of the item a gate at `from` applies to,
+    /// or -- if the item ends by running into a closer this walk did not open
+    /// -- the offset of that closer, which is NOT consumed.
+    ///
+    /// The second half is the whole point; see [`production_region`]'s doc.
+    fn gated_item_end(b: &[u8], from: usize) -> usize {
+        let mut i = from;
+        // Depths of what THIS walk opened. A closer while the matching depth
+        // is zero belongs to the item's parent, and the item ends before it.
+        let mut brace = 0usize;
+        let mut round = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'(' | b'[' => round += 1,
+                b')' | b']' => {
+                    if round == 0 && brace == 0 {
+                        return i;
+                    }
+                    round = round.saturating_sub(1);
+                }
+                b'{' => brace += 1,
+                b'}' => {
+                    if brace == 0 {
+                        return i;
+                    }
+                    brace -= 1;
+                    if brace == 0 {
+                        return i + 1;
+                    }
+                }
+                // A braceless item (`use foo;`), or a gated field, variant,
+                // tuple element or match arm.
+                b';' | b',' if round == 0 && brace == 0 => return i + 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        b.len()
     }
 
     /// The controls on [`production_region`] and [`sanitized`]. Without them
@@ -2345,7 +2542,63 @@ mod source_pins {
         assert_eq!(region.matches(concat!("list_", "sends(")).count(), 0, "{region:?}");
         assert!(region.contains("fn kept"), "{region:?}");
 
-        // 9. Non-vacuity: over this crate's own files the region is neither
+        // 9. **A GATED ITEM MAY NOT CONSUME ITS PARENT.** The measured
+        //    survivor this function's second round exists for: a gate on an
+        //    item with neither a `;` nor a `{..}` of its own -- a struct
+        //    field, an enum variant, a tuple element, a match arm -- used to
+        //    run past the enclosing `}` and delete everything up to the next
+        //    terminator anywhere later in the file. `victim` stands where
+        //    `prefetch_now` stood.
+        for (shape, parent) in [
+            ("a struct field", format!("struct S {{\n    {gate}\n    marker: u32,\n    real: u32,\n}}\n")),
+            ("a trailing struct field", format!("struct S {{\n    real: u32,\n    {gate}\n    marker: u32\n}}\n")),
+            ("an enum variant", format!("enum E {{\n    Real,\n    {gate}\n    Marker(u32),\n}}\n")),
+            ("a tuple element", format!("struct T(u32, {gate} u32);\n")),
+            ("a match arm", format!("fn f(e: E) {{\n    match e {{\n        {gate}\n        E::Marker(_) => probe(),\n        E::Real => {{ real(); }}\n    }}\n}}\n")),
+            ("a fn parameter", format!("fn g(a: u32, {gate} b: u32) {{ inner(); }}\n")),
+        ] {
+            let source = format!("{parent}\nfn victim() {{ list_sends(&runner); }}\n");
+            let region = production_region(&source);
+            assert!(
+                region.contains("fn victim"),
+                "{shape} gated with {gate:?} swallowed the production item after its parent: \
+                 {region:?}"
+            );
+            assert!(
+                region.contains(concat!("list_", "sends(")),
+                "{shape} gated with {gate:?} hid a banned call from every needle in this \
+                 module: {region:?}"
+            );
+            assert!(
+                !region.contains("marker") && !region.contains("Marker") && !region.contains("b: u32"),
+                "{shape} was not removed at all: {region:?}"
+            );
+        }
+
+        // 10. The same in the other direction: the gate is a PREDICATE, not a
+        //     literal. `all(test, ..)` is test-only and must be removed (it
+        //     is a normal thing to write and would otherwise red the crate
+        //     walk); `any(..)`, `not(..)` and `cfg_attr` may all be in the
+        //     shipped binary and must NOT be, or each becomes a hiding place
+        //     as large as the one case 9 closes.
+        let removed = "#[cfg(all(test, windows))]\nmod t { fn hidden() {} }\nfn kept() {}\n";
+        let region = production_region(removed);
+        assert!(region.contains("fn kept"), "{region:?}");
+        assert!(!region.contains("hidden"), "`all(test, ..)` was not recognised as test-only: {region:?}");
+        for (why, kept) in [
+            ("`any(test, ..)` can hold without `test`", "#[cfg(any(test, feature_x))]\nfn shipped() { list_sends(&r); }\n"),
+            ("`any(test, all())` is unconditionally true", "#[cfg(any(test, all()))]\nfn shipped() { list_sends(&r); }\n"),
+            ("`not(test)` IS production", "#[cfg(not(test))]\nfn shipped() { list_sends(&r); }\n"),
+            ("`cfg_attr` gates an attribute, not the item", "#[cfg_attr(test, derive(Debug))]\nfn shipped() { list_sends(&r); }\n"),
+        ] {
+            let region = production_region(kept);
+            assert!(
+                region.contains(concat!("list_", "sends(")),
+                "{why}, so removing the item hides production code: {region:?}"
+            );
+        }
+
+        // 11. Non-vacuity: over this crate's own files the region is neither
         //    everything nor nothing.
         let here = include_str!("send_ui.rs");
         let region = this_files_production();
@@ -2403,7 +2656,7 @@ mod source_pins {
     /// way `the_item_list_is_drawn_only_inside_the_not_sends_gate` slices its
     /// gate, so the pins below can say "inside there and nowhere else" rather
     /// than "somewhere in the file".
-    fn sealed_module() -> &'static str {
+    fn sealed_module() -> String {
         let production = production();
         let opener = concat!("mod send_fetch_", "thread {\r\n");
         assert_eq!(
@@ -2417,7 +2670,7 @@ mod source_pins {
         let end = rest
             .find("\r\n}\r\n")
             .expect("`mod send_fetch_thread` has no closing brace at column zero");
-        &rest[..end]
+        rest[..end].to_string()
     }
 
     /// Whitespace-insensitive, so this is a pin on the code and not on the
@@ -2737,7 +2990,7 @@ mod source_pins {
             "list( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), );"
         ));
         assert_eq!(
-            squashed(production).matches(&spawn).count(),
+            squashed(&production).matches(&spawn).count(),
             1,
             "{spawn:?} is not in production exactly once -- the Sends fetch is started from \
              nowhere, from more than one place, or without the generation that lets a stale \
@@ -2850,7 +3103,7 @@ mod source_pins {
         // one tab resurrected the exact previous-round survivor. `pub\r\nfn`
         // and `pub/*x*/fn` are the same hole. Comments are blanked by
         // `sanitized` first, which turns the third into whitespace too.
-        let block = sanitized(block);
+        let block = sanitized(&block);
         let block = block.as_str();
         let exported: Vec<String> = block
             .match_indices("pub")
@@ -2961,7 +3214,7 @@ mod source_pins {
         // explaining why `.recv()` is banned is not a call, and a guard that
         // cannot survive its own explanation gets deleted.
         for (file, text) in
-            [("mod.rs", sanitized(production())), ("send_ui.rs", this_files_production())]
+            [("mod.rs", sanitized(&production())), ("send_ui.rs", this_files_production())]
         {
             for banned in
                 [concat!(".recv", "()"), concat!(".recv_", "timeout("), concat!(".recv_", "deadline(")]
@@ -2975,7 +3228,7 @@ mod source_pins {
             }
         }
 
-        let production = sanitized(production());
+        let production = sanitized(&production());
         let production = production.as_str();
         let name = concat!("send_", "rx");
         let mut seen = 0usize;
@@ -3046,6 +3299,182 @@ mod source_pins {
         );
     }
 
+    /// The frame closure's whole text, from the `{` of
+    /// `let vault_frame_fn = move |ui: &mut egui::Ui ..` to its matching `}`,
+    /// sanitized.
+    ///
+    /// Sanitized, and the braces counted over the sanitized text, because a
+    /// `{` inside a doc comment or a string would otherwise shift every depth
+    /// below it -- and this file's comments are full of both.
+    fn frame_closure() -> String {
+        let production = sanitized(&production());
+        let head = concat!("let vault_frame_fn = ", "move |ui: &mut egui::Ui");
+        assert_eq!(
+            production.matches(head).count(),
+            1,
+            "{head:?} is not in production exactly once -- the frame closure has been renamed \
+             or duplicated, and every assertion taken over its body below is reading nothing"
+        );
+        let at = production.find(head).expect("counted just above");
+        let rest = &production[at..];
+        let open = rest.find('{').expect("the frame closure has no body");
+        let b = rest.as_bytes();
+        let mut depth = 0usize;
+        let mut i = open;
+        let end = loop {
+            assert!(i < b.len(), "the frame closure's body is never closed");
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break i + 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        };
+        rest[open..end].to_string()
+    }
+
+    /// **The frame closure has nothing to wait on, and no shape to wait in.**
+    ///
+    /// The stated property is that the frame does not wait, and until this
+    /// round nothing enforced it. What enforced it was two needles aimed at
+    /// the token `send_rx` and at the drain line's *indentation*, and both
+    /// were beaten by measurement on `cbe915e`, at 2068 lib + 217 bin, 0
+    /// failed:
+    ///
+    ///  * **M-2**, a spin loop written without re-indenting the drain:
+    ///
+    ///    ```ignore
+    ///    loop {
+    ///    if let Ok((tag, result)) = send_rx.try_recv() {
+    ///        ..
+    ///        break;
+    ///    }
+    ///    }
+    ///    ```
+    ///
+    ///    `send_rx` still occurred exactly twice and the drain line still
+    ///    matched the pinned string, spaces and all. The indentation pin held
+    ///    nothing, because indentation is a convention and a mutation is not
+    ///    obliged to follow it.
+    ///
+    ///  * **M-7**, which shows the drain was the wrong target altogether. The
+    ///    guards constrain the token `send_rx`; nothing stopped the closure
+    ///    making its own channel and blocking on that, under a spelling with
+    ///    no `.recv` in it to ban:
+    ///
+    ///    ```ignore
+    ///    let (park_tx, park_rx) = std::sync::mpsc::channel::<u8>();
+    ///    let _park = park_tx;
+    ///    let _ = std::sync::mpsc::Receiver::recv_timeout(
+    ///        &park_rx, std::time::Duration::from_secs(60));
+    ///    ```
+    ///
+    ///    Sixty seconds per frame. `SendListReceiver` removes the blocking
+    ///    API from *one* channel; it says nothing about a second one.
+    ///
+    /// So this asserts over the closure's own body rather than over a line:
+    ///
+    ///  1. The drain sits at **brace depth 1** -- the closure's own statement
+    ///     level -- counted, not inferred from leading spaces. A `loop`, a
+    ///     `while` or an `if` wrapped round it puts it at 2 whatever it is
+    ///     indented to, which is M-2 dead at the source.
+    ///  2. The closure contains **no unbounded `loop {`** at all. A frame
+    ///     that spins is a frame that waits with the CPU pinned, and the
+    ///     difference between that and `recv()` is invisible to the user.
+    ///  3. The closure **names no waiting primitive**: no `Receiver`, no
+    ///     `mpsc`, no `recv`, no `park`, no `sleep`, no `Condvar`, no
+    ///     `Barrier`. Every channel this window has is created *above* the
+    ///     closure and moved in, so this is an absence that is true today for
+    ///     structural reasons and not a coincidence -- and M-7 needs all
+    ///     three of `mpsc`, `Receiver` and `recv` to spell itself, under any
+    ///     path syntax, UFCS included.
+    ///
+    /// **What this is not.** It is not the behavioural hold the property
+    /// deserves -- driving the real closure in a headless `Context::run_ui`
+    /// harness and bounding the wall clock. That was designed and rejected
+    /// for this round for two reasons, both recorded rather than hidden:
+    /// `build_frame`'s second frame unconditionally calls `spawn_vault_sync`,
+    /// which shells out to the `bw` CLI, so the harness cannot run without a
+    /// spawn seam through `build_frame` that this round has no mandate to
+    /// cut; and a frame that *spins* (M-2) never returns at all, so a
+    /// wall-clock bound taken on the test's own thread would hang the suite
+    /// rather than fail it, and the closure is full of `Rc<RefCell<_>>` so it
+    /// cannot be watchdogged from another thread. The harness wants an
+    /// injectable spawner and a cooperative deadline the closure itself
+    /// checks; both are real work and belong with that seam.
+    #[test]
+    fn the_frame_closure_has_nothing_to_wait_on() {
+        let closure = frame_closure();
+        assert!(
+            closure.len() > 50_000,
+            "control: the frame closure slice is only {} bytes, so the assertions below are \
+             reading a fragment",
+            closure.len()
+        );
+
+        let drain = concat!("if let Ok((tag, result)) = send_rx.try_", "recv() {");
+        assert_eq!(
+            closure.matches(drain).count(),
+            1,
+            "{drain:?} is not in the frame closure exactly once"
+        );
+        let before = &closure[..closure.find(drain).expect("counted just above")];
+        let depth = before.matches('{').count() as isize - before.matches('}').count() as isize;
+        assert_eq!(
+            depth, 1,
+            "the Sends drain sits at brace depth {depth} inside the frame closure, not at the \
+             closure's own statement level. Anything deeper is a `loop`, a `while` or an `if` \
+             wrapped round it -- and a `try_recv` called round and round on the eframe thread \
+             is a blocking wait with a core burnt as well. Indentation is not what is measured \
+             here, precisely because a mutation is free to ignore it"
+        );
+
+        for shape in [concat!("loop", " {"), concat!("loop", "\r\n")] {
+            assert!(
+                !closure.contains(shape),
+                "the frame closure contains {shape:?}. An unbounded loop inside one frame is \
+                 the freeze this whole off-thread design exists to prevent, whether it spins \
+                 on `try_recv` or blocks outright; the user cannot tell the two apart"
+            );
+        }
+
+        // Every channel this window owns is created above the closure and
+        // moved in, and the one Sends receiver is a `SendListReceiver` bound
+        // out there too -- so the closure needs none of these words, and each
+        // of them is a way to wait. M-7 needed three of them at once.
+        //
+        // Matched as a PREFIX and not as a whole word, deliberately: the
+        // suffix is where the spellings hide. `recv` alone would miss
+        // `recv_timeout` and `recv_deadline`; `mpsc` alone is dodged by
+        // `use std::sync::mpsc as chan` written above the closure, which is
+        // why `channel` and `Receiver` are here beside it. Three of these
+        // words have to be absent at once for a second channel to exist at
+        // all, and any one of them is enough to fail.
+        for word in [
+            "Receiver", "Sender", "mpsc", "channel", "recv", "park", "sleep", "Condvar",
+            "Barrier", "wait",
+        ] {
+            let found = closure.match_indices(word).any(|(at, _)| {
+                let prev = closure[..at].chars().next_back();
+                !matches!(prev, Some(c) if c.is_alphanumeric() || c == '_')
+            });
+            assert!(
+                !found,
+                "the frame closure names {word:?}. Every channel this window has is built \
+                 above the closure and moved in, so there is no honest reason for the word to \
+                 be in here -- and a channel created *inside* the frame is one no type in \
+                 `mod send_channel` constrains: `std::sync::mpsc::Receiver::recv_timeout(&rx, \
+                 Duration::from_secs(60))` is a sixty-second freeze per frame that every \
+                 needle aimed at `send_rx` and at `.recv(` misses"
+            );
+        }
+    }
+
     /// **The Sends receiver has no blocking drain, by type.**
     ///
     /// This is the structural half of the test above, and the part that does
@@ -3063,7 +3492,7 @@ mod source_pins {
     /// out.
     #[test]
     fn the_sends_receiver_is_a_type_with_no_blocking_drain() {
-        let production = sanitized(production());
+        let production = sanitized(&production());
         let production = production.as_str();
 
         let build = concat!("send_channel::send_list_", "channel()");
@@ -3430,15 +3859,41 @@ mod source_pins {
         let source = include_str!("mod.rs");
         let lf = source.replace("\r\n", "\n");
 
-        // 1. The cut this control walks from is the SAME byte `production`
-        //    cuts at, or the walk proves nothing about the region the pins
-        //    cannot see.
+        // 1. The cut this control walks from agrees with what `production`
+        //    actually returns, or the walk proves nothing about the region
+        //    the pins can see.
+        //
+        //    **Not equality any more, and the difference is the point.**
+        //    `production` used to BE this cut; it goes through
+        //    `production_region_source` now, which removes each gated item
+        //    and keeps everything between them -- so below the cut it keeps
+        //    the blank lines separating the test modules, and above the cut
+        //    it ignores a gate spelled inside a comment or a string, which a
+        //    raw `find` cannot. What must still hold is the containment:
+        //    everything before the cut is in the region, and everything the
+        //    region has after it is whitespace. That is the same claim, said
+        //    in the shape the region can answer -- and it fails loudly if a
+        //    live production item ever appears below the first test module.
         let cut = cut_index(&lf);
-        assert_eq!(
-            lf[..cut],
-            production().replace("\r\n", "\n"),
-            "this control walks from a different byte than `production` cuts at, so the region \
-             it inspects is not the region the pins are blind to"
+        let region = production().replace("\r\n", "\n");
+        assert!(
+            region.starts_with(&lf[..cut]),
+            "the production region does not begin with everything above the first test gate, \
+             so `production_region_source` is dropping code the pins are supposed to read"
+        );
+        //    "Whitespace" is measured after [`sanitized`], and that is not a
+        //    dodge: a doc comment written ABOVE a `#[cfg(test)] mod ..` sits
+        //    before the attribute, so the region keeps it, and it is prose
+        //    either way. What must not be down there is *code*, and blanking
+        //    the comments is exactly how this control says so.
+        let below = sanitized(&region[lf[..cut].len()..]);
+        assert!(
+            below.trim().is_empty(),
+            "the production region contains {} bytes of live code BELOW the first test gate: \
+             {:?}. Every pin in this module reads that region, so an item down there is an \
+             item nothing above has looked at",
+            below.trim().len(),
+            below.trim().chars().take(200).collect::<String>()
         );
 
         // 2. Positive control on WHERE the cut is: the production half still
