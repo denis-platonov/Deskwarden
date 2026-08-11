@@ -1281,9 +1281,11 @@ where
             Stage::Working => {
                 // **This stage cannot be closed, and its ✕ says so.** It no
                 // longer owns the only handle to a `bw serve` that is starting
-                // up: the worker publishes its `Child` through
-                // `StartupChildHandoff` the instant it spawns, and `main`
-                // claims it before the arms split, so a close here strands
+                // up: the worker arms `est.child` in the PARKED estate,
+                // through `EstatePark::with`, the instant the process exists,
+                // and the estate comes home to `main` whether this window ends
+                // early or not -- `EstatePark::reclaim` is what takes it back
+                // from a worker that is still running. So a close here strands
                 // nothing and the recovery `main` then runs is handed the real
                 // process to stop. What a close here still costs is the work
                 // itself -- the whole `prepare` result is discarded, and the
