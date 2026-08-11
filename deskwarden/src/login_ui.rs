@@ -4929,7 +4929,30 @@ pub(crate) mod password_lifetime_tests {
     /// Long and distinctive: it must not occur by chance in an unrelated
     /// freed block, and it must be longer than a machine word so a partial
     /// overwrite cannot look like a wipe.
-    pub(crate) const PROBE: &str = "deskwarden-drop-probe-master-password";
+    ///
+    /// **Assembled from fragments, and that is the whole of a fix.** While
+    /// this was one string literal, THE SOURCE TEXT OF THIS FILE CONTAINED
+    /// THE PROBE -- and around thirty tests in this crate read `src/` back to
+    /// lint it, so every one of them allocated a copy of the probe and freed
+    /// it on its own libtest thread, on no schedule at all. The global scan
+    /// has no way to tell those bytes from an armed test's own, and credited
+    /// them to whoever was armed: a measured false positive, on a security
+    /// test, in the suite this repository uses as its mutation oracle.
+    ///
+    /// Two rounds of downstream filtering were tried against that noise and
+    /// each left a channel open. `concat!` closes it at the source instead:
+    /// the macro joins these three pieces at compile time, so `PROBE` is the
+    /// same `&'static str` constant it always was -- every call site in the
+    /// crate is unchanged, and there is no runtime cost -- while no source
+    /// file in this tree contains the assembled bytes. A test that reads this
+    /// file now reads three short fragments separated by punctuation, which
+    /// is not the needle any scan here looks for.
+    ///
+    /// **So do not re-join these into one literal**, here or anywhere: the
+    /// noise comes back, and it comes back as an intermittent failure of
+    /// whichever probe test happened to be armed.
+    pub(crate) const PROBE: &str =
+        concat!("deskwarden-", "drop-probe-", "master-", "password");
 
     thread_local! {
         /// Whether THIS thread has a watch armed. What [`SEEN`] is gated on.
@@ -5002,15 +5025,6 @@ pub(crate) mod password_lifetime_tests {
             .unwrap_or(false)
     }
 
-    /// How many threads are currently inside a probe test -- holding
-    /// [`PROBE_LOCK`] through [`PROBE_HOLD`]. Non-zero means [`PROBE`]
-    /// plaintext may be live somewhere in this process right now, which is the
-    /// only condition under which [`Watcher::realloc`] can be handed a block
-    /// carrying it. Gating the copying path in `realloc` on this keeps the
-    /// allocator's in-place growth intact for the other ~2080 tests, which
-    /// never allocate the probe at all.
-    static PROBE_HOLDERS: AtomicUsize = AtomicUsize::new(0);
-
     /// **Only one watch is armed in this process at a time.**
     ///
     /// [`SEEN_ANYWHERE`] is process-global, so two probes armed concurrently
@@ -5057,16 +5071,16 @@ pub(crate) mod password_lifetime_tests {
         static PROBE_HOLD: RefCell<Option<ProbeHold>> = const { RefCell::new(None) };
     }
 
-    /// [`PROBE_LOCK`]'s guard, wrapped so that taking and releasing it also
-    /// maintains [`PROBE_HOLDERS`]. A bare `MutexGuard` cannot: its `Drop` runs
-    /// when the thread ends and there is nowhere to hang the decrement.
+    /// [`PROBE_LOCK`]'s guard. A newtype rather than a bare `MutexGuard` so
+    /// that [`PROBE_HOLD`]'s slot has one name to talk about; it carries no
+    /// behaviour of its own, and releases the lock when the thread ends.
+    ///
+    /// It used to also maintain a `PROBE_HOLDERS` count, which existed for one
+    /// reader: a gate on [`Watcher::realloc`]'s scan. That gate is gone (see
+    /// the note there), and with it a counter whose own doc comment claimed it
+    /// meant "threads currently inside a probe test" when the hold it counted
+    /// is released only at thread end.
     struct ProbeHold(#[allow(dead_code)] MutexGuard<'static, ()>);
-
-    impl Drop for ProbeHold {
-        fn drop(&mut self) {
-            PROBE_HOLDERS.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
 
     /// Whether this thread is holding [`PROBE_LOCK`] through [`PROBE_HOLD`].
     /// The observable the serialisation test asserts on; deliberately not a
@@ -5123,8 +5137,20 @@ pub(crate) mod password_lifetime_tests {
         /// the heap felt like doing.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             stamp_this_thread();
+            // **UNGATED, AND THAT IS THE POINT.** This scan used to be gated
+            // on "some thread is inside a probe test", justified by the claim
+            // that no other test ever allocates the probe. That claim was
+            // false while `PROBE` was a literal in this file -- the ~30 source
+            // linting tests grow a `String` over probe-bearing text by
+            // repeated `realloc`, with the gate reading zero -- so the old
+            // block went back to the CRT inside `System.realloc`, never
+            // reached `dealloc`, and never met the unconditional wipe. It sat
+            // in the free list carrying probe bytes exactly as before the wipe
+            // existed. `PROBE` is assembled by `concat!` now and that
+            // particular producer is gone, but the gate was wrong on its own
+            // terms and a gate whose premise has to stay true forever is not
+            // a gate worth keeping. Its cost was measured as noise-level.
             let carries = layout.size() >= PROBE.len()
-                && probe_bytes_may_be_live()
                 && {
                     let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
                     block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes())
@@ -5207,17 +5233,6 @@ pub(crate) mod password_lifetime_tests {
         ANY_WATCH.load(Ordering::Relaxed) > 0
     }
 
-    /// Whether a block handed to the allocator could be carrying [`PROBE`]
-    /// plaintext -- that is, whether any thread is inside a probe test. Wider
-    /// than [`any_watch_is_armed`] on purpose: the probe strings a test builds
-    /// before and drops after its armed window are just as capable of ending up
-    /// in the free list as the ones inside it.
-    ///
-    /// Neither allocates, so it cannot re-enter the allocator.
-    fn probe_bytes_may_be_live() -> bool {
-        PROBE_HOLDERS.load(Ordering::Relaxed) > 0
-    }
-
     /// Records a probe-bearing block going back to the allocator, on both
     /// channels: the thread-local one the existing assertions read, and the
     /// process-global one that is the only channel a leak on another thread
@@ -5279,7 +5294,6 @@ pub(crate) mod password_lifetime_tests {
             let mut held = held.borrow_mut();
             if held.is_none() {
                 let guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-                PROBE_HOLDERS.fetch_add(1, Ordering::Relaxed);
                 *held = Some(ProbeHold(guard));
             }
         });
@@ -5291,9 +5305,16 @@ pub(crate) mod password_lifetime_tests {
         /// scan armed for the rest of the process -- every free on every
         /// thread scanned, and the next probe's verdict decided by whatever
         /// else was running. One of the tests here panics on purpose.
-        struct Disarm;
+        /// The [`WINDOW`] value this arm displaced, put back when the arm
+        /// ends. Without it a nested arm raised the participation bar for the
+        /// *enclosing* window permanently, so after the inner window closed the
+        /// outer one only counted threads born after the INNER one opened.
+        /// Nothing in this tree nests today; the field is what stops the first
+        /// thing that does from silently narrowing its own coverage.
+        struct Disarm(u64);
         impl Drop for Disarm {
             fn drop(&mut self) {
+                WINDOW.store(self.0, Ordering::Relaxed);
                 ANY_WATCH.fetch_sub(1, Ordering::Relaxed);
                 WATCHING.with(|watching| watching.set(false));
             }
@@ -5303,12 +5324,13 @@ pub(crate) mod password_lifetime_tests {
         // window is open reads an `EPOCH` at least this high and stamps itself as
         // participating. A thread already running reads it later or not at all,
         // and its older stamp keeps it out.
+        let previous = WINDOW.load(Ordering::Relaxed);
         let opened = EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
         WINDOW.store(opened, Ordering::Relaxed);
 
         WATCHING.with(|watching| watching.set(true));
         ANY_WATCH.fetch_add(1, Ordering::Relaxed);
-        let _disarm = Disarm;
+        let _disarm = Disarm(previous);
         body()
     }
 
@@ -5322,11 +5344,31 @@ pub(crate) mod password_lifetime_tests {
     /// but a body that spawns a worker and leaks inside it would once have
     /// read clean, silently.
     ///
-    /// It no longer can. The scan is global (see [`ANY_WATCH`]), so a leak on
-    /// any thread is *observed*; this function panics rather than returning
-    /// `false` when the global channel saw something this thread did not. A
-    /// body that means to leak elsewhere must say so by calling
+    /// It no longer can, **within the boundary stated below**. The scan is
+    /// global (see [`ANY_WATCH`]), so a leak on a thread this window can speak
+    /// for is *observed*; this function panics rather than returning `false`
+    /// when the global channel saw something this thread did not. A body that
+    /// means to leak elsewhere must say so by calling
     /// [`plaintext_reached_the_allocator_on_any_thread`] instead.
+    ///
+    /// # The boundary, and it is a real one
+    ///
+    /// **A leak on a thread that already existed when the window opened is not
+    /// reported, and this function does not panic about it either.** It returns
+    /// `false`. See [`record_a_hit`] for why the global channel is filtered
+    /// that way and
+    /// `a_free_on_a_thread_that_predates_the_window_is_not_that_windows_leak`
+    /// for the test that pins the edge.
+    ///
+    /// That is narrower than "never quietly blind", and saying otherwise here
+    /// would be the exact failure this instrument exists to catch, committed by
+    /// the instrument. What makes the narrowing survivable rather than merely
+    /// convenient is that nothing in production frees a secret on a thread that
+    /// predates the work that produced it: every path this crate asserts on
+    /// either stays on the calling thread or spawns a fresh thread per
+    /// operation, and there is no thread pool. **A pool would put a whole class
+    /// of leak outside this instrument's sight**, so if one is ever introduced,
+    /// the filter in [`record_a_hit`] is what has to be revisited first.
     pub(crate) fn plaintext_reached_the_allocator(body: impl FnOnce()) -> bool {
         // Both verdicts are read INSIDE the armed window: `SEEN_ANYWHERE` is
         // process-global and the next probe to arm clears it, so reading it
@@ -5354,6 +5396,12 @@ pub(crate) mod password_lifetime_tests {
     /// `body` must join whatever it spawns -- a thread still running when the
     /// watch disarms is outside the window and is not covered by this or by
     /// anything else.
+    ///
+    /// **"Any thread" means any thread the window can speak for**, which is the
+    /// arming thread and threads that did not exist before it opened -- not
+    /// literally every thread in the process. A free on a thread that predates
+    /// the window reads clean here. The same boundary, and the same reasons,
+    /// as the section on [`plaintext_reached_the_allocator`].
     pub(crate) fn plaintext_reached_the_allocator_on_any_thread(body: impl FnOnce()) -> bool {
         armed(|| {
             body();
@@ -5658,6 +5706,204 @@ pub(crate) mod password_lifetime_tests {
         );
 
         outsider.join().expect("the outsider ran");
+    }
+
+    /// **The channel `dealloc`'s unconditional wipe never covered.**
+    ///
+    /// A `String` grown past its capacity does not free its old buffer through
+    /// [`Watcher::dealloc`]. It calls `realloc`, and `System.realloc` releases
+    /// the old block inside the CRT -- so the wipe that
+    /// `a_block_recycled_after_an_unarmed_free_cannot_be_read_as_a_leak_in_a_later_window`
+    /// pins is never reached, and the block lands in the free list with its
+    /// probe bytes intact, exactly as if the wipe did not exist.
+    ///
+    /// [`Watcher::realloc`] has a hand-copy path that routes such a block back
+    /// through `dealloc` -- but it was gated on a counter that is zero outside a
+    /// probe test's own thread, on the premise that no other test ever allocates
+    /// the probe. That premise was false: while [`PROBE`] was a string literal
+    /// in this file, every one of the ~30 tests that reads `src/` back grew a
+    /// `String` over probe-bearing text with the gate reading zero.
+    ///
+    /// Both halves of that are fixed -- the gate is gone and the probe is
+    /// assembled by `concat!` -- and this pins the half that is structural. It
+    /// fails deterministically with the gate restored.
+    ///
+    /// Reading 2 is the control that stops a blind probe passing reading 3.
+    #[test]
+    fn a_block_released_by_realloc_growth_while_unarmed_cannot_be_read_as_a_leak_later() {
+        // The probe plus slack, so the stale bytes have room a short new
+        // occupant will not overwrite. Every block seeded at 1 is exactly this
+        // size, which is what lets 3 ask for the same size and be handed one.
+        let size = PROBE.len() * 2;
+
+        // 1. THE SEEDING RUNS FIRST, AND THE ORDER IS THE WHOLE OF THE REPRO.
+        //
+        //    The gate this pins reads a count of threads holding `PROBE_LOCK`,
+        //    and `armed` takes that hold at a thread's FIRST arm and keeps it
+        //    until the thread ends. So from the control at 2 onwards the gate is
+        //    open and the growth below is routed through `dealloc` and wiped --
+        //    the seeding has to happen before this test arms anything, which is
+        //    also exactly the state the ~30 source-linting tests grow in.
+        //
+        //    All the buffers are held live and grown afterwards, so that the
+        //    block each `reserve` releases is not immediately handed back to the
+        //    next iteration and overwritten. Sixty-four of them, because which
+        //    block the allocator recycles at 3 is its own business.
+        let mut seeds: Vec<String> = (0..64)
+            .map(|_| {
+                let mut seed = String::with_capacity(size);
+                seed.push_str(PROBE);
+                assert_eq!(seed.capacity(), size, "the growth below must reallocate, not fit");
+                seed
+            })
+            .collect();
+        for seed in &mut seeds {
+            // Past the capacity, so this reallocates rather than fitting: the
+            // old `size` block goes back to the allocator through `realloc`,
+            // which is the one door `dealloc`'s unconditional wipe is not behind.
+            seed.reserve(size * 4);
+            assert!(seed.capacity() > size, "`reserve` did not grow the buffer");
+        }
+        drop(seeds);
+
+        // 2. Control: a probe genuinely freed inside a window is still seen.
+        let live = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(live)),
+            "control: the probe is deaf, so the negative below is satisfied by nothing at all"
+        );
+
+        // 3. Blocks of that size, allocated and freed inside a window, written
+        //    to by nobody.
+        let leaked = plaintext_reached_the_allocator(|| {
+            for _ in 0..64 {
+                let recycled: Vec<u8> = Vec::with_capacity(size);
+                drop(recycled);
+            }
+        });
+        assert!(
+            !leaked,
+            "a block the armed window never wrote the probe into was reported as a leak, so it \
+             carried those bytes in from an earlier `realloc`. The wipe in `dealloc` does not \
+             reach a block `System.realloc` released, and every probe verdict in this crate can \
+             then be produced by an unrelated test's growth"
+        );
+    }
+
+    /// **The participation filter is not a filter for the thing it was built
+    /// against.**
+    ///
+    /// The filter admits any thread born at or after the window opened. libtest
+    /// at `-j 8` starts test threads continuously, so a source-linting test that
+    /// begins inside another test's armed window is stamped a participant and
+    /// its `read_to_string` of this crate's own source is credited as that
+    /// window's leak -- which is the original misattribution, surviving inside
+    /// the fix written for it. Widening the filter cannot help: a thread born
+    /// inside the window is exactly what the filter must admit, because that is
+    /// what "a worker the body spawned" looks like.
+    ///
+    /// So it is fixed where it starts. [`PROBE`] is assembled by `concat!`, so
+    /// no source file in this tree contains it and reading one allocates no
+    /// probe at all. This is that, made deterministic: the reader thread is born
+    /// inside the window -- a participant by construction, no filter involved --
+    /// and reads the very file the probe is declared in.
+    ///
+    /// Reading 1 is the control: a worker born inside the window that really
+    /// does leak must still be reported, so reading 2's `false` is the source
+    /// text being clean and not the channel being shut.
+    #[test]
+    fn a_thread_born_inside_the_window_reading_this_crates_source_is_not_that_windows_leak() {
+        // 1. Control: a participant's genuine leak is still seen.
+        assert!(
+            plaintext_reached_the_allocator_on_any_thread(|| {
+                let leaked = probe_password();
+                std::thread::spawn(move || drop(leaked)).join().expect("the worker ran");
+            }),
+            "control: a leak on a worker the body itself spawned is not reported, so the global \
+             channel is shut and the negative below is satisfied by blindness"
+        );
+
+        // 2. The stand-in for every source-linting test in this crate, born
+        //    inside the window so that the participation filter admits it.
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/login_ui.rs");
+        let leaked = plaintext_reached_the_allocator_on_any_thread(move || {
+            std::thread::spawn(move || {
+                let text = std::fs::read_to_string(&source).expect("this crate's own source");
+                // The premise, not decoration: a read that found nothing would
+                // satisfy the assertion below saying nothing at all.
+                assert!(
+                    text.contains("fn probe_password"),
+                    "the file read is not this module's source"
+                );
+                drop(text);
+            })
+            .join()
+            .expect("the reader ran");
+        });
+        assert!(
+            !leaked,
+            "a thread that did nothing but read this crate's own source was reported as this \
+             window's leak. The source text still contains the assembled probe -- someone \
+             re-joined the `concat!` fragments -- and every probe test in the crate is again a \
+             coin toss on what libtest schedules beside it"
+        );
+    }
+
+    /// **The pin on the fix above, stated where it can be checked directly.**
+    ///
+    /// The whole reason a source-linting test could produce a probe hit is that
+    /// the probe's bytes were sitting in a file those tests read. `concat!`
+    /// removes that, and nothing else in the module would notice it being put
+    /// back: re-joining the fragments into one literal compiles, passes every
+    /// other test here, and reintroduces an intermittent failure of whichever
+    /// probe test libtest happens to schedule alongside a source reader.
+    ///
+    /// So the property is asserted over the tree rather than over this file, and
+    /// over every file rather than a list -- a new file that pastes the probe in
+    /// is caught the day it is added.
+    ///
+    /// Its control is the count: a walk that found no files would pass a
+    /// `.all()` over nothing.
+    #[test]
+    fn no_source_file_in_this_crate_contains_the_assembled_probe() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the source tree is readable") {
+                let path = entry.expect("the entry is readable").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        assert!(
+            files.len() > 30,
+            "control: the walk found only {} source files, so the check below is a check over \
+             nothing",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("login_ui.rs")),
+            "control: the walk did not reach the file that declares the probe"
+        );
+
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("a source file is readable");
+            // `contains` allocates nothing, and `text` is dropped before the
+            // next read, so this test's own footprint is one file at a time.
+            assert!(
+                !text.contains(PROBE),
+                "{} contains the assembled probe. Any test that reads `src/` back now allocates \
+                 a copy of it and frees it on its own libtest thread, and the global scan cannot \
+                 tell those bytes from an armed test's own -- which is a measured, intermittent \
+                 false positive on this crate's security tests. Split the literal with `concat!`",
+                file.display()
+            );
+        }
     }
 
     /// A heap copy of [`PROBE`], built *before* any watch is armed so that the
