@@ -4958,6 +4958,15 @@ pub(crate) mod password_lifetime_tests {
     /// against [`SEEN`] by [`plaintext_reached_the_allocator`].
     static SEEN_ANYWHERE: AtomicBool = AtomicBool::new(false);
 
+    /// How many threads are currently inside a probe test -- holding
+    /// [`PROBE_LOCK`] through [`PROBE_HOLD`]. Non-zero means [`PROBE`]
+    /// plaintext may be live somewhere in this process right now, which is the
+    /// only condition under which [`Watcher::realloc`] can be handed a block
+    /// carrying it. Gating the copying path in `realloc` on this keeps the
+    /// allocator's in-place growth intact for the other ~2080 tests, which
+    /// never allocate the probe at all.
+    static PROBE_HOLDERS: AtomicUsize = AtomicUsize::new(0);
+
     /// **Only one watch is armed in this process at a time.**
     ///
     /// [`SEEN_ANYWHERE`] is process-global, so two probes armed concurrently
@@ -5001,8 +5010,18 @@ pub(crate) mod password_lifetime_tests {
         /// Reentrant by inspection: a second arm on a thread that already
         /// holds it re-uses the hold instead of deadlocking on a
         /// non-reentrant `Mutex`.
-        static PROBE_HOLD: RefCell<Option<MutexGuard<'static, ()>>> =
-            const { RefCell::new(None) };
+        static PROBE_HOLD: RefCell<Option<ProbeHold>> = const { RefCell::new(None) };
+    }
+
+    /// [`PROBE_LOCK`]'s guard, wrapped so that taking and releasing it also
+    /// maintains [`PROBE_HOLDERS`]. A bare `MutexGuard` cannot: its `Drop` runs
+    /// when the thread ends and there is nowhere to hang the decrement.
+    struct ProbeHold(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+    impl Drop for ProbeHold {
+        fn drop(&mut self) {
+            PROBE_HOLDERS.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Whether this thread is holding [`PROBE_LOCK`] through [`PROBE_HOLD`].
@@ -5057,16 +5076,42 @@ pub(crate) mod password_lifetime_tests {
         /// wipe-then-grow would look like a leak at random depending on what
         /// the heap felt like doing.
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            let carried = layout.size() >= PROBE.len()
-                && any_watch_is_armed()
+            let carries = layout.size() >= PROBE.len()
+                && probe_bytes_may_be_live()
                 && {
                     let block = unsafe { std::slice::from_raw_parts(ptr, layout.size()) };
                     block.windows(PROBE.len()).any(|w| w == PROBE.as_bytes())
                 };
-            let moved = unsafe { System.realloc(ptr, layout, new_size) };
-            if carried && !moved.is_null() && moved != ptr {
-                record_a_hit();
+            if !carries {
+                return unsafe { System.realloc(ptr, layout, new_size) };
             }
+            // `System.realloc` may free the old block, and once it has, the
+            // probe bytes still in it are in the free list and out of reach --
+            // there is no moment at which this method could wipe them. So a
+            // block that carries the probe is moved by hand instead: copy, then
+            // release the old block through `dealloc`, which both scans it and
+            // zeroes it. The copy is not free, which is why it is reached only
+            // for a block that really does carry the probe.
+            let new_layout =
+                unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
+            let moved = unsafe { System.alloc(new_layout) };
+            if moved.is_null() {
+                // Contract: a failed `realloc` leaves the old block untouched
+                // and owned by the caller. Wiping it here would be a
+                // use-after-... no, worse: a live-buffer corruption.
+                return moved;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(ptr, moved, layout.size().min(new_size)) };
+            // The hit is recorded by `dealloc`, and only when a watch is armed.
+            //
+            // **This is now decided, where it used to be a coin toss.** The old
+            // code flagged a probe-bearing `realloc` only when the allocator
+            // happened to move the block, so the same growth read as a leak or
+            // as clean depending on the heap. Taking the copying path whenever
+            // the block carries the probe makes that reading deterministic. A
+            // wipe-then-grow is unaffected: a wiped block does not carry the
+            // probe, so `carries` is false and the fast path is taken.
+            unsafe { self.dealloc(ptr, layout) };
             moved
         }
 
@@ -5077,6 +5122,27 @@ pub(crate) mod password_lifetime_tests {
                     record_a_hit();
                 }
             }
+            // **THE WIPE, AND IT IS UNCONDITIONAL ON PURPOSE.**
+            //
+            // The scan above is armed-gated; this is not, and it cannot be.
+            // The bug it closes is that a block freed while NOTHING was armed
+            // kept its probe bytes, went on the free list, and was handed to
+            // some unrelated allocation on some unrelated thread which freed it
+            // again inside a later armed window. `layout.size()` covers the
+            // whole block and the new owner need not have written all of it, so
+            // the old bytes met the scan and were credited to a test whose own
+            // body was clean. Measured at 3 failures in 70 full-suite runs.
+            //
+            // Gating this on "a probe test is running" would leave the same hole
+            // one step further out: a block freed before a probe test arms, or
+            // after its hold is released at thread end, is still a block with
+            // probe bytes in the free list. The only gate that closes it is no
+            // gate. The cost is a `memset` per free in a test build, which is
+            // the one build this allocator exists in.
+            //
+            // A genuine leak is untouched: the scan runs first, so the bytes are
+            // read and reported before they are erased.
+            unsafe { std::ptr::write_bytes(ptr, 0, layout.size()) };
             unsafe { System.dealloc(ptr, layout) }
         }
     }
@@ -5091,6 +5157,17 @@ pub(crate) mod password_lifetime_tests {
     /// Neither allocates, so it cannot re-enter the allocator.
     fn any_watch_is_armed() -> bool {
         ANY_WATCH.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether a block handed to the allocator could be carrying [`PROBE`]
+    /// plaintext -- that is, whether any thread is inside a probe test. Wider
+    /// than [`any_watch_is_armed`] on purpose: the probe strings a test builds
+    /// before and drops after its armed window are just as capable of ending up
+    /// in the free list as the ones inside it.
+    ///
+    /// Neither allocates, so it cannot re-enter the allocator.
+    fn probe_bytes_may_be_live() -> bool {
+        PROBE_HOLDERS.load(Ordering::Relaxed) > 0
     }
 
     /// Records a probe-bearing block going back to the allocator, on both
@@ -5121,7 +5198,9 @@ pub(crate) mod password_lifetime_tests {
         PROBE_HOLD.with(|held| {
             let mut held = held.borrow_mut();
             if held.is_none() {
-                *held = Some(PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+                let guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                PROBE_HOLDERS.fetch_add(1, Ordering::Relaxed);
+                *held = Some(ProbeHold(guard));
             }
         });
         SEEN.with(|seen| seen.set(false));
@@ -5336,6 +5415,81 @@ pub(crate) mod password_lifetime_tests {
             "the hold was released when the armed window closed. Only the windows are \
              serialised again, so this test's own fixtures and drops can be attributed to \
              whatever probe is armed on another thread -- which is the flake this pins"
+        );
+    }
+
+    /// **The flake this instrument shipped with, with the timing taken out.**
+    ///
+    /// A reviewer measured 3 failures in 70 consecutive full-suite runs on a
+    /// pristine tree -- 4.3% -- spread over this module and
+    /// `vault_cache::tests::a_custom_field_value_does_not_reach_the_allocator_in_the_clear`.
+    /// Always a false POSITIVE, never a false negative, which is precisely why
+    /// it mattered: this suite is used as a mutation oracle, so a spurious
+    /// failure corrupts KILLED verdicts, and a reviewer had already mistaken one
+    /// for a real kill.
+    ///
+    /// The mechanism is the free list, not a race between the readings.
+    /// [`Watcher::dealloc`] scans the WHOLE block, the arming check is a
+    /// process-global counter, and a freed block keeps its bytes. So probe
+    /// plaintext freed while nothing was armed sat in the free list until some
+    /// unrelated allocation on some unrelated thread was handed that block and
+    /// freed it again inside a later armed window -- and the scan, which cannot
+    /// tell whose bytes those are, credited them to whoever was armed.
+    ///
+    /// The previous attempt at this reordered one test's readings so its
+    /// negative control ran before it had leaked anything. That removes the
+    /// stale bytes *that one test* produces and nothing else: not the ten other
+    /// files that arm this probe, and not `vault_cache`, which was never
+    /// touched. [`PROBE_LOCK`] serialises the probe tests; it does not serialise
+    /// them against the allocator's memory.
+    ///
+    /// This test is that mechanism made deterministic. Reading 2 frees probe
+    /// plaintext with nothing armed; reading 3 then asks for blocks of exactly
+    /// that size inside an armed window and frees them **having written nothing
+    /// into them**. Against the un-wiped instrument the window reports a leak it
+    /// did not produce. It cannot now, because `dealloc` zeroes every block
+    /// before handing it back, so no free list entry carries probe bytes at all.
+    ///
+    /// Reading 1 is the control, and it is the one that stops this being passed
+    /// by a probe that has gone blind: a probe genuinely freed inside a window,
+    /// after the wipe exists, is still reported.
+    #[test]
+    fn a_block_recycled_after_an_unarmed_free_cannot_be_read_as_a_leak_in_a_later_window() {
+        // The probe plus slack, so the stale bytes have somewhere to sit that a
+        // short new occupant will not overwrite -- which is the shape of the
+        // real thing, where the recycled block belongs to an unrelated type.
+        let size = PROBE.len() * 2;
+
+        // 1. Control: a probe genuinely freed inside a window is still seen.
+        let live = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(live)),
+            "control: the probe is deaf, so the negative below is satisfied by \
+             nothing at all"
+        );
+
+        // 2. The stale free, deliberately OUTSIDE any armed window. Nothing
+        //    here is a leak this test claims to have found; it is the garbage
+        //    every other probe test in the crate also leaves behind.
+        let mut stale = String::with_capacity(size);
+        stale.push_str(PROBE);
+        drop(stale);
+
+        // 3. Blocks of that size, allocated and freed inside a window, written
+        //    to by nobody. Which block the allocator hands back is its own
+        //    business, so this asks repeatedly rather than once.
+        let leaked = plaintext_reached_the_allocator(|| {
+            for _ in 0..64 {
+                let recycled: Vec<u8> = Vec::with_capacity(size);
+                drop(recycled);
+            }
+        });
+        assert!(
+            !leaked,
+            "a block the armed window never wrote the probe into was reported as a leak, so \
+             it carried those bytes in from an earlier free. Every probe verdict in this \
+             crate can then be produced by an unrelated test's garbage, and this suite is \
+             the mutation oracle"
         );
     }
 
