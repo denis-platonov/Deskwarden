@@ -683,14 +683,61 @@ mod tests {
     }
 
     /// Every `.rs` file under this crate's `src`, recursively.
+    ///
+    /// **The extension compare is case-INSENSITIVE, and that is the whole
+    /// point of it.** It used to be `== Some(OsStr::new("rs"))`, a
+    /// case-SENSITIVE compare run over a case-INSENSITIVE filesystem. This is
+    /// Windows: `deskwarden/aid.RS` is a file rustc happily compiles, and
+    /// measured on the commit before this one,
+    ///
+    ///     // deskwarden/aid.RS -- a NEW file
+    ///     pub fn hint() { .. <the CLI, started> .. }
+    ///
+    ///     // prepended to src/tray.rs
+    ///     #[path = "../aid.RS"]
+    ///     mod aid;
+    ///
+    /// SURVIVED the whole suite at 2111 / 217 / 1 ignored / 0 failed. It
+    /// COMPILED -- so rustc read it -- while this walk did not list it, the
+    /// crate-root set equality below did not list it, and
+    /// [`direct_child_starts`] therefore never opened it. `src/aid.RS` works
+    /// the same way with no crate root involved at all. The `#[path]` refusal
+    /// elsewhere in this module covers only files inside the fenced closure;
+    /// `src/tray.rs` is not one of them.
+    ///
+    /// A case-sensitive extension compare is a denylist with exactly one
+    /// entry in it, and `.RS`/`.Rs`/`.rS` are the spellings it loses to.
     fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 rust_sources(&path, out);
-            } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+            } else if is_rust_source(&path) {
                 out.push(path);
             }
+        }
+    }
+
+    /// Whether `path` names a Rust source file, deciding it the way the
+    /// FILESYSTEM does rather than the way a byte compare does. See
+    /// [`rust_sources`] for the mutant that made this its own function.
+    fn is_rust_source(path: &std::path::Path) -> bool {
+        path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+    }
+
+    #[test]
+    fn a_rust_source_is_recognised_however_its_extension_is_cased() {
+        // The sixteenth hop, as a unit: every casing of the extension is a
+        // file rustc will compile on this filesystem, so every casing has to
+        // be walked. `aid.RS` is the exact spelling that SURVIVED.
+        for name in ["aid.rs", "aid.RS", "aid.Rs", "aid.rS", "src/tray.RS"] {
+            assert!(
+                is_rust_source(std::path::Path::new(name)),
+                "{name} is a Rust source file this walk would not have opened"
+            );
+        }
+        for name in ["aid.rst", "aid.txt", "Cargo.toml", "aid", "aid.rs.bak"] {
+            assert!(!is_rust_source(std::path::Path::new(name)), "{name} is not Rust source");
         }
     }
 
@@ -899,12 +946,156 @@ mod tests {
         // time without a byte of it changing. Measured as a mutant of this
         // very design; it is why this block exists.
         //
-        // So the section is pinned whole, the same way the file above is: no
-        // `path = `, no `git = `, no second entry, no version drift, without
-        // any of those having to be spelled out as a denylist.
-        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        // SO THE WHOLE `Cargo.toml` IS PINNED, NOT ONE SECTION OF IT.
+        //
+        // THE SIXTEENTH HOP, and it was won by a SECOND SPELLING of the same
+        // idea. The rule that landed here first pinned the
+        // `[build-dependencies]` SECTION, found by splitting the manifest on
+        // that header. Cargo has a second, equally official way to re-point a
+        // registry name, and it does not live in that section. This crate is
+        // its own workspace root, so its own manifest is the patch root:
+        //
+        //     # appended to deskwarden/Cargo.toml
+        //     [patch.crates-io]
+        //     winresource = { path = "../dwfork/winresource" }
+        //
+        // with `../dwfork/winresource` a byte-copy of registry
+        // `winresource-0.1.31` carrying two extra lines at the top of
+        // `compile()`. Measured: SURVIVED at 2111 / 217 / 1 ignored / 0
+        // failed, `[build-dependencies]` re-read after the run as exactly
+        // `winresource = "0.1"`, `build.rs` byte-identical -- and a marker
+        // file written from inside the fork, so attacker code ran and started
+        // a real child at build time. The fork sits OUTSIDE
+        // `CARGO_MANIFEST_DIR`, so the crate-root set equality below never
+        // enumerates it; `path = "../.."` is all it takes.
+        //
+        // That is the `spawn_aid`/`icon_aid` canary again, one layer out and
+        // written in TOML: the section pin was a DENYLIST WEARING A PIN'S
+        // CLOTHES. It enumerated one place a name can be re-pointed
+        // (`[build-dependencies]`) and lost to the other spelling
+        // (`[patch.crates-io]`). `[replace]`, a `[workspace.dependencies]`
+        // inherit, a `[target.'cfg(windows)'.build-dependencies]` table and
+        // whatever cargo adds next are all more of the same list.
+        //
+        // The answer is the move this module already made one level down for
+        // `build.rs`: pin the FILE, whole, by length and content hash. There
+        // is no list left to lose a race with, because there is no list. Every
+        // dependency change -- runtime or build-time, in any section, under
+        // any spelling -- now reds exactly one test, and that is intended.
+        //
+        // `.cargo/config.toml`'s `[source.crates-io] replace-with` is the same
+        // class of thing and lives in a file rather than in this manifest, so
+        // it gets its own assertion below.
+        let manifest_raw = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let manifest = manifest_raw.replace("\r\n", "\n");
+        assert_eq!(
+            (manifest.len(), fnv1a64(&manifest)),
+            (4895, 0xcad0_3739_421b_be8a_u64),
+            "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
+             `build.rs` is a call into a dependency named here, and re-pointing that name at a \
+             path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
+             measured, and it SURVIVED a pin on the `[build-dependencies]` section alone, \
+             because `[patch.crates-io]` re-points the same name from a different section. \
+             THE FIX IS NOT TO ADD A SECTION. If the change is a deliberate dependency edit, \
+             recompute the length and the FNV-1a/64 hash of this file with CRLF normalised to \
+             LF, re-pin the pair above, and say in the commit message which dependency moved \
+             and where it now comes from"
+        );
+
+        // CONTROLS ON THE PIN, so it is not two constants agreeing with each
+        // other, and so the exact edit the sixteenth hop made moves it.
+        assert!(
+            manifest.contains("\n[build-dependencies]\n"),
+            "control: the pin is not reading this crate's `Cargo.toml` -- it has no \
+             `[build-dependencies]` section"
+        );
+        let as_patched =
+            manifest.clone() + "\n[patch.crates-io]\nwinresource = { path = \"../dwfork\" }\n";
+        assert_ne!(
+            fnv1a64(&as_patched),
+            fnv1a64(&manifest),
+            "control: appending a `[patch.crates-io]` table does not move the pinned hash, so \
+             the assertion above would not have caught the sixteenth hop"
+        );
+        assert_ne!(as_patched.len(), manifest.len(), "control: the length half is vacuous");
+
+        // AND NO `.cargo/` DIRECTORY, IN THIS CRATE OR BESIDE IT.
+        //
+        // `.cargo/config.toml` is read by cargo and by nothing in this module.
+        // `[source.crates-io] replace-with = "mine"` plus a `[source.mine]`
+        // pointing at a local directory or a git mirror re-points EVERY
+        // registry name at once, without touching `Cargo.toml` at all -- so
+        // the whole-file pin above would not see it. Cargo reads config from
+        // the invocation directory upward, so both the crate directory and its
+        // parent (the repo root, from which `cargo test -p deskwarden` is
+        // also run) are refused.
+        //
+        // Neither exists today, and neither has any reason to: this crate
+        // needs no registry, target or linker configuration. "Absent" is a
+        // property a set equality can hold; "present but harmless" is not.
+        for dir in [Some(root.join(".cargo")), root.parent().map(|p| p.join(".cargo"))]
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                !dir.exists(),
+                "{} exists. A `.cargo/config.toml` there can re-point every crates.io name at \
+                 once with `[source.crates-io] replace-with`, which is the `Cargo.toml` pin \
+                 above defeated from outside the file it pins -- the pinned `build.rs` would \
+                 then call into whatever that source serves. If this crate genuinely needs \
+                 cargo configuration, pin that file's contents here the way `Cargo.toml` and \
+                 `build.rs` are pinned; do not simply delete this assertion",
+                dir.display()
+            );
+        }
+
+        // AND THE RESOLVED IDENTITY OF THAT DEPENDENCY, WHICH LIVES IN
+        // `Cargo.lock` RATHER THAN IN `Cargo.toml`.
+        //
+        // `Cargo.toml` says `winresource = "0.1"`. That is a RANGE, and the
+        // pin above freezes the range, not the crate that ends up compiled: a
+        // `Cargo.lock`-only edit moves within it, and nothing said so far
+        // reads `Cargo.lock`. Two things stop that from being a free
+        // re-point, and only one of them is cargo's: a lock entry's SOURCE
+        // KIND cannot be invented (`path`/`git` have to be declared in
+        // `Cargo.toml`, which is pinned), and a forged `checksum` is refused
+        // outright -- measured, `checksum for winresource v0.1.30 changed
+        // between lock files`, before a single test ran. What is left is a
+        // swap to a genuinely published version, and that is what this pins.
+        //
+        // The checksum is the crate archive's own hash, so pinning it pins
+        // the BYTES that get compiled and run at build time -- which is the
+        // property this whole block is about. It costs one edit when
+        // `winresource` is deliberately upgraded, which is roughly annual.
+        let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap().replace("\r\n", "\n");
+        let winresource_entries = lock.matches("name = \"winresource\"\n").count();
+        assert_eq!(
+            winresource_entries, 1,
+            "`Cargo.lock` resolves {winresource_entries} packages named `winresource`, not 1. \
+             Two entries means two sources for the one crate the pinned `build.rs` calls into"
+        );
+        assert!(
+            lock.contains(
+                "name = \"winresource\"\n\
+                 version = \"0.1.31\"\n\
+                 source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
+                 checksum = \"0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087\"\n"
+            ),
+            "`Cargo.lock` no longer resolves `winresource` to the exact registry archive this \
+             module pinned. `Cargo.toml` only constrains it to `0.1`, so a lock-only edit picks \
+             which bytes of build-time code actually run -- and every line of the byte-pinned \
+             `build.rs` is a call into them. If this is a deliberate upgrade, copy the new \
+             version and checksum out of `Cargo.lock` and re-pin them here, in the same commit \
+             that does the upgrade"
+        );
+
+        // SECONDARY, AND SUBSUMED. The section pin that lost the sixteenth
+        // hop, kept for the moment the whole-file pin above is legitimately
+        // re-pinned: at that moment someone is editing `Cargo.toml` on
+        // purpose, and this says in one line what the build-time dependency
+        // graph is supposed to be. It is NOT a guarantee -- the mutant that
+        // beat it is written out above and satisfies this exactly.
         let build_deps = manifest
-            .replace("\r\n", "\n")
             .split("\n[build-dependencies]\n")
             .nth(1)
             .expect(
@@ -958,7 +1149,7 @@ mod tests {
                     continue;
                 }
                 rust_sources(&path, &mut root_files);
-            } else if path.extension() == Some(std::ffi::OsStr::new("rs")) {
+            } else if is_rust_source(&path) {
                 root_files.push(path);
             }
         }
