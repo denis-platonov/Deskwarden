@@ -392,14 +392,19 @@ const HEAD_BYTES: usize = 512;
 /// kill-on-close job.
 ///
 /// An accessor that reports a job the spawn does not use is now
-/// unrepresentable because no such accessor exists. The `Cli` variant is
-/// destructured in exactly ONE place in this module,
-/// [`Self::call`], and [`the_real_runner_hands_the_export_the_job_it_was_given`]
-/// destructures that same variant itself rather than asking a second function
-/// about it. What remains beyond a test's reach is the one hop no test here
-/// may take -- the spawn itself, which needs a real process -- and that hop is
-/// held by the count-1 pin in
-/// [`the_export_child_is_spawned_into_the_kill_on_close_job`].
+/// unrepresentable because no such accessor exists.
+///
+/// **And none of the above is what holds the guarantee any more.** It was lost
+/// twice more after that -- by shadowing a `job` parameter, and finally by
+/// substituting the RECEIVER, `run` handing the work to a second method on the
+/// same type constructed jobless. Every needle stayed word-perfect through
+/// both. The property is now held at the spawn itself, by
+/// [`the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`],
+/// which drives [`run_export`] end to end and asserts the job value that
+/// arrived at [`crate::job_object::spawn_in_job`]; and by
+/// `job_object`'s tree walk, which proves this file has no other way to start
+/// a child. This enum's shape is kept because it is a good shape, not because
+/// anything now depends on counting its mentions.
 /// The boxed closure behind [`ExportRunner::Fake`]. Named only to keep the
 /// enum's own declaration readable.
 type FakeExport = Arc<dyn Fn(&ExportPlan, &str) -> RawExport + Send + Sync>;
@@ -489,18 +494,21 @@ impl CliExportRunner {
     /// [`bw_command`] already set would otherwise be dropped and a console
     /// window would flash on screen.
     ///
-    /// **A method that reads `self.job()` AT the spawn, and not a free
-    /// `run_cli(plan, session, job)` taking the job as a parameter, and that
-    /// is the fix for a review finding rather than a preference.** A
-    /// parameter is a local binding, and a local binding can be shadowed
-    /// under every guard this module holds. Measured, a `run_cli` beginning
-    /// `let job = job.filter(|_| false);` gave 2053 lib + 217 bin, 0 failed,
-    /// 0 warnings: the `spawn_in_job` pin stayed word-perfect, the
-    /// `run_cli(plan, session, self.job())` pin stayed word-perfect, both
-    /// pointer-identity tests stayed green -- and every export child spawned
-    /// outside the kill-on-close job. There is no local to shadow now: the
-    /// job is read off `self` in the pinned spawn line itself, and `self`
-    /// cannot be rebound. This is the shape [`crate::send`] already uses.
+    /// **Which job this hands over is not a fact about this line.** It reads
+    /// `self.job()`, and for five rounds that was the guarantee, expressed as
+    /// a source pin. It was defeated five times, most recently by a `run` of
+    ///
+    /// ```text
+    /// Self::new(Arc::new(None)).run_inner(plan, session)
+    /// ```
+    ///
+    /// which left every needle word-perfect at 0 failed and 0 warnings while
+    /// every export child spawned outside the job -- because a pin on
+    /// `self.job()` cannot see which `self` it is. The guarantee is now
+    /// observed at the spawn instead, by
+    /// [`the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`],
+    /// which would fail on that mutant and on any further hop, whatever
+    /// receiver, method or module it routed through.
     fn run(&self, plan: &ExportPlan, session: &str) -> RawExport {
         let mut command = match export_command(plan, session) {
             Ok(command) => command,
@@ -563,12 +571,20 @@ impl CliExportRunner {
 /// rather than merely untested there.
 ///
 /// It is the intended entry point, which is why
-/// [`the_real_runner_hands_the_export_the_job_it_was_given`] asserts by
-/// pointer identity that the job reaching the returned runner is this
-/// argument. But when step 5 lands, **this property must be re-proven at
-/// whatever function the wiring actually calls**: every previous round of
-/// this same finding was lost one hop further out than the last, and a hop
-/// that no test reaches is exactly where the job goes missing.
+/// [`the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`]
+/// drives [`run_export`] through THIS function and asserts, by pointer
+/// identity at [`crate::job_object::spawn_in_job`], that the job which
+/// reached the spawn is this argument.
+///
+/// **When step 5 lands, that test must be re-pointed at whatever the UI
+/// actually calls.** It is end-to-end from `real_runner` inwards, so every hop
+/// below this line is already covered whatever it is rewritten into -- but
+/// nothing covers the hops ABOVE it. If the wiring builds its own
+/// `CliExportRunner`, threads the `Arc<Option<KillOnCloseJob>>` through a
+/// window struct, or calls a new `export_now(..)` wrapper, then the job can go
+/// missing in that new code and this test will not notice: it hands
+/// `real_runner` a job itself. Re-proving means calling the wiring's own
+/// entry point with the arm's job and asserting the same recorded value.
 pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
     CliExportRunner::new(job).into_runner()
 }
@@ -1725,6 +1741,125 @@ mod tests {
         );
     }
 
+    /// Drives `run_export` end to end and answers what actually arrived at the
+    /// spawn: the address of the job, or `None` for a jobless child.
+    ///
+    /// No process is created. `job_object::spawn_probe` stands where
+    /// `CreateProcess` would and refuses, so the runner takes its ordinary
+    /// spawn-failed path and `run_export` returns a failure -- which is not
+    /// what is being asserted. What is asserted is the recorded value.
+    fn job_reaching_the_spawn(job: Arc<Option<KillOnCloseJob>>) -> Vec<Option<usize>> {
+        // `export_command` refuses outright unless startup recorded a
+        // signature-verified CLI. First-wins and idempotent, so this is safe
+        // however the test order falls out, and the path is a fiction that is
+        // never executed.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+
+        let temp = TempDir::new("spawnseam");
+        let plan = plan_in(temp.path(), "vault.json");
+
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let _ = run_export(&plan, "session", &real_runner(job));
+        let attempts = probe.attempts();
+        drop(probe);
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the production export path did not reach `spawn_in_job` exactly once, so the \
+             assertion made on what it carried is about nothing: {attempts:?}"
+        );
+        attempts.iter().map(|a| a.job).collect()
+    }
+
+    #[test]
+    fn the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given() {
+        // THE CRITICAL FINDING, held at the spawn itself.
+        //
+        // This same property has now been lost five times, each round one hop
+        // nearer the spawn than the last, and every round was lost the same
+        // way: the guarantee was expressed as text near the call --
+        // `spawn_in_job(self.job(), command)` -- and a text pin on
+        // `self.job()` cannot see WHICH `self` it is. Starving the
+        // constructor, starving `real_runner`, answering from a second `match`
+        // arm, shadowing a `job` parameter, and finally substituting the
+        // RECEIVER (`Self::new(Arc::new(None)).run_inner(plan, session)`) each
+        // left every needle word-perfect, both pointer-identity tests green,
+        // 0 failed and 0 warnings -- while every export child, a process
+        // holding an unlocked vault, spawned outside the kill-on-close job.
+        //
+        // So nothing here reads a line of source. `run_export` is driven end
+        // to end through the real `ExportRunner`, the real `CliExportRunner`
+        // and the real `crate::job_object::spawn_in_job`, and what is asserted
+        // is the job value that ARRIVED at that spawn. A sixth hop -- another
+        // method, another receiver, another module -- is caught for the same
+        // reason the fifth is: whatever route the work takes, it arrives here
+        // carrying a job, and that job must be this one.
+        //
+        // `KillOnCloseJob::new` creates a kernel handle. It starts no process,
+        // touches no file and opens no socket, and the probe refuses the spawn
+        // before `CreateProcess`, so this test starts nothing either.
+        let held = Arc::new(Some(
+            KillOnCloseJob::new().expect("a job object is a handle, not a process"),
+        ));
+        let given = std::ptr::from_ref(held.as_ref().as_ref().expect("the fixture holds one"))
+            as usize;
+
+        assert_eq!(
+            job_reaching_the_spawn(Arc::clone(&held)),
+            vec![Some(given)],
+            "the export child was spawned with a job that is not the one the production entry \
+             point was handed, so it would not die with this process after a panic, a \
+             `process::exit` or a Task Manager kill"
+        );
+
+        // Control: a DIFFERENT job is distinguishable, so the equality above
+        // is not satisfied by any job at all.
+        let other = Arc::new(Some(
+            KillOnCloseJob::new().expect("a second handle, still not a process"),
+        ));
+        let reached_other = job_reaching_the_spawn(Arc::clone(&other));
+        assert_ne!(
+            reached_other,
+            vec![Some(given)],
+            "control: two runners built from two different jobs deliver the same job to the \
+             spawn, so the assertion above is vacuous"
+        );
+        assert_eq!(
+            reached_other,
+            vec![Some(
+                std::ptr::from_ref(other.as_ref().as_ref().unwrap()) as usize
+            )]
+        );
+
+        // Control: "no job at all" is still expressible end to end, and is
+        // DISTINGUISHABLE from a job -- which is the whole difference every
+        // one of the five mutants erased.
+        assert_eq!(
+            job_reaching_the_spawn(Arc::new(None)),
+            vec![None],
+            "control: a runner built with no job did not reach the spawn jobless, so the probe \
+             cannot tell a child inside the job from one outside it"
+        );
+
+        // Control: the fake arm reaches no spawn at all, which is what makes
+        // the recorded attempt above a fact about the CLI path.
+        let temp = TempDir::new("spawnseam-fake");
+        let plan = plan_in(temp.path(), "vault.json");
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let outcome = run_export(&plan, "session", &writing_runner(envelope_body(), true, ""));
+        let fake_attempts = probe.attempts();
+        drop(probe);
+        assert_eq!(outcome, ExportOutcome::Written, "control: the fake still works");
+        assert!(
+            fake_attempts.is_empty(),
+            "control: a runner that starts no process reached the spawn, so the probe is \
+             recording something other than a child process: {fake_attempts:?}"
+        );
+    }
+
     #[test]
     fn run_export_really_sweeps_on_the_way_in() {
         // An absence with a witness. Nothing in the outcome of an export says
@@ -1790,74 +1925,33 @@ mod tests {
         assert!(!code.contains("the_source_pin_search_can_tell_present_from_absent"));
     }
 
-    #[test]
-    fn the_export_child_is_spawned_into_the_kill_on_close_job() {
-        // PIN. The child holds an unlocked vault. Job membership is what
-        // makes it die with this process however this process dies, and it
-        // is a property of a real process: a fake runner has none.
-        let code = code_under_test();
-        assert_eq!(
-            code.matches("crate::job_object::spawn_in_job(self.job(), command)").count(),
-            1,
-            "the export child is no longer spawned into the job exactly once, so a crash or a \
-             Task Manager kill could leave a `bw` running with the session token in its \
-             environment. Counted rather than merely required, because a second spawn added \
-             beside the pinned one satisfies a presence-only needle by construction"
-        );
-        assert_eq!(
-            code.matches("fn run_cli(").count(),
-            0,
-            "the spawn is back behind a free function taking the job as a PARAMETER. It used \
-             to be `run_cli(plan, session, self.job())`, pinned at exactly one occurrence -- \
-             and that pin was defeated one hop further in, because a parameter is a local \
-             binding and a local binding can be shadowed. Measured, a `run_cli` beginning \
-             `let job = job.filter(|_| false);` gave 2053 lib + 217 bin, 0 failed, 0 warnings \
-             with that pin, the `spawn_in_job` pin and both pointer-identity tests all intact, \
-             while every export child spawned outside the kill-on-close job. The spawn is now \
-             a method that reads `self.job()` IN the pinned spawn line above, and `self` \
-             cannot be rebound, so there is no local left to starve"
-        );
-        assert_eq!(
-            code.matches(concat!(
-                "fn call(&self, plan: &ExportPlan, session: &str) -> RawExport {\n",
-                "        match self {\n",
-                "            Self::Cli(cli) => cli.run(plan, session),\n",
-                "            Self::Fake(f) => f(plan, session),\n",
-                "        }\n",
-                "    }\n",
-            ))
-            .count(),
-            1,
-            "the export no longer runs through the `CliExportRunner` the seam is HOLDING. This \
-             is the pin for the hop the last round of this finding was lost in: \
-             `the_real_runner_hands_the_export_the_job_it_was_given` destructures \
-             `ExportRunner::Cli` and proves the job inside it is `real_runner`'s argument, but \
-             the spawn happens in `ExportRunner::call`, and a `call` that ran a runner of its \
-             own making -- `CliExportRunner::new(Arc::new(None)).run(plan, session)` -- left \
-             that test and every control in it green while every export child spawned outside \
-             the kill-on-close job. \
-             \
-             The WHOLE function body is pinned, not merely the `Self::Cli` arm, and that is \
-             deliberate: an arm-only needle is satisfied word-perfectly by an early return \
-             spliced in ABOVE the match, and such a return can test the variant with \
-             `Self::Cli {{ .. }}`, which no `Cli(` count would see. Pinning the body leaves \
-             nowhere to splice"
-        );
-        assert_eq!(
-            code.matches("Cli(").count(),
-            3,
-            "`ExportRunner::Cli` is mentioned somewhere new. Below the doc comments this module \
-             allows exactly three: the variant's own declaration, `into_runner` building it, \
-             and `call` destructuring it to spawn. A FOURTH would be a second reader of the \
-             job, and a second reader is free to report one job while `call` spawns into \
-             another -- precisely the bug that the deleted `ExportRunner::job` accessor was, \
-             and that this count makes unrepresentable rather than merely untested"
-        );
-        assert!(
-            !code.contains(".spawn()"),
-            "a direct spawn bypasses the job entirely"
-        );
-    }
+    // The pins that used to stand here are GONE, and their deletion is the
+    // point of this change rather than a tidy-up.
+    //
+    // There were four, all guarding one property: that the export child joins
+    // the kill-on-close job its runner was constructed with. A count-1 needle
+    // over `spawn_in_job(self.job(), command)`; a count-0 needle over
+    // `fn run_cli(`; a whole-body needle over `ExportRunner::call`; and a
+    // count-3 needle over `Cli(`. Five successive mutants defeated them, each
+    // one hop nearer the spawn than the last, and the fifth -- a `run` that
+    // handed the work to a second method on the same type, constructed
+    // jobless -- left ALL FOUR word-perfect and both pointer-identity tests
+    // green at 0 failed, 0 warnings.
+    //
+    // The `Cli(` count was bypassable by SPELLING as well: `Self::Cli { 0: cli
+    // }` is struct-field syntax on a tuple variant, so a second accessor could
+    // be added with the count intact.
+    //
+    // The diagnosis is that a text pin on `self.job()` cannot see WHICH `self`
+    // it is looking at -- the guarded thing is a relative expression, not a
+    // value. A sixth pin would lose to a sixth hop. So the guarantee moved to
+    // `the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`
+    // above, which observes the spawn itself through
+    // `job_object::spawn_probe`, and to
+    // `job_object::tests::the_two_job_bearing_modules_can_start_a_child_only_through_this_one`,
+    // which proves this file has no second door to a child process. Neither
+    // reads a line of this module's text, so neither can be beaten by moving
+    // the call.
 
     #[test]
     fn the_job_spawn_still_re_applies_the_no_window_flag() {
@@ -1913,12 +2007,15 @@ mod tests {
     // ABOVE the first `cfg(test)` marker and nothing else. The two controls
     // it already had prove the search can tell present from absent and that
     // the cut dropped the tests. NEITHER proves the cut does not drop
-    // PRODUCTION code, and measured on the commit before this one it did not:
-    // a real `pub fn` containing a bare `command.spawn()` appended at the end
-    // of this file, below the test module, gave 2050 lib + 217 bin, 0 failed,
-    // 0 warnings. `!code.contains(".spawn()")` missed it, both `== 1` spawn
-    // counts missed it, and `bw_path`'s crate-wide spawn guard missed it too.
-    // Same shape as the control `breach.rs` already carries.
+    // PRODUCTION code, and measured on an earlier commit it did not: a real
+    // `pub fn` containing a bare direct spawn appended at the end of this
+    // file, below the test module, gave 2050 lib + 217 bin, 0 failed, 0
+    // warnings. Every needle above missed it, and `bw_path`'s crate-wide
+    // spawn guard missed it too. Same shape as the control `breach.rs`
+    // carries. (The spawn half of that hazard is now also held from outside
+    // this file, by `job_object`'s tree walk, which reads whole files and so
+    // has no cut to append below; this walk still holds everything ELSE that
+    // could be smuggled down here.)
     // -----------------------------------------------------------------
 
     /// The `cfg` attribute that makes a module test-only, split so this

@@ -972,6 +972,32 @@ pub struct CliSendRunner<'a> {
     /// false), data_dir }` left the pinned line word-perfect, the whole suite
     /// green and no warning emitted, while every `bw` child was spawned
     /// outside the job.
+    ///
+    /// **Nor does an accessor settle it.** Measured on an earlier commit, a
+    /// [`SendRunner::run`] of
+    ///
+    /// ```text
+    /// CliSendRunner::new(None, self.data_dir).run_inner(inv)
+    /// ```
+    ///
+    /// -- the work handed to a second method on the same type, constructed
+    /// jobless -- left the pin word-perfect, [`Self::job`] answering honestly,
+    /// the pointer-identity test green, 0 failed and 0 warnings, while every
+    /// `bw` child spawned outside the job. A pin on `self.job()` cannot see
+    /// WHICH `self` it is. What holds this now is
+    /// [`the_send_reaches_the_spawn_carrying_the_job_the_runner_was_built_with`],
+    /// which drives [`list_sends`] end to end and asserts the job value that
+    /// ARRIVED at [`crate::job_object::spawn_in_job`], plus `job_object`'s
+    /// tree walk proving this file has no second route to a child process.
+    ///
+    /// **And it is unreachable in production today.** The one production
+    /// construction of this type, in `vault_window`, passes `None` outright:
+    /// the vault window holds no [`crate::job_object::KillOnCloseJob`], so
+    /// every real `bw send` child already spawns outside any job. That is
+    /// deliberate and documented, not an oversight -- but it means the
+    /// guarantee above is currently proven only of code no production caller
+    /// exercises with a job. When the window is given one, the property must
+    /// be re-proven at the call that hands it over.
     job: Option<&'a crate::job_object::KillOnCloseJob>,
     /// The active account's CLI profile directory, passed straight through to
     /// [`crate::bw_path::bw_command_in`] so a Send is created, listed and
@@ -1366,6 +1392,103 @@ mod runner_tests {
         );
     }
 
+    /// Drives `list_sends` end to end through the production `CliSendRunner`
+    /// and answers what arrived at the spawn: the address of the job, or
+    /// `None` for a jobless child.
+    ///
+    /// No process is created. `job_object::spawn_probe` stands where
+    /// `CreateProcess` would and refuses, so `run` takes its ordinary
+    /// spawn-failed path and `list_sends` returns `SendError::SpawnFailed` --
+    /// which is not what is being asserted. What is asserted is the recorded
+    /// value.
+    fn job_reaching_the_send_spawn(
+        job: Option<&crate::job_object::KillOnCloseJob>,
+    ) -> Vec<Option<usize>> {
+        // `build_command` refuses outright unless startup recorded a
+        // signature-verified CLI. First-wins and idempotent, so this is safe
+        // however the test order falls out, and the path is a fiction that is
+        // never executed.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+
+        let runner = CliSendRunner::new(job, None);
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let outcome = list_sends(&runner);
+        let attempts = probe.attempts();
+        drop(probe);
+
+        assert!(
+            matches!(outcome, Err(SendError::SpawnFailed(_))),
+            "the probe did not refuse the spawn, so this test may have started a process: \
+             {outcome:?}"
+        );
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the production Send path did not reach `spawn_in_job` exactly once, so the \
+             assertion made on what it carried is about nothing: {attempts:?}"
+        );
+        attempts.iter().map(|a| a.job).collect()
+    }
+
+    #[test]
+    fn the_send_reaches_the_spawn_carrying_the_job_the_runner_was_built_with() {
+        // THE CRITICAL FINDING, held at the spawn itself.
+        //
+        // `the_job_the_runner_was_given_is_the_job_the_child_is_spawned_into`
+        // above interrogates `CliSendRunner::job`, and that is not enough: an
+        // accessor answers about the receiver it is called on, and the spawn
+        // is free to use a different one. Measured, a `run` of
+        // `CliSendRunner::new(None, self.data_dir).run_inner(inv)` left that
+        // test green, the `spawn_in_job(self.job(), command)` pin word-perfect,
+        // 0 failed and 0 warnings -- while every `bw` child, a process holding
+        // the session token, spawned outside the kill-on-close job.
+        //
+        // So nothing here reads a line of source and nothing here calls an
+        // accessor. `list_sends` -- a production entry point -- is driven
+        // through the real `CliSendRunner` and the real
+        // `crate::job_object::spawn_in_job`, and what is asserted is the job
+        // that ARRIVED at that spawn. Another hop, another receiver, another
+        // module: whichever route the work takes it arrives here, and the job
+        // it arrives with must be this one.
+        //
+        // `KillOnCloseJob::new` creates a kernel handle: no process, no file,
+        // no socket. The probe refuses before `CreateProcess`, so this test
+        // starts nothing either.
+        let job = crate::job_object::KillOnCloseJob::new()
+            .expect("a job object is a handle, not a process");
+        let given = std::ptr::from_ref(&job) as usize;
+
+        assert_eq!(
+            job_reaching_the_send_spawn(Some(&job)),
+            vec![Some(given)],
+            "the `bw` child was spawned with a job that is not the one the runner was built \
+             with, so a CLI holding the session token would not die with this process"
+        );
+
+        // Control: a DIFFERENT job is distinguishable, so the equality above
+        // is not satisfied by any job at all.
+        let other = crate::job_object::KillOnCloseJob::new()
+            .expect("a second handle, still not a process");
+        assert_eq!(
+            job_reaching_the_send_spawn(Some(&other)),
+            vec![Some(std::ptr::from_ref(&other) as usize)]
+        );
+        assert_ne!(std::ptr::from_ref(&other) as usize, given);
+
+        // Control: "no job at all" is still expressible end to end and is
+        // DISTINGUISHABLE from a job -- which is exactly the difference every
+        // mutant in this family erased. It is also the shape production uses
+        // today: the vault window holds no job.
+        assert_eq!(
+            job_reaching_the_send_spawn(None),
+            vec![None],
+            "control: a runner built with no job did not reach the spawn jobless, so the probe \
+             cannot tell a child inside the job from one outside it"
+        );
+    }
+
     #[test]
     fn debug_printing_an_invocation_shows_neither_the_body_nor_the_session() {
         // A `log::debug!("{inv:?}")` at any future call site is one line
@@ -1611,14 +1734,17 @@ mod runner_tests {
                 "the command is no longer built by the one module that names the executable \
                  whose signature startup verified",
             ),
-            (
-                concat!("job_object::spawn_in_job(", "self.job(), command)"),
-                "the child no longer joins the kill-on-close job: an orphaned CLI holding the \
-                 session after deskwarden dies is the same hazard `bw serve` is in the job for. \
-                 This pin holds the CALL; the VALUE it is handed is held by \
-                 `the_job_the_runner_was_given_is_the_job_the_child_is_spawned_into`, because \
-                 a pin over a call is satisfied by starving its argument",
-            ),
+            // The `spawn_in_job(self.job(), command)` needle that used to sit
+            // here is DELETED, and its deletion is the point of this change.
+            // It was defeated for the fifth time by a `run` that handed the
+            // work to `CliSendRunner::new(None, self.data_dir).run_inner(inv)`
+            // -- word-perfect needle, honest accessor, 0 failed, 0 warnings,
+            // every child outside the job. A pin on `self.job()` cannot see
+            // which `self` it is, so a sixth spelling of it would lose to a
+            // sixth hop. The property is now held by
+            // `the_send_reaches_the_spawn_carrying_the_job_the_runner_was_built_with`,
+            // which observes the spawn, and by `job_object`'s tree walk, which
+            // proves this file has no other route to a child.
             (
                 concat!("child.stdin.", "take()"),
                 "the stdin handle is left inside the child, so the pipe stays open, the CLI \
@@ -1691,10 +1817,13 @@ mod runner_tests {
     // prove the search can tell present from absent and that the cut dropped
     // the tests. NEITHER proves the cut does not drop PRODUCTION code, and
     // measured on the commit before this one it did not: a real `pub fn`
-    // containing a bare `command.spawn()` appended at the end of this file,
-    // below both test modules, gave 2050 lib + 217 bin, 0 failed, 0 warnings
-    // -- unseen by the pins here and by `bw_path`'s crate-wide spawn guard.
-    // Same shape as the control `breach.rs` already carries.
+    // containing a bare direct spawn appended at the end of this file, below
+    // both test modules, gave 2050 lib + 217 bin, 0 failed, 0 warnings --
+    // unseen by the pins here and by `bw_path`'s crate-wide spawn guard.
+    // Same shape as the control `breach.rs` already carries. (The spawn half
+    // of that hazard is now also held from OUTSIDE this file, by
+    // `job_object`'s tree walk, which reads whole files and so has no cut to
+    // append below; this walk still holds everything else.)
     // -----------------------------------------------------------------
 
     /// The `cfg` attribute that makes a module test-only, split so this
