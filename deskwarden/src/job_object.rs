@@ -1334,17 +1334,69 @@ mod tests {
         // module the runners depend on. `job_object.rs`, the other REACHABLE
         // module, is the choke point itself and is guarded by the probe and
         // by its own tests instead.
+        // ONE HOP IS ONLY ONE HOP IF NO ENTRY HERE IS ITSELF A DOOR.
+        //
+        // THE TENTH ROUND'S SECOND HOP. This list is not followed: whatever is
+        // on it may do as it likes. That is only sound if nothing on it is a
+        // module licensed to start a jobless child -- and
+        // `crate::bw_serve::bw_serve_command` was, because `bw_serve.rs` is on
+        // both DOOR_FILES and the tree walk's ALLOWED. Measured, at 2077 lib /
+        // 217 bin / 0 failed / 0 warnings:
+        //
+        //     bw_path.rs, in `bw_job_command_in`:
+        //         let _ = crate::bw_serve::bw_serve_command("x");
+        //     bw_serve.rs, inside `bw_serve_command`:
+        //         let mut side = bw_command()?.into_jobless_command();
+        //         let _ = side.spawn();
+        //
+        // Two hops from a REACHABLE item, through an entry this very list
+        // blesses, every rule green. The entry was also STALE -- production
+        // `bw_path.rs` never called it; only its tests did -- which is the
+        // same defect DOOR_FILES and ALLOWED both treat as an error, and which
+        // is why it went unnoticed.
+        //
+        // So the list is cut to what production really names, staleness is an
+        // error here too, and no entry may live in a door module. What is left
+        // is `job_object` alone: the choke point, guarded by the probe and by
+        // its own tests rather than by this list.
+        //
+        // The scan is over PRODUCTION `bw_path.rs`, not the whole file: the
+        // test module is not compiled into the shipped binary, so nothing in
+        // it is reachable from the runners, and its calls are what made the
+        // stale entry look live.
         const BW_PATH_MAY_REACH: &[&str] = &[
             "crate::job_object::JobCommand",
             "crate::job_object::JobCommand::wrap",
-            "crate::job_object::spawn_in_job",
-            "crate::bw_path::bw_command_in",
-            "crate::bw_serve::bw_serve_command",
         ];
+        const DOOR_MODULES: &[&str] = &["bw_path", "bw_serve", "login_ui", "main"];
+        for entry in BW_PATH_MAY_REACH {
+            let module = entry
+                .strip_prefix("crate::")
+                .unwrap_or(entry)
+                .split("::")
+                .next()
+                .unwrap();
+            assert!(
+                !DOOR_MODULES.contains(&module),
+                "`{entry}` is reachable from `bw_path.rs` on the runners' behalf, and `{module}` \
+                 is a module allowed to open a `BareCommand` and start a child outside the \
+                 kill-on-close job. This list is not followed, so an entry that is itself a \
+                 door makes RULE 8 one hop shorter than the escape it is aimed at"
+            );
+        }
         let bw_path_raw = std::fs::read_to_string(src.join("bw_path.rs"))
             .unwrap()
             .replace("\r\n", "\n");
-        let bw_path_all = code_only(&bw_path_raw);
+        let bw_path_production = bw_path_raw
+            .split(concat!("#[cfg(", "test)]", "
+mod "))
+            .next()
+            .unwrap();
+        assert!(
+            bw_path_production.len() < bw_path_raw.len(),
+            "control: the test-module cut marker was not found in bw_path.rs"
+        );
+        let bw_path_all = code_only(bw_path_production);
         assert!(
             bw_path_all.len() > 1000,
             "control: bw_path.rs produced almost no code, so RULE 8 is vacuous"
@@ -1359,14 +1411,17 @@ mod tests {
                 "bw_path.rs names `{path}`. It is on RULE 7's REACHABLE list, so                  `vault_export.rs` and `send.rs` call into it -- and anything it calls, it                  calls on their behalf, with no rule of theirs in the way. A spawner reached                  from here starts a `bw` outside the kill-on-close job while both runners stay                  spotless. If this item is genuinely needed, adding it here is the visible                  decision that it cannot spawn"
             );
         }
-        let bw_path_production = bw_path_raw
-            .split(concat!("#[cfg(", "test)]", "
-mod "))
-            .next()
-            .unwrap();
+        // Stale entries are an error, exactly as they are on DOOR_FILES and on
+        // ALLOWED: an entry production no longer names is a pre-blessed hop
+        // for whoever edits `bw_path.rs` next, and it is what the second hop
+        // above walked through.
+        let named = crate_paths(&bw_path_all);
+        let stale: Vec<&&str> =
+            BW_PATH_MAY_REACH.iter().filter(|e| !named.contains(&e.to_string())).collect();
         assert!(
-            bw_path_production.len() < bw_path_raw.len(),
-            "control: the test-module cut marker was not found in bw_path.rs"
+            stale.is_empty(),
+            "{stale:?} are blessed for `bw_path.rs` to reach but production `bw_path.rs` no \
+             longer names them; remove them rather than leaving the permission standing"
         );
         assert_eq!(
             code_only(bw_path_production).matches("super::").count(),
@@ -1609,6 +1664,28 @@ mod "))
             // contains exactly four crate-local types, plus whatever the two
             // files define themselves, which is why a foreign `impl` reaching
             // into either module is refused as well.
+            //
+            // WHAT THIS STILL DOES NOT CLOSE, measured and left standing: the
+            // same `pub fn run_it` written in `job_object.rs` ITSELF, next to
+            // the type, survives at 2077 lib / 217 bin / 0 failed / 0
+            // warnings. So does a second jobless spawn inside `spawn_in_job`'s
+            // own body. Both require editing the choke point module -- the
+            // most-reviewed file in this crate, carrying the probe and its own
+            // spawn tests -- whereas everything refused above needs only an
+            // ordinary UI file and one innocuous line in a runner. These rules
+            // are aimed at the second kind.
+            //
+            // AND WHY THE READERS STAY. `JobCommand::get_program`, `get_args`
+            // and `get_envs` are what make the rebuild above possible: a
+            // foreign `impl` cannot touch the private `command` field, so the
+            // public surface is all it has. Removing them would close the
+            // rebuild structurally rather than by rule -- but they are not
+            // spare. `get_envs` is how `send.rs` and `vault_export.rs` assert
+            // that `BW_SESSION` really reaches the child without running one,
+            // and `get_program`/`get_args` are how the spawn probe records
+            // what arrived; those assertions ARE part of the guarantee this
+            // module makes. Narrowing them would trade a rule for a blind
+            // spot, so they stay and the rebuild is refused at the `impl`.
             const OWN_IMPLS_ONLY: &[(&str, &str)] = &[
                 (concat!("Bare", "Command"), "bw_path.rs"),
                 (concat!("Job", "Command"), "job_object.rs"),
@@ -1632,7 +1709,101 @@ mod "))
                      `the_two_job_bearing_modules_cannot_name_a_bare_command`. Keep the impl in \
                      `{home}`, where those rules and this crate's spawn guards can read it"
                 );
+
+                // AND NO ONE MAY GIVE A GUARDED TYPE A SECOND NAME.
+                //
+                // THE TENTH ROUND'S HOP, and the reason the rule above is not
+                // enough on its own: `impl_blocks_for` reads an impl HEAD, so
+                // it can only refuse a head in which the type is SPELLED. If
+                // the type is renamed first, the head names the rename and the
+                // needle never occurs. Both spellings were measured, each in
+                // `login_ui.rs` above its layout cut, each with
+                // `command.run_it();` added to `CliExportRunner::run`:
+                //
+                //     use crate::job_object::JobCommand as Jc;
+                //     impl Jc { pub fn run_it(&self) { .. spawn .. } }
+                //
+                //     type Jt = crate::job_object::JobCommand;
+                //     impl Jt { pub fn run_it(&self) { .. spawn .. } }
+                //
+                // 2077 lib / 217 bin / 0 failed / 0 warnings, both of them,
+                // with a signature-verified `bw.exe` on the export's full argv
+                // running outside the kill-on-close job. The identical helper
+                // written `impl crate::job_object::JobCommand` is refused by
+                // the assertion above -- so that assertion closed exactly the
+                // spelling its author happened to mutate with.
+                //
+                // Renaming is the whole of the gap, so renaming is what is
+                // banned: outside the type's home file the guarded names may
+                // be IMPORTED and USED (`vault_export.rs` really does
+                // `use crate::job_object::{JobCommand, KillOnCloseJob};`),
+                // but they may not be given a name the head-reader cannot
+                // recognise. Re-export without renaming is deliberately still
+                // allowed and is deliberately still caught: `mod al { pub use
+                // crate::job_object::JobCommand; } impl al::JobCommand { .. }`
+                // writes the needle at the impl head, which is where the rule
+                // above reads.
+                let renamed: Vec<String> = item_bodies(&code, "use")
+                    .into_iter()
+                    .filter(|item| item.contains(&format!("{ty}as")))
+                    .collect();
+                assert!(
+                    renamed.is_empty(),
+                    "{rel} imports `{ty}` under a second name: {renamed:?}. An `impl` block \
+                     written against the rename names no guarded type, so the assertion above \
+                     -- which reads the impl's head -- cannot see it, and the method it grows \
+                     is called as `x.run_it()`, which names no type and writes no path. Import \
+                     it under its own name (split the `use` if some other item in the same \
+                     list needs renaming), or keep the impl in `{home}`"
+                );
+                // Only an alias whose right-hand side IS the type: that is the
+                // one `impl <alias>` accepts as an inherent impl. An alias for
+                // a compound that merely mentions the type -- `type A = (u64,
+                // Result<Vec<crate::send::SendSummary>, ..>)`, which
+                // `vault_window/mod.rs` really writes -- names no type an
+                // inherent impl could attach to, and is not this rule's
+                // business. Parentheses are kept in the accepted set because
+                // `type Jt = (crate::job_object::JobCommand);` is the same
+                // alias with brackets round it.
+                let aliased: Vec<String> = item_bodies(&code, "type")
+                    .into_iter()
+                    .filter(|item| {
+                        let rhs = match item.split_once('=') {
+                            Some((_, rhs)) => rhs,
+                            None => return false,
+                        };
+                        rhs.contains(ty)
+                            && !rhs.contains(',')
+                            && rhs.chars().all(|c| c.is_alphanumeric() || "_:<>'()".contains(c))
+                    })
+                    .collect();
+                assert!(
+                    aliased.is_empty(),
+                    "{rel} declares a type alias naming `{ty}`: {aliased:?}. `impl <alias>` is \
+                     an inherent impl for the aliased type, and its head names nothing the \
+                     assertion above can read. Write the type out at the impl, or keep the \
+                     impl in `{home}`"
+                );
             }
+
+            // AND NO IMPL MAY HIDE ITS SELF TYPE BEHIND A MACRO ARGUMENT.
+            //
+            // The third way to write an impl head that does not spell the
+            // type: let a macro spell it. `macro_rules! grow { ($t:ty) => {
+            // impl $t { .. } } }` puts `impl$t` in the head, and the only
+            // place the guarded name is written is the invocation
+            // `grow!(crate::job_object::JobCommand);` -- an argument, not a
+            // head. Banned outright, in every file including the home files:
+            // an impl whose self type is a metavariable is unreadable to
+            // every rule here, and this crate has none.
+            let heads = impl_heads(&code);
+            let macro_heads: Vec<&String> = heads.iter().filter(|h| h.contains('$')).collect();
+            assert!(
+                macro_heads.is_empty(),
+                "{rel} writes an `impl` whose self type is a macro metavariable: {macro_heads:?}. \
+                 The type it grows a method onto is named at the macro's call site rather than \
+                 at its head, where every rule in this test reads. Write the impl out"
+            );
 
             // `extern crate self as x;` makes `x::` a synonym for `crate::`,
             // which RULE 7 reads, and for `super::`, which RULE 7b reads --
@@ -1731,6 +1902,80 @@ mod "))
             0
         );
         assert_eq!(code_only("extern crate self as dw;").matches("externcrateselfas").count(), 1);
+
+        // The tenth round's three shapes, each through the matcher that now
+        // refuses it, and each shown to have been INVISIBLE to the needle
+        // walk that a head reader replaces.
+        //
+        //  * a generic impl: the old backwards walk stopped on the `>`.
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl<'a> crate::job_object::JobCommand { fn r(&'a self) {} }"),
+                JOB
+            ),
+            1
+        );
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl<T: Fn() -> u8> Trait<T> for JobCommand { fn r(&self) {} }"),
+                JOB
+            ),
+            1
+        );
+        //  * a rename: no head names the type at all, so the head reader is
+        //    silent by construction and the `use` item is what is refused.
+        assert_eq!(impl_blocks_for(&code_only("use X as Jc; impl Jc {}"), JOB), 0);
+        assert_eq!(
+            item_bodies(&code_only("use crate::job_object::JobCommand as Jc;"), "use")
+                .iter()
+                .filter(|i| i.contains(&format!("{JOB}as")))
+                .count(),
+            1
+        );
+        assert_eq!(
+            item_bodies(&code_only("type Jt = crate::job_object::JobCommand;"), "type")
+                .iter()
+                .filter(|i| i.contains(JOB))
+                .count(),
+            1
+        );
+        //  * and the honest shapes the same two matchers must pass: an import
+        //    under the type's own name (`vault_export.rs` really writes this
+        //    one), a brace list, and the two words that contain the keywords.
+        assert_eq!(
+            item_bodies(&code_only("use crate::job_object::{JobCommand, KillOnCloseJob};"), "use")
+                .iter()
+                .filter(|i| i.contains(&format!("{JOB}as")))
+                .count(),
+            0
+        );
+        assert_eq!(item_bodies(&code_only("let n = x.type_of(); f(user);"), "type").len(), 0);
+        assert_eq!(item_bodies(&code_only("let n = x.type_of(); f(user);"), "use").len(), 0);
+        //  * a macro-supplied self type: the guarded name is written at the
+        //    call site, never at the head, so the head is what is refused.
+        let macro_impl = code_only("macro_rules! g { ($t:ty) => { impl $t { fn r(&self) {} } } }");
+        assert_eq!(impl_blocks_for(&macro_impl, JOB), 0);
+        assert_eq!(impl_heads(&macro_impl).iter().filter(|h| h.contains('$')).count(), 1);
+        //  * a braced const generic argument does not end the head early. Not
+        //    reachable on its own -- a trait impl needs the trait in scope at
+        //    the call site, which is a `crate::` path RULE 7 refuses -- but a
+        //    head this reader cannot read whole is a hole either way.
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl RunIt<{ 0 }> for crate::job_object::JobCommand { fn r(&self) {} }"),
+                JOB
+            ),
+            1
+        );
+        //  * and `impl` is a keyword here, not a substring: neither of these
+        //    is an impl block.
+        assert_eq!(impl_heads(&code_only("let simple = 1; fn implementation() {}")).len(), 0);
+        //  * a return-position `impl Trait` is a head, and a harmless one:
+        //    it is seen, and it names no guarded type.
+        assert_eq!(
+            impl_heads(&code_only("fn f() -> impl Iterator<Item = u8> { g() }")),
+            vec!["Iterator<Item=u8>".to_string()]
+        );
     }
 
     /// Every `crate::` path written in one file's `code_only` view.
@@ -1820,38 +2065,135 @@ mod "))
         out
     }
 
+    /// The head of every `impl` block in one file's `code_only` view: the
+    /// text between the `impl` keyword and the `{` (or `;`) that follows it,
+    /// with the generic parameter list skipped.
+    ///
+    /// **Driven by the `impl` keyword, not by the type being looked for.**
+    /// The previous shape of this walked BACKWARDS from an occurrence of the
+    /// needle and asked whether it landed on `impl`, which made it a reader of
+    /// spellings: `impl<'a> JobCommand` walks back onto the `>` that ends the
+    /// generic list, stops there, and is not counted -- and a head that never
+    /// writes the type at all (because the type was renamed first, or because
+    /// a macro supplies it) has no occurrence to walk back from. Enumerating
+    /// the heads instead means every impl in the file is looked at exactly
+    /// once, whatever its self type is written as, and the renames are refused
+    /// separately by [`item_bodies`].
+    ///
+    /// `code_only` has already removed the whitespace, so the head of
+    /// `impl SomeTrait for BareCommand` is one string `SomeTraitforBareCommand`
+    /// and a needle test over it sees the trait impl as well as the inherent
+    /// one. Trait impls are not the hazard this rule is aimed at (a foreign
+    /// module cannot reach a private field through one either), but they are
+    /// caught for free and there are none, so they are left caught.
+    ///
+    /// The token test is what keeps `simple` and `implementation` out: no
+    /// IDENTIFIER character may touch the keyword on either side -- except
+    /// that `pub` cannot precede an `impl`, so nothing legitimate does.
+    fn impl_heads(code: &str) -> Vec<String> {
+        let b = code.as_bytes();
+        let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find("impl") {
+            let start = from + at;
+            from = start + "impl".len();
+            if start > 0 && ident(b[start - 1]) {
+                continue;
+            }
+            // A head is a type or a trait, so what follows the keyword is an
+            // identifier, a path, or the `<` of a generic parameter list.
+            match b.get(start + "impl".len()) {
+                Some(&c) if ident(c) || c == b'<' || c == b'$' => {}
+                _ => continue,
+            }
+            let mut i = start + "impl".len();
+            if b[i] == b'<' {
+                // Skip `<'a, T: Fn() -> u8>`. The `>` of an `->` is not a
+                // closing bracket, and is the one that would end the skip in
+                // the wrong place.
+                let mut depth = 0usize;
+                while i < b.len() {
+                    match b[i] {
+                        b'<' => depth += 1,
+                        b'>' if b[i - 1] != b'-' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            // The head ends at the `{` that opens the block -- but NOT at a
+            // `{` inside the trait's own arguments. `impl RunIt<{ 0 }> for
+            // crate::job_object::JobCommand` is a legal head whose const
+            // generic argument is braced, and a head cut at the first `{`
+            // would read as `RunIt<` and would name no type at all. The angle
+            // depth is tracked for exactly that, with the `>` of an `->`
+            // excluded as above.
+            let mut angle = 0isize;
+            let mut end = i;
+            while end < b.len() {
+                match b[end] {
+                    b'<' => angle += 1,
+                    b'>' if b[end - 1] != b'-' => angle -= 1,
+                    b'{' | b';' if angle <= 0 => break,
+                    _ => {}
+                }
+                end += 1;
+            }
+            out.push(code[i..end].to_string());
+            from = end;
+        }
+        out
+    }
+
     /// The number of `impl` blocks naming `needle` in one file's `code_only`
     /// view.
-    ///
-    /// Walks back from each occurrence of the needle over the characters a
-    /// path is made of and asks whether what it lands on begins with `impl`.
-    /// That covers `impl BareCommand`, `impl crate::bw_path::BareCommand` and
-    /// -- because `code_only` has already dropped the whitespace that would
-    /// separate them -- `impl SomeTrait for BareCommand` as well. It works
-    /// equally for a path PREFIX such as `crate::vault_export::`, because the
-    /// walk back from the `c` of `crate` picks up the same `impl`.
-    ///
-    /// Trait impls are not the hazard this rule is aimed at (a foreign module
-    /// cannot reach a private field through one either), but they are caught
-    /// for free and there are none, so they are left caught: one arriving is a
-    /// change to a guarded type's surface that deserves to be looked at.
     fn impl_blocks_for(code: &str, needle: &str) -> usize {
-        let mut found = 0;
+        impl_heads(code).iter().filter(|head| head.contains(needle)).count()
+    }
+
+    /// The text of every `use` (or `type`) item in one file's `code_only`
+    /// view, from the keyword to the `;` that ends it.
+    ///
+    /// Used to refuse the two ways a guarded type can be given a name that
+    /// [`impl_heads`] cannot recognise. `code_only` has dropped the whitespace,
+    /// so `use crate::job_object::JobCommand as Jc;` arrives as one string in
+    /// which the rename is the literal `JobCommandas`, and
+    /// `type Jt = crate::job_object::JobCommand;` arrives as an item that
+    /// simply contains the name.
+    ///
+    /// The keyword must start an item, which after whitespace removal means it
+    /// is at the start of the file, or touches a `;`, `}`, `{` or `]` (an
+    /// attribute), or `)` (`pub(crate) use`), or is preceded by `pub`. That is
+    /// what keeps `.type_of()` and `(user)` out -- neither is preceded by any
+    /// of those.
+    fn item_bodies(code: &str, kw: &str) -> Vec<String> {
+        let b = code.as_bytes();
+        let mut out = Vec::new();
         let mut from = 0;
-        while let Some(at) = code[from..].find(needle) {
+        while let Some(at) = code[from..].find(kw) {
             let start = from + at;
-            from = start + needle.len();
-            let head_start = code[..start]
-                .char_indices()
-                .rev()
-                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == ':'))
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            if code[head_start..start].starts_with("impl") {
-                found += 1;
+            from = start + kw.len();
+            let starts_item = start == 0
+                || matches!(b[start - 1], b';' | b'}' | b'{' | b']' | b')')
+                || code[..start].ends_with("pub");
+            if !starts_item {
+                continue;
             }
+            let end = code[start..]
+                .find(';')
+                .map(|k| start + k)
+                .unwrap_or(code.len());
+            out.push(code[start..end].to_string());
+            from = end;
         }
-        found
+        out
     }
 
     /// The `cfg` predicates of every `not(..)` in one file's code.
