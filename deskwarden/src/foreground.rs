@@ -860,7 +860,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 33] = [
+        const OPENS_NO_WINDOW: [&str; 34] = [
             "accounts",
             "app",
             // Reads an executable's version resource and its shell icon.
@@ -897,6 +897,10 @@ mod tests {
             "logging",
             "match_engine",
             "password_strength",
+            // Builds the argument vector, the stdin JSON and the failure
+            // classification for `bw send`. Pure data; the Sends screen that
+            // will draw it is a later step and is not this module.
+            "send",
             "session_store",
             "settings",
             "signature",
