@@ -2075,8 +2075,31 @@ mod refusal_lifetime_tests {
     /// `Vec` to release, and was already clean. It is here so that a future
     /// change which makes the flushing case leak again cannot be mistaken for
     /// the probe having gone quiet across the board.
+    ///
+    /// **Which is precisely what it could not tell you, for as long as it had
+    /// no control of its own.** Its whole claim is a `!leaked`, so a probe that
+    /// had gone deaf passed it vacuously -- the one failure mode this test was
+    /// written to rule out, in the test written to rule it out.
+    ///
+    /// The positive control is first for two reasons. It is what makes the
+    /// `!leaked` below mean something; and arming it takes `PROBE_LOCK` for the
+    /// rest of this thread, which the probe plaintext allocated afterwards then
+    /// sits inside. Building probe-bearing fixtures before the first arm is the
+    /// crate's house rule and it is the one shape that hold does not cover: it
+    /// is safe here only because `Box::leak` never frees, and that is a fact
+    /// about this fixture rather than a licence.
     #[test]
     fn a_refusal_before_any_flush_was_never_the_leaking_case() {
+        use crate::login_ui::password_lifetime_tests::plaintext_reached_the_allocator;
+
+        let bare = String::from_utf8(PROBE.as_bytes().to_vec()).expect("PROBE is UTF-8");
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: the probe cannot see an ordinary String's plaintext go past the \
+             allocator, so the `!leaked` below is satisfied by a deaf instrument and this \
+             test -- whose entire job is to tell a real fix from a deaf probe -- proves nothing"
+        );
+
         let password: &'static str = Box::leak(PROBE.to_string().into_boxed_str());
         let tokens = parse("{PASSWORD}{S:NOPE}");
         let mut refused = false;
@@ -2088,6 +2111,6 @@ mod refusal_lifetime_tests {
             .is_err();
         });
         assert!(refused, "the fixture was expected to refuse");
-        assert!(!leaked);
+        assert!(!leaked, "the refusal reached before any flush released the password");
     }
 }
