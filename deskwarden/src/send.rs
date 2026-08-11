@@ -513,20 +513,20 @@ fn itoa_u32(mut n: u32) -> String {
 /// the type, so a call site outside this module can only reach a
 /// [`SendInvocation`] through [`list_sends`] / [`delete_send`] /
 /// [`plan_to_invocation`], never by assembling one.
-fn list_invocation() -> SendInvocation {
+fn list_invocation(session: Option<&str>) -> SendInvocation {
     SendInvocation {
         args: vec!["send".to_string(), "list".to_string()],
         stdin_json_b64: Zeroizing::new(String::new()),
-        session_token: None,
+        session_token: session.map(|s| Zeroizing::new(s.to_string())),
     }
 }
 
 /// The invocation that revokes one Send. Same privacy, same reason.
-fn delete_invocation(id: &str) -> SendInvocation {
+fn delete_invocation(id: &str, session: Option<&str>) -> SendInvocation {
     SendInvocation {
         args: vec!["send".to_string(), "delete".to_string(), id.to_string()],
         stdin_json_b64: Zeroizing::new(String::new()),
-        session_token: None,
+        session_token: session.map(|s| Zeroizing::new(s.to_string())),
     }
 }
 
@@ -808,6 +808,24 @@ pub fn parse_send_list(stdout: &str) -> Result<Vec<SendSummary>, SendError> {
 /// this app can publish anything. Step 2 adds the real one.
 pub trait SendRunner {
     fn run(&self, inv: &SendInvocation) -> Result<RawOutput, SendError>;
+
+    /// The session this runner was configured with, or `None` for one that
+    /// was given none.
+    ///
+    /// **This is how the read paths get their token.** `SendInvocation`'s
+    /// fields are private and the type is the whole of what reaches `bw`, so
+    /// `list` and `delete` -- which are built here rather than from a plan a
+    /// caller already holds a session for -- have to be handed one from
+    /// somewhere. Step 1 already wrote down where: `session_token: None`
+    /// means "the runner uses the session it was configured with", and this
+    /// is that configuration, read at the one moment the invocation is built.
+    ///
+    /// Defaulted to `None` rather than required, because the fakes that stand
+    /// in for `bw` in this crate's tests configure no session and must not be
+    /// made to invent one.
+    fn session(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Creates a Send: build the invocation, hand **that** invocation to the
@@ -833,7 +851,7 @@ pub fn create_send<R: SendRunner>(
 }
 
 pub fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendError> {
-    let raw = runner.run(&list_invocation())?;
+    let raw = runner.run(&list_invocation(runner.session()))?;
     if raw.exit_code != Some(0) {
         return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
     }
@@ -843,7 +861,7 @@ pub fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendErr
 /// Revokes one Send. **Nothing is parsed back**: `bw send delete` prints a
 /// human sentence, and the only question worth asking is whether it exited 0.
 pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError> {
-    let raw = runner.run(&delete_invocation(id))?;
+    let raw = runner.run(&delete_invocation(id, runner.session()))?;
     if raw.exit_code != Some(0) {
         return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
     }
@@ -1003,6 +1021,18 @@ pub struct CliSendRunner<'a> {
     /// [`crate::bw_path::bw_command_in`] so a Send is created, listed and
     /// revoked against the same account as every other write in this app.
     data_dir: Option<&'a Path>,
+    /// The vault session this runner hands to every child it starts, or
+    /// `None` for a runner that was given none.
+    ///
+    /// A `Zeroizing<String>` and not a `&str`, for the same reason
+    /// `SendPlan`'s secrets are: the token unlocks the whole vault, and a
+    /// plain `String` goes back to the allocator with the token still in it.
+    ///
+    /// **It reaches the child in the environment and nowhere else.** See
+    /// `SESSION_ENV`, and `the_session_the_list_runner_holds_reaches_the_child_and_never_its_argv`,
+    /// which reads the overlay that arrived at the spawn rather than the one
+    /// this field was set from.
+    session: Option<Zeroizing<String>>,
 }
 
 impl<'a> CliSendRunner<'a> {
@@ -1010,7 +1040,32 @@ impl<'a> CliSendRunner<'a> {
         job: Option<&'a crate::job_object::KillOnCloseJob>,
         data_dir: Option<&'a Path>,
     ) -> Self {
-        Self { job, data_dir }
+        Self {
+            job,
+            data_dir,
+            session: None,
+        }
+    }
+
+    /// The same runner, configured with the vault session every child it
+    /// starts will inherit.
+    ///
+    /// **This is what makes the read paths work against a real vault.**
+    /// `bw send list` and `bw send delete` are authenticated commands: a
+    /// child that inherits no `BW_SESSION` answers "locked", which is exactly
+    /// what the Sends screen used to show. `create` never had this problem
+    /// because its invocation is built from a plan the caller already holds a
+    /// session for.
+    pub fn with_session(
+        job: Option<&'a crate::job_object::KillOnCloseJob>,
+        data_dir: Option<&'a Path>,
+        session: &str,
+    ) -> Self {
+        Self {
+            job,
+            data_dir,
+            session: Some(Zeroizing::new(session.to_string())),
+        }
     }
 
     /// The job the child will be placed in, or `None` when this runner was
@@ -1063,6 +1118,10 @@ impl<'a> CliSendRunner<'a> {
 }
 
 impl SendRunner for CliSendRunner<'_> {
+    fn session(&self) -> Option<&str> {
+        self.session.as_deref().map(|s| s.as_str())
+    }
+
     fn run(&self, inv: &SendInvocation) -> Result<RawOutput, SendError> {
         let command = self.build_command(inv)?;
 
@@ -1311,11 +1370,13 @@ mod runner_tests {
 
     #[test]
     fn the_invocations_that_carry_no_session_do_not_have_one_invented_for_them() {
-        // `list` and `delete` leave `session_token` as `None`, meaning "use
-        // the session the runner was configured with". Honouring that means
-        // setting nothing, not reaching for some other source.
+        // An invocation whose `session_token` is `None` means "the runner
+        // was configured with no session". Honouring that means setting
+        // nothing, not reaching for some other source -- and it is what
+        // makes `the_session_the_list_runner_holds_reaches_the_child_and_never_its_argv`'s
+        // control able to tell a configured token from an invented one.
         let _ = verified_exe();
-        for inv in [list_invocation(), delete_invocation("send-id-1")] {
+        for inv in [list_invocation(None), delete_invocation("send-id-1", None)] {
             assert!(inv.session_token().is_none(), "control: {inv:?} has none");
             let command = CliSendRunner::new(None, None)
                 .build_command(&inv)
@@ -1338,7 +1399,7 @@ mod runner_tests {
         let _ = verified_exe();
         let dir = PathBuf::from(r"C:\deskwarden-test\profile-b");
         let command = CliSendRunner::new(None, Some(&dir))
-            .build_command(&list_invocation())
+            .build_command(&list_invocation(None))
             .expect("the command builds");
         assert!(
             command.get_envs().any(|(k, v)| k
@@ -1463,11 +1524,171 @@ mod runner_tests {
             .collect();
         assert_eq!(
             args,
-            list_invocation().args(),
+            list_invocation(None).args(),
             "the recorded spawn does not carry this Send's arguments, so it is not the Send"
         );
 
         attempts.iter().map(|a| a.job).collect()
+    }
+
+    /// The one spawn a read path makes when driven end to end through the
+    /// production runner: its argument vector and its environment overlay.
+    ///
+    /// No process is created: `job_object::spawn_probe` stands where
+    /// `CreateProcess` would and refuses, so `run` takes its ordinary
+    /// spawn-failed path. The checks here are only that the recorded attempt
+    /// really is this Send's -- the caller asserts what it carried.
+    #[allow(clippy::type_complexity)]
+    fn the_one_spawn(
+        op: impl FnOnce() -> Result<(), SendError>,
+    ) -> (Vec<String>, Vec<(String, Option<String>)>) {
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-testirstw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let outcome = op();
+        let attempts = probe.attempts();
+        drop(probe);
+
+        match &outcome {
+            Err(SendError::SpawnFailed(why)) => assert!(
+                why.contains(crate::job_object::spawn_probe::REFUSED),
+                "the read failed for some other reason, so its result did not come from the                  call the probe recorded: {why}"
+            ),
+            other => panic!(
+                "the probe refused the only spawn this read may make, yet it reported                  {other:?}, so a child was started by a route the probe cannot see"
+            ),
+        }
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the production read path did not reach `spawn_in_job` exactly once, so any              assertion about what it carried is about nothing: {attempts:?}"
+        );
+        let attempt = attempts.into_iter().next().expect("just counted one");
+        assert!(
+            attempt
+                .program
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the read: {:?}",
+            attempt.program
+        );
+        // Handed back as plain strings rather than as the recorded value
+        // itself: `job_object`'s
+        // `the_two_job_bearing_modules_cannot_name_a_bare_command` keeps this
+        // file from NAMING items in that module, and the point here is what
+        // the child would have been given, not the recorder's type.
+        (
+            attempt
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect(),
+            attempt
+                .envs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.as_ref().map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_session_the_list_runner_holds_reaches_the_child_and_never_its_argv() {
+        // THE GAP, held at the spawn itself and not at any accessor.
+        //
+        // `bw send list` against a real vault answers "locked" unless the
+        // child inherits `BW_SESSION`. Asserting that on the invocation, or
+        // on `build_command`, would say nothing about what the production
+        // path actually hands to `CreateProcess` -- this crate has lost that
+        // argument repeatedly -- so `list_sends` is driven end to end through
+        // the real `CliSendRunner` and the real `spawn_in_job`, and what is
+        // read back is the environment overlay that ARRIVED there.
+        //
+        // The second half is the other side of the same rule: a process's
+        // argument vector is readable by every other process on the machine,
+        // so the token that unlocks the whole vault must appear in no element
+        // of it. `--session` on the command line would satisfy the first
+        // assertion and fail this one.
+        let runner = CliSendRunner::with_session(None, None, SESSION);
+        let (args, envs) = the_one_spawn(|| list_sends(&runner).map(|_| ()));
+
+        let session_values: Vec<Option<String>> = envs
+            .iter()
+            .filter(|(k, _)| k == SESSION_ENV)
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            session_values,
+            vec![Some(SESSION.to_string())],
+            "`{SESSION_ENV}` did not arrive at the child set exactly once to the token the              runner was built with, so a real `bw send list` answers `locked`; the overlay              that arrived was {envs:?}"
+        );
+
+        for arg in &args {
+            assert!(
+                !arg.contains(SESSION),
+                "the session token is in argv, where any process on the machine can read it:                  {arg}"
+            );
+        }
+        assert!(
+            !SESSION.is_empty() && SESSION.len() > 8,
+            "control: the token searched for in argv is a real string, so the loop above is              not vacuous"
+        );
+        assert_eq!(
+            args,
+            vec!["send".to_string(), "list".to_string()],
+            "control: the recorded spawn does not carry this list's arguments, so the argv              check above is about some other command"
+        );
+
+        // Control, and the mutant it kills: a runner built with no session is
+        // still DISTINGUISHABLE from one that has it. Without this, a
+        // `build_command` that set `BW_SESSION` unconditionally out of some
+        // other source would pass the assertion above.
+        let jobless = CliSendRunner::new(None, None);
+        let (_, jobless_envs) = the_one_spawn(|| list_sends(&jobless).map(|_| ()));
+        assert!(
+            jobless_envs.iter().all(|(k, _)| k != SESSION_ENV),
+            "control: a runner configured with no session still set {SESSION_ENV}, so the              assertion above cannot tell the configured token from an invented one:              {jobless_envs:?}"
+        );
+    }
+
+    #[test]
+    fn the_session_the_delete_runner_holds_reaches_the_child_and_never_its_argv() {
+        // The same hole existed on the revoke path, and it is the more
+        // dangerous of the two: a `bw send delete` that answers "locked"
+        // leaves a public link live while the screen reports a failure.
+        //
+        // The Send's id DOES belong in argv -- it is not a secret and `bw`
+        // takes it positionally -- so this asserts the TOKEN's absence
+        // specifically rather than "argv is two words".
+        const ID: &str = "send-id-to-revoke";
+        let runner = CliSendRunner::with_session(None, None, SESSION);
+        let (args, envs) = the_one_spawn(|| delete_send(&runner, ID));
+
+        assert_eq!(
+            envs.iter()
+                .filter(|(k, _)| k == SESSION_ENV)
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(SESSION.to_string())],
+            "`{SESSION_ENV}` did not arrive at the child set exactly once to the token the runner was built with, so a real `bw send delete` answers `locked` and the link stays live: {envs:?}"
+        );
+        assert_eq!(
+            args,
+            vec!["send".to_string(), "delete".to_string(), ID.to_string()],
+            "control: the recorded spawn is not this revoke"
+        );
+        for arg in &args {
+            assert!(
+                !arg.contains(SESSION),
+                "the session token is in argv, where any process on the machine can read it: {arg}"
+            );
+        }
     }
 
     #[test]
@@ -1552,6 +1773,29 @@ mod runner_tests {
             "the encoded request body is in the debug output; it decodes to the secret being \
              published and to the share password: {printed}"
         );
+
+        // **The read invocations carry the token too, now that they are
+        // authenticated**, and the same `Debug` has to hide it there. Without
+        // this, closing the session gap would have quietly reopened the
+        // logging leak the hand-written `Debug` exists for.
+        for inv in [
+            list_invocation(Some(SESSION)),
+            delete_invocation("send-id-1", Some(SESSION)),
+        ] {
+            let printed = format!("{inv:?}");
+            assert!(
+                inv.session_token() == Some(SESSION),
+                "control: this invocation really is carrying the token: {printed}"
+            );
+            assert!(
+                printed.contains("send"),
+                "control: the arguments still print: {printed}"
+            );
+            assert!(
+                !printed.contains(SESSION),
+                "the session token -- the key to the whole vault -- is in the debug output of                  a read invocation: {printed}"
+            );
+        }
 
         // The plan the invocation was built from, same rule.
         let printed_plan = format!("{:?}", a_plan());

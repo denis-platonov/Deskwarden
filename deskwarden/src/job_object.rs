@@ -417,6 +417,13 @@ pub(crate) mod spawn_probe {
         /// spawn from another without starting either.
         pub program: OsString,
         pub args: Vec<OsString>,
+        /// The environment overlay the command carried, exactly as
+        /// `Command::get_envs` reports it: the variables this process ASKED
+        /// to add, change or remove for the child, not the whole inherited
+        /// block. Recorded so that a caller can assert a secret reached the
+        /// child in the environment rather than in `argv` without starting
+        /// one -- see `send::tests`.
+        pub envs: Vec<(OsString, Option<OsString>)>,
     }
 
     thread_local! {
@@ -473,6 +480,10 @@ pub(crate) mod spawn_probe {
                 job: job.map(|j| std::ptr::from_ref(j) as usize),
                 program: command.get_program().to_os_string(),
                 args: command.get_args().map(OsString::from).collect(),
+                envs: command
+                    .get_envs()
+                    .map(|(k, v)| (k.to_os_string(), v.map(OsString::from)))
+                    .collect(),
             });
             true
         })
