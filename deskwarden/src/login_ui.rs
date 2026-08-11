@@ -5276,20 +5276,32 @@ pub(crate) mod password_lifetime_tests {
         }
     }
 
-    /// Arms the watch for `body` and clears both verdicts, holding
-    /// [`PROBE_LOCK`] for the whole armed window. Returns the guard so the
-    /// caller disarms after reading whichever verdict it wants.
-    fn armed<R>(body: impl FnOnce() -> R) -> R {
+    /// Takes [`PROBE_LOCK`] into [`PROBE_HOLD`] for the rest of this thread, if
+    /// this thread is not already holding it.
+    ///
+    /// **Called by [`armed`], and separately callable on purpose.** A test that
+    /// allocates or frees probe plaintext BEFORE its first arm is not covered by
+    /// the hold, and such frees are not harmlessly invisible: if libtest started
+    /// this test's thread inside another probe test's armed window, this thread
+    /// is a participant in that window and its frees are reported as that
+    /// window's leak. Measured, at one failure in 45 full-suite runs, landing on
+    /// the negative control of
+    /// `a_leak_on_a_worker_thread_is_seen_by_the_cross_thread_watch_and_never_reported_clean`.
+    ///
+    /// So the house rule -- every probe test arms its positive control first --
+    /// has an escape hatch for the one test that cannot follow it, rather than
+    /// an exception.
+    fn hold_the_probe_lock() {
         // `PROBE_LOCK` is poisoned by any probe test that panics deliberately
         // -- `an_unwind_does_not_release_the_master_password_in_the_clear`
         // does exactly that -- and a poisoned lock here would turn one
         // deliberate panic into a cascade of unrelated failures. The data is
         // `()`; there is no invariant to have been broken.
         //
-        // Taken into `PROBE_HOLD` rather than a local, so it outlives this
-        // window and covers the rest of the test around it; see `PROBE_HOLD`.
-        // The `borrow_mut` is dropped before `body` runs, so a nested arm on
-        // this thread re-borrows cleanly and finds the hold already there.
+        // Taken into `PROBE_HOLD` rather than a local, so it outlives the
+        // caller and covers the rest of the test around it; see `PROBE_HOLD`.
+        // The `borrow_mut` is dropped before returning, so a nested arm on this
+        // thread re-borrows cleanly and finds the hold already there.
         PROBE_HOLD.with(|held| {
             let mut held = held.borrow_mut();
             if held.is_none() {
@@ -5297,6 +5309,15 @@ pub(crate) mod password_lifetime_tests {
                 *held = Some(ProbeHold(guard));
             }
         });
+    }
+
+    /// Arms the watch for `body` and clears both verdicts, holding
+    /// [`PROBE_LOCK`] for the whole armed window. Returns the guard so the
+    /// caller disarms after reading whichever verdict it wants.
+    fn armed<R>(body: impl FnOnce() -> R) -> R {
+        // Before anything else, and for the rest of this thread: no second
+        // probe test may run beside this one, window or not.
+        hold_the_probe_lock();
         SEEN.with(|seen| seen.set(false));
         SEEN_ANYWHERE.store(false, Ordering::Relaxed);
 
@@ -5736,14 +5757,27 @@ pub(crate) mod password_lifetime_tests {
         // size, which is what lets 3 ask for the same size and be handed one.
         let size = PROBE.len() * 2;
 
+        // **THE SEEDING IS UNDER THE LOCK BUT OUTSIDE ANY WINDOW.**
+        //
+        // Without this line the seeding below frees sixty-four probe-bearing
+        // blocks while this thread holds nothing, and if libtest started this
+        // test's thread inside ANOTHER probe test's armed window then this
+        // thread is one that window can speak for -- so those frees are
+        // reported as that test's leak. That is this crate's signature flake,
+        // and this test reintroduced it: measured at 1 failure in 45 full-suite
+        // runs, landing on the negative control of
+        // `a_leak_on_a_worker_thread_is_seen_by_the_cross_thread_watch_and_never_reported_clean`.
+        //
+        // Taking the hold without arming keeps reading 1's premise intact: no
+        // window is open, which is the state the gate this test pins reads as
+        // "skip the scan".
+        hold_the_probe_lock();
+
         // 1. THE SEEDING RUNS FIRST, AND THE ORDER IS THE WHOLE OF THE REPRO.
         //
-        //    The gate this pins reads a count of threads holding `PROBE_LOCK`,
-        //    and `armed` takes that hold at a thread's FIRST arm and keeps it
-        //    until the thread ends. So from the control at 2 onwards the gate is
-        //    open and the growth below is routed through `dealloc` and wiped --
-        //    the seeding has to happen before this test arms anything, which is
-        //    also exactly the state the ~30 source-linting tests grow in.
+        //    The gate this pins skips the scan when no window is armed, so the
+        //    growth below must happen before the control at 2 opens one -- which
+        //    is also exactly the state the ~30 source-linting tests grow in.
         //
         //    All the buffers are held live and grown afterwards, so that the
         //    block each `reserve` releases is not immediately handed back to the
