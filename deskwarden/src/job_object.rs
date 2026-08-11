@@ -185,14 +185,45 @@ impl JobCommand {
     /// Reads the program that would be run. A reader, not a way out: it
     /// borrows an `OsStr`, from which no child process can be started without
     /// naming a command type the two job-bearing modules may not name.
+    ///
+    /// **`#[cfg(test)]`, and that is the eleventh round's structural fix.**
+    /// These three readers are what made an argv rebuild possible: given a
+    /// `JobCommand`, they hand back its program, its argv and its environment,
+    /// which is everything needed to construct a second `std::process::Command`
+    /// that is byte-for-byte the same child and start it outside the job. Six
+    /// separate mutants did exactly that, differing only in where the helper
+    /// was written and how its `impl` head spelled the self type; each survived
+    /// a full green suite with a signature-verified `bw.exe` running on the
+    /// export's real argv, outside the kill-on-close job. Every one of those
+    /// spellings is a way of *writing* the helper, and each round closed one
+    /// spelling and left the next.
+    ///
+    /// The readers are the thing they all need, and **no production code in
+    /// this crate calls any of them**: outside this file the only callers are
+    /// below the `#[cfg(test)]` cuts in `send.rs`, `vault_export.rs` and
+    /// `login_ui.rs`. So they are gated rather than guarded. The shipped
+    /// binary no longer contains the rebuild surface at all, and every
+    /// `BW_SESSION` assertion and the spawn probe keep working unchanged,
+    /// because tests are exactly who these were for.
+    ///
+    /// This is a partial mitigation and is meant to be read as one. A helper
+    /// can still be written that takes what it needs as an ARGUMENT from a
+    /// caller which already has it -- `CliExportRunner::run` holds the plan and
+    /// the session -- and rebuilds the command from those. What is gone is the
+    /// ability to derive the child from a `JobCommand` a runner is *holding*,
+    /// which is what every measured hop did; the remaining route costs a
+    /// signature change at the call site rather than one added line.
+    #[cfg(test)]
     pub fn get_program(&self) -> &std::ffi::OsStr {
         self.command.get_program()
     }
 
+    #[cfg(test)]
     pub fn get_args(&self) -> std::process::CommandArgs<'_> {
         self.command.get_args()
     }
 
+    #[cfg(test)]
     pub fn get_envs(&self) -> std::process::CommandEnvs<'_> {
         self.command.get_envs()
     }
@@ -600,6 +631,39 @@ mod tests {
         assert!(running);
     }
 
+    /// The files excused from
+    /// [`only_the_files_that_must_leave_the_job_can_open_a_bare_command`] --
+    /// the ones licensed to open a `BareCommand` and start a child that is not
+    /// in the kill-on-close job.
+    ///
+    ///   bw_path.rs  -- defines the door, and `bw_job_command_in` is the one
+    ///                  production place that walks through it in order to hand
+    ///                  the command straight to `JobCommand::wrap`.
+    ///   bw_serve.rs -- `bw serve` is the long-lived backend; it is owned and
+    ///                  killed by the backend policy, not by the job.
+    ///   login_ui.rs -- sign-in, unlock and status run before there is a vault
+    ///                  window, and so before there is a job.
+    ///   main.rs     -- re-wraps into a `JobCommand` at the one call site that
+    ///                  builds the vault window's own job.
+    ///
+    /// **Module scope because there are two readers and they must not drift.**
+    /// RULE 8 needs this same set as MODULE names, to refuse a hop that lands
+    /// in a door, and it kept a hand-written copy -- four strings with the
+    /// `.rs` filed off, in a different test function, with nothing asserting
+    /// the two agreed and no staleness check, while `DOOR_FILES`, `ALLOWED` and
+    /// `BW_PATH_MAY_REACH` are all stale-checked. A copy that is one entry
+    /// behind is a door RULE 8 has stopped refusing, and nothing would say so.
+    /// There is now one list and [`door_modules`] derives the other view of it.
+    const DOOR_FILES: &[&str] = &["bw_path.rs", "bw_serve.rs", "login_ui.rs", "main.rs"];
+
+    /// [`DOOR_FILES`] as module names -- what RULE 8 refuses to end a hop in.
+    fn door_modules() -> Vec<String> {
+        DOOR_FILES
+            .iter()
+            .map(|f| f.strip_suffix(".rs").unwrap_or(f).to_string())
+            .collect()
+    }
+
     /// Every `.rs` file under this crate's `src`, recursively.
     fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -919,6 +983,195 @@ mod tests {
         }
         out.chars().filter(|c| !c.is_whitespace()).collect()
     }
+
+    /// Production `job_object.rs`, cut at the first module-level
+    /// `#[cfg(test)]`. Everything below that -- the spawn probe and this test
+    /// module -- is absent from the shipped binary.
+    fn job_object_production() -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw = std::fs::read_to_string(src.join("job_object.rs")).unwrap().replace("\r\n", "\n");
+        let cut = concat!("
+#[cfg(", "test)]
+");
+        let production = raw.split(cut).next().unwrap().to_string();
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found in job_object.rs, so this scan \
+             is reading the test module as production and every count below is meaningless"
+        );
+        assert!(
+            production.contains("pub fn spawn_in_job("),
+            "control: the production cut of job_object.rs does not contain `spawn_in_job`, so \
+             the cut is in the wrong place"
+        );
+        production
+    }
+
+    /// RULE 9: THE CHOKE POINT MODULE IS GOVERNED TOO.
+    ///
+    /// Every other rule in this file points somewhere else. `vault_export.rs`
+    /// and `send.rs` may not name a `BareCommand`; `bw_path.rs` may reach only
+    /// two items; the tree walk excuses six files and refuses the rest. Nothing
+    /// governed `job_object.rs`. It was excused from the tree walk (it *is* the
+    /// spawn), it is its own home file for `OWN_IMPLS_ONLY`, and RULE 8's one
+    /// permitted hop now terminates here by construction -- `job_object` is the
+    /// only module `BW_PATH_MAY_REACH` allows. So the one-hop check is sound
+    /// and hands the problem to a module with no rules.
+    ///
+    /// Two mutants written in this file survived a full green suite:
+    ///
+    ///   M12 -- a `run_it` helper written HERE, in the type's own home file,
+    ///          where `OWN_IMPLS_ONLY` skips it by design, called from
+    ///          `CliExportRunner::run` as `command.run_it()`, which names no
+    ///          type and writes no path.
+    ///   N14 -- `spawn_in_job` starting a SECOND, jobless child in its own
+    ///          body:
+    ///
+    ///              let mut side = std::process::Command::new(command.get_program());
+    ///              side.args(command.get_args());
+    ///              let _ = side.spawn();
+    ///
+    ///          placed after the probe's early return, so under an armed probe
+    ///          the added lines never execute and the probe reports exactly one
+    ///          arrival carrying exactly the right job. 2077 lib / 217 bin /
+    ///          1 ignored / 0 failed / 0 warnings.
+    ///
+    /// M12 is dead structurally: `get_program`, `get_args` and `get_envs` are
+    /// `#[cfg(test)]` now, so a production helper cannot read the command it
+    /// was handed. N14 is not -- it destructures nothing and reads nothing that
+    /// is gated; it just writes a second command.
+    ///
+    /// **This rule is a set of counts, and counts are a text rule.** It is
+    /// shipped knowing that, because the alternative on offer was nothing: job
+    /// membership is a property of a live process, no test here may start one
+    /// beyond the single pre-existing `cmd`, and the probe cannot observe code
+    /// placed after the refusal it returns. What the counts buy is that the
+    /// second child cannot be written in one line: it needs a second `Command`
+    /// value AND a way to start it, and each of those is pinned separately, so
+    /// the cheapest surviving mutation is now a deliberate rewrite of the
+    /// choke point rather than an insertion into it. The known ways through are
+    /// written out at the bottom of this test, in the same spirit as the notes
+    /// above: a rule whose holes are undocumented is a rule nobody can widen.
+    #[test]
+    fn the_choke_point_module_starts_a_child_in_exactly_one_place() {
+        let production = job_object_production();
+        let code = code_only(&production);
+        assert!(
+            code.len() > 2000,
+            "control: production job_object.rs stripped to almost nothing, so every count \
+             below is vacuous"
+        );
+
+        // (a) The three literals the tree walk reads, over the same stripped
+        //     view it uses. `.output()` and `.status()` start a child too, and
+        //     this file is on ALLOWED, so nothing else in the crate looks at
+        //     them here.
+        assert_eq!(code.matches(concat!(".spa", "wn()")).count(), 2, "{}", SPAWN_COUNT);
+        assert_eq!(code.matches(concat!(".out", "put()")).count(), 0, "{}", SPAWN_COUNT);
+        assert_eq!(code.matches(concat!(".sta", "tus()")).count(), 0, "{}", SPAWN_COUNT);
+
+        // (b) ...and both of them are the one binding `spawn_in_job`
+        //     destructures out of the `JobCommand` it was handed. A second
+        //     child started on any other receiver -- `side.spawn()`, which is
+        //     what N14 wrote -- fails here even before the count does.
+        assert_eq!(
+            code.matches(concat!("command.spa", "wn()")).count(),
+            2,
+            "production job_object.rs starts a child on a receiver that is not the `command` \
+             destructured out of the caller's `JobCommand`. That child is not the one the \
+             runner built and is not in the runner's job"
+        );
+
+        // (c) The whole word, however it is spelled. `Command::spawn(&mut c)`
+        //     is the sixth round's decoy and contains none of the literals in
+        //     (a); a function pointer `let f = Command::spawn;` contains none
+        //     of them either. Both write the word, so the word is counted.
+        //     Five: `spawn_in_job`, two `spawn_probe::` paths, and the two
+        //     spawns from (a).
+        assert_eq!(
+            code.matches("spawn").count(),
+            5,
+            "the word `spawn` occurs somewhere new in production job_object.rs. Every use is \
+             accounted for -- the function's own name, the two `spawn_probe` paths, and the \
+             two `command.spawn()` calls -- so a sixth is a way of starting a child that (a) \
+             and (b) were not written to see, `Command::spawn(&mut c)` among them"
+        );
+
+        // (d) And there is no second command to start. `JobCommand` owns the
+        //     only `Command` this module holds, it is opened in exactly one
+        //     place, and a fresh one cannot be built without saying so.
+        assert_eq!(
+            code.matches(concat!("Command::", "new(")).count(),
+            0,
+            "production job_object.rs constructs a `Command`. This module holds exactly one, \
+             it arrives already built from `bw_path::bw_job_command_in`, and a second one is a \
+             second child that no caller asked for and no job owns"
+        );
+        assert_eq!(
+            code.matches(concat!("JobCommand{mut", "command}=command;")).count(),
+            1,
+            "the one place a `JobCommand` is opened has moved or been joined by another. The \
+             destructure is the only way to reach the inner `Command`, so a second one is a \
+             second spawnable command inside the choke point itself"
+        );
+
+        // CONTROLS, through the same matcher, on shapes that are not in the
+        // file: each half can see what it exists to catch.
+        assert_eq!(code_only("let _ = side . spawn ( ) ;").matches(concat!(".spa", "wn()")).count(), 1);
+        assert_eq!(
+            code_only("let _ = side . spawn ( ) ;").matches(concat!("command.spa", "wn()")).count(),
+            0,
+            "control: (b) cannot tell a foreign receiver from `command`, so N14 walks through it"
+        );
+        assert_eq!(
+            code_only("let _ = Command :: spawn ( & mut side ) ;").matches(concat!(".spa", "wn()")).count(),
+            0,
+            "control: the sixth round's decoy really is invisible to (a), which is why (c) exists"
+        );
+        assert_eq!(code_only("let _ = Command :: spawn ( & mut side ) ;").matches("spawn").count(), 1);
+        assert_eq!(code_only("let f = Command :: spawn ;").matches("spawn").count(), 1);
+        assert_eq!(
+            code_only("let mut side = std :: process :: Command :: new ( p ) ;")
+                .matches(concat!("Command::", "new("))
+                .count(),
+            1,
+            "control: (d) cannot see a freshly built command, so N14's first line walks through it"
+        );
+        assert_eq!(
+            code_only("let JobCommand { mut command } = other ;")
+                .matches(concat!("JobCommand{mut", "command}=command;"))
+                .count(),
+            0,
+            "control: a second destructure of a DIFFERENT value is not miscounted as the one \
+             real one"
+        );
+
+        // WHAT THIS DOES NOT CATCH, written down rather than left to be
+        // rediscovered as the twelfth hop:
+        //
+        //  * `CreateProcessW` called directly through `windows-sys`. It writes
+        //    no `spawn` and builds no `Command`. It is refused nowhere and is
+        //    the cheapest remaining escape from this file -- but it is a dozen
+        //    lines of `unsafe` FFI with a `STARTUPINFOW` in the crate's most
+        //    reviewed function, against one line before this rule existed.
+        //  * a rewrite of `spawn_in_job` that keeps all five `spawn` words and
+        //    all the counts while handing `None` for the job. That one is not
+        //    this rule's business: it is what the probe observes, by pointer
+        //    identity, in
+        //    `the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`.
+        //  * a helper that takes what it needs as an ARGUMENT rather than
+        //    reading it off a `JobCommand` -- the residue the `#[cfg(test)]`
+        //    gate on the `get_*` readers deliberately leaves. It would still
+        //    have to start its child, and in this file (c) counts that.
+    }
+
+    /// Shared failure text for the three literal counts in RULE 9.
+    const SPAWN_COUNT: &str = "production job_object.rs starts a child somewhere other than the \
+         two `command.spawn()` calls in `spawn_in_job`. This file is excused from the tree walk \
+         because it IS the spawn, so nothing else in the crate is looking: a second child \
+         started here is started nowhere any rule can see, and a child started after the spawn \
+         probe's early return never executes under an armed probe, so the probe reports one \
+         clean arrival while two processes start";
 
     #[test]
     fn the_code_only_view_really_drops_comments_and_strings() {
@@ -1368,22 +1621,67 @@ mod tests {
             "crate::job_object::JobCommand",
             "crate::job_object::JobCommand::wrap",
         ];
-        const DOOR_MODULES: &[&str] = &["bw_path", "bw_serve", "login_ui", "main"];
-        for entry in BW_PATH_MAY_REACH {
-            let module = entry
+        // DERIVED FROM `DOOR_FILES`, NOT COPIED FROM IT. This used to be
+        // `const DOOR_MODULES: &[&str] = &["bw_path", "bw_serve", "login_ui",
+        // "main"];` -- a hand transcription of a list that lives in another
+        // test function, with no assertion tying the two together and none of
+        // the staleness or anti-vacuity controls that `DOOR_FILES`, `ALLOWED`
+        // and `BW_PATH_MAY_REACH` all carry. Adding a door file and forgetting
+        // this copy would silently make RULE 8 stop refusing exactly the hop it
+        // exists to refuse, and the suite would stay green. One list, two
+        // views, and the derivation is asserted below.
+        let door_modules = door_modules();
+        let entry_module = |entry: &str| {
+            entry
                 .strip_prefix("crate::")
                 .unwrap_or(entry)
                 .split("::")
                 .next()
-                .unwrap();
+                .unwrap()
+                .to_string()
+        };
+        for entry in BW_PATH_MAY_REACH {
+            let module = entry_module(entry);
             assert!(
-                !DOOR_MODULES.contains(&module),
+                !door_modules.contains(&module),
                 "`{entry}` is reachable from `bw_path.rs` on the runners' behalf, and `{module}` \
                  is a module allowed to open a `BareCommand` and start a child outside the \
                  kill-on-close job. This list is not followed, so an entry that is itself a \
                  door makes RULE 8 one hop shorter than the escape it is aimed at"
             );
         }
+        // ANTI-VACUITY. With `BW_PATH_MAY_REACH` shrunk to two `job_object`
+        // entries the loop above rejects nothing, so on its own it would go on
+        // passing if `door_modules` returned an empty list, or the wrong names,
+        // or names with the `.rs` still attached. Each of the three is checked
+        // against a synthetic entry that is not on the real list, which is the
+        // only way to exercise a "count is zero" rule.
+        assert_eq!(
+            door_modules,
+            vec!["bw_path", "bw_serve", "login_ui", "main"],
+            "the door module list no longer derives to the modules RULE 8 must refuse; either \
+             DOOR_FILES changed (in which case update this control deliberately) or the \
+             derivation is broken and RULE 8 has quietly stopped refusing anything"
+        );
+        for door in &door_modules {
+            let synthetic = format!("crate::{door}::some_helper");
+            assert_eq!(
+                entry_module(&synthetic),
+                *door,
+                "control: the module of a `crate::` entry is not read back, so the loop above \
+                 compares the wrong string and forgives every door"
+            );
+            assert!(
+                door_modules.contains(&entry_module(&synthetic)),
+                "control: `{synthetic}` -- an entry landing squarely in a door module -- would \
+                 not be refused, so RULE 8's second hop is open"
+            );
+        }
+        assert!(
+            !door_modules.contains(&entry_module("crate::job_object::JobCommand")),
+            "control: `job_object` reads as a door, so RULE 8 would refuse the one hop it is \
+             built to allow and this rule is asserting the opposite of its intent"
+        );
         let bw_path_raw = std::fs::read_to_string(src.join("bw_path.rs"))
             .unwrap()
             .replace("\r\n", "\n");
@@ -1595,7 +1893,10 @@ mod "))
         //                  vault window, and so before there is a job.
         //   main.rs     -- re-wraps into a `JobCommand` at the one call site
         //                  that builds the vault window's own job.
-        const DOOR_FILES: &[&str] = &["bw_path.rs", "bw_serve.rs", "login_ui.rs", "main.rs"];
+        //
+        // Declared at module scope rather than here because RULE 8, in the
+        // other test, needs the SAME list as a set of module names and used to
+        // keep a hand copy of it. See [`DOOR_FILES`] and [`door_modules`].
 
         let relative = |p: &std::path::Path| {
             p.strip_prefix(&src)
@@ -1765,18 +2066,40 @@ mod "))
                 // business. Parentheses are kept in the accepted set because
                 // `type Jt = (crate::job_object::JobCommand);` is the same
                 // alias with brackets round it.
-                let aliased: Vec<String> = item_bodies(&code, "type")
-                    .into_iter()
-                    .filter(|item| {
-                        let rhs = match item.split_once('=') {
-                            Some((_, rhs)) => rhs,
-                            None => return false,
-                        };
-                        rhs.contains(ty)
-                            && !rhs.contains(',')
-                            && rhs.chars().all(|c| c.is_alphanumeric() || "_:<>'()".contains(c))
-                    })
-                    .collect();
+                //
+                // THE ELEVENTH ROUND, and both halves of this filter were
+                // wrong. It used to read `item.split_once('=')` -- the FIRST
+                // `=` -- and test the needle against the right-hand side. A
+                // generic parameter's DEFAULT is spelled with an `=` too, and
+                // it comes first:
+                //
+                //     type Jd<A = crate::job_object::JobCommand> = A;
+                //     impl Jd { pub fn run_it(&self) { .. } }
+                //
+                // The split landed inside the parameter list, the "right-hand
+                // side" came out as `crate::job_object::JobCommand>=A`, and the
+                // `=` still in it is not in the accepted character set, so
+                // `.all()` failed and the alias was not flagged. `A` is used,
+                // so there is no E0091 and no warning. Measured SURVIVING at
+                // 2077 lib / 217 bin / 1 ignored / 0 failed / 0 warnings.
+                //
+                // Splitting on the LAST top-level `=` fixes the first half but
+                // not the rule: the right-hand side is then `A`, which does not
+                // contain the type either -- the guarded name is on the LEFT,
+                // in the default. So the needle is tested against the WHOLE
+                // item, which is where the type is named however the alias is
+                // spelled, and the right-hand side is used only for the one
+                // thing it is good for: deciding whether the alias resolves to
+                // something an inherent impl could attach to at all.
+                //
+                // That second test is why `type A = (u64, Result<Vec<crate::
+                // send::SendSummary>, ..>)` -- which `vault_window/mod.rs`
+                // really writes -- is still let through: its right-hand side is
+                // a compound, and `impl A` for a tuple grows a method onto
+                // nothing this rule guards. Parentheses stay in the accepted
+                // set because `type Jt = (crate::job_object::JobCommand);` is
+                // the same alias with brackets round it.
+                let aliased = aliases_naming(&code, ty);
                 assert!(
                     aliased.is_empty(),
                     "{rel} declares a type alias naming `{ty}`: {aliased:?}. `impl <alias>` is \
@@ -1976,7 +2299,145 @@ mod "))
             impl_heads(&code_only("fn f() -> impl Iterator<Item = u8> { g() }")),
             vec!["Iterator<Item=u8>".to_string()]
         );
+
+        // THE ELEVENTH ROUND'S CONTROLS, AND WHY THEY ARE NOT LITERALS.
+        //
+        // Every control above this point is a SPELLING its author already knew
+        // how to write: `impl crate::job_object::JobCommand ..`, `impl<'a> ..`,
+        // `impl RunIt<{ 0 }> for ..`. Each was added the round after a mutant
+        // used it. Nothing anchored the reader's ENTRY GATE against a head
+        // shape it refuses to look at, and nothing anchored the alias filter's
+        // CHARACTER SET against a right-hand side it drops -- and those two
+        // hand-written sets are exactly where the eleventh round's two
+        // survivors lived. `impl (crate::job_object::JobCommand)` was not
+        // rejected as a head, it was never READ as one; `type Jd<A = ..> = A;`
+        // was not judged safe, it was never TESTED.
+        //
+        // So these are shape-driven: a table of forms, each one built rather
+        // than written out, each asserted through the real matcher. A shape
+        // added to the table is one line; a shape the matcher cannot see fails
+        // here rather than in production three rounds later.
+
+        // (i) The reader must not be silenced by how a self type BEGINS. Not
+        //     all of these are impls Rust would accept -- `impl !T` is not --
+        //     but a reader that stops at the first byte it does not recognise
+        //     is a reader whose author's imagination is the guard, which is the
+        //     defect being closed. Every one of them must yield a head naming
+        //     the type.
+        const HEAD_SHAPES: &[(&str, &str)] = &[
+            ("", ""),
+            ("(", ")"),
+            ("((", "))"),
+            ("(", ",)"),
+            ("&", ""),
+            ("&'a ", ""),
+            ("&mut ", ""),
+            ("*const ", ""),
+            ("*mut ", ""),
+            ("[", "]"),
+            ("[", "; 4]"),
+            ("!", ""),
+            ("dyn ", ""),
+        ];
+        for (open, close) in HEAD_SHAPES {
+            let text = format!(
+                "impl {open}crate::job_object::{JOB}{close} {{ pub fn run_it(&self) {{}} }}"
+            );
+            assert!(
+                impl_blocks_for(&code_only(&text), JOB) >= 1,
+                "the impl head reader cannot see `{text}`. A head it refuses to read is not a \
+                 head it rejects: `impl_blocks_for` counts nothing, the `$` metavariable filter \
+                 sees nothing, and the method the block grows is called as `x.run_it()`, which \
+                 names no type and writes no path"
+            );
+        }
+        // ...and the reader still refuses the two things it must: a keyword
+        // that is really part of a word, and a generic PARAMETER list, whose
+        // contents are not the self type.
+        assert_eq!(impl_heads(&code_only("fn implementation() {} let simple = 1;")).len(), 0);
+        assert_eq!(
+            impl_blocks_for(
+                &code_only("impl<T: Into<crate::job_object::JobCommand>> Other { fn r(&self) {} }"),
+                JOB
+            ),
+            0,
+            "control: a generic BOUND naming the type is not an impl FOR it, and counting it \
+             would make this rule fire on honest code until someone deleted it"
+        );
+
+        // (ii) The alias filter must not drop a right-hand side because of the
+        //      characters in it, and must not be fooled about WHICH `=` is the
+        //      alias's. Every form below gives `JobCommand` a second name that
+        //      `impl <alias>` accepts, and every one must be flagged.
+        const ALIAS_SHAPES: &[&str] = &[
+            "type Jt = crate::job_object::JobCommand;",
+            "pub type Jt = crate::job_object::JobCommand;",
+            "type Jt = (crate::job_object::JobCommand);",
+            "type Jt = ((crate::job_object::JobCommand));",
+            "type Jd<A = crate::job_object::JobCommand> = A;",
+            "type Jd<A = crate::job_object::JobCommand> = (A);",
+            "type Jd<'a, A = crate::job_object::JobCommand> = A;",
+            "type Jd<A = crate::job_object::JobCommand, B = u8> = A;",
+            "type Jd<A = crate::job_object::JobCommand> = Jd2<A>;",
+            "type Jd<A: Sized = crate::job_object::JobCommand> = A;",
+        ];
+        for shape in ALIAS_SHAPES {
+            assert_eq!(
+                aliases_naming(&code_only(shape), JOB).len(),
+                1,
+                "the alias filter does not flag `{shape}`, which names `{JOB}` and which \
+                 `impl <alias>` accepts as an inherent impl for it. The filter's job is to \
+                 refuse a second name the head reader cannot recognise, and a form it silently \
+                 passes is that second name"
+            );
+        }
+        // ...and it must still pass the compounds, or it fires on honest code
+        // and gets deleted. `vault_window/mod.rs` really writes the first one.
+        for honest in [
+            "type Pair = (u64, Result<Vec<crate::send::SendSummary>, String>);",
+            "type Outcome = Result<crate::send::SendSummary, String>;",
+        ] {
+            assert_eq!(
+                aliases_naming(&code_only(honest), "crate::send::").len(),
+                0,
+                "control: the alias filter flags `{honest}`, which resolves to a compound no \
+                 inherent impl can attach to"
+            );
+        }
+        // The split itself, driven directly: the alias's `=` is the last one
+        // outside the brackets, not the first one anywhere.
+        let rhs_of = |s: &str| alias_rhs(&item_bodies(&code_only(s), "type")[0]).to_string();
+        assert_eq!(rhs_of("type Jd<A = crate::job_object::JobCommand> = A;"), "A");
+        assert_eq!(rhs_of("type Jt = crate::job_object::JobCommand;"), JOB_PATH);
+        assert_eq!(rhs_of("type Jd<A = u8> = (A, u8);"), "(A,u8)");
+        assert_eq!(rhs_of("type Jd<A = u8, B = u8> = Map<A, B>;"), "Map<A,B>");
+        // ...and an item that is not an alias at all has no right-hand side.
+        assert_eq!(alias_rhs(&code_only("use crate::job_object::JobCommand;")), "");
+
+        // A TWELFTH-HOP MUTANT THAT SATISFIES EVERY CONTROL ABOVE AND STILL
+        // ESCAPES, written down rather than left to be found:
+        //
+        //     impl<T> crate::job_object::JobCommand where T: Sized { .. }
+        //
+        // is refused (the head names the type). But
+        //
+        //     mod al { pub use crate::job_object::JobCommand as Jc; }
+        //     impl al::Jc { pub fn run_it(&self) { .. } }
+        //
+        // renames inside a nested module. The rename is caught -- `item_bodies`
+        // reads `use` items anywhere in the file, and `JobCommandas` occurs --
+        // so this one dies. What does NOT die is a rename in a DIFFERENT file
+        // that is not on `OWN_IMPLS_ONLY`'s walk at all, or a `pub use` in one
+        // file consumed by an `impl` in another. That is caught only because
+        // the walk covers every `.rs` file under `src` and the `use` scan runs
+        // on all of them: the two halves are in different files but both are
+        // scanned. The genuine residue is the `get_*` gate's -- a helper that
+        // takes the plan and the session as arguments instead of reading a
+        // `JobCommand` -- and RULE 9's, listed there.
     }
+
+    /// The path spelling of `JobCommand`, in the whitespace-free view.
+    const JOB_PATH: &str = concat!("crate::job_object::Job", "Command");
 
     /// Every `crate::` path written in one file's `code_only` view.
     ///
@@ -2101,14 +2562,42 @@ mod "))
             if start > 0 && ident(b[start - 1]) {
                 continue;
             }
-            // A head is a type or a trait, so what follows the keyword is an
-            // identifier, a path, or the `<` of a generic parameter list.
-            match b.get(start + "impl".len()) {
-                Some(&c) if ident(c) || c == b'<' || c == b'$' => {}
-                _ => continue,
-            }
+            // THERE IS NO ACCEPT-SET FOR WHAT MAY FOLLOW THE KEYWORD, and the
+            // eleventh round is why. This gate used to read
+            //
+            //     match b.get(start + "impl".len()) {
+            //         Some(&c) if ident(c) || c == b'<' || c == b'$' => {}
+            //         _ => continue,
+            //     }
+            //
+            // -- a hand-written list of the three first characters its author
+            // could think of. `(` is not on it, so
+            //
+            //     #[allow(unused_parens)]
+            //     impl (crate::job_object::JobCommand) { pub fn run_it(&self) { .. } }
+            //
+            // was not a head at all: `impl_blocks_for` could not count it, the
+            // `$` metavariable filter could not see it, and the attribute
+            // removed the only warning. Measured SURVIVING at 2077 lib / 217
+            // bin / 1 ignored / 0 failed / 0 warnings, byte-identical to
+            // baseline, with the export's child running outside the job.
+            //
+            // Adding `(` would have been the ninth round's mistake a second
+            // time: `&`, `*`, `[`, `!` and `dyn` all begin types too, and the
+            // next author gets to pick. So the set is DELETED. Every `impl`
+            // token that is not glued to an identifier is a head, and the head
+            // is whatever text runs up to the block. A head that is not really
+            // an impl is harmless -- it names no guarded type, so every reader
+            // here ignores it -- while a head that is refused is a hole, which
+            // is the asymmetry the accept-set had backwards.
+            //
+            // `from` is left at the end of the keyword rather than at the end
+            // of the head for the same reason: advancing past a head means
+            // never looking inside it, and a garbage head that swallowed a real
+            // `impl` would be a new way to be skipped. Overlapping heads only
+            // add false positives, which cost nothing.
             let mut i = start + "impl".len();
-            if b[i] == b'<' {
+            if b.get(i) == Some(&b'<') {
                 // Skip `<'a, T: Fn() -> u8>`. The `>` of an `->` is not a
                 // closing bracket, and is the one that would end the skip in
                 // the wrong place.
@@ -2147,9 +2636,81 @@ mod "))
                 end += 1;
             }
             out.push(code[i..end].to_string());
-            from = end;
         }
         out
+    }
+
+    /// Every `type` alias in one file's `code_only` view that gives `ty` a
+    /// second name an `impl` head could be written against.
+    ///
+    /// Two tests, and they ask different questions. The NEEDLE is tested
+    /// against the whole item, because the guarded name can be written on
+    /// either side of the `=` -- a generic parameter's DEFAULT puts it on the
+    /// left, which is the eleventh round's hop. The SHAPE test is on the
+    /// right-hand side only, and answers "could an inherent impl attach to what
+    /// this resolves to at all?": a compound -- anything with a comma in it,
+    /// such as the tuple `vault_window/mod.rs` really writes -- resolves to no
+    /// nominal type and grows a method onto nothing.
+    ///
+    /// A named function, not a closure at the call site, so the shape-driven
+    /// controls in the same test can drive the real filter rather than a
+    /// re-typed copy of it.
+    fn aliases_naming(code: &str, ty: &str) -> Vec<String> {
+        item_bodies(code, "type")
+            .into_iter()
+            .filter(|item| {
+                let rhs = alias_rhs(item);
+                item.contains(ty)
+                    && !rhs.contains(',')
+                    && rhs.chars().all(|c| c.is_alphanumeric() || "_:<>'()".contains(c))
+            })
+            .collect()
+    }
+
+    /// The right-hand side of a `type` alias item, in the `code_only` view.
+    ///
+    /// The alias's `=` is the LAST one that is not inside a generic bracket, so
+    /// that is the one this splits on. `type Jd<A = crate::job_object::
+    /// JobCommand> = A;` has two: the first is a parameter default and belongs
+    /// to the left-hand side, and splitting there -- which is what
+    /// `split_once('=')` did -- produced a "right-hand side" that was really
+    /// most of the parameter list.
+    ///
+    /// Only two spellings are excluded, and both because they are a single
+    /// token that merely contains the character: the `>` of a `->`, and the `=`
+    /// of an `==` or a `=>`. `>=` and `<=` are deliberately NOT excluded --
+    /// `type Jd<A = ..> = A;` ends its parameter list with exactly the bytes
+    /// `>=`, and treating that as a comparison operator is how the first
+    /// attempt at this function silently returned the empty string for the very
+    /// shape it was written for. A type has no comparisons in it.
+    ///
+    /// An item with no top-level `=` (which is not an alias at all) yields the
+    /// empty string, which no needle matches and which passes the shape test
+    /// vacuously -- harmless, because the needle is tested against the whole
+    /// item by [`aliases_naming`], not against this.
+    fn alias_rhs(item: &str) -> &str {
+        let b = item.as_bytes();
+        let mut angle = 0isize;
+        let mut cut = None;
+        for k in 0..b.len() {
+            match b[k] {
+                b'<' => angle += 1,
+                b'>' if k > 0 && b[k - 1] != b'-' => angle -= 1,
+                b'=' if angle <= 0
+                    && b.get(k + 1) != Some(&b'=')
+                    && b.get(k + 1) != Some(&b'>')
+                    && k > 0
+                    && b[k - 1] != b'=' =>
+                {
+                    cut = Some(k)
+                }
+                _ => {}
+            }
+        }
+        match cut {
+            Some(k) => &item[k + 1..],
+            None => "",
+        }
     }
 
     /// The number of `impl` blocks naming `needle` in one file's `code_only`

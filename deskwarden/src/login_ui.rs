@@ -5096,17 +5096,50 @@ pub(crate) mod password_lifetime_tests {
     ///
     /// Three readings, and it is the combination that is the claim:
     ///
-    /// 1. The cross-thread verdict SEES a leak on a thread it did not arm.
-    /// 2. Its own positive control: the same worker, wiping instead of
-    ///    leaking, is not reported -- so reading 1 is a leak and not a function
-    ///    that answers `true` to everything.
+    /// 1. Its own control, run FIRST (see the note in the body): a worker
+    ///    that wipes instead of leaking is not reported -- so reading 2 is a
+    ///    leak and not a function that answers `true` to everything.
+    /// 2. The cross-thread verdict SEES a leak on a thread it did not arm.
     /// 3. The thread-local verdict does not silently answer `false` to
-    ///    reading 1's body: it panics, naming the channel it cannot see on.
+    ///    reading 2's body: it panics, naming the channel it cannot see on.
     ///    That is what stops the twenty existing call sites -- which all read
     ///    the thread-local verdict -- from ever being quietly blind.
     #[test]
     fn a_leak_on_a_worker_thread_is_seen_by_the_cross_thread_watch_and_never_reported_clean() {
-        // 1. Seen.
+        // 1. THE CONTROL RUNS FIRST, and the order is the whole of a fix.
+        //
+        //    This assertion is a negative -- a worker that WIPES must not be
+        //    reported -- and when it ran second it fired roughly one run in
+        //    eight. For a suite used as a mutation oracle that is far too
+        //    high, and the cause is not a race between the two readings; it
+        //    is the free list.
+        //
+        //    `Watcher::dealloc` scans the WHOLE block being freed for the
+        //    probe bytes. The leak reading below is meant to leave those
+        //    bytes in a block that goes back to the allocator un-wiped --
+        //    that is the thing it is testing -- and nothing overwrites them
+        //    afterwards. With the control second, any unrelated allocation
+        //    handed that recycled block and freed inside the control's armed
+        //    window carried the old probe bytes past the scan, and the
+        //    control read a leak its own body had not produced.
+        //    Intermittent exactly as an allocator's reuse is intermittent,
+        //    and always in the safe direction, which is how it survived.
+        //
+        //    Running the negative before anything in this test has leaked
+        //    removes the one source of stale probe bytes that is certain to
+        //    be there. It cannot remove bytes left by an earlier test in the
+        //    process -- `PROBE_LOCK` serialises the probe tests but not the
+        //    allocator's memory -- so a residual rate is possible.
+        assert!(
+            !plaintext_reached_the_allocator_on_any_thread(|| {
+                let wiped = zeroize::Zeroizing::new(probe_password());
+                std::thread::spawn(move || drop(wiped)).join().expect("the worker ran");
+            }),
+            "control: the cross-thread watch reports a leak for a worker that wipes, so its \
+             `true` below means nothing"
+        );
+
+        // 2. Seen.
         assert!(
             plaintext_reached_the_allocator_on_any_thread(|| {
                 let leaked = probe_password();
@@ -5115,18 +5148,6 @@ pub(crate) mod password_lifetime_tests {
             "a plaintext probe was freed on a worker thread and the cross-thread watch did not \
              see it -- the watch is still per-thread and every fill path that spawns is \
              unobserved"
-        );
-
-        // 2. Control on that verdict: a worker that wipes is not reported, so
-        //    reading 1 above is a leak rather than an instrument stuck on
-        //    `true`.
-        assert!(
-            !plaintext_reached_the_allocator_on_any_thread(|| {
-                let wiped = zeroize::Zeroizing::new(probe_password());
-                std::thread::spawn(move || drop(wiped)).join().expect("the worker ran");
-            }),
-            "control: the cross-thread watch reports a leak for a worker that wipes, so its \
-             `true` above means nothing"
         );
 
         // 3. The thread-local verdict refuses to answer `false` to the same
