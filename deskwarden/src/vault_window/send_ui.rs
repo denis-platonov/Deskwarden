@@ -163,6 +163,21 @@ pub struct SendFetch {
     /// [`apply_answer`]: SendFetch::apply_answer
     /// [`invalidate`]: SendFetch::invalidate
     generation: u64,
+    /// Whether the Sends screen was up on the PREVIOUS frame.
+    ///
+    /// **Owned here rather than beside the fetch in the frame closure**, and
+    /// private, so that the refetch policy cannot be separated from the state
+    /// it acts on. It used to be a `let mut was_on_sends` local, with the
+    /// whole decision written out as an `if` in the render closure -- and
+    /// logic inside that closure is logic no test in this crate can run. The
+    /// measured consequence: replacing the `if`'s body with a log line left
+    /// the entire suite green while leaving Sends silently stopped dropping
+    /// the list, so a returning user saw the previous visit's Copy links
+    /// forever. The decision is [`note_screen`] now, and it is tested
+    /// directly.
+    ///
+    /// [`note_screen`]: SendFetch::note_screen
+    was_selected: bool,
 }
 
 impl SendFetch {
@@ -227,6 +242,32 @@ impl SendFetch {
         }
         self.result = Some(result);
         true
+    }
+
+    /// **The refetch policy, applied.** Tell the fetch which screen the frame
+    /// is drawing; if the user has just left Sends, the list it fetched is
+    /// dropped so the next visit asks again.
+    ///
+    /// The whole of the decision, so that the frame closure carries none of
+    /// it: the rule ([`should_invalidate_on_leave`]), the action
+    /// ([`invalidate`]) and the remembering are one call with one argument.
+    /// A frame that calls this has the policy; a frame that does not has no
+    /// half of it left behind to look correct. That is the point -- the
+    /// previous shape spelled all three out in the render closure, where an
+    /// edit that kept the `if` and dropped the `invalidate` was invisible to
+    /// every test in this file.
+    ///
+    /// Must be called BEFORE [`wants_fetch`] in the same frame: the whole
+    /// value of dropping the list is that the gate below sees `None` on the
+    /// frame the user returns.
+    ///
+    /// [`invalidate`]: SendFetch::invalidate
+    /// [`wants_fetch`]: SendFetch::wants_fetch
+    pub fn note_screen(&mut self, now_selected: bool) {
+        if should_invalidate_on_leave(self.was_selected, now_selected) {
+            self.invalidate();
+        }
+        self.was_selected = now_selected;
     }
 
     /// What the sidebar's Sends badge should read, or `None` for "unknown".
@@ -1191,6 +1232,118 @@ mod tests {
         fetch.invalidate();
         assert_ne!(fetch.generation(), before);
     }
+
+    // -- the refetch policy, driven rather than pinned ---------------------
+    //
+    // `should_invalidate_on_leave` was already tested as a standalone
+    // predicate, and that proved nothing about the frame: the predicate can
+    // be right while its answer is thrown away. Measured on `c14afb2`,
+    // replacing the frame's `send_fetch.invalidate();` with a `log::trace!`
+    // left 2050 lib + 217 bin green with the policy entirely gone. The
+    // decision is `note_screen` now -- rule, action and remembering in one
+    // place -- so these run it.
+
+    /// **The property, end to end.** Visit, get an answer, leave, come back:
+    /// the list must be asked for again rather than redrawn from the last
+    /// visit.
+    #[test]
+    fn leaving_the_sends_screen_and_returning_asks_the_server_again() {
+        let mut fetch = SendFetch::default();
+
+        // Visit one: the gate opens, a fetch runs, an answer lands.
+        fetch.note_screen(true);
+        assert!(fetch.wants_fetch(true), "the first visit did not ask");
+        fetch.in_flight = true;
+        let tag = fetch.generation();
+        assert!(fetch.apply_answer(tag, Ok(vec![summary("alpha", false, 7)])));
+        assert!(!fetch.wants_fetch(true), "the held list was refetched mid-visit");
+
+        // Staying on the screen for further frames changes nothing.
+        fetch.note_screen(true);
+        assert_eq!(fetch.badge_count(), Some(1), "the list was dropped without leaving");
+
+        // Leaving drops it.
+        fetch.note_screen(false);
+        assert_eq!(
+            fetch.badge_count(),
+            None,
+            "leaving the Sends screen did not drop the list, so the next visit will show a \
+             Copy link for a Send that may have been deleted or expired since"
+        );
+
+        // Frames spent elsewhere are not repeated leaves, and do not ask.
+        fetch.note_screen(false);
+        assert!(!fetch.wants_fetch(false), "a fetch was started for a screen that is not up");
+
+        // Returning asks.
+        fetch.note_screen(true);
+        assert!(
+            fetch.wants_fetch(true),
+            "returning to Sends did not ask again -- the previous visit's list would be drawn"
+        );
+    }
+
+    /// **Arriving is not leaving.** A `note_screen` that invalidated on every
+    /// transition, or on every frame, would pass the test above and refetch
+    /// on the frame after the answer lands -- a `bw` child per frame.
+    #[test]
+    fn only_the_leaving_edge_drops_the_list() {
+        for (was, now) in [(false, false), (false, true), (true, true)] {
+            let mut fetch = SendFetch::default();
+            fetch.note_screen(was);
+            fetch.in_flight = true;
+            let tag = fetch.generation();
+            assert!(fetch.apply_answer(tag, Ok(vec![summary("alpha", false, 7)])));
+            let before = fetch.generation();
+
+            fetch.note_screen(now);
+
+            assert_eq!(
+                fetch.badge_count(),
+                Some(1),
+                "the list was dropped moving from was_selected={was} to {now}, which is not a \
+                 leave"
+            );
+            assert_eq!(
+                fetch.generation(),
+                before,
+                "the generation moved on a transition that is not a leave, which disowns a \
+                 fetch that is still the current question"
+            );
+        }
+    }
+
+    /// The leave **bumps the generation**, so a fetch still running from the
+    /// visit being left cannot land as though it answered the next one. This
+    /// is the same reason `invalidate` bumps it; routing through `note_screen`
+    /// must not lose that.
+    #[test]
+    fn a_fetch_still_running_when_the_user_leaves_is_disowned() {
+        let mut fetch = SendFetch::default();
+        fetch.note_screen(true);
+        fetch.in_flight = true;
+        let tag = fetch.generation();
+
+        fetch.note_screen(false);
+
+        assert!(
+            !fetch.apply_answer(tag, Ok(vec![summary("alpha", false, 7)])),
+            "an answer to the visit the user has left was accepted as the current one"
+        );
+        fetch.note_screen(true);
+        assert!(fetch.wants_fetch(true), "the next visit did not ask");
+    }
+
+    /// A window that opens straight onto some other screen has never been on
+    /// Sends, so the first frame must not be treated as a leave.
+    #[test]
+    fn the_first_frame_is_not_a_leave() {
+        let mut fetch = SendFetch::default();
+        let before = fetch.generation();
+        fetch.note_screen(false);
+        assert_eq!(fetch.generation(), before);
+        assert!(fetch.result.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1236,7 +1389,7 @@ mod fetch_thread_tests {
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let caller = std::thread::current().id();
 
-        super::super::spawn_send_list_with(ctx.clone(), tx, 7, move || {
+        super::super::send_fetch_thread::spawn_send_list_with(ctx.clone(), tx, 7, move || {
             let _ = where_tx.send(std::thread::current().id());
             // If the fetch were run by the caller, this would still be inside
             // the call below and the gate could not have been opened. A
@@ -1281,7 +1434,7 @@ mod fetch_thread_tests {
             "the fixture context already wanted a repaint, so the assertion below is vacuous"
         );
 
-        super::super::spawn_send_list_with(ctx.clone(), tx, 0, || Ok(Vec::new()));
+        super::super::send_fetch_thread::spawn_send_list_with(ctx.clone(), tx, 0, || Ok(Vec::new()));
         let _ = rx.recv_timeout(PATIENCE).expect("no answer was ever sent");
 
         // The send happens just before the repaint request, so poll rather
@@ -1793,17 +1946,53 @@ mod source_pins {
         &source[..end]
     }
 
-    /// A named function's body, from its opening `(` to the first `}` at
-    /// column zero.
-    fn body_of(name: &str) -> String {
+    /// A named function's body, from its opening `(` to the first `}` at the
+    /// indentation the function itself is written at.
+    ///
+    /// `indent` is a parameter and not a hardcoded column zero because both
+    /// functions this reads now live inside `mod send_fetch_thread`, and a
+    /// column-zero terminator there would run to the module's own closing
+    /// brace and swallow every sibling. A wrong `indent` is not silent: the
+    /// terminator is required to be found rather than defaulted to
+    /// end-of-slice, so the slice cannot quietly become "the rest of the
+    /// file" -- which is how a body pin turns into a pin on nothing in
+    /// particular.
+    fn body_of(name: &str, indent: &str) -> String {
         let production = production();
         let opener = format!("fn {name}(");
         let start = production
             .find(&opener)
             .unwrap_or_else(|| panic!("`{name}` is gone from production"));
         let rest = &production[start + opener.len()..];
-        let end = rest.find("\r\n}\r\n").unwrap_or(rest.len());
+        let closer = format!("\r\n{indent}}}\r\n");
+        let end = rest.find(&closer).unwrap_or_else(|| {
+            panic!("`{name}` has no closing brace at the indentation {indent:?}")
+        });
         rest[..end].to_string()
+    }
+
+    /// The body of `mod send_fetch_thread`, from its opener to the first `}`
+    /// at column zero.
+    ///
+    /// **The privacy boundary the blocking fetch lives behind**, sliced the
+    /// way `the_item_list_is_drawn_only_inside_the_not_sends_gate` slices its
+    /// gate, so the pins below can say "inside there and nowhere else" rather
+    /// than "somewhere in the file".
+    fn sealed_module() -> &'static str {
+        let production = production();
+        let opener = concat!("mod send_fetch_", "thread {\r\n");
+        assert_eq!(
+            production.matches(opener).count(),
+            1,
+            "{opener:?} is not in production exactly once -- the module the blocking Sends \
+             fetch is sealed inside is gone, or there are two of them"
+        );
+        let start = production.find(opener).expect("counted just above");
+        let rest = &production[start + opener.len()..];
+        let end = rest
+            .find("\r\n}\r\n")
+            .expect("`mod send_fetch_thread` has no closing brace at column zero");
+        &rest[..end]
     }
 
     /// Whitespace-insensitive, so this is a pin on the code and not on the
@@ -1834,7 +2023,7 @@ mod source_pins {
             concat!("spawn_send_list_", "with"),
             concat!("real_send_", "list")
         ));
-        let actual = squashed(&body_of(concat!("spawn_send_", "list")));
+        let actual = squashed(&body_of(concat!("spawn_send_", "list"), "    "));
         assert_eq!(
             actual, expected,
             "`spawn_send_list` is no longer purely a delegation to the spawner that \
@@ -1852,7 +2041,7 @@ mod source_pins {
     /// closure in it, so there is no inside and outside to move code between.
     #[test]
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
-        let body = body_of(concat!("real_send_", "list"));
+        let body = body_of(concat!("real_send_", "list"), "    ");
         let runner = concat!("crate::send::CliSendRunner::", "new(None, data_dir.as_deref())");
         assert!(
             body.contains(runner),
@@ -1884,16 +2073,125 @@ mod source_pins {
     #[test]
     fn the_frame_starts_the_fetch_once_and_tags_it_with_the_question_it_is_asking() {
         let production = production();
-        let spawn = concat!(
-            "spawn_send_",
-            "list(ui.ctx().clone(), send_tx.clone(), send_fetch.generation())"
-        );
+        // Squashed on both sides, so this is a pin on the call and not on
+        // where rustfmt chose to break its arguments.
+        let spawn = squashed(concat!(
+            "send_fetch_thread::spawn_send_",
+            "list( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), );"
+        ));
         assert_eq!(
-            production.matches(spawn).count(),
+            squashed(production).matches(&spawn).count(),
             1,
             "{spawn:?} is not in production exactly once -- the Sends fetch is started from \
              nowhere, from more than one place, or without the generation that lets a stale \
              answer be told from a current one"
+        );
+        // And the entry point itself is named exactly once, so the squashed
+        // match above cannot be satisfied by a doc comment that spells the
+        // call out while the frame does something else.
+        let entry = concat!("send_fetch_thread::spawn_send_", "list(");
+        assert_eq!(
+            production.matches(entry).count(),
+            1,
+            "{entry:?} appears in production {} times, not once",
+            production.matches(entry).count()
+        );
+    }
+
+    /// **The blocking fetch cannot be reached from the frame closure.**
+    ///
+    /// The property is "the up-to-sixty-second `bw send list` never runs on
+    /// the eframe thread", and it has now been defeated twice by hoisting the
+    /// call to a position the pin of the day did not look at. The last one
+    /// was the frame closure itself -- measured on `c14afb2`, adding
+    /// `let _ = real_send_list();` above the spawn gave 2050 lib + 217 bin,
+    /// 0 failed, because nothing counted `real_send_list`'s call sites and
+    /// the single textual `list_sends` call was still where it had always
+    /// been.
+    ///
+    /// The primary hold is now the compiler: `real_send_list` is private to
+    /// `mod send_fetch_thread`, so that line does not build. What is left for
+    /// source to hold is the two ways round a privacy boundary -- writing a
+    /// *fresh* blocking call in the frame (`use crate::send::list_sends;` and
+    /// a bare call), or widening the module's exports until the sealed fetch
+    /// leaks out through a wrapper. So: every mention of either name lives in
+    /// the block, and the block exports exactly the two spawners.
+    #[test]
+    fn every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module() {
+        let production = production();
+        let block = sealed_module();
+
+        // Control: the slice is a slice, not the whole file. Without this the
+        // containment assertions below are trivially true.
+        assert!(
+            block.len() > 200,
+            "control: the sealed-module slice is only {} bytes, which is not a module's worth",
+            block.len()
+        );
+        let frame_only = concat!("send_fetch.note_", "screen(on_sends);");
+        assert!(
+            !block.contains(frame_only),
+            "control: the sealed-module slice contains the frame closure, so it is not a slice \
+             of the module and every containment assertion here is vacuous"
+        );
+
+        for needle in [
+            concat!("list_", "sends"),
+            concat!("real_send_", "list"),
+            concat!("spawn_send_list_", "with"),
+            concat!("CliSendRunner", "::new"),
+        ] {
+            let total = production.matches(needle).count();
+            let inside = block.matches(needle).count();
+            assert!(
+                total > 0,
+                "control: {needle:?} is not in production at all, so requiring it to be inside \
+                 the sealed module asserts nothing"
+            );
+            assert_eq!(
+                inside, total,
+                "{needle:?} occurs {total} times in production but only {inside} of them are \
+                 inside `mod send_fetch_thread`. Every mention outside that block is a blocking \
+                 `bw send list` reachable from the eframe frame closure, where it freezes the \
+                 window -- titlebar included -- for up to sixty seconds"
+            );
+        }
+
+        // The exports. A `pub(super) fn blocking_send_list()` added here that
+        // merely forwards to the private fetch would keep every count above
+        // unchanged and hand the frame closure the call back.
+        let exported: Vec<&str> = block
+            .match_indices("pub(super) fn ")
+            .map(|(at, tag)| {
+                let rest = &block[at + tag.len()..];
+                let end = rest.find(['(', '<', ' ']).expect("a function name ends somewhere");
+                &rest[..end]
+            })
+            .collect();
+        assert_eq!(
+            exported,
+            vec![concat!("spawn_send_", "list"), concat!("spawn_send_list_", "with")],
+            "`mod send_fetch_thread` no longer exports exactly the two spawners. Anything else \
+             reachable from outside is a way for the frame closure to obtain the blocking fetch \
+             the module exists to keep away from it"
+        );
+        for wider in ["\n    pub fn ", "\n    pub(crate) ", "\n    pub struct ", "\n    pub use "] {
+            assert!(
+                !block.contains(wider),
+                "`mod send_fetch_thread` contains {wider:?} -- an export wider than \
+                 `pub(super)`, which is the visibility the seal is made of"
+            );
+        }
+
+        // And the answer is never waited for on the frame's own thread: a
+        // blocking `recv` on the Sends channel is the same sixty-second
+        // freeze arrived at from the other end.
+        let blocking_drain = concat!("send_rx.", "recv()");
+        assert!(
+            !production.contains(blocking_drain),
+            "production contains {blocking_drain:?} -- the frame waits on the Sends answer \
+             instead of draining it with `try_recv`, which is the window freeze the whole \
+             off-thread fetch exists to prevent"
         );
     }
 
@@ -1919,23 +2217,68 @@ mod source_pins {
     }
 
     /// Leaving the screen drops the list. This is the refetch policy, and it
-    /// is an **absence** in the wrong shape: with the call deleted, every
-    /// pure test in this file still passes and the only symptom is a Sends
-    /// list that silently stops matching the server.
+    /// is an **absence** in the wrong shape: with it gone, every pure test in
+    /// this file still passes and the only symptom is a Sends list that
+    /// silently stops matching the server.
+    ///
+    /// **What changed, and why this pin is now thin.** It used to be an `if`
+    /// in the frame closure, guarded by a predicate pinned once and an
+    /// `invalidate();` that only had to exist *somewhere*. Measured on
+    /// `c14afb2`, replacing the `if`'s body with a `log::trace!` and adding a
+    /// semicolon to the unrelated notice-arm `invalidate()` gave 2050 lib +
+    /// 217 bin, 0 failed: the refetch policy entirely deleted, green. The
+    /// decision lives in `SendFetch::note_screen` now, where
+    /// `leaving_the_sends_screen_and_returning_asks_the_server_again` and its
+    /// three siblings run it for real. The frame's whole part is one call
+    /// with one argument, so there is no body left to hollow out and nothing
+    /// this pin has to describe except that the call is made, once, at the
+    /// closure's top level, and made *before* the fetch gate reads the state
+    /// it clears.
     #[test]
     fn leaving_the_sends_screen_invalidates_the_list() {
         let production = production();
-        let call = concat!("send_ui::should_invalidate_on_", "leave(was_on_sends, on_sends)");
+
+        // The leading newline and eight spaces put this at the frame
+        // closure's own top level -- the same indentation `if !show_sends {`
+        // sits at. A call moved inside any conditional is indented further
+        // and fails here, which matters because "invalidate only sometimes"
+        // is exactly the mutation this file has already been beaten by.
+        let call = concat!("\r\n        send_fetch.note_", "screen(on_sends);\r\n");
         assert_eq!(
             production.matches(call).count(),
             1,
-            "{call:?} is not in production exactly once -- the Sends list is never refreshed, so \
-             a Send deleted or expired elsewhere keeps its Copy link button forever"
+            "{call:?} is not in production exactly once at the frame closure's top level -- the \
+             Sends list is never refreshed, so a Send deleted or expired elsewhere keeps its \
+             Copy link button forever"
         );
-        let apply = concat!("send_fetch.invalidate", "();");
+
+        // Ordering. The call above and the gate below both pass, in either
+        // order, but only one order works: `note_screen` after the gate means
+        // the frame the user returns on still sees the previous visit's
+        // `Some(..)`, `wants_fetch` is false, and the stale list is drawn
+        // with no refetch ever -- the very defect the policy exists for.
+        let gate = concat!("send_fetch.wants_", "fetch(show_sends)");
+        assert_eq!(
+            production.matches(gate).count(),
+            1,
+            "{gate:?} is not in production exactly once, so the ordering assertion below reads \
+             the wrong gate"
+        );
         assert!(
-            production.contains(apply),
-            "the leave rule is consulted and its answer thrown away"
+            production.find(call).expect("counted above")
+                < production.find(gate).expect("counted above"),
+            "the Sends fetch gate is consulted BEFORE the leave rule is applied, so a visit \
+             returning to Sends reads the previous visit's list as current and never refetches"
+        );
+
+        // The predicate is no longer consulted from the frame at all: it is
+        // `note_screen`'s, in a file with tests that can run it.
+        let old = concat!("should_invalidate_on_", "leave");
+        assert!(
+            !production.contains(old),
+            "the frame closure consults {old:?} directly again. The point of `note_screen` is \
+             that the rule, the action and the remembering cannot be separated -- spelled out \
+             in the closure they can be, and were"
         );
     }
 
@@ -2009,5 +2352,238 @@ mod source_pins {
         for forbidden in [concat!("create_", "send("), concat!("delete_", "send(")] {
             assert!(!here.contains(forbidden), "{forbidden:?} has a call site in `send_ui`");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The region of `mod.rs` BELOW the cut -- the half no pin here reads.
+    //
+    // `production()` is `mod.rs` up to its first `#[cfg(test)]` and nothing
+    // else, and every pin in this module -- plus the ten identical
+    // `production()` copies inside `mod.rs`'s own test modules -- is blind to
+    // everything past it. Nothing asserted that the region past it was only
+    // test modules. It is today, but "is" is not "stays": a real `pub fn`
+    // appended at the end of `mod.rs` could spawn a process, or duplicate a
+    // call site pinned at exactly one here, with the suite green. Measured in
+    // exactly that shape on `send.rs` at `708a34d`. Same walk `breach.rs`,
+    // `send.rs` and `vault_export.rs` carry.
+    //
+    // `mod.rs` carries a sibling of this walk of its own
+    // (`nothing_but_gated_test_modules_lives_below_the_guards_cut`) and today
+    // the two cut at the same byte. That is a fact, not a guarantee: it lives
+    // in another module, over a marker of its own, and this file's pins would
+    // go blind without a word if it were renamed, retargeted or deleted. So
+    // this one is written independently and cut from THIS module's
+    // `production()` -- assertion 1 below is what ties them. The exact
+    // module count is left to the sibling; what is asserted here is the
+    // shape, plus the self-controls (LF/CRLF agreement, and three mutants fed
+    // to the walk) that the sibling does not carry.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a search for the
+    /// real attribute.
+    const CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Empty today, and controlled by the walk.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// Where [`production`] cuts `mod.rs`: its FIRST [`CUT_GATE`].
+    ///
+    /// Deliberately the same rule -- a plain first-occurrence find -- rather
+    /// than a better one, because the point of this walk is to inspect the
+    /// region the pins are actually blind to, not a region a smarter cut
+    /// would have given them. The equality control below ties the two.
+    fn cut_index(source: &str) -> usize {
+        source.find(CUT_GATE).expect("no `cfg(test)` attribute in `mod.rs`")
+    }
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Exact rather than a `starts_with`: a whole
+    /// module written on one line is not a module opener here and must fail.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let rest = match t.strip_prefix("mod ") {
+            Some(rest) => rest,
+            None => return false,
+        };
+        let name = match rest.strip_suffix(" {") {
+            Some(name) => name,
+            None => return false,
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk from the cut to EOF over whatever text it is handed.
+    /// Returns `(visited, modules, closes, depth)` so the caller can control
+    /// it for non-vacuity.
+    ///
+    /// **Line-ending agnostic on purpose**: `lines()` strips a trailing
+    /// carriage return, so every comparison is against the line's real text on
+    /// a CRLF tree and on an LF one alike.
+    fn walk_below_the_cut(source: &str) -> (usize, usize, usize, usize) {
+        let cut = cut_index(source);
+        let mut depth = 0usize;
+        // The walked region BEGINS with the gate, so nothing outside it is
+        // taken on trust: the first line seen is the attribute itself.
+        let mut gated = false;
+        let (mut modules, mut closes, mut visited) = (0usize, 0usize, 0usize);
+        for line in source[cut..].lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments,
+                // the gate and a module opener -- at ANY indentation, because
+                // an indented `fn` at file scope is still a top-level item
+                // and a column-0-only filter would walk straight past it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                if trimmed == CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                assert!(
+                    !line.starts_with(char::is_whitespace) && below_cut_is_module_opener(trimmed),
+                    "top-level source below the cut: {line:?}. Every pin in this module reads \
+                     only the half of `mod.rs` ABOVE the cut, so an item down here is read by \
+                     none of them: it can spawn a process on the eframe thread, reintroduce a \
+                     blocking `list_sends`, or duplicate a call site pinned at exactly one -- \
+                     and the suite stays green. Move it above the first test module."
+                );
+                assert!(
+                    gated,
+                    "the module {line:?} below the cut is not test-gated, so it SHIPS -- and it \
+                     ships in the half of the file no pin here reads"
+                );
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                assert!(
+                    BELOW_CUT_STRING_LINES.contains(&line),
+                    "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                     top-level item escaped the brace count, or this is the contents of a \
+                     string literal and belongs in BELOW_CUT_STRING_LINES"
+                );
+            }
+        }
+        (visited, modules, closes, depth)
+    }
+
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_pins_cut() {
+        let source = include_str!("mod.rs");
+        let lf = source.replace("\r\n", "\n");
+
+        // 1. The cut this control walks from is the SAME byte `production`
+        //    cuts at, or the walk proves nothing about the region the pins
+        //    cannot see.
+        let cut = cut_index(&lf);
+        assert_eq!(
+            lf[..cut],
+            production().replace("\r\n", "\n"),
+            "this control walks from a different byte than `production` cuts at, so the region \
+             it inspects is not the region the pins are blind to"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half still
+        //    reaches the last production item in the file. Were the cut to
+        //    move UP -- into a doc comment or a string that happened to spell
+        //    the gate -- this anchor would fall below it and every pin
+        //    downstream would be reading a truncated file.
+        const LAST_PRODUCTION_ITEM: &str =
+            concat!("windows::Win32::UI::WindowsAndMessaging::SW_", "SHOWNORMAL,");
+        assert_eq!(
+            lf.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: the anchor is not in `mod.rs` exactly once, so it pins nothing -- \
+             repoint it at the last production item above the first test module"
+        );
+        let anchor = lf.find(LAST_PRODUCTION_ITEM).expect("counted just above");
+        assert!(
+            anchor < cut,
+            "the last production item this control knows about is BELOW the cut, so the cut \
+             moved up and the production half every pin reads is truncated"
+        );
+        assert!(
+            cut - anchor < 4_000,
+            "the cut is more than 4000 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved down"
+        );
+
+        // 3. The walk, over an LF copy and a CRLF copy of the same text,
+        //    which must agree. Built both ways rather than compared against
+        //    the bytes on disk: this repository stores LF blobs and only
+        //    `core.autocrlf=true` makes a working tree CRLF, so a control
+        //    that asserted "this file is CRLF" would pass here and fail on
+        //    Linux.
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this file has no line endings at all"
+        );
+        assert_eq!(
+            walk_below_the_cut(&lf),
+            walk_below_the_cut(&crlf),
+            "the walk gives a different answer on an LF copy of `mod.rs` than on a CRLF one"
+        );
+        let on_disk = walk_below_the_cut(source);
+        assert!(
+            on_disk == walk_below_the_cut(&lf) || on_disk == walk_below_the_cut(&crlf),
+            "`mod.rs`'s line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) = on_disk;
+        assert!(
+            visited > 1_000,
+            "control: the walk visited only {visited} lines below the cut, which is not this \
+             file's worth of test modules -- the slice is empty and this test proves nothing"
+        );
+        assert_eq!(
+            modules, closes,
+            "below the cut {modules} test modules are opened and {closes} closed"
+        );
+        assert_eq!(depth, 0, "the walk ended inside a module, at depth {depth}");
+        assert!(
+            modules > 40,
+            "control: only {modules} test modules were found below the cut, far fewer than \
+             `mod.rs` has -- the walk stopped early"
+        );
+
+        // 5. Control on the walk itself: it really refuses production code
+        //    down there. Without this the walk could be a no-op that visits
+        //    lines and asserts nothing.
+        let with_an_appended_item = format!("{lf}\npub fn sneaked() {{}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_appended_item)).is_err(),
+            "control: the walk accepted a `pub fn` appended below the test modules, which is \
+             the exact mutation it exists to catch"
+        );
+        // And an INDENTED one, which a column-0-only filter would miss.
+        let with_an_indented_item = format!("{lf}\n    struct Sneaked(u8);\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_indented_item)).is_err(),
+            "control: the walk accepted an INDENTED top-level item appended below the test \
+             modules"
+        );
+        // And an ungated module, which ships.
+        let with_an_ungated_module = format!("{lf}\nmod shipped {{\n}}\n");
+        assert!(
+            std::panic::catch_unwind(|| walk_below_the_cut(&with_an_ungated_module)).is_err(),
+            "control: the walk accepted an UNGATED module below the cut, which ships"
+        );
     }
 }

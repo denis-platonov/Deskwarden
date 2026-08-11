@@ -735,11 +735,6 @@ pub fn build_frame(
     // from `bw serve`, and the failure lives inside the `Result` rather than
     // beside it -- see `send_ui::SendFetch`.
     let mut send_fetch = send_ui::SendFetch::default();
-    // Whether the Sends row was selected on the PREVIOUS frame, so that
-    // leaving the screen can drop the list it fetched. This is the refetch
-    // policy's only moving part; the rule itself is
-    // `send_ui::should_invalidate_on_leave`.
-    let mut was_on_sends = false;
     // Whether the rail has the Sends row selected rather than one of the item
     // filters. A flag beside `filter` and NOT a `SidebarFilter` variant: that
     // type is the item list's filter, matched on for per-row scoping and for
@@ -1661,14 +1656,14 @@ pub fn build_frame(
         // then does not draw.
         let on_sends = sends_selected;
         // **The refetch policy.** Leaving the Sends screen drops the list, so
-        // the next visit asks the server again; the rule itself, and the
-        // reasoning for it, is `send_ui::should_invalidate_on_leave`. Applied
-        // before the fetch gate below, so arriving on the screen after a
-        // visit finds `result` already `None` and asks straight away.
-        if send_ui::should_invalidate_on_leave(was_on_sends, on_sends) {
-            send_fetch.invalidate();
-        }
-        was_on_sends = on_sends;
+        // the next visit asks the server again. Both halves of that -- the
+        // rule and the remembering -- live in `SendFetch::note_screen`, where
+        // they are unit-tested directly; this line is the whole of the
+        // frame's part in it, and there is no `if` here to hollow out. Must
+        // stay ABOVE the fetch gate below, so arriving on the screen after a
+        // visit finds `result` already `None` and asks straight away; the
+        // order is pinned by `leaving_the_sends_screen_invalidates_the_list`.
+        send_fetch.note_screen(on_sends);
         let body = vault_body_state(
             vault_loading,
             items.is_empty(),
@@ -1798,7 +1793,11 @@ pub fn build_frame(
         // user who never opens Sends never spawns a `bw`.
         if send_fetch.wants_fetch(show_sends) {
             send_fetch.in_flight = true;
-            spawn_send_list(ui.ctx().clone(), send_tx.clone(), send_fetch.generation());
+            send_fetch_thread::spawn_send_list(
+                ui.ctx().clone(),
+                send_tx.clone(),
+                send_fetch.generation(),
+            );
         }
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
@@ -4309,78 +4308,122 @@ fn spawn_aux_load(
     });
 }
 
-/// Fetches the account's Sends on a background thread.
-///
-/// **`.output()` blocks, and this must never run on the eframe thread.**
-/// `send.rs`'s runner spawns a real `bw` child and waits on it for up to
-/// `send::SEND_TIMEOUT` -- sixty seconds -- so a synchronous call here would
-/// freeze the whole window, titlebar included, for a full minute on the frame
-/// the user clicks Sends. That is an order of magnitude worse than the ten
-/// seconds the trash/archive fetch was moved off-thread to avoid.
-///
-/// `ctx.request_repaint()` is what makes the answer visible: the drain is a
-/// `try_recv` in the frame closure, so without a frame to run in, a landed
-/// list sits in the channel until some unrelated input provokes one and the
-/// screen shows a spinner over a list it already has.
-///
-/// **Known gap, and it is the reason this screen cannot yet work against a
-/// real vault:** `list_sends` builds an invocation whose session token is
-/// `None`, which step 1 defined as "the runner uses the session it was
-/// configured with" -- and step 2's `CliSendRunner` has no session to be
-/// configured with. So the child inherits no `BW_SESSION` and a real
-/// `bw send list` answers "locked". Closing it is a change to `send.rs`,
-/// which is not this step's file; the shape of the gap is asserted by
-/// `send_ui::tests::the_list_invocation_still_carries_no_session_token`, and
-/// when it is closed the session this window already holds is what to pass.
-/// The failure is at least loud: it renders as a `Locked` failure in the
-/// notice band, never as an empty list.
-fn spawn_send_list(
-    ctx_for_sends: egui::Context,
-    tx: SendListSender,
-    generation: u64,
-) {
-    spawn_send_list_with(ctx_for_sends, tx, generation, real_send_list);
-}
+/// The Sends fetch's thread boundary, **with the blocking call sealed in**.
+mod send_fetch_thread {
+    //! This module is a privacy boundary and that is its entire reason for
+    //! existing. Two rounds of source pins over the previous shape were
+    //! defeated by *hoisting* -- moving the blocking call to a position the
+    //! pin did not look at while satisfying every needle it did. The third
+    //! position was the frame closure itself: a bare call to the real fetch,
+    //! its answer thrown away, on the line above the spawn. Nothing counted
+    //! it, because the only textual call to the underlying `send.rs` entry
+    //! point was still the one inside the fetch function.
+    //!
+    //! There is no position left to hoist to. The fetch is **private to this
+    //! module**, so writing that line in the frame closure is a compile error
+    //! rather than a green suite, and this module exports nothing but the two
+    //! spawners. The one remaining spelling -- importing `send.rs`'s entry
+    //! point into the frame's scope and calling it bare -- is held by
+    //! `send_ui`'s
+    //! `every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`,
+    //! which requires every occurrence of those names in production to be
+    //! inside this block, and the export list to be exactly the two spawners.
+    //!
+    //! **`.output()` blocks, and it must never run on the eframe thread.**
+    //! `send.rs`'s runner spawns a real `bw` child and waits on it for up to
+    //! `send::SEND_TIMEOUT` -- sixty seconds -- so a synchronous call from a
+    //! frame would freeze the whole window, titlebar included, for a full
+    //! minute on the frame the user clicks Sends. That is an order of
+    //! magnitude worse than the ten seconds the trash/archive fetch was moved
+    //! off-thread to avoid.
+    //!
+    //! `ctx.request_repaint()` is what makes the answer visible: the drain is
+    //! a `try_recv` in the frame closure, so without a frame to run in, a
+    //! landed list sits in the channel until some unrelated input provokes
+    //! one and the screen shows a spinner over a list it already has.
+    //!
+    //! **Known gap, and it is the reason this screen cannot yet work against
+    //! a real vault:** `list_sends` builds an invocation whose session token
+    //! is `None`, which step 1 defined as "the runner uses the session it was
+    //! configured with" -- and step 2's `CliSendRunner` has no session to be
+    //! configured with. So the child inherits no `BW_SESSION` and a real
+    //! `bw send list` answers "locked". Closing it is a change to `send.rs`,
+    //! which is not this step's file; the shape of the gap is asserted by
+    //! `send_ui::tests::the_list_invocation_still_carries_no_session_token`,
+    //! and when it is closed the session this window already holds is what to
+    //! pass. The failure is at least loud: it renders as a `Locked` failure
+    //! in the notice band, never as an empty list.
 
-/// What one `bw send list` is, with nothing in it about threads.
-///
-/// A plain function and not a closure inside the spawn, so that "the fetch"
-/// is a **value** that can be handed to [`spawn_send_list_with`] -- and so
-/// that the test below can hand it a different one and watch where it runs.
-fn real_send_list() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
-    // Read on the fetching thread, not captured from the frame: `bw_path`
-    // keeps the active account's profile directory as process state
-    // precisely so that every spawn in this crate reaches the same account,
-    // and a copy taken a frame earlier is a copy that can be stale.
-    let data_dir = crate::bw_path::active_data_dir();
-    // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
-    // owns the one `bw serve` is in), so the child is unprotected against
-    // an abrupt death of this process. `bw send list` is a read that
-    // finishes in seconds and holds no session in its environment -- see
-    // the gap above -- so it is not the orphan hazard the job exists for.
-    let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
-    crate::send::list_sends(&runner)
-}
+    use super::SendListSender;
+    use eframe::egui;
 
-/// The off-thread half, **generic over the fetch so that it can be tested**.
-///
-/// This split is the whole point. The property that matters -- the blocking
-/// call happens on a thread that is not the caller's -- used to be held by a
-/// source pin over `spawn_send_list`'s text, and a pin over a *function* is
-/// satisfied by hoisting the blocking call above the spawn while breaking
-/// exactly the property it was written for. Here `fetch` is a value the
-/// caller cannot see the inside of, so there is nothing to hoist: calling it
-/// before the spawn is a change this function's own behavioural test catches,
-/// by thread identity and by a gate the caller only opens after the call has
-/// returned. See `send_ui::fetch_thread_tests`.
-fn spawn_send_list_with<F>(ctx_for_sends: egui::Context, tx: SendListSender, generation: u64, fetch: F)
-where
-    F: FnOnce() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> + Send + 'static,
-{
-    std::thread::spawn(move || {
-        let _ = tx.send((generation, fetch()));
-        ctx_for_sends.request_repaint();
-    });
+    /// What one `bw send list` is, with nothing in it about threads.
+    ///
+    /// **Private, and deliberately unnameable from the frame closure.** A
+    /// plain function and not a closure inside the spawn, so that "the fetch"
+    /// is a **value** that can be handed to [`spawn_send_list_with`] -- and
+    /// so that `send_ui::fetch_thread_tests` can hand it a different one and
+    /// watch where it runs. Privacy is what stops that same value being
+    /// obtained by anyone who would then call it in place.
+    fn real_send_list() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+        // Read on the fetching thread, not captured from the frame: `bw_path`
+        // keeps the active account's profile directory as process state
+        // precisely so that every spawn in this crate reaches the same
+        // account, and a copy taken a frame earlier is a copy that can be
+        // stale.
+        let data_dir = crate::bw_path::active_data_dir();
+        // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
+        // owns the one `bw serve` is in), so the child is unprotected against
+        // an abrupt death of this process. `bw send list` is a read that
+        // finishes in seconds and holds no session in its environment -- see
+        // the gap above -- so it is not the orphan hazard the job exists for.
+        let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
+        crate::send::list_sends(&runner)
+    }
+
+    /// Fetches the account's Sends on a background thread.
+    ///
+    /// The frame closure's only entry point, and it is *nothing but* the
+    /// delegation -- pinned as an equality by
+    /// `spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`.
+    pub(super) fn spawn_send_list(
+        ctx_for_sends: egui::Context,
+        tx: SendListSender,
+        generation: u64,
+    ) {
+        spawn_send_list_with(ctx_for_sends, tx, generation, real_send_list);
+    }
+
+    /// The off-thread half, **generic over the fetch so that it can be
+    /// tested**.
+    ///
+    /// The property that matters -- the blocking call happens on a thread
+    /// that is not the caller's -- used to be held by a source pin over
+    /// `spawn_send_list`'s text, and a pin over a *function* is satisfied by
+    /// hoisting the blocking call above the spawn while breaking exactly the
+    /// property it was written for. Here `fetch` is a value the caller cannot
+    /// see the inside of, so there is nothing to hoist: calling it before the
+    /// spawn is a change this function's own behavioural test catches, by
+    /// thread identity and by a gate the caller only opens after the call has
+    /// returned. See `send_ui::fetch_thread_tests`.
+    ///
+    /// Exported alongside `spawn_send_list` only so those tests can drive it.
+    /// That is harmless: a caller outside this module has no blocking fetch
+    /// to hand it, because the only one in the crate reachable from here is
+    /// private above.
+    pub(super) fn spawn_send_list_with<F>(
+        ctx_for_sends: egui::Context,
+        tx: SendListSender,
+        generation: u64,
+        fetch: F,
+    ) where
+        F: FnOnce() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let _ = tx.send((generation, fetch()));
+            ctx_for_sends.request_repaint();
+        });
+    }
 }
 
 /// The Sends channel's sending half. Named because three signatures carry it.
