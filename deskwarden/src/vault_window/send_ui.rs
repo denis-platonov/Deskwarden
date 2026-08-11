@@ -1946,6 +1946,60 @@ mod source_pins {
         &source[..end]
     }
 
+    /// The same cut over **this** file. `production()` reads `mod.rs` only,
+    /// which is how a blocking fetch written one file over stayed invisible.
+    fn this_files_production() -> &'static str {
+        let source = include_str!("send_ui.rs");
+        let end = source.find(concat!("#[cfg(", "test)]")).expect("no test marker");
+        &source[..end]
+    }
+
+    /// Every `.rs` file under `deskwarden/src`, walked at test time, as
+    /// `(path relative to `src` with `/` separators, contents)`.
+    ///
+    /// **A directory walk and not an `include_str!` list**, because a list is
+    /// a thing somebody has to remember to extend and a file added next month
+    /// would simply not be looked at. `CARGO_MANIFEST_DIR` is the crate root
+    /// at compile time; this reads from disk, which is the same thing every
+    /// source pin in this crate already does through `include_str!`, and
+    /// touches nothing but the crate's own sources.
+    fn crate_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {dir:?}: {e}"));
+            let mut paths: Vec<std::path::PathBuf> =
+                entries.map(|e| e.expect("a directory entry").path()).collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("walked below the root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+                    out.push((rel, text));
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    /// Whatever the compiler builds into the shipped binary from `text`: it up
+    /// to its first `#[cfg(test)]`, or all of it if it has none.
+    fn production_region(text: &str) -> &str {
+        match text.find(concat!("#[cfg(", "test)]")) {
+            Some(end) => &text[..end],
+            None => text,
+        }
+    }
+
     /// A named function's body, from its opening `(` to the first `}` at the
     /// indentation the function itself is written at.
     ///
@@ -2066,6 +2120,76 @@ mod source_pins {
         );
     }
 
+    /// **The blocking fetch has exactly one call site in the whole crate.**
+    ///
+    /// The count just above is over `include_str!("mod.rs")`, and so is every
+    /// other containment assertion in this module. A blocking `bw send list`
+    /// written in any SIBLING file is invisible to all of them. Measured on
+    /// `0eeb749`, adding to `send_ui`'s own production
+    ///
+    /// ```ignore
+    /// pub fn prefetch_now() -> Result<Vec<SendSummary>, SendError> {
+    ///     let data_dir = crate::bw_path::active_data_dir();
+    ///     let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
+    ///     crate::send::list_sends(&runner)
+    /// }
+    /// ```
+    ///
+    /// plus `let _ = send_ui::prefetch_now();` in the frame closure gave
+    /// 2059 lib + 217 bin, 0 failed. Same "third position nobody counted"
+    /// shape as the two before it, moved one file over.
+    ///
+    /// So the count is taken over the crate: every `.rs` file under `src`,
+    /// discovered by walking the directory rather than from a list that a new
+    /// file would not be on, cut to its production region, minus `send.rs`
+    /// where these two are defined and legitimately used. The expected answer
+    /// is a *list of call sites*, so deleting the real one fails as loudly as
+    /// adding a second.
+    #[test]
+    fn the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate() {
+        let files = crate_sources();
+
+        // Controls: the walk really walked, and it walked the two files whose
+        // presence and absence the assertion below depends on.
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+        assert!(
+            files.iter().any(|(p, _)| p == "vault_window/mod.rs"),
+            "control: the walk never reached `vault_window/mod.rs`, so the one real call site \
+             would not be counted and the expectation below could be met by finding nothing"
+        );
+        assert!(
+            files.iter().any(|(p, _)| p == "send.rs"),
+            "control: the walk never reached `send.rs`, so excluding it excludes nothing"
+        );
+
+        // Bare names, not `crate::send::`-qualified ones: `use
+        // crate::send::list_sends;` and a bare call is precisely the spelling
+        // the seal's doc comment names as the remaining way round privacy.
+        for needle in [concat!("list_", "sends("), concat!("CliSendRunner::", "new(")] {
+            let sites: Vec<&str> = files
+                .iter()
+                .filter(|(path, _)| path != "send.rs")
+                .flat_map(|(path, text)| {
+                    std::iter::repeat(path.as_str())
+                        .take(production_region(text).matches(needle).count())
+                })
+                .collect();
+            assert_eq!(
+                sites,
+                vec!["vault_window/mod.rs"],
+                "{needle:?} is called from {sites:?} in the crate's production code. The one \
+                 permitted site is `real_send_list`, inside `mod send_fetch_thread`, whose \
+                 caller is proven to be a background thread. Every other site is an up-to-sixty\
+                 -second `bw send list` on whatever thread reaches it -- and the eframe thread \
+                 reaches every `pub` function in this module"
+            );
+        }
+    }
+
     /// The frame closure is what starts the fetch, exactly once, and it hands
     /// over the **current** generation. The tag is what `apply_answer` uses to
     /// drop a late answer; a spawn that carries a constant instead would make
@@ -2160,38 +2284,133 @@ mod source_pins {
         // The exports. A `pub(super) fn blocking_send_list()` added here that
         // merely forwards to the private fetch would keep every count above
         // unchanged and hand the frame closure the call back.
-        let exported: Vec<&str> = block
-            .match_indices("pub(super) fn ")
-            .map(|(at, tag)| {
-                let rest = &block[at + tag.len()..];
-                let end = rest.find(['(', '<', ' ']).expect("a function name ends somewhere");
-                &rest[..end]
+        //
+        // **Read from EVERY `pub` in the block, not from `pub(super) fn `.**
+        // The previous shape collected function headers only, and blacklisted
+        // four wider spellings (`pub fn `, `pub(crate) `, `pub struct `,
+        // `pub use `) -- none of which is a `pub(super)` non-`fn`. Measured on
+        // `0eeb749`, adding
+        //
+        // ```ignore
+        //     pub(super) const PREFETCH: fn() -> Result<..> = real_send_list;
+        // ```
+        //
+        // to the block and `let _ = send_fetch_thread::PREFETCH();` to the
+        // frame closure gave 2059 lib + 217 bin, 0 failed: the collected vec
+        // was unchanged, every containment count above was unchanged (the
+        // mention is inside the block, and the frame line names no needle),
+        // and the eframe thread ran a sixty-second `bw send list`. A value
+        // export needs no wrapper. So the list below is every `pub` token in
+        // the block, whatever item it sits on, matched as whole lines.
+        let exported: Vec<String> = block
+            .match_indices("pub")
+            .filter(|(at, _)| {
+                let before = block[..*at].chars().next_back();
+                let after = block[at + "pub".len()..].chars().next();
+                // A visibility keyword on a word boundary -- `pub(` or
+                // `pub ` -- and not the middle of "published" in prose.
+                !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                    && matches!(after, Some('(') | Some(' '))
             })
+            .map(|(at, _)| block[at..].lines().next().unwrap_or_default().trim_end().to_string())
             .collect();
         assert_eq!(
             exported,
-            vec![concat!("spawn_send_", "list"), concat!("spawn_send_list_", "with")],
-            "`mod send_fetch_thread` no longer exports exactly the two spawners. Anything else \
-             reachable from outside is a way for the frame closure to obtain the blocking fetch \
-             the module exists to keep away from it"
+            vec![
+                concat!("pub(super) fn spawn_send_", "list("),
+                concat!("pub(super) fn spawn_send_list_", "with<F>("),
+            ],
+            "`mod send_fetch_thread` no longer declares exactly the two spawners and nothing \
+             else. Every `pub` in the block is listed here whatever item it is on: a \
+             `pub(super) const`, `static`, `type`, `use`, `mod` or `trait` is as good a handle \
+             on the blocking fetch as a `pub(super) fn` wrapper is, and a function-pointer \
+             constant is one with no wrapper at all"
         );
-        for wider in ["\n    pub fn ", "\n    pub(crate) ", "\n    pub struct ", "\n    pub use "] {
+
+        // A trait method's visibility is the *trait's*, not the impl's, so an
+        // `impl super::SomeTrait for ()` written in here would carry
+        // `real_send_list` out to the frame closure without the token `pub`
+        // appearing anywhere for the scan above to see, and without adding a
+        // mention of any needle outside the block. A macro defined here and
+        // expanded there is the same hole. These two are named needles, said
+        // plainly: what closes them is that the block has no reason to hold
+        // either, so the assertion is cheap and the mutant is loud.
+        for leak in ["impl ", "macro_rules!"] {
             assert!(
-                !block.contains(wider),
-                "`mod send_fetch_thread` contains {wider:?} -- an export wider than \
-                 `pub(super)`, which is the visibility the seal is made of"
+                !block.contains(leak),
+                "`mod send_fetch_thread` contains {leak:?}. The module is two spawners and one \
+                 private fetch; an impl or a macro here is a way to name the fetch from outside \
+                 that the visibility scan above cannot see"
             );
         }
+    }
 
-        // And the answer is never waited for on the frame's own thread: a
-        // blocking `recv` on the Sends channel is the same sixty-second
-        // freeze arrived at from the other end.
-        let blocking_drain = concat!("send_rx.", "recv()");
+    /// **Nothing waits on the Sends channel from the frame's own thread.**
+    ///
+    /// The freeze has two ends. The fetch end is held by the seal above; this
+    /// is the channel end, and it was held by a single literal `contains` of
+    /// `send_rx.recv()`. Measured on `0eeb749`, replacing the drain with
+    ///
+    /// ```ignore
+    /// if let Ok((tag, result)) = send_rx.recv_timeout(Duration::from_secs(60)) {
+    /// ```
+    ///
+    /// gave 2059 lib + 217 bin, 0 failed -- the identical sixty-second freeze
+    /// the banned spelling describes, under a name nobody had banned.
+    /// `recv_deadline`, `send_rx.iter()`, `for .. in send_rx` and
+    /// `into_iter()` were all unbanned too.
+    ///
+    /// Needles, said plainly. Two of them, and they are complementary: the
+    /// blocking method names are banned outright in both files' production
+    /// (so renaming the binding does not help), and every occurrence of the
+    /// receiver itself must be followed by `try_recv` or by nothing at all
+    /// (so an iterator over it, which has no `.recv` in its text, is caught
+    /// as well).
+    #[test]
+    fn the_sends_answer_is_never_waited_for_on_the_frames_own_thread() {
+        for (file, text) in [("mod.rs", production()), ("send_ui.rs", this_files_production())] {
+            for banned in
+                [concat!(".recv", "()"), concat!(".recv_", "timeout("), concat!(".recv_", "deadline(")]
+            {
+                assert!(
+                    !text.contains(banned),
+                    "{file}'s production contains {banned:?} -- something on the eframe thread \
+                     waits for a channel instead of draining it with `try_recv`, which is the \
+                     window freeze the whole off-thread fetch exists to prevent"
+                );
+            }
+        }
+
+        let production = production();
+        let name = concat!("send_", "rx");
+        let mut seen = 0usize;
+        for (at, _) in production.match_indices(name) {
+            let before = production[..at].chars().next_back();
+            if matches!(before, Some(c) if c.is_alphanumeric() || c == '_') {
+                continue;
+            }
+            seen += 1;
+            let after = &production[at + name.len()..];
+            if after.starts_with('.') {
+                assert!(
+                    after.starts_with(concat!(".try_", "recv()")),
+                    "the Sends receiver is used as {:?} -- the only non-blocking drain is \
+                     `try_recv`, and everything else waits on the eframe thread",
+                    after.chars().take(32).collect::<String>()
+                );
+            }
+            let head = production[..at].trim_end();
+            assert!(
+                !head.ends_with(" in") && !head.ends_with('&'),
+                "the Sends receiver is iterated ({:?}). A `for` over a receiver blocks on every \
+                 step exactly as `recv()` does, and has no `.recv` in its text",
+                head.chars().rev().take(24).collect::<String>().chars().rev().collect::<String>()
+            );
+        }
         assert!(
-            !production.contains(blocking_drain),
-            "production contains {blocking_drain:?} -- the frame waits on the Sends answer \
-             instead of draining it with `try_recv`, which is the window freeze the whole \
-             off-thread fetch exists to prevent"
+            seen >= 2,
+            "control: {name:?} occurs {seen} times in production as its own token -- the channel \
+             this test is about is gone, and every assertion above is vacuous"
         );
     }
 
