@@ -62,10 +62,14 @@
 //! [`ExportOutcome::Written`] classification may promote it to the name the
 //! user picked. The promotion itself is the runner's job, not this module's.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use crate::bw_path::bw_command;
+use crate::job_object::KillOnCloseJob;
 
 /// The one export format this crate offers. See the module docs.
 pub const EXPORT_FORMAT: &str = "encrypted_json";
@@ -301,6 +305,292 @@ pub fn export_command(plan: &ExportPlan, session_token: &str) -> Result<Command,
     cmd.args(export_args(plan));
     cmd.env("BW_SESSION", session_token);
     Ok(cmd)
+}
+
+/// How long a `.dw-partial` must have sat untouched before the sweep treats
+/// it as leftover rather than as an export somebody is still running.
+///
+/// Generous on purpose. The cost of waiting too long is one encrypted file of
+/// litter; the cost of being too eager is deleting the output of an export
+/// that is still writing it, which turns a working backup into a failure the
+/// user cannot explain.
+pub const STALE_PARTIAL_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// How many bytes of the partial are read for the envelope check. The markers
+/// `looks_like_an_encrypted_envelope` searches for are in the first object of
+/// the document, well inside this.
+const HEAD_BYTES: usize = 512;
+
+/// Runs one planned export and reports what was seen, judging nothing.
+///
+/// A boxed closure rather than a trait so the UI can hold one in a struct
+/// field and a test can hand over a fake that writes bytes instead of
+/// starting a process. `Send + Sync` because the export runs on a worker
+/// thread while the window keeps painting.
+pub type ExportRunner = std::sync::Arc<dyn Fn(&ExportPlan, &str) -> RawExport + Send + Sync>;
+
+/// The runner that really spawns the CLI.
+///
+/// The job object is taken by `Arc` because it is `main.rs`'s, shared with
+/// the thread that starts `bw serve`, and it must outlive every child it
+/// owns. `Arc<Option<..>>` rather than `Option<Arc<..>>` so the "no job at
+/// all" case is the one `main.rs` already holds and not a second shape
+/// invented here.
+///
+/// Membership of the job is not a nicety. The child is a process holding an
+/// unlocked vault, and kill-on-close is what guarantees it dies with this
+/// process however this process dies -- a panic, a `process::exit` that skips
+/// every destructor, or a Task Manager kill. Without it a crash mid-export
+/// leaves a `bw` running with the session token in its environment.
+pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
+    Arc::new(move |plan, session| run_cli(plan, session, job.as_ref().as_ref()))
+}
+
+/// One spawn, start to finish, with nothing judged and nothing renamed.
+///
+/// Both output streams are captured and stdin is `null`: an inherited stream
+/// would attach the child to a console this app does not own, and `bw export`
+/// has nothing to read from stdin. The spawn goes through
+/// [`crate::job_object::spawn_in_job`], which spawns suspended, assigns the
+/// child to the job and only then resumes it -- and which re-ORs
+/// `CREATE_NO_WINDOW`, because `creation_flags` **replaces** the flags a
+/// command is holding rather than adding to them, so the flag
+/// [`bw_command`] already set would otherwise be dropped and a console window
+/// would flash on screen.
+fn run_cli(plan: &ExportPlan, session: &str, job: Option<&KillOnCloseJob>) -> RawExport {
+    let mut command = match export_command(plan, session) {
+        Ok(command) => command,
+        Err(why) => return nothing_ran(why),
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = match crate::job_object::spawn_in_job(job, command) {
+        Ok(child) => child,
+        Err(e) => {
+            return nothing_ran(format!(
+                "Bitwarden's command-line tool could not be started ({e}). Nothing was exported."
+            ))
+        }
+    };
+
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            // The child was started, so something may well be on disk -- but
+            // this side never learned how it ended. Reported as a failure
+            // with its own words; `run_export` deletes the partial either
+            // way, which is the safe direction.
+            return nothing_ran(format!(
+                "Bitwarden's command-line tool was started but could not be waited on ({e})."
+            ));
+        }
+    };
+
+    // Observed BEFORE anything is renamed, and off the partial path, because
+    // the partial is the only file this crate has written anything to yet.
+    let (written, head) = observe_partial(plan);
+    RawExport {
+        exit_ok: output.status.success(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        written,
+        head,
+    }
+}
+
+/// The observation for a run that produced no process at all.
+///
+/// `written` is `Err`, not `Ok(0)`: nothing looked, so nothing knows. It is
+/// only read by `classify` on a zero exit anyway, and this is not one.
+fn nothing_ran(why: String) -> RawExport {
+    RawExport {
+        exit_ok: false,
+        stderr: why,
+        written: Err("no export process ran, so nothing was checked".to_string()),
+        head: Vec::new(),
+    }
+}
+
+/// Stats and samples **the partial**, never the final path.
+///
+/// Public, and taking the whole plan rather than a bare path, so the choice
+/// of which of the two files is measured is a fact a test can read back: a
+/// version that looked at `final_path` would answer with the bytes of
+/// whatever was already there -- a previous good backup, most of the time --
+/// and so would confirm an export that never happened.
+///
+/// The size is a `Result` all the way out, and deliberately not flattened to
+/// `Ok(0)` on error. `Ok(0)` says the file is there and empty; `Err` says
+/// nobody knows. [`classify`] routes the second to [`ExportOutcome::Unconfirmed`],
+/// and collapsing them here would make that arm unreachable and let a failed
+/// check render as a success one layer above.
+pub fn observe_partial(plan: &ExportPlan) -> (Result<u64, String>, Vec<u8>) {
+    let path = plan.partial_path.as_path();
+    let written = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| format!("could not check {}: {e}", path.display()));
+    (written, read_head(path))
+}
+
+/// The first [`HEAD_BYTES`] of `path`, or nothing if it cannot be read.
+///
+/// An unreadable head is empty rather than an error because `classify`
+/// already refuses to confirm a head that is not an envelope, and an empty
+/// one is not; there is no outcome an error here could reach that the empty
+/// vector does not already reach.
+fn read_head(path: &Path) -> Vec<u8> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = vec![0u8; HEAD_BYTES];
+    let mut filled = 0;
+    // Read in a loop: one `read` may legally return fewer bytes than asked
+    // for, and a short first chunk would otherwise truncate the head to
+    // before the markers.
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => break,
+        }
+    }
+    buf.truncate(filled);
+    buf
+}
+
+/// Runs one export and leaves the disk in exactly one of two states: the
+/// archive under the name the user picked, or no file of this crate's making.
+///
+/// The order is the whole of it.
+///
+/// 1. **Sweep** stale `.dw-partial` files out of the destination directory.
+///    An app killed mid-export leaves one behind; it is encrypted, so this is
+///    litter rather than exposure, but it is litter in a folder the user
+///    chose. Same shape as [`crate::updater::cleanup_stale_downloads`].
+/// 2. **Run**, through the injected runner, which is pointed at
+///    `plan.partial_path` and never at `plan.final_path`.
+/// 3. **Judge**, with [`classify`] and nothing else.
+/// 4. **Promote only on [`ExportOutcome::Written`]**, by renaming the partial
+///    over the final path. Every other verdict deletes the partial instead.
+///
+/// Step 4 is the reason the staging name exists. Pointing the CLI straight at
+/// the chosen path would mean a failed or half-finished export overwriting
+/// the previous good backup with a truncated file carrying its name -- the
+/// user would have destroyed their only copy by trying to make a second one,
+/// and nothing would say so. So the final path is touched on exactly one
+/// path through this function, and that path is the one where the bytes have
+/// been stat'd and read and found to open like an encrypted envelope.
+///
+/// A rename that itself fails is a failure, and it also deletes the partial:
+/// a `.dw-partial` left beside the user's backups is a file they did not ask
+/// for and cannot identify, and the export it holds was never promoted, so
+/// nothing is lost by removing it.
+pub fn run_export(plan: &ExportPlan, session: &str, runner: &ExportRunner) -> ExportOutcome {
+    if let Some(dir) = plan.partial_path.parent() {
+        let swept = sweep_stale_partials(dir, SystemTime::now(), STALE_PARTIAL_AGE);
+        if swept > 0 {
+            log::info!("removed {swept} stale export partial(s) from {}", dir.display());
+        }
+    }
+
+    let raw = runner(plan, session);
+    let outcome = classify(&raw);
+
+    if outcome != ExportOutcome::Written {
+        discard_partial(plan);
+        return outcome;
+    }
+
+    match std::fs::rename(&plan.partial_path, &plan.final_path) {
+        Ok(()) => ExportOutcome::Written,
+        Err(e) => {
+            let why = format!(
+                "The export was written but could not be renamed to {} ({e}).",
+                plan.final_path.display()
+            );
+            discard_partial(plan);
+            ExportOutcome::Failed(why)
+        }
+    }
+}
+
+/// Removes the staged file, best effort.
+///
+/// A failure to delete is logged and not reported: the export already failed
+/// and the user is about to be told so, and "and also a temporary file could
+/// not be removed" is not information they can act on.
+fn discard_partial(plan: &ExportPlan) {
+    match std::fs::remove_file(&plan.partial_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "could not delete the staged export {}: {e}",
+            plan.partial_path.display()
+        ),
+    }
+}
+
+/// Deletes `.dw-partial` files in `dir` that have sat untouched for at least
+/// `older_than`. Answers how many were removed.
+///
+/// `now` is a parameter rather than a call to the clock so the threshold can
+/// be exercised on both sides without a test sleeping for ten minutes.
+///
+/// What it deletes: regular files whose name ends in [`PARTIAL_SUFFIX`] and
+/// whose last-modified time is at least `older_than` in the past.
+///
+/// What it leaves, every one of them on purpose:
+/// * anything else in the directory -- the user's own files live here
+/// * a partial younger than `older_than`, which may be an export in progress
+/// * a *directory* whose name happens to end in the suffix
+/// * an entry whose modification time cannot be read, or which claims to be
+///   from the future (a clock change, or a file copied from another machine):
+///   an age that cannot be established is not an old age
+/// * a file named exactly `.dw-partial` with nothing before it, which this
+///   crate never creates -- the suffix is always appended to a chosen name
+///
+/// Best effort throughout: an unreadable directory answers zero, and a file
+/// that will not delete is logged and skipped. Neither is worth failing an
+/// export the user asked for.
+pub fn sweep_stale_partials(dir: &Path, now: SystemTime, older_than: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.ends_with(PARTIAL_SUFFIX) || name.len() == PARTIAL_SUFFIX.len() {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            _ => continue,
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        // `duration_since` is an `Err` when `modified` is after `now`, which
+        // is the future-dated case above: skipped, not treated as age zero
+        // and not treated as infinitely old.
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < older_than {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) => log::warn!(
+                "could not delete the stale export partial {}: {e}",
+                entry.path().display()
+            ),
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -697,5 +987,421 @@ mod tests {
             "BW_SESSION must be set exactly once, to the token that was passed in -- a command \
              that accepted the token and never used it would otherwise pass"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The runner and the promotion.
+    // -----------------------------------------------------------------
+
+    /// A plan pointed inside `dir`, with a config directory that is nowhere
+    /// near it so the refusal cannot interfere.
+    fn plan_in(dir: &Path, name: &str) -> ExportPlan {
+        plan_export(
+            &ExportRequest {
+                destination: dir.join(name),
+            },
+            Path::new("C:\\a-config-directory-far-from-any-temp-dir"),
+        )
+        .expect("a file inside a temp dir plans")
+    }
+
+    /// A runner that writes `body` where the plan says the CLI would, then
+    /// observes it exactly as `run_cli` does. It starts no process.
+    fn writing_runner(body: &'static [u8], exit_ok: bool, stderr: &'static str) -> ExportRunner {
+        Arc::new(move |plan: &ExportPlan, _session: &str| {
+            std::fs::write(&plan.partial_path, body).expect("the fake runner stages its own file");
+            let (written, head) = observe_partial(plan);
+            RawExport {
+                exit_ok,
+                stderr: stderr.to_string(),
+                written,
+                head,
+            }
+        })
+    }
+
+    /// A runner that writes nothing at all, as a CLI that died before opening
+    /// its output file would leave things.
+    fn barren_runner(exit_ok: bool, stderr: &'static str) -> ExportRunner {
+        Arc::new(move |plan: &ExportPlan, _session: &str| {
+            let (written, head) = observe_partial(plan);
+            RawExport {
+                exit_ok,
+                stderr: stderr.to_string(),
+                written,
+                head,
+            }
+        })
+    }
+
+    fn envelope_body() -> &'static [u8] {
+        br#"{"encrypted":true,"encKeyValidation_DO_NOT_EDIT":"2.abcdef","items":[]}"#
+    }
+
+    #[test]
+    fn a_confirmed_export_is_promoted_to_the_name_the_user_picked() {
+        let temp = TempDir::new("promote");
+        let plan = plan_in(temp.path(), "vault.json");
+
+        let outcome = run_export(&plan, "session", &writing_runner(envelope_body(), true, ""));
+
+        assert_eq!(outcome, ExportOutcome::Written);
+        assert_eq!(
+            std::fs::read(&plan.final_path).expect("the archive is under the chosen name"),
+            envelope_body(),
+            "the promotion must move the staged bytes, not write something of its own"
+        );
+        assert!(
+            !plan.partial_path.exists(),
+            "the staging file must not survive a successful export"
+        );
+    }
+
+    #[test]
+    fn no_failure_leaves_a_partial_behind_and_none_of_them_touches_a_previous_backup() {
+        // THE test of this module. Each row is a way for an export to not be
+        // confirmed; in each, a previous good backup is already sitting under
+        // the name the user picked, and it must come out byte-identical.
+        const PREVIOUS: &[u8] = b"a previous, perfectly good encrypted backup";
+
+        let rows: Vec<(&str, ExportRunner, ExportOutcome)> = vec![
+            (
+                "the CLI failed and said why",
+                barren_runner(false, "EACCES: permission denied"),
+                ExportOutcome::Failed("EACCES: permission denied".to_string()),
+            ),
+            (
+                "the session went stale",
+                barren_runner(false, "Vault is locked."),
+                ExportOutcome::SessionInvalid,
+            ),
+            (
+                "exit 0 and an EMPTY file -- a truncated export must never take the name",
+                writing_runner(b"", true, ""),
+                ExportOutcome::Unconfirmed,
+            ),
+            (
+                "exit 0 and a PLAINTEXT document where an envelope was asked for",
+                writing_runner(br#"{"items":[{"login":{"password":"hunter2"}}]}"#, true, ""),
+                ExportOutcome::Unconfirmed,
+            ),
+            (
+                "exit 0 and NO file at all, so the size check itself fails",
+                barren_runner(true, ""),
+                ExportOutcome::Unconfirmed,
+            ),
+        ];
+
+        assert_eq!(rows.len(), 5, "the table lost rows");
+        let mut ran = 0usize;
+        for (why, runner, expected) in &rows {
+            let temp = TempDir::new("failpath");
+            let plan = plan_in(temp.path(), "vault.json");
+            std::fs::write(&plan.final_path, PREVIOUS).expect("the previous backup is placed");
+
+            assert_eq!(run_export(&plan, "session", runner), *expected, "row: {why}");
+
+            // Absence, asserted rather than assumed.
+            assert!(
+                !plan.partial_path.exists(),
+                "row: {why} -- the staging file was left in the user's chosen folder"
+            );
+            assert_eq!(
+                std::fs::read(&plan.final_path).expect("the previous backup is still there"),
+                PREVIOUS,
+                "row: {why} -- A FAILED EXPORT OVERWROTE THE USER'S PREVIOUS BACKUP"
+            );
+            ran += 1;
+        }
+        assert_eq!(ran, rows.len(), "control: every row ran");
+    }
+
+    #[test]
+    fn a_failure_with_no_previous_backup_leaves_the_chosen_name_unused() {
+        // The other half of the row above: when nothing was there before,
+        // nothing must be there after either -- not an empty file, not a
+        // truncated one. A caller that then reports "exported to vault.json"
+        // would otherwise be pointing at a file that does exist.
+        let temp = TempDir::new("nothingbefore");
+        let plan = plan_in(temp.path(), "vault.json");
+        assert!(!plan.final_path.exists(), "precondition");
+
+        let outcome = run_export(&plan, "session", &writing_runner(b"truncated", true, ""));
+
+        assert_eq!(outcome, ExportOutcome::Unconfirmed);
+        assert!(
+            !plan.final_path.exists(),
+            "the chosen name must not exist after an export that was never confirmed"
+        );
+        assert!(!plan.partial_path.exists());
+    }
+
+    #[test]
+    fn a_promotion_that_cannot_happen_is_a_failure_and_still_clears_the_staging_file() {
+        // A directory standing where the file belongs: the rename cannot
+        // succeed, and the interesting part is what is left behind.
+        let temp = TempDir::new("renamefail");
+        let plan = plan_in(temp.path(), "occupied.json");
+        std::fs::create_dir(&plan.final_path).expect("a directory takes the chosen name");
+
+        let outcome = run_export(&plan, "session", &writing_runner(envelope_body(), true, ""));
+
+        assert!(
+            matches!(outcome, ExportOutcome::Failed(_)),
+            "a promotion that did not happen must not be reported as Written: {outcome:?}"
+        );
+        assert!(
+            !plan.partial_path.exists(),
+            "the staging file must not be left beside the user's backups"
+        );
+        assert!(
+            plan.final_path.is_dir(),
+            "and whatever was already at the chosen name is untouched"
+        );
+    }
+
+    #[test]
+    fn the_observation_reads_the_staged_file_and_not_the_chosen_one() {
+        // The mutation this exists for reads the head and the size off
+        // `final_path`. With a previous backup sitting there, that version
+        // answers with a perfectly good envelope for an export that wrote
+        // nothing -- and `classify` would then confirm it.
+        let temp = TempDir::new("whichfile");
+        let plan = plan_in(temp.path(), "vault.json");
+        std::fs::write(&plan.final_path, envelope_body()).expect("the previous backup");
+        std::fs::write(&plan.partial_path, b"xy").expect("the staged file");
+
+        let (written, head) = observe_partial(&plan);
+        assert_eq!(written, Ok(2), "the size is the staged file's");
+        assert_eq!(head, b"xy".to_vec(), "the head is the staged file's");
+
+        // And with no staged file, the size check FAILS rather than reading
+        // the one that is there.
+        std::fs::remove_file(&plan.partial_path).expect("remove the staged file");
+        let (written, head) = observe_partial(&plan);
+        assert!(
+            written.is_err(),
+            "a missing staged file must be an unknown size, not the previous backup's size"
+        );
+        assert!(head.is_empty());
+    }
+
+    #[test]
+    fn a_head_longer_than_the_sample_is_truncated_and_a_short_one_is_not() {
+        let temp = TempDir::new("headlen");
+        let plan = plan_in(temp.path(), "vault.json");
+        let big = vec![b'z'; HEAD_BYTES * 3];
+        std::fs::write(&plan.partial_path, &big).expect("write");
+        let (written, head) = observe_partial(&plan);
+        assert_eq!(written, Ok(big.len() as u64));
+        assert_eq!(head.len(), HEAD_BYTES);
+
+        std::fs::write(&plan.partial_path, b"abc").expect("write");
+        let (_, head) = observe_partial(&plan);
+        assert_eq!(head, b"abc".to_vec(), "a short file is not padded out");
+    }
+
+    // -----------------------------------------------------------------
+    // The sweep.
+    // -----------------------------------------------------------------
+
+    fn backdate(path: &Path, by: Duration) {
+        let when = SystemTime::now() - by;
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_modified");
+        file.set_modified(when).expect("backdate the file");
+    }
+
+    #[test]
+    fn the_sweep_removes_old_partials_and_leaves_everything_else_alone() {
+        let temp = TempDir::new("sweep");
+        let dir = temp.path();
+
+        let stale = dir.join("vault.json.dw-partial");
+        let also_stale = dir.join("something-else.json.dw-partial");
+        let fresh = dir.join("in-progress.json.dw-partial");
+        let unrelated = dir.join("taxes.pdf");
+        let old_unrelated = dir.join("last-years-backup.json");
+        let bare = dir.join(".dw-partial");
+        let dir_partial = dir.join("a-folder.dw-partial");
+
+        for p in [&stale, &also_stale, &fresh, &unrelated, &old_unrelated, &bare] {
+            std::fs::write(p, b"contents").expect("write the fixture");
+        }
+        std::fs::create_dir(&dir_partial).expect("a directory wearing the suffix");
+        for p in [&stale, &also_stale, &unrelated, &old_unrelated, &bare] {
+            backdate(p, Duration::from_secs(60 * 60));
+        }
+
+        let removed = sweep_stale_partials(dir, SystemTime::now(), STALE_PARTIAL_AGE);
+
+        assert_eq!(removed, 2, "exactly the two aged partials");
+        assert!(!stale.exists());
+        assert!(!also_stale.exists());
+        // The four absences that matter, each asserted, because "it did not
+        // delete this" is invisible unless something says so.
+        assert!(fresh.exists(), "a partial younger than the threshold may be an export still \
+                                 running; deleting it would break a backup in progress");
+        assert!(unrelated.exists(), "the user's own files live in this folder");
+        assert!(old_unrelated.exists(), "age alone is not a reason; the suffix is");
+        assert!(bare.exists(), "this crate never creates a bare suffix, so it is not ours");
+        assert!(dir_partial.is_dir(), "a directory is never removed by a file sweep");
+    }
+
+    #[test]
+    fn a_future_dated_partial_is_left_alone() {
+        // A clock change or a file copied from another machine. Its age
+        // cannot be established, and an age that cannot be established is
+        // not an old age.
+        let temp = TempDir::new("future");
+        let ahead = temp.path().join("vault.json.dw-partial");
+        std::fs::write(&ahead, b"contents").expect("write");
+        backdate(&ahead, Duration::ZERO);
+        let long_ago = SystemTime::now() - Duration::from_secs(60 * 60 * 24);
+
+        assert_eq!(
+            sweep_stale_partials(temp.path(), long_ago, STALE_PARTIAL_AGE),
+            0
+        );
+        assert!(ahead.exists());
+    }
+
+    #[test]
+    fn the_sweep_answers_zero_for_a_directory_that_is_not_there() {
+        let temp = TempDir::new("nodir");
+        let missing = temp.path().join("no-such-folder");
+        assert_eq!(
+            sweep_stale_partials(&missing, SystemTime::now(), STALE_PARTIAL_AGE),
+            0,
+            "a destination that vanished is not worth failing an export over"
+        );
+    }
+
+    #[test]
+    fn run_export_really_sweeps_on_the_way_in() {
+        // An absence with a witness. Nothing in the outcome of an export says
+        // whether the sweep ran, so a leftover from an earlier crash is put
+        // in the folder first and its disappearance is the evidence.
+        let temp = TempDir::new("sweepwired");
+        let leftover = temp.path().join("an-earlier-crash.json.dw-partial");
+        std::fs::write(&leftover, b"leftover").expect("write");
+        backdate(&leftover, Duration::from_secs(60 * 60));
+
+        let plan = plan_in(temp.path(), "vault.json");
+        assert_eq!(
+            run_export(&plan, "session", &writing_runner(envelope_body(), true, "")),
+            ExportOutcome::Written
+        );
+
+        assert!(
+            !leftover.exists(),
+            "run_export never swept the destination directory"
+        );
+        assert!(plan.final_path.exists(), "control: the export itself still worked");
+    }
+
+    // -----------------------------------------------------------------
+    // Source pins.
+    //
+    // Everything below asserts about this module's own text rather than its
+    // behaviour, and each says why. The common reason: they are facts about
+    // a CHILD PROCESS, and no test in this crate may spawn one. A fake
+    // runner starts nothing, so job membership and the creation flags are
+    // not observable from any test that could run here. Rather than write a
+    // test that restates the source and calls itself behavioural, they are
+    // labelled pins.
+    // -----------------------------------------------------------------
+
+    /// This file's own text, **above the test module only**, so a needle
+    /// spelled out in a test below cannot satisfy the pin looking for it.
+    fn code_under_test() -> String {
+        // Normalised to LF once, so a needle written with `\n` matches this
+        // file whether it is stored CRLF or LF.
+        let whole = include_str!("vault_export.rs").replace("\r\n", "\n");
+        let code = whole.split("#[cfg(test)]").next().unwrap().to_string();
+        assert!(
+            code.len() < whole.len(),
+            "the test module marker was not found; the split did nothing"
+        );
+        code
+    }
+
+    #[test]
+    fn the_source_pin_search_can_tell_present_from_absent() {
+        // The positive control every pin below depends on. Without it, a
+        // `code_under_test` that answered an empty string would make each
+        // `!contains` pin pass while asserting nothing whatsoever.
+        let code = code_under_test();
+        assert!(code.contains("pub fn real_runner(job: Arc<Option<KillOnCloseJob>>)"));
+        assert!(!code.contains("no such line appears anywhere in this module"));
+        // And the split really did drop the tests: this function's own name
+        // is below the marker.
+        assert!(!code.contains("the_source_pin_search_can_tell_present_from_absent"));
+    }
+
+    #[test]
+    fn the_export_child_is_spawned_into_the_kill_on_close_job() {
+        // PIN. The child holds an unlocked vault. Job membership is what
+        // makes it die with this process however this process dies, and it
+        // is a property of a real process: a fake runner has none.
+        let code = code_under_test();
+        assert!(
+            code.contains("crate::job_object::spawn_in_job(job, command)"),
+            "the export child is no longer spawned into the job, so a crash or a Task Manager \
+             kill would leave a `bw` running with the session token in its environment"
+        );
+        assert!(
+            !code.contains(".spawn()"),
+            "a direct spawn bypasses the job entirely"
+        );
+    }
+
+    #[test]
+    fn the_job_spawn_still_re_applies_the_no_window_flag() {
+        // PIN, and it reads ANOTHER file: `creation_flags` REPLACES the flags
+        // a command holds rather than adding to them, so `spawn_in_job`
+        // setting CREATE_SUSPENDED would silently drop the CREATE_NO_WINDOW
+        // that `bw_command` set -- and every export would flash a console
+        // window. Nothing this module owns can hold that guarantee, and no
+        // test here may spawn the process that would show the symptom.
+        let job_source = include_str!("job_object.rs").replace("\r\n", "\n");
+        assert!(
+            job_source.contains("pub fn spawn_in_job("),
+            "control: the file being searched is the one that defines the spawn"
+        );
+        assert!(
+            job_source.contains("creation_flags(crate::bw_path::CREATE_NO_WINDOW"),
+            "spawn_in_job stopped re-applying CREATE_NO_WINDOW, so every export would flash a \
+             console window on screen"
+        );
+    }
+
+    #[test]
+    fn the_streams_are_captured_and_stdin_is_closed() {
+        // PIN. An inherited stream attaches the child to a console this app
+        // does not own; there is no way to observe a child's inherited
+        // handles from a test that never starts one.
+        let code = code_under_test();
+        for needle in [
+            ".stdin(Stdio::null())",
+            ".stdout(Stdio::piped())",
+            ".stderr(Stdio::piped())",
+        ] {
+            assert!(code.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn the_real_runner_points_the_cli_at_the_partial_through_export_command() {
+        // PIN on the wiring, not on the behaviour: `export_command` is
+        // already tested for real above (argv, program, BW_SESSION), and this
+        // is the line that says the runner uses it rather than assembling an
+        // invocation of its own. A runner that built its own would be caught
+        // by `bw_path`'s crate-wide spawn guard too -- this pin says which
+        // line it is.
+        let code = code_under_test();
+        assert!(code.contains("match export_command(plan, session)"));
     }
 }
