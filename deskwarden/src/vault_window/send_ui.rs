@@ -1089,29 +1089,6 @@ mod tests {
         assert_eq!(rows[1].access_url, "https://send.bitwarden.com/#/bbb");
     }
 
-    /// **The gap this step could not close, asserted rather than left
-    /// latent.** `list_invocation` carries no session token -- step 1 defined
-    /// `None` as "the runner uses the session it was configured with", and
-    /// step 2's `CliSendRunner` has no session to be configured with. So the
-    /// child inherits whatever `BW_SESSION` this process has, which is none,
-    /// and a real `bw send list` answers `Locked`.
-    ///
-    /// This test is the evidence for the report, and it will fail the moment
-    /// somebody fixes it -- which is the point: the fix is a change to
-    /// `send.rs`, which this task does not own.
-    #[test]
-    fn the_list_invocation_still_carries_no_session_token() {
-        let runner = FakeRunner::ok("[]");
-        let _ = list_sends(&runner);
-        assert_eq!(runner.seen.borrow().as_slice(), [vec!["send".to_string(), "list".to_string()]]);
-        assert_eq!(
-            runner.sessions.borrow().as_slice(),
-            [None],
-            "the list invocation now carries a session -- delete this test and the note in \
-             `spawn_send_list` with it"
-        );
-    }
-
     #[test]
     fn an_unreadable_list_is_a_failure_and_not_an_empty_account() {
         let runner = FakeRunner::ok("this is not json");
@@ -2932,8 +2909,9 @@ mod source_pins {
     #[test]
     fn spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner() {
         let expected = squashed(&format!(
-            "ctx_for_sends: egui::Context, tx: SendListSender, generation: u64, ) {{ {}(\
-             ctx_for_sends, tx, generation, {}); ",
+            "ctx_for_sends: egui::Context, tx: SendListSender, generation: u64, \
+             session: zeroize::Zeroizing<String>, ) {{ {}(ctx_for_sends, tx, generation, \
+             move || {}(&session)); ",
             concat!("spawn_send_list_", "with"),
             concat!("real_send_", "list")
         ));
@@ -2956,7 +2934,10 @@ mod source_pins {
     #[test]
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
         let body = body_of(concat!("real_send_", "list"), "    ");
-        let runner = concat!("crate::send::CliSendRunner::", "new(None, data_dir.as_deref())");
+        let runner = concat!(
+            "crate::send::CliSendRunner::",
+            "with_session(None, data_dir.as_deref(), session)"
+        );
         assert!(
             body.contains(runner),
             "the Sends fetch no longer runs through {runner:?}. Body was: {body}"
@@ -3044,7 +3025,7 @@ mod source_pins {
         // .. as` renames the spelling. So each file's own `use` items are
         // read first and every local name they bind to these two is counted
         // as well -- see `local_names_of`.
-        for item in [concat!("list_", "sends"), concat!("CliSendRunner::", "new")] {
+        for item in [concat!("list_", "sends"), concat!("CliSendRunner::", "with_session")] {
             let sites: Vec<&str> = files
                 .iter()
                 .filter(|(path, _)| path != "send.rs")
@@ -3234,14 +3215,16 @@ mod source_pins {
         // where rustfmt chose to break its arguments.
         let spawn = squashed(concat!(
             "(spawn_send_",
-            "list)( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), );"
+            "list)( ui.ctx().clone(), send_tx.clone(), send_fetch.generation(), ",
+            "zeroize::Zeroizing::new(session_token.clone()), );"
         ));
         assert_eq!(
             squashed(&production).matches(&spawn).count(),
             1,
             "{spawn:?} is not in production exactly once -- the Sends fetch is started from \
-             nowhere, from more than one place, or without the generation that lets a stale \
-             answer be told from a current one"
+             nowhere, from more than one place, without the generation that lets a stale \
+             answer be told from a current one, or without the window's own session, in \
+             which case a real `bw send list` answers `locked`"
         );
         // The binding the call reads, exactly once. Without this the call
         // above could be reading a local shadowing `env.send_list` with
@@ -3308,7 +3291,7 @@ mod source_pins {
             concat!("list_", "sends"),
             concat!("real_send_", "list"),
             concat!("spawn_send_list_", "with"),
-            concat!("CliSendRunner", "::new"),
+            concat!("CliSendRunner", "::with_session"),
         ] {
             let total = production.matches(needle).count();
             let inside = block.matches(needle).count();
@@ -4387,7 +4370,7 @@ mod frame_promptness {
     use crate::vault_bridge::VaultItem;
     use crate::vault_cache::{VaultCache, VaultSnapshot};
     use eframe::egui;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::sync::mpsc;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4474,6 +4457,16 @@ mod frame_promptness {
     /// painted by `draw_send_pane`'s `Ok` arm.
     const SEND_NAME: &str = "Harness Send";
 
+    /// The vault session this harness's window is opened with -- the one
+    /// value `build_frame` is handed for it, so a scenario cannot be
+    /// measuring one token while asserting about another.
+    ///
+    /// Long enough to be an unmistakable substring, and distinct from every
+    /// other fixture string here, so
+    /// [`the_windows_own_session_is_what_reaches_the_bw_child`] cannot be
+    /// satisfied by some other value that happens to travel the same path.
+    const HARNESS_SESSION: &str = "harness-session-token";
+
     // Counted per THREAD, not per process. Each scenario runs on its own
     // freshly spawned worker and every stub below is called synchronously on
     // that worker (the "spawns" are stubs; they spawn nothing), so a
@@ -4485,6 +4478,9 @@ mod frame_promptness {
         static SYNC_SPAWNS: Cell<usize> = const { Cell::new(0) };
         static LOAD_SPAWNS: Cell<usize> = const { Cell::new(0) };
         static SEND_LIST_SPAWNS: Cell<usize> = const { Cell::new(0) };
+        /// The session each Sends spawn ARRIVED with, in order. Same scope
+        /// and same reasoning as the counters above.
+        static SEND_LIST_SESSIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     }
 
     fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -4511,8 +4507,17 @@ mod frame_promptness {
     ///
     /// Synchronous, not spawned, so the answer is on the channel before the
     /// next frame drains it and the frame count is fixed rather than a race.
-    fn counted_send_list(_ctx: egui::Context, tx: SendListSender, generation: u64) {
+    fn counted_send_list(
+        _ctx: egui::Context,
+        tx: SendListSender,
+        generation: u64,
+        session: zeroize::Zeroizing<String>,
+    ) {
         bump(&SEND_LIST_SPAWNS);
+        // Recorded, not asserted here: this stub runs inside the frame, and
+        // a panic in there is an eframe panic rather than a test failure with
+        // a message. See `the_windows_own_session_is_what_reaches_the_bw_child`.
+        SEND_LIST_SESSIONS.with(|s| s.borrow_mut().push(session.to_string()));
         let _ = tx.send((
             generation,
             Ok(vec![crate::send::SendSummary {
@@ -4698,6 +4703,8 @@ mod frame_promptness {
         sync_spawns: usize,
         load_spawns: usize,
         send_list_spawns: usize,
+        /// The session each Sends spawn was handed, in order.
+        send_list_sessions: Vec<String>,
     }
 
     impl Outcome {
@@ -4866,7 +4873,7 @@ mod frame_promptness {
                 // `None`, so no favicon is fetched for any host.
                 server_url: None,
             }),
-            "harness-session-token".to_string(),
+            HARNESS_SESSION.to_string(),
             scratch.join("icons"),
             // `Never`, so the auto-lock countdown cannot end the session
             // underneath the measurement.
@@ -5043,6 +5050,7 @@ mod frame_promptness {
             sync_spawns: read(&SYNC_SPAWNS),
             load_spawns: read(&LOAD_SPAWNS),
             send_list_spawns: read(&SEND_LIST_SPAWNS),
+            send_list_sessions: SEND_LIST_SESSIONS.with(|s| s.borrow().clone()),
         };
         drop(frame_fn);
         drop(handles);
@@ -5372,6 +5380,143 @@ mod frame_promptness {
              {:?}",
             outcome.painted
         );
+    }
+
+    /// **The window's own session is what a real `bw send list` runs with.**
+    ///
+    /// This replaces `tests::the_list_invocation_still_carries_no_session_token`,
+    /// which asserted the opposite -- that the list invocation carried no
+    /// session at all -- and which is deleted this commit. That test drove a
+    /// FAKE runner the test itself constructed, so under the design this
+    /// commit lands its assertion can never fire again whatever production
+    /// does: it documented a gap that no longer exists.
+    ///
+    /// The chain has two links and both are measured here.
+    ///
+    ///  1. **Window -> spawn.** A real frame is driven to the Sends screen
+    ///     the only way there is (the sidebar row), and the stub records the
+    ///     token that ARRIVED at the `send_list` pointer. Not the token this
+    ///     harness passed in -- the one the frame closure chose to hand over
+    ///     -- so a session dropped, defaulted, or read from anywhere but
+    ///     `build_frame`'s own `session_token` fails right here.
+    ///  2. **Spawn -> child.** That very value, and not a constant written
+    ///     out a second time, is then given to the runner `real_send_list`
+    ///     builds and driven through the real `list_sends` and the real
+    ///     `spawn_in_job` with the spawn probe armed. What is read back is
+    ///     the environment overlay that reached the spawn, and every element
+    ///     of argv: a process's argument vector is readable by every other
+    ///     process on the machine, so the token that unlocks the whole vault
+    ///     must appear in none of it.
+    ///
+    /// **No child is started.** The probe refuses the spawn and `list_sends`
+    /// maps the refusal through the ordinary failure path, which is the same
+    /// path a real spawn error takes.
+    ///
+    /// What this does NOT assert, said plainly: that `real_send_list` is the
+    /// function on the far side of the pointer in a shipping build, and that
+    /// it hands its `session` parameter to the runner rather than dropping
+    /// it. The seam substitutes the pointer, so no test that drives the frame
+    /// can see that. It is held from the source by
+    /// [`source_pins::the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]
+    /// and by `production_is_the_only_env_a_shipping_build_has`.
+    #[test]
+    fn the_windows_own_session_is_what_reaches_the_bw_child() {
+        let outcome = measured("session", Scenario { press_sends: true, ..Scenario::new() });
+        assert!(
+            outcome.send_list_spawns >= 1,
+            "control: the Sends row was pressed and no Sends fetch was started at all, so \
+             there is no session to be right or wrong about. What was painted: {:?}",
+            outcome.painted
+        );
+        assert!(
+            HARNESS_SESSION.len() > 8,
+            "control: the token this test compares against is too short to be an \
+             unmistakable match, so the assertions below could be satisfied by an accident"
+        );
+        assert_eq!(
+            outcome.send_list_sessions,
+            vec![HARNESS_SESSION.to_string(); outcome.send_list_spawns],
+            "the Sends fetch was not handed the session this window was opened with. A real \
+             `bw send list` started without it inherits no BW_SESSION and answers `locked` -- \
+             which is exactly what this screen used to show against a real vault"
+        );
+
+        // Link 2. From here on the value under test is the one that came back
+        // out of the frame, so nothing below can pass on a token the window
+        // did not actually hand over.
+        let arrived = outcome.send_list_sessions.into_iter().next().expect("counted above");
+
+        // The verified CLI path `bw_job_command_in` refuses without. A path
+        // that does not exist and never will: nothing is executed, because
+        // the probe below refuses every spawn before `CreateProcess`.
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-testirstw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let refused = crate::send::list_sends(&crate::send::CliSendRunner::with_session(
+            None,
+            None,
+            &arrived,
+        ));
+        // Plain strings, deliberately: the recorded type belongs to
+        // `job_object`, and what this test is about is what the CHILD would
+        // have been given, not the recorder's shape.
+        let attempts: Vec<(Vec<String>, Vec<(String, Option<String>)>)> = probe
+            .attempts()
+            .into_iter()
+            .map(|a| {
+                (
+                    a.args.iter().map(|s| s.to_string_lossy().into_owned()).collect(),
+                    a.envs
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.as_ref().map(|v| v.to_string_lossy().into_owned()),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        drop(probe);
+
+        assert!(
+            refused.is_err(),
+            "the probe refused the only spawn this read may make, yet it answered {refused:?} \
+             -- so a child was started by a route the probe cannot see"
+        );
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the read path did not reach the one spawn exactly once, so any assertion about \
+             what it carried is about nothing: {attempts:?}"
+        );
+        let (args, envs) = attempts.into_iter().next().expect("just counted one");
+
+        assert_eq!(
+            envs.iter()
+                .filter(|(k, _)| k == "BW_SESSION")
+                .map(|(_, v)| v.clone())
+                .collect::<Vec<_>>(),
+            vec![Some(HARNESS_SESSION.to_string())],
+            "`BW_SESSION` did not arrive at the child set exactly once to the session the \
+             window holds, so a real `bw send list` answers `locked`. The overlay that \
+             arrived was {envs:?}"
+        );
+        assert_eq!(
+            args,
+            vec!["send".to_string(), "list".to_string()],
+            "control: the recorded spawn does not carry this list's arguments, so the argv \
+             check below is about some other command"
+        );
+        for arg in &args {
+            assert!(
+                !arg.contains(HARNESS_SESSION),
+                "the session token is in argv, where every other process on the machine can \
+                 read it: {arg}"
+            );
+        }
     }
 
     /// **The "your vault could not be loaded" page returns promptly.**

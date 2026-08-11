@@ -1824,6 +1824,10 @@ pub fn build_frame(
                 ui.ctx().clone(),
                 send_tx.clone(),
                 send_fetch.generation(),
+                // The window's own session, cloned per fetch into a
+                // `Zeroizing` that the fetching thread drops -- so the token
+                // never outlives the one `bw send list` it authenticates.
+                zeroize::Zeroizing::new(session_token.clone()),
             );
         }
         egui::Panel::left("vault-sidebar")
@@ -3431,7 +3435,7 @@ pub struct VaultFrameEnv {
     /// at all -- so the whole arm, ~70% of the closure's Sends half, was
     /// covered by source scanning alone. See
     /// `send_ui::frame_promptness::the_sends_screen_returns_promptly`.
-    send_list: fn(egui::Context, SendListSender, u64),
+    send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
     /// `settings::default_path()` in production. A test hands a path under
     /// its own temporary directory, so no frame reads or writes the real
     /// `%APPDATA%\Deskwarden`.
@@ -4444,17 +4448,18 @@ mod send_fetch_thread {
     //! landed list sits in the channel until some unrelated input provokes
     //! one and the screen shows a spinner over a list it already has.
     //!
-    //! **Known gap, and it is the reason this screen cannot yet work against
-    //! a real vault:** `list_sends` builds an invocation whose session token
-    //! is `None`, which step 1 defined as "the runner uses the session it was
-    //! configured with" -- and step 2's `CliSendRunner` has no session to be
-    //! configured with. So the child inherits no `BW_SESSION` and a real
-    //! `bw send list` answers "locked". Closing it is a change to `send.rs`,
-    //! which is not this step's file; the shape of the gap is asserted by
-    //! `send_ui::tests::the_list_invocation_still_carries_no_session_token`,
-    //! and when it is closed the session this window already holds is what to
-    //! pass. The failure is at least loud: it renders as a `Locked` failure
-    //! in the notice band, never as an empty list.
+    //! **The session, and why it is a parameter rather than something this
+    //! module reads for itself.** `bw send list` is an authenticated command:
+    //! a child that inherits no `BW_SESSION` answers "locked", which is
+    //! exactly what this screen used to show against a real vault. There is
+    //! no process-global session in this crate to read -- `bw_path`'s
+    //! `ACTIVE_DATA_DIR` has no counterpart for the token, deliberately -- so
+    //! the window's own session is threaded down from the frame closure,
+    //! through the `VaultFrameEnv` pointer, to `CliSendRunner::with_session`.
+    //! It travels as a `Zeroizing<String>` the whole way and is dropped with
+    //! the fetching thread; it reaches the child in the environment and never
+    //! in argv. What holds that end to end is
+    //! `send_ui::frame_promptness::the_windows_own_session_is_what_reaches_the_bw_child`.
 
     use super::SendListSender;
     use eframe::egui;
@@ -4467,7 +4472,9 @@ mod send_fetch_thread {
     /// so that `send_ui::fetch_thread_tests` can hand it a different one and
     /// watch where it runs. Privacy is what stops that same value being
     /// obtained by anyone who would then call it in place.
-    fn real_send_list() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+    fn real_send_list(
+        session: &str,
+    ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
         // Read on the fetching thread, not captured from the frame: `bw_path`
         // keeps the active account's profile directory as process state
         // precisely so that every spawn in this crate reaches the same
@@ -4477,9 +4484,12 @@ mod send_fetch_thread {
         // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
         // owns the one `bw serve` is in), so the child is unprotected against
         // an abrupt death of this process. `bw send list` is a read that
-        // finishes in seconds and holds no session in its environment -- see
-        // the gap above -- so it is not the orphan hazard the job exists for.
-        let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
+        // finishes in seconds, so it is a far smaller orphan hazard than the
+        // long-lived `bw serve` the job exists for -- but it DOES now carry
+        // the session, so when this window is given a job the runner must be
+        // handed it here and the property re-proven at this call.
+        let runner =
+            crate::send::CliSendRunner::with_session(None, data_dir.as_deref(), session);
         crate::send::list_sends(&runner)
     }
 
@@ -4492,8 +4502,9 @@ mod send_fetch_thread {
         ctx_for_sends: egui::Context,
         tx: SendListSender,
         generation: u64,
+        session: zeroize::Zeroizing<String>,
     ) {
-        spawn_send_list_with(ctx_for_sends, tx, generation, real_send_list);
+        spawn_send_list_with(ctx_for_sends, tx, generation, move || real_send_list(&session));
     }
 
     /// The off-thread half, **generic over the fetch so that it can be
@@ -15219,7 +15230,7 @@ mod frame_env_seam {
             mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
             VaultLoadRequest,
         ),
-        send_list: fn(egui::Context, SendListSender, u64),
+        send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
         settings_path: Option<std::path::PathBuf>,
     ) -> VaultFrameEnv {
         VaultFrameEnv { sync, load, send_list, settings_path }
