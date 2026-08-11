@@ -856,7 +856,7 @@ pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError>
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// The environment variable the CLI reads its session from.
@@ -1041,9 +1041,12 @@ impl<'a> CliSendRunner<'a> {
     /// signature `check_bw_signature` verified at startup, and it refuses
     /// outright when no verified path was recorded. Building one here by hand
     /// would run whatever binary the ambient search order found first.
-    fn build_command(&self, inv: &SendInvocation) -> Result<Command, SendError> {
-        let mut command =
-            crate::bw_path::bw_command_in(self.data_dir).map_err(SendError::NoVerifiedCli)?;
+    fn build_command(
+        &self,
+        inv: &SendInvocation,
+    ) -> Result<crate::job_object::JobCommand, SendError> {
+        let mut command = crate::bw_path::bw_job_command_in(self.data_dir)
+            .map_err(SendError::NoVerifiedCli)?;
         command.args(inv.args());
         if let Some(token) = inv.session_token() {
             command.env(SESSION_ENV, token);
@@ -1190,7 +1193,7 @@ mod runner_tests {
         plan_to_invocation(&a_plan(), SESSION, &NOW).expect("the plan is valid")
     }
 
-    fn args_of(command: &Command) -> Vec<String> {
+    fn args_of(command: &crate::job_object::JobCommand) -> Vec<String> {
         command
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1429,6 +1432,41 @@ mod runner_tests {
             "the production Send path did not reach `spawn_in_job` exactly once, so the \
              assertion made on what it carried is about nothing: {attempts:?}"
         );
+        // THE RECORDED SPAWN IS THE SEND, and not merely *a* spawn that
+        // happened, and the Send's answer CAME FROM IT. Round six of this
+        // finding (in `vault_export`) satisfied a probe assertion exactly like
+        // the one below with a one-line decoy while the real child spawned by
+        // another route; the decoy is now unwritable here, and these checks are
+        // what would say so if it ever became writable again -- including via
+        // a helper in some file `job_object`'s tree walk excuses, because a
+        // child started anywhere else would answer instead of this refusal.
+        match &outcome {
+            Err(SendError::SpawnFailed(why)) => assert!(
+                why.contains(crate::job_object::spawn_probe::REFUSED),
+                "the Send failed for some other reason, so its result did not come from the \
+                 call the probe recorded: {why}"
+            ),
+            other => panic!(
+                "the probe refused the only spawn this Send may make, yet it reported \
+                 {other:?}, so a child was started by a route the probe cannot see"
+            ),
+        }
+        let program = attempts[0].program.to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the Send: {program}"
+        );
+        let args: Vec<String> = attempts[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            list_invocation().args(),
+            "the recorded spawn does not carry this Send's arguments, so it is not the Send"
+        );
+
         attempts.iter().map(|a| a.job).collect()
     }
 
@@ -1730,7 +1768,7 @@ mod runner_tests {
         let source = code_under_test();
         for (required, why) in [
             (
-                concat!("bw_path::bw_command_in(", "self.data_dir)"),
+                concat!("bw_path::bw_job_command_in(", "self.data_dir)"),
                 "the command is no longer built by the one module that names the executable \
                  whose signature startup verified",
             ),

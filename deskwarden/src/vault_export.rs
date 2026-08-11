@@ -64,12 +64,12 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crate::bw_path::bw_command;
-use crate::job_object::KillOnCloseJob;
+use crate::bw_path::bw_job_command;
+use crate::job_object::{JobCommand, KillOnCloseJob};
 
 /// The one export format this crate offers. See the module docs.
 pub const EXPORT_FORMAT: &str = "encrypted_json";
@@ -336,8 +336,8 @@ fn looks_like_an_encrypted_envelope(head: &[u8]) -> bool {
 /// `bw_serve::run_bw_sync` makes, and for the same reason the module docs
 /// give for the export password: on Windows a sibling process can read this
 /// process's command line, and it cannot read this process's environment.
-pub fn export_command(plan: &ExportPlan, session_token: &str) -> Result<Command, String> {
-    let mut cmd = bw_command()?;
+pub fn export_command(plan: &ExportPlan, session_token: &str) -> Result<JobCommand, String> {
+    let mut cmd = bw_job_command()?;
     cmd.args(export_args(plan));
     cmd.env("BW_SESSION", session_token);
     Ok(cmd)
@@ -1761,7 +1761,7 @@ mod tests {
         let plan = plan_in(temp.path(), "vault.json");
 
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
-        let _ = run_export(&plan, "session", &real_runner(job));
+        let outcome = run_export(&plan, "session", &real_runner(job));
         let attempts = probe.attempts();
         drop(probe);
 
@@ -1771,6 +1771,47 @@ mod tests {
             "the production export path did not reach `spawn_in_job` exactly once, so the \
              assertion made on what it carried is about nothing: {attempts:?}"
         );
+        // THE RECORDED SPAWN IS THE EXPORT, and not merely *a* spawn that
+        // happened. Round six satisfied the assertion above with a one-line
+        // decoy -- `spawn_in_job(self.job(), Command::new("x"))` -- while the
+        // real export child spawned by another route entirely. That is now
+        // unwritable, because this module can neither name a bare command type
+        // nor get one out of the wrapper it can name. These two checks are
+        // what would say so if it ever became writable again.
+        let program = attempts[0].program.to_string_lossy().to_lowercase();
+        assert!(
+            program.ends_with("bw.exe"),
+            "the recorded spawn is not the CLI, so it is not the export: {program}"
+        );
+        let args: Vec<String> = attempts[0]
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            export_args(&plan),
+            "the recorded spawn does not carry this export's arguments, so it is not the export"
+        );
+
+        // AND THE EXPORT'S ANSWER CAME FROM THAT SPAWN. The probe refuses, so
+        // a `run_export` that reports anything but this refusal must have
+        // started its child by a route the probe never saw -- which is exactly
+        // what a decoy is, whether it is written in this file or behind a
+        // helper in some file the tree walk excuses. This is what makes the
+        // recorded call load-bearing rather than merely present.
+        match &outcome {
+            ExportOutcome::Failed(why) => assert!(
+                why.contains(crate::job_object::spawn_probe::REFUSED),
+                "the export failed for some other reason, so its result did not come from the \
+                 call the probe recorded: {why}"
+            ),
+            other => panic!(
+                "the probe refused the only spawn this export may make, yet the export reported \
+                 {other:?}, so a child was started by a route the probe cannot see"
+            ),
+        }
+
         attempts.iter().map(|a| a.job).collect()
     }
 

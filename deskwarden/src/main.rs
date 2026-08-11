@@ -7089,7 +7089,11 @@ fn try_start_backend(
             bw_serve::BW_SERVE_PORT
         );
     }
-    job_object::spawn_in_job(job, command).map_err(BackendStartError::Spawn)
+    // Wrapped here rather than in `bw_serve_command`, which is also used by
+    // `spawn_bw_serve` for callers that hold no job at all. `main.rs` is one
+    // of the files `job_object`'s tree walk already excuses.
+    job_object::spawn_in_job(job, job_object::JobCommand::wrap(command))
+        .map_err(BackendStartError::Spawn)
 }
 
 /// Startup variant of [`try_start_backend`]: there is nothing to fall back to

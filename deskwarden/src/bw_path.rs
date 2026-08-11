@@ -152,6 +152,31 @@ pub fn bw_command() -> Result<Command, String> {
     bw_command_in(active_data_dir().as_deref())
 }
 
+/// The same verified command, wrapped so that **the only way to start it is
+/// [`crate::job_object::spawn_in_job`]**.
+///
+/// The two modules that spawn a `bw` holding an unlocked vault --
+/// [`crate::vault_export`] and [`crate::send`] -- build their child through
+/// here and never through [`bw_command_in`], and neither of them may name a
+/// bare `std::process` command type at all (see
+/// `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`).
+/// So in those modules "the command that runs the verified CLI" and "the
+/// command that cannot escape the kill-on-close job" are the same value, and
+/// there is no second one for them to spawn instead.
+///
+/// This is the one production place a [`crate::job_object::JobCommand`] is
+/// made. Deliberately a thin wrapper over [`bw_command_in`] rather than a
+/// second resolution of `bw.exe`: the signature-verified path is still
+/// answered in exactly one place.
+pub fn bw_job_command_in(dir: Option<&Path>) -> Result<crate::job_object::JobCommand, String> {
+    bw_command_in(dir).map(crate::job_object::JobCommand::wrap)
+}
+
+/// [`bw_job_command_in`] pointed at the active account's profile directory.
+pub fn bw_job_command() -> Result<crate::job_object::JobCommand, String> {
+    bw_job_command_in(active_data_dir().as_deref())
+}
+
 /// Resolves `bw.exe`, preferring the location deskwarden's own installer
 /// places it (`<install dir>\bin\bw.exe`, added to the user `PATH` by
 /// `installer/bootstrap-bw.ps1`), falling back to a manual `PATH` search that

@@ -86,6 +86,118 @@ impl KillOnCloseJob {
     }
 }
 
+/// A `std::process::Command` that **cannot be spawned by anything except
+/// [`spawn_in_job`]**.
+///
+/// This is the seventh round of one finding, and the first one whose fix is a
+/// type rather than a text search. The sixth round was lost like this, in
+/// `CliExportRunner::run`:
+///
+/// ```text
+/// let _ = spawn_in_job(self.job(), Command::new("x"));   // decoy
+/// let child = Command::spawn(&mut command)?;             // the real export
+/// ```
+///
+/// Both halves of the previous seam shrugged. The probe below saw exactly one
+/// arrival carrying exactly the right job, because it records *an* arrival and
+/// not *the* spawn. The tree walk matched the three literals `.spawn()`,
+/// `.output()` and `.status()` and `Command::spawn(&mut command)` is none of
+/// them. Everything stayed green while every export child spawned outside the
+/// kill-on-close job.
+///
+/// The answer is that the two halves stop being separate questions. The inner
+/// `Command` is **private to this module**: there is no accessor, no
+/// `into_inner`, no `Deref`, no `AsMut`, and the only code that can take it
+/// out is [`spawn_in_job`], four lines below. So the decoy is not merely
+/// caught, it is unwritable: a runner that wants to spawn its command at all
+/// has exactly one call available, and if it also offers a decoy the probe
+/// sees two arrivals instead of one.
+///
+/// Construction is `pub(crate)` and made in exactly one production place,
+/// [`crate::bw_path::bw_job_command_in`], which is also the one place that
+/// names the `bw.exe` whose signature startup verified. So "the command that
+/// runs the verified CLI" and "the command that can only be spawned into a
+/// job" are the same value, and neither can be obtained without the other.
+///
+/// The forwarding methods are everything a caller legitimately needs to
+/// *describe* a child (arguments, environment, stream wiring) and nothing that
+/// starts one. The `get_*` readers exist so tests can assert what would be run
+/// without running it -- reading the description, never consuming it.
+pub struct JobCommand {
+    /// Private to this module. **This is the whole design**; see the type's
+    /// note. Adding any accessor that hands this out re-opens the sixth hop.
+    command: Command,
+}
+
+impl JobCommand {
+    /// Wraps a command so that it can only be started through
+    /// [`spawn_in_job`].
+    ///
+    /// `pub` only because `main.rs` is a separate crate from this library and
+    /// wraps the `bw serve` command there; the intended production caller for
+    /// everything else is [`crate::bw_path::bw_job_command_in`].
+    ///
+    /// **Being public costs nothing here.** Wrapping requires already holding
+    /// a `std::process::Command`, and the two job-bearing modules may not name
+    /// that type at all -- see
+    /// [`tests::the_two_job_bearing_modules_cannot_name_a_bare_command`],
+    /// which also forbids them to name this function. Without both, a runner
+    /// could wrap a decoy of its own and hand that to the probe while spawning
+    /// the real child by some other route, which is exactly how round six was
+    /// lost.
+    pub fn wrap(command: Command) -> Self {
+        Self { command }
+    }
+
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    pub fn env<K, V>(&mut self, key: K, val: V) -> &mut Self
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        self.command.env(key, val);
+        self
+    }
+
+    pub fn stdin<T: Into<std::process::Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stdin(cfg);
+        self
+    }
+
+    pub fn stdout<T: Into<std::process::Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stdout(cfg);
+        self
+    }
+
+    pub fn stderr<T: Into<std::process::Stdio>>(&mut self, cfg: T) -> &mut Self {
+        self.command.stderr(cfg);
+        self
+    }
+
+    /// Reads the program that would be run. A reader, not a way out: it
+    /// borrows an `OsStr`, from which no child process can be started without
+    /// naming a command type the two job-bearing modules may not name.
+    pub fn get_program(&self) -> &std::ffi::OsStr {
+        self.command.get_program()
+    }
+
+    pub fn get_args(&self) -> std::process::CommandArgs<'_> {
+        self.command.get_args()
+    }
+
+    pub fn get_envs(&self) -> std::process::CommandEnvs<'_> {
+        self.command.get_envs()
+    }
+}
+
 /// Spawns `command` so that it is a member of `job` **before it executes a
 /// single instruction**.
 ///
@@ -136,7 +248,11 @@ impl KillOnCloseJob {
 /// asserts it dies when the job handle closes. Between the two, every step
 /// from a runner's constructor to the kernel is observed by something that is
 /// not a text search.
-pub fn spawn_in_job(job: Option<&KillOnCloseJob>, mut command: Command) -> io::Result<Child> {
+pub fn spawn_in_job(job: Option<&KillOnCloseJob>, command: JobCommand) -> io::Result<Child> {
+    // The one place a `JobCommand` is opened. Everything above this line can
+    // describe a child; only this function can start one.
+    let JobCommand { mut command } = command;
+
     // Deliberately above the jobless early return, so a spawn that carries no
     // job is recorded as such rather than slipping past unseen.
     #[cfg(test)]
@@ -384,6 +500,11 @@ mod tests {
         cmd
     }
 
+    /// The same child, wrapped so it can be handed to `spawn_in_job`.
+    fn long_lived_job_command() -> JobCommand {
+        JobCommand::wrap(long_lived_command())
+    }
+
     fn kill_and_reap(child: &mut Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -408,7 +529,7 @@ mod tests {
     #[test]
     fn spawn_in_job_returns_a_running_child() {
         let job = KillOnCloseJob::new().unwrap();
-        let mut child = spawn_in_job(Some(&job), long_lived_command())
+        let mut child = spawn_in_job(Some(&job), long_lived_job_command())
             .expect("spawn_in_job must succeed for a valid command");
 
         // The point of `CREATE_SUSPENDED` is that it is invisible to the
@@ -420,7 +541,7 @@ mod tests {
 
     #[test]
     fn spawn_in_job_works_without_a_job_object() {
-        let mut child = spawn_in_job(None, long_lived_command())
+        let mut child = spawn_in_job(None, long_lived_job_command())
             .expect("spawn_in_job must degrade to a plain spawn with no job");
         let still_running = child.try_wait().unwrap().is_none();
         kill_and_reap(&mut child);
@@ -437,9 +558,9 @@ mod tests {
         let other = KillOnCloseJob::new().unwrap();
 
         let probe = spawn_probe::SpawnProbe::arm();
-        let refused = spawn_in_job(Some(&job), long_lived_command());
-        let _ = spawn_in_job(Some(&other), long_lived_command());
-        let _ = spawn_in_job(None, long_lived_command());
+        let refused = spawn_in_job(Some(&job), long_lived_job_command());
+        let _ = spawn_in_job(Some(&other), long_lived_job_command());
+        let _ = spawn_in_job(None, long_lived_job_command());
         let seen = probe.attempts();
         drop(probe);
 
@@ -472,7 +593,7 @@ mod tests {
         // The other half of the control above, and the reason the three tests
         // in this module that really spawn are still real tests: with no probe
         // armed on this thread, `spawn_in_job` performs the spawn.
-        let mut child = spawn_in_job(None, long_lived_command())
+        let mut child = spawn_in_job(None, long_lived_job_command())
             .expect("with no probe armed the spawn must really happen");
         let running = child.try_wait().unwrap().is_none();
         kill_and_reap(&mut child);
@@ -636,6 +757,324 @@ mod tests {
         .is_empty());
     }
 
+    /// A file's Rust source with comments and string literals removed, and
+    /// then all whitespace removed.
+    ///
+    /// **Both halves matter, and each answers a measured defeat.** Dropping
+    /// comments and strings is what lets the rules below talk about the
+    /// identifier `Command` at all: these two modules are full of prose about
+    /// commands and spawning, and a matcher that saw prose could only be a
+    /// matcher for phrases. Dropping whitespace is what makes the rules immune
+    /// to spelling: `Command :: new`, a receiver split across two lines and
+    /// `Command::new` are one string here, and round six was lost precisely
+    /// because `.spawn()` and `Command::spawn(&mut command)` are different
+    /// strings.
+    ///
+    /// Raw strings and char literals are handled explicitly because both occur
+    /// in the scanned files (`r"C:\..."` paths; `'\\'`), and a lifetime `'a`
+    /// is not mistaken for a char literal -- `CliSendRunner<'a>` would
+    /// otherwise swallow the rest of the file and make every rule vacuous.
+    /// [`the_code_only_view_really_drops_comments_and_strings`] is the control.
+    fn code_only(text: &str) -> String {
+        let b: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            let next = b.get(i + 1).copied();
+            if c == '/' && next == Some('/') {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 1;
+                i += 2;
+                while i < b.len() && depth > 0 {
+                    if b[i] == '/' && b.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == '*' && b.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if c == 'r' && (next == Some('"') || next == Some('#')) {
+                // `r"..."` / `r#"..."#`, with the hash count preserved.
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while b.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if b.get(j) != Some(&'"') {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+                let close: String =
+                    std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                let rest: String = b[j..].iter().collect();
+                i = match rest.find(&close) {
+                    Some(k) => j + rest[..k].chars().count() + close.chars().count(),
+                    None => b.len(),
+                };
+            } else if c == '"' {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == '\\' {
+                        i += 2;
+                    } else if b[i] == '"' {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if c == '\'' {
+                // A char literal only if it closes within the next few
+                // characters; otherwise it is a lifetime and is kept.
+                let mut j = i + 1;
+                if b.get(j) == Some(&'\\') {
+                    j += 1;
+                }
+                if b.get(j).is_some() && b.get(j + 1) == Some(&'\'') {
+                    i = j + 2;
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    #[test]
+    fn the_code_only_view_really_drops_comments_and_strings() {
+        // Every rule in the next test is worth exactly what this is worth.
+        assert_eq!(code_only("let a = 1; // Command::new\n"), "leta=1;");
+        assert_eq!(code_only("/* Command::spawn() */ let b = 2;"), "letb=2;");
+        assert_eq!(code_only("panic!(\"Command::spawn()\");"), "panic!();");
+        assert_eq!(code_only("let p = r\"C:\\x\\Command\"; let q = 3;"), "letp=;letq=3;");
+        assert_eq!(code_only("let s = r#\"a\"Command\"#; let t = 4;"), "lets=;lett=4;");
+        assert_eq!(code_only("let c = '\\\\'; let d = '\"';"), "letc=;letd=;");
+        // A lifetime is not a char literal: the rest of the line survives.
+        assert_eq!(code_only("struct S<'a> { c: &'a Command }"), "structS<'a>{c:&'aCommand}");
+        // And code really is kept, in every spelling of it.
+        assert_eq!(code_only("Command :: spawn ( & mut c )"), "Command::spawn(&mutc)");
+        assert_eq!(code_only("Command\n    ::spawn(&mut c)"), "Command::spawn(&mutc)");
+    }
+
+    #[test]
+    fn the_two_job_bearing_modules_cannot_name_a_bare_command() {
+        // THE FIX FOR ROUND SIX, in text; the type is the other half.
+        //
+        // Round six was this, in `CliExportRunner::run`:
+        //
+        //     let _ = spawn_in_job(self.job(), Command::new("x"));   // decoy
+        //     let child = Command::spawn(&mut command)?;             // real
+        //
+        // Everything stayed green. The probe recorded one arrival carrying
+        // exactly the right job -- because it records *an* arrival, not *the*
+        // spawn -- and the tree walk above matched three literals none of
+        // which `Command::spawn(&mut command)` contains.
+        //
+        // The type closes the second line: `export_command` and
+        // `build_command` now hand back a `JobCommand` whose inner command is
+        // private to this module, so there is no method on it that starts a
+        // process and no way to get the command out. This test closes the
+        // first: with no way to *name* a bare command type, these two modules
+        // cannot construct a second child description at all, so they have
+        // nothing to offer the probe as a decoy and nothing to spawn behind
+        // its back. Neither half is sufficient alone, which is why both are
+        // here.
+        //
+        // Note what is NOT being asserted: no phrase, no call spelling, no
+        // line. The rules are about the identifiers `Command` and `wrap`, and
+        // an identifier has exactly one spelling.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        for file in ["vault_export.rs", "send.rs"] {
+            let code = code_only(&std::fs::read_to_string(src.join(file)).unwrap());
+
+            // Controls FIRST: these rules are all "count is zero" shaped, and
+            // a `code_only` that returned nothing, or a module that stopped
+            // spawning, would satisfy every one of them while asserting
+            // nothing at all.
+            assert!(
+                code.len() > 1000,
+                "{file} produced almost no code, so every rule below is vacuous"
+            );
+            assert_eq!(
+                code.matches("JobCommand").count() >= 1,
+                true,
+                "{file} no longer names the wrapper at all, so it is not building its child \
+                 through the one type that can only be spawned into a job"
+            );
+            assert!(
+                code.contains("job_object::spawn_in_job("),
+                "control: {file} no longer spawns through the choke point at all, so the \
+                 emptiness asserted below means the module stopped spawning rather than that \
+                 it spawns correctly"
+            );
+
+            // RULE 1, and the load-bearing one: every occurrence of the
+            // identifier `Command` is part of `JobCommand`. So there is no
+            // `std::process::Command` in this module under any spelling --
+            // not `Command::new`, not `process::Command`, not a `use` alias
+            // (an alias must still name the type it aliases), not `CommandExt`
+            // -- and therefore no way to reach `spawn`, `output` or `status`,
+            // which exist only on that type.
+            assert_eq!(
+                code.matches("Command").count(),
+                code.matches("JobCommand").count(),
+                "{file} names a command type that is not `JobCommand`, so it can describe a \
+                 child this module cannot see and start it outside the kill-on-close job"
+            );
+
+            // RULE 2: and it may not wrap one either. `JobCommand::wrap` is
+            // public (main.rs is a separate crate), so without this a runner
+            // could wrap a decoy, hand it to the probe, and satisfy every
+            // pointer assertion made through it.
+            assert_eq!(
+                code.matches("JobCommand::wrap").count(),
+                0,
+                "{file} wraps a command of its own; the only command it may build is the \
+                 verified one from `bw_path`, or it has a second child to offer the probe"
+            );
+
+            // There is deliberately no rule about the identifier `spawn`.
+            // Rule 1 already denies these modules any value with a `spawn`,
+            // `output` or `status` method on it, and a text rule would have
+            // to tell `Command::spawn` from `scope.spawn` and
+            // `job_reaching_the_spawn` -- which is a rule about phrases, and
+            // rules about phrases are what the last six rounds defeated.
+
+            // RULE 4: the only things it may reach out of `std::process` for
+            // are stream wiring and this process's own pid -- neither of which
+            // can describe or start a child.
+            assert_eq!(
+                code.matches("std::process::").count(),
+                code.matches("std::process::Stdio").count()
+                    + code.matches("std::process::id()").count(),
+                "{file} reaches into `std::process` for something other than `Stdio` and `id`"
+            );
+        }
+
+        // Positive controls, through the very same matcher: each rule can see
+        // the thing it exists to catch.
+        let planted = |s: &str| code_only(s);
+        let p = planted("let child = Command::spawn(&mut command)?;");
+        assert_eq!(p.matches("Command").count(), 1);
+        assert_eq!(p.matches("JobCommand").count(), 0);
+        assert_eq!(planted("std::process::Command::new(\"x\")").matches("std::process::Stdio").count(), 0);
+        assert_eq!(planted("JobCommand :: wrap ( c )").matches("JobCommand::wrap").count(), 1);
+        // ...and passes the honest spelling, which names only `JobCommand`.
+        let honest = planted("let c = job_object::spawn_in_job(self.job(), command)?;");
+        assert_eq!(honest.matches("Command").count(), 0);
+    }
+
+    /// The `cfg` predicates of every `not(..)` in one file's code.
+    fn negated_cfg_predicates(text: &str) -> Vec<String> {
+        let code = code_only(text);
+        let needle = concat!("not", "(");
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let open = from + at + needle.len();
+            let mut depth = 1usize;
+            let mut end = open;
+            for (k, ch) in code[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found.push(code[open..end].to_string());
+            from = open;
+        }
+        found
+    }
+
+    #[test]
+    fn nothing_in_this_crate_is_compiled_differently_when_it_is_tested() {
+        // "Is the tested configuration the shipped one?" -- asked of the whole
+        // crate, because the answer was measured to be NO and nothing noticed.
+        //
+        // In `vault_export::real_runner`:
+        //
+        //     #[cfg(not(test))]
+        //     let job = { let _ = job; Arc::new(None) };
+        //
+        // 2065 lib + 217 bin, 0 failed, 0 warnings -- green BY CONSTRUCTION,
+        // because the shipped binary and the tested library were no longer the
+        // same program. Every other guarantee in this module is a statement
+        // about code that is compiled under `cfg(test)`; this is what makes
+        // those statements also statements about the shipped binary.
+        //
+        // A whole-crate ban rather than a two-file one, and cheap: the crate
+        // contained zero of these before this test, and test-only *additions*
+        // (`#[cfg(test)] mod tests`) are untouched -- only a `not` on `test`
+        // is refused, which is the shape that removes production code.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        assert!(files.len() > 5, "the source walk found almost nothing: {files:?}");
+
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for predicate in negated_cfg_predicates(&text) {
+                let names_test = predicate
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|token| token == "test");
+                if names_test {
+                    offenders.push(format!("{}: not({predicate})", file.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "this crate compiles differently when it is under test, so the suite is green about \
+             a program that is not the one shipped to users:\n{}",
+            offenders.join("\n")
+        );
+
+        // Controls: the matcher sees every shape of the thing it bans...
+        for planted in [
+            concat!("#[cfg(", "not", "(test))]\nlet job = Arc::new(None);"),
+            concat!("#[cfg(all(windows, ", "not", "(test)))]\nfn f() {}"),
+            concat!("#[cfg(", "not", "(any(test, feature = \"x\")))]\nfn f() {}"),
+            concat!("#[cfg(", "not", " ( test ) )]\nfn f() {}"),
+        ] {
+            assert!(
+                negated_cfg_predicates(planted)
+                    .iter()
+                    .any(|p| p.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .any(|t| t == "test")),
+                "the matcher cannot see `{planted}`, so its silence above means nothing"
+            );
+        }
+        // ...and does not flag a test-only addition, nor a function whose
+        // name merely ends in `_not()`.
+        assert!(negated_cfg_predicates("#[cfg(test)]\nmod tests {}").is_empty());
+        assert!(negated_cfg_predicates("fn a_thing_is_so_and_another_is_not() { let test = 1; }")
+            .iter()
+            .all(|p| p.is_empty()));
+    }
+
     #[test]
     fn closing_the_job_kills_its_members() {
         // The whole reason the job object exists: this is what protects an
@@ -643,7 +1082,7 @@ mod tests {
         // Manager kill, and nothing else in the test suite exercises it.
         let job = KillOnCloseJob::new().unwrap();
         let mut child =
-            spawn_in_job(Some(&job), long_lived_command()).expect("failed to spawn test child");
+            spawn_in_job(Some(&job), long_lived_job_command()).expect("failed to spawn test child");
         assert!(
             child.try_wait().unwrap().is_none(),
             "test child exited before the job was closed"
