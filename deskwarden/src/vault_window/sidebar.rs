@@ -224,7 +224,7 @@ impl SidebarFilter {
         match self {
             SidebarFilter::Trash => FilterSource::Trash,
             SidebarFilter::Archive => FilterSource::Archive,
-                SidebarFilter::All
+            SidebarFilter::All
             | SidebarFilter::Favorites
             | SidebarFilter::Apps
             | SidebarFilter::Logins

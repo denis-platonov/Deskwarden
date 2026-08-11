@@ -144,6 +144,25 @@ pub struct SendFetch {
     /// currency check, for the reason the TOTP and aux drains give: gating
     /// the clear on currency is how a flag like this latches forever.
     pub in_flight: bool,
+    /// Which question the current `result` is an answer to.
+    ///
+    /// **This is what makes `invalidate` real.** Bumped by every invalidate,
+    /// carried by every spawn, and compared by [`apply_answer`]. Without it,
+    /// a fetch started on one visit and landing after the user has left is
+    /// written into `result` anyway -- so the next visit finds `result`
+    /// already `Some`, `wants_fetch` false, and shows the *previous* visit's
+    /// list with no refetch. That is precisely the stale list the refetch
+    /// policy exists to prevent, arrived at through the code that was
+    /// supposed to prevent it. See
+    /// `a_late_answer_from_the_visit_before_is_dropped_and_the_next_visit_asks_again`.
+    ///
+    /// Private, and there is no setter: [`invalidate`] is the only thing that
+    /// may move it, so "the tag changed" and "the answer is stale" cannot
+    /// drift apart.
+    ///
+    /// [`apply_answer`]: SendFetch::apply_answer
+    /// [`invalidate`]: SendFetch::invalidate
+    generation: u64,
 }
 
 impl SendFetch {
@@ -164,12 +183,50 @@ impl SendFetch {
         selected && self.result.is_none() && !self.in_flight
     }
 
+    /// The tag a fetch started **now** should carry back with its answer.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Forget the answer, so the next frame asks again.
     ///
     /// `in_flight` is deliberately NOT cleared -- a thread is still running,
-    /// and clearing it would let a second one start.
+    /// and clearing it would let a second one start. **That is only safe
+    /// because the generation moves at the same instant**: the running
+    /// thread's answer is now tagged with a generation this value no longer
+    /// holds, so [`apply_answer`] drops it. `AuxList::invalidate` says the
+    /// same thing about its own generation check; this line without the bump
+    /// is the same comment attached to nothing.
+    ///
+    /// [`apply_answer`]: SendFetch::apply_answer
     pub fn invalidate(&mut self) {
         self.result = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Take -- or drop -- an answer that a background fetch has reported.
+    ///
+    /// **The whole drain, as one pure function.** The window's drain is a
+    /// `try_recv` inside the frame closure, which no test in this crate can
+    /// run; keeping the decision here rather than there is what makes the
+    /// late-answer rule testable at all instead of pinned in source.
+    ///
+    /// `in_flight` is cleared whatever the tag says: the thread that set it
+    /// has finished, and a currency-gated clear is how a flag like this
+    /// latches forever.
+    ///
+    /// Returns whether the answer was kept, for the caller's log line.
+    pub fn apply_answer(
+        &mut self,
+        tag: u64,
+        result: Result<Vec<SendSummary>, SendError>,
+    ) -> bool {
+        self.in_flight = false;
+        if tag != self.generation {
+            return false;
+        }
+        self.result = Some(result);
+        true
     }
 
     /// What the sidebar's Sends badge should read, or `None` for "unknown".
@@ -408,6 +465,22 @@ pub fn draw_send_pane(
     );
     ui.add_space(12.0);
 
+    // **The same sentence is never printed twice.** A failed fetch reaches
+    // this function through both doors: `vault_window` turns it into the
+    // window's inline notice (`NoticeSource::Sends`), and `pane_state` turns
+    // the very same `SendError` into `Failed { message }` below -- both from
+    // `SendError::user_message`. Handed both, the pane used to paint the
+    // identical line in the band and again under the headline, which reads
+    // as two failures.
+    //
+    // The pane's own rendering wins, because it is the richer one: it has
+    // the headline, the "could not check" line for an ambiguous failure, and
+    // Try again. A notice that is *not* the failure being drawn (a move or
+    // generate error arriving while the list is up) is still shown.
+    let notice = match (notice, state) {
+        (Some(n), SendPaneState::Failed { message, .. }) if n == message => None,
+        (n, _) => n,
+    };
     if let Some(message) = notice {
         if draw_notice_band(ui, message) {
             action = SendUiAction::DismissNotice;
@@ -558,6 +631,14 @@ fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
         ),
         egui::vec2(COPY_BUTTON_WIDTH, COPY_BUTTON_HEIGHT),
     );
+    // **A row with no URL has nothing to copy, and says so by being
+    // unclickable.** `send.rs`'s parser rejects a *missing* `accessUrl` but
+    // accepts an empty one, so a row can reach here holding `""`; copying
+    // that would hand `copy_text("")` to the clipboard, silently wiping
+    // whatever the user had there and reporting success. The button is still
+    // drawn -- the row must not lose its shape, and a row that quietly has
+    // no control is harder to understand than one that has a dead one.
+    let has_url = !row.access_url.is_empty();
     let clicked = ui
         .put(
             button_rect,
@@ -566,7 +647,9 @@ fn draw_row(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
         )
         .clicked();
     ui.add_space(6.0);
-    clicked.then(|| row.access_url.clone())
+    // Belt and braces: the guard is on the *returned action* as well as on
+    // the widget, so no future re-layout of the button can reopen the path.
+    (clicked && has_url).then(|| row.access_url.clone())
 }
 
 /// The inline band. Same shape the item list's band has -- one line, clicking
@@ -820,12 +903,13 @@ mod tests {
         let running = SendFetch { in_flight: true, ..SendFetch::default() };
         assert!(!running.wants_fetch(true), "a second `bw` child started while one was running");
 
-        let answered = SendFetch { result: Some(Ok(Vec::new())), in_flight: false };
+        let answered = SendFetch { result: Some(Ok(Vec::new())), in_flight: false, ..Default::default() };
         assert!(!answered.wants_fetch(true), "a list already in hand was fetched again");
 
         let failed = SendFetch {
             result: Some(Err(SendError::Offline)),
             in_flight: false,
+            ..Default::default()
         };
         assert!(!failed.wants_fetch(true), "a failed fetch was retried at frame rate");
     }
@@ -839,6 +923,7 @@ mod tests {
         let mut fetch = SendFetch {
             result: Some(Ok(vec![summary("a", false, 1)])),
             in_flight: false,
+            ..Default::default()
         };
         assert!(!fetch.wants_fetch(true));
         fetch.invalidate();
@@ -847,6 +932,7 @@ mod tests {
         let mut running = SendFetch {
             result: Some(Err(SendError::Offline)),
             in_flight: true,
+            ..Default::default()
         };
         running.invalidate();
         assert!(
@@ -870,7 +956,7 @@ mod tests {
     fn a_failed_fetch_never_badges_the_sidebar_with_a_zero() {
         assert_eq!(SendFetch::default().badge_count(), None, "an unfetched list claimed a count");
         assert_eq!(
-            SendFetch { result: Some(Ok(Vec::new())), in_flight: false }.badge_count(),
+            SendFetch { result: Some(Ok(Vec::new())), in_flight: false, ..Default::default() }.badge_count(),
             Some(0),
             "an answered empty list must say 0, which is a fact it has"
         );
@@ -878,12 +964,13 @@ mod tests {
             SendFetch {
                 result: Some(Ok(vec![summary("a", false, 1), summary("b", true, 1)])),
                 in_flight: false,
+                ..Default::default()
             }
             .badge_count(),
             Some(2)
         );
         assert_eq!(
-            SendFetch { result: Some(Err(SendError::Offline)), in_flight: false }.badge_count(),
+            SendFetch { result: Some(Err(SendError::Offline)), in_flight: false, ..Default::default() }.badge_count(),
             None,
             "a failed fetch badged a count it does not have -- a 0 here reads as `no Sends`"
         );
@@ -992,6 +1079,221 @@ mod tests {
         assert!(
             !state.is_an_answer(),
             "unreadable output from `bw` was painted as `you have no Sends`"
+        );
+    }
+
+    // ---- The late answer -------------------------------------------------
+
+    /// **The reviewer's reproduction, kept as a test.** Every step is a
+    /// thing the window actually does, in the order an ordinary user does
+    /// them, and the whole sequence used to end with the previous visit's
+    /// list on screen and no refetch.
+    ///
+    /// 1. On Sends, a fetch is in flight.
+    /// 2. The user clicks Cards. `should_invalidate_on_leave` fires and
+    ///    `invalidate` runs -- a **no-op** on `result`, which is already
+    ///    `None`.
+    /// 3. The detached thread lands. Before the generation tag, the drain
+    ///    wrote it into `result` unconditionally.
+    /// 4. The user comes back to Sends. `was_on_sends` was false so nothing
+    ///    invalidates, and `result` is `Some`, so `wants_fetch` is false.
+    ///
+    /// The result was a list from before the user left, shown and counted in
+    /// the badge as current -- the stale Copy link the refetch policy exists
+    /// to prevent, reached through the code meant to prevent it.
+    #[test]
+    fn a_late_answer_from_the_visit_before_is_dropped_and_the_next_visit_asks_again() {
+        let mut fetch = SendFetch::default();
+
+        // 1. Arriving on Sends asks, once.
+        assert!(fetch.wants_fetch(true));
+        fetch.in_flight = true;
+        let tag = fetch.generation();
+        assert!(!fetch.wants_fetch(true), "a second thread was allowed to start");
+
+        // 2. Leaving for Cards.
+        assert!(should_invalidate_on_leave(true, false));
+        fetch.invalidate();
+        assert!(fetch.result.is_none());
+        assert!(fetch.in_flight, "`invalidate` must not let a second thread start");
+
+        // 3. The thread from step 1 lands, late.
+        let stale = vec![SendSummary {
+            id: "stale".into(),
+            name: "from the visit before".into(),
+            access_url: "https://send.bitwarden.com/#/stale".into(),
+            deletion_date: at(7),
+            is_file: false,
+        }];
+        assert!(
+            !fetch.apply_answer(tag, Ok(stale)),
+            "an answer to a question the user has navigated away from was kept"
+        );
+        assert!(!fetch.in_flight, "`in_flight` latched -- no further fetch can ever start");
+        assert!(
+            fetch.result.is_none(),
+            "the late answer was stored, so the next visit will show it without asking"
+        );
+        assert_eq!(
+            fetch.badge_count(),
+            None,
+            "the sidebar badge counted a list from a visit the user has left"
+        );
+
+        // 4. Returning to Sends. Nothing invalidates on arrival...
+        assert!(!should_invalidate_on_leave(false, true));
+        // ...and the screen asks again anyway, because the stale answer never
+        // landed.
+        assert!(
+            fetch.wants_fetch(true),
+            "returning to Sends did not refetch -- the previous visit's list is on screen"
+        );
+    }
+
+    /// The other half, so the drop rule cannot be satisfied by dropping
+    /// *everything*: an answer to the question actually on screen is kept.
+    #[test]
+    fn an_answer_tagged_with_the_current_question_is_kept() {
+        let mut fetch = SendFetch::default();
+        assert!(fetch.wants_fetch(true));
+        fetch.in_flight = true;
+        let tag = fetch.generation();
+        assert!(fetch.apply_answer(tag, Ok(vec![summary("alpha", false, 7)])));
+        assert!(!fetch.in_flight);
+        assert_eq!(fetch.badge_count(), Some(1));
+        assert!(!fetch.wants_fetch(true), "a held list was refetched");
+    }
+
+    /// A **failure** is current-or-stale on the same terms. A failed fetch
+    /// from a previous visit must not be the failure the next visit shows.
+    #[test]
+    fn a_late_failure_is_dropped_just_as_a_late_success_is() {
+        let mut fetch = SendFetch::default();
+        fetch.in_flight = true;
+        let tag = fetch.generation();
+        fetch.invalidate();
+        assert!(!fetch.apply_answer(tag, Err(SendError::Offline)));
+        assert!(matches!(
+            pane_state(fetch.result.as_ref(), &FixedClock(NOW)),
+            SendPaneState::Loading
+        ));
+    }
+
+    /// `invalidate` moves the tag. This is the line that makes the "in_flight
+    /// is deliberately NOT cleared" comment true rather than merely copied
+    /// from `AuxList`.
+    #[test]
+    fn invalidating_moves_the_generation_so_the_running_thread_is_disowned() {
+        let mut fetch = SendFetch::default();
+        let before = fetch.generation();
+        fetch.invalidate();
+        assert_ne!(fetch.generation(), before);
+        fetch.invalidate();
+        assert_ne!(fetch.generation(), before);
+    }
+}
+
+#[cfg(test)]
+mod fetch_thread_tests {
+    //! **Where the `bw send list` call runs.** Behavioural, not a source pin.
+    //!
+    //! The property is "the blocking call is made on a thread that is not the
+    //! frame's". It was a pin over `spawn_send_list`'s text, and a pin over a
+    //! *function* is satisfied by hoisting the call above the spawn -- which
+    //! breaks exactly the property the pin was written for, silently. So
+    //! `spawn_send_list_with` takes the fetch as a value, and these tests
+    //! hand it one that reports where and when it ran.
+    //!
+    //! No process is spawned and no network is touched: the fetch under test
+    //! is a closure, and the production one is reached only through
+    //! `spawn_send_list`, which is not called here.
+
+    use eframe::egui;
+    use std::sync::mpsc;
+    use std::thread::ThreadId;
+    use std::time::Duration;
+
+    /// Generous on purpose. Nothing here is a timing measurement -- the
+    /// timeouts exist only so that a regression fails loudly instead of
+    /// hanging the suite -- so the bound is set well above any plausible
+    /// scheduling delay on a loaded machine.
+    const PATIENCE: Duration = Duration::from_secs(60);
+
+    /// **The fetch does not run on the caller's thread.**
+    ///
+    /// Two independent witnesses, because either alone is weak. The thread id
+    /// is the direct statement of the property. The gate is the consequence
+    /// that actually matters: `spawn_send_list_with` returns *before* the
+    /// fetch has finished, which is what stops a sixty-second `bw` cap from
+    /// freezing the window on the frame the user clicks Sends. A hoist of the
+    /// call above the spawn fails both.
+    #[test]
+    fn the_fetch_runs_off_the_callers_thread_and_the_caller_does_not_wait_for_it() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        let (where_tx, where_rx) = mpsc::channel::<ThreadId>();
+        // Opened by this thread only after the call below has returned.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let caller = std::thread::current().id();
+
+        super::super::spawn_send_list_with(ctx.clone(), tx, 7, move || {
+            let _ = where_tx.send(std::thread::current().id());
+            // If the fetch were run by the caller, this would still be inside
+            // the call below and the gate could not have been opened. A
+            // timeout rather than a blocking recv, so a regression fails
+            // loudly instead of hanging the suite.
+            let released = gate_rx.recv_timeout(PATIENCE).is_ok();
+            assert!(
+                released,
+                "the fetch was never released -- it ran before `spawn_send_list_with` returned, \
+                 so the eframe thread is waiting on `bw`"
+            );
+            Ok(Vec::new())
+        });
+        // Reached only because the call above did not block on the fetch.
+        gate_tx.send(()).expect("the fetch thread was never started");
+
+        let ran_on = where_rx.recv_timeout(PATIENCE).expect("the fetch never ran");
+        assert_ne!(
+            ran_on, caller,
+            "the Sends fetch ran on the calling thread -- in production that is the eframe \
+             thread, and `bw` may be waited on for sixty seconds"
+        );
+
+        let (tag, answer) = rx.recv_timeout(PATIENCE).expect("no answer was ever sent");
+        assert_eq!(tag, 7, "the answer did not carry the generation it was started under");
+        assert!(answer.is_ok());
+    }
+
+    /// **The window is asked to repaint when the answer lands.** Without it
+    /// the answer sits in the channel until some unrelated input provokes a
+    /// frame, and the screen shows a spinner over a list it already has.
+    #[test]
+    fn a_landed_answer_asks_the_window_to_repaint() {
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        // Consume the request the context starts life with, so the assertion
+        // below is about this fetch and not about a fresh `Context`.
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        assert!(
+            !ctx.has_requested_repaint(),
+            "the fixture context already wanted a repaint, so the assertion below is vacuous"
+        );
+
+        super::super::spawn_send_list_with(ctx.clone(), tx, 0, || Ok(Vec::new()));
+        let _ = rx.recv_timeout(PATIENCE).expect("no answer was ever sent");
+
+        // The send happens just before the repaint request, so poll rather
+        // than read once.
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while !ctx.has_requested_repaint() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            ctx.has_requested_repaint(),
+            "a landed Sends answer did not ask for a repaint, so it would wait for an unrelated \
+             frame before it was drawn"
         );
     }
 }
@@ -1291,6 +1593,74 @@ mod paint_tests {
         action
     }
 
+    /// **A row with no URL cannot clear the clipboard.** `parse_send_list`
+    /// rejects a *missing* `accessUrl` but accepts `""`, so this row shape is
+    /// reachable from a real server answer. The button is still painted --
+    /// the row keeps its shape -- but pressing it reports nothing, because
+    /// `CopyLink("")` reaches `copy_text("")`, which wipes the clipboard and
+    /// then tells the user it copied a link.
+    #[test]
+    fn a_row_whose_url_is_empty_paints_its_button_but_copies_nothing() {
+        let state = SendPaneState::Rows(vec![SendRow {
+            id: "id-no-url".into(),
+            name: "no url".into(),
+            expiry: "Expires in 7 days".into(),
+            is_file: false,
+            access_url: String::new(),
+        }]);
+        let (painted, _) = paint(&state, None, min_pane_size());
+        assert_eq!(
+            painted.count("Copy link"),
+            1,
+            "the row lost its button entirely, so this test would pass against a row that is \
+             not drawn at all"
+        );
+        assert_eq!(
+            click_nth(&state, "Copy link", 0),
+            SendUiAction::None,
+            "pressing Copy link on a row with an empty URL reported a copy -- that call clears \
+             the clipboard and reports success"
+        );
+    }
+
+    /// **A failure is not printed twice.** The window turns a failed fetch
+    /// into the inline notice AND `pane_state` turns the same `SendError`
+    /// into `Failed { message }`, both from `SendError::user_message`. Handed
+    /// both, the pane must show the sentence once.
+    #[test]
+    fn a_failure_that_is_also_the_notice_is_shown_once_and_not_twice() {
+        let message = SendError::Offline.user_message().to_string();
+        let state = SendPaneState::Failed { message: message.clone(), ambiguous: false };
+        let (painted, _) = paint(&state, Some(message.as_str()), min_pane_size());
+        assert!(
+            painted.has(FAILED_HEADLINE),
+            "the failure was not drawn at all, so the count below would be vacuous"
+        );
+        assert_eq!(
+            painted.count(message.as_str()),
+            1,
+            "{message:?} was painted {} times -- the notice band and the failure body are \
+             printing the same sentence, which reads as two failures",
+            painted.count(message.as_str())
+        );
+    }
+
+    /// ...and the de-duplication is by **content**, not by "the pane is
+    /// failed". A move or generate error arriving while the Sends fetch has
+    /// failed is a different message and must still be shown.
+    #[test]
+    fn a_notice_that_is_not_the_failure_is_still_shown_beside_it() {
+        let message = SendError::Offline.user_message().to_string();
+        let state = SendPaneState::Failed { message: message.clone(), ambiguous: false };
+        let other = "Could not move that item.";
+        let (painted, _) = paint(&state, Some(other), min_pane_size());
+        assert!(
+            painted.has(other),
+            "an unrelated notice was swallowed by the failure body"
+        );
+        assert_eq!(painted.count(message.as_str()), 1);
+    }
+
     /// **Copy link copies the row it was clicked on.** Clicked on the *last*
     /// row of six, because a wrong-row bug that reaches for index 0 is
     /// invisible when the test clicks the first one.
@@ -1389,13 +1759,33 @@ mod paint_tests {
 mod source_pins {
     //! Facts about `vault_window::mod`'s render closure and its helpers that
     //! no test in this crate can reach, because they are statements inside an
-    //! `eframe` frame closure that only a real window runs, or inside a
-    //! thread body that only a real `bw` child gives meaning to.
+    //! `eframe` frame closure that only a real window runs.
     //!
     //! Each needle is `concat!`-split so it cannot match its own declaration,
     //! and each is a single line, so a CRLF checkout cannot make it vacuous.
     //! Each is *required*, so the assertion is its own evidence that it still
     //! matches live code.
+    //!
+    //! **What is deliberately NOT here any more.** "The fetch is not on the
+    //! eframe thread" used to be pinned, by slicing `spawn_send_list` out of
+    //! this file and asserting `std::thread::spawn`, `list_sends` and
+    //! `CliSendRunner::new` were somewhere inside it. Every one of those
+    //! needles is satisfied by hoisting the blocking call *above* the spawn:
+    //!
+    //! ```ignore
+    //! let answer = crate::send::list_sends(&runner);   // on the eframe thread
+    //! std::thread::spawn(move || { let _ = tx.send(answer); ... });
+    //! ```
+    //!
+    //! -- which is the exact defect the pin existed to prevent, passing the
+    //! pin. The property is **closure**-wide and the slice was
+    //! **function**-wide. It is now held behaviourally instead, by
+    //! `fetch_thread_tests`, against `spawn_send_list_with`, whose `fetch` is
+    //! a value with nothing to hoist out of.
+    //!
+    //! What is left here is the seam between that tested function and
+    //! production: that `spawn_send_list` is *nothing but* the delegation, and
+    //! that the fetch it delegates is the real one.
 
     fn production() -> &'static str {
         let source = include_str!("mod.rs");
@@ -1403,80 +1793,128 @@ mod source_pins {
         &source[..end]
     }
 
-    /// `spawn_send_list`'s own body, and nothing else.
-    ///
-    /// **The slice matters more than the needles.** `mod.rs` already contains
-    /// several `std::thread::spawn` calls and several `request_repaint`s, so
-    /// a crate-wide "does this file spawn a thread" assertion is satisfied by
-    /// somebody else's thread -- and a fetch moved onto the eframe thread
-    /// would walk straight past it. Everything below is asserted *within this
-    /// function*.
-    fn spawn_send_list_body() -> &'static str {
+    /// A named function's body, from its opening `(` to the first `}` at
+    /// column zero.
+    fn body_of(name: &str) -> String {
         let production = production();
-        let opener = concat!("fn spawn_send_", "list(");
+        let opener = format!("fn {name}(");
         let start = production
-            .find(opener)
-            .expect("`spawn_send_list` is gone from production -- the Sends fetch has no home");
+            .find(&opener)
+            .unwrap_or_else(|| panic!("`{name}` is gone from production"));
         let rest = &production[start + opener.len()..];
-        // To the next item at column zero, which is the end of this function.
         let end = rest.find("\r\n}\r\n").unwrap_or(rest.len());
-        &rest[..end]
+        rest[..end].to_string()
     }
 
-    /// **The fetch is never on the eframe thread.** `.output()` blocks, and
-    /// `send.rs` gives a `bw` child a sixty-second cap, so a synchronous call
-    /// would freeze the whole window -- titlebar, drag, close -- for a minute
-    /// on the frame the user clicks Sends.
-    #[test]
-    fn the_send_list_fetch_is_spawned_and_never_run_in_the_frame() {
-        let production = production();
-        let spawn = concat!("spawn_send_", "list(ui.ctx().clone(), send_tx.clone())");
-        assert_eq!(
-            production.matches(spawn).count(),
-            1,
-            "{spawn:?} is not in production exactly once -- the Sends fetch must be started \
-             from the frame closure and run off it"
-        );
+    /// Whitespace-insensitive, so this is a pin on the code and not on the
+    /// formatter.
+    fn squashed(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
 
-        let body = spawn_send_list_body();
-        let thread = concat!("std::thread::", "spawn(move || {");
+    /// **`spawn_send_list` is the delegation and nothing else.**
+    ///
+    /// An *equality*, not a set of needles. A needle-based pin over this
+    /// function can be satisfied while the property is violated -- that is
+    /// how the previous one was defeated -- and there is no hoist, no `let`
+    /// binding above the call, and no helper-function spelling that survives
+    /// an exact match of the whole body. Anything at all added here fails,
+    /// including the one shape that would otherwise slip past a behavioural
+    /// test of `spawn_send_list_with`:
+    ///
+    /// ```ignore
+    /// let answer = real_send_list();                       // eframe thread
+    /// spawn_send_list_with(ctx, tx, generation, move || answer);
+    /// ```
+    #[test]
+    fn spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner() {
+        let expected = squashed(&format!(
+            "ctx_for_sends: egui::Context, tx: SendListSender, generation: u64, ) {{ {}(\
+             ctx_for_sends, tx, generation, {}); ",
+            concat!("spawn_send_list_", "with"),
+            concat!("real_send_", "list")
+        ));
+        let actual = squashed(&body_of(concat!("spawn_send_", "list")));
+        assert_eq!(
+            actual, expected,
+            "`spawn_send_list` is no longer purely a delegation to the spawner that \
+             `fetch_thread_tests` drives. Anything else in this function is work done on \
+             whichever thread called it -- and the only caller is the eframe frame closure."
+        );
+    }
+
+    /// The delegated fetch really is a real `bw send list`. A fake here, or a
+    /// runner built for some other account, would be a screen that lists
+    /// nothing whatever the account holds -- and `fetch_thread_tests` cannot
+    /// see it, because it deliberately supplies its own fetch.
+    ///
+    /// Needles are safe *here*: `real_send_list` is a plain function with no
+    /// closure in it, so there is no inside and outside to move code between.
+    #[test]
+    fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
+        let body = body_of(concat!("real_send_", "list"));
+        let runner = concat!("crate::send::CliSendRunner::", "new(None, data_dir.as_deref())");
         assert!(
-            body.contains(thread),
-            "`spawn_send_list` no longer opens with {thread:?}, so the `bw` child is waited on \
-             by whichever thread called it -- and the only caller is the frame closure. Body \
-             was: {body}"
+            body.contains(runner),
+            "the Sends fetch no longer runs through {runner:?}. Body was: {body}"
+        );
+        let dir = concat!("crate::bw_path::active_data_", "dir()");
+        assert!(
+            body.contains(dir),
+            "the fetch no longer reads the active account's profile directory, so it can \
+             list a different account's Sends than the window is showing"
         );
         let call = concat!("crate::send::list_", "sends(&runner)");
         assert!(
             body.contains(call),
-            "`spawn_send_list` does not call {call:?} -- it is not the thing fetching the list"
+            "`real_send_list` does not call {call:?} -- it is not the thing fetching the list"
         );
-        // ...and the blocking call is made nowhere else in the file.
         assert_eq!(
-            production.matches(concat!("crate::send::list_", "sends(")).count(),
+            production().matches(concat!("crate::send::list_", "sends(")).count(),
             1,
-            "`list_sends` is called somewhere other than inside the spawned thread"
-        );
-        // The runner really is the production one. A fake here would be a
-        // screen that lists nothing whatever the account holds.
-        let runner = concat!("crate::send::CliSendRunner::", "new(None, data_dir.as_deref())");
-        assert!(
-            body.contains(runner),
-            "the Sends fetch no longer runs through {runner:?}"
+            "`list_sends` is called somewhere other than `real_send_list` -- and every other \
+             caller is unproven ground for which thread it runs on"
         );
     }
 
-    /// The window repaints when the answer lands. Without it the result sits
-    /// in the channel until some unrelated input provokes a frame, and the
-    /// screen shows a spinner over a list it already has.
+    /// The frame closure is what starts the fetch, exactly once, and it hands
+    /// over the **current** generation. The tag is what `apply_answer` uses to
+    /// drop a late answer; a spawn that carries a constant instead would make
+    /// every answer look current.
     #[test]
-    fn the_send_fetch_asks_for_a_repaint_when_it_lands() {
-        let repaint = concat!("ctx_for_sends.request_", "repaint();");
-        let body = spawn_send_list_body();
+    fn the_frame_starts_the_fetch_once_and_tags_it_with_the_question_it_is_asking() {
+        let production = production();
+        let spawn = concat!(
+            "spawn_send_",
+            "list(ui.ctx().clone(), send_tx.clone(), send_fetch.generation())"
+        );
+        assert_eq!(
+            production.matches(spawn).count(),
+            1,
+            "{spawn:?} is not in production exactly once -- the Sends fetch is started from \
+             nowhere, from more than one place, or without the generation that lets a stale \
+             answer be told from a current one"
+        );
+    }
+
+    /// **The drain goes through `apply_answer`.** That function is where the
+    /// late-answer rule and the `in_flight` clear are both tested; a drain
+    /// that writes `send_fetch.result` itself is a drain that has neither.
+    #[test]
+    fn the_sends_drain_applies_the_answer_rather_than_storing_it_directly() {
+        let production = production();
+        let apply = concat!("send_fetch.apply_", "answer(tag, result)");
+        assert_eq!(
+            production.matches(apply).count(),
+            1,
+            "{apply:?} is not in production exactly once -- the Sends drain is not going \
+             through the tested rule, so an answer from a visit the user has left can be \
+             written in as though it were current"
+        );
+        let direct = concat!("send_fetch.result = ", "Some(");
         assert!(
-            body.contains(repaint),
-            "{repaint:?} is not in `spawn_send_list` -- a landed Sends answer would wait for an \
-             unrelated frame before it was drawn"
+            !production.contains(direct),
+            "production writes {direct:?} directly, bypassing the generation check"
         );
     }
 
@@ -1503,16 +1941,48 @@ mod source_pins {
 
     /// The Sends screen replaces the item list rather than being drawn beside
     /// it, and the item list is not asked to render Sends.
+    ///
+    /// **This pins the coverage, not the gate.** Counting `if !show_sends {`
+    /// alone says only that the gate exists somewhere; a second, ungated
+    /// `draw_item_list` leaves that count at one and puts the item list back
+    /// on the Sends screen. So the gate's own block is sliced out -- to the
+    /// next `}` at the gate's indentation -- and the item list panel and its
+    /// draw call are required to be inside *it*, and to exist nowhere else.
     #[test]
-    fn the_item_list_is_not_drawn_on_the_sends_screen() {
+    fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate = concat!("if !show_", "sends {");
+        let gate = concat!("        if !show_", "sends {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,
-            "{gate:?} is not in production exactly once -- the item list panel is drawn on the \
-             Sends screen, or the Sends screen has been given a second gate"
+            "{gate:?} is not in production exactly once -- the Sends screen has been given a \
+             second gate, or the gate has moved out of the frame closure's top level"
         );
+        let start = production.find(gate).expect("gate");
+        let rest = &production[start + gate.len()..];
+        let end = rest
+            .find("\r\n        }\r\n")
+            .expect("the `!show_sends` block has no closing brace at its own indentation");
+        let block = &rest[..end];
+
+        for needle in [
+            concat!("egui::Panel::", "left(\"vault-item-list\")"),
+            concat!("draw_item_", "list("),
+        ] {
+            assert_eq!(
+                production.matches(needle).count(),
+                1,
+                "{needle:?} appears in production {} times, not once -- a second one is an \
+                 item list drawn on the Sends screen",
+                production.matches(needle).count()
+            );
+            assert!(
+                block.contains(needle),
+                "{needle:?} is outside the `!show_sends` block, so the item list is drawn on \
+                 the Sends screen"
+            );
+        }
+
         let pane = concat!("send_ui::draw_send_", "pane(ui, state, notice_message.as_deref())");
         assert_eq!(
             production.matches(pane).count(),
@@ -1520,5 +1990,24 @@ mod source_pins {
             "{pane:?} is not in production exactly once -- the Sends pane is drawn from more \
              than one place, or from none"
         );
+    }
+
+    /// **Nothing outside `send.rs` can publish or revoke a Send.** The design
+    /// puts revocation before publication and this step is the read-only one;
+    /// a call site appearing here is the whole ordering undone.
+    #[test]
+    fn this_window_can_neither_create_nor_delete_a_send() {
+        let source = include_str!("mod.rs");
+        for forbidden in [concat!("create_", "send("), concat!("delete_", "send(")] {
+            assert!(
+                !source.contains(forbidden),
+                "{forbidden:?} has a call site in the vault window -- this step is read-only, \
+                 and revoke is step 4"
+            );
+        }
+        let here = include_str!("send_ui.rs");
+        for forbidden in [concat!("create_", "send("), concat!("delete_", "send(")] {
+            assert!(!here.contains(forbidden), "{forbidden:?} has a call site in `send_ui`");
+        }
     }
 }

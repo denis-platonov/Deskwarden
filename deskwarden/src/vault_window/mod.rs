@@ -747,9 +747,14 @@ pub fn build_frame(
     // through the item pane. `draw_sidebar` is the single place the two are
     // kept mutually exclusive.
     let mut sends_selected = false;
+    // The `u64` is the `SendFetch` generation the fetch was started under, so
+    // an answer to a question the user has since navigated away from can be
+    // told apart from an answer to the current one. See
+    // `send_ui::SendFetch::apply_answer`, and `spawn_aux_load`, which carries
+    // its own tag for exactly the same reason.
     let (send_tx, send_rx): (
-        mpsc::Sender<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
-        Receiver<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
+        mpsc::Sender<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>,
+        Receiver<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>,
     ) = mpsc::channel();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
@@ -1263,16 +1268,21 @@ pub fn build_frame(
         // `in_flight` is cleared FIRST, for the reason the aux and TOTP
         // drains give: the thread that set the flag has finished, whatever
         // became of its answer.
-        if let Ok(result) = send_rx.try_recv() {
-            send_fetch.in_flight = false;
+        if let Ok((tag, result)) = send_rx.try_recv() {
             if let Err(e) = &result {
                 log::warn!("could not list this account's Sends: {e:?}");
             }
-            // Stored whether it succeeded or failed. **The failure is the
-            // value**, not something beside it -- which is what stops the
-            // pane reaching an empty list by way of an error. See
-            // `send_ui::pane_state`.
-            send_fetch.result = Some(result);
+            // Stored whether it succeeded or failed -- **the failure is the
+            // value**, not something beside it, which is what stops the pane
+            // reaching an empty list by way of an error -- and stored only if
+            // it is still the answer to the question on screen. Both rules,
+            // and the `in_flight` clear that happens either way, are inside
+            // `apply_answer`, which is where they are tested.
+            if !send_fetch.apply_answer(tag, result) {
+                log::debug!(
+                    "dropping a Sends answer from a visit this window has already left"
+                );
+            }
         }
 
         // Non-blocking, like the favicon drain above: the sync thread
@@ -1788,7 +1798,7 @@ pub fn build_frame(
         // user who never opens Sends never spawns a `bw`.
         if send_fetch.wants_fetch(show_sends) {
             send_fetch.in_flight = true;
-            spawn_send_list(ui.ctx().clone(), send_tx.clone());
+            spawn_send_list(ui.ctx().clone(), send_tx.clone(), send_fetch.generation());
         }
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
@@ -4326,24 +4336,56 @@ fn spawn_aux_load(
 /// notice band, never as an empty list.
 fn spawn_send_list(
     ctx_for_sends: egui::Context,
-    tx: mpsc::Sender<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
+    tx: SendListSender,
+    generation: u64,
 ) {
+    spawn_send_list_with(ctx_for_sends, tx, generation, real_send_list);
+}
+
+/// What one `bw send list` is, with nothing in it about threads.
+///
+/// A plain function and not a closure inside the spawn, so that "the fetch"
+/// is a **value** that can be handed to [`spawn_send_list_with`] -- and so
+/// that the test below can hand it a different one and watch where it runs.
+fn real_send_list() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+    // Read on the fetching thread, not captured from the frame: `bw_path`
+    // keeps the active account's profile directory as process state
+    // precisely so that every spawn in this crate reaches the same account,
+    // and a copy taken a frame earlier is a copy that can be stale.
+    let data_dir = crate::bw_path::active_data_dir();
+    // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
+    // owns the one `bw serve` is in), so the child is unprotected against
+    // an abrupt death of this process. `bw send list` is a read that
+    // finishes in seconds and holds no session in its environment -- see
+    // the gap above -- so it is not the orphan hazard the job exists for.
+    let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
+    crate::send::list_sends(&runner)
+}
+
+/// The off-thread half, **generic over the fetch so that it can be tested**.
+///
+/// This split is the whole point. The property that matters -- the blocking
+/// call happens on a thread that is not the caller's -- used to be held by a
+/// source pin over `spawn_send_list`'s text, and a pin over a *function* is
+/// satisfied by hoisting the blocking call above the spawn while breaking
+/// exactly the property it was written for. Here `fetch` is a value the
+/// caller cannot see the inside of, so there is nothing to hoist: calling it
+/// before the spawn is a change this function's own behavioural test catches,
+/// by thread identity and by a gate the caller only opens after the call has
+/// returned. See `send_ui::fetch_thread_tests`.
+fn spawn_send_list_with<F>(ctx_for_sends: egui::Context, tx: SendListSender, generation: u64, fetch: F)
+where
+    F: FnOnce() -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> + Send + 'static,
+{
     std::thread::spawn(move || {
-        // Read on this thread, not captured from the frame: `bw_path` keeps
-        // the active account's profile directory as process state precisely
-        // so that every spawn in this crate reaches the same account, and a
-        // copy taken a frame earlier is a copy that can be stale.
-        let data_dir = crate::bw_path::active_data_dir();
-        // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
-        // owns the one `bw serve` is in), so the child is unprotected against
-        // an abrupt death of this process. `bw send list` is a read that
-        // finishes in seconds and holds no session in its environment -- see
-        // the gap above -- so it is not the orphan hazard the job exists for.
-        let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
-        let _ = tx.send(crate::send::list_sends(&runner));
+        let _ = tx.send((generation, fetch()));
         ctx_for_sends.request_repaint();
     });
 }
+
+/// The Sends channel's sending half. Named because three signatures carry it.
+type SendListSender =
+    mpsc::Sender<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>;
 
 /// Why an on-demand list could not be fetched.
 ///
