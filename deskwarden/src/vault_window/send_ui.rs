@@ -3601,7 +3601,7 @@ mod source_pins {
     ///
     /// The property that the frame does not WAIT is no longer held here. It
     /// is held behaviourally, by running the real closure and timing it --
-    /// see `frame_promptness::the_frame_closure_returns_promptly` at the
+    /// see `frame_promptness::the_loaded_vault_returns_promptly` at the
     /// bottom of this file. What used to be here beside this assertion was a
     /// ban on `loop {` and a ten-word list of `std::sync::mpsc` vocabulary,
     /// and both were DELETED in the same commit that added the harness,
@@ -4182,7 +4182,7 @@ mod source_pins {
     /// shipped one.**
     ///
     /// The one thing a behavioural harness cannot measure about itself.
-    /// `frame_promptness::the_frame_closure_returns_promptly` drives the real
+    /// `frame_promptness::the_loaded_vault_returns_promptly` drives the real
     /// closure and times it, which kills every wait it can REACH -- but a
     /// frame that asked which build it was in could return promptly for the
     /// harness and freeze for the user:
@@ -4234,7 +4234,7 @@ mod source_pins {
             assert!(
                 !closure.contains(asking),
                 "the frame closure contains {asking:?}, so what it does depends on which \
-                 build it is. `the_frame_closure_returns_promptly` drives it in the TEST \
+                 build it is. `the_loaded_vault_returns_promptly` drives it in the TEST \
                  build and can only ever measure that half; a frame that waits in the other \
                  half is a frozen window for the user and a green suite for whoever ships \
                  it. The window's behaviour is decided by the values `build_frame` is \
@@ -4247,17 +4247,18 @@ mod source_pins {
     /// one.**
     ///
     /// The seam `build_frame` grew this round is what lets
-    /// `frame_promptness::the_frame_closure_returns_promptly` drive the real
+    /// `frame_promptness::the_loaded_vault_returns_promptly` drive the real
     /// frame closure without a `bw` spawn, an HTTP call or a read of the real
     /// `settings.json`. The objection a seam like that has to answer is that
     /// it might ALSO be a new way for production to reach a spawn nothing
     /// guards. It is not, and the reason is in the source rather than in this
     /// paragraph: the substitute constructor lives in a module gated to the
     /// test configuration, so it is not compiled into the binary the user
-    /// runs, and the three fields are private, so nothing outside
+    /// runs, and **all four fields are private**, so nothing outside
     /// `mod vault_window` can build one any other way. What is left is one
-    /// constructor whose body names the same two spawn functions the call
-    /// sites used to name directly.
+    /// constructor whose body names the same **three** spawn functions the
+    /// call sites used to name directly, plus the settings path they used to
+    /// compute inline.
     #[test]
     fn production_is_the_only_env_a_shipping_build_has() {
         let production = sanitized(&production());
@@ -4424,10 +4425,50 @@ mod frame_promptness {
     /// The fixture vault's one login. Its name is the item list's positive
     /// control.
     const LOGIN_NAME: &str = "Harness Login";
-    /// Its username, which the read detail pane paints and the item list row
-    /// does not. Distinct from the account email above so that a label
-    /// matching this cannot have come from the titlebar.
+    /// Its username. **Not a control**, and the reason the two below exist.
+    ///
+    /// It was one, on the claim that "the item-list row does not paint it".
+    /// The row DOES paint it -- `item_list.rs`'s row subtitle -- and the
+    /// harness's own painted dump shows this string twice. Measured: with
+    /// `draw_read_arm` returning `DetailAction::None` at its top, so the read
+    /// pane paints nothing at all, the old control SURVIVED; with
+    /// `draw_item_list` returning at its top, it SURVIVED again. Only killing
+    /// both together turned it red, which is the whole of "at least one of
+    /// the two panes drew something". Kept as the fixture's username because
+    /// the item list still needs a username to put in a row.
     const LOGIN_USERNAME: &str = "harness-detail-username";
+    /// **The read detail pane's control.** The heading of its LOGIN
+    /// CREDENTIALS card, painted by `detail::draw_detail_read` and by nothing
+    /// else in this window -- not the item list, not the sidebar, not the
+    /// titlebar. See [`the_loaded_vault_returns_promptly`].
+    const DETAIL_PANE_ONLY: &str = "LOGIN CREDENTIALS";
+    /// **The item list's control**: its search field's hint, which
+    /// `item_list::search_hint` produces and `draw_item_list` is the sole
+    /// caller of. The count is the fixture's own two items, so a list that
+    /// drew its chrome over an empty vault does not satisfy it either.
+    const ITEM_LIST_ONLY: &str = "Search 2 items";
+    /// **The `DetailMode::Edit` arm's control**: `detail_edit::form_title`'s
+    /// answer for an existing login. `draw_detail_edit` is its only caller,
+    /// and the read pane's Edit *button* reads "Edit" alone, so this cannot
+    /// be satisfied by the pane the click started from.
+    const EDITOR_EDIT_TITLE: &str = "Edit login";
+    /// **The `DetailMode::Create` arm's control**, the same title's other
+    /// half. `creating` is the only thing that chooses between them, and
+    /// `DetailMode::Create` is the only arm that passes `true`.
+    const EDITOR_CREATE_TITLE: &str = "New login";
+    /// **The item row context menu's control.** `item_list::menu_entries`
+    /// produces it and `response.context_menu`'s closure is the only thing
+    /// that draws it; no pane on this screen has a "Move to folder" of its
+    /// own.
+    const ROW_MENU_ONLY: &str = super::super::item_list::MOVE_TO_FOLDER_LABEL;
+    /// **The preferences modal's control**: the General section's subtitle,
+    /// which `prefs_ui::section_heading` paints and nothing in this window
+    /// does. Deliberately NOT `prefs_ui::MODAL_TITLE` ("Preferences"), which
+    /// is also the tune button's hover text -- the pointer is resting on that
+    /// button when the modal opens, so its tooltip would satisfy a control
+    /// that meant to be about the modal.
+    const PREFS_MODAL_ONLY: &str =
+        "How Deskwarden runs in the background, and when it locks itself.";
     /// The one Send [`counted_send_list`] hands back, and the Sends screen's
     /// second positive control: a row with this name on it can only have been
     /// painted by `draw_send_pane`'s `Ok` arm.
@@ -4609,13 +4650,41 @@ mod frame_promptness {
         /// `false` and `draw_sidebar` is the sole thing that writes it, so
         /// this arm cannot be reached except by clicking.
         press_sends: bool,
+        /// Whether to press the read detail pane's **Edit** button once the
+        /// vault is up. The only producer of `DetailAction::Edit`, which is
+        /// the only thing that writes `DetailMode::Edit` -- so, like the
+        /// Sends row, there is no back door and this drives the sequence of
+        /// frames a user's click produces.
+        press_edit: bool,
+        /// Whether to press the titlebar's **Preferences** control (the tune
+        /// mark), the only writer of the `prefs` cell and so the only way
+        /// into the modal block at the very end of the closure.
+        press_prefs: bool,
+        /// Whether to send **Ctrl+N**, the only other producer of
+        /// `DetailMode::Create` besides the sidebar's own new-item menu, and
+        /// the one that needs no control located on screen first.
+        press_ctrl_n: bool,
+        /// Whether to RIGHT-click the fixture login's row, which is the only
+        /// way into `item_list.rs`'s `response.context_menu` closure --
+        /// measured, a sixty-second spin in it survived the whole previous
+        /// harness.
+        press_row_menu: bool,
     }
 
     impl Scenario {
         /// The shape every scenario starts from: production's `pre_styled`,
         /// a loader that answers, [`FRAMES`] frames, no click.
         fn new() -> Self {
-            Self { pre_styled: false, load: load_that_answers, frames: FRAMES, press_sends: false }
+            Self {
+                pre_styled: false,
+                load: load_that_answers,
+                frames: FRAMES,
+                press_sends: false,
+                press_edit: false,
+                press_prefs: false,
+                press_ctrl_n: false,
+                press_row_menu: false,
+            }
         }
     }
 
@@ -4648,25 +4717,68 @@ mod frame_promptness {
         }
     }
 
+    /// The two ways [`within`] fails, kept apart.
+    ///
+    /// They used to be one `Err(())`, and every failure therefore read "did
+    /// not come back within 20s -- either one frame is WAITING ... or the
+    /// frame panicked". A panic *arrived* as a timeout because the only
+    /// signal was the sender being dropped, so an epaint panic in the frame
+    /// burned the whole budget and then reported the wrong diagnosis first.
+    /// The panic is caught on the worker now, so the report is immediate and
+    /// says which of the two happened.
+    #[derive(Debug)]
+    enum Halt {
+        /// The budget ran out. The worker is still running; see this module's
+        /// doc for why it is left that way.
+        Timeout,
+        /// The body unwound, and this is what it said.
+        Panicked(String),
+    }
+
+    /// What a caught panic payload actually said, for the two payload types
+    /// `panic!` produces. Anything else is a type this harness cannot name,
+    /// and saying so beats printing nothing.
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            (*message).to_string()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "a panic payload that is neither `&str` nor `String`".to_string()
+        }
+    }
+
     /// Runs `work` on its own thread and gives it `budget` to answer.
     ///
-    /// `Err(())` is "it did not answer in time", and the thread is left
-    /// running -- see this module's doc. `work` returning is the only way to
-    /// get `Ok`, so a panic inside it arrives as `Err` too (the sender is
-    /// dropped), which is why the caller's message names both possibilities.
+    /// `Err(Halt::Timeout)` is "it did not answer in time", and the thread is
+    /// left running -- see this module's doc. `Err(Halt::Panicked(_))` is the
+    /// body unwinding, caught on the worker so it is reported the moment it
+    /// happens rather than at the end of the budget.
     fn within<T: Send + 'static>(
         budget: Duration,
         work: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, ()> {
-        let (tx, rx) = mpsc::channel::<T>();
+    ) -> Result<T, Halt> {
+        let (tx, rx) = mpsc::channel::<Result<T, String>>();
         std::thread::Builder::new()
             .name("vault-frame-harness".to_string())
             .stack_size(16 * 1024 * 1024)
             .spawn(move || {
-                let _ = tx.send(work());
+                // `AssertUnwindSafe` because `work` is a closure this module
+                // wrote, run on a thread that is thrown away either way:
+                // nothing it could leave half-written outlives the catch.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                    .map_err(panic_message);
+                let _ = tx.send(outcome);
             })
             .expect("could not start the harness thread");
-        rx.recv_timeout(budget).map_err(|_| ())
+        match rx.recv_timeout(budget) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(message)) => Err(Halt::Panicked(message)),
+            // The sender dropped without sending is only reachable if the
+            // catch itself failed to run; reported as the timeout it is
+            // indistinguishable from.
+            Err(_) => Err(Halt::Timeout),
+        }
     }
 
     fn collect_labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
@@ -4681,6 +4793,36 @@ mod frame_promptness {
             }
             _ => {}
         }
+    }
+
+    /// Everything painted, as one shape, which is what `theme::icon_probe`'s
+    /// finders take: the two controls this harness has to press paint no text
+    /// and cannot be found any other way.
+    fn all_shapes(output: &egui::FullOutput) -> egui::Shape {
+        egui::Shape::Vec(output.shapes.iter().map(|clipped| clipped.shape.clone()).collect())
+    }
+
+    /// The centre of the label reading exactly `needle` on `output`, or a
+    /// failure naming everything that WAS painted.
+    ///
+    /// Exact equality, not `contains`: "Edit" as a substring matches the
+    /// editor's own "Edit login" heading, and a scenario that clicked the
+    /// heading it was supposed to produce would be a click on nothing dressed
+    /// up as a driven arm.
+    #[track_caller]
+    fn locate_label(output: &egui::FullOutput, needle: &str, owner: &str) -> egui::Pos2 {
+        let labels = labels_of(output);
+        labels
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{owner} painted no {needle:?} to press, so this scenario cannot reach \
+                     what it is about at all. What was painted: {:?}",
+                    labels.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                )
+            })
     }
 
     fn labels_of(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
@@ -4766,28 +4908,17 @@ mod frame_promptness {
         for _ in 1..scenario.frames {
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
-        if scenario.press_sends {
-            let labels = labels_of(&output);
-            let pos = labels
-                .iter()
-                .find(|(text, _)| text == super::super::sidebar::SENDS_ROW_LABEL)
-                .map(|(_, rect)| rect.center())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "the sidebar painted no {:?} row to press, so this scenario cannot \
-                         reach the Sends screen at all. What was painted: {:?}",
-                        super::super::sidebar::SENDS_ROW_LABEL,
-                        labels.iter().map(|(t, _)| t).collect::<Vec<_>>()
-                    )
-                });
-            // A press AND a release is what egui counts as a click, and the
-            // frame that locates the row cannot be the frame that clicks it.
-            let button = |pos, pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: Default::default(),
-            };
+        // A press AND a release is what egui counts as a click, and the frame
+        // that locates a control cannot be the frame that clicks it.
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let click = |ctx: &egui::Context,
+                     frame_fn: &mut dyn FnMut(&mut egui::Ui),
+                     pos: egui::Pos2| {
             let _ = ctx.run_ui(
                 egui::RawInput {
                     events: vec![egui::Event::PointerMoved(pos), button(pos, true)],
@@ -4799,10 +4930,109 @@ mod frame_promptness {
                 egui::RawInput { events: vec![button(pos, false)], ..input() },
                 |ui| frame_fn(ui),
             );
+        };
+        if scenario.press_sends {
+            let pos = locate_label(&output, super::super::sidebar::SENDS_ROW_LABEL, "the sidebar");
+            click(&ctx, &mut *frame_fn, pos);
             // Two more settled frames, so what is read below is the Sends
             // screen at rest rather than the frame the click landed on: the
             // fetch is started by the frame that first draws the screen, and
             // its answer is not drained until the frame after that.
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        if scenario.press_edit {
+            // Edit lives inside the read pane's OVERFLOW MENU, at the user's
+            // direction -- so reaching it is two clicks, exactly as it is for
+            // a user. The kebab paints no text either; `kebab_dots` finds it
+            // the same way `tune_icons` finds the tune mark, and
+            // `theme::kebab_button` has exactly one production call site (the
+            // one being pressed here), so "the first mark found" is not a
+            // guess.
+            let dots = crate::theme::icon_probe::kebab_dots(&all_shapes(&output));
+            let (rect, _) = *dots.first().unwrap_or_else(|| {
+                panic!(
+                    "the read pane painted no overflow menu to open, so this scenario cannot \
+                     reach the editor. What was painted: {:?}",
+                    labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+                )
+            });
+            click(&ctx, &mut *frame_fn, rect.center());
+            // The menu is open from the frame after the release; this is the
+            // frame that paints its entries, and so the one "Edit" is found
+            // on.
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+            let pos = locate_label(&output, "Edit", "the read pane's overflow menu");
+            click(&ctx, &mut *frame_fn, pos);
+            // The click is applied by the frame after the release, and the
+            // editor is drawn by the frame after that.
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        if scenario.press_ctrl_n {
+            let key = |pressed| egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            };
+            // `RawInput::modifiers` as well as the event's: the closure asks
+            // `i.modifiers.ctrl && i.key_pressed(N)`, and `modifiers` is the
+            // frame's own held-key state rather than anything derived from
+            // the event list. Setting only the event's leaves Ctrl+N reading
+            // as a bare N, which is nothing at all.
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![key(true)],
+                    modifiers: egui::Modifiers::CTRL,
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput { events: vec![key(false)], ..input() },
+                |ui| frame_fn(ui),
+            );
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        if scenario.press_row_menu {
+            let pos = locate_label(&output, LOGIN_NAME, "the item list");
+            let secondary = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerMoved(pos), secondary(true)],
+                    ..input()
+                },
+                |ui| frame_fn(ui),
+            );
+            let _ = ctx.run_ui(
+                egui::RawInput { events: vec![secondary(false)], ..input() },
+                |ui| frame_fn(ui),
+            );
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
+        if scenario.press_prefs {
+            // The tune mark paints no text, so it cannot be found the way
+            // every other control here is. `theme::icon_probe::tune_icons` is
+            // the crate's existing answer to "where is that mark" -- it finds
+            // the knobs by the radius that draws them, which is the same two
+            // numbers `tune_button` uses, so a retuned mark moves this
+            // scenario with it instead of stranding it.
+            let marks = crate::theme::icon_probe::tune_icons(&all_shapes(&output));
+            let (rect, _) = *marks.first().unwrap_or_else(|| {
+                panic!(
+                    "the titlebar painted no tune mark to press, so this scenario cannot open \
+                     the preferences modal at all. What was painted: {:?}",
+                    labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+                )
+            });
+            click(&ctx, &mut *frame_fn, rect.center());
             let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
@@ -4827,17 +5057,24 @@ mod frame_promptness {
     fn measured(tag: &'static str, scenario: Scenario) -> Outcome {
         let scratch = Scratch::new(tag);
         let path = scratch.0.clone();
-        let outcome = within(BUDGET, move || drive(scenario, &path)).unwrap_or_else(|()| {
-            panic!(
-                "the {tag} scenario's {} frames of the vault window did not come back within \
-                 {BUDGET:?}. Either one frame is WAITING -- on a channel, a lock, a thread, a \
-                 process, a file handle, a busy spin, anything at all; the user cannot tell \
-                 those apart and neither does this test -- or the frame panicked, in which \
-                 case the panic is printed above this line. This is the whole property: the \
-                 eframe thread is the only thread this window has, and a frame that does not \
-                 return is a frozen window, no repaint and no input, for as long as it takes",
+        let outcome = within(BUDGET, move || drive(scenario, &path)).unwrap_or_else(|halt| match halt
+        {
+            Halt::Panicked(message) => panic!(
+                "the {tag} scenario's {} frames of the vault window PANICKED: {message}. Not a \
+                 timeout -- this is reported the moment it happens rather than after \
+                 {BUDGET:?}, which is what it used to cost to find out",
                 scenario.frames
-            )
+            ),
+            Halt::Timeout => panic!(
+                "the {tag} scenario's {} frames of the vault window did not come back within \
+                 {BUDGET:?}. One frame is WAITING -- on a channel, a lock, a thread, a \
+                 process, a file handle, a busy spin, anything at all; the user cannot tell \
+                 those apart and neither does this test. (It is NOT a panic: a panic is \
+                 caught and reported as one.) This is the whole property: the eframe thread \
+                 is the only thread this window has, and a frame that does not return is a \
+                 frozen window, no repaint and no input, for as long as it takes",
+                scenario.frames
+            ),
         });
         assert!(
             outcome.elapsed < BUDGET,
@@ -4944,24 +5181,155 @@ mod frame_promptness {
     /// Positive controls, one per pane, because "the arm ran" and "both panes
     /// drew" are different claims and only the second is worth having:
     ///
-    ///  * the fixture item's NAME is on screen -- `draw_item_list` ran.
-    ///  * the fixture item's USERNAME is on screen -- and the item-list row
-    ///    does not paint it, so only the read detail pane can have. Without
-    ///    this, a spin in the detail pane and a working list would look
-    ///    identical to a working window.
+    ///  * [`ITEM_LIST_ONLY`], the search field's hint -- `draw_item_list` ran.
+    ///  * [`DETAIL_PANE_ONLY`], the LOGIN CREDENTIALS card's heading -- the
+    ///    read detail pane ran.
+    ///
+    /// **Both were vacuous before.** They were the fixture's name and its
+    /// USERNAME, on the claim that the list row does not paint the username.
+    /// It does, as its subtitle. Measured: an early return at the top of
+    /// `draw_read_arm` SURVIVED, an early return at the top of
+    /// `draw_item_list` SURVIVED, and only both together were caught -- so
+    /// this test asserted nothing more than "at least one of the two panes
+    /// drew the fixture item". The two strings above are each produced by
+    /// exactly one of the panes, and each mutant now fails ALONE.
     #[test]
     fn the_loaded_vault_returns_promptly() {
         let outcome = measured("vault", Scenario::new());
         assert_the_body_was_entered("vault", &outcome);
         outcome.expect_painted(
-            LOGIN_NAME,
-            "the loaded window painted no item row, so the item list never drew",
+            ITEM_LIST_ONLY,
+            "the loaded window painted no search hint, so `draw_item_list` never drew -- and \
+             the hint is the one thing on that half of the screen the detail pane cannot \
+             produce",
         );
         outcome.expect_painted(
-            LOGIN_USERNAME,
-            "the loaded window painted no username, so the DETAIL PANE never drew -- the \
-             list alone is half this screen, and a frame that waits in the pane beside it \
-             is the same frozen window",
+            DETAIL_PANE_ONLY,
+            "the loaded window painted no LOGIN CREDENTIALS card, so the READ DETAIL PANE \
+             never drew -- the list alone is half this screen, and a frame that waits in the \
+             pane beside it is the same frozen window",
+        );
+    }
+
+    /// **The item EDITOR returns promptly** -- `DetailMode::Edit`, reached
+    /// the only way a user can reach it: by pressing the read pane's Edit
+    /// button.
+    ///
+    /// This arm and the one below sit in `mod.rs` 2716..3241, the largest
+    /// blind region the coverage instrumentation found: 525 consecutive
+    /// lines, 22% of the closure, not one statement of which any scenario
+    /// executed. Measured against the previous harness, a sixty-second spin
+    /// at the top of each of the two editor arms SURVIVED -- 7 passed in
+    /// 0.45s.
+    ///
+    /// Two positive controls:
+    ///
+    ///  * [`EDITOR_EDIT_TITLE`] is on screen. Only `draw_detail_edit` with
+    ///    `creating: false` paints it, and the button that was pressed reads
+    ///    "Edit" alone, so the click really did change the mode.
+    ///  * [`DETAIL_PANE_ONLY`] is NOT. The editor REPLACES the read pane; a
+    ///    window showing both would mean the press landed somewhere else and
+    ///    this test measured the read arm over again.
+    #[test]
+    fn the_item_editor_returns_promptly() {
+        let outcome = measured("edit", Scenario { press_edit: true, ..Scenario::new() });
+        assert_the_body_was_entered("edit", &outcome);
+        outcome.expect_painted(
+            EDITOR_EDIT_TITLE,
+            "the Edit button was pressed and no edit form is on screen, so `DetailMode::Edit` \
+             was never entered and this test is measuring the read pane again",
+        );
+        assert!(
+            !outcome.painted(DETAIL_PANE_ONLY),
+            "the edit form is up and the read pane's {DETAIL_PANE_ONLY:?} card is still \
+             painted, so the pane was not replaced -- the click did not take. What was \
+             painted: {:?}",
+            outcome.painted
+        );
+    }
+
+    /// **The new-item form returns promptly** -- `DetailMode::Create`,
+    /// reached by Ctrl+N, which `mod.rs`'s keyboard block is the only
+    /// producer of besides the sidebar's own menu.
+    ///
+    /// Controls mirror the editor's, in the other direction:
+    ///
+    ///  * [`EDITOR_CREATE_TITLE`] is on screen -- `draw_detail_edit` with
+    ///    `creating: true`, which only the `Create` arm passes.
+    ///  * [`EDITOR_EDIT_TITLE`] is NOT, which is what separates this arm from
+    ///    the one above. The two differ by a single `bool` and every other
+    ///    label on the form is shared, so without this the two scenarios
+    ///    would be the same test written twice.
+    #[test]
+    fn the_new_item_form_returns_promptly() {
+        let outcome = measured("create", Scenario { press_ctrl_n: true, ..Scenario::new() });
+        assert_the_body_was_entered("create", &outcome);
+        outcome.expect_painted(
+            EDITOR_CREATE_TITLE,
+            "Ctrl+N was pressed and no new-item form is on screen, so `DetailMode::Create` \
+             was never entered",
+        );
+        assert!(
+            !outcome.painted(EDITOR_EDIT_TITLE),
+            "the form on screen is the EDIT form, not the create form -- this scenario is \
+             measuring the arm the test above already measures. What was painted: {:?}",
+            outcome.painted
+        );
+    }
+
+    /// **The item row's context menu returns promptly.**
+    ///
+    /// `item_list.rs`'s `response.context_menu` closure, which builds and
+    /// draws every per-row command. Nothing right-clicked a row until now, so
+    /// a sixty-second spin at the top of that closure was measured green
+    /// against the whole previous suite -- and a menu that never comes back
+    /// freezes the window under it, because it is drawn by the same frame.
+    ///
+    /// Positive control: [`ROW_MENU_ONLY`], an entry that exists nowhere but
+    /// in that menu. The row itself, the detail pane and the sidebar all stay
+    /// on screen while a context menu is up, so nothing weaker would
+    /// distinguish "the menu opened" from "the right-click did nothing".
+    #[test]
+    fn the_item_row_menu_returns_promptly() {
+        let outcome = measured("row-menu", Scenario { press_row_menu: true, ..Scenario::new() });
+        assert_the_body_was_entered("row-menu", &outcome);
+        outcome.expect_painted(
+            ROW_MENU_ONLY,
+            "the item row was right-clicked and no context menu is on screen, so \
+             `response.context_menu`'s closure never ran",
+        );
+    }
+
+    /// **The preferences modal returns promptly.**
+    ///
+    /// The block at the very end of the closure, past every `return` in the
+    /// body match. It is drawn over this window rather than in a window of
+    /// its own, so a frame that waits inside `draw_prefs_modal` freezes the
+    /// vault window behind it too -- and a sixty-second spin there was
+    /// measured green against the previous harness.
+    ///
+    /// Reached by pressing the titlebar's tune mark, the only writer of the
+    /// `prefs` cell. Two positive controls:
+    ///
+    ///  * [`PREFS_MODAL_ONLY`] is on screen -- the General section's
+    ///    subtitle, which only `prefs_ui` paints.
+    ///  * the vault behind it is STILL painted. The modal is an overlay, not
+    ///    a screen: if the item list vanished, the click did something other
+    ///    than open the modal and this scenario is not measuring an overlay
+    ///    at all.
+    #[test]
+    fn the_preferences_modal_returns_promptly() {
+        let outcome = measured("prefs", Scenario { press_prefs: true, ..Scenario::new() });
+        assert_the_body_was_entered("prefs", &outcome);
+        outcome.expect_painted(
+            PREFS_MODAL_ONLY,
+            "the tune mark was pressed and the preferences modal is not on screen, so the \
+             block at the end of the closure never ran",
+        );
+        outcome.expect_painted(
+            ITEM_LIST_ONLY,
+            "the preferences modal is up and the vault window behind it is gone, so this is \
+             not the overlay this test is about",
         );
     }
 
@@ -5060,6 +5428,44 @@ mod frame_promptness {
         );
     }
 
+    /// **A body that PANICS is reported as a panic, not as a timeout.**
+    ///
+    /// It used to be the other way round: the only signal was the sender
+    /// being dropped, so an epaint panic in the frame -- much the commonest
+    /// way one of these scenarios goes wrong -- burned the whole twenty
+    /// seconds and then produced a message whose first sentence was the wrong
+    /// diagnosis. Both halves are asserted: the reason must be the panic's
+    /// own words, and it must arrive nowhere near the budget.
+    #[test]
+    fn a_body_that_panics_is_reported_as_a_panic_rather_than_as_a_timeout() {
+        // The default hook would print this deliberate panic and make a green
+        // run look like a failed one; restored before the assertions so a
+        // real failure below still reports normally.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let asked_at = Instant::now();
+        let answer = within(Duration::from_secs(20), || -> u8 {
+            panic!("the harness panicked on purpose")
+        });
+        std::panic::set_hook(hook);
+        match answer {
+            Err(Halt::Panicked(message)) => assert!(
+                message.contains("on purpose"),
+                "the panic was reported without what it said: {message:?}"
+            ),
+            other => panic!(
+                "a body that panicked was reported as {other:?} rather than as a panic, so \
+                 every panicking scenario spends its whole budget and then blames a wait"
+            ),
+        }
+        assert!(
+            asked_at.elapsed() < Duration::from_secs(5),
+            "the panic took {:?} to report -- it was waited out rather than caught, which is \
+             the twenty-second silence this catch exists to remove",
+            asked_at.elapsed()
+        );
+    }
+
     /// **The scratch directory does not survive the run.**
     ///
     /// The reported hygiene bug was that `FillStats::new` and the icons path
@@ -5090,7 +5496,7 @@ mod frame_promptness {
                 let path = path.clone();
                 move || drive(Scenario::new(), &path)
             })
-            .unwrap_or_else(|()| panic!("the hygiene scenario did not come back"));
+            .unwrap_or_else(|halt| panic!("the hygiene scenario did not come back: {halt:?}"));
             assert!(outcome.load_spawns >= 1, "control: the hygiene scenario built no window");
             // Control: there IS something to delete when the guard drops.
             std::fs::create_dir_all(path.join("icons"))

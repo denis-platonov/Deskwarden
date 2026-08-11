@@ -196,6 +196,30 @@ pub fn raise_this_process() -> Raised {
     raise_on(&Win32Desktop, Target::Any)
 }
 
+/// The handle of **this process's** top-level window titled `title`, if it
+/// has one.
+///
+/// The process-scoped answer to "which window is ours". `FindWindowW(None,
+/// title)` is the obvious way to ask and it is the wrong one: it walks the
+/// whole desktop and returns whichever window `EnumWindows` reaches first,
+/// so a File Explorer window open on a folder named `Deskwarden` -- or a
+/// second copy of this app -- answers it. Callers here only ever want their
+/// OWN window, and `win32::own_windows` already filters by
+/// `GetCurrentProcessId`, so this is both the safer question and the one
+/// that was actually meant.
+///
+/// Unlike [`pick`] this does NOT skip invisible windows: its one caller
+/// ([`crate::login_ui::round_window_corners`]) runs from the first painted
+/// frame, before the window is necessarily mapped, and a corner preference
+/// set on a not-yet-visible window is applied when it appears.
+///
+/// In a test process, which has no windows at all, this is `None` and every
+/// caller becomes a no-op -- which is why no test can reach out of the
+/// process through it.
+pub fn own_window_titled(title: &str) -> Option<isize> {
+    win32::own_windows().into_iter().find(|w| w.title == title).map(|w| w.hwnd)
+}
+
 /// The real desktop. Thin wrappers only: every decision is in [`raise_on`].
 pub struct Win32Desktop;
 
@@ -1111,9 +1135,9 @@ mod tests {
     /// title strings are pairwise distinct would fail today, so it is not a
     /// guard that can be added -- it is a demand to rename three windows. That
     /// rename was rejected: the titles are load-bearing outside this crate.
-    /// `round_window_corners` (`login_ui.rs`) reaches for its window with
-    /// `FindWindowW(None, title)`, which is NOT scoped to this process and
-    /// matches on the string, and `raise_window` matches on it too; and all
+    /// `round_window_corners` (`login_ui.rs`) reaches for its window by title
+    /// through [`own_window_titled`] -- process-scoped now, but still matching
+    /// on the string -- and `raise_window` matches on it too; and all
     /// three files are owned elsewhere. Distinct titles would also only remove
     /// the *consequence*. Serialization is the property the code actually
     /// relies on, so it is the one written down here.

@@ -565,7 +565,16 @@ pub fn build_frame(
     // `settings_path` is read below to place the window and again after the
     // loop to save its geometry, so the closure gets its own copy to seed the
     // modal from.
-    let settings_path_for_prefs = crate::settings::default_path();
+    //
+    // **Through the seam**, not `settings::default_path()` again. This used to
+    // compute its own path, outside [`VaultFrameEnv`] -- so a harness that
+    // handed a scratch `settings.json` still had this one reader pointed at
+    // the user's real `%APPDATA%\Deskwarden\settings.json`. Nothing leaked,
+    // because the gear arm below is undriven and `default_path` creates
+    // nothing; but the gear is exactly what a widening drives next, and the
+    // leak would have arrived silently. One source of this path, and it is the
+    // seam's.
+    let settings_path_for_prefs = env.settings_path.clone();
     // See `VaultWindowResult::switch_to`. A fourth cell rather than a share of
     // any of the three above, for the reason that field's doc gives.
     let switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>> =
@@ -3372,7 +3381,7 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// without any of them happening.
 ///
 /// **Why this exists.** The property `send_ui`'s
-/// `frame_promptness::the_frame_closure_returns_promptly` holds is that one
+/// `frame_promptness::the_loaded_vault_returns_promptly` holds is that one
 /// frame RETURNS PROMPTLY, and the only honest way to hold it is to run the
 /// frame and time it. Seven rounds of source scanning were tried first and
 /// five independent mutants were measured through them (a `while` spin, a

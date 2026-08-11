@@ -1037,18 +1037,34 @@ pub fn draw_window_chrome_with_extra(
 /// drop-shadow) even though it is frameless. Windows 11 only; on Windows 10
 /// the call fails harmlessly and the window stays square. Resolved by title
 /// because eframe never exposes the HWND.
+///
+/// **Scoped to this process**, through
+/// [`crate::foreground::own_window_titled`]. It used to ask
+/// `FindWindowW(None, title)`, which searches the WHOLE DESKTOP and returns
+/// whichever top-level window `EnumWindows` reaches first with that exact
+/// title -- and "Deskwarden" is a common noun: a File Explorer window open on
+/// this repo's own `deskwarden\` folder carries exactly that title, and so
+/// does a second copy of this app. This function then wrote a DWM attribute
+/// into a window belonging to a process it does not own, non-deterministically
+/// and permanently for that window's lifetime. Measured happening: the frame
+/// harness reaches the `!styled` block six times per suite run, and it took
+/// this call with it.
+///
+/// Process-scoping is the fix rather than a test seam because it is what
+/// production wanted all along -- this app only ever means its own window --
+/// so the production function is corrected rather than hidden from tests. In
+/// a test process, which owns no windows, the lookup is `None` and this is a
+/// no-op that touches nothing.
 pub fn round_window_corners(window_title: &str) {
-    use windows::core::HSTRING;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
     };
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
 
     unsafe {
-        let hwnd: HWND = match FindWindowW(None, &HSTRING::from(window_title)) {
-            Ok(hwnd) if !hwnd.is_invalid() => hwnd,
-            _ => return,
+        let hwnd: HWND = match crate::foreground::own_window_titled(window_title) {
+            Some(handle) => HWND(handle as *mut core::ffi::c_void),
+            None => return,
         };
         let preference = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
@@ -2594,6 +2610,99 @@ pub fn run_login_flow(account: Option<(&Path, &Account)>, first_run: bool) -> St
             log::error!("login window was closed without producing a session token; exiting");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod round_window_corners_stays_inside_this_process {
+    use super::{round_window_corners, VAULT_WINDOW_TITLE, WINDOW_TITLE};
+
+    /// **This process's window lookup answers `None` in a test process, for
+    /// every title this crate rounds the corners of.**
+    ///
+    /// The reported defect: `round_window_corners` asked
+    /// `FindWindowW(None, title)`, which walks the WHOLE DESKTOP and returns
+    /// the first top-level window with that exact title -- and
+    /// `crate::vault_window::WINDOW_TITLE` is "Deskwarden", which a File
+    /// Explorer window open on this repo's own `deskwarden\` folder carries.
+    /// It then wrote `DWMWA_WINDOW_CORNER_PREFERENCE` into a window belonging
+    /// to another process, non-deterministically, permanently for that
+    /// window's lifetime. A reviewer measured the frame harness reaching it
+    /// six times per suite run **while the user's real Deskwarden was
+    /// running**.
+    ///
+    /// `foreground::own_window_titled` filters by `GetCurrentProcessId`, and
+    /// the test process opens no windows, so this is `None` no matter what is
+    /// on the desktop -- which is exactly the property: a title collision
+    /// with anything outside this process can no longer be reached.
+    ///
+    /// This is a live call, not a source scan: it fails against a build that
+    /// went back to a desktop-wide `FindWindowW` **while an app or an
+    /// Explorer window with one of these titles is open**, and it costs
+    /// nothing when none is.
+    #[test]
+    fn no_window_of_this_process_answers_to_any_title_this_crate_rounds() {
+        for title in [WINDOW_TITLE, VAULT_WINDOW_TITLE, "Deskwarden Preferences"] {
+            assert_eq!(
+                crate::foreground::own_window_titled(title),
+                None,
+                "a test process owns no windows, so nothing should answer to {title:?}; \
+                 whatever did belongs to another process and `round_window_corners` would \
+                 have written a DWM attribute into it"
+            );
+            // And the caller itself is therefore inert. Calling it is the
+            // point: a `None` lookup that the caller ignored would be no fix
+            // at all.
+            round_window_corners(title);
+        }
+    }
+
+    /// **The whole crate resolves its own window one way.**
+    ///
+    /// A source guard beside the live one above, because the live one is
+    /// silent on a desktop that happens to have no colliding window open --
+    /// which is most desktops, and none of the CI ones. `FindWindowW` is the
+    /// only desktop-wide window lookup Win32 offers by name, so its absence
+    /// from every call position in this crate is the whole of "nobody asks
+    /// that question any more". It may still be NAMED, in the two paragraphs
+    /// that explain why it is not called.
+    ///
+    /// The scan is over `use` LINES rather than over the whole text, because
+    /// the whole text is where those two paragraphs are: a guard that
+    /// forbade the name outright would forbid writing down why. `FindWindowW`
+    /// is a Win32 import and cannot be called without one, so a file that
+    /// does not import it does not call it.
+    #[test]
+    fn nothing_in_this_crate_imports_the_desktop_wide_window_lookup() {
+        // Split so this line does not match itself.
+        let name = concat!("FindWindow", "W");
+        let mut scanned = 0usize;
+        for (module, source) in [
+            ("login_ui.rs", include_str!("login_ui.rs")),
+            ("foreground.rs", include_str!("foreground.rs")),
+            ("prefs_ui.rs", include_str!("prefs_ui.rs")),
+            ("vault_window/mod.rs", include_str!("vault_window/mod.rs")),
+        ] {
+            for line in source.lines() {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with("use ") {
+                    continue;
+                }
+                scanned += 1;
+                assert!(
+                    !trimmed.contains(name),
+                    "{module} imports {name}, which is not scoped to this process: it returns \
+                     the first window ANYWHERE on the desktop with the title asked for, and \
+                     this app's titles are common enough that a folder window answers to one. \
+                     Use `foreground::own_window_titled`. The line was: {trimmed}"
+                );
+            }
+        }
+        assert!(
+            scanned > 40,
+            "control: only {scanned} `use` lines were inspected across four modules, so this \
+             guard is looking at almost nothing"
+        );
     }
 }
 
@@ -5963,7 +6072,7 @@ mod status_deadline_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 11,
+            modules, 12,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
