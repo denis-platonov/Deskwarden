@@ -157,13 +157,22 @@ pub struct VaultLists<'a> {
     pub live: &'a [VaultItem],
     pub trash: Option<&'a [VaultItem]>,
     pub archive: Option<&'a [VaultItem]>,
+    /// How many Sends this account has, or `None` for "this app does not
+    /// know". A **count** and not a list, because Sends are not `VaultItem`s
+    /// and the rail only ever needs the number; the rows themselves live in
+    /// `vault_window::send_ui`.
+    ///
+    /// `None` covers two situations on purpose -- not fetched, and fetched
+    /// unsuccessfully -- because the badge must say the same thing about
+    /// both: it does not know. See [`badge_for`] and [`UNKNOWN_COUNT`].
+    pub sends: Option<usize>,
 }
 
 impl<'a> VaultLists<'a> {
     /// A window that holds only the live vault -- neither on-demand query has
     /// answered yet. What every caller starts from.
     pub fn live_only(live: &'a [VaultItem]) -> Self {
-        VaultLists { live, trash: None, archive: None }
+        VaultLists { live, trash: None, archive: None, sends: None }
     }
 }
 
@@ -215,7 +224,7 @@ impl SidebarFilter {
         match self {
             SidebarFilter::Trash => FilterSource::Trash,
             SidebarFilter::Archive => FilterSource::Archive,
-            SidebarFilter::All
+                SidebarFilter::All
             | SidebarFilter::Favorites
             | SidebarFilter::Apps
             | SidebarFilter::Logins
@@ -392,6 +401,10 @@ pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
     items.iter().filter(|item| filter.scope_contains(item)).count()
 }
 
+/// The Sends row's label, spelled once so the rail and the tests that press
+/// it cannot drift apart.
+pub const SENDS_ROW_LABEL: &str = "Sends";
+
 /// Whether design 2b paints this row's label in [`theme::TEXT_MUTED`]
 /// (`#605d5d`) rather than the ordinary [`theme::INK`].
 ///
@@ -460,11 +473,44 @@ fn glyph_column_center_x(sidebar_right: f32) -> f32 {
     sidebar_right - FOLDER_EDIT_BUTTON_WIDTH / 2.0
 }
 
+/// One VAULT-section row backed by a [`SidebarFilter`], drawn and handled.
+///
+/// Extracted so the rows above the Sends row and the two below it cannot
+/// drift apart -- in particular so that **every** item row clears
+/// `sends_selected`, which is the invariant that stops the window sitting on
+/// the Sends screen while the rail highlights Cards.
+fn item_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    filter: SidebarFilter,
+    lists: VaultLists<'_>,
+    selected: &mut SidebarFilter,
+    sends_selected: &mut bool,
+) {
+    // NOT `count_for(items, ..)`: Archive and Trash read a different list,
+    // and counting them against the live snapshot is precisely the
+    // always-zero badge those rows shipped with. `badge_for` picks the list,
+    // and returns `None` while it has not been fetched.
+    let count = badge_for(&filter, lists);
+    let width = ui.available_width();
+    let selected_now = *selected == filter && !*sends_selected;
+    if sidebar_row(ui, label, count, selected_now, is_muted(&filter), width).clicked() {
+        *selected = filter;
+        *sends_selected = false;
+    }
+}
+
 pub fn draw_sidebar(
     ui: &mut egui::Ui,
     lists: VaultLists<'_>,
     folders: &[Folder],
     selected: &mut SidebarFilter,
+    // Whether the rail's Sends row is the one selected, rather than any of
+    // the item filters. A second flag beside `selected` and not a variant
+    // inside it -- see the row's own comment below -- and the invariant that
+    // exactly one of the two is live is kept here, in this function, and
+    // nowhere else.
+    sends_selected: &mut bool,
     lock_countdown: &str,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
@@ -498,19 +544,44 @@ pub fn draw_sidebar(
             ("Identities", SidebarFilter::Identities),
             ("Secure notes", SidebarFilter::SecureNotes),
             ("SSH keys", SidebarFilter::SshKeys),
-            // Design 2b's order for the last two: Archive above Trash.
+        ] {
+            item_row(ui, label, filter, lists, selected, sends_selected);
+        }
+        // **Not a `SidebarFilter`.** Every other row in this rail names a cut
+        // of an item list; this one selects a different screen entirely, made
+        // of `crate::send::SendSummary`s that are not `VaultItem`s and have
+        // no id in common with any of them. Giving it a `SidebarFilter`
+        // variant would put it in the type `item_list` matches on to choose
+        // its empty-state nouns and its per-row scoping, i.e. it would force
+        // Sends through the item pane -- which is the one thing the design
+        // says must not happen.
+        //
+        // Placed below the type rows and above Archive/Trash: the rows above
+        // are cuts of the live vault, the two below are vault items put away,
+        // and this is neither. Not muted -- the two below are greyed because
+        // they are outside the working vault, and Sends is a live feature the
+        // user acts in.
+        //
+        // Its badge is `lists.sends`, which is `None` for a fetch that FAILED
+        // as well as for one that has not happened, so it draws
+        // `UNKNOWN_COUNT` rather than a `0` that would read as "nothing of
+        // yours is published". See `send_ui::SendFetch::badge_count`.
+        {
+            let width = ui.available_width();
+            if sidebar_row(ui, SENDS_ROW_LABEL, lists.sends, *sends_selected, false, width).clicked()
+            {
+                *sends_selected = true;
+            }
+        }
+        // Design 2b's order for the last two: Archive above Trash. Below the
+        // Sends row, which is where the two kinds of "not the working vault"
+        // part company -- these are vault items put away, Sends are not vault
+        // items at all.
+        for (label, filter) in [
             ("Archive", SidebarFilter::Archive),
             ("Trash", SidebarFilter::Trash),
         ] {
-            // NOT `count_for(items, ..)`: Archive and Trash read a different
-            // list, and counting them against the live snapshot is precisely
-            // the always-zero badge this row shipped with. `badge_for` picks
-            // the list, and returns `None` while it has not been fetched.
-            let count = badge_for(&filter, lists);
-            let width = ui.available_width();
-            if sidebar_row(ui, label, count, *selected == filter, is_muted(&filter), width).clicked() {
-                *selected = filter;
-            }
+            item_row(ui, label, filter, lists, selected, sends_selected);
         }
         ui.spacing_mut().item_spacing.y = 0.0;
 
@@ -587,12 +658,13 @@ pub fn draw_sidebar(
                 ui,
                 &folder.name,
                 count,
-                *selected == filter,
+                *selected == filter && !*sends_selected,
                 is_muted(&filter),
                 row_width,
             );
             if response.clicked() {
                 *selected = filter.clone();
+                *sends_selected = false;
             }
             // The drop half of the row. Painted AFTER `sidebar_row` and as an
             // OUTLINE rather than a fill, deliberately: the row has already
@@ -1132,6 +1204,7 @@ mod drag_and_drop_tests {
                                 VaultLists::live_only(items),
                                 folders,
                                 &mut filter,
+                                &mut false,
                                 "Locks in 11:42",
                             );
                         },
@@ -1802,11 +1875,12 @@ mod tests {
         let _ = ctx.run_ui(input(), |_ui| {});
 
         let mut selected = SidebarFilter::All;
+        let mut sends_selected = false;
 
         let mut bounds = egui::Rect::NOTHING;
         let output = ctx.run_ui(input(), |ui| {
             bounds = ui.max_rect();
-            draw_sidebar(ui, lists, folders, &mut selected, lock_countdown);
+            draw_sidebar(ui, lists, folders, &mut selected, &mut sends_selected, lock_countdown);
         });
 
         let mut rects = Vec::new();
@@ -1971,6 +2045,9 @@ mod tests {
                 "Identities",
                 "Secure notes",
                 "SSH keys",
+                // The Sends row sits between the type rows and the two
+                // put-away rows; see `draw_sidebar`.
+                "Sends",
                 "Archive",
                 "Trash",
             ]
@@ -2192,6 +2269,7 @@ mod tests {
             live: &live,
             trash: Some(&trash),
             archive: Some(&archive),
+            sends: None,
         };
 
         assert_eq!(badge_for(&SidebarFilter::Trash, lists), Some(2));
@@ -2205,7 +2283,7 @@ mod tests {
     fn the_trash_row_lists_the_trashed_items_themselves() {
         let live = three_unfiled_and_two_filed();
         let trash = vec![trashed("t1"), trashed("t2")];
-        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None };
+        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None, sends: None };
 
         let listed: Vec<&str> = items_for(&SidebarFilter::Trash, lists)
             .expect("the trash list was fetched")
@@ -2233,7 +2311,7 @@ mod tests {
         assert_eq!(badge_text(None), UNKNOWN_COUNT);
 
         let empty: Vec<VaultItem> = Vec::new();
-        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None };
+        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None, sends: None };
         assert_eq!(badge_for(&SidebarFilter::Trash, fetched), Some(0));
         assert_eq!(badge_text(Some(0)), "0");
     }
@@ -2263,7 +2341,7 @@ mod tests {
         let folders = one_real_folder_and_the_virtual_bucket();
         let (painted, _, _) = painted_sidebar_lists(
             "Locks in 11:42",
-            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive) },
+            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive), sends: None },
             &folders,
         );
 
@@ -2312,6 +2390,171 @@ mod tests {
         );
     }
 
+    /// The Sends row's badge is its own count, and `None` -- an en dash --
+    /// for a fetch that has not happened OR has failed.
+    ///
+    /// The row where the `0`-versus-en-dash rule matters most: a `0` beside
+    /// Sends reads as "nothing of yours is published", and a fetch that
+    /// failed has no business saying that. All three states are asserted, so
+    /// this cannot pass against a badge that always reads unknown.
+    #[test]
+    fn the_sends_row_badges_its_own_count_and_never_the_vault() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+
+        // Not fetched, or fetched and failed -- both `None`, both an en dash.
+        let (unknown, _, _) =
+            painted_sidebar_lists("Locks in 11:42", VaultLists::live_only(&live), &folders);
+        assert_eq!(badge_beside(&unknown, SENDS_ROW_LABEL), UNKNOWN_COUNT);
+
+        // Answered, and empty. `0` is a claim, and here it is one this app
+        // has: the CLI said so.
+        let (none_published, _, _) = painted_sidebar_lists(
+            "Locks in 11:42",
+            VaultLists { sends: Some(0), ..VaultLists::live_only(&live) },
+            &folders,
+        );
+        assert_eq!(badge_beside(&none_published, SENDS_ROW_LABEL), "0");
+
+        // Answered, with three. And it is not the live vault's count leaking
+        // through: the live list here has five items.
+        let (three, _, _) = painted_sidebar_lists(
+            "Locks in 11:42",
+            VaultLists { sends: Some(3), ..VaultLists::live_only(&live) },
+            &folders,
+        );
+        assert_eq!(badge_beside(&three, SENDS_ROW_LABEL), "3");
+        assert_eq!(badge_beside(&three, "All items"), "5");
+    }
+
+    /// The row is in the rail, once, and pressing it selects the Sends screen
+    /// **without** disturbing which item filter is selected underneath.
+    ///
+    /// The count assertion comes first on purpose: a row pushed out of the
+    /// sidebar is culled entirely by egui and comes back as nothing, so
+    /// reading geometry before counting would read the rows that survived.
+    #[test]
+    fn the_sends_row_is_in_the_rail_once_and_is_the_only_thing_it_selects() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let (painted, _, _) =
+            painted_sidebar_lists("Locks in 11:42", VaultLists::live_only(&live), &folders);
+        assert_eq!(
+            painted.iter().filter(|(t, _)| t == SENDS_ROW_LABEL).count(),
+            1,
+            "the Sends row is not in the rail exactly once: {painted:?}"
+        );
+
+        // Press it, and the item filter is untouched: Sends is not a cut of
+        // the item list and selecting it must not pretend to be one.
+        let (filter, sends) =
+            press_row(SENDS_ROW_LABEL, SidebarFilter::Logins, false, &live, &folders);
+        assert!(sends, "the Sends row did not select the Sends screen");
+        assert_eq!(filter, SidebarFilter::Logins, "the Sends row changed the item filter");
+
+        // ...and pressing any item row leaves the Sends screen. This is the
+        // invariant `draw_sidebar` exists to keep, and without it the window
+        // would sit on the Sends screen while the rail highlights Cards.
+        let (filter, sends) = press_row("Cards", SidebarFilter::Logins, true, &live, &folders);
+        assert!(!sends, "an item row was clicked and the Sends screen stayed up");
+        assert_eq!(filter, SidebarFilter::Cards);
+
+        // The same for a folder row, which is a separate loop with a separate
+        // click handler -- and therefore a separate chance to forget.
+        let (filter, sends) =
+            press_row("Engineering", SidebarFilter::Logins, true, &live, &folders);
+        assert!(!sends, "a folder row was clicked and the Sends screen stayed up");
+        assert_eq!(filter, SidebarFilter::Folder("f1".into()));
+    }
+
+    /// Presses the sidebar row whose label is `label` and reports the two
+    /// selections afterwards.
+    ///
+    /// A press **and** a release is what egui counts as a click, and the
+    /// frame that locates the row cannot be the frame that clicks it.
+    fn press_row(
+        label: &str,
+        filter: SidebarFilter,
+        sends: bool,
+        live: &[VaultItem],
+        folders: &[Folder],
+    ) -> (SidebarFilter, bool) {
+        const HEIGHT: f32 = 900.0;
+        let ctx = egui::Context::default();
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(crate::vault_window::SIDEBAR_WIDTH, HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(base(), |_ui| {});
+
+        let mut selected = filter;
+        let mut sends_selected = sends;
+        let mut run = |raw: egui::RawInput| {
+            ctx.run_ui(raw, |ui| {
+                draw_sidebar(
+                    ui,
+                    VaultLists::live_only(live),
+                    folders,
+                    &mut selected,
+                    &mut sends_selected,
+                    "Locks in 11:42",
+                );
+            })
+        };
+        let output = run(base());
+        let mut rects: Vec<(String, egui::Rect)> = Vec::new();
+        for clipped in &output.shapes {
+            collect_labelled_rects(&clipped.shape, &mut rects);
+        }
+        let pos = rects
+            .iter()
+            .find(|(text, _)| text == label)
+            .map(|(_, rect)| rect.center())
+            .unwrap_or_else(|| panic!("no sidebar row labelled {label:?}: {rects:?}"));
+
+        let _ = run(egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..base()
+        });
+        let _ = run(egui::RawInput {
+            events: vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            ..base()
+        });
+        (selected, sends_selected)
+    }
+
+    fn collect_labelled_rects(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push((text.galley.text().to_string(), text.visual_bounding_rect()))
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_labelled_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Design 2b paints Archive, Trash and "No folder" in `#605d5d` and every
     /// other row in the ordinary ink.
     ///
@@ -2340,6 +2583,7 @@ mod tests {
                 VaultLists::live_only(&live),
                 &folders,
                 &mut selected,
+                &mut false,
                 "Locks in 11:42",
             );
         });

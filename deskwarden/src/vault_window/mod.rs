@@ -9,6 +9,7 @@ pub mod detail;
 pub mod detail_edit;
 pub mod folder_modal;
 pub mod item_list;
+pub mod send_ui;
 pub mod sidebar;
 
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
@@ -729,6 +730,27 @@ pub fn build_frame(
     // and dropped whenever the live vault is reloaded; see `AuxList`.
     let mut trash_list = AuxList::default();
     let mut archive_list = AuxList::default();
+    // The Sends screen's one piece of cross-frame state. NOT an `AuxList`:
+    // Sends are not `VaultItem`s, they come from a `bw` child rather than
+    // from `bw serve`, and the failure lives inside the `Result` rather than
+    // beside it -- see `send_ui::SendFetch`.
+    let mut send_fetch = send_ui::SendFetch::default();
+    // Whether the Sends row was selected on the PREVIOUS frame, so that
+    // leaving the screen can drop the list it fetched. This is the refetch
+    // policy's only moving part; the rule itself is
+    // `send_ui::should_invalidate_on_leave`.
+    let mut was_on_sends = false;
+    // Whether the rail has the Sends row selected rather than one of the item
+    // filters. A flag beside `filter` and NOT a `SidebarFilter` variant: that
+    // type is the item list's filter, matched on for per-row scoping and for
+    // the empty-state nouns, and a Sends variant in it would be Sends forced
+    // through the item pane. `draw_sidebar` is the single place the two are
+    // kept mutually exclusive.
+    let mut sends_selected = false;
+    let (send_tx, send_rx): (
+        mpsc::Sender<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
+        Receiver<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
+    ) = mpsc::channel();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -1231,6 +1253,28 @@ pub fn build_frame(
             }
         }
 
+        // The Sends fetch reporting back. Non-blocking like every other drain
+        // here, and drained on EVERY frame rather than only when the Sends
+        // row is selected: an answer that arrives a frame after the user
+        // navigated away is still the answer to the question they asked, and
+        // a drain gated on the current row would leave it in the channel with
+        // `in_flight` latched true forever.
+        //
+        // `in_flight` is cleared FIRST, for the reason the aux and TOTP
+        // drains give: the thread that set the flag has finished, whatever
+        // became of its answer.
+        if let Ok(result) = send_rx.try_recv() {
+            send_fetch.in_flight = false;
+            if let Err(e) = &result {
+                log::warn!("could not list this account's Sends: {e:?}");
+            }
+            // Stored whether it succeeded or failed. **The failure is the
+            // value**, not something beside it -- which is what stops the
+            // pane reaching an empty list by way of an error. See
+            // `send_ui::pane_state`.
+            send_fetch.result = Some(result);
+        }
+
         // Non-blocking, like the favicon drain above: the sync thread
         // (spawned from the Sync button below) reports its outcome here, and
         // this loop never waits on it.
@@ -1602,7 +1646,31 @@ pub fn build_frame(
         // The same slot also carries the case where the load gave up with
         // nothing on screen to keep (review 29's Minor 3) -- see
         // `vault_body_state`, which decides between the two.
-        match vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref()) {
+        // Read once, here, and reused by the fetch gate and the panel
+        // routing below, so the frame cannot start a fetch for a screen it
+        // then does not draw.
+        let on_sends = sends_selected;
+        // **The refetch policy.** Leaving the Sends screen drops the list, so
+        // the next visit asks the server again; the rule itself, and the
+        // reasoning for it, is `send_ui::should_invalidate_on_leave`. Applied
+        // before the fetch gate below, so arriving on the screen after a
+        // visit finds `result` already `None` and asks straight away.
+        if send_ui::should_invalidate_on_leave(was_on_sends, on_sends) {
+            send_fetch.invalidate();
+        }
+        was_on_sends = on_sends;
+        let body = vault_body_state(
+            vault_loading,
+            items.is_empty(),
+            vault_load_error.as_deref(),
+            on_sends,
+        );
+        // Read out before the match consumes it. NOT recomputed further down
+        // from `filter` again: two derivations of "is the Sends screen up"
+        // are two things that can disagree, and the one that decides which
+        // panels are drawn must be the one the body state actually returned.
+        let show_sends = matches!(body, VaultBodyState::Sends);
+        match body {
             VaultBodyState::Loading => {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::CANVAS))
@@ -1671,7 +1739,10 @@ pub fn build_frame(
                     });
                 return;
             }
-            VaultBodyState::Vault => {}
+            // Both draw the sidebar and everything above it; they differ only
+            // in what fills the two panes to its right, which is decided by
+            // `show_sends` where those panels are drawn.
+            VaultBodyState::Vault | VaultBodyState::Sends => {}
         }
 
         // No `.stroke(...)` on this frame: `egui::Panel` already paints its
@@ -1712,6 +1783,13 @@ pub fn build_frame(
                 spawn_aux_load(cache.clone(), which, load_generation, window_era, aux_tx.clone());
             }
         }
+        // The Sends list, on the same terms and for the same reasons: the
+        // selected row is what asks for it, once, off the eframe thread. A
+        // user who never opens Sends never spawns a `bw`.
+        if send_fetch.wants_fetch(show_sends) {
+            send_fetch.in_flight = true;
+            spawn_send_list(ui.ctx().clone(), send_tx.clone());
+        }
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -1730,8 +1808,21 @@ pub fn build_frame(
                     live: &items,
                     trash: trash_list.items.as_deref(),
                     archive: archive_list.items.as_deref(),
+                    // A count, not a list -- and `None` for a fetch that
+                    // FAILED as well as for one that has not happened, so the
+                    // badge draws an en dash rather than a `0` that would
+                    // read as "nothing of yours is published". See
+                    // `send_ui::SendFetch::badge_count`.
+                    sends: send_fetch.badge_count(),
                 };
-                match draw_sidebar(ui, lists, &folders, &mut filter, &lock_countdown) {
+                match draw_sidebar(
+                    ui,
+                    lists,
+                    &folders,
+                    &mut filter,
+                    &mut sends_selected,
+                    &lock_countdown,
+                ) {
                     SidebarAction::NewFolder => match cache.create_folder("New folder") {
                         Ok(folder) => folders.push(folder),
                         Err(e) => {
@@ -1797,78 +1888,98 @@ pub fn build_frame(
             Some(OutOfVault::Archive) => archive_list.error.clone(),
             None => None,
         };
+        // A `bw send list` that failed, taken out of the fetch's `Result`.
+        // **Only when the Sends screen is actually up**: the band is drawn by
+        // the Sends pane, so a failure carried while some other row is
+        // selected would win the band and then be painted by nobody -- the
+        // silent failure this whole step is about, produced by the fix for
+        // it.
+        let send_error: Option<String> = match (show_sends, send_fetch.result.as_ref()) {
+            (true, Some(Err(e))) => Some(e.user_message().to_string()),
+            _ => None,
+        };
         // The one message the inline band shows this frame, and which of the
-        // three sources it came from -- see `inline_notice` for the order and
-        // why Generate is first. Computed out here so the dismissal below can
+        // four sources it came from -- see `inline_notice` for the order and
+        // why Sends is first. Computed out here so the dismissal below can
         // clear exactly the source that was on screen.
         let notice = inline_notice(
+            send_error.as_deref(),
             generate_error.as_deref(),
             aux_error.as_deref(),
             move_error.as_deref(),
         );
         let notice_source = notice.map(|(source, _)| source);
+        // Owned, because the central panel is drawn a long way below and the
+        // three `Option<String>`s `notice` borrows are written to in between.
+        let notice_message: Option<String> = notice.map(|(_, message)| message.to_string());
         // The inline band was clicked away. Applied after the closure for the
         // same reason its message is computed before it: the three `Option`s
         // the band reads are borrowed for the length of the call.
         let mut dismiss_move_error = false;
-        egui::Panel::left("vault-item-list")
-            .exact_size(LIST_WIDTH)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(theme::CANVAS))
-            .show(ui, |ui| {
-                // THE LIST THE SELECTED ROW ACTUALLY READS, which for Trash
-                // and Archive is not `items` at all -- those two rows are
-                // separate queries whose results are disjoint from the live
-                // vault (see `sidebar::FilterSource`). Passing `items` here
-                // regardless is what made the Trash row list nothing: the
-                // pane filtered a list that by construction holds none of
-                // its members.
-                //
-                // `None` is carried through to `draw_item_list` rather than
-                // flattened to `&[]` here, because the search placeholder
-                // beneath the toolbar has to be able to tell "no items" from
-                // "no answer yet" -- see `list_unless_unfetched`.
-                let shown: Option<&[VaultItem]> = list_unless_unfetched(
-                    filter.source(),
-                    &items,
-                    trash_list.items.as_deref(),
-                    archive_list.items.as_deref(),
-                );
-                match draw_item_list(
-                    ui,
-                    shown,
-                    &folders,
-                    &filter,
-                    &mut search,
-                    &mut selected_id,
-                    item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
-                    &icons,
-                    &mut visible_ids,
-                    notice.map(|(_, message)| message),
-                    // NOT `notice.is_some()`: the band can be carrying a
-                    // Generate or a Move failure, neither of which says
-                    // anything about whether this list's fetch is still
-                    // running. `aux_error` is this row's own `AuxList::error`
-                    // and is the only one of the three that does.
-                    aux_error.is_some(),
-                ) {
-                    // The kind the `+ New` menu was clicked on -- `empty_of`,
-                    // not `empty`, which would open a login form whatever row
-                    // the user picked. Always one of `CREATABLE_KINDS`; the
-                    // menu has no other rows.
-                    ItemListAction::NewItem(kind) => {
-                        mode = DetailMode::Create(EditDraft::empty_of(kind))
+        // **The item list is not drawn on the Sends screen.** Sends are not
+        // `VaultItem`s and must not be forced through a pane that filters a
+        // list of them; the Sends rows are drawn in the central panel below
+        // instead, at the full width the two panes would have shared.
+        if !show_sends {
+            egui::Panel::left("vault-item-list")
+                .exact_size(LIST_WIDTH)
+                .resizable(false)
+                .frame(egui::Frame::new().fill(theme::CANVAS))
+                .show(ui, |ui| {
+                    // THE LIST THE SELECTED ROW ACTUALLY READS, which for Trash
+                    // and Archive is not `items` at all -- those two rows are
+                    // separate queries whose results are disjoint from the live
+                    // vault (see `sidebar::FilterSource`). Passing `items` here
+                    // regardless is what made the Trash row list nothing: the
+                    // pane filtered a list that by construction holds none of
+                    // its members.
+                    //
+                    // `None` is carried through to `draw_item_list` rather than
+                    // flattened to `&[]` here, because the search placeholder
+                    // beneath the toolbar has to be able to tell "no items" from
+                    // "no answer yet" -- see `list_unless_unfetched`.
+                    let shown: Option<&[VaultItem]> = list_unless_unfetched(
+                        filter.source(),
+                        &items,
+                        trash_list.items.as_deref(),
+                        archive_list.items.as_deref(),
+                    );
+                    match draw_item_list(
+                        ui,
+                        shown,
+                        &folders,
+                        &filter,
+                        &mut search,
+                        &mut selected_id,
+                        item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
+                        &icons,
+                        &mut visible_ids,
+                        notice.map(|(_, message)| message),
+                        // NOT `notice.is_some()`: the band can be carrying a
+                        // Generate or a Move failure, neither of which says
+                        // anything about whether this list's fetch is still
+                        // running. `aux_error` is this row's own `AuxList::error`
+                        // and is the only one of the three that does.
+                        aux_error.is_some(),
+                    ) {
+                        // The kind the `+ New` menu was clicked on -- `empty_of`,
+                        // not `empty`, which would open a login form whatever row
+                        // the user picked. Always one of `CREATABLE_KINDS`; the
+                        // menu has no other rows.
+                        ItemListAction::NewItem(kind) => {
+                            mode = DetailMode::Create(EditDraft::empty_of(kind))
+                        }
+                        // Not acted on here: this closure holds `items` borrowed
+                        // (a Delete has to drain it) and, more importantly, the
+                        // selection this right-click just made has not been
+                        // reacted to yet -- see where `row_command` is handled,
+                        // below the reset block.
+                        ItemListAction::Row { id, command } => row_command = Some((id, command)),
+                        ItemListAction::DismissMoveError => dismiss_move_error = true,
+                        ItemListAction::None => {}
                     }
-                    // Not acted on here: this closure holds `items` borrowed
-                    // (a Delete has to drain it) and, more importantly, the
-                    // selection this right-click just made has not been
-                    // reacted to yet -- see where `row_command` is handled,
-                    // below the reset block.
-                    ItemListAction::Row { id, command } => row_command = Some((id, command)),
-                    ItemListAction::DismissMoveError => dismiss_move_error = true,
-                    ItemListAction::None => {}
-                }
-            });
+                });
+        }
 
         // Only the source that was actually on screen is cleared. Clearing
         // all three would mean waving away one message also fired the
@@ -1888,6 +1999,15 @@ pub fn build_frame(
         // was about something else entirely.
         if dismiss_move_error {
             match notice_source {
+                // Not the live route for a Sends dismissal -- `dismiss_move_error`
+                // is set by `draw_item_list`, which does not run while the
+                // Sends screen is up, and the Sends band's own click is
+                // handled where that pane is drawn (`SendUiAction::DismissNotice`,
+                // below the central panel). It is the arm this match needs
+                // and the same answer either route gives: clearing `result`
+                // is what makes `SendFetch::wants_fetch` true again, so the
+                // dismissal is also the retry rather than a dead affordance.
+                Some(NoticeSource::Sends) => send_fetch.invalidate(),
                 Some(NoticeSource::Generate) => generate_error = None,
                 Some(NoticeSource::Move) => move_error = None,
                 // Dismissing a Trash/Archive failure is also the retry:
@@ -2279,9 +2399,27 @@ pub fn build_frame(
             }
         }
 
+        // The Sends screen's whole model for this frame, computed BEFORE the
+        // panel rather than inside it: the closure would otherwise hold
+        // `send_fetch` borrowed for its whole length, and the action it
+        // reports (Refresh, or a dismissal) has to write to that same value.
+        // It is also the point at which "no answer", "an empty account" and
+        // "a failed fetch" become three different things -- see
+        // `send_ui::pane_state`, which is where that decision is tested.
+        let send_pane = show_sends
+            .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock));
+        let mut send_action = send_ui::SendUiAction::None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
             .show(ui, |ui| {
+                // The Sends screen replaces the detail pane as well as the
+                // item list, so it takes this panel whole and the read/edit
+                // pane below is not drawn at all.
+                if let Some(state) = &send_pane {
+                    send_action =
+                        send_ui::draw_send_pane(ui, state, notice_message.as_deref());
+                    return;
+                }
                 // Resolved from the list the selection was made in, for the
                 // reason the row menu is: a row clicked under Trash or
                 // Archive is not in `items`, so looking it up there would
@@ -3027,6 +3165,25 @@ pub fn build_frame(
                 }
             });
 
+        // What the Sends screen reported. Applied out here rather than in the
+        // closure because two of the three arms write to `send_fetch`, which
+        // the closure reads through `send_pane`.
+        match send_action {
+            // The URL comes out of the row that was clicked and is carried in
+            // the action itself -- there is no second lookup here that could
+            // resolve to a different row. `copy_text` takes an owned
+            // `String`, which is why the action owns one.
+            send_ui::SendUiAction::CopyLink(url) => ui.ctx().copy_text(url),
+            // Refresh and a dismissed band are the same operation: forget the
+            // answer, so `wants_fetch` is true on the next frame and the list
+            // is asked for again. A dismissal that only hid the message would
+            // leave the pane saying the fetch failed with no way to retry.
+            send_ui::SendUiAction::Refresh | send_ui::SendUiAction::DismissNotice => {
+                send_fetch.invalidate()
+            }
+            send_ui::SendUiAction::None => {}
+        }
+
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
         //
         // `generate_error` used to be cleared only by the band's own
@@ -3686,6 +3843,12 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
 /// surprise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoticeSource {
+    /// A `bw send list` that could not be run or could not be read. Drawn by
+    /// `send_ui::draw_send_pane` rather than by the item list, because the
+    /// item list is not on screen when the Sends row is selected -- but the
+    /// *choice* of which message the window's one band shows is still made
+    /// here, so a Sends failure cannot become a second, competing channel.
+    Sends,
     Generate,
     Aux,
     Move,
@@ -3703,13 +3866,22 @@ enum NoticeSource {
 /// unchanged and there is nothing else on screen that a click happened at all.
 /// That is precisely the dead-button failure this fix exists to close, so it
 /// must not be reintroduced by a Trash fetch that failed ten minutes ago.
+/// **Sends outranks all three**, for the same reason Generate outranks the
+/// two below it and then some: the other three describe the item list and the
+/// detail pane, and neither of those is on screen when the Sends row is
+/// selected. A Sends failure that lost the band would not be deferred, it
+/// would be invisible -- and an invisible failure on this screen is the exact
+/// untruth the whole step is built to prevent, because what is left behind is
+/// a pane that reads as "you have no Sends".
 fn inline_notice<'a>(
+    sends: Option<&'a str>,
     generate: Option<&'a str>,
     aux: Option<&'a str>,
     moved: Option<&'a str>,
 ) -> Option<(NoticeSource, &'a str)> {
-    generate
-        .map(|m| (NoticeSource::Generate, m))
+    sends
+        .map(|m| (NoticeSource::Sends, m))
+        .or_else(|| generate.map(|m| (NoticeSource::Generate, m)))
         .or_else(|| aux.map(|m| (NoticeSource::Aux, m)))
         .or_else(|| moved.map(|m| (NoticeSource::Move, m)))
 }
@@ -4124,6 +4296,52 @@ fn spawn_aux_load(
             OutOfVault::Archive => cache.list_archive_unless_superseded(era),
         };
         let _ = tx.send((generation, which, result.map_err(AuxLoadError::of)));
+    });
+}
+
+/// Fetches the account's Sends on a background thread.
+///
+/// **`.output()` blocks, and this must never run on the eframe thread.**
+/// `send.rs`'s runner spawns a real `bw` child and waits on it for up to
+/// `send::SEND_TIMEOUT` -- sixty seconds -- so a synchronous call here would
+/// freeze the whole window, titlebar included, for a full minute on the frame
+/// the user clicks Sends. That is an order of magnitude worse than the ten
+/// seconds the trash/archive fetch was moved off-thread to avoid.
+///
+/// `ctx.request_repaint()` is what makes the answer visible: the drain is a
+/// `try_recv` in the frame closure, so without a frame to run in, a landed
+/// list sits in the channel until some unrelated input provokes one and the
+/// screen shows a spinner over a list it already has.
+///
+/// **Known gap, and it is the reason this screen cannot yet work against a
+/// real vault:** `list_sends` builds an invocation whose session token is
+/// `None`, which step 1 defined as "the runner uses the session it was
+/// configured with" -- and step 2's `CliSendRunner` has no session to be
+/// configured with. So the child inherits no `BW_SESSION` and a real
+/// `bw send list` answers "locked". Closing it is a change to `send.rs`,
+/// which is not this step's file; the shape of the gap is asserted by
+/// `send_ui::tests::the_list_invocation_still_carries_no_session_token`, and
+/// when it is closed the session this window already holds is what to pass.
+/// The failure is at least loud: it renders as a `Locked` failure in the
+/// notice band, never as an empty list.
+fn spawn_send_list(
+    ctx_for_sends: egui::Context,
+    tx: mpsc::Sender<Result<Vec<crate::send::SendSummary>, crate::send::SendError>>,
+) {
+    std::thread::spawn(move || {
+        // Read on this thread, not captured from the frame: `bw_path` keeps
+        // the active account's profile directory as process state precisely
+        // so that every spawn in this crate reaches the same account, and a
+        // copy taken a frame earlier is a copy that can be stale.
+        let data_dir = crate::bw_path::active_data_dir();
+        // `None` for the job: this window holds no `KillOnCloseJob` (main.rs
+        // owns the one `bw serve` is in), so the child is unprotected against
+        // an abrupt death of this process. `bw send list` is a read that
+        // finishes in seconds and holds no session in its environment -- see
+        // the gap above -- so it is not the orphan hazard the job exists for.
+        let runner = crate::send::CliSendRunner::new(None, data_dir.as_deref());
+        let _ = tx.send(crate::send::list_sends(&runner));
+        ctx_for_sends.request_repaint();
     });
 }
 
@@ -5244,6 +5462,19 @@ enum VaultBodyState<'a> {
     Unavailable(&'a str),
     /// Draw the vault: sidebar, list, detail pane.
     Vault,
+    /// Draw the sidebar and, in place of the item list and the detail pane,
+    /// the **Sends** screen -- see [`send_ui`].
+    ///
+    /// Ranked LAST, below both of the two states above, and that is a
+    /// deliberate choice rather than an accident of match order. Those two
+    /// draw no sidebar at all, so a window in either of them has no row for
+    /// the user to have selected; ranking Sends above them would change the
+    /// behaviour of states it can never actually be reached from, while
+    /// making the whole vault load look optional to a reader. The Sends
+    /// screen genuinely does not need the vault snapshot -- Sends come from
+    /// the CLI, not from `bw serve` -- and if the loading and unavailable
+    /// screens ever grow a sidebar, this rank is the line to revisit.
+    Sends,
 }
 
 /// Decides between the three (see [`VaultBodyState`]).
@@ -5258,12 +5489,22 @@ enum VaultBodyState<'a> {
 ///  * `vault_load_error.is_some()` -- an empty vault with no failure is a
 ///    genuinely empty vault, and it gets the normal chrome (sidebar counts at
 ///    zero, the list's own empty state), not an error page.
-fn vault_body_state(vault_loading: bool, items_empty: bool, vault_load_error: Option<&str>) -> VaultBodyState<'_> {
+fn vault_body_state(
+    vault_loading: bool,
+    items_empty: bool,
+    vault_load_error: Option<&str>,
+    sends_selected: bool,
+) -> VaultBodyState<'_> {
     if vault_loading {
         return VaultBodyState::Loading;
     }
     match vault_load_error {
         Some(reason) if items_empty => VaultBodyState::Unavailable(reason),
+        // The Sends row is checked here, after both early-return states and
+        // before the ordinary vault body, because it replaces the item list
+        // and the detail pane and nothing else. See `VaultBodyState::Sends`
+        // for why it does not outrank the two above.
+        Some(_) | None if sends_selected => VaultBodyState::Sends,
         Some(_) | None => VaultBodyState::Vault,
     }
 }
@@ -7379,7 +7620,7 @@ mod inline_notice_tests {
 
     #[test]
     fn nothing_waiting_shows_no_band() {
-        assert_eq!(inline_notice(None, None, None), None);
+        assert_eq!(inline_notice(None, None, None, None), None);
     }
 
     #[test]
@@ -7389,11 +7630,11 @@ mod inline_notice_tests {
         // `inline_notice` that returned `None` for two of them could not pass
         // the precedence tests by default.
         assert_eq!(
-            inline_notice(Some("g"), None, None),
+            inline_notice(None, Some("g"), None, None),
             Some((NoticeSource::Generate, "g"))
         );
-        assert_eq!(inline_notice(None, Some("a"), None), Some((NoticeSource::Aux, "a")));
-        assert_eq!(inline_notice(None, None, Some("m")), Some((NoticeSource::Move, "m")));
+        assert_eq!(inline_notice(None, None, Some("a"), None), Some((NoticeSource::Aux, "a")));
+        assert_eq!(inline_notice(None, None, None, Some("m")), Some((NoticeSource::Move, "m")));
     }
 
     #[test]
@@ -7403,15 +7644,15 @@ mod inline_notice_tests {
         // one second ago produces nothing at all on screen -- the dead button,
         // back again, in the one case where the band was already occupied.
         assert_eq!(
-            inline_notice(Some("g"), Some("a"), Some("m")),
+            inline_notice(None, Some("g"), Some("a"), Some("m")),
             Some((NoticeSource::Generate, "g"))
         );
         assert_eq!(
-            inline_notice(Some("g"), Some("a"), None),
+            inline_notice(None, Some("g"), Some("a"), None),
             Some((NoticeSource::Generate, "g"))
         );
         assert_eq!(
-            inline_notice(Some("g"), None, Some("m")),
+            inline_notice(None, Some("g"), None, Some("m")),
             Some((NoticeSource::Generate, "g"))
         );
     }
@@ -7421,7 +7662,7 @@ mod inline_notice_tests {
         // Unchanged from before Generate existed as a source: the pane the
         // aux error explains is the one on screen.
         assert_eq!(
-            inline_notice(None, Some("a"), Some("m")),
+            inline_notice(None, None, Some("a"), Some("m")),
             Some((NoticeSource::Aux, "a"))
         );
     }
@@ -9687,7 +9928,7 @@ mod apply_vault_load_result_tests {
              to say about why it is empty"
         );
         assert_eq!(
-            vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref()),
+            vault_body_state(vault_loading, items.is_empty(), vault_load_error.as_deref(), false),
             VaultBodyState::Unavailable(VAULT_SUPERSEDED_BEFORE_LOAD),
             "an empty window after a give-up must SAY so rather than drawing an empty vault"
         );
@@ -9833,13 +10074,13 @@ mod vault_body_state_tests {
 
     #[test]
     fn a_load_in_flight_is_the_spinner_whatever_else_is_true() {
-        assert_eq!(vault_body_state(true, true, Some("stale reason")), VaultBodyState::Loading);
+        assert_eq!(vault_body_state(true, true, Some("stale reason"), false), VaultBodyState::Loading);
     }
 
     #[test]
     fn an_empty_window_after_a_failure_says_what_happened() {
         assert_eq!(
-            vault_body_state(false, true, Some("the vault was locked before this load could read it")),
+            vault_body_state(false, true, Some("the vault was locked before this load could read it"), false),
             VaultBodyState::Unavailable("the vault was locked before this load could read it")
         );
     }
@@ -9848,7 +10089,7 @@ mod vault_body_state_tests {
     fn an_empty_vault_that_simply_has_no_items_is_not_an_error() {
         // A real empty vault gets the normal chrome -- sidebar, list, empty
         // state -- not an error page.
-        assert_eq!(vault_body_state(false, true, None), VaultBodyState::Vault);
+        assert_eq!(vault_body_state(false, true, None, false), VaultBodyState::Vault);
     }
 
     #[test]
@@ -9857,7 +10098,7 @@ mod vault_body_state_tests {
         // populated window with an error page because a background refresh
         // failed would be a worse regression than the blank window this
         // fixes; the pill reports it instead.
-        assert_eq!(vault_body_state(false, false, Some("connection refused")), VaultBodyState::Vault);
+        assert_eq!(vault_body_state(false, false, Some("connection refused"), false), VaultBodyState::Vault);
     }
 }
 
@@ -10126,7 +10367,7 @@ mod frame_schedule_placement_tests {
     use std::time::Duration;
 
     const SCHEDULE: &str = concat!("ui.ctx().request_repaint", "_after(FRAME_INTERVAL);");
-    const BODY_MATCH: &str = concat!("match vault_body", "_state(");
+    const BODY_MATCH: &str = concat!("let body = vault_body", "_state(");
     const ANY_SCHEDULE: &str = concat!("request_repaint", "_after(");
     const TESTS_BEGIN: &str = concat!("#[cfg(", "test)]");
 
@@ -11502,7 +11743,14 @@ mod the_idle_timer_follows_the_edited_setting {
         let folders: Vec<Folder> = Vec::new();
         let mut selected = SidebarFilter::All;
         let output = ctx.run_ui(input(), |ui| {
-            draw_sidebar(ui, VaultLists::live_only(&items), &folders, &mut selected, lock_countdown);
+            draw_sidebar(
+                ui,
+                VaultLists::live_only(&items),
+                &folders,
+                &mut selected,
+                &mut false,
+                lock_countdown,
+            );
         });
 
         let mut out = Vec::new();
