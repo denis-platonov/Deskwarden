@@ -4499,13 +4499,31 @@ mod send_fetch_thread {
     /// test's own thread. See
     /// `send_ui::source_pins::the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given`.
     ///
-    /// The other of the two things is untouched and is the stronger one:
-    /// `send_ui::source_pins::every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`
-    /// requires every occurrence of the token `real_send_list` in production
-    /// to be inside this block. A call written in the frame closure spells
-    /// it, so it is a mention outside the block, so it fails -- and unlike
-    /// privacy, that also refuses a call written in a SIBLING file, which
-    /// `pub(super)` never permitted but `pub(crate)` would have.
+    /// The other of the two things is
+    /// `send_ui::source_pins::every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module`,
+    /// which requires every occurrence of the token `real_send_list` in
+    /// production to be inside this block. A call written in the frame
+    /// closure spells it, so it is a mention outside the block, so it fails.
+    ///
+    /// **That guard did not cover a sibling file, and this doc used to say
+    /// it did.** The claim was that the seal "unlike privacy, also refuses
+    /// a call written in a SIBLING file, which `pub(super)` never permitted
+    /// but `pub(crate)` would have". Both halves were false. `pub(super)`
+    /// on an item inside `mod send_fetch_thread` means visible throughout
+    /// `vault_window` -- `send_ui.rs` and `item_list.rs` included -- and the
+    /// seal read `include_str!("mod.rs")` and nothing else, so it could not
+    /// see a sibling at all. Measured on `c92c00c`: a
+    /// `pub fn blocking_prefetch` in `send_ui.rs`'s production forwarding to
+    /// this function, called from the frame closure, COMPILED and gave 2101
+    /// lib / 217 bin / 0 failed / 0 warnings -- a sixty-second blocking
+    /// `bw send list` on the eframe thread.
+    ///
+    /// The seal walks the whole crate now -- every `.rs` file under `src`,
+    /// discovered by a directory walk, minus `send.rs` where two of its four
+    /// needles are defined -- the way
+    /// `send_ui::source_pins::the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate`
+    /// already did. So the sentence above is true of a sibling file today
+    /// because the guard was widened, not because `pub(super)` forbids one.
     ///
     /// **Why not a test-gated seam instead.** Tried first, and it is not
     /// available in this file: three controls across three modules

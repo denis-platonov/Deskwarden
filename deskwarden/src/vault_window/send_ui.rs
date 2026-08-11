@@ -3073,6 +3073,16 @@ mod source_pins {
             "the probe refused the only spawn this read may make, yet it answered {refused:?} \
              -- so a child was started by a route the probe cannot see"
         );
+        // **This is a non-vacuity control, NOT a spawn-count control**, and
+        // reading it as one would be a mistake. The probe is thread-local
+        // and armed on THIS thread, so a spawn issued from a thread
+        // `real_send_list` started is not recorded here and this count does
+        // not go up. What refuses a second, off-thread `bw` on this path is
+        // the whole-body equality in
+        // `the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`,
+        // which admits no statement this body does not already have. All
+        // this line says is that the one spawn it CAN see happened, so the
+        // three assertions below are about something.
         assert_eq!(
             attempts.len(),
             1,
@@ -3435,6 +3445,115 @@ mod source_pins {
         );
     }
 
+    /// **The session wipe is where it has to be, not merely present twice.**
+    ///
+    /// What held this was the COUNT just above --
+    /// `production.matches(wrapped).count() == 2` -- and a count says
+    /// nothing about PLACEMENT. Plain deletion of `spawn_vault_sync`'s wrap
+    /// is caught by it, so the count is not vacuous; RELOCATION is not.
+    /// Measured on `c92c00c`, **M-A**: delete the wrap from
+    /// `spawn_vault_sync` and add the byte-identical line to `run()`
+    /// (wrapping there and passing `session_token.to_string()` into
+    /// `build_frame`) gave 2101 lib / 217 bin / 0 failed / 0 warnings. The
+    /// count was still exactly two. `spawn_vault_sync` then received a bare
+    /// `String`, moved it into the sync thread and dropped it un-wiped --
+    /// one freed heap block holding the vault-unlocking session per Sync,
+    /// for the life of the process, which is verbatim the hazard the count
+    /// claims to prevent.
+    ///
+    /// So the wrap is pinned by placement, as a whole-body EQUALITY -- the
+    /// same shape as
+    /// [`the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]
+    /// and
+    /// [`spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`],
+    /// which the reviewer attacked and could not defeat. Any inserted
+    /// statement, any rebinding, any reordering, any extra argument and any
+    /// swapped callee changes the compared string; a wrap that moved to a
+    /// caller leaves this body without one and fails here whatever the
+    /// file-wide count says.
+    ///
+    /// **Comments are blanked first**, so this pins the code and not the six
+    /// lines of prose the wrap carries above it.
+    ///
+    /// `body_of` with an EMPTY indent: this function is at column zero, so
+    /// its terminator is `\r\n}\r\n`, and a terminator that is required to
+    /// be found rather than defaulted is what stops the slice quietly
+    /// becoming "the rest of the file".
+    #[test]
+    fn the_sync_thread_wipes_the_session_it_was_handed() {
+        let expected = squashed(&format!(
+            "tx: mpsc::Sender<Result<(), String>>, session_token: String) {{ \
+             let session_token = zeroize::{}(session_token); \
+             std::thread::spawn(move || {{ let _ = tx.send(bw_serve::run_bw_{}\
+             (&session_token)); }});",
+            concat!("Zeroizing::", "new"),
+            "sync",
+        ));
+        let actual = squashed(&sanitized(&body_of(concat!("spawn_vault_", "sync"), "")));
+        assert_eq!(
+            actual, expected,
+            "`spawn_vault_sync` is no longer exactly `wrap the session, then run `bw sync` \
+             on a thread with it`. A wrap that moved to a CALLER leaves this function \
+             taking a bare `String`, moving it into the thread and dropping it un-wiped -- \
+             one freed heap block holding the vault-unlocking token per Sync, for the life \
+             of the process -- while the count of that line in the file is unchanged"
+        );
+    }
+
+    /// **Both Sync call sites hand over the window's own session, and
+    /// nothing rebinds that session in between.**
+    ///
+    /// The behavioural half of the sync path is
+    /// `frame_promptness::the_windows_own_session_is_what_reaches_the_bw_sync_child`,
+    /// which drives a real frame and reads back what ARRIVED at the
+    /// `VaultFrameEnv::sync` pointer -- at both call sites, the auto-sync on
+    /// the first real frame and the status pill's own press. That is the
+    /// primary hold and it is what kills **M-C** (`String::new()` for the
+    /// argument at both sites, measured green at 2101 / 0 / 0 warnings,
+    /// every `bw sync` then running with `BW_SESSION=""` against a vault
+    /// that answers `Locked`).
+    ///
+    /// What is left for source to hold is the two things driving a frame
+    /// cannot see. First, that there is no THIRD call site spelled some
+    /// other way -- the harness observes the sites it reaches, not the ones
+    /// it does not. Second, that `session_token` inside the closure is the
+    /// binding `build_frame` wrapped on its first line and not a shadow: a
+    /// `let session_token = String::new();` written between the two presses
+    /// would leave both call sites word-perfect and both arguments empty,
+    /// and the whole-body equality one test up cannot see into the closure.
+    #[test]
+    fn both_sync_call_sites_pass_the_windows_own_session() {
+        let closure = squashed(&frame_closure());
+        let call =
+            squashed(concat!("(spawn_", "sync)(sync_tx.clone(), session_token.to_string());"));
+        let opener = concat!("(spawn_", "sync)(");
+        assert_eq!(
+            closure.matches(&call).count(),
+            2,
+            "{call:?} is not written in the frame closure exactly twice. The two Sync call \
+             sites are the auto-sync on the window's first real frame and the status \
+             pill's press, and each must hand over the window's own session: a `bw sync` \
+             started with an empty `BW_SESSION` is answered `Locked` by a real vault"
+        );
+        assert_eq!(
+            closure.matches(opener).count(),
+            2,
+            "{opener:?} is called from the frame closure {} times, not twice -- there is a \
+             Sync call site spelled some other way, and the frame harness observes only \
+             the sites it reaches",
+            closure.matches(opener).count()
+        );
+        let rebind = concat!("let session_", "token");
+        assert_eq!(
+            closure.matches(rebind).count(),
+            0,
+            "{rebind:?} appears inside the frame closure. The session the two Sync call \
+             sites read is then whatever the nearest shadow bound, not the \
+             `Zeroizing<String>` `build_frame` wrapped on its first line -- and both call \
+             sites stay word-perfect while both arguments go empty"
+        );
+    }
+
     /// **The blocking fetch cannot be reached from the frame closure.**
     ///
     /// The property is "the up-to-sixty-second `bw send list` never runs on
@@ -3455,8 +3574,62 @@ mod source_pins {
     /// the block, and the block exports exactly the two spawners.
     #[test]
     fn every_mention_of_the_blocking_fetch_is_sealed_inside_the_spawning_module() {
-        let production = production();
-        let block = sealed_module();
+        // **The region read is the whole crate, not `mod.rs` alone.**
+        //
+        // `production()` is `production_region_source(include_str!("mod.rs"))`
+        // -- ONE FILE. `real_send_list` is `pub(super)` inside `mod
+        // send_fetch_thread`, and `pub(super)` there means "visible in
+        // `vault_window`" -- which is `vault_window::send_ui` and
+        // `vault_window::item_list` every bit as much as it is `mod.rs`. The
+        // commit that traded privacy away for the behavioural test argued
+        // this seal was the stronger lock because it "also refuses a call
+        // written in a SIBLING file, which `pub(super)` never permitted but
+        // `pub(crate)` would have". Both halves were false, and the second
+        // was measured. On `c92c00c`, writing in THIS file's production
+        //
+        // ```ignore
+        // pub fn blocking_prefetch(session: &str)
+        //     -> Result<Vec<SendSummary>, crate::send::SendError> {
+        //     super::send_fetch_thread::real_send_list(session)
+        // }
+        // ```
+        //
+        // plus `let _ = send_ui::blocking_prefetch(&session_token);` in the
+        // frame closure gave 2101 lib / 217 bin / 0 failed / 0 warnings. It
+        // COMPILED, which is the proof that `pub(super)` admits the sibling
+        // file; the frame line spelled none of the four needles below; and
+        // nothing `pub` was added inside the block, so the export list was
+        // unchanged too. A sixty-second blocking `bw send list` on the eframe
+        // thread, past every guard in this module.
+        //
+        // So the counts are taken over every `.rs` file under `src`, walked
+        // rather than listed so that a file added next month is read, minus
+        // `send.rs` where two of the four are DEFINED -- the same exclusion,
+        // for the same reason, as
+        // `the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate`.
+        // Both sides are `sanitized`, so a mention in another file's prose is
+        // not a mention and cannot inflate the total past what the block can
+        // account for.
+        let files = crate_sources();
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+        for required in ["vault_window/mod.rs", "vault_window/send_ui.rs"] {
+            assert!(
+                files.iter().any(|(p, _)| p == required),
+                "control: the crate walk never reached {required:?}, so a blocking fetch \
+                 written there would be counted by nothing at all"
+            );
+        }
+        let production: String = files
+            .iter()
+            .filter(|(path, _)| path != "send.rs")
+            .map(|(_, text)| production_region(text))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        let block = sanitized(&sealed_module());
 
         // Control: the slice is a slice, not the whole file. Without this the
         // containment assertions below are trivially true.
@@ -3487,8 +3660,10 @@ mod source_pins {
             );
             assert_eq!(
                 inside, total,
-                "{needle:?} occurs {total} times in production but only {inside} of them are \
-                 inside `mod send_fetch_thread`. Every mention outside that block is a blocking \
+                "{needle:?} occurs {total} times in the CRATE's production (every file under \
+                 `src` but `send.rs`) but only {inside} of them are \
+                 inside `mod send_fetch_thread`. Every mention outside that block -- in \
+                 `mod.rs` or in any sibling file, which `pub(super)` admits -- is a blocking \
                  `bw send list` reachable from the eframe frame closure, where it freezes the \
                  window -- titlebar included -- for up to sixty seconds"
             );
@@ -4671,6 +4846,21 @@ mod frame_promptness {
         /// The session each Sends spawn ARRIVED with, in order. Same scope
         /// and same reasoning as the counters above.
         static SEND_LIST_SESSIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// The session each `bw sync` spawn ARRIVED with, in order. Same
+        /// scope and same reasoning as the counters above, and the reason
+        /// it exists is `source_pins::both_sync_call_sites_pass_the_windows_own_session`'s
+        /// measured survivor **M-C**.
+        static SYNC_SESSIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        /// Whether [`counted_sync`] ANSWERS on the channel it is handed.
+        ///
+        /// Off for every scenario but the one that presses the Sync pill,
+        /// and off by default deliberately: an answered sync clears
+        /// `sync_in_progress`, relabels the pill and starts a forced
+        /// reload, so switching it on for everybody would change what
+        /// every other scenario in this module measures. The pill refuses
+        /// its own click while `sync_in_progress`, so the one scenario
+        /// that presses it cannot reach that call site without this.
+        static SYNC_ANSWERS: Cell<bool> = const { Cell::new(false) };
     }
 
     fn bump(counter: &'static std::thread::LocalKey<Cell<usize>>) {
@@ -4682,8 +4872,26 @@ mod frame_promptness {
     }
 
     /// Stands in for `spawn_vault_sync`, which shells out to `bw sync`.
-    fn counted_sync(_tx: mpsc::Sender<Result<(), String>>, _session_token: String) {
+    ///
+    /// It RECORDS the session it was handed, for the same reason
+    /// [`counted_send_list`] does: `(spawn_sync)(sync_tx.clone(),
+    /// String::new())` at both call sites was measured green on `c92c00c`
+    /// at 2101 lib / 217 bin / 0 failed, and every `bw sync` then ran with
+    /// `BW_SESSION=""`, which a real vault answers `Locked`. Recorded and
+    /// not asserted here: this runs inside the frame, where a panic is an
+    /// eframe panic rather than a test failure with a message. See
+    /// [`the_windows_own_session_is_what_reaches_the_bw_sync_child`].
+    fn counted_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String) {
         bump(&SYNC_SPAWNS);
+        SYNC_SESSIONS.with(|s| s.borrow_mut().push(session_token));
+        // Synchronous, not spawned, so the answer is on the channel before
+        // the drain three hundred lines further down the same frame reads
+        // it -- which is what makes the pill clickable on a fixed frame
+        // rather than on a race. Off unless the scenario asks; see
+        // [`SYNC_ANSWERS`].
+        if SYNC_ANSWERS.with(Cell::get) {
+            let _ = tx.send(Ok(()));
+        }
     }
 
     /// Stands in for `send_fetch_thread::spawn_send_list`, which runs a real
@@ -4859,6 +5067,14 @@ mod frame_promptness {
         /// `DetailMode::Create` besides the sidebar's own new-item menu, and
         /// the one that needs no control located on screen first.
         press_ctrl_n: bool,
+        /// Whether to press the toolbar's **Sync** status pill, the second
+        /// of the two `VaultFrameEnv::sync` call sites -- the first being
+        /// the auto-sync every scenario already runs on its first real
+        /// frame. Turning this on also turns [`SYNC_ANSWERS`] on, because
+        /// `theme::status_pill_button(..).clicked() && !sync_in_progress`
+        /// is the production gate and an unanswered auto-sync never lets
+        /// go of `sync_in_progress`.
+        press_sync: bool,
         /// Whether to RIGHT-click the fixture login's row, which is the only
         /// way into `item_list.rs`'s `response.context_menu` closure --
         /// measured, a sixty-second spin in it survived the whole previous
@@ -4878,6 +5094,7 @@ mod frame_promptness {
                 press_edit: false,
                 press_prefs: false,
                 press_ctrl_n: false,
+                press_sync: false,
                 press_row_menu: false,
             }
         }
@@ -4895,6 +5112,8 @@ mod frame_promptness {
         send_list_spawns: usize,
         /// The session each Sends spawn was handed, in order.
         send_list_sessions: Vec<String>,
+        /// The session each `bw sync` spawn was handed, in order.
+        sync_sessions: Vec<String>,
     }
 
     impl Outcome {
@@ -5048,6 +5267,8 @@ mod frame_promptness {
     /// throwaway frame against an empty `Ui` first, exactly as `sidebar.rs`
     /// and `detail.rs` do, and call it themselves.
     fn drive(scenario: Scenario, scratch: &std::path::Path) -> Outcome {
+        // Before the first frame, because the auto-sync fires inside it.
+        SYNC_ANSWERS.with(|c| c.set(scenario.press_sync));
         let (_options, mut frame_fn, handles) = build_frame(
             // A base URL nothing listens on. It is never dialled anyway --
             // the only thing that would dial it is the load spawn, and that
@@ -5128,6 +5349,18 @@ mod frame_promptness {
                 |ui| frame_fn(ui),
             );
         };
+        if scenario.press_sync {
+            // The pill is the only control that reaches the SECOND
+            // `(spawn_sync)` call site. It is found by the words it paints
+            // once the auto-sync has been answered and drained --
+            // `sync_pill`'s `(Some(Ok(())), None)` arm, whose
+            // `synced_ago_text` is "just now" for any elapsed under a
+            // minute, which no clock this test runs under can exceed
+            // between the drain and this line.
+            let pos = locate_label(&output, "Synced just now", "the toolbar's sync pill");
+            click(&ctx, &mut *frame_fn, pos);
+            output = ctx.run_ui(input(), |ui| frame_fn(ui));
+        }
         if scenario.press_sends {
             let pos = locate_label(&output, super::super::sidebar::SENDS_ROW_LABEL, "the sidebar");
             click(&ctx, &mut *frame_fn, pos);
@@ -5241,6 +5474,7 @@ mod frame_promptness {
             load_spawns: read(&LOAD_SPAWNS),
             send_list_spawns: read(&SEND_LIST_SPAWNS),
             send_list_sessions: SEND_LIST_SESSIONS.with(|s| s.borrow().clone()),
+            sync_sessions: SYNC_SESSIONS.with(|s| s.borrow().clone()),
         };
         drop(frame_fn);
         drop(handles);
@@ -5707,6 +5941,61 @@ mod frame_promptness {
                  read it: {arg}"
             );
         }
+    }
+
+    /// **The window's own session is what a real `bw sync` runs with.**
+    ///
+    /// The sync path's counterpart to
+    /// [`the_windows_own_session_is_what_reaches_the_bw_child`], and it
+    /// exists because the sync path had the identical defect one function
+    /// over. Measured on `c92c00c`, **M-C**: `(spawn_sync)(sync_tx.clone(),
+    /// String::new())` at BOTH call sites -- the auto-sync on the first
+    /// real frame and the status pill's press -- gave 2101 lib / 217 bin /
+    /// 0 failed / 0 warnings. Every `bw sync` then ran with
+    /// `BW_SESSION=""`, which a real vault answers `Locked`: Sync silently
+    /// stops syncing and the window keeps painting whatever it already had.
+    ///
+    /// Nothing here is a spelling. A real frame is driven, and what is read
+    /// back is the value that ARRIVED at the `VaultFrameEnv::sync` pointer
+    /// -- so a session dropped, emptied, defaulted or read from anywhere
+    /// but `build_frame`'s own `session_token` fails here whatever the
+    /// source says.
+    ///
+    /// **Both call sites, not one.** The auto-sync is reached by every
+    /// scenario in this module; the pill is reached by this one alone, and
+    /// pressing it is the only way there is (`sync_in_progress` gates the
+    /// click and `draw_toolbar`'s pill is its sole producer). A mutation
+    /// that empties only the button's argument therefore dies here too,
+    /// which a source count over one call site could not manage.
+    ///
+    /// **No `bw` child is started.** `counted_sync` is a stub;
+    /// `spawn_vault_sync` is behind the seam and is never called. What
+    /// happens to the token BELOW the pointer -- that `bw_serve::run_bw_sync`
+    /// puts it in the child's environment rather than argv -- is not
+    /// asserted here, and is recorded as open in this round's notes.
+    #[test]
+    fn the_windows_own_session_is_what_reaches_the_bw_sync_child() {
+        let outcome = measured("sync-session", Scenario { press_sync: true, ..Scenario::new() });
+        assert!(
+            HARNESS_SESSION.len() > 8,
+            "control: the token this test compares against is too short to be an \
+             unmistakable match, so the assertions below could be satisfied by an accident"
+        );
+        assert_eq!(
+            outcome.sync_spawns, 2,
+            "this scenario did not reach BOTH `VaultFrameEnv::sync` call sites exactly once \
+             each -- the auto-sync on the window's first real frame and the toolbar pill's \
+             press -- so whichever it missed is unmeasured here. What was painted: {:?}",
+            outcome.painted
+        );
+        assert_eq!(
+            outcome.sync_sessions,
+            vec![HARNESS_SESSION.to_string(); 2],
+            "a `bw sync` was started without the session this window was opened with. A \
+             `bw sync` whose `BW_SESSION` is missing or empty is answered `Locked` by a \
+             real vault, so Sync silently stops syncing while the pill still says it \
+             worked"
+        );
     }
 
     /// **The "your vault could not be loaded" page returns promptly.**
