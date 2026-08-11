@@ -998,12 +998,21 @@ mod tests {
     /// Production `job_object.rs`, cut at the first module-level
     /// `#[cfg(test)]`. Everything below that -- the spawn probe and this test
     /// module -- is absent from the shipped binary.
-    fn job_object_production() -> String {
+    /// This file, whole, with its line endings normalised to LF.
+    ///
+    /// Split out of [`job_object_production`] so that
+    /// `nothing_but_gated_test_modules_lives_below_the_choke_points_cut` can walk the
+    /// half the cut throws away, taken from the same text by the same
+    /// function, rather than re-reading the file and re-deriving a cut that
+    /// could drift away from the one every rule here reads.
+    fn job_object_raw() -> String {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let raw = std::fs::read_to_string(src.join("job_object.rs")).unwrap().replace("\r\n", "\n");
-        let cut = concat!("
-#[cfg(", "test)]
-");
+        std::fs::read_to_string(src.join("job_object.rs")).unwrap().replace("\r\n", "\n")
+    }
+
+    fn job_object_production() -> String {
+        let raw = job_object_raw();
+        let cut = concat!("\n#[cfg(", "test)]\n");
         let production = raw.split(cut).next().unwrap().to_string();
         assert!(
             production.len() < raw.len(),
@@ -1697,8 +1706,7 @@ mod tests {
             .unwrap()
             .replace("\r\n", "\n");
         let bw_path_production = bw_path_raw
-            .split(concat!("#[cfg(", "test)]", "
-mod "))
+            .split(concat!("#[cfg(", "test)]", "\nmod "))
             .next()
             .unwrap();
         assert!(
@@ -2425,6 +2433,54 @@ mod "))
         // ...and an item that is not an alias at all has no right-hand side.
         assert_eq!(alias_rhs(&code_only("use crate::job_object::JobCommand;")), "");
 
+        // The NEEDLE view, driven directly: a generic BOUND is not a way to
+        // reach the type, a DEFAULT is, and the right-hand side is untouched.
+        let needle_of = |s: &str| alias_needle_view(&item_bodies(&code_only(s), "type")[0]);
+        assert_eq!(
+            needle_of("type W<T: Into<crate::job_object::JobCommand>> = Vec<T>;"),
+            "typeW<T>=Vec<T>",
+            "the bound is still in the needle view, so the filter flags an alias no inherent \
+             impl can attach to and the next editor weakens it to shut it up"
+        );
+        assert_eq!(
+            needle_of("type Jd<A = crate::job_object::JobCommand> = A;"),
+            concat!("typeJd<A=crate::job_object::", "JobCommand>=A"),
+            "a parameter DEFAULT was dropped along with the bounds, which deletes the \
+             eleventh round's hop from this rule"
+        );
+        assert_eq!(
+            needle_of("type Jd<T: Clone, A = crate::job_object::JobCommand> = A;"),
+            concat!("typeJd<T,A=crate::job_object::", "JobCommand>=A"),
+            "a bound ended at the wrong place, taking the default that follows it with it"
+        );
+        assert_eq!(
+            needle_of("type Jt = crate::job_object::JobCommand;"),
+            concat!("typeJt=crate::job_object::", "JobCommand"),
+            "the path separators in an ordinary alias were read as bounds"
+        );
+        assert_eq!(
+            needle_of("type F<T: Fn() -> crate::job_object::JobCommand> = Vec<T>;"),
+            "typeF<T>=Vec<T>",
+            "the `>` of an `->` inside a bound ended the skip early"
+        );
+        // ...and the filter itself agrees on both.
+        assert_eq!(
+            aliases_naming(
+                &code_only("type W<T: Into<crate::job_object::JobCommand>> = Vec<T>;"),
+                JOB
+            )
+            .len(),
+            0
+        );
+        assert_eq!(
+            aliases_naming(
+                &code_only("type Jd<A = crate::job_object::JobCommand> = A;"),
+                JOB
+            )
+            .len(),
+            1
+        );
+
         // A TWELFTH-HOP MUTANT THAT SATISFIES EVERY CONTROL ABOVE AND STILL
         // ESCAPES, written down rather than left to be found:
         //
@@ -2657,7 +2713,8 @@ mod "))
     /// Two tests, and they ask different questions. The NEEDLE is tested
     /// against the whole item, because the guarded name can be written on
     /// either side of the `=` -- a generic parameter's DEFAULT puts it on the
-    /// left, which is the eleventh round's hop. The SHAPE test is on the
+    /// left, which is the eleventh round's hop -- but NOT against a generic
+    /// BOUND, which is [`alias_needle_view`]'s business. The SHAPE test is on the
     /// right-hand side only, and answers "could an inherent impl attach to what
     /// this resolves to at all?": a compound -- anything with a comma in it,
     /// such as the tuple `vault_window/mod.rs` really writes -- resolves to no
@@ -2671,11 +2728,77 @@ mod "))
             .into_iter()
             .filter(|item| {
                 let rhs = alias_rhs(item);
-                item.contains(ty)
+                alias_needle_view(item).contains(ty)
                     && !rhs.contains(',')
                     && rhs.chars().all(|c| c.is_alphanumeric() || "_:<>'()".contains(c))
             })
             .collect()
+    }
+
+    /// A `type` alias item with its generic BOUNDS removed, which is the view
+    /// [`aliases_naming`] tests its needle against.
+    ///
+    /// The needle has to be tested against more than the right-hand side,
+    /// because a generic parameter's DEFAULT names the guarded type on the
+    /// LEFT and still reaches it -- `type Jd<A = crate::job_object::JobCommand>
+    /// = A;` is the eleventh round's hop. But testing it against the WHOLE item
+    /// false-positives on a bound:
+    ///
+    ///     type W<T: Into<crate::job_object::JobCommand>> = Vec<T>;
+    ///
+    /// has the right-hand side `Vec<T>`, which passes the shape test, and
+    /// contains the needle -- so it is flagged, though `T` is a parameter and
+    /// nothing can be `impl`'d for `W`. No such code exists in this crate
+    /// today. It is closed anyway, because a rule that fires on honest code is
+    /// a rule the next editor weakens to silence it, and that is exactly the
+    /// failure this file warns about elsewhere.
+    ///
+    /// So a bound -- everything from a single `:` to the `,`, the `=` or the
+    /// `>` that ends it -- is dropped, and a default is not. The `:` must be a
+    /// single one: `::` is a path separator, and the RIGHT-hand side of a real
+    /// alias is full of them.
+    fn alias_needle_view(item: &str) -> String {
+        let b = item.as_bytes();
+        let mut out = String::with_capacity(item.len());
+        let mut angle = 0isize;
+        // The bracket depth a bound is currently being skipped at, if any.
+        let mut skip_at: Option<isize> = None;
+        for k in 0..b.len() {
+            match b[k] {
+                b'<' => {
+                    if skip_at.is_none() {
+                        out.push('<');
+                    }
+                    angle += 1;
+                    continue;
+                }
+                // The `>` of an `->` is not a closing bracket -- the same
+                // exclusion `alias_rhs` and `impl_heads` make.
+                b'>' if k > 0 && b[k - 1] != b'-' => {
+                    if skip_at == Some(angle) {
+                        skip_at = None;
+                    }
+                    angle -= 1;
+                    if skip_at.is_none() {
+                        out.push('>');
+                    }
+                    continue;
+                }
+                b':' if skip_at.is_none()
+                    && b.get(k + 1) != Some(&b':')
+                    && (k == 0 || b[k - 1] != b':') =>
+                {
+                    skip_at = Some(angle);
+                    continue;
+                }
+                b',' | b'=' if skip_at == Some(angle) => skip_at = None,
+                _ => {}
+            }
+            if skip_at.is_none() {
+                out.push(b[k] as char);
+            }
+        }
+        out
     }
 
     /// The right-hand side of a `type` alias item, in the `code_only` view.
@@ -2986,5 +3109,723 @@ mod "))
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The region BELOW the cut -- the half RULE 9 does not read.
+    // -----------------------------------------------------------------
+
+    /// The `cfg` attribute that makes a module test-only, split so this
+    /// constant is not itself one and cannot be found by a scan looking for
+    /// the real attribute.
+    const BELOW_CUT_GATE: &str = concat!("#[cfg(", "test)]");
+
+    /// Column-0 lines below the cut that are the CONTENTS OF A STRING LITERAL
+    /// rather than source. Each would have to be controlled below -- it must
+    /// still occur in this file exactly once -- so a stale entry cannot
+    /// quietly widen the hole the walk exists to close. Empty on purpose: the
+    /// two cut markers this file splits on are written with `\n` escapes
+    /// rather than as real line breaks precisely so that this list can stay
+    /// empty and the walk can stay exact.
+    const BELOW_CUT_STRING_LINES: &[&str] = &[];
+
+    /// `true` for `mod NAME {`, `pub mod NAME {` and `pub(crate) mod NAME {`,
+    /// and for nothing else. Deliberately exact rather than a `starts_with`:
+    /// a whole module written on one line is not a module opener as far as
+    /// this walk is concerned, and must fail it.
+    fn below_cut_is_module_opener(line: &str) -> bool {
+        let t = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let t = t.strip_prefix("pub ").unwrap_or(t);
+        let Some(rest) = t.strip_prefix("mod ") else {
+            return false;
+        };
+        let Some(name) = rest.strip_suffix(" {") else {
+            return false;
+        };
+        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The two-state walk of everything from the cut to EOF, over whatever
+    /// text it is handed. Returns `(visited, modules, closes, depth)` so the
+    /// caller can control it for non-vacuity.
+    ///
+    /// The same walk `breach.rs`, `vault_export.rs` and `send.rs` carry, and
+    /// deliberately not a weaker one: it is handed the tail that
+    /// [`job_object_production`] threw away, so the two cannot drift apart.
+    ///
+    /// **Line-ending agnostic on purpose.** `lines()` strips a trailing
+    /// carriage return, so every comparison here is against the line's real
+    /// text on a CRLF working tree and on an LF one alike. The blobs this
+    /// repository stores are LF and only `core.autocrlf=true` makes this file
+    /// CRLF on disk, so a needle written with a carriage return in it would
+    /// match nothing on a plain checkout -- green, and reading nothing.
+    ///
+    /// Returns `Err` rather than panicking so the controls at the bottom of
+    /// the test can drive the REAL walk over the mutants it exists to catch,
+    /// rather than a re-typed copy of it, and without a `catch_unwind` that
+    /// would print a panic into a green run's output.
+    fn walk_below_the_cut(tail: &str) -> Result<(usize, usize, usize, usize), String> {
+        let mut depth = 0usize;
+        // The region walked here BEGINS with the gate, so nothing outside it
+        // has to be taken on trust: the first non-blank line the walk sees is
+        // the attribute, and that line is what flips this to `true`.
+        let mut gated = false;
+        let mut modules = 0usize;
+        let mut closes = 0usize;
+        let mut visited = 0usize;
+        for line in tail.lines() {
+            visited += 1;
+            if depth == 0 {
+                // Between modules NOTHING is allowed but blanks, comments, the
+                // gate and a module opener -- at ANY indentation, because an
+                // indented `fn` at file scope is still a top-level item and a
+                // column-0-only filter would miss it.
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with("//") {
+                    continue;
+                }
+                // Column-0 exactly, not `trimmed`: a `#[cfg(test)]` written
+                // INSIDE a function body is indented, and accepting it here
+                // would let it arm the walk for the next module along.
+                if line == BELOW_CUT_GATE {
+                    gated = true;
+                    continue;
+                }
+                if line.starts_with(char::is_whitespace) || !below_cut_is_module_opener(trimmed) {
+                    return Err(format!(
+                    "top-level source below the cut: {line:?}. RULE 9 -- every count in \
+                     `the_choke_point_module_starts_a_child_in_exactly_one_place` and in \
+                     `the_choke_point_module_names_exactly_one_child_starting_primitive` -- \
+                     reads only the half ABOVE the cut, and this file is excused from the tree \
+                     walk and is `JobCommand`'s own home file for OWN_IMPLS_ONLY, so an item \
+                     down here is read by NOTHING. That is where `impl JobCommand {{ pub fn \
+                     run_it(&self) {{ .. }} }}` survived a full green suite: nine lines below \
+                     this line, called from `CliExportRunner::run`, starting a second jobless \
+                     `bw export` carrying `BW_SESSION`. The identical nine lines ABOVE the cut \
+                     die. Move it above the test module."
+                    ));
+                }
+                if !gated {
+                    return Err(format!(
+                        "the module {line:?} below the cut is not test-gated, so it SHIPS -- \
+                         and it ships in the half of the file no rule here reads. A \
+                         `pub(crate) mod jc_ext {{ impl super::JobCommand {{ .. }} }}` written \
+                         down here is the same escape as an ungated `impl`, one `mod` deep"
+                    ));
+                }
+                gated = false;
+                depth = 1;
+                modules += 1;
+            } else if !line.is_empty() && !line.starts_with(char::is_whitespace) {
+                // Inside a test module every item is indented, so the only
+                // column-0 line is the module's own closing brace.
+                if line == "}" {
+                    depth = 0;
+                    closes += 1;
+                    continue;
+                }
+                if !BELOW_CUT_STRING_LINES.contains(&line) {
+                    return Err(format!(
+                        "a column-0 line inside a test module below the cut: {line:?}. Either a \
+                         top-level item escaped the brace count, or this is the contents of a \
+                         string literal and belongs in BELOW_CUT_STRING_LINES"
+                    ));
+                }
+            }
+        }
+        Ok((visited, modules, closes, depth))
+    }
+
+    /// **Below the cut there is nothing but gated test modules.**
+    ///
+    /// [`job_object_production`] cuts this file at the first column-0
+    /// `#[cfg(test)]` and every rule in this module reads the half above it.
+    /// Its only controls were that the cut was FOUND and that `spawn_in_job`
+    /// stayed above it. Nothing asserted that what lies BELOW it is test-only,
+    /// and nothing else in the crate looks: `job_object.rs` is on the tree
+    /// walk's ALLOWED list because it *is* the spawn, and `OWN_IMPLS_ONLY`
+    /// skips it because this is `JobCommand`'s home file.
+    ///
+    /// So the tail was governed by nothing at all, and two mutants proved it,
+    /// each measured SURVIVING at 2087 lib / 217 bin / 0 failed / 0 warnings:
+    ///
+    ///   Y2 -- an ungated `impl JobCommand` with a `run_it(&self)` that
+    ///         rebuilds the inner `Command` and spawns it, written immediately
+    ///         after `mod spawn_probe { .. }`, called from
+    ///         `CliExportRunner::run`. Replacing its spawn with a panic proved
+    ///         it LIVE on the real export path, holding the signature-verified
+    ///         `bw.exe` and all five export arguments -- in production a
+    ///         second, jobless `bw export` carrying `BW_SESSION`.
+    ///   Y1 -- the same nine lines inside `pub(crate) mod jc_ext { .. }`.
+    ///
+    /// The identical helper written ABOVE the cut is killed by RULE 9's word
+    /// count. The ONLY difference between killed and survived was which side
+    /// of the cut the lines sat on. The `#[cfg(test)]` gate on the three
+    /// `get_*` readers does not reach either mutant: inside this file the
+    /// private `command` field is visible directly, so the getters are never
+    /// needed. (That is also why the previous round misread a mutant of its
+    /// own: it used the gated readers, died to E0599, and the compile error
+    /// was taken for the PLACEMENT being closed.)
+    ///
+    /// This walk is the fix, and it is structural rather than another needle:
+    /// it does not ask what the tail says, it asks that the tail contains
+    /// nothing but `#[cfg(test)]`-gated modules, so there is no spelling of an
+    /// ungated item that passes it.
+    #[test]
+    fn nothing_but_gated_test_modules_lives_below_the_choke_points_cut() {
+        let raw = job_object_raw();
+        let production = job_object_production();
+
+        // 1. The tail is EXACTLY what the production cut threw away -- taken
+        //    by length from the very function every rule here cuts with, so
+        //    the two cannot drift apart and a cut that moved up is walked
+        //    from its new place (where it meets production source and fails)
+        //    rather than from where this test wished it were.
+        assert!(
+            raw.starts_with(&production) && production.len() < raw.len(),
+            "control: the production cut is not a prefix of this file, so the tail below is \
+             not the half the rules here stopped reading"
+        );
+        let tail = &raw[production.len()..];
+        assert!(
+            tail.starts_with(concat!("\n#[cfg(", "test)]\npub(crate) mod spawn_probe {")),
+            "the first thing below the cut is no longer the spawn probe's own module. The cut \
+             is the FIRST column-0 `cfg(test)` in the file, so a marker written above the real \
+             test modules -- in a comment, in a doc example -- moves it up and shortens the \
+             production half every rule in this module reads. Measured Z5: three comment lines \
+             carrying a column-0 marker, green at 2089 lib / 217 bin / 0 failed / 0 warnings. \
+             Nothing REAL can follow a moved cut, because the walk below refuses it -- but the \
+             cut is not a thing to leave loose, and this pins it to the byte"
+        );
+
+        // 2. Positive control on WHERE the cut is: the production half must
+        //    still reach the last production item in the file. Were the marker
+        //    matched above the real test module -- in a comment, in a doc
+        //    example -- this anchor would fall below the cut instead of just
+        //    above it, and every count in this module would be reading a
+        //    truncated file while still passing.
+        const LAST_PRODUCTION_ITEM: &str = concat!("Ok(res", "umed)");
+        assert_eq!(
+            raw.matches(LAST_PRODUCTION_ITEM).count(),
+            1,
+            "control: the anchor is not in this file exactly once, so it no longer pins \
+             anything -- repoint it at the last production item above the test module"
+        );
+        assert!(
+            production.contains(LAST_PRODUCTION_ITEM),
+            "the last production item this control knows about is BELOW the cut, which means \
+             the cut moved up and the production half every rule in this module reads is \
+             truncated"
+        );
+        assert!(
+            production.len() - production.rfind(LAST_PRODUCTION_ITEM).unwrap() < 1_500,
+            "the cut is more than 1500 bytes past the last production item this control knows \
+             about: either production was appended below the anchor (repoint the anchor) or \
+             the cut moved DOWN. Measured Z5: a column-0 `#[cfg(test)]` written into a COMMENT \
+             above the real test module moves the cut up. The walk below makes that \
+             self-defeating -- anything real that lands under the moved cut fails it -- but \
+             the gap between the last real item and the cut is not a place to keep source, \
+             and this bounds it"
+        );
+
+        // 3. The walk, run over an LF copy of the tail and a CRLF copy of the
+        //    same text, which must agree. Built BOTH ways rather than compared
+        //    against the bytes on disk on purpose: this repository stores LF
+        //    blobs and only `core.autocrlf=true` makes a working tree CRLF, so
+        //    a control that asserted "this file is CRLF" would itself be a
+        //    check that passes on this machine and fails on a plain checkout.
+        let lf = tail.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        assert_ne!(
+            lf, crlf,
+            "control: the two copies are the same string, so comparing the walk over them \
+             compares it with itself -- this tail has no line endings at all"
+        );
+        assert_eq!(
+            walk_below_the_cut(&lf),
+            walk_below_the_cut(&crlf),
+            "the walk gives a different answer on an LF copy of the tail than on a CRLF one, \
+             so something in it is sensitive to line endings"
+        );
+        let as_on_disk = walk_below_the_cut(tail);
+        assert!(
+            as_on_disk == walk_below_the_cut(&lf) || as_on_disk == walk_below_the_cut(&crlf),
+            "this file's line endings are mixed: the walk over it agrees with neither the \
+             all-LF nor the all-CRLF copy of its own text"
+        );
+
+        // 4. The walk is not vacuous, and it finished.
+        let (visited, modules, closes, depth) =
+            as_on_disk.unwrap_or_else(|why| panic!("{why}"));
+        assert!(
+            visited > 500,
+            "control: the walk visited only {visited} lines below the cut, which is not this \
+             file's test modules' worth -- the slice is empty or nearly so and this test \
+             proves nothing"
+        );
+        assert_eq!(
+            depth, 0,
+            "a test module below the cut is never closed by a column-0 brace, so the walk ran \
+             off the end of the file inside it and stopped inspecting top-level lines"
+        );
+        assert_eq!(
+            modules, 2,
+            "the number of top-level test modules below the cut changed. It is `spawn_probe` \
+             and `tests`. That is fine to change -- but this count is the control that proves \
+             the walk really visited them, so update it deliberately rather than loosening it"
+        );
+        assert_eq!(
+            closes, modules,
+            "control: every module the walk opened must also have been closed at column 0"
+        );
+        for known in BELOW_CUT_STRING_LINES {
+            assert_eq!(
+                raw.matches(known).count(),
+                1,
+                "control: the string-literal exception {known:?} is not in this file exactly \
+                 once, so it is stale and is widening this check for nothing"
+            );
+        }
+
+        // 5. CONTROLS on the walk itself, through the real function: each
+        //    assertion above can see the mutant it exists to catch, and does
+        //    not fire on the shape it must allow.
+        let gate = BELOW_CUT_GATE;
+        assert_eq!(
+            walk_below_the_cut(&format!("\n{gate}\nmod tests {{\n    fn a() {{}}\n}}\n")),
+            Ok((5, 1, 1, 0)),
+            "control: the walk rejects the one shape it must ALLOW -- a gated module whose \
+             only column-0 line is its own closing brace"
+        );
+        // Y2: an ungated `impl` at column 0 below the cut.
+        assert!(
+            walk_below_the_cut(&format!(
+                "\n{gate}\nmod tests {{\n}}\n\nimpl JobCommand {{\n}}\n"
+            ))
+            .is_err(),
+            "control: the walk does not see an ungated `impl` below the cut, which is Y2 \
+             exactly and the whole reason this test exists"
+        );
+        // Y1: the same, one ungated `mod` deep.
+        assert!(
+            walk_below_the_cut(&format!(
+                "\n{gate}\nmod tests {{\n}}\n\npub(crate) mod jc_ext {{\n}}\n"
+            ))
+            .is_err(),
+            "control: the walk does not see an UNGATED module below the cut, so Y1 walks \
+             through it"
+        );
+        // An INDENTED top-level item, which a column-0-only filter would miss.
+        assert!(
+            walk_below_the_cut(&format!(
+                "\n{gate}\nmod tests {{\n}}\n\n  impl JobCommand {{\n  }}\n"
+            ))
+            .is_err(),
+            "control: the walk is fooled by indenting a top-level item, which is the defect \
+             the column-0 form of this check shipped with elsewhere"
+        );
+        // A whole module on ONE line is not a module opener.
+        assert!(
+            walk_below_the_cut(&format!("\n{gate}\nmod m {{ impl JobCommand {{}} }}\n")).is_err(),
+            "control: `below_cut_is_module_opener` accepts a one-line module, so a whole impl \
+             can ride in on the opener's own line"
+        );
+        // And a gate that is INDENTED does not arm the walk: it is not a
+        // module-level attribute.
+        assert!(
+            walk_below_the_cut(&format!("\n  {gate}\nmod tests {{\n}}\n")).is_err(),
+            "control: an indented `cfg(test)` line arms the walk, so a gate written inside a \
+             function body would excuse the next module"
+        );
+        assert!(below_cut_is_module_opener("pub(crate) mod spawn_probe {"));
+        assert!(below_cut_is_module_opener("mod tests {"));
+        assert!(!below_cut_is_module_opener("impl JobCommand {"));
+        assert!(!below_cut_is_module_opener("mod tests { }"));
+        assert!(!below_cut_is_module_opener("pub mod a::b {"));
+    }
+
+    /// Every distinct name that production `job_object.rs` CALLS, in the
+    /// `code_only` view, sorted and deduplicated.
+    ///
+    /// A call is the only way to start a child, so this is an ALLOWLIST of one
+    /// primitive rather than a denylist of spellings -- the distinction RULE 9
+    /// could not make and [`CreateProcessW`] walked through. Two things are
+    /// normalised first so the callee cannot hide behind syntax:
+    ///
+    ///  * a turbofish `::<..>` is removed, so `f::<>()` -- legal on a
+    ///    non-generic function -- still reports `f` rather than reporting
+    ///    nothing because the character before the `(` was a `>`. The `>` of
+    ///    an `->` is not a closing bracket, the same exclusion
+    ///    [`alias_rhs`] and [`impl_heads`] make.
+    ///  * whitespace is already gone, so a keyword touching the name arrives
+    ///    glued to it (`ifThread32Next`). That is left alone deliberately:
+    ///    gluing changes the entry rather than hiding it, and the entry is
+    ///    pinned.
+    ///
+    /// Renaming the callee does not help -- `use ..::CreateProcessW as go;`
+    /// then `go(..)` reports `go`, which is equally not in the list. Nor does
+    /// a function pointer: `let f = CreateProcessW; f(x)` reports `f`.
+    fn production_callees(code: &str) -> Vec<String> {
+        let src: Vec<char> = code.chars().collect();
+        let mut flat: Vec<char> = Vec::with_capacity(src.len());
+        let mut i = 0;
+        while i < src.len() {
+            if src[i] == ':' && src.get(i + 1) == Some(&':') && src.get(i + 2) == Some(&'<') {
+                let mut depth = 0usize;
+                let mut j = i + 2;
+                while j < src.len() {
+                    if src[j] == '<' {
+                        depth += 1;
+                    } else if src[j] == '>' && src[j - 1] != '-' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+            } else {
+                flat.push(src[i]);
+                i += 1;
+            }
+        }
+
+        let mut out: Vec<String> = Vec::new();
+        for k in 0..flat.len() {
+            if flat[k] != '(' {
+                continue;
+            }
+            let mut start = k;
+            while start > 0 && (flat[start - 1].is_ascii_alphanumeric() || flat[start - 1] == '_') {
+                start -= 1;
+            }
+            if start < k {
+                let name: String = flat[start..k].iter().collect();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every distinct macro production `job_object.rs` invokes. A macro body
+    /// written HERE is scanned by [`production_callees`] like any other code,
+    /// but a macro imported from elsewhere expands to a call this file never
+    /// spells -- so the set of macros it invokes is pinned too.
+    fn production_macros(code: &str) -> Vec<String> {
+        let src: Vec<char> = code.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        for k in 0..src.len() {
+            // `!=` is a comparison, not an invocation: `a!=b` would otherwise
+            // report a macro called `a`.
+            if src[k] != '!' || src.get(k + 1) == Some(&'=') {
+                continue;
+            }
+            let mut start = k;
+            while start > 0 && (src[start - 1].is_ascii_alphanumeric() || src[start - 1] == '_') {
+                start -= 1;
+            }
+            if start < k {
+                let name: String = src[start..k].iter().collect();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every name production `job_object.rs` calls. Keywords arrive glued to
+    /// the name they touch because `code_only` has removed the whitespace;
+    /// that is not cosmetic damage, it is the pin.
+    const PRODUCTION_CALLEES: &[&str] = &[
+        "AssignProcessToJobObject",
+        "CloseHandle",
+        "CreateJobObjectW",
+        "CreateToolhelp32Snapshot",
+        "Err",
+        "HANDLE",
+        "Ok",
+        "OpenThread",
+        "SetInformationJobObject",
+        "args",
+        "as_raw_handle",
+        "assign",
+        "cfg",
+        "creation_flags",
+        "default",
+        "env",
+        "fnresume_process",
+        "from_raw_handle",
+        "get_args",
+        "get_envs",
+        "get_program",
+        "id",
+        "ifResumeThread",
+        "ifThread32First",
+        "ifThread32Next",
+        "ifletErr",
+        "ifletOk",
+        "is_err",
+        "is_ok",
+        "kill",
+        "letSome",
+        "matchresume_process",
+        "null",
+        "other",
+        "pubfnassign",
+        "pubfnget_args",
+        "pubfnget_envs",
+        "pubfnget_program",
+        "pubfnnew",
+        "pubfnspawn_in_job",
+        "pubfnwrap",
+        "record",
+        "returnErr",
+        "size_of",
+        "spawn",
+        "stderr",
+        "stdin",
+        "stdout",
+        "wait",
+    ];
+
+    /// Every macro production `job_object.rs` invokes: `log::error!` and
+    /// `format!`, both of which take a message and return one.
+    const PRODUCTION_MACROS: &[&str] = &["error", "format"];
+
+    /// Every `use` item production `job_object.rs` has, in the `code_only`
+    /// view (so the whitespace is gone and a trailing `;` is not part of the
+    /// body). `std` and `windows`, and nothing from this crate.
+    const PRODUCTION_IMPORTS: &[&str] = &[
+        "usestd::io",
+        "usestd::os::windows::io::{AsRawHandle,FromRawHandle,OwnedHandle}",
+        "usestd::os::windows::process::CommandExt",
+        "usestd::process::{Child,Command}",
+        "usewindows::Win32::Foundation::{CloseHandle,HANDLE}",
+        concat!(
+            "usewindows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot,",
+            "Thread32First,Thread32Next,TH32CS_SNAPTHREAD,THREADENTRY32,}"
+        ),
+        concat!(
+            "usewindows::Win32::System::JobObjects::{AssignProcessToJobObject,CreateJobObjectW,",
+            "JobObjectExtendedLimitInformation,SetInformationJobObject,",
+            "JOBOBJECT_EXTENDED_LIMIT_INFORMATION,JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,}"
+        ),
+        concat!(
+            "usewindows::Win32::System::Threading::{OpenThread,ResumeThread,CREATE_SUSPENDED,",
+            "THREAD_SUSPEND_RESUME,}"
+        ),
+        "usewindows::core::PCWSTR",
+    ];
+
+    /// Every path production `job_object.rs` writes that reaches back into
+    /// THIS crate. Exactly one: the console flag `bw_path::bw_command` has
+    /// already applied and that `spawn_in_job` must re-apply, because
+    /// `creation_flags` replaces rather than ORs.
+    const PRODUCTION_LOCAL_PATHS: &[&str] = &[concat!("crate::bw_pa", "th::CREATE_NO_WINDOW")];
+
+    /// Every `crate::`-, `super::`- or `self::`-rooted path in a `code_only`
+    /// view, sorted and deduplicated.
+    ///
+    /// The companion to [`production_callees`]. That one pins the NAMES this
+    /// file calls; a name on it can still be re-pointed at a different
+    /// function, which is what Z2 did to `null`. This pins where the names
+    /// come from, and a call into a sibling module cannot be written without
+    /// one of these three roots or a `use` (pinned separately).
+    fn production_local_paths(code: &str) -> Vec<String> {
+        let b: Vec<char> = code.chars().collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut k = 0;
+        while k < b.len() {
+            // `code_only` has removed the whitespace, so a root arrives GLUED
+            // to whatever preceded it -- `use super::x;` is `usesuper::x` and
+            // `return self::x()` is `returnself::x()`. Requiring a non-letter
+            // in front therefore hides exactly the shapes this exists to see,
+            // so only a digit, an underscore and a `:` are refused. An
+            // identifier that genuinely ENDS in `crate`/`super`/`self` would
+            // be a false positive -- this crate has none, and a rule that
+            // fires is the safe side of this trade.
+            let boundary = k == 0 || !(b[k - 1].is_ascii_digit() || b[k - 1] == '_' || b[k - 1] == ':');
+            let rest: String = b[k..].iter().take(8).collect();
+            let root = ["crate::", "super::", "self::"]
+                .into_iter()
+                .find(|r| rest.starts_with(r));
+            match (boundary, root) {
+                (true, Some(root)) => {
+                    let mut end = k + root.len();
+                    while end < b.len()
+                        && (b[end].is_ascii_alphanumeric() || b[end] == '_' || b[end] == ':')
+                    {
+                        end += 1;
+                    }
+                    let path: String = b[k..end].iter().collect();
+                    let path = path.trim_end_matches(':').to_string();
+                    if !out.contains(&path) {
+                        out.push(path);
+                    }
+                    k = end;
+                }
+                _ => k += 1,
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// **This file names exactly one child-starting primitive.**
+    ///
+    /// RULE 9 counts SPELLINGS -- `.spawn()`, `Command::new(`, the word
+    /// `spawn` -- and writes its own hole down at the bottom: `CreateProcessW`
+    /// called straight through the `windows` crate writes no `spawn` and
+    /// builds no `Command`, so it leaves all five counts untouched. That was
+    /// disclosed as "not reproduced". It is reproduced: a dozen lines of
+    /// `unsafe` FFI dropped into `spawn_in_job` after the probe's early
+    /// return, using `windows::Win32::System::Threading::{CreateProcessW,
+    /// PROCESS_INFORMATION, STARTUPINFOW}` -- a feature this crate already
+    /// enables -- measured SURVIVING over three runs at 2087 lib / 217 bin /
+    /// 0 failed / 0 warnings. `std::process::Command`'s own `get_program` and
+    /// `get_args` are not the gated ones, so the `#[cfg(test)]` readers do not
+    /// reach it either.
+    ///
+    /// A denylist of spellings is a losing race -- `CreateProcessA`,
+    /// `CreateProcessAsUserW`, `ShellExecuteExW`, `WinExec`,
+    /// `NtCreateUserProcess`, a rename at the `use`. But this file is the one
+    /// file in the crate ALLOWED to start a child, so the honest rule is an
+    /// allowlist of one: **every name this file calls is written down.** A
+    /// child cannot be started without calling something, and anything called
+    /// appears in [`production_callees`] under whatever name it was given.
+    ///
+    /// That makes this a closed, stale-checked set -- the same shape as
+    /// `ALLOWED`, `DOOR_FILES`, `DOOR_MODULES` and `BW_PATH_MAY_REACH` -- and
+    /// not another needle. It is still a TEXT rule: it reads the source rather
+    /// than running it, for the reason RULE 9 gives at length. What it buys is
+    /// that the next escape from this file cannot be a new spelling; it has to
+    /// be a name that is already on this list doing something else.
+    #[test]
+    fn the_choke_point_module_names_exactly_one_child_starting_primitive() {
+        let code = code_only(&job_object_production());
+        assert!(
+            code.len() > 2000,
+            "control: production job_object.rs stripped to almost nothing, so the sets below \
+             are vacuous"
+        );
+
+        assert_eq!(
+            production_callees(&code),
+            PRODUCTION_CALLEES,
+            "production job_object.rs calls a name that is not on the list. This file is the \
+             ONE file in the crate allowed to start a child, and `command.spawn()` is the one \
+             primitive it may use to do it -- so every other name it calls is written down. A \
+             new entry is either a refactor (update the list, deliberately) or it is the next \
+             `CreateProcessW`: a way of starting a process that writes no `spawn`, builds no \
+             `Command`, and leaves every one of RULE 9's five counts untouched"
+        );
+        assert_eq!(
+            production_macros(&code),
+            PRODUCTION_MACROS,
+            "production job_object.rs invokes a macro that is not on the list. A macro body \
+             written in this file is scanned like any other code, but one imported from \
+             elsewhere expands to a call this file never spells -- so the macro itself is the \
+             callee and has to be named here"
+        );
+        assert_eq!(
+            code.matches("unsafe").count(),
+            3,
+            "the number of `unsafe` regions in production job_object.rs changed. Every Win32 \
+             entry point is `unsafe`, so a new one is the cheapest first sign of a second way \
+             to start a child. Three: `KillOnCloseJob::new`, `KillOnCloseJob::assign` and \
+             `resume_process`. (This count alone is NOT the rule -- a call added INSIDE an \
+             existing block does not move it -- which is what the callee list is for.)"
+        );
+
+        assert_eq!(
+            {
+                let mut uses = item_bodies(&code, "use");
+                uses.sort();
+                uses
+            },
+            PRODUCTION_IMPORTS,
+            "production job_object.rs imports something new. The callee list above pins the \
+             NAMES this file calls; this pins where those names come from. Measured Z2: \
+             `PCWSTR::null()` reports the callee `null`, so re-pointing that ONE call at a \
+             `null()` in another file left the callee list byte-identical while starting a \
+             child through `CreateProcessW` next door -- and the tree walk reads other files \
+             only for `.spawn()`, `.output()` and `.status()`, so it did not look"
+        );
+        assert_eq!(
+            production_local_paths(&code),
+            PRODUCTION_LOCAL_PATHS,
+            "production job_object.rs reaches into this crate somewhere new. One item, one \
+             constant: `bw_path::CREATE_NO_WINDOW`. Everything else this file needs is `std` \
+             or `windows`. A `crate::`-rooted path is the other half of Z2 -- the half that \
+             does not need a `use` at all"
+        );
+
+        // CONTROLS, through the real functions, on shapes that are not in the
+        // file: each half can see what it exists to catch.
+        let seen = |s: &str| production_callees(&code_only(s));
+        assert_eq!(
+            production_local_paths(&code_only("let n: PCWSTR = crate::bw_path::null();")),
+            vec![concat!("crate::bw_pa", "th::null").to_string()],
+            "control: Z2's own re-pointed call is invisible to the local-path scan"
+        );
+        assert_eq!(
+            production_local_paths(&code_only("use super::helpers::go; use self::x::y;")),
+            vec!["self::x::y".to_string(), "super::helpers::go".to_string()],
+            "control: `super::` and `self::` reach the same crate and are not scanned"
+        );
+        assert!(
+            production_local_paths(&code_only("let a = windows::core::PCWSTR::null();")).is_empty(),
+            "control: an ordinary external path is miscounted as a local one, so the pin \
+             above is noise that will be deleted"
+        );
+        assert_eq!(
+            seen("unsafe { let _ = CreateProcessW(&si, &mut pi); }"),
+            vec!["CreateProcessW".to_string()],
+            "control: the reproduced mutant's own call is invisible to the callee scan"
+        );
+        assert_eq!(
+            seen("use windows::Win32::System::Threading::CreateProcessW as go; go(&mut pi);"),
+            vec!["go".to_string()],
+            "control: renaming the primitive at the `use` hides it -- an alias-blind rule is \
+             the denylist this exists to avoid being"
+        );
+        assert_eq!(
+            seen("let f = CreateProcessW; f(&mut pi);"),
+            vec!["f".to_string()],
+            "control: a function pointer hides the callee"
+        );
+        assert_eq!(
+            seen("let _ = go::<>(&mut pi);"),
+            vec!["go".to_string()],
+            "control: an empty turbofish -- legal on a non-generic fn -- puts a `>` before \
+             the `(` and hides the callee"
+        );
+        assert_eq!(
+            seen("let _ = f::<fn() -> u8>(x);"),
+            vec!["f".to_string()],
+            "control: the `>` of an `->` inside a turbofish ends the skip early and eats the \
+             callee's name"
+        );
+        assert_eq!(
+            seen("let n = std::mem::size_of::<STARTUPINFOW>();"),
+            vec!["size_of".to_string()],
+            "control: a real turbofish call in this file is still attributed to its callee"
+        );
+        assert_eq!(
+            production_macros(&code_only("elsewhere::start_it!(command);")),
+            vec!["start_it".to_string()],
+            "control: a macro that expands to a call somewhere else is invisible"
+        );
+        assert!(
+            seen("println!(\"x\");").is_empty(),
+            "control: a macro invocation is not miscounted as a call -- if it were, the macro \
+             list below would be doing nothing"
+        );
     }
 }
