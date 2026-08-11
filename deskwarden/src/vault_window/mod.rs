@@ -747,10 +747,13 @@ pub fn build_frame(
     // told apart from an answer to the current one. See
     // `send_ui::SendFetch::apply_answer`, and `spawn_aux_load`, which carries
     // its own tag for exactly the same reason.
-    let (send_tx, send_rx): (
-        mpsc::Sender<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>,
-        Receiver<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>,
-    ) = mpsc::channel();
+    //
+    // The receiving half is a `send_channel::SendListReceiver` and not an
+    // `mpsc::Receiver`: it has `try_recv` and no blocking drain at all, so
+    // moving it into a holder struct -- in this file or any other -- carries
+    // no way to wait on it. See `mod send_channel`.
+    let (send_tx, send_rx): (SendListSender, send_channel::SendListReceiver) =
+        send_channel::send_list_channel();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
     let (aux_tx, aux_rx): (
@@ -4427,8 +4430,70 @@ mod send_fetch_thread {
 }
 
 /// The Sends channel's sending half. Named because three signatures carry it.
-type SendListSender =
-    mpsc::Sender<(u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>)>;
+type SendListSender = mpsc::Sender<send_channel::SendListAnswer>;
+
+/// The Sends channel's **receiving** half, as a type that cannot be waited on.
+mod send_channel {
+    //! A privacy boundary around one `Receiver`, and that is its entire
+    //! reason for existing.
+    //!
+    //! The freeze this whole design exists to prevent has two ends. The fetch
+    //! end is sealed inside `mod send_fetch_thread`. This is the channel end,
+    //! and until now it was held only by *source pins* over the token
+    //! `send_rx` -- which is a pin on a name, and a name can be moved. The
+    //! reviewer's mutation was to move the raw `Receiver` into a struct one
+    //! file over:
+    //!
+    //! ```ignore
+    //! let waiter = send_ui::RxHolder::new(send_rx);   // in the frame
+    //! if let Some((tag, result)) = waiter.wait() { .. } // `self.0.recv()`
+    //! ```
+    //!
+    //! Every `send_rx` token still passed the follow-character rule, no
+    //! banned method name appeared in either file's production, and the
+    //! eframe thread blocked for up to sixty seconds. Green.
+    //!
+    //! So the receiver is a *type* now instead of a *token*.
+    //! [`SendListReceiver`] exposes `try_recv` and nothing else, and its
+    //! field is private to **this** module -- deliberately not to
+    //! `vault_window`, because `vault_window::send_ui` is a descendant of
+    //! `vault_window` and Rust would let a descendant reach a private field
+    //! of its ancestor. There is no descendant of `send_channel`. Whatever
+    //! struct anybody wraps the value in, and wherever they wrap it, the only
+    //! method reachable through it is the non-blocking one, and reaching past
+    //! it is an `E0616`.
+
+    use std::sync::mpsc;
+
+    /// One answer: the `SendFetch` generation the fetch was started under,
+    /// and what came back.
+    pub(super) type SendListAnswer =
+        (u64, Result<Vec<crate::send::SendSummary>, crate::send::SendError>);
+
+    /// A `Receiver` with the blocking half of its interface removed.
+    ///
+    /// `recv`, `recv_timeout`, `recv_deadline`, `iter`, `into_iter` and the
+    /// `IntoIterator` impl are all reachable on `mpsc::Receiver`; none of
+    /// them is reachable here, and the wrapped receiver cannot be got at to
+    /// reach them, because `.0` is private to this module.
+    pub(super) struct SendListReceiver(mpsc::Receiver<SendListAnswer>);
+
+    impl SendListReceiver {
+        /// The only drain there is: takes an answer if one has landed and
+        /// returns immediately if none has.
+        pub(super) fn try_recv(&self) -> Result<SendListAnswer, mpsc::TryRecvError> {
+            self.0.try_recv()
+        }
+    }
+
+    /// The channel, built as a pair whose receiving half is already sealed --
+    /// so there is never a moment at which a raw `Receiver` for this channel
+    /// exists outside this module for somebody to keep.
+    pub(super) fn send_list_channel() -> (super::SendListSender, SendListReceiver) {
+        let (tx, rx) = mpsc::channel();
+        (tx, SendListReceiver(rx))
+    }
+}
 
 /// Why an on-demand list could not be fetched.
 ///

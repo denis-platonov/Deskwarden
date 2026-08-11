@@ -1946,12 +1946,16 @@ mod source_pins {
         &source[..end]
     }
 
-    /// The same cut over **this** file. `production()` reads `mod.rs` only,
+    /// The same idea over **this** file. `production()` reads `mod.rs` only,
     /// which is how a blocking fetch written one file over stayed invisible.
-    fn this_files_production() -> &'static str {
-        let source = include_str!("send_ui.rs");
-        let end = source.find(concat!("#[cfg(", "test)]")).expect("no test marker");
-        &source[..end]
+    ///
+    /// Not the same *cut*, though: this file has four `#[cfg(test)]` modules
+    /// and a first-occurrence cut would hand back 718 lines out of 2808 and
+    /// call the other 2090 "test code" without looking. It goes through
+    /// [`production_region`], which removes each gated item by brace-matching
+    /// and keeps everything between them.
+    fn this_files_production() -> String {
+        production_region(include_str!("send_ui.rs"))
     }
 
     /// Every `.rs` file under `deskwarden/src`, walked at test time, as
@@ -1991,13 +1995,380 @@ mod source_pins {
         out
     }
 
-    /// Whatever the compiler builds into the shipped binary from `text`: it up
-    /// to its first `#[cfg(test)]`, or all of it if it has none.
-    fn production_region(text: &str) -> &str {
-        match text.find(concat!("#[cfg(", "test)]")) {
-            Some(end) => &text[..end],
-            None => text,
+    /// `text` with every comment and the *contents* of every string, raw
+    /// string and character literal replaced by spaces, byte-for-byte in
+    /// length so that byte offsets still line up with the original, and
+    /// newlines preserved so that line-oriented reads still line up too.
+    ///
+    /// **Why.** Two reasons, and they are the two ends of the same problem.
+    ///
+    /// A needle counted in a *comment* is a false positive: writing
+    /// `list_sends(` into a doc comment in `job_object.rs` would have turned
+    /// the crate walk below red for no behavioural reason at all, which is
+    /// the fastest way to get a guard deleted. And a `#[cfg(test)]` written
+    /// inside a comment or a string -- this file's own pins are full of
+    /// `concat!("#[cfg(", "test)]")` precisely to avoid it -- is a false
+    /// *gate*, which would make [`production_region`] discard live production
+    /// code and go blind exactly where it must not.
+    ///
+    /// String literal contents are blanked rather than kept: a call written
+    /// in a string is not a call. The delimiters are kept, so the text still
+    /// tokenises.
+    fn sanitized(text: &str) -> String {
+        let b = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0usize;
+        // Blank `n` bytes from `i`, keeping any newline in them.
+        let blank = |out: &mut String, from: usize, to: usize| {
+            for &c in &b[from..to] {
+                // Carriage returns are kept as well as newlines: a pin
+                // written as `"\r\n        if let .."` must still match a
+                // line whose predecessor was a comment.
+                out.push(match c {
+                    b'\n' => '\n',
+                    b'\r' => '\r',
+                    _ => ' ',
+                });
+            }
+        };
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    let start = i;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    blank(&mut out, start, i);
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    // Rust block comments nest.
+                    let start = i;
+                    let mut depth = 0usize;
+                    while i < b.len() {
+                        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    blank(&mut out, start, i);
+                }
+                b'r' if matches!(b.get(i + 1), Some(&b'"') | Some(&b'#')) => {
+                    let mut j = i + 1;
+                    let mut hashes = 0usize;
+                    while b.get(j) == Some(&b'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if b.get(j) != Some(&b'"') {
+                        // Not a raw string: an identifier like `r#type`, or
+                        // `r` followed by something else. Copy one byte.
+                        out.push('r');
+                        i += 1;
+                        continue;
+                    }
+                    out.push('r');
+                    blank(&mut out, i + 1, j + 1);
+                    i = j + 1;
+                    let close: Vec<u8> =
+                        std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+                    let start = i;
+                    while i < b.len() && !b[i..].starts_with(&close) {
+                        i += 1;
+                    }
+                    blank(&mut out, start, i);
+                    let end = (i + close.len()).min(b.len());
+                    blank(&mut out, i, end);
+                    i = end;
+                }
+                b'"' => {
+                    out.push('"');
+                    i += 1;
+                    let start = i;
+                    while i < b.len() {
+                        if b[i] == b'\\' {
+                            i = (i + 2).min(b.len());
+                        } else if b[i] == b'"' {
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    blank(&mut out, start, i.min(b.len()));
+                    if i < b.len() {
+                        out.push('"');
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    // A character literal, or a lifetime. `'a'`, `'\n'`,
+                    // `'\\'` and `'\u{1f}'` all end at the next unescaped
+                    // quote on the same line; a lifetime has none.
+                    let mut j = i + 1;
+                    if b.get(j) == Some(&b'\\') {
+                        j += 1;
+                        while j < b.len() && b[j] != b'\'' && b[j] != b'\n' {
+                            j += 1;
+                        }
+                    } else {
+                        while j < b.len() && (b[j] & 0xc0) == 0x80 {
+                            j += 1;
+                        }
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'\'') {
+                        out.push('\'');
+                        blank(&mut out, i + 1, j);
+                        out.push('\'');
+                        i = j + 1;
+                    } else {
+                        out.push('\'');
+                        i += 1;
+                    }
+                }
+                c => {
+                    // Multi-byte UTF-8 is copied whole so the output stays
+                    // valid UTF-8 and the same byte length.
+                    let width = if c < 0x80 {
+                        1
+                    } else if c >= 0xf0 {
+                        4
+                    } else if c >= 0xe0 {
+                        3
+                    } else {
+                        2
+                    };
+                    let end = (i + width).min(b.len());
+                    out.push_str(&text[i..end]);
+                    i = end;
+                }
+            }
         }
+        out
+    }
+
+    /// Whatever the compiler builds into the shipped binary from `text`:
+    /// everything that is not inside a `#[cfg(test)]`-gated item, with
+    /// comments and literal contents blanked by [`sanitized`].
+    ///
+    /// **This used to be `text[..text.find("#[cfg(test)]")]`, and that was a
+    /// hole big enough to drive the whole defect through.** A first-occurrence
+    /// cut is only correct for a file shaped as "production, then nothing but
+    /// test modules to EOF" -- and `mod.rs` is that shape only because a
+    /// dedicated walk (`nothing_but_gated_test_modules_lives_below_the_pins_cut`)
+    /// asserts it every run. **This** file has FOUR `#[cfg(test)]` modules,
+    /// and the crate walk hands this function fifty files whose shape nothing
+    /// asserts at all. Measured on `4446e9a`: the reviewer inserted
+    ///
+    /// ```ignore
+    /// pub(super) fn prefetch_now() -> Result<Vec<SendSummary>, SendError> {
+    ///     let runner = crate::send::CliSendRunner::new(None, /* data dir */);
+    ///     crate::send::list_sends(&runner)
+    /// }
+    /// ```
+    ///
+    /// at column zero between `mod tests` and `mod fetch_thread_tests` -- a
+    /// position that compiles into the shipped binary and that the old cut
+    /// could not see -- plus a call in the frame closure. 2061 lib + 217 bin,
+    /// 0 failed. A sixty-second freeze, green.
+    ///
+    /// So the gated items are *removed*, not cut at: each `#[cfg(test)]` is
+    /// followed to its item's extent -- the matching `}` of the item's brace
+    /// group, or the `;` that ends a braceless item such as
+    /// `#[cfg(test)] use foo::bar;` -- and everything else is kept, however
+    /// many times production and tests interleave.
+    ///
+    /// The alternative considered and rejected was to require every file in
+    /// the crate to have `mod.rs`'s "one trailing run of test modules" shape,
+    /// enforced by a walk. That is a real property and it is what holds
+    /// `mod.rs`, but imposing it on ~50 files reshapes files this round has
+    /// no business reshaping, and it fixes the *files* rather than the
+    /// *function* -- the next file added is out of shape until somebody
+    /// notices. Handling the interleaving is the honest fix, and
+    /// `the_production_region_survives_interleaved_test_items` runs it
+    /// against interleaving that the old cut got wrong.
+    fn production_region(text: &str) -> String {
+        let gate = concat!("#[cfg(", "test)]");
+        let clean = sanitized(text);
+        let b = clean.as_bytes();
+        let mut out = String::with_capacity(clean.len());
+        let mut i = 0usize;
+        while let Some(rel) = clean[i..].find(gate) {
+            let at = i + rel;
+            out.push_str(&clean[i..at]);
+            // Walk from the end of the attribute to the end of the item it
+            // gates. `(` and `[` are tracked so a `;` inside a type such as
+            // `[u8; 4]` or a `const` generic is not mistaken for the item's
+            // terminator.
+            let mut j = at + gate.len();
+            let mut nesting = 0usize;
+            let end = loop {
+                if j >= b.len() {
+                    break b.len();
+                }
+                match b[j] {
+                    b'(' | b'[' => nesting += 1,
+                    b')' | b']' => nesting = nesting.saturating_sub(1),
+                    b';' if nesting == 0 => break j + 1,
+                    b'{' => {
+                        let mut depth = 1usize;
+                        j += 1;
+                        while j < b.len() && depth > 0 {
+                            match b[j] {
+                                b'{' => depth += 1,
+                                b'}' => depth -= 1,
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        break j;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            };
+            i = end;
+        }
+        out.push_str(&clean[i..]);
+        out
+    }
+
+    /// The controls on [`production_region`] and [`sanitized`]. Without them
+    /// the function above is a hundred lines of unexercised string handling
+    /// standing between every guard in this module and the code it guards.
+    ///
+    /// Each case is a shape the OLD first-occurrence cut got wrong, or one
+    /// the new scanner could plausibly get wrong.
+    #[test]
+    fn the_production_region_survives_interleaved_test_items() {
+        let gate = concat!("#[cfg(", "test)]");
+
+        // 1. The reviewer's mutation, in miniature: production BETWEEN two
+        //    gated modules. The old cut returned "keep\n" and lost `sneaked`.
+        let interleaved = format!(
+            "fn keep_a() {{}}\n{gate}\nmod t1 {{\n    fn inner() {{ let x = 1; }}\n}}\n\
+             fn sneaked() {{ danger(); }}\n{gate}\nmod t2 {{\n    fn inner() {{}}\n}}\n\
+             fn keep_b() {{}}\n"
+        );
+        let region = production_region(&interleaved);
+        for kept in ["keep_a", "sneaked", "danger()", "keep_b"] {
+            assert!(region.contains(kept), "{kept:?} was dropped from {region:?}");
+        }
+        for dropped in ["mod t1", "mod t2", "fn inner"] {
+            assert!(!region.contains(dropped), "{dropped:?} survived in {region:?}");
+        }
+        // The old rule, stated here so the improvement is measured and not
+        // merely asserted in prose.
+        let old_cut = &interleaved[..interleaved.find(gate).expect("a gate")];
+        assert!(
+            !old_cut.contains("sneaked"),
+            "control: the first-occurrence cut this replaced already saw the interleaved \
+             production item, so this test is not measuring anything"
+        );
+
+        // 2. Nested braces inside a gated module do not end it early.
+        let nested = format!("{gate}\nmod t {{\n    fn f() {{ if x {{ y(); }} }}\n}}\nfn after() {{}}\n");
+        let region = production_region(&nested);
+        assert!(region.contains("fn after"), "{region:?}");
+        assert!(!region.contains("y()"), "a nested brace ended the gated module early: {region:?}");
+
+        // 3. A braceless gated item ends at its semicolon, and does not eat
+        //    the file. A `[u8; 4]` in the way must not end it either.
+        let braceless = format!("{gate}\nuse foo::bar;\nfn after() {{}}\n");
+        assert!(production_region(&braceless).contains("fn after"));
+        let with_array = format!("{gate}\nstatic S: [u8; 4] = [0; 4];\nfn after() {{}}\n");
+        let region = production_region(&with_array);
+        assert!(region.contains("fn after"), "a `;` inside `[..]` ended the item early: {region:?}");
+        assert!(!region.contains("static S"), "{region:?}");
+
+        // 4. A gate written in a COMMENT or a STRING is not a gate. This is
+        //    the failure mode that would make the region discard live code.
+        let in_prose = format!("// {gate} in prose\nfn kept() {{}}\nlet s = \"{gate}\";\nfn also() {{}}\n");
+        let region = production_region(&in_prose);
+        assert!(region.contains("fn kept"), "a gate in a comment cut production: {region:?}");
+        assert!(region.contains("fn also"), "a gate in a string cut production: {region:?}");
+
+        // 5. Comments and literal contents are blanked, so a needle written
+        //    in either is not counted -- and the code around them survives.
+        let commented = "fn a() {} // list_sends( in a comment\nfn b() {}\n\
+                         /* list_sends( */ fn c() {}\nlet s = \"list_sends(\";\n";
+        let region = production_region(commented);
+        assert_eq!(
+            region.matches(concat!("list_", "sends(")).count(),
+            0,
+            "a needle in a comment or a string was counted: {region:?}"
+        );
+        for kept in ["fn a", "fn b", "fn c", "let s"] {
+            assert!(region.contains(kept), "{kept:?} was blanked with its comment: {region:?}");
+        }
+
+        // 6. `sanitized` preserves byte length and newlines, which is what
+        //    lets offsets and line reads taken over it mean anything.
+        let messy = "fn a() { /* x\ny */ let c = '\\''; let s = \"q\\\"z\"; }\n// tail\n";
+        let clean = sanitized(messy);
+        assert_eq!(clean.len(), messy.len(), "sanitized changed the byte length");
+        assert_eq!(
+            clean.matches('\n').count(),
+            messy.matches('\n').count(),
+            "sanitized changed the line count"
+        );
+        // And CRLF survives blanking, or every `"\r\n.."` pin taken over a
+        // sanitized region silently matches nothing.
+        let crlf = "// a comment\r\nfn kept() {}\r\n";
+        assert!(
+            sanitized(crlf).contains("\r\nfn kept() {}"),
+            "a blanked CRLF comment ate the carriage return: {:?}",
+            sanitized(crlf)
+        );
+        assert!(clean.contains("fn a() {"), "{clean:?}");
+        assert!(!clean.contains("tail"), "a line comment survived: {clean:?}");
+
+        // 7. A lifetime is not a character literal: blanking from `'a` to the
+        //    next quote would swallow real code.
+        let lifetimes = "fn f<'a>(x: &'a str) -> &'a str { list_sends(x) }\n";
+        assert!(
+            production_region(lifetimes).contains(concat!("list_", "sends(x)")),
+            "lifetimes were treated as character literals: {:?}",
+            production_region(lifetimes)
+        );
+
+        // 8. Raw strings, including hashed ones containing quotes.
+        let raws = "let a = r\"list_sends(\"; let b = r#\"a \" list_sends( b\"#; fn kept() {}\n";
+        let region = production_region(raws);
+        assert_eq!(region.matches(concat!("list_", "sends(")).count(), 0, "{region:?}");
+        assert!(region.contains("fn kept"), "{region:?}");
+
+        // 9. Non-vacuity: over this crate's own files the region is neither
+        //    everything nor nothing.
+        let here = include_str!("send_ui.rs");
+        let region = this_files_production();
+        assert!(
+            region.len() > 5_000,
+            "control: this file's production region is only {} bytes",
+            region.len()
+        );
+        assert!(
+            region.len() < here.len() * 2 / 3,
+            "control: this file's production region is {} of {} bytes -- the four test modules \
+             are not being removed",
+            region.len(),
+            here.len()
+        );
+        assert!(
+            !region.contains(concat!("mod fetch_thread_", "tests")),
+            "a `#[cfg(test)]` module survived into this file's production region"
+        );
+        assert!(
+            region.contains(concat!("fn draw_send_", "pane")),
+            "the pane's own entry point is missing from this file's production region"
+        );
     }
 
     /// A named function's body, from its opening `(` to the first `}` at the
@@ -2169,15 +2540,35 @@ mod source_pins {
         // Bare names, not `crate::send::`-qualified ones: `use
         // crate::send::list_sends;` and a bare call is precisely the spelling
         // the seal's doc comment names as the remaining way round privacy.
-        for needle in [concat!("list_", "sends("), concat!("CliSendRunner::", "new(")] {
+        //
+        // And not the bare name ALONE either. Measured on `4446e9a`, writing
+        // in `send_ui`'s production
+        //
+        // ```ignore
+        // use crate::send::{list_sends as fetch_now, CliSendRunner as Runner};
+        // fetch_now(&Runner::new(None, d.as_deref()))
+        // ```
+        //
+        // and calling it from the frame closure gave 2061 lib + 217 bin, 0
+        // failed: neither `list_sends(` nor `CliSendRunner::new(` appeared
+        // anywhere in the crate. A needle is a pin on a *spelling*, and `use
+        // .. as` renames the spelling. So each file's own `use` items are
+        // read first and every local name they bind to these two is counted
+        // as well -- see `local_names_of`.
+        for item in [concat!("list_", "sends"), concat!("CliSendRunner::", "new")] {
             let sites: Vec<&str> = files
                 .iter()
                 .filter(|(path, _)| path != "send.rs")
                 .flat_map(|(path, text)| {
-                    std::iter::repeat(path.as_str())
-                        .take(production_region(text).matches(needle).count())
+                    let region = production_region(text);
+                    let count: usize = local_names_of(&region, item)
+                        .iter()
+                        .map(|name| region.matches(&format!("{name}(")).count())
+                        .sum();
+                    std::iter::repeat(path.as_str()).take(count)
                 })
                 .collect();
+            let needle = format!("{item}(");
             assert_eq!(
                 sites,
                 vec!["vault_window/mod.rs"],
@@ -2188,6 +2579,148 @@ mod source_pins {
                  reaches every `pub` function in this module"
             );
         }
+
+        // `use` is module-scoped, so `local_names_of` sees a rename only in
+        // the file that wrote it. The one way a rename crosses a file is a
+        // re-export, so no file but `send.rs` may re-export either name.
+        for (path, text) in files.iter().filter(|(path, _)| path != "send.rs") {
+            for item in [concat!("list_", "sends"), concat!("CliSendRunner", "")] {
+                for use_item in use_items(&production_region(text)) {
+                    assert!(
+                        !(use_item.starts_with("pub use") && use_item.contains(item)),
+                        "{path} re-exports {item:?} ({use_item:?}). A re-export carries the \
+                         blocking fetch, and any rename of it, into files whose own `use` items \
+                         say nothing about it -- which is past every count above"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every way `item` can be *spelled as a call* inside one production
+    /// region, given that region's own `use` items.
+    ///
+    /// `item` is `head` or `head::method`. The answer always contains `item`
+    /// itself, plus one entry for each of:
+    ///
+    /// * `use ..::head as ALIAS;` (in a braced group or not) -> `ALIAS[::method]`
+    /// * `use crate::send as M;` / `use super::send as M;` -> `M::item`
+    ///
+    /// **This is alias resolution, not a longer list of needles.** A needle
+    /// is a pin on a spelling and `use .. as` exists to change the spelling;
+    /// see the measurement in the caller. It is still only as wide as one
+    /// file, because Rust `use` is module-scoped -- which is why the caller
+    /// also refuses a `pub use` of either name outside `send.rs`, closing the
+    /// re-export hop that would otherwise carry an alias across files.
+    ///
+    /// **The real fix is not here.** It is to narrow `list_sends`'s and
+    /// `CliSendRunner`'s visibility in `send.rs` so that `vault_window`
+    /// cannot name them outside `mod send_fetch_thread` at all, at which
+    /// point every spelling above is an `E0603` and no scan is needed.
+    /// `send.rs` was held by another change this round and could not be
+    /// touched; this stands in until it can.
+    fn local_names_of(region: &str, item: &str) -> Vec<String> {
+        let (head, method) = match item.split_once("::") {
+            Some((h, m)) => (h, format!("::{m}")),
+            None => (item, String::new()),
+        };
+        let mut names = vec![item.to_string()];
+        for use_item in use_items(region) {
+            // `use ..::head as ALIAS`
+            for (at, _) in use_item.match_indices(head) {
+                let before = use_item[..at].chars().next_back();
+                if matches!(before, Some(c) if c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = use_item[at + head.len()..].trim_start();
+                if let Some(alias) = rest.strip_prefix("as ") {
+                    let alias: String =
+                        alias.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if !alias.is_empty() {
+                        names.push(format!("{alias}{method}"));
+                    }
+                }
+            }
+            // `use crate::send as M;`
+            for prefix in [concat!("crate::", "send"), concat!("super::", "send")] {
+                if let Some(at) = use_item.find(prefix) {
+                    let rest = use_item[at + prefix.len()..].trim_start();
+                    if let Some(alias) = rest.strip_prefix("as ") {
+                        let alias: String = alias
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
+                        if !alias.is_empty() {
+                            names.push(format!("{alias}::{item}"));
+                        }
+                    }
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Every `use` item in a production region, as the text from `use` to its
+    /// terminating `;`, whitespace-squashed so `use crate::send::{\r\n    a as
+    /// b,\r\n};` reads the same as the one-line spelling.
+    fn use_items(region: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for (at, _) in region.match_indices("use ") {
+            let before = region[..at].chars().next_back();
+            if matches!(before, Some(c) if c.is_alphanumeric() || c == '_' || c == ':') {
+                continue;
+            }
+            let rest = &region[at..];
+            let end = rest.find(';').unwrap_or(rest.len());
+            out.push(squashed(&rest[..end]));
+        }
+        out
+    }
+
+    /// The controls on [`local_names_of`]: it really does follow a rename.
+    #[test]
+    fn a_renaming_import_of_the_blocking_fetch_is_still_the_blocking_fetch() {
+        let aliased = concat!(
+            "use crate::send::{list_", "sends as fetch_now, CliSendRunner as Runner};\r\n",
+            "fn go() { fetch_now(&Runner::new(None, None)) }\r\n"
+        );
+        let names = local_names_of(aliased, concat!("list_", "sends"));
+        assert!(
+            names.iter().any(|n| n == "fetch_now"),
+            "the rename in {aliased:?} was not followed: {names:?}"
+        );
+        let runner = local_names_of(aliased, concat!("CliSendRunner::", "new"));
+        assert!(
+            runner.iter().any(|n| n == concat!("Runner::", "new")),
+            "the type rename was not followed: {runner:?}"
+        );
+
+        // A module rename, and a multi-line braced group.
+        let module_aliased = concat!(
+            "use crate::",
+            "send as s;\r\nfn go() { s::list_",
+            "sends(&r) }\r\n"
+        );
+        let names = local_names_of(module_aliased, concat!("list_", "sends"));
+        assert!(
+            names.iter().any(|n| n == concat!("s::list_", "sends")),
+            "the module rename was not followed: {names:?}"
+        );
+
+        // Control: with no `use` at all the answer is just the item, so the
+        // caller's count over an ordinary file is not inflated.
+        assert_eq!(
+            local_names_of("fn go() {}\r\n", concat!("list_", "sends")),
+            vec![concat!("list_", "sends").to_string()]
+        );
+
+        // Control: this is a real improvement over the plain needle. The
+        // aliased text above contains neither banned spelling.
+        assert_eq!(aliased.matches(concat!("list_", "sends(")).count(), 0);
+        assert_eq!(aliased.matches(concat!("CliSendRunner::", "new(")).count(), 0);
     }
 
     /// The frame closure is what starts the fetch, exactly once, and it hands
@@ -2302,15 +2835,33 @@ mod source_pins {
         // and the eframe thread ran a sixty-second `bw send list`. A value
         // export needs no wrapper. So the list below is every `pub` token in
         // the block, whatever item it sits on, matched as whole lines.
+        //
+        // **The separator is any Rust whitespace, not a literal space.**
+        // Measured on `4446e9a`: the previous filter required the character
+        // after `pub` to be `(` or `' '`, and writing the same
+        // function-pointer export with a TAB --
+        //
+        // ```ignore
+        // \tpub\tconst PREFETCH: fn() -> Result<..> = real_send_list;
+        // ```
+        //
+        // -- plus `let _ = send_fetch_thread::PREFETCH();` in the frame
+        // closure gave 2061 lib + 217 bin, 0 failed. One space swapped for
+        // one tab resurrected the exact previous-round survivor. `pub\r\nfn`
+        // and `pub/*x*/fn` are the same hole. Comments are blanked by
+        // `sanitized` first, which turns the third into whitespace too.
+        let block = sanitized(block);
+        let block = block.as_str();
         let exported: Vec<String> = block
             .match_indices("pub")
             .filter(|(at, _)| {
                 let before = block[..*at].chars().next_back();
                 let after = block[at + "pub".len()..].chars().next();
-                // A visibility keyword on a word boundary -- `pub(` or
-                // `pub ` -- and not the middle of "published" in prose.
+                // A visibility keyword on a word boundary -- `pub(` or `pub`
+                // followed by ANY whitespace -- and not the middle of
+                // "published" in prose.
                 !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
-                    && matches!(after, Some('(') | Some(' '))
+                    && matches!(after, Some(c) if c == '(' || c.is_whitespace())
             })
             .map(|(at, _)| block[at..].lines().next().unwrap_or_default().trim_end().to_string())
             .collect();
@@ -2335,12 +2886,30 @@ mod source_pins {
         // expanded there is the same hole. These two are named needles, said
         // plainly: what closes them is that the block has no reason to hold
         // either, so the assertion is cheap and the mutant is loud.
-        for leak in ["impl ", "macro_rules!"] {
+        //
+        // **As tokens, not as `"impl "`.** `block.contains("impl ")` misses
+        // `impl<T: Trait> Foo for X`, `impl\tTrait for ()` and `impl\r\nTrait`
+        // -- three spellings of the same leak, and the reason the previous
+        // shape's KILLED verdict was good for one spelling only. `impl` is a
+        // keyword, so a word-boundary scan is exact: nothing else can be
+        // spelled `impl` on both boundaries.
+        for leak in ["impl", concat!("macro_", "rules!")] {
+            let found = block.match_indices(leak).any(|(at, _)| {
+                let before = block[..at].chars().next_back();
+                let after = block[at + leak.len()..].chars().next();
+                let starts = !matches!(before, Some(c) if c.is_alphanumeric() || c == '_');
+                // `!` already ends `macro_rules!`; `impl` needs a boundary of
+                // its own, and `<` (a generic impl) is one.
+                let ends = leak.ends_with('!')
+                    || !matches!(after, Some(c) if c.is_alphanumeric() || c == '_');
+                starts && ends
+            });
             assert!(
-                !block.contains(leak),
-                "`mod send_fetch_thread` contains {leak:?}. The module is two spawners and one \
-                 private fetch; an impl or a macro here is a way to name the fetch from outside \
-                 that the visibility scan above cannot see"
+                !found,
+                "`mod send_fetch_thread` contains the token {leak:?}. The module is two spawners \
+                 and one private fetch; an impl or a macro here is a way to name the fetch from \
+                 outside that the visibility scan above cannot see. A trait method's visibility \
+                 is the trait's, not the impl's, so it carries no `pub` for that scan to find"
             );
         }
     }
@@ -2366,9 +2935,34 @@ mod source_pins {
     /// receiver itself must be followed by `try_recv` or by nothing at all
     /// (so an iterator over it, which has no `.recv` in its text, is caught
     /// as well).
+    ///
+    /// **And both of them were beaten, so the primary hold is now a type.**
+    /// Measured on `4446e9a`: because `this_files_production()` cut this file
+    /// at line 718, a `pub(super) struct RxHolder(Receiver<Answer>)` with
+    /// `fn wait(&self) { self.0.recv().ok() }` written BELOW that cut -- still
+    /// compiled production -- plus, in the frame closure,
+    ///
+    /// ```ignore
+    /// let waiter = send_ui::RxHolder::new(send_rx);
+    /// if let Some((tag, result)) = waiter.wait() { .. }
+    /// ```
+    ///
+    /// gave 2061 lib + 217 bin, 0 failed: every `send_rx` token still passed
+    /// the follow-character rule, `seen` was still 2, and the frame closure
+    /// blocked on `recv()` for sixty seconds. Both ends of that are fixed --
+    /// the region is no longer cut (see [`production_region`]) and, more to
+    /// the point, `send_rx` is a `send_channel::SendListReceiver` now, which
+    /// has no blocking drain to move anywhere. The needles below stay as the
+    /// second line: they are what catches a *new* raw `mpsc::Receiver` being
+    /// introduced beside the sealed one.
     #[test]
     fn the_sends_answer_is_never_waited_for_on_the_frames_own_thread() {
-        for (file, text) in [("mod.rs", production()), ("send_ui.rs", this_files_production())] {
+        // Sanitized on both sides: a `.recv()` written inside a doc comment
+        // explaining why `.recv()` is banned is not a call, and a guard that
+        // cannot survive its own explanation gets deleted.
+        for (file, text) in
+            [("mod.rs", sanitized(production())), ("send_ui.rs", this_files_production())]
+        {
             for banned in
                 [concat!(".recv", "()"), concat!(".recv_", "timeout("), concat!(".recv_", "deadline(")]
             {
@@ -2381,7 +2975,8 @@ mod source_pins {
             }
         }
 
-        let production = production();
+        let production = sanitized(production());
+        let production = production.as_str();
         let name = concat!("send_", "rx");
         let mut seen = 0usize;
         for (at, _) in production.match_indices(name) {
@@ -2407,11 +3002,143 @@ mod source_pins {
                 head.chars().rev().take(24).collect::<String>().chars().rev().collect::<String>()
             );
         }
-        assert!(
-            seen >= 2,
-            "control: {name:?} occurs {seen} times in production as its own token -- the channel \
-             this test is about is gone, and every assertion above is vacuous"
+        // **Exactly two, and the second one is the drain, at the frame
+        // closure's own indentation.**
+        //
+        // `>= 2` was a control against the channel being deleted; it is a
+        // requirement now, because the last freeze left is one this file
+        // cannot see any other way. Measured on this change before this
+        // paragraph existed:
+        //
+        // ```ignore
+        // let blocked = loop {
+        //     if let Ok(v) = send_rx.try_recv() { break Some(v); }
+        // };
+        // ```
+        //
+        // gave 2068 lib + 217 bin, 0 failed. Every guard was satisfied --
+        // `try_recv` is the only drain, the receiver has no blocking method,
+        // nothing is aliased -- and the eframe thread spun until an answer
+        // came, which is the same sixty seconds with the CPU pinned. A
+        // non-blocking drain in a loop is a blocking drain.
+        //
+        // Needle, said plainly: two occurrences, and the drain is the exact
+        // line, at exactly the closure's top-level indentation. A `loop`
+        // wrapped round it indents it and adds a third mention. What beats
+        // this is writing the loop *without* re-indenting; what catches that
+        // is that nothing else in this file is written that way and rustfmt
+        // does not produce it. The receiver's type is the primary hold; this
+        // is the second line.
+        assert_eq!(
+            seen, 2,
+            "{name:?} occurs {seen} times in production as its own token, not twice. It is \
+             bound once and drained once; a third mention is the receiver being read from a \
+             second place, and the shape that matters is a spin loop -- `try_recv` called \
+             round and round on the eframe thread is a blocking wait with the CPU pinned"
         );
+        let drain = concat!("\r\n        if let Ok((tag, result)) = send_rx.try_", "recv() {\r\n");
+        assert_eq!(
+            production.matches(drain).count(),
+            1,
+            "{drain:?} is not in production exactly once at the frame closure's top level. \
+             Indented further, the drain is inside a conditional or a loop; the loop is the \
+             freeze this whole design exists to prevent, spelled with the permitted method"
+        );
+    }
+
+    /// **The Sends receiver has no blocking drain, by type.**
+    ///
+    /// This is the structural half of the test above, and the part that does
+    /// not depend on any needle: the frame closure never holds an
+    /// `mpsc::Receiver` for this channel at all. It holds a
+    /// `send_channel::SendListReceiver`, whose only method is `try_recv` and
+    /// whose wrapped receiver is private to `mod send_channel` -- a module
+    /// with no descendants, so unlike a private field of `vault_window`
+    /// itself, `vault_window::send_ui` cannot reach it either. Wrapping the
+    /// value in a holder struct, in this file or any other, carries nothing
+    /// to wait on; reaching past it is an `E0616`.
+    ///
+    /// What source has to hold is the shape of the boundary: that the channel
+    /// really is built through it, and that the module does not grow a way
+    /// out.
+    #[test]
+    fn the_sends_receiver_is_a_type_with_no_blocking_drain() {
+        let production = sanitized(production());
+        let production = production.as_str();
+
+        let build = concat!("send_channel::send_list_", "channel()");
+        assert_eq!(
+            production.matches(build).count(),
+            1,
+            "{build:?} is not in production exactly once -- the Sends channel is built somewhere \
+             other than behind its sealing constructor, which means a raw `mpsc::Receiver` for \
+             it exists for somebody to keep and block on"
+        );
+
+        // The module's block, sliced the way `sealed_module` slices the other
+        // one, and every `pub` in it listed whatever item it sits on.
+        let opener = concat!("mod send_", "channel {\r\n");
+        assert_eq!(
+            production.matches(opener).count(),
+            1,
+            "{opener:?} is not in production exactly once"
+        );
+        let start = production.find(opener).expect("counted just above");
+        let rest = &production[start + opener.len()..];
+        let end = rest.find("\r\n}\r\n").expect("`mod send_channel` has no column-zero close");
+        let block = &rest[..end];
+        assert!(block.len() > 200, "control: the slice is only {} bytes", block.len());
+
+        let exported: Vec<String> = block
+            .match_indices("pub")
+            .filter(|(at, _)| {
+                let before = block[..*at].chars().next_back();
+                let after = block[at + "pub".len()..].chars().next();
+                !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                    && matches!(after, Some(c) if c == '(' || c.is_whitespace())
+            })
+            .map(|(at, _)| block[at..].lines().next().unwrap_or_default().trim_end().to_string())
+            .collect();
+        assert_eq!(
+            exported,
+            vec![
+                concat!("pub(super) type SendList", "Answer ="),
+                concat!("pub(super) struct SendList", "Receiver(mpsc::Receiver<SendListAnswer>);"),
+                concat!("pub(super) fn try_", "recv(&self) -> Result<SendListAnswer, mpsc::TryRecvError> {"),
+                concat!("pub(super) fn send_list_", "channel() -> (super::SendListSender, SendListReceiver) {"),
+            ],
+            "`mod send_channel` no longer exports exactly the answer type, the sealed receiver, \
+             its one non-blocking drain and the constructor. Anything else here -- an \
+             `into_inner`, a `pub(super)` field, a `Deref`, a `pub(super) use` of \
+             `mpsc::Receiver` -- hands the raw receiver back out, and a raw receiver in the \
+             frame closure is a sixty-second freeze one `.recv()` away"
+        );
+        // A trait impl carries methods out without a `pub` for the scan above
+        // to see; `Deref<Target = mpsc::Receiver<_>>` would hand back every
+        // blocking method at once.
+        for leak in ["impl", concat!("macro_", "rules!")] {
+            let found = block.match_indices(leak).any(|(at, _)| {
+                let before = block[..at].chars().next_back();
+                let after = block[at + leak.len()..].chars().next();
+                !matches!(before, Some(c) if c.is_alphanumeric() || c == '_')
+                    && (leak.ends_with('!')
+                        || !matches!(after, Some(c) if c.is_alphanumeric() || c == '_'))
+            });
+            // The one permitted `impl` is the inherent block holding
+            // `try_recv`, so this is a count and not an absence.
+            if leak == "impl" {
+                let opener = concat!("impl SendList", "Receiver {");
+                assert_eq!(
+                    block.matches("impl").count(),
+                    1,
+                    "`mod send_channel` has more than one `impl`. The only one permitted is \
+                     {opener:?}; a trait impl here carries methods out with no `pub` to see"
+                );
+                assert!(block.contains(opener), "the inherent impl is not {opener:?}");
+            } else {
+                assert!(!found, "`mod send_channel` contains {leak:?}");
+            }
+        }
     }
 
     /// **The drain goes through `apply_answer`.** That function is where the
