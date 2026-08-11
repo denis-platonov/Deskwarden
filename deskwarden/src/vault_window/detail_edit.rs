@@ -6382,7 +6382,10 @@ mod generator_row_tests {
 
         assert!(theme::icon_probe::stars(&all).is_empty(), "a bitmap was read as a star");
         assert!(theme::icon_probe::eyes(&all).is_empty(), "a bitmap was read as an eye");
-        assert!(theme::icon_probe::gears(&all).is_empty(), "a bitmap was read as a gear");
+        assert!(
+            theme::icon_probe::tune_icons(&all).is_empty(),
+            "a bitmap was read as a Preferences tune icon"
+        );
         assert!(
             theme::icon_probe::kebab_dots(&all).is_empty(),
             "a bitmap was read as a kebab dot"

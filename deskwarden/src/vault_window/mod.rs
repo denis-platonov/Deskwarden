@@ -1484,10 +1484,10 @@ pub fn build_frame(
                 // gear, cog or "Settings" anywhere in `Deskwarden.dc.html`), so
                 // this is the user's direction rather than the design's, the
                 // same way the detail pane's star, kebab and eye were. What it
-                // does take from 2b is its metrics: `theme::gear_button` is 28px
+                // does take from 2b is its metrics: `theme::tune_button` is 28px
                 // square, matching the Lock pill's height and the avatar's
                 // diameter beside it.
-                if theme::gear_button(ui).clicked() {
+                if theme::tune_button(ui).clicked() {
                     // **NOT the two-step dance Lock does immediately below.**
                     // This window stays exactly where it is; the form is drawn
                     // over it, dimmed, by the block at the very end of this
@@ -11433,7 +11433,7 @@ mod settings_gear_placement_tests {
     }
 
     fn gear_needle() -> String {
-        concat!("theme::gear_", "button(ui).clicked()").to_string()
+        concat!("theme::tune_", "button(ui).clicked()").to_string()
     }
 
     /// **The strip's call, not the avatar's own definition.** The avatar used
@@ -13000,7 +13000,7 @@ mod titlebar_switcher_placement_tests {
                         // chevron and then the avatar itself: right-to-left
                         // packing means earlier is further right, so this lands
                         // as avatar, chevron, gear from the left.
-                        gear = theme::gear_button(ui).rect;
+                        gear = theme::tune_button(ui).rect;
                         let _ = account_menu(ui, Some(&state), "AN", None, None, false);
                     },
                 );
@@ -13194,7 +13194,7 @@ mod switcher_wiring_tests {
     }
 
     fn gear_needle() -> String {
-        concat!("theme::gear_", "button(ui).clicked()").to_string()
+        concat!("theme::tune_", "button(ui).clicked()").to_string()
     }
 
     /// The strip packs right-to-left, so the widget added EARLIER ends up

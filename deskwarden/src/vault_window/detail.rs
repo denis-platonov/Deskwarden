@@ -14465,9 +14465,9 @@ mod tests {
             "the app icon was counted as a line segment"
         );
         assert_eq!(
-            theme::icon_probe::gears(&frame.shapes).len(),
-            theme::icon_probe::gears(&bare.shapes).len(),
-            "the app icon was counted as a gear"
+            theme::icon_probe::tune_icons(&frame.shapes).len(),
+            theme::icon_probe::tune_icons(&bare.shapes).len(),
+            "the app icon was counted as a Preferences tune icon"
         );
         // The control: the probes are not blind on this pane -- it really
         // does draw eyes and a star for this item, so the equalities above
