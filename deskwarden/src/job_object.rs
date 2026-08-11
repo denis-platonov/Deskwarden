@@ -1414,28 +1414,6 @@ mod tests {
             // call what you cannot write -- so the list is simply drawn one
             // level finer, and a helper that is not on it is unreachable
             // wherever it is planted, including in this very file.
-            const REACHABLE: &[&str] = &[
-                // The choke point, and the parts of it these modules build a
-                // child out of.
-                "crate::job_object::spawn_in_job",
-                "crate::job_object::JobCommand",
-                "crate::job_object::KillOnCloseJob",
-                "crate::job_object::KillOnCloseJob::new",
-                // The `cfg(test)` recorder the seam tests arm.
-                "crate::job_object::spawn_probe::REFUSED",
-                "crate::job_object::spawn_probe::SpawnProbe::arm",
-                // The verified `bw.exe`. `bw_command_in` is on the list because
-                // `send.rs` asserts it refuses without a verified path -- and
-                // it is harmless here, because what it hands back is a
-                // `BareCommand` whose only door is closed by RULE 5.
-                "crate::bw_path::bw_job_command",
-                "crate::bw_path::bw_job_command_in",
-                "crate::bw_path::bw_command_in",
-                "crate::bw_path::verified_bw_exe",
-                "crate::bw_path::remember_verified_bw_exe",
-                "crate::bw_path::CREATE_NO_WINDOW",
-                "crate::bw_path::BW_DATA_DIR_ENV",
-            ];
             // `send.rs`'s test module borrows `login_ui`'s allocator probe for
             // the secret-lifetime assertions. Left as a prefix rather than
             // itemised because it is a `#[cfg(test)]` module: production code
@@ -3444,6 +3422,34 @@ mod tests {
         assert!(!below_cut_is_module_opener("pub mod a::b {"));
     }
 
+    /// Moved here from inside RULE 7's test body so that RULE 10 below can
+    /// DERIVE the set of files it fences from it rather than keeping a hand
+    /// copy of it -- the defect `DOOR_MODULES` shipped with. Adding a module
+    /// here and forgetting to fence it now fails RULE 10 instead of silently
+    /// widening the runners' reach into an unfenced file.
+    const REACHABLE: &[&str] = &[
+        // The choke point, and the parts of it these modules build a
+        // child out of.
+        "crate::job_object::spawn_in_job",
+        "crate::job_object::JobCommand",
+        "crate::job_object::KillOnCloseJob",
+        "crate::job_object::KillOnCloseJob::new",
+        // The `cfg(test)` recorder the seam tests arm.
+        "crate::job_object::spawn_probe::REFUSED",
+        "crate::job_object::spawn_probe::SpawnProbe::arm",
+        // The verified `bw.exe`. `bw_command_in` is on the list because
+        // `send.rs` asserts it refuses without a verified path -- and
+        // it is harmless here, because what it hands back is a
+        // `BareCommand` whose only door is closed by RULE 5.
+        "crate::bw_path::bw_job_command",
+        "crate::bw_path::bw_job_command_in",
+        "crate::bw_path::bw_command_in",
+        "crate::bw_path::verified_bw_exe",
+        "crate::bw_path::remember_verified_bw_exe",
+        "crate::bw_path::CREATE_NO_WINDOW",
+        "crate::bw_path::BW_DATA_DIR_ENV",
+    ];
+
     /// Every distinct name that production `job_object.rs` CALLS, in the
     /// `code_only` view, sorted and deduplicated.
     ///
@@ -3465,7 +3471,7 @@ mod tests {
     /// Renaming the callee does not help -- `use ..::CreateProcessW as go;`
     /// then `go(..)` reports `go`, which is equally not in the list. Nor does
     /// a function pointer: `let f = CreateProcessW; f(x)` reports `f`.
-    fn production_callees(code: &str) -> Vec<String> {
+    fn flatten_turbofish(code: &str) -> Vec<char> {
         let src: Vec<char> = code.chars().collect();
         let mut flat: Vec<char> = Vec::with_capacity(src.len());
         let mut i = 0;
@@ -3490,7 +3496,32 @@ mod tests {
                 i += 1;
             }
         }
+        flat
+    }
 
+    /// Every call SITE, counted rather than deduplicated.
+    ///
+    /// [`production_callees`] pins the SET of names a fenced file calls: its
+    /// `out.contains` check makes a SECOND call to an already-listed name
+    /// free. That is not a child start on its own -- no way was found to build
+    /// one out of a repeat inside `job_object.rs` -- but the set was sold as
+    /// "every name this file calls is written down", and a set pins names, not
+    /// occurrences. A refactor that reuses a listed name for a new errand gets
+    /// past it byte-identical. So the count is pinned beside the set, over the
+    /// same turbofish-flattened view, and a repeat now has to be declared too.
+    fn production_call_sites(code: &str) -> usize {
+        let flat = flatten_turbofish(code);
+        (0..flat.len())
+            .filter(|&k| {
+                flat[k] == '('
+                    && k > 0
+                    && (flat[k - 1].is_ascii_alphanumeric() || flat[k - 1] == '_')
+            })
+            .count()
+    }
+
+    fn production_callees(code: &str) -> Vec<String> {
+        let flat = flatten_turbofish(code);
         let mut out: Vec<String> = Vec::new();
         for k in 0..flat.len() {
             if flat[k] != '(' {
@@ -3826,6 +3857,458 @@ mod tests {
             seen("println!(\"x\");").is_empty(),
             "control: a macro invocation is not miscounted as a call -- if it were, the macro \
              list below would be doing nothing"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // RULE 10: EVERY FILE THE RUNNERS CAN REACH IS FENCED THE SAME WAY.
+    // -------------------------------------------------------------------
+
+    /// One fenced file: the production half of a module `vault_export.rs` and
+    /// `send.rs` are allowed to reach, and every name it is allowed to write.
+    ///
+    /// # The thirteenth hop
+    ///
+    /// The round before this one closed `CreateProcessW` inside
+    /// `job_object.rs` with four allowlists -- callees, macros, imports,
+    /// local paths -- and left the OTHER file on RULE 7's `REACHABLE` list
+    /// governed by nothing of the kind. Measured, prepended to the body of
+    /// `bw_path::bw_job_command_in` and SURVIVING twice independently at
+    /// 2100 lib / 217 bin / 1 ignored / 0 failed / 0 warnings:
+    ///
+    /// ```text
+    /// if dir.map_or(0, |d| d.as_os_str().len()) > 100_000 {
+    ///     unsafe {
+    ///         let mut si = ..::STARTUPINFOW::default();
+    ///         si.cb = std::mem::size_of::<..STARTUPINFOW>() as u32;
+    ///         let mut pi = ..::PROCESS_INFORMATION::default();
+    ///         let mut line: Vec<u16> = "bw.exe export".encode_utf16().chain([0]).collect();
+    ///         let _ = ..::CreateProcessW(PCWSTR::null(), PWSTR(line.as_mut_ptr()), ..);
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// The `> 100_000` guard only keeps the suite from launching real
+    /// processes; every rule in play is a text rule, so the guard is invisible
+    /// to all of them. Remove it and it is a live second, jobless `bw export`
+    /// on every export -- and liveness is proven rather than argued: replacing
+    /// that body with a `panic!` fails
+    /// `vault_export::tests::the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`.
+    ///
+    /// Every guard missed it, and each for a different reason:
+    ///
+    ///  * the tree walk reads non-`ALLOWED` files only for `.spawn()`,
+    ///    `.output()` and `.status()`; `CreateProcessW` is none of them.
+    ///  * RULE 6's `unsafe == 0` is asserted over `vault_export.rs` and
+    ///    `send.rs` only. (The reviewer tried this exact shape there FIRST and
+    ///    it was KILLED -- which is what pointed at the unfenced neighbour.)
+    ///  * RULE 7 is satisfied: `vault_export.rs` names
+    ///    `crate::bw_path::bw_job_command`, which is ON `REACHABLE`. No new
+    ///    path is written anywhere.
+    ///  * RULE 8's `BW_PATH_MAY_REACH` constrains what `bw_path.rs` REACHES,
+    ///    not what it WRITES. No callee list, no import list, no `unsafe`
+    ///    count.
+    ///  * the four sets added last round read `job_object_production()` only,
+    ///    and `job_object.rs` is byte-untouched by this mutant.
+    ///
+    /// # Why this is a rule and not a third hand-written copy
+    ///
+    /// The obvious fix -- transcribe the four lists for `bw_path.rs` -- leaves
+    /// the FOURTEENTH hop open by construction: the next file to appear on
+    /// `REACHABLE` gets no lists either, and nothing says so. `DOOR_MODULES`
+    /// was exactly that mistake one round earlier, a hand copy of `DOOR_FILES`
+    /// with no assertion tying the two together.
+    ///
+    /// So the set of fenced files is DERIVED from `REACHABLE`: the modules the
+    /// two job-bearing runners may name are the modules that must carry these
+    /// lists, and a module added to `REACHABLE` without a `Fence` fails this
+    /// test rather than quietly arriving unfenced. `job_object.rs` is fenced
+    /// here too, by the very same code and against the very same constants the
+    /// previous round pinned it with, so the two cannot drift apart.
+    struct Fence {
+        /// File name under `src/`.
+        file: &'static str,
+        /// A string that must occur in the whole file EXACTLY ONCE and must
+        /// land just above the `#[cfg(test)]` cut. Without it a mutant moves
+        /// the cut up -- a column-0 marker in a comment does it -- and every
+        /// list below reads a truncated file while staying green.
+        last_production_item: &'static str,
+        min_code_len: usize,
+        callees: &'static [&'static str],
+        /// The number of call SITES, which the deduplicated set above cannot
+        /// see. See [`production_call_sites`].
+        call_sites: usize,
+        macros: &'static [&'static str],
+        imports: &'static [&'static str],
+        local_paths: &'static [&'static str],
+        /// `job_object.rs` has three (every Win32 entry point is `unsafe`);
+        /// every other fenced file has none, and the cheapest first sign of a
+        /// second way to start a child is that number moving. NOT the rule on
+        /// its own -- a call added inside an existing block does not move it,
+        /// which the previous round proved with a renamed `CreateProcessW` --
+        /// which is what the callee list is for.
+        unsafe_regions: usize,
+        below_cut_modules: usize,
+        below_cut_min_lines: usize,
+    }
+
+    /// Every name production `bw_path.rs` calls. Keywords arrive glued to the
+    /// name they touch because `code_only` has removed the whitespace; that is
+    /// not cosmetic damage, it is the pin.
+    const BW_PATH_CALLEES: &[&str] = &[
+        "Err",
+        "Ok",
+        "Some",
+        "active_data_dir",
+        "and_then",
+        "arg",
+        "args",
+        "as_deref",
+        "as_os_str",
+        "as_ref",
+        "bw_command_in",
+        "bw_job_command_in",
+        "canonicalize",
+        "clone",
+        "creation_flags",
+        "current_exe",
+        "derive",
+        "display",
+        "env",
+        "exists",
+        "fninstall_bin_candidate",
+        "fnnormalize_for_compare",
+        "fnresolve_bw_exe_with",
+        "fnsame_directory",
+        "from",
+        "get",
+        "get_args",
+        "get_envs",
+        "get_program",
+        "ifletSome",
+        "ifsame_directory",
+        "install_bin_candidate",
+        "is_empty",
+        "is_err",
+        "is_relative",
+        "is_some_and",
+        "join",
+        "map",
+        "matchverified_bw_exe",
+        "multi_account_availability_from_exe",
+        "multi_account_from",
+        "new",
+        "normalize_for_compare",
+        "ok",
+        "or_else",
+        "parent",
+        "pubfnactive_data_dir",
+        "pubfnbw_command",
+        "pubfnbw_command_in",
+        "pubfnbw_job_command",
+        "pubfnbw_job_command_in",
+        "pubfnexplanation",
+        "pubfnget_args",
+        "pubfnget_envs",
+        "pubfnget_program",
+        "pubfninto_jobless_command",
+        "pubfnis_available",
+        "pubfnmulti_account_availability",
+        "pubfnmulti_account_availability_from_exe",
+        "pubfnmulti_account_from",
+        "pubfnrelative_data_dir",
+        "pubfnremember_verified_bw_exe",
+        "pubfnresolve_bw_exe",
+        "pubfnset_active_data_dir",
+        "pubfnverified_bw_exe",
+        "read",
+        "resolve_bw_exe_with",
+        "returnSome",
+        "set",
+        "split_paths",
+        "stderr",
+        "stdout",
+        "to_lowercase",
+        "to_string",
+        "to_string_lossy",
+        "trim_end_matches",
+        "unwrap_or_default",
+        "unwrap_or_else",
+        "var_os",
+        "verified_bw_exe",
+        "write",
+    ];
+
+    /// Every macro production `bw_path.rs` invokes.
+    const BW_PATH_MACROS: &[&str] = &["debug", "format", "matches", "warn"];
+
+    /// Every `use` item production `bw_path.rs` has, in the `code_only` view.
+    /// `std` and nothing else: this file reaches into the crate by `crate::`
+    /// path only, which RULE 8 already pins.
+    const BW_PATH_IMPORTS: &[&str] = &[
+        "usestd::ffi::OsStr",
+        "usestd::os::windows::process::CommandExt",
+        "usestd::path::{Path,PathBuf}",
+        "usestd::process::Command",
+        "usestd::sync::{OnceLock,PoisonError,RwLock}",
+    ];
+
+    /// Every path production `bw_path.rs` writes that reaches back into this
+    /// crate. The same two entries RULE 8's `BW_PATH_MAY_REACH` blesses,
+    /// asserted here as an ordered set as well so the two halves of the fence
+    /// agree.
+    const BW_PATH_LOCAL_PATHS: &[&str] = &[
+        "crate::job_object::JobCommand",
+        "crate::job_object::JobCommand::wrap",
+    ];
+
+    const FENCES: &[Fence] = &[
+        Fence {
+            file: "bw_path.rs",
+            last_production_item: "BlockedByUnknownCliPath => Some(",
+            min_code_len: 1000,
+            callees: BW_PATH_CALLEES,
+            call_sites: 113,
+            macros: BW_PATH_MACROS,
+            imports: BW_PATH_IMPORTS,
+            local_paths: BW_PATH_LOCAL_PATHS,
+            unsafe_regions: 0,
+            below_cut_modules: 1,
+            below_cut_min_lines: 300,
+        },
+        Fence {
+            file: "job_object.rs",
+            last_production_item: concat!("Ok(res", "umed)"),
+            min_code_len: 2000,
+            callees: PRODUCTION_CALLEES,
+            call_sites: 71,
+            macros: PRODUCTION_MACROS,
+            imports: PRODUCTION_IMPORTS,
+            local_paths: PRODUCTION_LOCAL_PATHS,
+            unsafe_regions: 3,
+            below_cut_modules: 2,
+            below_cut_min_lines: 500,
+        },
+    ];
+
+    /// A fenced file, whole, line endings normalised to LF.
+    fn fenced_raw(file: &str) -> String {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        std::fs::read_to_string(src.join(file)).unwrap().replace("\r\n", "\n")
+    }
+
+    /// Its production half, cut at the first column-0 `#[cfg(test)]` -- the
+    /// SAME cut [`job_object_production`] makes, so the file both functions
+    /// read cannot be read two different ways.
+    fn fenced_production(file: &str) -> String {
+        fenced_raw(file).split(concat!("\n#[cfg(", "test)]\n")).next().unwrap().to_string()
+    }
+
+    /// **Every file the two job-bearing runners can reach writes down every
+    /// name it calls.**
+    ///
+    /// See [`Fence`] for the measured survivor this exists to kill and for why
+    /// the fenced set is derived rather than transcribed.
+    #[test]
+    fn every_file_the_runners_can_reach_writes_down_every_name_it_calls() {
+        // (0) THE FENCED SET IS DERIVED FROM RULE 7's `REACHABLE`.
+        let module_of = |p: &str| {
+            p.strip_prefix("crate::")
+                .unwrap_or(p)
+                .split("::")
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let mut reachable_modules: Vec<String> = REACHABLE.iter().map(|p| module_of(p)).collect();
+        reachable_modules.sort();
+        reachable_modules.dedup();
+        let mut fenced: Vec<String> =
+            FENCES.iter().map(|f| f.file.trim_end_matches(".rs").to_string()).collect();
+        fenced.sort();
+        assert_eq!(
+            fenced, reachable_modules,
+            "the set of fenced files is no longer the set of modules RULE 7 lets \
+             `vault_export.rs` and `send.rs` name. A module on `REACHABLE` is a module the two \
+             runners call INTO, and anything it calls it calls on their behalf with no rule of \
+             theirs in the way -- which is exactly how the thirteenth hop put a `CreateProcessW` \
+             in `bw_path.rs` while both runners stayed spotless. Either add a `Fence` for it \
+             (with its own four lists) or take it off `REACHABLE`"
+        );
+        assert_eq!(
+            reachable_modules,
+            vec!["bw_path", "job_object"],
+            "control: the derivation no longer produces the two modules this fence is known to \
+             cover, so either `REACHABLE` changed (update this deliberately) or `module_of` is \
+             broken and the equality above is comparing two wrong lists to each other"
+        );
+        for m in ["job_object", "bw_path", "login_ui"] {
+            assert_eq!(
+                module_of(&format!("crate::{m}::some_helper")),
+                m,
+                "control: the module of a `crate::` path is not read back, so the derivation \
+                 above compares the wrong strings"
+            );
+        }
+
+        for fence in FENCES {
+            let file = fence.file;
+            let raw = fenced_raw(file);
+            let production = fenced_production(file);
+
+            // (1) THE CUT. Everything below is read from the production half
+            //     only, so a cut that moved UP is a green rule reading a
+            //     truncated file.
+            assert!(
+                production.len() < raw.len(),
+                "control: no column-0 `cfg(test)` cut marker in {file}, so every list below is \
+                 reading the test module as production"
+            );
+            assert_eq!(
+                raw.matches(fence.last_production_item).count(),
+                1,
+                "control: {file}'s cut anchor {:?} is not in it exactly once, so it pins \
+                 nothing -- repoint it at the last production item above the test module",
+                fence.last_production_item
+            );
+            assert!(
+                production.contains(fence.last_production_item),
+                "{file}'s last production item is BELOW the cut, so the cut moved up and every \
+                 list below is reading a truncated file"
+            );
+            assert!(
+                production.len() - production.rfind(fence.last_production_item).unwrap() < 1_500,
+                "{file}'s cut is more than 1500 bytes past its last known production item: \
+                 either production was appended below the anchor (repoint it) or the cut moved \
+                 DOWN and source is living in the gap"
+            );
+
+            // (2) THE FOUR ALLOWLISTS, plus the count the sets cannot see.
+            let code = code_only(&production);
+            assert!(
+                code.len() > fence.min_code_len,
+                "control: production {file} stripped to {} chars, so every list below is vacuous",
+                code.len()
+            );
+            assert_eq!(
+                production_callees(&code),
+                fence.callees,
+                "production {file} calls a name that is not on its list. A child cannot be \
+                 started without CALLING something, and whatever is called appears here under \
+                 whatever name it was given -- a rename at the `use`, a function pointer and an \
+                 empty turbofish all still report a name. A new entry is either a refactor \
+                 (update the list, deliberately) or it is the next `CreateProcessW`: a way of \
+                 starting a process that writes no `spawn`, builds no `Command`, and leaves \
+                 every spelling-count in this module untouched"
+            );
+            assert_eq!(
+                production_call_sites(&code),
+                fence.call_sites,
+                "the number of call SITES in production {file} changed while the set of names \
+                 it calls did not. The set deduplicates, so a SECOND call to an \
+                 already-listed name is free -- this is the count that is not"
+            );
+            assert_eq!(
+                production_macros(&code),
+                fence.macros,
+                "production {file} invokes a macro that is not on its list. A macro body \
+                 written in the file is scanned like any other code, but one imported from \
+                 elsewhere expands to a call the file never spells -- so the macro itself is \
+                 the callee and has to be named here"
+            );
+            assert_eq!(
+                {
+                    let mut uses = item_bodies(&code, "use");
+                    uses.sort();
+                    uses
+                },
+                fence.imports,
+                "production {file} imports something new. The callee list pins the NAMES it \
+                 calls; this pins where those names come from -- and re-pointing one existing \
+                 call at a function next door is a mutation the callee list cannot see"
+            );
+            assert_eq!(
+                production_local_paths(&code),
+                fence.local_paths,
+                "production {file} reaches into this crate somewhere new. A `crate::`-, \
+                 `super::`- or `self::`-rooted path is the half of that move that needs no \
+                 `use` at all"
+            );
+            assert_eq!(
+                code.matches("unsafe").count(),
+                fence.unsafe_regions,
+                "the number of `unsafe` regions in production {file} changed. Every Win32 \
+                 entry point is `unsafe`, so a new one is the cheapest first sign of a second \
+                 way to start a child -- and the thirteenth hop's survivor opened the FIRST \
+                 one in a file that had none"
+            );
+
+            // (3) AND THE HALF BELOW THE CUT IS NOTHING BUT GATED TEST
+            //     MODULES, so a helper cannot simply be written where none of
+            //     the lists above look. The same walk, over the tail the same
+            //     cut threw away.
+            let tail = &raw[production.len()..];
+            let lf = tail.replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            assert_ne!(
+                lf, crlf,
+                "control: {file}'s tail has no line endings at all, so comparing the walk over \
+                 two copies of it compares it with itself"
+            );
+            assert_eq!(
+                walk_below_the_cut(&lf),
+                walk_below_the_cut(&crlf),
+                "the walk gives a different answer on an LF copy of {file}'s tail than on a \
+                 CRLF one, so something in it is sensitive to line endings"
+            );
+            let (visited, modules, closes, depth) =
+                walk_below_the_cut(&lf).unwrap_or_else(|why| panic!("{file}: {why}"));
+            assert!(
+                visited > fence.below_cut_min_lines,
+                "control: the walk visited only {visited} lines below {file}'s cut, which is \
+                 not its test modules' worth -- the slice is empty or nearly so"
+            );
+            assert_eq!(
+                depth, 0,
+                "a test module below {file}'s cut is never closed by a column-0 brace, so the \
+                 walk ran off the end of the file inside it and stopped inspecting top-level \
+                 lines"
+            );
+            assert_eq!(
+                modules, fence.below_cut_modules,
+                "the number of top-level test modules below {file}'s cut changed. That is fine \
+                 to change -- but this count is the control that proves the walk really \
+                 visited them, so update it deliberately rather than loosening it"
+            );
+            assert_eq!(
+                closes, modules,
+                "control: every module the walk opened in {file} must also have been closed at \
+                 column 0"
+            );
+        }
+
+        // (4) CONTROLS on the count, through the real function: it can see
+        //     exactly the repeat the deduplicated set cannot.
+        assert_eq!(production_call_sites(&code_only("f(1); f(2); g(3);")), 3);
+        assert_eq!(production_callees(&code_only("f(1); f(2); g(3);")).len(), 2);
+        assert_eq!(
+            production_call_sites(&code_only("let _ = go::<>(&mut pi);")),
+            1,
+            "control: an empty turbofish -- legal on a non-generic fn -- puts a `>` before the \
+             `(` and hides the call site as well as the callee"
+        );
+        assert_eq!(
+            production_call_sites(&code_only("println!(\"x\");")),
+            0,
+            "control: a macro invocation is miscounted as a call -- the `!` sits between the \
+             name and the `(` -- which would make the macro list below do nothing"
+        );
+        assert_eq!(
+            production_call_sites(&code_only("if (a) { }")),
+            1,
+            "control: `code_only` glues the keyword to the paren, so `if(` counts as one site. \
+             That is the same gluing the callee list already pins as `ifThread32Next`, and it \
+             is deliberate: gluing changes the entry rather than hiding it"
         );
     }
 }
