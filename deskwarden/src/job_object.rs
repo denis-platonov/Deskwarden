@@ -751,9 +751,92 @@ mod tests {
         // commit, a `pub fn` carrying a bare `command.spawn()` appended BELOW
         // both test modules of `send.rs` was invisible to every pin in that
         // file. A walk sees whole files, and sees files that do not exist yet.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let src = root.join("src");
         let mut files = Vec::new();
         rust_sources(&src, &mut files);
+
+        // AND `build.rs`, WHICH IS NOT UNDER `src/`.
+        //
+        // The round that closed the thirteenth hop disclosed a proc-macro
+        // route as "not constructible today (adding one needs a `Cargo.toml`
+        // change)". That understated it. `deskwarden/build.rs` is ALREADY in
+        // this tree, cargo compiles and RUNS it on every build of this crate,
+        // and it sits outside `src/` -- so the walk above never reached it and
+        // no rule in this module read a byte of it. A `.spawn()` written there
+        // runs at build time, outside everything the fences below can see.
+        //
+        // It is a source file of this crate, so it is walked like one. It is
+        // deliberately NOT on `ALLOWED`: it starts no child today.
+        //
+        // It is NOT fenced the way `src/` files are (no callee list, no cut),
+        // and the reason is stated rather than left to silence: the fences
+        // constrain what the two JOB-BEARING RUNNERS can reach at RUNTIME, and
+        // `build.rs` is in no runtime call graph at all -- nothing in `src/`
+        // can name it, and it cannot name anything in `src/`. The only
+        // property of it that belongs to this guarantee is the one asserted
+        // here: it starts no child.
+        let build_rs = root.join("build.rs");
+        assert!(
+            build_rs.is_file(),
+            "control: `build.rs` is not where this walk expects it. If it was deleted, delete \
+             this block too; if it moved, follow it -- do not leave the walk silently reading \
+             nothing, which is exactly how it went unread for thirteen rounds"
+        );
+        files.push(build_rs.clone());
+
+        // AND HELD TIGHTER THAN THE WALK ALONE HOLDS IT.
+        //
+        // Measured, and SURVIVING the walk above at 2105 lib / 217 bin / 1
+        // ignored / 0 failed / 0 warnings:
+        //
+        //     let mut c = <std's process builder>::new(<the CLI>);
+        //     let f = <that same type>::spawn;   // the fn ITEM, by path
+        //     let _ = f(&mut c);
+        //
+        // (Spelled around rather than verbatim: `bw_path.rs` runs its own
+        // crate-wide scan for a `bw` started outside it, and a comment
+        // carrying the real literals trips that instead of this.)
+        //
+        // `direct_child_starts` matches a RECEIVER followed by `.spawn(`,
+        // `.output(` or `.status(`; a function ITEM taken by path and called
+        // through a binding writes none of the three. Every file under `src/`
+        // the two runners can reach has a callee allowlist below it, which
+        // sees `spawn` under any spelling -- `build.rs` has none and cannot
+        // usefully be given one, because it is in no runtime call graph and
+        // the entire reason it is in scope is that nothing else reads it.
+        //
+        // So this one file gets the blunt rule its size affords: 46 lines
+        // that embed an icon resource, and not one of the tokens out of which
+        // a child process is built. Cheaper than a fence, and strictly
+        // stronger for a file this small.
+        //
+        // Disclosed rather than claimed complete: a build script can still
+        // reach a child through some other crate that spawns on its behalf,
+        // and no token ban sees that. What it does see is every route that
+        // names the primitive itself.
+        let build_code = code_only(&std::fs::read_to_string(&build_rs).unwrap());
+        for banned in [
+            concat!("spa", "wn"),
+            concat!("Comm", "and"),
+            concat!("CreatePro", "cess"),
+            concat!("ex", "ec"),
+        ] {
+            assert!(
+                !build_code.contains(banned),
+                "`build.rs` names `{banned}`. It runs at BUILD time, outside every fence in \
+                 this module and outside the job object entirely, and all it does is embed an \
+                 icon -- it has no business anywhere near a child process. If it genuinely \
+                 needs one, that is a decision to write down here, not to slip past a walk \
+                 that knows only three spellings"
+            );
+        }
+        assert!(
+            build_code.len() > 150,
+            "control: `build.rs` stripped to {} chars (it is mostly comment, and 204 when this \r
+             was written) -- the token ban above is reading nothing",
+            build_code.len()
+        );
 
         // The walk itself, pinned: a recursion that returned nothing, or that
         // never descended into `vault_window/`, would make this vacuous.
@@ -761,7 +844,8 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        for expected in ["vault_export.rs", "send.rs", "job_object.rs", "mod.rs", "main.rs"] {
+        for expected in ["vault_export.rs", "send.rs", "job_object.rs", "mod.rs", "main.rs", "build.rs"]
+        {
             assert!(
                 names.iter().any(|n| n == expected),
                 "the source walk never reached {expected}; it found {names:?}"
@@ -789,9 +873,11 @@ mod tests {
             "vault_window/mod.rs",
         ];
 
+        // `build.rs` is not under `src/`, so it keeps its bare name here --
+        // which is also the name it would have to be given on `ALLOWED`.
         let relative = |p: &std::path::Path| {
             p.strip_prefix(&src)
-                .unwrap()
+                .unwrap_or(std::path::Path::new(p.file_name().unwrap()))
                 .to_string_lossy()
                 .replace('\\', "/")
         };
@@ -3708,6 +3794,114 @@ mod tests {
         out
     }
 
+    /// Every `mod NAME;` a `code_only` view declares -- the OUT-OF-FILE ones,
+    /// which name a second file, not the inline `mod NAME { .. }` ones, whose
+    /// bodies are already in the text every list above reads.
+    ///
+    /// # The fourteenth hop
+    ///
+    /// [`Fence`] pins six things about a file: the names it calls, the number
+    /// of call sites, its macros, its `use` items, its rooted paths and its
+    /// `unsafe` count. **A `mod x;` item is none of the six.** And the tree
+    /// walk reads non-`ALLOWED` files only for `.spawn()`/`.output()`/
+    /// `.status()`, so the file such an item pulls in is scanned for nothing
+    /// else at all. Measured, both edits ABOVE `bw_path.rs`'s cut, SURVIVING
+    /// at 2105 lib / 217 bin / 1 ignored / 0 failed / 0 warnings, byte
+    /// identical to baseline:
+    ///
+    /// ```text
+    /// // src/bw_path.rs, after the last `use`:
+    /// mod spawn_helper;
+    /// // and in `bw_job_command_in`, one existing call re-pointed:
+    /// -    bw_command_in(dir)
+    /// +    spawn_helper::bw_command_in(dir)
+    ///
+    /// // src/bw_path/spawn_helper.rs (a new, entirely unfenced file):
+    /// pub fn bw_command_in(dir: Option<&Path>) -> Result<super::BareCommand, String> {
+    ///     if dir.map_or(0, |d| d.as_os_str().len()) > 100_000 {
+    ///         unsafe { .. CreateProcessW(.., "bw.exe export", ..) .. }
+    ///     }
+    ///     super::bw_command_in(dir)
+    /// }
+    /// ```
+    ///
+    /// Every list stayed identical, and each for its own reason:
+    ///
+    ///  * the callee scan walks back from `(` over alnum and `_` and STOPS at
+    ///    `:`, so `spawn_helper::bw_command_in(` reports `bw_command_in` --
+    ///    already on [`BW_PATH_CALLEES`], because the call it replaced was to
+    ///    the real one.
+    ///  * call SITES 113 -> 113. A module prefix is not a new site. This is
+    ///    exactly the "one call replaced by another" shape, which is what the
+    ///    site count was added to catch -- and it does not catch this one.
+    ///  * `spawn_helper::` is not `crate::`/`super::`/`self::` rooted, so the
+    ///    local-path list misses it and so does RULE 8's `BW_PATH_MAY_REACH`.
+    ///    The `super::` that IS written lives in the child file, which no rule
+    ///    read.
+    ///  * imports, macros and `unsafe` in `bw_path.rs` are untouched; the
+    ///    `unsafe` sits in the unfenced child.
+    ///  * the derivation added the round before is right as far as it goes,
+    ///    but the child module is never NAMED by `vault_export.rs` or
+    ///    `send.rs`, so it never enters `REACHABLE` and the derived set never
+    ///    grew.
+    ///
+    /// Liveness proven rather than argued: replacing the child's body with a
+    /// `panic!` fails twelve tests, among them
+    /// `vault_export::tests::the_export_reaches_the_spawn_carrying_the_job_the_entry_point_was_given`
+    /// and
+    /// `vault_window::send_ui::source_pins::the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given`.
+    /// Drop the `> 100_000` guard and every export and every Send fetch starts
+    /// a second, jobless `bw`.
+    ///
+    /// # Why this is a closure and not a seventh list
+    ///
+    /// A `mods: &[&str]` field per fence would be a hand-written list that a
+    /// human has to remember to add to -- and forgetting is SILENT, which is
+    /// the defect `DOOR_MODULES` already was once. So the fenced set is the
+    /// TRANSITIVE `mod` closure of the `REACHABLE` modules instead: a new
+    /// child file is discovered by reading its parent, and a child without a
+    /// [`Fence`] FAILS. Adding a module is fail-by-default, in both
+    /// directions and at any depth -- a child of a child is found by the same
+    /// loop, because the loop re-reads whatever it just added.
+    fn production_mod_children(code: &str) -> Vec<String> {
+        let b = code.as_bytes();
+        let mut out: Vec<String> = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find("mod") {
+            let start = from + at;
+            from = start + 3;
+            // `code_only` has glued everything together, so an item `mod`
+            // arrives welded to whatever preceded it: `pub mod x;` is
+            // `pubmodx;` and `pub(crate) mod x;` is `pub(crate)modx;`. The
+            // same allowance [`item_bodies`] makes, for the same reason --
+            // and the cost of being generous here is a false POSITIVE, which
+            // fails loudly, never a miss.
+            let starts_item = start == 0
+                || matches!(b[start - 1], b';' | b'}' | b'{' | b']' | b')')
+                || code[..start].ends_with("pub");
+            if !starts_item {
+                continue;
+            }
+            let mut end = from;
+            while end < b.len() && (b[end].is_ascii_alphanumeric() || b[end] == b'_') {
+                end += 1;
+            }
+            // `mod x {` is an INLINE module: its body is right here, in the
+            // very text every other list reads, so it needs no fence of its
+            // own. Only `mod x;` names a second file.
+            if end == from || b.get(end) != Some(&b';') {
+                continue;
+            }
+            let name = code[from..end].to_string();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+            from = end;
+        }
+        out.sort();
+        out
+    }
+
     /// **This file names exactly one child-starting primitive.**
     ///
     /// RULE 9 counts SPELLINGS -- `.spawn()`, `Command::new(`, the word
@@ -3933,6 +4127,15 @@ mod tests {
         /// the cut up -- a column-0 marker in a comment does it -- and every
         /// list below reads a truncated file while staying green.
         last_production_item: &'static str,
+        /// A LOWER BOUND on the length of the `code_only` production view,
+        /// close enough to the real figure to notice a truncation.
+        ///
+        /// It was `1000` for `bw_path.rs` against a measured 4580, and `2000`
+        /// for `job_object.rs` against a measured 3542 -- so three quarters of
+        /// either file could have vanished with this control still passing
+        /// while every list below read a stump. Set just under the measured
+        /// figure instead; an edit that really moves it is a deliberate
+        /// one-line bump, and the failure names the new number.
         min_code_len: usize,
         callees: &'static [&'static str],
         /// The number of call SITES, which the deduplicated set above cannot
@@ -4066,7 +4269,7 @@ mod tests {
         Fence {
             file: "bw_path.rs",
             last_production_item: "BlockedByUnknownCliPath => Some(",
-            min_code_len: 1000,
+            min_code_len: 4400,
             callees: BW_PATH_CALLEES,
             call_sites: 113,
             macros: BW_PATH_MACROS,
@@ -4079,7 +4282,7 @@ mod tests {
         Fence {
             file: "job_object.rs",
             last_production_item: concat!("Ok(res", "umed)"),
-            min_code_len: 2000,
+            min_code_len: 3400,
             callees: PRODUCTION_CALLEES,
             call_sites: 71,
             macros: PRODUCTION_MACROS,
@@ -4123,17 +4326,84 @@ mod tests {
         let mut reachable_modules: Vec<String> = REACHABLE.iter().map(|p| module_of(p)).collect();
         reachable_modules.sort();
         reachable_modules.dedup();
-        let mut fenced: Vec<String> =
-            FENCES.iter().map(|f| f.file.trim_end_matches(".rs").to_string()).collect();
+
+        // ...AND CLOSED OVER `mod` CHILDREN, TRANSITIVELY.
+        //
+        // See [`production_mod_children`] for the fourteenth hop, which is the
+        // whole reason this is a closure: `REACHABLE` names only what the two
+        // runners SPELL, and a module reached through a child of a module they
+        // spell is never spelled by either of them. The closure is
+        // `REACHABLE` -> modules -> their `mod` children -> theirs, until it
+        // stops growing. A file discovered here and not in `FENCES` fails.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut required: Vec<String> = reachable_modules.iter().map(|m| format!("{m}.rs")).collect();
+        let mut discovered_children: Vec<String> = Vec::new();
+        let mut at = 0;
+        while at < required.len() {
+            let file = required[at].clone();
+            at += 1;
+            assert!(
+                src_dir.join(&file).is_file(),
+                "the closure wants to read `src/{file}`, which is not a file. A module was \
+                 named that this walk cannot follow -- resolve it or fix the name; do not let \
+                 the closure quietly stop here"
+            );
+            let code = code_only(&fenced_production(&file));
+            // A `#[path = ".."]` attribute re-points a `mod` item at an
+            // arbitrary file -- possibly outside `src/` entirely -- and the
+            // two candidate locations below would then both be wrong while
+            // the real child stayed unfenced. There is no such attribute in
+            // this crate and no reason for a fenced file to grow one, so it
+            // is refused outright rather than followed.
+            assert!(
+                !code.contains(concat!("#[pa", "th=")),
+                "production src/{file} carries a `#[path = ..]` attribute. That re-points a \
+                 `mod` item at a file this closure would not look at, which puts the child \
+                 outside every fence. Put the child where its `mod` name says it goes"
+            );
+            for child in production_mod_children(&code) {
+                let dir = file.trim_end_matches(".rs").trim_end_matches("/mod");
+                let flat = format!("{dir}/{child}.rs");
+                let nested = format!("{dir}/{child}/mod.rs");
+                let found = [flat, nested]
+                    .into_iter()
+                    .find(|c| src_dir.join(c).is_file())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "production src/{file} declares `mod {child};` but neither \
+                             `src/{dir}/{child}.rs` nor `src/{dir}/{child}/mod.rs` exists, so \
+                             this closure cannot fence the file it pulls in. If the `mod` item \
+                             sits inside an INLINE `mod` in this file, the real file is a \
+                             directory deeper than either name above: this scan finds `mod` \
+                             items wherever they are written but resolves them against the \
+                             FILE, so it stops here rather than guessing, and the fix is to \
+                             stop nesting it. (Measured: that shape, hiding a `CreateProcessW`, \
+                             lands on this line.)"
+                        )
+                    });
+                if !required.contains(&found) {
+                    discovered_children.push(found.clone());
+                    required.push(found);
+                }
+            }
+        }
+        required.sort();
+        required.dedup();
+
+        let mut fenced: Vec<String> = FENCES.iter().map(|f| f.file.to_string()).collect();
         fenced.sort();
         assert_eq!(
-            fenced, reachable_modules,
+            fenced, required,
             "the set of fenced files is no longer the set of modules RULE 7 lets \
              `vault_export.rs` and `send.rs` name. A module on `REACHABLE` is a module the two \
              runners call INTO, and anything it calls it calls on their behalf with no rule of \
              theirs in the way -- which is exactly how the thirteenth hop put a `CreateProcessW` \
-             in `bw_path.rs` while both runners stayed spotless. Either add a `Fence` for it \
-             (with its own four lists) or take it off `REACHABLE`"
+             in `bw_path.rs` while both runners stayed spotless -- or, if the missing name is a \
+             `mod` CHILD of one of those, how the FOURTEENTH hop put one in \
+             `bw_path/spawn_helper.rs` with `bw_path.rs` itself staying spotless too. Either add \
+             a `Fence` for it (with its own lists) or take it off `REACHABLE`. Adding a module \
+             under a fenced one FAILS HERE BY DESIGN: that is the point of the closure, and the \
+             answer is a fence, not an exemption"
         );
         assert_eq!(
             reachable_modules,
@@ -4141,6 +4411,13 @@ mod tests {
             "control: the derivation no longer produces the two modules this fence is known to \
              cover, so either `REACHABLE` changed (update this deliberately) or `module_of` is \
              broken and the equality above is comparing two wrong lists to each other"
+        );
+        assert!(
+            discovered_children.is_empty(),
+            "control-of-record: neither fenced file has a `mod` child today, and this says so \
+             out loud. If one is added deliberately, this line changes with it -- so the day \
+             the closure DOES pull a file in is a visible edit rather than a silent one. Found \
+             {discovered_children:?}"
         );
         for m in ["job_object", "bw_path", "login_ui"] {
             assert_eq!(
@@ -4150,6 +4427,31 @@ mod tests {
                  above compares the wrong strings"
             );
         }
+        // CONTROLS on the child scanner. `discovered_children` is empty above,
+        // so without these the closure could be a no-op and read exactly the
+        // same.
+        assert_eq!(
+            production_mod_children(&code_only("use std::path::Path;\nmod spawn_helper;\n")),
+            vec!["spawn_helper"],
+            "control: the fourteenth hop's own `mod` item is invisible to the scanner, so the \
+             closure above is decorative"
+        );
+        assert_eq!(
+            production_mod_children(&code_only("pub mod a;\npub(crate) mod b;\n")),
+            vec!["a", "b"],
+            "control: a `mod` item behind a visibility keyword is missed -- and `code_only` \
+             glues the keyword to it, which is the shape this has to survive"
+        );
+        assert!(
+            production_mod_children(&code_only("mod inline { fn f() {} }")).is_empty(),
+            "control: an INLINE module is reported as an out-of-file child; its body is already \
+             in the text every list reads, and demanding a file for it would fail the crate"
+        );
+        assert!(
+            production_mod_children(&code_only("fn f() { let model = 1; }")).is_empty(),
+            "control: `mod` inside a longer identifier is reported as a module declaration, so \
+             the closure would demand a file for a local variable"
+        );
 
         for fence in FENCES {
             let file = fence.file;
