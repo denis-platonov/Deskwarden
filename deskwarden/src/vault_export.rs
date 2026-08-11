@@ -371,14 +371,35 @@ const HEAD_BYTES: usize = 512;
 /// argument away. Replacing that function's body with
 /// `CliExportRunner::new(Arc::new(None)).into_runner()` left every test in the
 /// crate green and no warning emitted -- and every export child spawned
-/// outside the kill-on-close job, through the one function the UI calls.
+/// outside the kill-on-close job.
 ///
 /// The `Cli` variant therefore keeps the [`CliExportRunner`] itself rather
-/// than a closure over it, so [`Self::job`] and the spawn read the SAME
-/// value. There is no second copy of the job to drift from the first:
-/// [`Self::job`] answers out of the runner that will do the spawning, which
-/// is what makes [`the_real_runner_hands_the_export_the_job_it_was_given`] a
-/// test of the production path rather than of a bookkeeping field.
+/// than a closure over it, so a test can reach the very runner that will do
+/// the spawning.
+///
+/// **And there is deliberately no `ExportRunner::job` accessor, which is the
+/// fix for the NEXT round of the same finding.** There used to be one, and it
+/// looked like the proof: it read the job out of the `Cli` arm, and the test
+/// below asserted by pointer identity that `real_runner`'s argument reached
+/// it. But `job` and [`Self::call`] were two independent `match` arms over
+/// the same `self`, and only `job` was ever asserted -- `call`'s `Cli` arm was
+/// reached by no test and named by no pin. Measured, a `call` whose CLI arm
+/// ignored the runner it was handed and ran
+/// `CliExportRunner::new(Arc::new(None))` instead
+/// gave 2053 lib + 217 bin, 0 failed, 0 warnings: `job` went on reporting the
+/// real job, both of its pointer controls went on passing, and every export
+/// child -- a process holding an unlocked vault -- spawned outside the
+/// kill-on-close job.
+///
+/// An accessor that reports a job the spawn does not use is now
+/// unrepresentable because no such accessor exists. The `Cli` variant is
+/// destructured in exactly ONE place in this module,
+/// [`Self::call`], and [`the_real_runner_hands_the_export_the_job_it_was_given`]
+/// destructures that same variant itself rather than asking a second function
+/// about it. What remains beyond a test's reach is the one hop no test here
+/// may take -- the spawn itself, which needs a real process -- and that hop is
+/// held by the count-1 pin in
+/// [`the_export_child_is_spawned_into_the_kill_on_close_job`].
 /// The boxed closure behind [`ExportRunner::Fake`]. Named only to keep the
 /// enum's own declaration readable.
 type FakeExport = Arc<dyn Fn(&ExportPlan, &str) -> RawExport + Send + Sync>;
@@ -398,21 +419,12 @@ impl ExportRunner {
         Self::Fake(Arc::new(f))
     }
 
-    /// The job the child this runner spawns will be assigned to, or `None`
-    /// when there is no child to assign -- a fake, or a process that never
-    /// managed to create a job.
-    ///
-    /// Read out of the [`CliExportRunner`] that does the spawning, not out of
-    /// a field beside it, so this cannot answer one job while the spawn uses
-    /// another.
-    pub fn job(&self) -> Option<&KillOnCloseJob> {
-        match self {
-            Self::Cli(cli) => cli.job(),
-            Self::Fake(_) => None,
-        }
-    }
-
     /// Runs the export.
+    ///
+    /// **The only place `Self::Cli` is destructured**, deliberately: see the
+    /// type's own note. Anything wanting to know which job the export child
+    /// will be spawned into must match this variant for itself, so it is
+    /// looking at the same value this line spawns through.
     fn call(&self, plan: &ExportPlan, session: &str) -> RawExport {
         match self {
             Self::Cli(cli) => cli.run(plan, session),
@@ -439,8 +451,8 @@ impl ExportRunner {
 /// **This is a named struct and not a bare closure, and that is the fix for a
 /// review finding rather than a preference.** The guarantee above used to be
 /// held by a source pin over the `spawn_in_job` call alone. A pin over a call
-/// says nothing about the value flowing into it: replacing the body with
-/// `run_cli(plan, session, job.as_ref().as_ref().filter(|_| false))` left the
+/// says nothing about the value flowing into it: starving the job on its way
+/// in -- `job.as_ref().as_ref().filter(|_| false)` -- left the
 /// pinned line word-perfect, every test in the crate green and no warning
 /// emitted -- and every export child spawned outside the job. The job is now
 /// a value on a type, [`CliExportRunner::job`] is the single place the spawn
@@ -465,83 +477,100 @@ impl CliExportRunner {
         self.job.as_ref().as_ref()
     }
 
+    /// One spawn, start to finish, with nothing judged and nothing renamed.
+    ///
+    /// Both output streams are captured and stdin is `null`: an inherited
+    /// stream would attach the child to a console this app does not own, and
+    /// `bw export` has nothing to read from stdin. The spawn goes through
+    /// [`crate::job_object::spawn_in_job`], which spawns suspended, assigns
+    /// the child to the job and only then resumes it -- and which re-ORs
+    /// `CREATE_NO_WINDOW`, because `creation_flags` **replaces** the flags a
+    /// command is holding rather than adding to them, so the flag
+    /// [`bw_command`] already set would otherwise be dropped and a console
+    /// window would flash on screen.
+    ///
+    /// **A method that reads `self.job()` AT the spawn, and not a free
+    /// `run_cli(plan, session, job)` taking the job as a parameter, and that
+    /// is the fix for a review finding rather than a preference.** A
+    /// parameter is a local binding, and a local binding can be shadowed
+    /// under every guard this module holds. Measured, a `run_cli` beginning
+    /// `let job = job.filter(|_| false);` gave 2053 lib + 217 bin, 0 failed,
+    /// 0 warnings: the `spawn_in_job` pin stayed word-perfect, the
+    /// `run_cli(plan, session, self.job())` pin stayed word-perfect, both
+    /// pointer-identity tests stayed green -- and every export child spawned
+    /// outside the kill-on-close job. There is no local to shadow now: the
+    /// job is read off `self` in the pinned spawn line itself, and `self`
+    /// cannot be rebound. This is the shape [`crate::send`] already uses.
     fn run(&self, plan: &ExportPlan, session: &str) -> RawExport {
-        run_cli(plan, session, self.job())
+        let mut command = match export_command(plan, session) {
+            Ok(command) => command,
+            Err(why) => return nothing_ran(why),
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let child = match crate::job_object::spawn_in_job(self.job(), command) {
+            Ok(child) => child,
+            Err(e) => {
+                return nothing_ran(format!(
+                    "Bitwarden's command-line tool could not be started ({e}). Nothing was exported."
+                ))
+            }
+        };
+
+        let output = match child.wait_with_output() {
+            Ok(output) => output,
+            Err(e) => {
+                // The child was started, so something may well be on disk -- but
+                // this side never learned how it ended. Reported as a failure
+                // with its own words; `run_export` deletes the partial either
+                // way, which is the safe direction.
+                return nothing_ran(format!(
+                    "Bitwarden's command-line tool was started but could not be waited on ({e})."
+                ));
+            }
+        };
+
+        // Observed BEFORE anything is renamed, and off the partial path, because
+        // the partial is the only file this crate has written anything to yet.
+        let (written, head) = observe_partial(plan);
+        RawExport {
+            exit_ok: output.status.success(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            written,
+            head,
+        }
     }
 
-    /// Puts this runner into the seam [`run_export`] takes, whole -- so the
-    /// job it was constructed with is still readable through
-    /// [`ExportRunner::job`] afterwards.
+    /// Puts this runner into the seam [`run_export`] takes, whole -- so a
+    /// test that matches `ExportRunner::Cli` afterwards is looking at the
+    /// very runner the spawn will go through, not at a copy of its job.
     pub fn into_runner(self) -> ExportRunner {
         ExportRunner::Cli(self)
     }
 }
 
-/// The production [`ExportRunner`], for the one call site that wires it up.
+/// The production [`ExportRunner`].
 ///
-/// **The only production entry point into the export**, which is why
+/// **Nothing calls this yet.** Export step 5, the UI wiring, is unwritten: a
+/// search of `deskwarden/src` outside this file finds no reference to
+/// `real_runner`, `ExportRunner`, `CliExportRunner` or [`run_export`]. An
+/// earlier version of this comment described "the one function the UI calls"
+/// and "the one call site that wires it up"; there is no such call site, and
+/// the guarantee below is therefore currently unreachable in production
+/// rather than merely untested there.
+///
+/// It is the intended entry point, which is why
 /// [`the_real_runner_hands_the_export_the_job_it_was_given`] asserts by
 /// pointer identity that the job reaching the returned runner is this
-/// argument. Every guarantee `CliExportRunner` carries about job membership
-/// is reachable only through this function, so a body that dropped `job` on
-/// the floor would put every export child outside the kill-on-close job while
-/// the constructor's own test went on passing.
+/// argument. But when step 5 lands, **this property must be re-proven at
+/// whatever function the wiring actually calls**: every previous round of
+/// this same finding was lost one hop further out than the last, and a hop
+/// that no test reaches is exactly where the job goes missing.
 pub fn real_runner(job: Arc<Option<KillOnCloseJob>>) -> ExportRunner {
     CliExportRunner::new(job).into_runner()
-}
-
-/// One spawn, start to finish, with nothing judged and nothing renamed.
-///
-/// Both output streams are captured and stdin is `null`: an inherited stream
-/// would attach the child to a console this app does not own, and `bw export`
-/// has nothing to read from stdin. The spawn goes through
-/// [`crate::job_object::spawn_in_job`], which spawns suspended, assigns the
-/// child to the job and only then resumes it -- and which re-ORs
-/// `CREATE_NO_WINDOW`, because `creation_flags` **replaces** the flags a
-/// command is holding rather than adding to them, so the flag
-/// [`bw_command`] already set would otherwise be dropped and a console window
-/// would flash on screen.
-fn run_cli(plan: &ExportPlan, session: &str, job: Option<&KillOnCloseJob>) -> RawExport {
-    let mut command = match export_command(plan, session) {
-        Ok(command) => command,
-        Err(why) => return nothing_ran(why),
-    };
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let child = match crate::job_object::spawn_in_job(job, command) {
-        Ok(child) => child,
-        Err(e) => {
-            return nothing_ran(format!(
-                "Bitwarden's command-line tool could not be started ({e}). Nothing was exported."
-            ))
-        }
-    };
-
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(e) => {
-            // The child was started, so something may well be on disk -- but
-            // this side never learned how it ended. Reported as a failure
-            // with its own words; `run_export` deletes the partial either
-            // way, which is the safe direction.
-            return nothing_ran(format!(
-                "Bitwarden's command-line tool was started but could not be waited on ({e})."
-            ));
-        }
-    };
-
-    // Observed BEFORE anything is renamed, and off the partial path, because
-    // the partial is the only file this crate has written anything to yet.
-    let (written, head) = observe_partial(plan);
-    RawExport {
-        exit_ok: output.status.success(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        written,
-        head,
-    }
 }
 
 /// The observation for a run that produced no process at all.
@@ -1210,7 +1239,8 @@ mod tests {
     }
 
     /// A runner that writes `body` where the plan says the CLI would, then
-    /// observes it exactly as `run_cli` does. It starts no process.
+    /// observes it exactly as [`CliExportRunner::run`] does. It starts no
+    /// process.
     fn writing_runner(body: &'static [u8], exit_ok: bool, stderr: &'static str) -> ExportRunner {
         ExportRunner::from_fn(move |plan: &ExportPlan, _session: &str| {
             std::fs::write(plan.partial_path(), body).expect("the fake runner stages its own file");
@@ -1608,10 +1638,28 @@ mod tests {
         // hazard the constructor's test claims to have closed, reached
         // through the one function the UI calls.
         //
-        // What makes this assertable at all is that `ExportRunner` keeps the
-        // `CliExportRunner` whole instead of boxing a closure over it, so
-        // `ExportRunner::job` reads out of the very value that will do the
-        // spawning. There is no second copy to agree with.
+        // AND THE ROUND AFTER THAT, which is why this test no longer calls an
+        // accessor. It used to read `runner.job()` -- an `ExportRunner::job`
+        // that matched `Self::Cli(cli) => cli.job()`. But `ExportRunner::call`
+        // matched `Self::Cli(cli) => cli.run(..)` in a SECOND, independent
+        // arm, and only the first one was ever asserted. Measured on the
+        // commit before this one, a `call` of
+        //
+        //     Self::Cli(cli) => {
+        //         let _ = cli;
+        //         CliExportRunner::new(Arc::new(None)).run(plan, session)
+        //     }
+        //
+        // gave 2053 lib + 217 bin, 0 failed, 0 warnings. `job()` still
+        // reported the real job and both pointer controls below still passed,
+        // while every export child spawned outside the job.
+        //
+        // So the accessor is gone. `Self::Cli` is destructured in exactly one
+        // production place -- `ExportRunner::call`, the line that spawns --
+        // and this test destructures the same variant itself. There is no
+        // second function left that could answer one job while `call` uses
+        // another; what `call` does with the runner after that is held by the
+        // count-1 pin in `the_export_child_is_spawned_into_the_kill_on_close_job`.
         //
         // `KillOnCloseJob::new` creates a kernel handle. It starts no
         // process, touches no file, opens no socket, and the handle is
@@ -1621,7 +1669,13 @@ mod tests {
         let given: &KillOnCloseJob = held.as_ref().as_ref().expect("the fixture holds one");
 
         let runner = real_runner(Arc::clone(&held));
-        let reaching = runner.job().expect(
+        let ExportRunner::Cli(cli) = &runner else {
+            panic!(
+                "`real_runner` no longer produces the CLI runner, so nothing spawns the export \
+                 through `spawn_in_job` at all"
+            )
+        };
+        let reaching = cli.job().expect(
             "`real_runner` threw its job away, so every export child -- a process holding an \
              unlocked vault -- would be spawned outside the kill-on-close job and could \
              outlive a panic, a `process::exit` or a Task Manager kill",
@@ -1631,14 +1685,17 @@ mod tests {
             "the job reaching the production runner is not the one `real_runner` was handed"
         );
 
-        // Control: the accessor is not answering `given` by construction.
+        // Control: the runner is not answering `given` by construction.
         // A runner built from a DIFFERENT job must be distinguishable, or
         // the pointer comparison above would pass for any job at all.
         let other = Arc::new(Some(
             KillOnCloseJob::new().expect("a second handle, still not a process"),
         ));
         let other_runner = real_runner(Arc::clone(&other));
-        let other_reaching = other_runner.job().expect("the second fixture holds one too");
+        let ExportRunner::Cli(other_cli) = &other_runner else {
+            panic!("control: the second production runner is not a CLI runner either")
+        };
+        let other_reaching = other_cli.job().expect("the second fixture holds one too");
         assert!(
             !std::ptr::eq(given, other_reaching),
             "control: two runners built from two different jobs report the same job, so the \
@@ -1647,16 +1704,24 @@ mod tests {
 
         // Control: the absence is still expressible end to end, so the
         // assertion above is about a job that was really there.
+        let empty = real_runner(Arc::new(None));
+        let ExportRunner::Cli(empty_cli) = &empty else {
+            panic!("control: the jobless production runner is not a CLI runner")
+        };
         assert!(
-            real_runner(Arc::new(None)).job().is_none(),
+            empty_cli.job().is_none(),
             "control: `no job at all` no longer survives the trip through `real_runner`"
         );
 
-        // Control: a fake reports no job, which is what makes `job()` a
-        // question about the spawn rather than a field every runner sets.
+        // Control: a fake is NOT the spawning arm, which is what makes the
+        // destructuring above a question about the spawn rather than a shape
+        // every runner has.
         assert!(
-            writing_runner(envelope_body(), true, "").job().is_none(),
-            "control: a runner that starts no process claims a job to spawn into"
+            !matches!(
+                writing_runner(envelope_body(), true, ""),
+                ExportRunner::Cli(_)
+            ),
+            "control: a runner that starts no process is taking the CLI spawn arm"
         );
     }
 
@@ -1732,7 +1797,7 @@ mod tests {
         // is a property of a real process: a fake runner has none.
         let code = code_under_test();
         assert_eq!(
-            code.matches("crate::job_object::spawn_in_job(job, command)").count(),
+            code.matches("crate::job_object::spawn_in_job(self.job(), command)").count(),
             1,
             "the export child is no longer spawned into the job exactly once, so a crash or a \
              Task Manager kill could leave a `bw` running with the session token in its \
@@ -1740,13 +1805,53 @@ mod tests {
              beside the pinned one satisfies a presence-only needle by construction"
         );
         assert_eq!(
-            code.matches("run_cli(plan, session, self.job())").count(),
+            code.matches("fn run_cli(").count(),
+            0,
+            "the spawn is back behind a free function taking the job as a PARAMETER. It used \
+             to be `run_cli(plan, session, self.job())`, pinned at exactly one occurrence -- \
+             and that pin was defeated one hop further in, because a parameter is a local \
+             binding and a local binding can be shadowed. Measured, a `run_cli` beginning \
+             `let job = job.filter(|_| false);` gave 2053 lib + 217 bin, 0 failed, 0 warnings \
+             with that pin, the `spawn_in_job` pin and both pointer-identity tests all intact, \
+             while every export child spawned outside the kill-on-close job. The spawn is now \
+             a method that reads `self.job()` IN the pinned spawn line above, and `self` \
+             cannot be rebound, so there is no local left to starve"
+        );
+        assert_eq!(
+            code.matches(concat!(
+                "fn call(&self, plan: &ExportPlan, session: &str) -> RawExport {\n",
+                "        match self {\n",
+                "            Self::Cli(cli) => cli.run(plan, session),\n",
+                "            Self::Fake(f) => f(plan, session),\n",
+                "        }\n",
+                "    }\n",
+            ))
+            .count(),
             1,
-            "the runner no longer passes its OWN job to the spawn. This is the pin that the \
-             finding was about: pinning the `spawn_in_job` line above says nothing about the \
-             value flowing into it, and the behavioural assertion in \
-             `the_runner_spawns_into_the_very_job_it_was_constructed_with` is what holds the \
-             value. This says which line carries it"
+            "the export no longer runs through the `CliExportRunner` the seam is HOLDING. This \
+             is the pin for the hop the last round of this finding was lost in: \
+             `the_real_runner_hands_the_export_the_job_it_was_given` destructures \
+             `ExportRunner::Cli` and proves the job inside it is `real_runner`'s argument, but \
+             the spawn happens in `ExportRunner::call`, and a `call` that ran a runner of its \
+             own making -- `CliExportRunner::new(Arc::new(None)).run(plan, session)` -- left \
+             that test and every control in it green while every export child spawned outside \
+             the kill-on-close job. \
+             \
+             The WHOLE function body is pinned, not merely the `Self::Cli` arm, and that is \
+             deliberate: an arm-only needle is satisfied word-perfectly by an early return \
+             spliced in ABOVE the match, and such a return can test the variant with \
+             `Self::Cli {{ .. }}`, which no `Cli(` count would see. Pinning the body leaves \
+             nowhere to splice"
+        );
+        assert_eq!(
+            code.matches("Cli(").count(),
+            3,
+            "`ExportRunner::Cli` is mentioned somewhere new. Below the doc comments this module \
+             allows exactly three: the variant's own declaration, `into_runner` building it, \
+             and `call` destructuring it to spawn. A FOURTH would be a second reader of the \
+             job, and a second reader is free to report one job while `call` spawns into \
+             another -- precisely the bug that the deleted `ExportRunner::job` accessor was, \
+             and that this count makes unrepresentable rather than merely untested"
         );
         assert!(
             !code.contains(".spawn()"),
