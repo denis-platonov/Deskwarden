@@ -7608,6 +7608,27 @@ mod tests {
         let armed = body
             .find(concat!("park.wi", "th(|est| {"))
             .expect("`produce` must arm the parked estate with the child it started");
+        // **BOTH fields, by exact text.** The `with` is one closure and it
+        // is easy to read as one act; it is two, and each is a different
+        // way for the estate to come home useless. Found by mutation:
+        // `est.child = spawned.take();` replaced by `spawned = None;`
+        // compiles, warns about nothing and left the whole suite green
+        // while the estate came back holding `child: None` -- so
+        // `stop_backend_if_idle` stops nothing, every recovery stops
+        // nothing, and the `bw serve` this process started holds
+        // `BW_SERVE_PORT` for the life of the machine. **The vault would
+        // not lock.** The sibling needle for the token was already here;
+        // this one was not, which is the ledger's house defect in its
+        // exact form -- a change correct in isolation whose guard did not
+        // reach the behaviour it claimed.
+        assert!(
+            body.contains(concat!("est.child = spawned.", "take();")),
+            "`produce` does not arm the parked estate's CHILD at the spawn. The estate \
+             then comes home with `child: None` on every path -- and an estate holding \
+             `child: None` cannot stop `bw serve`: the recovery's first act is \
+             `stop_bw_serve` on what it is handed, so it stops nothing, re-asks for the \
+             master password and dies on the port its own orphan is holding"
+        );
         assert!(
             body.contains(concat!("est.token = token.to_", "string();")),
             "`produce` arms the child but not the TOKEN. The two paths out of the window \
@@ -7929,6 +7950,75 @@ mod tests {
             "a second `BackendOp` channel is built BELOW the startup window, which is the \
              shadow this guard exists for: placed after one use of the original, \
              `unused_variables` does not fire and nothing else notices"
+        );
+    }
+
+    /// **The lock's tray labels reach a tray on the startup path.**
+    ///
+    /// `resettle_session_reporting_tray` reports its Sync-item updates as
+    /// values instead of applying them, because `AppTray` owns a hidden
+    /// Win32 window bound to the thread that built it and the teardown runs
+    /// on a worker. The vault host drops them on purpose -- `main`'s tray
+    /// already exists there and the idle pass reconciles the label as soon
+    /// as the window is gone.
+    ///
+    /// **Neither of those holds at startup**, and that is the whole of this
+    /// guard: `tray::build_tray()` runs BELOW the window and there is no
+    /// idle loop yet, so a dropped `SyncFailed` is a tray that comes up in
+    /// its resting state claiming a sync succeeded when it did not, and
+    /// nothing ever corrects it.
+    ///
+    /// **Found by mutation.** The one line that moves the labels out of the
+    /// worker was deleted and the whole suite stayed green: the sink was
+    /// still built, still cloned, still passed and still drained -- of
+    /// nothing. Presence of the plumbing is not the property; the transfer
+    /// is, and so is the fact that the drain happens where a tray exists.
+    #[test]
+    fn the_locks_tray_labels_are_carried_out_of_the_worker_and_applied_to_a_real_tray() {
+        let production = production_half_of_this_file();
+        let carried = concat!(".append(&mut tray_", "effects);");
+        assert_eq!(
+            production.matches(carried).count(),
+            1,
+            "the teardown does not move its reported tray labels into the sink its caller \
+             holds. Every other line of the plumbing can stay -- the sink built, cloned, \
+             passed and drained -- and it drains nothing: the startup tray then comes up \
+             saying a sync succeeded on a launch where it failed, with no idle loop to \
+             correct it"
+        );
+        let applied = concat!("effect.apply(&", "tray);");
+        // TWO sites: this one, beside `build_tray`, and the main loop's
+        // own idle reconciliation further down -- which is the one the
+        // VAULT host relies on and the one that does not exist yet at
+        // startup. `find` below takes the first, which is this one.
+        assert_eq!(
+            production.matches(applied).count(),
+            2,
+            "the carried labels are applied other than exactly twice. One means the \
+             startup site is gone -- the labels are carried out of the worker and then \
+             dropped one step later, which is the same tray telling the same lie -- and \
+             three is a third applier nothing here reasons about"
+        );
+        let tray_at = production
+            .find(concat!("let mut tray = tray::build", "_tray();"))
+            .expect("control: the tray must still be built on a line of its own");
+        let apply_at = production.find(applied).expect("counted just above");
+        assert!(
+            tray_at < apply_at,
+            "the labels are applied ABOVE `tray::build_tray()`, which cannot be: there is \
+             no tray to apply them to yet"
+        );
+        assert!(
+            production[tray_at..apply_at].len() < 1_500,
+            "the labels are applied {} bytes below the tray rather than beside it. \
+             Anything between them runs while the Sync item is still showing whatever the \
+             teardown left it saying",
+            production[tray_at..apply_at].len()
+        );
+        assert!(
+            production[tray_at..apply_at].contains(concat!("startup_tray_", "effects")),
+            "what is applied beside the tray is not the sink the startup window's teardown \
+             filled"
         );
     }
 
